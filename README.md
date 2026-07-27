@@ -275,51 +275,66 @@ stemmers are case-sensitive on the token surface form exactly as its proto
 documents; the mock would have lowercased it. Offsets slice the original
 surface forms out of the stored text (`"running"`, `"foxes"`).
 
-## Court-opinion pipeline (chunking -> TEI embedding -> ingest)
+## Court-opinion pipeline (chunk + embed + ingest)
 
-Three-stage pipeline over the court-opinion corpus
+Two-stage-plus-ingest pipeline over the court-opinion corpus
 (`/work/court-corpus/opinions-sample.ndjson`, 264k full-length opinions,
-`{"id", "cluster_id", "plain_text"}`; not copied into the repo). All
-artifacts live under `/work/court-corpus/`.
+`{"id", "cluster_id", "plain_text"}`; not copied into the repo). The
+DEFAULT embedding path is the OpenNLP analysis sidecar's static
+embeddings; TEI/bge-m3 (`court_embed`) remains the quality path.
 
-1. **Chunk** (`court_chunks`): streams the NDJSON through the REAL
-   OpenNLP analysis sidecar (sentence detection + whitespace tokens) and
-   assembles sentence-aware chunks of ~256 tokens (`--target-tokens`).
-   Oversized single sentences are split at token boundaries — truncation
-   is never used, so the CONTIGUITY INVARIANT holds and is asserted per
-   opinion: chunk spans are contiguous and gap-free, and concatenating an
-   opinion's chunk texts in ordinal order reproduces the original
-   `plain_text` byte-for-byte. Output: `chunks.ndjson` (one record per
-   chunk: chunk_id, opinion/cluster id, span, ordinal, text), streamable
-   and resumable (a rerun skips input lines already processed). Measured
-   ~3,800 opinions/s (~39,000 chunks/s) with 16 workers.
-2. **Embed** (`court_embed`): streams chunks through TEI
-   (`tei-bge-m3` container, native gRPC on `localhost:8095`, bge-m3
-   fp16, 1024d; vendored proto at `proto/tei/v1/tei.proto` from
-   huggingface/text-embeddings-inference v1.9.3 — see the file header).
-   `normalize=true`, `truncate=false` (the chunker already bounds input
-   well under TEI's 8192-token cap, so embeddings always cover the full
-   chunk text). Output: `embeddings.bin` keyed by `(opinion_id,
-   ordinal)` — the durable resume key, stable across chunker reruns.
-   Measured ~300 chunks/s, saturated (GPU-bound); that is the full-run
-   bottleneck (~2.5 h for the full corpus).
-3. **Ingest** (`court_ingest`): joins chunks and embeddings, assigns
-   contiguous blocks to N shards (default 4), fits calibration on a
-   stride sample and pushes it with `BroadcastCalibration`, ingests
-   documents (chunk text WITH `DocLineage` — opinion id, cluster id,
-   span — persisted in the doc store's v2 `.bm25` format and returned by
-   `GetDocuments`) and vectors with aligned ids, and flushes under
-   `--out-dir` (default `/work/court-corpus/shards/`). Finishes with
-   sample hybrid cascade queries printing per-leg scores and lineage.
+### Static-embedding path (default for court)
 
-Court/date metadata join from the CSVs is deliberately out of scope
-(second pass); only opinion id + cluster id + span lineage is carried.
+The native sidecar serves Model2Vec-family static embeddings (distilled
+all-MiniLM-L6-v2, WordPiece layout, 256-dim) when started with
+`OPENNLP_EMBEDDINGS_DIR` (the binaries spawn it that way; an instance
+with the model lives at `/work/court-corpus/models/minilm-l6-v2-static`).
+Its sentence detection is NEWLINE-BASED, so "sentences" are
+paragraph-ish blocks with exact original-text offsets.
 
-Resume semantics: every stage is idempotent-safe — `court_chunks` skips
-processed input lines, `court_embed` skips already-embedded
-`(opinion_id, ordinal)` keys, and the ingest stage starts from whatever
-`chunks.ndjson` / `embeddings.bin` contain (`--limit` everywhere for
-slice runs).
+1. **Chunk + vector in one pass** (`court_chunks` v2): per opinion, ONE
+   Analyze (sentence detection + whitespace tokens + EmbeddingOptions
+   SOURCE_SENTENCES) returns per-block 256-dim vectors. `plan_chunks`
+   packs whole blocks to ~`--target-tokens` (256) and splits blocks over
+   `--hard-cap-tokens` (1024) at their own token boundaries via a solo
+   re-Analyze — never dropping text, so the CONTIGUITY INVARIANT holds
+   and is asserted per opinion (concatenated chunk texts reproduce
+   `plain_text` byte-for-byte). Packed-chunk vectors are the
+   token-weighted pool of the block vectors, L2-normalized: EXACT for a
+   mean-pooled static table (mean of concatenation = weighted mean of
+   block means) when weights are the analyzer's token counts, and
+   normalization matches the model's own `Normalize` stage (turbovec
+   scores true dot products, so vectors must be unit-length).
+   Outputs `chunks.ndjson` + `embeddings-static.bin`, both resumable.
+   Measured ~860 opinions/s (~9,000 chunks+vectors/s) — about 27x the
+   TEI embedding stage's ~326 chunks/s end-to-end.
+2. **Ingest** (`court_ingest`): unchanged mechanics — joins chunks and
+   embeddings on `(opinion_id, ordinal)`, contiguous blocks to N shards,
+   calibration fit + BroadcastCalibration, AddDocuments with `DocLineage`
+   + AddVectors with aligned ids, Flush (e.g.
+   `/work/court-corpus/shards-static/`). dim comes from the embeddings
+   file header (256 here, 1024 for TEI).
+
+Pooling honesty note: block embeddings are normalized WordPiece-subtoken
+means, while chunk weights are whitespace token counts, so pooled vs a
+direct whole-chunk embedding agrees at ~0.95 median cosine (measured
+min 0.86 / median 0.95 over 500 chunks) — not the theoretical 1.0,
+because subtoken counts are not exposed by the analysis API. All chunks
+share the same weighting, so scores stay mutually comparable.
+
+### TEI/bge-m3 path (quality runs)
+
+`court_embed` streams chunks through TEI (`tei-bge-m3` container, native
+gRPC `localhost:8095`, bge-m3 fp16, 1024d; vendored proto at
+`proto/tei/v1/tei.proto` from huggingface/text-embeddings-inference
+v1.9.3). `normalize=true`, `truncate=false` (the chunker bounds inputs
+well under TEI's 8192-token cap). Measured ~300 chunks/s (GPU-bound) —
+use it when bge-m3 quality matters more than ingest speed; the two
+vector families produce separate shard sets, never mixed.
+
+Court/date metadata join from the CSVs is out of scope (second pass);
+only opinion id + cluster id + span lineage is carried. Resume: every
+stage skips work already present (`--limit` everywhere for slices).
 
 ## Real-data shakedown (wikipedia bge-m3)
 
