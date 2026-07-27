@@ -36,11 +36,17 @@ struct Corpus {
 fn build_corpus() -> Corpus {
     let query = unit_vectors(1, DIM, 0xCA5C_0001);
     let fillers = unit_vectors(N, DIM, 0xCA5C_0002);
-    // V: near-query, comfortably above random fillers.
+    // V: near-query, comfortably above random fillers. The 0.85/0.15 mix
+    // keeps V clearly below the exact self-match under v5 (Hadamard)
+    // quantization: v5's approximate scores can reorder vectors whose true
+    // cosines are within ~0.001 of 1.0 (at 0.95/0.05, V outscored the
+    // self-match by ~0.0008 and fell OUTSIDE the intended boundary tie
+    // group). At 0.85/0.15 the margin is ~0.008, so A is top, the three
+    // V copies tie exactly at the k=2 boundary, and fillers sit far below.
     let mut v: Vec<f32> = query
         .iter()
         .zip(fillers[..DIM].iter())
-        .map(|(q, f)| 0.95 * q + 0.05 * f)
+        .map(|(q, f)| 0.85 * q + 0.15 * f)
         .collect();
     normalize(&mut v);
 
