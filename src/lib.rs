@@ -28,6 +28,7 @@ pub mod bm25;
 pub mod chunked;
 pub mod config;
 pub mod coordinator;
+pub mod fusion;
 pub mod harness;
 pub mod merge;
 pub mod node;
