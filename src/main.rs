@@ -1,4 +1,8 @@
-//! turbovec-search binary: one process, one or both roles.
+//! turbovec-search binary: one process, one or both roles, one or more
+//! shards.
+//!
+//! Configuration: `--config cluster.toml` (TOML file) with `TURBOVEC_*`
+//! env overrides and `--key=value` flags on top (see `src/config.rs`).
 //!
 //! Examples:
 //!
@@ -8,58 +12,29 @@
 //! turbovec-search --role=both --demo-vectors=20000 \
 //!     --nodes=127.0.0.1:50051 --demo-query
 //!
-//! # A real shard node over a persisted .tv index.
-//! turbovec-search --role=node --index=/data/shard-0.tv \
-//!     --slot-offset=0 --node-listen=0.0.0.0:50051
-//!
-//! # A coordinator over three nodes.
-//! turbovec-search --role=coordinator --coord-listen=0.0.0.0:50050 \
-//!     --nodes=node0:50051,node1:50051,node2:50051
+//! # Static two-machine cluster (see README "Two-machine runbook").
+//! # host-a:    turbovec-search --config /etc/turbovec/host-a.toml
+//! # krick-1:   turbovec-search --config /etc/turbovec/krick-1.toml
 //! ```
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use turbovec::TurboQuantIndex;
-use turbovec_search::config::{parse, Config, DemoConfig, Role};
+use turbovec_search::config::{parse, Config, DemoConfig, Role, ShardConfig};
 use turbovec_search::coordinator::CoordinatorServiceImpl;
+use turbovec_search::harness;
 use turbovec_search::node::{NodeConfig, NodeServiceImpl};
-use turbovec_search::pb::node_service_server::NodeServiceServer;
 use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::search_service_server::SearchServiceServer;
 use turbovec_search::pb::SearchRequest;
-
-/// Deterministic pseudo-random unit vectors (LCG + normalize) for the demo
-/// corpus. Fixed seed so demo runs are reproducible.
-fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
-    let mut out = vec![0.0f32; n * dim];
-    for row in out.chunks_mut(dim) {
-        let mut norm = 0.0f64;
-        for x in row.iter_mut() {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let v = ((s >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
-            *x = v as f32;
-            norm += v * v;
-        }
-        let inv = 1.0 / (norm.sqrt() + 1e-9);
-        for x in row.iter_mut() {
-            *x = (*x as f64 * inv) as f32;
-        }
-    }
-    out
-}
 
 /// Build a demo index: fit TQ+ calibration on a 20% sample (min 1024
 /// vectors), then construct the real index seeded with it — the same flow a
 /// multi-shard deployment uses to keep shard scores comparable.
 fn build_demo_index(demo: DemoConfig) -> Result<TurboQuantIndex, String> {
-    let corpus = unit_vectors(demo.vectors, demo.dim, 0xDE10_0001);
+    let corpus = harness::unit_vectors(demo.vectors, demo.dim, 0xDE10_0001);
     let sample_n = (demo.vectors / 5).max(1).min(demo.vectors);
     let mut fitting = TurboQuantIndex::new(demo.dim, demo.bit_width)
         .map_err(|e| format!("demo index construct: {e}"))?;
@@ -74,15 +49,15 @@ fn build_demo_index(demo: DemoConfig) -> Result<TurboQuantIndex, String> {
     Ok(index)
 }
 
-fn load_index(cfg: &Config) -> Result<Arc<TurboQuantIndex>, String> {
-    if let Some(demo) = cfg.demo {
+fn load_shard_index(shard: &ShardConfig) -> Result<Arc<TurboQuantIndex>, String> {
+    if let Some(demo) = shard.demo {
         eprintln!(
             "building demo index: {} vectors x dim {} @ {} bits",
             demo.vectors, demo.dim, demo.bit_width
         );
         return build_demo_index(demo).map(Arc::new);
     }
-    let path = cfg
+    let path = shard
         .index_path
         .as_ref()
         .expect("config validated an index source");
@@ -91,47 +66,38 @@ fn load_index(cfg: &Config) -> Result<Arc<TurboQuantIndex>, String> {
     Ok(Arc::new(index))
 }
 
-async fn serve(
-    listener: TcpListener,
-    server: tonic::transport::server::Router,
-) -> Result<(), tonic::transport::Error> {
-    server
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let demo_query = argv.iter().any(|a| a == "--demo-query");
-    let cfg = parse(&argv)?;
-
+async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::new();
 
     if matches!(cfg.role, Role::Node | Role::Both) {
-        let index = load_index(&cfg)?;
-        eprintln!(
-            "node: {} vectors, dim {:?}, {} bits, slot offset {}",
-            index.len(),
-            index.dim_opt(),
-            index.bit_width(),
-            cfg.slot_offset
-        );
-        let listener = TcpListener::bind(cfg.node_listen).await?;
-        let addr: SocketAddr = listener.local_addr()?;
-        let node = NodeServiceImpl::new(
-            index,
-            NodeConfig {
-                slot_offset: cfg.slot_offset,
-                chunk_blocks: cfg.chunk_blocks,
-                share_floors: cfg.share_floors,
-            },
-        );
-        eprintln!("NodeService listening on {addr}");
-        handles.push(tokio::spawn(serve(
-            listener,
-            Server::builder().add_service(NodeServiceServer::new(node)),
-        )));
+        for shard in &cfg.shards {
+            let index = load_shard_index(shard)?;
+            eprintln!(
+                "shard @{}: {} vectors, dim {:?}, {} bits, slot offset {}",
+                shard.listen,
+                index.len(),
+                index.dim_opt(),
+                index.bit_width(),
+                shard.slot_offset
+            );
+            let listener = TcpListener::bind(shard.listen).await?;
+            let addr: SocketAddr = listener.local_addr()?;
+            let node = NodeServiceImpl::new(
+                index,
+                NodeConfig {
+                    slot_offset: shard.slot_offset,
+                    chunk_blocks: cfg.chunk_blocks,
+                    share_floors: cfg.share_floors,
+                },
+            );
+            eprintln!("NodeService listening on {addr}");
+            let max = cfg.max_message_bytes;
+            handles.push(tokio::spawn(
+                Server::builder()
+                    .add_service(NodeServiceImpl::into_server(node, max))
+                    .serve_with_incoming(harness::nodelay_incoming(listener)),
+            ));
+        }
     }
 
     if matches!(cfg.role, Role::Coordinator | Role::Both) {
@@ -142,16 +108,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "SearchService listening on {addr} ({} shard nodes)",
             cfg.node_addrs.len()
         );
-        handles.push(tokio::spawn(serve(
-            listener,
-            Server::builder().add_service(SearchServiceServer::new(coordinator)),
-        )));
+        let max = cfg.max_message_bytes;
+        handles.push(tokio::spawn(
+            Server::builder()
+                .add_service(CoordinatorServiceImpl::into_server(coordinator, max))
+                .serve_with_incoming(harness::nodelay_incoming(listener)),
+        ));
     }
 
-    if demo_query {
-        let query = unit_vectors(1, cfg.demo.map(|d| d.dim).unwrap_or(128), 0x0E0E_0001);
+    if cfg.demo_query {
+        let query = harness::unit_vectors(1, cfg.query_dim, 0x0E0E_0001);
         let endpoint = format!("http://127.0.0.1:{}", cfg.coord_listen.port());
-        let mut client = SearchServiceClient::connect(endpoint).await?;
+        let mut client = SearchServiceClient::connect(endpoint)
+            .await?
+            .max_decoding_message_size(cfg.max_message_bytes)
+            .max_encoding_message_size(cfg.max_message_bytes);
         let response = client
             .search(SearchRequest {
                 request_id: String::new(),
@@ -174,4 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle.await??;
     }
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cfg = parse(&argv)?;
+    run(cfg).await
 }

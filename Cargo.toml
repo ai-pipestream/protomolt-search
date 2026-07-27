@@ -9,6 +9,8 @@ description = "Distributed top-k search over turbovec shard indexes with collabo
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream" }
 tonic = "0.12"
 prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 
