@@ -275,6 +275,39 @@ stemmers are case-sensitive on the token surface form exactly as its proto
 documents; the mock would have lowercased it. Offsets slice the original
 surface forms out of the stored text (`"running"`, `"foxes"`).
 
+## Real-data shakedown (wikipedia bge-m3)
+
+`src/bin/wiki_shakedown.rs` ingests a REAL corpus end-to-end: the
+bge-m3 embeddings + Simple English Wikipedia sentence pairs from the
+earlier Lucene/OpenSearch distributed testing
+(`/work/opensearch-grpc-knn/distributed_test_data/wikipedia/`, not
+copied into this repo). Format: per part, a `.bin` of big-endian
+`i32 count | i32 dim | count × dim f32` (61077 x 1024 per part, 4
+parts) plus a one-sentence-per-line text file. The text files have no
+trailing newline, so `wc -l` says 61076; the final newline-less segment
+is a record (parser asserts exact vector/text pairing).
+
+The 4 parts are the pre-existing shard partitioning: part N goes to
+shard N, doc id `N * 61077 + index`. The run:
+
+```bash
+cargo run --release --bin wiki_shakedown   # --data-dir, --out-dir, --sidecar-port
+```
+
+loads the parts, fits calibration on a sample, pushes it to every shard
+with `BroadcastCalibration`, starts the REAL native analysis sidecar
+(falls back to the in-repo mock with a loud warning), ingests documents
+(AddDocuments, PORTER stems) and vectors (AddVectors) with aligned ids,
+persists `.tv` + `.bm25` under `--out-dir` for the later two-machine
+run, and runs hybrid cascade queries, printing per-leg scores and top
+hit texts. Eyeball: the probe doc ranks first by vector score (self
+match), BM25-rich siblings outrank vector-only neighbors, and query
+terms slice correctly out of the stored text.
+
+dim=1024 is just config (the parser reads it from the header). The ULP
+caveat from `tests/score_layout.rs` applies: raw vector scores are
+bit-exact only within same-shape kernel paths.
+
 ## Hybrid search: cascade (default), global-rank RRF, two-level RRF
 
 `SearchService.HybridSearch{text, vector, k, analysis, legs}` offers
