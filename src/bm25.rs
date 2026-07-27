@@ -7,7 +7,7 @@
 //! coordinator's summed globals). The shard-local share of those stats
 //! lives on [`crate::postings::Bm25Store`] and is exposed via TermStats.
 
-use crate::postings::{Bm25Store, Posting};
+use crate::postings::{Bm25Index, Posting};
 
 /// Default BM25 k1 (term-frequency saturation).
 pub const DEFAULT_K1: f64 = 1.2;
@@ -102,7 +102,7 @@ pub struct ScoredDoc {
 /// walk. Returns one [`ScoredDoc`] per candidate that scored above zero,
 /// doc id ascending.
 pub fn score_candidates(
-    store: &Bm25Store,
+    store: &dyn Bm25Index,
     terms: &[String],
     stats: &CorpusStats,
     params: Bm25Params,
@@ -116,43 +116,34 @@ pub fn score_candidates(
 
     let mut docs: Vec<ScoredDoc> = Vec::new();
     for (ti, term) in terms.iter().enumerate() {
-        let Some(postings) = store.postings(term) else {
-            continue;
-        };
         if stats.dfs[ti] == 0 {
             continue;
         }
         let idf = idf(stats.doc_count, stats.dfs[ti]);
-        // Merge-join: both lists ascending by doc id.
-        let (mut ci, mut pi) = (0, 0);
-        while ci < candidates.len() && pi < postings.len() {
-            let c = candidates[ci];
-            let p = postings[pi].doc_id;
-            match c.cmp(&p) {
-                std::cmp::Ordering::Less => ci += 1,
-                std::cmp::Ordering::Greater => pi += 1,
-                std::cmp::Ordering::Equal => {
-                    let posting = &postings[pi];
-                    let contribution =
-                        idf * tf_norm(params, posting.tf, store.doc_length(p), avgdl);
-                    let entry = match docs.iter_mut().find(|d| d.doc_id == p) {
-                        Some(d) => d,
-                        None => {
-                            docs.push(ScoredDoc {
-                                doc_id: p,
-                                score: 0.0,
-                                term_offsets: Vec::new(),
-                            });
-                            docs.last_mut().expect("just pushed")
-                        }
-                    };
-                    entry.score += contribution;
-                    entry.term_offsets.push((ti, posting.offsets.clone()));
-                    ci += 1;
-                    pi += 1;
-                }
+        // Merge-join: postings stream ascending by doc id; a cursor per
+        // term walks the sorted candidates.
+        let mut ci = 0usize;
+        store.for_each_posting(term, &mut |doc_id, tf, offsets| {
+            while ci < candidates.len() && candidates[ci] < doc_id {
+                ci += 1;
             }
-        }
+            if ci < candidates.len() && candidates[ci] == doc_id {
+                let contribution = idf * tf_norm(params, tf, store.doc_length(doc_id), avgdl);
+                let entry = match docs.iter_mut().find(|d| d.doc_id == doc_id) {
+                    Some(d) => d,
+                    None => {
+                        docs.push(ScoredDoc {
+                            doc_id,
+                            score: 0.0,
+                            term_offsets: Vec::new(),
+                        });
+                        docs.last_mut().expect("just pushed")
+                    }
+                };
+                entry.score += contribution;
+                entry.term_offsets.push((ti, offsets.to_vec()));
+            }
+        });
     }
     docs
 }
@@ -160,7 +151,7 @@ pub fn score_candidates(
 /// Score `terms` over the shard's postings with the supplied (global)
 /// stats; return the top-k, score descending, ties by ascending doc id.
 pub fn top_k(
-    store: &Bm25Store,
+    store: &dyn Bm25Index,
     terms: &[String],
     stats: &CorpusStats,
     params: Bm25Params,
@@ -173,19 +164,21 @@ pub fn top_k(
     let mut scores: std::collections::HashMap<u32, (f64, TermHits)> =
         std::collections::HashMap::new();
     for (ti, term) in terms.iter().enumerate() {
-        let Some(postings) = store.postings(term) else {
-            continue;
-        };
         if stats.dfs[ti] == 0 {
             continue;
         }
-        for posting in postings {
-            let doc_len = store.doc_length(posting.doc_id);
-            let contribution = score_posting(params, stats, ti, posting, doc_len);
-            let entry = scores.entry(posting.doc_id).or_default();
+        store.for_each_posting(term, &mut |doc_id, tf, offsets| {
+            let doc_len = store.doc_length(doc_id);
+            let posting = Posting {
+                doc_id,
+                tf,
+                offsets: offsets.to_vec(),
+            };
+            let contribution = score_posting(params, stats, ti, &posting, doc_len);
+            let entry = scores.entry(doc_id).or_default();
             entry.0 += contribution;
-            entry.1.push((ti, posting.offsets.clone()));
-        }
+            entry.1.push((ti, posting.offsets));
+        });
     }
     let mut docs: Vec<ScoredDoc> = scores
         .into_iter()
@@ -228,7 +221,7 @@ pub fn merge_stats(shares: &[(u64, u64, Vec<u32>)]) -> CorpusStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::postings::AnalyzedDoc;
+    use crate::postings::{AnalyzedDoc, Bm25Store};
 
     /// Hand-computed BM25 on a 3-doc corpus (N=3, avgdl=3):
     /// doc0 "rust rust search", doc1 "rust vector vector", doc2 "search".
