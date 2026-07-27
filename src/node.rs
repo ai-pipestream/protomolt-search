@@ -22,14 +22,19 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use turbovec::TurboQuantIndex;
 
+use crate::bm25::{self, Bm25Params};
 use crate::chunked::{chunked_topk, DEFAULT_CHUNK_BLOCKS};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
-    search_shard_request, search_shard_response, AddVectorsRequest, AddVectorsResponse,
+    search_shard_request, search_shard_response, AddDocumentsRequest, AddDocumentsResponse,
+    AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse,
     FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest, GetCalibrationResponse,
-    ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
-    SetCalibrationResponse, ShardScanStats, StartShardSearch,
+    GetDocumentsRequest, GetDocumentsResponse, OffsetSpan, ScoredHit, SearchShardDone,
+    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse,
+    ShardScanStats, StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest,
+    TermStatsResponse,
 };
+use crate::postings::Bm25Store;
 
 /// How a node scans and whether it participates in floor sharing.
 #[derive(Debug, Clone)]
@@ -49,6 +54,9 @@ pub struct NodeConfig {
     /// Persistence target for `Flush` / save-on-shutdown. `None` makes the
     /// shard purely in-memory (flush is a no-op).
     pub index_path: Option<PathBuf>,
+    /// Analysis sidecar address (`http://host:port`) for AddDocuments.
+    /// `None` makes AddDocuments fail UNAVAILABLE.
+    pub analysis_addr: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -59,16 +67,32 @@ impl Default for NodeConfig {
             share_floors: true,
             bit_width: 4,
             index_path: None,
+            analysis_addr: None,
         }
     }
+}
+
+/// The shard's two indexes behind one lock: the turbovec vector index and
+/// the BM25 postings store. Either may be absent (vector-only shards,
+/// docs-only shards, from-scratch shards).
+#[derive(Default)]
+struct ShardState {
+    index: Option<TurboQuantIndex>,
+    bm25: Option<Bm25Store>,
+}
+
+/// The persistence path of a shard's BM25 store: `<index path>.bm25`.
+pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".bm25");
+    PathBuf::from(p)
 }
 
 /// The shard-owner gRPC service. Cheap to clone (state is shared).
 #[derive(Clone)]
 pub struct NodeServiceImpl {
-    /// `None` until the shard has an index (loaded, seeded via
-    /// `SetCalibration`, or constructed by the first `AddVectors` batch).
-    state: Arc<RwLock<Option<TurboQuantIndex>>>,
+    /// Locked shard state; see [`ShardState`].
+    state: Arc<RwLock<ShardState>>,
     config: NodeConfig,
 }
 
@@ -76,9 +100,15 @@ impl NodeServiceImpl {
     /// Wrap an optional preloaded index in a node service.
     pub fn new(index: Option<TurboQuantIndex>, config: NodeConfig) -> Self {
         Self {
-            state: Arc::new(RwLock::new(index)),
+            state: Arc::new(RwLock::new(ShardState { index, bm25: None })),
             config,
         }
+    }
+
+    /// Attach a preloaded BM25 store (loaded from `<index path>.bm25`).
+    pub fn with_bm25(self, store: Option<Bm25Store>) -> Self {
+        self.state.write().expect("shard state lock poisoned").bm25 = store;
+        self
     }
 
     /// Build the tonic server for this service with explicit message size
@@ -118,27 +148,33 @@ impl NodeServiceImpl {
     /// `Flush` RPC and save-on-shutdown in the binary.
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let guard = self.state.read().expect("shard state lock poisoned");
-        let Some(index) = guard.as_ref() else {
-            return Ok(FlushResponse {
-                path: String::new(),
-                num_vectors: 0,
-                written: false,
-            });
-        };
+        let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
+        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let Some(path) = self.config.index_path.clone() else {
             return Ok(FlushResponse {
                 path: String::new(),
-                num_vectors: index.len() as u64,
+                num_vectors,
+                num_documents,
                 written: false,
             });
         };
-        index
-            .write(&path)
-            .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
+        if let Some(index) = guard.index.as_ref() {
+            index
+                .write(&path)
+                .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
+        }
+        if let Some(store) = guard.bm25.as_ref() {
+            let bm25_path = bm25_sidecar_path(&path);
+            store
+                .save(&bm25_path)
+                .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
+        }
+        let written = guard.index.is_some() || guard.bm25.is_some();
         Ok(FlushResponse {
             path: path.display().to_string(),
-            num_vectors: index.len() as u64,
-            written: true,
+            num_vectors,
+            num_documents,
+            written,
         })
     }
 
@@ -151,7 +187,7 @@ impl NodeServiceImpl {
                 .map_err(|e| Status::invalid_argument(format!("invalid calibration: {e}")))
         };
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        match guard.as_ref() {
+        match guard.index.as_ref() {
             Some(index) if !index.is_empty() => Err(Status::failed_precondition(format!(
                 "shard holds {} vectors; calibration is locked for the index lifetime",
                 index.len()
@@ -171,11 +207,11 @@ impl NodeServiceImpl {
                     ));
                 }
                 // Empty, unseeded index: replace with the seeded one.
-                *guard = Some(build()?);
+                guard.index = Some(build()?);
                 Ok(false)
             }
             None => {
-                *guard = Some(build()?);
+                guard.index = Some(build()?);
                 Ok(false)
             }
         }
@@ -188,7 +224,7 @@ impl NodeServiceImpl {
             return Ok((0, 0));
         }
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        let known_dim = guard.as_ref().and_then(|i| i.dim_opt());
+        let known_dim = guard.index.as_ref().and_then(|i| i.dim_opt());
         let dim = if batch.dim != 0 {
             let d = batch.dim as usize;
             if let Some(known) = known_dim {
@@ -217,17 +253,17 @@ impl NodeServiceImpl {
                 "invalid input value at vector {vi}, coord {ci}: {v}"
             )));
         }
-        let index = match guard.as_mut() {
+        let index = match guard.index.as_mut() {
             Some(index) => index,
             None => {
                 // From-scratch, unseeded: turbovec fits calibration from
                 // this first batch. Seeded deployment is the SetCalibration
                 // path; this exists for single-shard convenience.
-                *guard = Some(
+                guard.index = Some(
                     TurboQuantIndex::new(dim, self.config.bit_width)
                         .map_err(|e| Status::invalid_argument(format!("{e}")))?,
                 );
-                guard.as_mut().expect("just constructed")
+                guard.index.as_mut().expect("just constructed")
             }
         };
         let first_id = self.config.slot_offset + index.len() as u64;
@@ -309,7 +345,7 @@ impl NodeService for NodeServiceImpl {
                 // (write lock) never interleave with a scan, so a search
                 // sees one consistent index snapshot.
                 let guard = state.read().expect("shard state lock poisoned");
-                let index = guard.as_ref().ok_or_else(|| {
+                let index = guard.index.as_ref().ok_or_else(|| {
                     Status::failed_precondition(
                         "shard has no index yet (set calibration or add vectors)",
                     )
@@ -391,7 +427,7 @@ impl NodeService for NodeServiceImpl {
         _request: Request<GetCalibrationRequest>,
     ) -> Result<Response<GetCalibrationResponse>, Status> {
         let guard = self.state.read().expect("shard state lock poisoned");
-        let (dim, bit_width, num_vectors, shift, scale) = match guard.as_ref() {
+        let (dim, bit_width, num_vectors, shift, scale) = match guard.index.as_ref() {
             Some(index) => {
                 let (shift, scale) = index
                     .calibration()
@@ -446,6 +482,7 @@ impl NodeService for NodeServiceImpl {
             .state
             .read()
             .expect("shard state lock poisoned")
+            .index
             .as_ref()
             .map_or(0, |i| i.len() as u64);
         Ok(Response::new(AddVectorsResponse {
@@ -464,5 +501,147 @@ impl NodeService for NodeServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("flush task failed: {e}")))?
             .map(Response::new)
+    }
+
+    async fn add_documents(
+        &self,
+        request: Request<Streaming<AddDocumentsRequest>>,
+    ) -> Result<Response<AddDocumentsResponse>, Status> {
+        let addr = self.config.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
+        })?;
+        let mut inbound = request.into_inner();
+        let mut added = 0u64;
+        let mut first_id = 0u64;
+        while let Some(doc) = inbound.message().await? {
+            let analyzed =
+                crate::analyzer::analyze_document(&addr, &doc.text, doc.analysis.as_ref()).await?;
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            // Shared positional id space with the vector side: the next id
+            // is past both indexes' tips.
+            let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
+            let store = guard.bm25.get_or_insert_with(Bm25Store::new);
+            let doc_id = vector_tip.max(store.next_doc_id());
+            if added == 0 {
+                first_id = self.config.slot_offset + u64::from(doc_id);
+            }
+            store.add_document(doc_id, doc.text, analyzed);
+            added += 1;
+        }
+        let total = self
+            .state
+            .read()
+            .expect("shard state lock poisoned")
+            .bm25
+            .as_ref()
+            .map_or(0, |b| b.doc_count());
+        Ok(Response::new(AddDocumentsResponse {
+            added,
+            total,
+            first_id,
+        }))
+    }
+
+    async fn term_stats(
+        &self,
+        request: Request<TermStatsRequest>,
+    ) -> Result<Response<TermStatsResponse>, Status> {
+        let req = request.into_inner();
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let (doc_count, total_doc_length, doc_frequencies) = match guard.bm25.as_ref() {
+            Some(store) => (
+                store.doc_count(),
+                store.total_doc_length(),
+                req.terms
+                    .iter()
+                    .map(|t| store.postings(t).map_or(0, |p| p.len() as u32))
+                    .collect(),
+            ),
+            None => (0, 0, req.terms.iter().map(|_| 0).collect()),
+        };
+        Ok(Response::new(TermStatsResponse {
+            doc_count,
+            total_doc_length,
+            doc_frequencies,
+        }))
+    }
+
+    async fn bm25_query(
+        &self,
+        request: Request<Bm25QueryRequest>,
+    ) -> Result<Response<Bm25QueryResponse>, Status> {
+        let req = request.into_inner();
+        let params = Bm25Params {
+            k1: if req.k1 == 0.0 {
+                bm25::DEFAULT_K1
+            } else {
+                f64::from(req.k1)
+            },
+            b: if req.b == 0.0 {
+                bm25::DEFAULT_B
+            } else {
+                f64::from(req.b)
+            },
+        };
+        let stats = bm25::CorpusStats {
+            doc_count: req.global_doc_count,
+            total_doc_length: req.global_total_doc_length,
+            dfs: req.global_doc_frequencies.clone(),
+        };
+        if req.terms.len() != stats.dfs.len() {
+            return Err(Status::invalid_argument(
+                "terms and global_doc_frequencies must have the same length",
+            ));
+        }
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let hits = match guard.bm25.as_ref() {
+            Some(store) if req.k > 0 => {
+                bm25::top_k(store, &req.terms, &stats, params, req.k as usize)
+                    .into_iter()
+                    .map(|doc| Bm25Hit {
+                        doc_id: self.config.slot_offset + u64::from(doc.doc_id),
+                        score: doc.score as f32,
+                        terms: doc
+                            .term_offsets
+                            .into_iter()
+                            .map(|(ti, offsets)| TermOccurrences {
+                                term: req.terms[ti].clone(),
+                                offsets: offsets
+                                    .into_iter()
+                                    .map(|(start, end)| OffsetSpan { start, end })
+                                    .collect(),
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        Ok(Response::new(Bm25QueryResponse { hits }))
+    }
+
+    async fn get_documents(
+        &self,
+        request: Request<GetDocumentsRequest>,
+    ) -> Result<Response<GetDocumentsResponse>, Status> {
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let mut documents = Vec::new();
+        if let Some(store) = guard.bm25.as_ref() {
+            for id in req.doc_ids {
+                if id < offset {
+                    continue;
+                }
+                let local = (id - offset) as u32;
+                if let Some(text) = store.text(local) {
+                    documents.push(StoredDocument {
+                        doc_id: id,
+                        text: text.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(Response::new(GetDocumentsResponse { documents }))
     }
 }

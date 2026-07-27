@@ -8,13 +8,14 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::bm25::{self, Bm25Params, CorpusStats};
 use crate::merge::{merge_topk, FloorTracker};
 use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
-    search_shard_request, search_shard_response, FloorUpdate, ScoredHit, SearchRequest,
-    SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse, ShardScanStats,
-    StartShardSearch,
+    search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25SearchRequest,
+    Bm25SearchResponse, FloorUpdate, ScoredHit, SearchRequest, SearchResponse, SearchShardDone,
+    SearchShardRequest, SearchShardResponse, ShardScanStats, StartShardSearch, TermStatsRequest,
 };
 
 /// Process-unique request id counter for coordinator-assigned ids.
@@ -32,13 +33,126 @@ pub struct CoordinatorServiceImpl {
     /// Node addresses in `http://host:port` form, in stable shard order
     /// (index in this list is the shard index used for tie-breaking).
     node_addrs: Vec<String>,
+    /// Analysis sidecar address for query analysis in Bm25Search.
+    analysis_addr: Option<String>,
+    /// BM25 tuning sent to every shard (identical scoring everywhere).
+    bm25_params: Bm25Params,
 }
 
 impl CoordinatorServiceImpl {
     /// A coordinator over the given shard nodes (fan-out order = shard
     /// index for merge tie-breaks).
     pub fn new(node_addrs: Vec<String>) -> Self {
-        Self { node_addrs }
+        Self {
+            node_addrs,
+            analysis_addr: None,
+            bm25_params: Bm25Params::default(),
+        }
+    }
+
+    /// Configure the BM25 path: analysis sidecar for query analysis and
+    /// the scoring parameters every shard is told to use.
+    pub fn with_bm25(mut self, analysis_addr: Option<String>, params: Bm25Params) -> Self {
+        self.analysis_addr = analysis_addr;
+        self.bm25_params = params;
+        self
+    }
+
+    /// Distributed BM25 with the two-phase global-stats flow (see the
+    /// proto comments on `SearchService.Bm25Search`).
+    pub async fn fanout_bm25(
+        &self,
+        text: &str,
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+    ) -> Result<Vec<Bm25Hit>, Status> {
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+        })?;
+        // (a) Query analysis with the SAME options as ingest: query terms
+        // share identity with indexed terms (stems when SOURCE_STEMS).
+        let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+        let mut terms: Vec<String> = Vec::new();
+        for (term, _, _) in analyzed.terms {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+        if terms.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // (b) TermStats fan-out: each shard's share of the corpus stats.
+        let mut share_tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let node = node.clone();
+            let terms = terms.clone();
+            share_tasks.push(tokio::spawn(async move {
+                let mut client = NodeServiceClient::connect(node.clone())
+                    .await
+                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
+                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+                client
+                    .term_stats(TermStatsRequest { terms })
+                    .await
+                    .map(|r| r.into_inner())
+            }));
+        }
+        let mut shares = Vec::with_capacity(share_tasks.len());
+        for task in share_tasks {
+            let stats = task
+                .await
+                .map_err(|e| Status::internal(format!("term stats task failed: {e}")))??;
+            shares.push((
+                stats.doc_count,
+                stats.total_doc_length,
+                stats.doc_frequencies,
+            ));
+        }
+        let global: CorpusStats = bm25::merge_stats(&shares);
+
+        // (c) Bm25Query fan-out with the GLOBAL stats: every shard scores
+        // identically, so (d) the merge is a straight top-k.
+        let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let node = node.clone();
+            let request = Bm25QueryRequest {
+                terms: terms.clone(),
+                k,
+                global_doc_count: global.doc_count,
+                global_total_doc_length: global.total_doc_length,
+                global_doc_frequencies: global.dfs.clone(),
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
+            };
+            query_tasks.push(tokio::spawn(async move {
+                let mut client = NodeServiceClient::connect(node.clone())
+                    .await
+                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
+                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+                client
+                    .bm25_query(request)
+                    .await
+                    .map(|r| (shard as u32, r.into_inner().hits))
+            }));
+        }
+        let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        for task in query_tasks {
+            let (shard, hits) = task
+                .await
+                .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            all.extend(hits.into_iter().map(|h| (shard, h)));
+        }
+        all.sort_by(|(sa, a), (sb, b)| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| sa.cmp(sb))
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        all.truncate(k as usize);
+        Ok(all.into_iter().map(|(_, h)| h).collect())
     }
 
     /// Build the tonic server for this service with explicit message size
@@ -223,5 +337,16 @@ impl SearchService for CoordinatorServiceImpl {
             request_id,
             hits: result.hits,
         }))
+    }
+
+    async fn bm25_search(
+        &self,
+        request: Request<Bm25SearchRequest>,
+    ) -> Result<Response<Bm25SearchResponse>, Status> {
+        let req = request.into_inner();
+        let hits = self
+            .fanout_bm25(&req.text, req.k, req.analysis.as_ref())
+            .await?;
+        Ok(Response::new(Bm25SearchResponse { hits }))
     }
 }

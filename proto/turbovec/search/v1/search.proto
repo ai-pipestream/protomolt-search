@@ -87,6 +87,41 @@ service NodeService {
   // with the same config comes back with all ingested vectors. On a shard
   // with no persistence path configured this is a no-op (`written=false`).
   rpc Flush(FlushRequest) returns (FlushResponse);
+
+  // Ingests raw-text documents into the shard's BM25 postings index.
+  // Client-streaming, one document per message. For each document the node
+  // calls the configured analysis sidecar (Analyze, term vectors in
+  // MODE_FULL so occurrence offsets survive) and builds postings from the
+  // returned terms: term identity, frequency, and occurrence spans in
+  // ORIGINAL text coordinates. The raw text is stored in the shard's doc
+  // store (the highlight source, read via GetDocuments).
+  //
+  // Doc ids are SERVER-ASSIGNED and share the shard's positional id space
+  // with ingested vectors: the next id is max(vectors, documents) so the
+  // vector side can later attach the same id. Global id = slot_offset +
+  // local id, as everywhere else.
+  //
+  // Fails UNAVAILABLE when the shard has no analysis sidecar configured,
+  // INVALID_ARGUMENT on empty or oversized text.
+  rpc AddDocuments(stream AddDocumentsRequest) returns (AddDocumentsResponse);
+
+  // Returns this shard's per-term document frequencies and corpus stats —
+  // phase (b) of the distributed BM25 flow. The coordinator sums these
+  // across all shards to build the GLOBAL stats every shard then scores
+  // with (see Bm25Query), which is what makes BM25 scores comparable
+  // across shards.
+  rpc TermStats(TermStatsRequest) returns (TermStatsResponse);
+
+  // Scores BM25 for the given query terms against this shard's postings,
+  // using the GLOBAL corpus stats supplied by the coordinator (never
+  // shard-local stats — that would make scores incomparable). k1/b of 0
+  // select the defaults (1.2 / 0.75). Returns the shard's local top-k.
+  rpc Bm25Query(Bm25QueryRequest) returns (Bm25QueryResponse);
+
+  // Reads raw document texts from the shard's doc store (the highlight
+  // source). Ids are global; ids outside this shard's range or with no
+  // stored text are simply absent from the response.
+  rpc GetDocuments(GetDocumentsRequest) returns (GetDocumentsResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
@@ -95,6 +130,18 @@ service SearchService {
   // lists into one global top-k (score descending; ties broken by shard
   // index, then vector id), and returns it.
   rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Distributed BM25 over the shards' postings. Flow:
+  //   1. the coordinator analyzes `text` with the sidecar using the SAME
+  //      analysis options, producing the query terms (stem identity when
+  //      SOURCE_STEMS is configured, exactly as at ingest);
+  //   2. TermStats fan-out: per-shard df + doc count + total doc length;
+  //   3. the coordinator sums them into GLOBAL stats and sends them back
+  //      with Bm25Query, so every shard scores with identical idf/avgdl;
+  //   4. shard hits merge into the global top-k (score desc, shard, doc id).
+  // Hits carry per-term occurrence offsets in original-text coordinates;
+  // fetch the raw text with NodeService.GetDocuments to highlight.
+  rpc Bm25Search(Bm25SearchRequest) returns (Bm25SearchResponse);
 }
 
 // One message on the client-to-server leg of `SearchShard`. The first
@@ -259,6 +306,9 @@ message FlushResponse {
   // a no-op, not an error — a purely in-memory shard is a legitimate
   // configuration).
   bool written = 3;
+  // Documents in the flushed BM25 postings store (0 when the shard has no
+  // postings).
+  uint64 num_documents = 4;
 }
 
 // Client-facing search request.
@@ -280,4 +330,149 @@ message SearchResponse {
   // id. Fewer than k entries when the whole corpus holds fewer than k
   // vectors.
   repeated ScoredHit hits = 2;
+}
+
+// Passthrough for the analysis sidecar's pipeline options (vendored proto
+// ai.pipestream.opennlp.analysis.v1). Values are the NUMERIC values of the
+// sidecar's enums; 0 always means "sidecar default". Mirroring the enums
+// here would just duplicate the vendored definitions.
+message AnalysisSpec {
+  // AnalysisOptions.Tokenizer value (1 = WHITESPACE, 2 = SIMPLE).
+  int32 tokenizer = 1;
+  // AnalysisOptions.Stemmer value (1 = NONE, 2 = PORTER, ...). Required to
+  // be non-NONE when term_vector_source selects stems.
+  int32 stemmer = 2;
+  // TermVectorOptions.Mode value (1 = FULL with offsets, 2 = SCORING_ONLY).
+  int32 term_vector_mode = 3;
+  // TermVectorOptions.Source value (1 = TOKENS, 2 = STEMS). Ingest and
+  // query MUST use the same source or term identities will not match.
+  int32 term_vector_source = 4;
+  // TermVectorOptions.NormalizerRung values for term identity (ignored
+  // when source is STEMS).
+  repeated int32 normalizer_rungs = 5;
+}
+
+// One document on the `AddDocuments` stream.
+message AddDocumentsRequest {
+  // Raw document text. Non-empty, at most 1 MiB (the sidecar's cap).
+  string text = 1;
+  // Analysis options for this document. Absent = sidecar defaults with
+  // term vectors in MODE_FULL over TOKENS.
+  AnalysisSpec analysis = 2;
+}
+
+// Terminal response of an `AddDocuments` stream.
+message AddDocumentsResponse {
+  // Documents ingested over this stream.
+  uint64 added = 1;
+  // Total documents in the shard's postings after the stream.
+  uint64 total = 2;
+  // Global doc id assigned to the first document of this stream.
+  uint64 first_id = 3;
+}
+
+// Phase (b) of the distributed BM25 flow: stats for these query terms.
+message TermStatsRequest {
+  // Query terms (exact identity: stems when ingest used SOURCE_STEMS).
+  repeated string terms = 1;
+}
+
+// This shard's share of the global BM25 corpus stats.
+message TermStatsResponse {
+  // Documents in this shard's postings.
+  uint64 doc_count = 1;
+  // Sum of document lengths (in terms) over the shard.
+  uint64 total_doc_length = 2;
+  // Document frequency per requested term, parallel to `terms`.
+  repeated uint32 doc_frequencies = 3;
+}
+
+// Phase (c) of the distributed BM25 flow: score with GLOBAL stats.
+message Bm25QueryRequest {
+  // Query terms (same identity as TermStatsRequest.terms).
+  repeated string terms = 1;
+  // Number of top hits this shard must return.
+  uint32 k = 2;
+  // Total documents across ALL shards.
+  uint64 global_doc_count = 3;
+  // Total document length across ALL shards.
+  uint64 global_total_doc_length = 4;
+  // Global document frequency per term (summed over shards), parallel to
+  // `terms`.
+  repeated uint32 global_doc_frequencies = 5;
+  // BM25 k1 saturation parameter; 0 selects the default (1.2).
+  float k1 = 6;
+  // BM25 length-normalization parameter; 0 selects the default (0.75).
+  float b = 7;
+}
+
+// A half-open span [start, end) in original-text coordinates.
+message OffsetSpan {
+  // Start offset (inclusive).
+  uint32 start = 1;
+  // End offset (exclusive).
+  uint32 end = 2;
+}
+
+// Occurrences of one query term in one hit document.
+message TermOccurrences {
+  // The query term as scored (stem identity when SOURCE_STEMS).
+  string term = 1;
+  // Every occurrence span in original-text coordinates.
+  repeated OffsetSpan offsets = 2;
+}
+
+// One BM25 hit, highlight-ready.
+message Bm25Hit {
+  // Global doc id (slot_offset + local id).
+  uint64 doc_id = 1;
+  // BM25 score computed with GLOBAL corpus stats; comparable across
+  // shards. Higher is better.
+  float score = 2;
+  // Per-query-term occurrences in this document (terms absent from the
+  // document are omitted).
+  repeated TermOccurrences terms = 3;
+}
+
+// A shard's BM25 top-k.
+message Bm25QueryResponse {
+  // Hits, score descending, ties by doc id.
+  repeated Bm25Hit hits = 1;
+}
+
+// Reads raw texts from the doc store.
+message GetDocumentsRequest {
+  // Global doc ids.
+  repeated uint64 doc_ids = 1;
+}
+
+// One stored document.
+message StoredDocument {
+  // Global doc id.
+  uint64 doc_id = 1;
+  // The raw text as ingested.
+  string text = 2;
+}
+
+// Stored documents, in request order, omitting unknown ids.
+message GetDocumentsResponse {
+  // Found documents.
+  repeated StoredDocument documents = 1;
+}
+
+// Client-facing distributed BM25 request.
+message Bm25SearchRequest {
+  // Query text, analyzed with `analysis` before scoring.
+  string text = 1;
+  // Number of global top hits to return.
+  uint32 k = 2;
+  // Analysis options for the query. MUST match the options documents were
+  // ingested with (term identity source above all).
+  AnalysisSpec analysis = 3;
+}
+
+// Client-facing distributed BM25 response.
+message Bm25SearchResponse {
+  // Global top-k: score descending, ties by shard index then doc id.
+  repeated Bm25Hit hits = 1;
 }

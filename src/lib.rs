@@ -23,6 +23,8 @@
 // it to satisfy result_large_err would only add allocations.
 #![allow(clippy::result_large_err)]
 
+pub mod analyzer;
+pub mod bm25;
 pub mod chunked;
 pub mod config;
 pub mod coordinator;
@@ -30,6 +32,7 @@ pub mod harness;
 pub mod merge;
 pub mod node;
 pub mod pb;
+pub mod postings;
 
 /// Max gRPC message size (encoding and decoding) applied to every client
 /// and server this crate builds. 64 MiB leaves headroom for large-k
