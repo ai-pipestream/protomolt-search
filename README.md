@@ -167,6 +167,54 @@ cargo run --release --bin sweep -- \
 prints ready-to-paste `[[shards]]` config entries — this is how the indexes
 for a real deployment are produced (shared calibration baked in).
 
+## BM25 lexical search (hybrid half)
+
+Each shard also carries a **BM25 postings index** next to its vector index:
+term → postings (doc id, tf, occurrence offsets in original-text
+coordinates), per-doc lengths and corpus totals, plus a doc store of raw
+texts (the highlight source). This repo deliberately contains **no query
+parser and no text analysis**: language analysis is the
+[grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
+sidecar's job (`AnalysisService.Analyze` → term vectors; its proto is
+vendored at `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`, see
+the file header).
+
+**Ingest** (`NodeService.AddDocuments`, client-streaming): for each
+document the node calls the sidecar (term vectors, MODE_FULL → offsets in
+ORIGINAL text coordinates), builds postings, and stores the raw text. Doc
+ids share the shard's positional id space with vectors (next id =
+max(vectors, docs)). Analysis options pass through (`AnalysisSpec`:
+tokenizer/stemmer/term-vector mode+source/normalizer rungs, as the
+sidecar's enum numbers). Per-shard `analysis_addr` in the config; unset →
+UNAVAILABLE.
+
+**Query** (`SearchService.Bm25Search`) — distributed correctness via the
+two-phase global-stats flow:
+
+```
+coordinator                                   shards
+    │ 1. Analyze(query text, same options) ──▶ sidecar → query terms
+    │ 2. TermStats{terms} ──────────────────▶ per-shard df, N, Σlen
+    │ 3. global N, avgdl, Σdf ──▶ Bm25Query{terms, globals, k, k1, b}
+    │                                         every shard scores with
+    │                                         IDENTICAL idf/avgdl
+    │ 4. merge (score desc, shard, doc id) ◀── shard top-ks + offsets
+```
+
+Shard-local BM25 stats would make scores incomparable across shards; the
+global-stats fan-out is what keeps distributed ranking identical to a
+monolithic index (proven exactly by
+`tests/bm25_search.rs::distributed_bm25_matches_monolithic_exactly`, and
+`shard_local_stats_would_differ` guards the regression). Hits carry
+per-term occurrence offsets; fetch raw text with
+`NodeService.GetDocuments` to highlight. BM25 k1/b are configurable
+(`bm25_k1`/`bm25_b`, defaults 1.2/0.75) and sent to every shard with the
+query so scoring is uniform.
+
+**Persistence**: postings + doc store live in `<index path>.bm25` (custom
+versioned binary format, atomic write), flushed with `Flush` and on
+graceful shutdown, loaded at startup when present.
+
 ## Ingest flow (write path)
 
 Shards ingest over gRPC; prebuilt `.tv` files are no longer required.
@@ -294,6 +342,10 @@ losslessness at k=1000 over a 24k corpus.
   k=1000.
 - `src/merge.rs` — global top-k merge (total order: score desc, shard, id)
   and the coordinator's floor tracker.
+- `src/postings.rs` / `src/bm25.rs` — the BM25 postings index, doc store,
+  persistence, and scoring (with externally supplied global stats).
+- `src/analyzer.rs` — the analysis-sidecar client (text in, term vectors
+  out). No local analysis by design.
 - `src/node.rs` / `src/coordinator.rs` — the two gRPC services. The node
   owns the shard state machine (empty → seeded → live) behind a write
   lock: chunked scans under the read lock, adds/calibration under the
@@ -305,7 +357,10 @@ losslessness at k=1000 over a 24k corpus.
 - `src/bin/sweep.rs` — the k-sweep benchmark harness.
 - `tests/` — lossless e2e (k=10 and k=1000), NodeService loopback with
   mid-scan injection, ingest/calibration rules, a multi-process
-  ingest-and-restart acceptance test, and the skipped-work benchmark.
+  ingest-and-restart acceptance test, BM25 tests with a mock analysis
+  sidecar (postings, distributed-vs-monolithic equality, local-stats
+  regression guard, STEMS identity, flush persistence), and the
+  skipped-work benchmark.
 
 ## Limitations
 
@@ -329,3 +384,11 @@ losslessness at k=1000 over a 24k corpus.
 - **Skipped-work metric is a proxy.** `candidates_collected` is countable
   through the public API; a true per-block prefilter-skip counter needs a
   small patch to the turbovec kernel.
+- **Postings are append-only and unscored-deleted.** No document deletes
+  or updates; a changed document must be re-ingested as a new id.
+- **No vector+BM25 fusion yet.** RRF hybrid search (reciprocal rank fusion
+  of the two rankings) was considered for this phase and deferred: the two
+  query paths are independent and composable, but a fused `Search` oneof
+  wants its own design pass (weights, k semantics per leg).
+- **No node-local BM25 shortcut.** Single-node deployments go through the
+  same coordinator flow (a 1-node fan-out).
