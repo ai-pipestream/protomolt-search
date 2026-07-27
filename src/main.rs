@@ -124,6 +124,22 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             let listener = TcpListener::bind(shard.listen).await?;
             let addr: SocketAddr = listener.local_addr()?;
+            let bm25_store = shard.index_path.as_ref().and_then(|p| {
+                let bm25_path = turbovec_search::node::bm25_sidecar_path(p);
+                if bm25_path.exists() {
+                    eprintln!(
+                        "shard @{}: loading BM25 store from {}",
+                        shard.listen,
+                        bm25_path.display()
+                    );
+                    Some(
+                        turbovec_search::postings::Bm25Store::load(&bm25_path)
+                            .unwrap_or_else(|e| panic!("load {}: {e}", bm25_path.display())),
+                    )
+                } else {
+                    None
+                }
+            });
             let node = NodeServiceImpl::new(
                 index,
                 NodeConfig {
@@ -132,8 +148,10 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     share_floors: cfg.share_floors,
                     bit_width: cfg.bit_width,
                     index_path: shard.index_path.clone(),
+                    analysis_addr: shard.analysis_addr.clone(),
                 },
-            );
+            )
+            .with_bm25(bm25_store);
             node_services.push(node.clone());
             eprintln!("NodeService listening on {addr}");
             let max = cfg.max_message_bytes;
@@ -154,7 +172,13 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cfg.role, Role::Coordinator | Role::Both) {
         let listener = TcpListener::bind(cfg.coord_listen).await?;
         let addr: SocketAddr = listener.local_addr()?;
-        let coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone());
+        let coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone()).with_bm25(
+            cfg.analysis_addr.clone(),
+            turbovec_search::bm25::Bm25Params {
+                k1: f64::from(cfg.bm25_k1),
+                b: f64::from(cfg.bm25_b),
+            },
+        );
         eprintln!(
             "SearchService listening on {addr} ({} shard nodes)",
             cfg.node_addrs.len()

@@ -67,6 +67,8 @@ pub struct ShardConfig {
     pub demo: Option<DemoConfig>,
     /// This shard's global id base (added to local slots).
     pub slot_offset: u64,
+    /// Analysis sidecar address for AddDocuments on this shard.
+    pub analysis_addr: Option<String>,
 }
 
 /// Full process configuration.
@@ -95,6 +97,13 @@ pub struct Config {
     pub bit_width: usize,
     /// Flush shards to their index paths on graceful shutdown.
     pub save_on_shutdown: bool,
+    /// Analysis sidecar address for the coordinator's query analysis
+    /// (Bm25Search). Required for BM25 queries.
+    pub analysis_addr: Option<String>,
+    /// BM25 k1 parameter sent to every shard.
+    pub bm25_k1: f32,
+    /// BM25 b parameter sent to every shard.
+    pub bm25_b: f32,
 }
 
 /// Raw TOML file shape; every field optional (file < env < CLI).
@@ -116,6 +125,9 @@ struct FileConfig {
     demo_query: Option<bool>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
+    analysis_addr: Option<String>,
+    bm25_k1: Option<f32>,
+    bm25_b: Option<f32>,
     shards: Vec<FileShard>,
 }
 
@@ -127,6 +139,7 @@ struct FileShard {
     index: Option<String>,
     slot_offset: Option<u64>,
     demo_vectors: Option<usize>,
+    analysis_addr: Option<String>,
 }
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
@@ -262,7 +275,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     .parse::<u64>()
     .map_err(|e| format!("invalid slot offset: {e}"))?;
 
-    let shards: Vec<ShardConfig> = if cli_index.is_some() || cli_demo.is_some() {
+    let mut shards: Vec<ShardConfig> = if cli_index.is_some() || cli_demo.is_some() {
         if cli_index.is_some() && cli_demo.is_some() {
             return Err("--index and --demo-vectors are mutually exclusive".to_string());
         }
@@ -285,6 +298,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             index_path: cli_index.map(PathBuf::from),
             demo,
             slot_offset: cli_offset,
+            analysis_addr: None,
         }]
     } else {
         file.shards
@@ -312,6 +326,10 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     index_path: shard.index.as_ref().map(PathBuf::from),
                     demo,
                     slot_offset: shard.slot_offset.unwrap_or(0),
+                    analysis_addr: shard
+                        .analysis_addr
+                        .clone()
+                        .map(|a| normalize_addrs(vec![a]).remove(0)),
                 })
             })
             .collect::<Result<_, String>>()?
@@ -384,6 +402,39 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         None => file.save_on_shutdown.unwrap_or(true),
     };
 
+    let analysis_addr = opt(
+        args,
+        "analysis-addr",
+        "TURBOVEC_ANALYSIS_ADDR",
+        file.analysis_addr.as_deref(),
+    )
+    .map(|a| normalize_addrs(vec![a]).remove(0));
+    // A single-shard CLI setup shares the sidecar address with its shard.
+    if analysis_addr.is_some() && shards.len() == 1 && shards[0].analysis_addr.is_none() {
+        shards[0].analysis_addr.clone_from(&analysis_addr);
+    }
+    let bm25_k1 = opt(
+        args,
+        "bm25-k1",
+        "TURBOVEC_BM25_K1",
+        file.bm25_k1.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<f32>()
+            .map_err(|e| format!("invalid bm25 k1: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(1.2);
+    let bm25_b = opt(
+        args,
+        "bm25-b",
+        "TURBOVEC_BM25_B",
+        file.bm25_b.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| s.parse::<f32>().map_err(|e| format!("invalid bm25 b: {e}")))
+    .transpose()?
+    .unwrap_or(0.75);
+
     Ok(Config {
         role,
         coord_listen,
@@ -396,6 +447,9 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         query_dim,
         bit_width,
         save_on_shutdown,
+        analysis_addr,
+        bm25_k1,
+        bm25_b,
     })
 }
 
