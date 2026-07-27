@@ -10,7 +10,7 @@ use tonic::{Request, Response, Status};
 
 use crate::merge::{merge_topk, FloorTracker};
 use crate::pb::node_service_client::NodeServiceClient;
-use crate::pb::search_service_server::SearchService;
+use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
     search_shard_request, search_shard_response, FloorUpdate, ScoredHit, SearchRequest,
     SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse, ShardScanStats,
@@ -41,6 +41,14 @@ impl CoordinatorServiceImpl {
         Self { node_addrs }
     }
 
+    /// Build the tonic server for this service with explicit message size
+    /// limits (see [`crate::MAX_MESSAGE_BYTES`]).
+    pub fn into_server(self, max_message_bytes: usize) -> SearchServiceServer<Self> {
+        SearchServiceServer::new(self)
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes)
+    }
+
     /// Run one fan-out search against every configured node. Broken out
     /// from the gRPC handler so tests and the binary can drive it directly.
     ///
@@ -69,7 +77,9 @@ impl CoordinatorServiceImpl {
         for (shard, addr) in self.node_addrs.iter().enumerate() {
             let mut client = NodeServiceClient::connect(addr.clone())
                 .await
-                .map_err(|e| Status::unavailable(format!("connect {addr}: {e}")))?;
+                .map_err(|e| Status::unavailable(format!("connect {addr}: {e}")))?
+                .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
 
             let (req_tx, req_rx) = mpsc::channel::<SearchShardRequest>(64);
             req_tx

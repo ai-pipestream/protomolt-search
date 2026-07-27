@@ -8,7 +8,7 @@ use tonic::{Request, Response, Status, Streaming};
 use turbovec::TurboQuantIndex;
 
 use crate::chunked::{chunked_topk, DEFAULT_CHUNK_BLOCKS};
-use crate::pb::node_service_server::NodeService;
+use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
     search_shard_request, search_shard_response, FloorUpdate, GetCalibrationRequest,
     GetCalibrationResponse, ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse,
@@ -50,6 +50,17 @@ impl NodeServiceImpl {
     /// Wrap a loaded/built index in a node service.
     pub fn new(index: Arc<TurboQuantIndex>, config: NodeConfig) -> Self {
         Self { index, config }
+    }
+
+    /// Build the tonic server for this service with explicit message size
+    /// limits (see [`crate::MAX_MESSAGE_BYTES`]). tonic's 4 MiB default
+    /// decoding cap is comfortably above even k=10000 shard responses
+    /// (~160 KiB), but the limit is set explicitly so it never silently
+    /// depends on a library default.
+    pub fn into_server(self, max_message_bytes: usize) -> NodeServiceServer<Self> {
+        NodeServiceServer::new(self)
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes)
     }
 
     /// Validate an incoming `StartShardSearch` against the index shape.

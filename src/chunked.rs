@@ -57,17 +57,48 @@ fn ranks_before(a: ChunkHit, b: ChunkHit) -> bool {
     a.score > b.score || (a.score == b.score && a.slot < b.slot)
 }
 
-/// Insert `hit` into `heap` (kept sorted by [`ranks_before`], capped at `k`).
-fn insert_hit(heap: &mut Vec<ChunkHit>, hit: ChunkHit, k: usize) {
-    if heap.len() == k {
-        // Full: only displace the current k-th if strictly better ranked.
-        if !ranks_before(hit, heap[k - 1]) {
-            return;
-        }
-        heap.pop();
+/// Merge one chunk's hits into the running top-k `heap` (score desc, slot
+/// asc, capped at `k`).
+///
+/// turbovec returns each row score-descending, so instead of inserting hit
+/// by hit — O(k) per insert, which hurts at k=10000 — this sorts the (small)
+/// chunk batch into the heap's total order and does a linear two-pointer
+/// merge: O(chunk log chunk + k) per chunk.
+fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize) {
+    if chunk.is_empty() {
+        return;
     }
-    let pos = heap.partition_point(|h| ranks_before(*h, hit));
-    heap.insert(pos, hit);
+    chunk.sort_by(|a, b| {
+        if ranks_before(*a, *b) {
+            std::cmp::Ordering::Less
+        } else if ranks_before(*b, *a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    if heap.len() == k && !ranks_before(chunk[0], heap[k - 1]) {
+        // The chunk's best hit cannot displace the heap's worst.
+        return;
+    }
+    let mut merged = Vec::with_capacity(heap.len() + chunk.len());
+    let (mut i, mut j) = (0, 0);
+    while merged.len() < k && (i < heap.len() || j < chunk.len()) {
+        let take_heap = match (heap.get(i), chunk.get(j)) {
+            (Some(&h), Some(&c)) => ranks_before(h, c),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        merged.push(if take_heap {
+            i += 1;
+            heap[i - 1]
+        } else {
+            j += 1;
+            chunk[j - 1]
+        });
+    }
+    *heap = merged;
 }
 
 /// Scan `index` for the top-`k` of `query` in chunks, adopting external
@@ -136,6 +167,7 @@ pub fn chunked_topk(
             *slot = false;
         }
 
+        let mut chunk_hits = Vec::new();
         for (&score, &slot) in results
             .scores_for_query(0)
             .iter()
@@ -146,15 +178,12 @@ pub fn chunked_topk(
                 continue;
             }
             stats.candidates_collected += 1;
-            insert_hit(
-                &mut heap,
-                ChunkHit {
-                    slot: slot as u32,
-                    score,
-                },
-                k,
-            );
+            chunk_hits.push(ChunkHit {
+                slot: slot as u32,
+                score,
+            });
         }
+        merge_chunk_hits(&mut heap, &mut chunk_hits, k);
 
         if heap.len() == k {
             publish_floor(heap[k - 1].score);
@@ -227,6 +256,35 @@ mod tests {
                 stats.chunk_calls,
                 n.div_ceil(chunk_blocks.max(1) * BLOCK_VECTORS) as u32
             );
+        }
+    }
+
+    /// Large-k correctness: the merge-based heap must hold up at k=1000
+    /// (where the per-chunk candidate batches are large and k exceeds the
+    /// chunk size, so the heap fills across many chunks).
+    #[test]
+    fn chunked_matches_unchunked_at_large_k() {
+        let (n, dim, k) = (6_000, 64, 1_000);
+        let index = build(n, dim);
+        let query = unit_vectors(1, dim, 0x0E50_0005);
+        let expected = index.search(&query, k);
+
+        for chunk_blocks in [1, 8] {
+            let (hits, _) =
+                chunked_topk(&index, &query, k, chunk_blocks, &mut || None, &mut |_| {});
+            assert_eq!(hits.len(), k);
+            let got: Vec<(i64, u32)> = hits
+                .iter()
+                .map(|h| (h.slot as i64, h.score.to_bits()))
+                .collect();
+            let mut want: Vec<(i64, u32)> = expected
+                .indices_for_query(0)
+                .iter()
+                .zip(expected.scores_for_query(0))
+                .map(|(&i, &s)| (i, s.to_bits()))
+                .collect();
+            want.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            assert_eq!(got, want, "chunk_blocks={chunk_blocks}");
         }
     }
 

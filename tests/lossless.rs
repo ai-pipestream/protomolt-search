@@ -66,6 +66,45 @@ async fn distributed_matches_monolithic_without_floor_sharing() {
     assert_lossless(false).await;
 }
 
+/// Large-k losslessness: the floor logic is k-agnostic by construction
+/// (every floor is a lower bound on the global k-th best, whatever k is),
+/// but k=1000 exercises the paths small k does not — the heap fills across
+/// many chunks, shard responses carry 1000 hits each, and the coordinator
+/// merges 3×1000. Corpus sized so every shard holds 4× k vectors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_matches_monolithic_at_k_1000() {
+    const BIG_K: u32 = 1_000;
+    // 3 shards x 8000 vectors; 8 blocks/chunk → ~31 chunks per shard.
+    let cluster = Cluster::start(24_000, 8, true).await;
+    let coordinator = CoordinatorServiceImpl::new(cluster.node_addrs.clone());
+
+    for qi in 0..2u64 {
+        let query = unit_vectors(1, DIM, 0xB16B_0000 + qi);
+        let result = coordinator
+            .fanout_search(&format!("bigk-{qi}"), &query, BIG_K)
+            .await
+            .expect("fanout search");
+
+        let got: Vec<(u64, u32)> = result
+            .hits
+            .iter()
+            .map(|h| (h.vector_id, h.score.to_bits()))
+            .collect();
+        let want = monolithic_topk(&cluster.monolithic, &query, BIG_K as usize);
+        assert_eq!(got.len(), BIG_K as usize);
+        assert_eq!(
+            got, want,
+            "query {qi}: distributed top-{BIG_K} != monolithic"
+        );
+        // Each shard must have returned a full k.
+        for stats in result.shard_stats.iter().flatten() {
+            assert!(stats.chunk_calls > 1);
+        }
+    }
+
+    cluster.shutdown().await;
+}
+
 /// Direct gRPC path (SearchService client over loopback) rather than the
 /// in-process fanout, so the client-facing surface is covered too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -21,6 +21,13 @@
 pub mod chunked;
 pub mod config;
 pub mod coordinator;
+pub mod harness;
 pub mod merge;
 pub mod node;
 pub mod pb;
+
+/// Max gRPC message size (encoding and decoding) applied to every client
+/// and server this crate builds. 64 MiB leaves headroom for large-k
+/// responses: k=10000 hits is ~160 KiB, so even pathological future
+/// payloads (vectors in responses, many shards) fit comfortably.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
