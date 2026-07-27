@@ -29,12 +29,12 @@ use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
     search_shard_request, search_shard_response, AddDocumentsRequest, AddDocumentsResponse,
     AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse,
-    FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest, GetCalibrationResponse,
-    GetDocumentsRequest, GetDocumentsResponse, HybridLegHit, HybridShardRequest,
-    HybridShardResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
-    ShardLegsResponse, ShardScanStats, StartShardSearch, StoredDocument, TermOccurrences,
-    TermStatsRequest, TermStatsResponse,
+    Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse,
+    GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse,
+    HybridLegHit, HybridShardRequest, HybridShardResponse, OffsetSpan, RawLegHit, ScoredHit,
+    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
+    SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, StartShardSearch,
+    StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
 };
 use crate::postings::Bm25Store;
 
@@ -320,6 +320,7 @@ impl NodeServiceImpl {
                     self.config.chunk_blocks,
                     &mut || None,
                     &mut |_| {},
+                    false,
                 );
                 vector_leg = hits
                     .into_iter()
@@ -530,6 +531,7 @@ impl NodeService for NodeServiceImpl {
                     chunk_blocks,
                     &mut external_floor,
                     &mut publish_floor,
+                    start.tie_complete,
                 ))
             });
 
@@ -766,6 +768,68 @@ impl NodeService for NodeServiceImpl {
             _ => Vec::new(),
         };
         Ok(Response::new(Bm25QueryResponse { hits }))
+    }
+
+    async fn bm25_rescore(
+        &self,
+        request: Request<Bm25RescoreRequest>,
+    ) -> Result<Response<Bm25RescoreResponse>, Status> {
+        let req = request.into_inner();
+        if req.terms.len() != req.global_doc_frequencies.len() {
+            return Err(Status::invalid_argument(
+                "terms and global_doc_frequencies must have the same length",
+            ));
+        }
+        let params = Bm25Params {
+            k1: if req.k1 == 0.0 {
+                bm25::DEFAULT_K1
+            } else {
+                f64::from(req.k1)
+            },
+            b: if req.b == 0.0 {
+                bm25::DEFAULT_B
+            } else {
+                f64::from(req.b)
+            },
+        };
+        let stats = bm25::CorpusStats {
+            doc_count: req.global_doc_count,
+            total_doc_length: req.global_total_doc_length,
+            dfs: req.global_doc_frequencies.clone(),
+        };
+        let offset = self.config.slot_offset;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let hits = match guard.bm25.as_ref() {
+            Some(store) => {
+                // Route global ids to this shard's local range.
+                let local: Vec<u32> = req
+                    .candidate_ids
+                    .iter()
+                    .filter(|&&id| id >= offset && (id - offset) <= u64::from(u32::MAX))
+                    .map(|id| (id - offset) as u32)
+                    .collect();
+                bm25::score_candidates(store, &req.terms, &stats, params, &local)
+                    .into_iter()
+                    .map(|doc| Bm25Hit {
+                        doc_id: offset + u64::from(doc.doc_id),
+                        score: doc.score as f32,
+                        terms: doc
+                            .term_offsets
+                            .into_iter()
+                            .map(|(ti, offsets)| TermOccurrences {
+                                term: req.terms[ti].clone(),
+                                offsets: offsets
+                                    .into_iter()
+                                    .map(|(start, end)| OffsetSpan { start, end })
+                                    .collect(),
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        Ok(Response::new(Bm25RescoreResponse { hits }))
     }
 
     async fn get_documents(

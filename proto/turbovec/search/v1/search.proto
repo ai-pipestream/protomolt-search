@@ -123,6 +123,11 @@ service NodeService {
   // stored text are simply absent from the response.
   rpc GetDocuments(GetDocumentsRequest) returns (GetDocumentsResponse);
 
+  // Candidate-scoped BM25 scoring (phase 2 of FUSION_MODE_CASCADE):
+  // score just `candidate_ids` against this shard's postings with the
+  // supplied global stats.
+  rpc Bm25Rescore(Bm25RescoreRequest) returns (Bm25RescoreResponse);
+
   // Runs the shard's LOCAL half of a hybrid query: the chunked vector
   // scan and the BM25 scoring (with the supplied global stats), fused
   // with RRF on the node — level one of the settled two-level fusion. The
@@ -202,6 +207,14 @@ message StartShardSearch {
   uint32 k = 2;
   // The query vector. Length must equal the shard index dimension.
   repeated float vector = 3;
+  // When true, the shard's running top-k never evicts a candidate whose
+  // score equals the current k-th best: the whole boundary tie group
+  // rides along, so `SearchShardDone.hits` may exceed k by the tie-group
+  // size (worst case: a shard of identical scores returns everything).
+  // Used by the cascade fusion mode, whose cutoff is score-defined and
+  // must include every tied doc on every shard. Off by default, leaving
+  // plain vector Search semantics untouched.
+  bool tie_complete = 4;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -512,7 +525,7 @@ message Bm25SearchResponse {
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.
 enum FusionMode {
-  // Unused zero value; resolves to FUSION_MODE_GLOBAL_RANK.
+  // Unused zero value; resolves to FUSION_MODE_CASCADE.
   FUSION_MODE_UNSPECIFIED = 0;
 
   // Default. Shards return RAW per-leg lists (ShardLegs); the coordinator
@@ -531,6 +544,18 @@ enum FusionMode {
   // shard-local ranks are compressed relative to global ranks, so the
   // result can differ from a monolithic index.
   FUSION_MODE_TWO_LEVEL = 2;
+
+  // Default. Cascade, no score fusion: phase 1 generates vector
+  // candidates through the floor-sharing bidi path (cross-shard early
+  // termination applies — the cutoff IS the savings, no leg_k hits per
+  // shard), with a TIE-COMPLETE cutoff: the candidate pool is
+  // {score >= s_k} where s_k is the global k-th vector score, so the
+  // pool can exceed k by the boundary tie-group size. Phase 2 reranks
+  // the pool by BM25 (global stats, candidate-scoped scoring per owning
+  // shard) and returns the top k. Vector recall is a GATE here:
+  // keyword-strong but vector-weak docs are not surfaced — use
+  // Bm25Search for pure lexical queries, or GLOBAL_RANK for true fusion.
+  FUSION_MODE_CASCADE = 3;
 }
 
 // Per-leg options for hybrid (RRF-fused) search. Every field is optional;
@@ -648,8 +673,12 @@ message HybridSearchResponse {
   // Echoes the request id (or the assigned one).
   string request_id = 1;
   // Global fused top-k: coordinator-level RRF score descending, ties by
-  // shard then doc id.
+  // shard then doc id. Populated for FUSION_MODE_GLOBAL_RANK and
+  // FUSION_MODE_TWO_LEVEL.
   repeated HybridHit hits = 2;
+  // Cascade top-k (BM25 rerank order; pool beyond k is truncated here).
+  // Populated for FUSION_MODE_CASCADE; `hits` is then empty.
+  repeated CascadeHit cascade_hits = 3;
 }
 
 // A shard's raw per-leg lists for a hybrid query (FUSION_MODE_GLOBAL_RANK).
@@ -718,4 +747,50 @@ message CalibrationApplyResult {
 message BroadcastCalibrationResponse {
   // One result per configured node.
   repeated CalibrationApplyResult results = 1;
+}
+
+// Candidate-scoped BM25 scoring: phase 2 of the cascade fusion mode.
+// The coordinator routes each candidate's id to its owning shard; the
+// shard scores just those ids against its postings (intersection over
+// the append-only, doc-id-sorted postings lists, not a full walk) with
+// the supplied GLOBAL stats, so scores are cross-shard comparable.
+message Bm25RescoreRequest {
+  // Query terms (already analyzed by the coordinator).
+  repeated string terms = 1;
+  // Global corpus stats for the BM25 leg (see Bm25QueryRequest).
+  uint64 global_doc_count = 2;
+  // Global total document length for the BM25 leg.
+  uint64 global_total_doc_length = 3;
+  // Global per-term document frequencies for the BM25 leg.
+  repeated uint32 global_doc_frequencies = 4;
+  // Global candidate doc ids to score. Ids outside this shard's range
+  // (or with no postings) are ignored.
+  repeated uint64 candidate_ids = 5;
+  // BM25 k1; 0 selects the default (1.2).
+  float k1 = 6;
+  // BM25 b; 0 selects the default (0.75).
+  float b = 7;
+}
+
+// BM25 scores for the requested candidates, doc id ascending.
+message Bm25RescoreResponse {
+  // One hit per candidate that scored above zero.
+  repeated Bm25Hit hits = 1;
+}
+
+// One cascade hit: the two leg scores as SEPARATE fields (no fused
+// score) plus the final rerank rank.
+message CascadeHit {
+  // Global doc id.
+  uint64 doc_id = 1;
+  // Final 1-based rank after the BM25 rerank (BM25 desc, vector desc,
+  // doc id asc).
+  uint32 rank = 2;
+  // Shard that owns the doc.
+  uint32 shard = 3;
+  // Raw vector score from phase 1 (shared calibration; globally
+  // comparable).
+  float vector_score = 4;
+  // Raw BM25 score from phase 2 (global stats; globally comparable).
+  float bm25_score = 5;
 }

@@ -58,13 +58,23 @@ fn ranks_before(a: ChunkHit, b: ChunkHit) -> bool {
 }
 
 /// Merge one chunk's hits into the running top-k `heap` (score desc, slot
-/// asc, capped at `k`).
+/// asc, capped at `k` — or at `k` plus the boundary tie group when
+/// `keep_ties` is set).
 ///
 /// turbovec returns each row score-descending, so instead of inserting hit
 /// by hit — O(k) per insert, which hurts at k=10000 — this sorts the (small)
 /// chunk batch into the heap's total order and does a linear two-pointer
 /// merge: O(chunk log chunk + k) per chunk.
-fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize) {
+///
+/// With `keep_ties`, entries beyond `k` are kept while their score equals
+/// the current k-th best: the cascade fusion mode's cutoff is
+/// score-defined, so every doc tied at the boundary must survive on every
+/// shard. Eviction still happens whenever the k-th best score RISES (the
+/// old boundary group is then provably below any future cutoff), so the
+/// retention is bounded by k plus the largest tie group at the CURRENT
+/// boundary — worst case a shard of identical scores, same as any
+/// tie-complete contract.
+fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize, keep_ties: bool) {
     if chunk.is_empty() {
         return;
     }
@@ -77,9 +87,17 @@ fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize) 
             std::cmp::Ordering::Equal
         }
     });
-    if heap.len() == k && !ranks_before(chunk[0], heap[k - 1]) {
-        // The chunk's best hit cannot displace the heap's worst.
-        return;
+    if heap.len() >= k {
+        // The chunk's best hit cannot displace the heap's k-th. With
+        // keep_ties, a hit TIED at the boundary must still merge in.
+        let skip = if keep_ties {
+            chunk[0].score < heap[k - 1].score
+        } else {
+            heap.len() == k && !ranks_before(chunk[0], heap[k - 1])
+        };
+        if skip {
+            return;
+        }
     }
     let mut merged = Vec::with_capacity(heap.len() + chunk.len());
     let (mut i, mut j) = (0, 0);
@@ -97,6 +115,23 @@ fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize) 
             j += 1;
             chunk[j - 1]
         });
+    }
+    if keep_ties && merged.len() == k {
+        // Boundary tie group: every remaining entry scoring exactly the
+        // k-th best rides along. Both sides are (score desc, slot asc), so
+        // ties are contiguous.
+        let boundary = merged[k - 1].score;
+        while i < heap.len() && heap[i].score == boundary {
+            merged.push(heap[i]);
+            i += 1;
+        }
+        while j < chunk.len() && chunk[j].score == boundary {
+            merged.push(chunk[j]);
+            j += 1;
+        }
+        // Re-sort the tie tail into (score desc, slot asc) order: heap
+        // ties and chunk ties interleave by slot.
+        merged[k..].sort_by_key(|h| h.slot);
     }
     *heap = merged;
 }
@@ -122,6 +157,7 @@ pub fn chunked_topk(
     chunk_blocks: usize,
     external_floor: &mut dyn FnMut() -> Option<f32>,
     publish_floor: &mut dyn FnMut(f32),
+    keep_ties: bool,
 ) -> (Vec<ChunkHit>, ScanStats) {
     let n = index.len();
     let mut stats = ScanStats::default();
@@ -148,16 +184,23 @@ pub fn chunked_topk(
                 }
             }
         }
-        if heap.len() == k {
+        if heap.len() >= k {
             floor = floor.max(heap[k - 1].score);
         }
 
+        // In tie-complete mode the chunk search must NOT cap at k: a
+        // boundary tie group larger than k would be truncated inside the
+        // kernel before the merge could retain it. Collecting everything
+        // at-or-above the floor keeps the whole group; the merge then
+        // retains top-k plus the boundary ties. (The floor still does the
+        // pruning — collection beyond it is what tie-completeness costs.)
+        let chunk_k = if keep_ties { usize::MAX } else { k };
         for slot in mask.iter_mut().take(end).skip(start) {
             *slot = true;
         }
         let results = index.search_with_options(
             query,
-            k,
+            chunk_k,
             SearchOptions::new()
                 .with_mask(&mask)
                 .with_initial_threshold(floor),
@@ -183,9 +226,9 @@ pub fn chunked_topk(
                 score,
             });
         }
-        merge_chunk_hits(&mut heap, &mut chunk_hits, k);
+        merge_chunk_hits(&mut heap, &mut chunk_hits, k, keep_ties);
 
-        if heap.len() == k {
+        if heap.len() >= k {
             publish_floor(heap[k - 1].score);
             stats.floors_published += 1;
         }
@@ -237,8 +280,15 @@ mod tests {
         let expected = index.search(&query, k);
 
         for chunk_blocks in [1, 2, 7, 64, 10_000] {
-            let (hits, stats) =
-                chunked_topk(&index, &query, k, chunk_blocks, &mut || None, &mut |_| {});
+            let (hits, stats) = chunked_topk(
+                &index,
+                &query,
+                k,
+                chunk_blocks,
+                &mut || None,
+                &mut |_| {},
+                false,
+            );
             let got: Vec<(i64, u32)> = hits
                 .iter()
                 .map(|h| (h.slot as i64, h.score.to_bits()))
@@ -270,8 +320,15 @@ mod tests {
         let expected = index.search(&query, k);
 
         for chunk_blocks in [1, 8] {
-            let (hits, _) =
-                chunked_topk(&index, &query, k, chunk_blocks, &mut || None, &mut |_| {});
+            let (hits, _) = chunked_topk(
+                &index,
+                &query,
+                k,
+                chunk_blocks,
+                &mut || None,
+                &mut |_| {},
+                false,
+            );
             assert_eq!(hits.len(), k);
             let got: Vec<(i64, u32)> = hits
                 .iter()
@@ -298,7 +355,8 @@ mod tests {
         let query = unit_vectors(1, dim, 0x0E50_0002);
         let true_kth = index.search(&query, k).scores_for_query(0)[k - 1];
 
-        let (baseline, base_stats) = chunked_topk(&index, &query, k, 2, &mut || None, &mut |_| {});
+        let (baseline, base_stats) =
+            chunked_topk(&index, &query, k, 2, &mut || None, &mut |_| {}, false);
 
         // Floor becomes visible after the first chunk, like a coordinator
         // update arriving mid-scan.
@@ -313,6 +371,7 @@ mod tests {
                 (polls > 1).then_some(true_kth)
             },
             &mut |_| {},
+            false,
         );
 
         assert_eq!(baseline, floored);
@@ -334,9 +393,15 @@ mod tests {
         let query = unit_vectors(1, dim, 0x0E50_0003);
 
         let mut published = Vec::new();
-        let (hits, stats) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |f| {
-            published.push(f)
-        });
+        let (hits, stats) = chunked_topk(
+            &index,
+            &query,
+            k,
+            1,
+            &mut || None,
+            &mut |f| published.push(f),
+            false,
+        );
 
         assert_eq!(hits.len(), k);
         assert!(!published.is_empty());
@@ -344,6 +409,31 @@ mod tests {
         assert!(published.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(*published.last().unwrap(), hits[k - 1].score);
         assert_eq!(stats.floors_published as usize, published.len());
+    }
+
+    /// Boundary tie retention: with `keep_ties`, the whole tie group at
+    /// the k-th score survives (the heap may exceed k); without it, the
+    /// heap caps at exactly k. Duplicated vectors score identically, so
+    /// copies past the boundary are the tie group.
+    #[test]
+    fn tie_complete_keeps_boundary_tie_group() {
+        let (n, dim, k) = (512, 64, 3);
+        let mut index = TurboQuantIndex::new(dim, 4).unwrap();
+        index.add(&unit_vectors(n, dim, 0xC40C_0002));
+        // Six copies of the query vector: identical codes, identical
+        // (top) score. They ARE the boundary tie group at k=3.
+        let query = unit_vectors(1, dim, 0x0E50_0006);
+        for _ in 0..6 {
+            index.add(&query);
+        }
+
+        let (capped, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| {}, false);
+        assert_eq!(capped.len(), k, "without keep_ties the heap caps at k");
+
+        let (tied, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| {}, true);
+        assert_eq!(tied.len(), 6, "whole boundary tie group must survive");
+        assert!(tied.iter().all(|h| h.score == tied[0].score));
+        assert!(tied.windows(2).all(|w| w[0].slot < w[1].slot));
     }
 
     /// An over-high floor (above the true k-th best) is allowed by the
@@ -356,7 +446,15 @@ mod tests {
         let query = unit_vectors(1, dim, 0x0E50_0004);
         let top = index.search(&query, k).scores_for_query(0)[0];
 
-        let (hits, _) = chunked_topk(&index, &query, k, 64, &mut || Some(top + 1.0), &mut |_| {});
+        let (hits, _) = chunked_topk(
+            &index,
+            &query,
+            k,
+            64,
+            &mut || Some(top + 1.0),
+            &mut |_| {},
+            false,
+        );
         assert!(hits.is_empty());
     }
 }

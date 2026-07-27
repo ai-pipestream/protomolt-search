@@ -93,6 +93,70 @@ pub struct ScoredDoc {
     pub term_offsets: Vec<(usize, Vec<(u32, u32)>)>,
 }
 
+/// Score only the given candidate docs (local ids, any order, duplicates
+/// tolerated) against the postings — phase 2 of the cascade fusion mode.
+///
+/// Postings lists are append-only, hence doc-id-sorted, so scoring is a
+/// per-term merge-join between the sorted candidate list and each term's
+/// postings: O(candidates + matched postings), never a full postings
+/// walk. Returns one [`ScoredDoc`] per candidate that scored above zero,
+/// doc id ascending.
+pub fn score_candidates(
+    store: &Bm25Store,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    candidate_ids: &[u32],
+) -> Vec<ScoredDoc> {
+    debug_assert_eq!(terms.len(), stats.dfs.len());
+    let mut candidates: Vec<u32> = candidate_ids.to_vec();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let avgdl = stats.avgdl();
+
+    let mut docs: Vec<ScoredDoc> = Vec::new();
+    for (ti, term) in terms.iter().enumerate() {
+        let Some(postings) = store.postings(term) else {
+            continue;
+        };
+        if stats.dfs[ti] == 0 {
+            continue;
+        }
+        let idf = idf(stats.doc_count, stats.dfs[ti]);
+        // Merge-join: both lists ascending by doc id.
+        let (mut ci, mut pi) = (0, 0);
+        while ci < candidates.len() && pi < postings.len() {
+            let c = candidates[ci];
+            let p = postings[pi].doc_id;
+            match c.cmp(&p) {
+                std::cmp::Ordering::Less => ci += 1,
+                std::cmp::Ordering::Greater => pi += 1,
+                std::cmp::Ordering::Equal => {
+                    let posting = &postings[pi];
+                    let contribution =
+                        idf * tf_norm(params, posting.tf, store.doc_length(p), avgdl);
+                    let entry = match docs.iter_mut().find(|d| d.doc_id == p) {
+                        Some(d) => d,
+                        None => {
+                            docs.push(ScoredDoc {
+                                doc_id: p,
+                                score: 0.0,
+                                term_offsets: Vec::new(),
+                            });
+                            docs.last_mut().expect("just pushed")
+                        }
+                    };
+                    entry.score += contribution;
+                    entry.term_offsets.push((ti, posting.offsets.clone()));
+                    ci += 1;
+                    pi += 1;
+                }
+            }
+        }
+    }
+    docs
+}
+
 /// Score `terms` over the shard's postings with the supplied (global)
 /// stats; return the top-k, score descending, ties by ascending doc id.
 pub fn top_k(
