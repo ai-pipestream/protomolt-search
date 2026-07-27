@@ -167,6 +167,36 @@ cargo run --release --bin sweep -- \
 prints ready-to-paste `[[shards]]` config entries — this is how the indexes
 for a real deployment are produced (shared calibration baked in).
 
+## Ingest flow (write path)
+
+Shards ingest over gRPC; prebuilt `.tv` files are no longer required.
+Deployment order for a from-scratch cluster is **fit → seed → ingest →
+search**:
+
+1. **Fit** a calibration on a representative sample (any tool that can run
+   turbovec: build a throwaway index from the sample, read `calibration()`).
+2. **Seed** every shard with it via `NodeService.SetCalibration` — or let
+   the CLI do it: start one seeded node (demo or loaded index), then
+   `turbovec-search calibrate --fit-from=node0:50051 --apply-to=node1:50051,node2:50051`.
+   SetCalibration is accepted only while a shard is empty; calibration is
+   locked for the index's lifetime (turbovec's own rule), so a retry of the
+   same calibration is an idempotent no-op and anything else is rejected.
+3. **Ingest** with `NodeService.AddVectors` (client-streaming, flat
+   batches). Batches apply under the shard's write lock; searches hold the
+   read lock for their whole scan, so no search observes a half-applied
+   batch. Ids are server-assigned: the i-th vector of a shard is
+   `slot_offset + i` (positional; turbovec's id-mapped index does not
+   support the masked, floor-seeded scan this service uses).
+4. **Search** as before — the lossless invariant holds for ingested data
+   exactly as for prebuilt indexes (proven by `tests/multiprocess.rs`).
+
+**Persistence**: `NodeService.Flush` writes the shard to its config
+`index` path (atomic `.tv` write), and `save_on_shutdown = true` (the
+default) flushes on SIGINT/SIGTERM. A shard whose index path does not
+exist at startup starts empty; after ingest + flush (or graceful
+shutdown), a restart with the same config comes back with all vectors
+and the locked calibration (`.tv` persists it).
+
 ## Two-machine runbook
 
 Topology: host A (this host) runs coordinator + shard 0; host B (`krick-1`)
@@ -183,7 +213,9 @@ runs shard 1. Static membership — both configs list the same node set.
 
    (Any source of `.tv` files works as long as every shard was built with
    the SAME seeded calibration — that is what makes scores mergeable.
-   Verify with `NodeService.GetCalibration` if in doubt.)
+   Verify with `NodeService.GetCalibration` if in doubt. Alternatively,
+   skip files entirely: point each node's `index` at a fresh path, start
+   empty, then seed + ingest over gRPC per "Ingest flow" above.)
 
 2. **Copy the binary and shard 1 to krick-1:**
 
@@ -262,14 +294,18 @@ losslessness at k=1000 over a 24k corpus.
   k=1000.
 - `src/merge.rs` — global top-k merge (total order: score desc, shard, id)
   and the coordinator's floor tracker.
-- `src/node.rs` / `src/coordinator.rs` — the two gRPC services.
+- `src/node.rs` / `src/coordinator.rs` — the two gRPC services. The node
+  owns the shard state machine (empty → seeded → live) behind a write
+  lock: chunked scans under the read lock, adds/calibration under the
+  write lock, flush on demand or shutdown.
 - `src/config.rs` / `src/main.rs` — TOML/env/CLI config and process wiring
-  (multi-shard, multi-role).
+  (multi-shard, multi-role, graceful shutdown, `calibrate` subcommand).
 - `src/harness.rs` — corpus generation, calibration fitting, shard building
   and loopback server startup shared by tests and the sweep binary.
 - `src/bin/sweep.rs` — the k-sweep benchmark harness.
 - `tests/` — lossless e2e (k=10 and k=1000), NodeService loopback with
-  mid-scan injection, and the skipped-work benchmark.
+  mid-scan injection, ingest/calibration rules, a multi-process
+  ingest-and-restart acceptance test, and the skipped-work benchmark.
 
 ## Limitations
 
@@ -277,12 +313,19 @@ losslessness at k=1000 over a 24k corpus.
   no discovery, no re-sharding, no node failure handling beyond surfacing
   the error.
 - **No replication.** Each shard lives on exactly one node.
-- **Calibration is manual.** Nodes must be constructed with the same
-  seeded calibration out of band (`sweep --write-indexes` produces such
-  shards); `GetCalibration` only verifies, it does not distribute.
+- **Calibration distribution is manual-trigger.** `SetCalibration` (or the
+  `calibrate` subcommand) pushes a fitted calibration; nothing fits or
+  verifies automatically, and shards with mismatched calibrations produce
+  incomparable scores without warning beyond `GetCalibration` inspection.
+- **Positional ids only.** Ingested vectors are identified by
+  `slot_offset + slot` in insertion order; client-chosen ids would need
+  turbovec's `IdMapIndex`, which lacks the masked, floor-seeded scan.
+  Deletes/updates are not supported (append-only).
+- **Durability is flush-based.** Vectors are durable after `Flush` or a
+  graceful shutdown; an ungraceful kill loses everything since the last
+  flush (no WAL, no save interval).
 - **Per-query streams.** Each query opens a fresh channel + `SearchShard`
-  stream per node (no pooling), and vector ids are `slot_offset + slot`
-  with contiguous disjoint offsets assigned out of band.
+  stream per node (no pooling).
 - **Skipped-work metric is a proxy.** `candidates_collected` is countable
   through the public API; a true per-block prefilter-skip counter needs a
   small patch to the turbovec kernel.
