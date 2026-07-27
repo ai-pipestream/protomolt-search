@@ -91,6 +91,10 @@ pub struct Config {
     pub demo_query: bool,
     /// Dimension of the demo-query vector.
     pub query_dim: usize,
+    /// Bit width for from-scratch index construction via AddVectors.
+    pub bit_width: usize,
+    /// Flush shards to their index paths on graceful shutdown.
+    pub save_on_shutdown: bool,
 }
 
 /// Raw TOML file shape; every field optional (file < env < CLI).
@@ -111,6 +115,7 @@ struct FileConfig {
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
     query_dim: Option<usize>,
+    save_on_shutdown: Option<bool>,
     shards: Vec<FileShard>,
 }
 
@@ -374,6 +379,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         return Err("--demo-query requires the coordinator or both role".to_string());
     }
 
+    let save_on_shutdown = match opt(args, "save-on-shutdown", "TURBOVEC_SAVE_ON_SHUTDOWN", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.save_on_shutdown.unwrap_or(true),
+    };
+
     Ok(Config {
         role,
         coord_listen,
@@ -384,6 +394,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         max_message_bytes,
         demo_query,
         query_dim,
+        bit_width,
+        save_on_shutdown,
     })
 }
 

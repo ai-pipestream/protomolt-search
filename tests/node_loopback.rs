@@ -90,11 +90,12 @@ async fn mid_scan_floor_update_is_lossless() {
     // chunk_blocks=2 → 64 vectors per chunk → ~157 chunks: the injected
     // floor is guaranteed to land before most chunks run.
     let (addr, handle) = common::start_node(
-        std::sync::Arc::new(index),
+        index,
         NodeConfig {
             slot_offset: 0,
             chunk_blocks: 2,
             share_floors: true,
+            ..Default::default()
         },
     )
     .await;
@@ -149,11 +150,12 @@ async fn overhigh_floor_yields_fewer_hits() {
     let best = index.search(&query, 1).scores_for_query(0)[0];
 
     let (addr, handle) = common::start_node(
-        std::sync::Arc::new(index),
+        index,
         NodeConfig {
             slot_offset: 0,
             chunk_blocks: 2,
             share_floors: true,
+            ..Default::default()
         },
     )
     .await;

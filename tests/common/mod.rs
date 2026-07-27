@@ -15,7 +15,7 @@ use turbovec::TurboQuantIndex;
 use turbovec_search::harness::{self, build_monolithic, build_shards};
 use turbovec_search::node::NodeConfig;
 
-pub use harness::{fit_calibration, start_coordinator, start_node, unit_vectors};
+pub use harness::{fit_calibration, start_coordinator, start_empty_node, start_node, unit_vectors};
 
 pub const DIM: usize = 128;
 pub const BIT_WIDTH: usize = 4;
@@ -73,6 +73,7 @@ impl Cluster {
                     slot_offset: shard.slot_offset,
                     chunk_blocks,
                     share_floors,
+                    ..Default::default()
                 },
             )
             .await;

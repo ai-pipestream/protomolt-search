@@ -180,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     slot_offset: shard.slot_offset,
                     chunk_blocks: args.chunk_blocks,
                     share_floors: sharing,
+                    ..Default::default()
                 },
             )
             .await;

@@ -8,7 +8,6 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -55,7 +54,7 @@ pub fn fit_calibration(dim: usize, bit_width: usize, sample: &[f32]) -> (Vec<f32
 /// One shard's index plus its global id base (the corpus offset of its
 /// first vector; partitions are contiguous ranges).
 pub struct Shard {
-    pub index: Arc<TurboQuantIndex>,
+    pub index: TurboQuantIndex,
     pub slot_offset: u64,
 }
 
@@ -80,7 +79,7 @@ pub fn build_shards(
             index.add(&corpus[start * dim..end * dim]);
             index.prepare();
             Shard {
-                index: Arc::new(index),
+                index,
                 slot_offset: start as u64,
             }
         })
@@ -143,10 +142,25 @@ pub fn nodelay_incoming(
     })
 }
 
-/// Start a node server on 127.0.0.1:0. Returns its `http://` address and
-/// the server task (abort to stop).
+/// Start a node server over a prebuilt index on 127.0.0.1:0. Returns its
+/// `http://` address and the server task (abort to stop).
 pub async fn start_node(
-    index: Arc<TurboQuantIndex>,
+    index: TurboQuantIndex,
+    config: NodeConfig,
+) -> (String, JoinHandle<Result<(), TransportError>>) {
+    start_node_inner(Some(index), config).await
+}
+
+/// Start a node server with NO index (the from-scratch state: awaiting
+/// SetCalibration or AddVectors).
+pub async fn start_empty_node(
+    config: NodeConfig,
+) -> (String, JoinHandle<Result<(), TransportError>>) {
+    start_node_inner(None, config).await
+}
+
+async fn start_node_inner(
+    index: Option<TurboQuantIndex>,
     config: NodeConfig,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

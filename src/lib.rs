@@ -18,6 +18,11 @@
 //! lower bound on the global k-th best, pruning at-or-below the shared floor
 //! never drops a true global top-k hit — the mechanism is lossless.
 
+// tonic Status is the natural error type throughout this gRPC crate; the
+// generated service traits themselves return Result<_, Status>, so boxing
+// it to satisfy result_large_err would only add allocations.
+#![allow(clippy::result_large_err)]
+
 pub mod chunked;
 pub mod config;
 pub mod coordinator;
