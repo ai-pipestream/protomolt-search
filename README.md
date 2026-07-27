@@ -275,91 +275,94 @@ stemmers are case-sensitive on the token surface form exactly as its proto
 documents; the mock would have lowercased it. Offsets slice the original
 surface forms out of the stored text (`"running"`, `"foxes"`).
 
-## Hybrid search (RRF fusion)
+## Hybrid search: cascade (default), global-rank RRF, two-level RRF
 
-`SearchService.HybridSearch{text, vector, k, analysis, legs}` runs BOTH
-legs and fuses them with **reciprocal rank fusion**. No score
-normalization anywhere: turbovec scores and BM25 scores have unrelated
-scales, and fusing ranks sidesteps that entirely.
+`SearchService.HybridSearch{text, vector, k, analysis, legs}` offers
+three modes (`HybridLegOptions.fusion_mode`); unspecified resolves to
+**FUSION_MODE_CASCADE**.
 
-```text
-fused(doc) = Σ_legs weight_leg / (rrf_k + rank_leg(doc))     rrf_k = 60
-```
+### FUSION_MODE_CASCADE (default): vector gate, then BM25 rerank
 
-**Headline guarantee**: with shared calibration and the default
-`FUSION_MODE_GLOBAL_RANK`, distributed hybrid == monolithic hybrid
-EXACTLY for `k <= leg_k` (ids, fused scores, per-leg ranks). Proof in
-one line: any doc in the true global top-`leg_k` of a leg is in its own
-shard's local top-`leg_k` (a shard's leg is a subsequence of the global
-leg, so local rank <= global rank), hence the union of the shard lists
-contains the exact global top-`leg_k`, and merging by raw score
-reconstructs it; single-level RRF over it is the monolithic result.
-This requires globally comparable scores per leg — BM25 already has them
-(global stats), and the vector leg has them under a shared seeded TQ+
-calibration (guarded by `tests/score_layout.rs`: same vector, same
-calibration, different layout => bit-identical score).
+No score fusion at all — the legs stay separate and only the cutoff is
+shared:
 
-Flow for GLOBAL_RANK (the default):
+1. **Phase 1, candidate generation.** The vector leg runs through the
+   EXISTING floor-sharing bidi path (`SearchShard`), so cross-shard
+   early termination applies: once any shard holds k candidates, its
+   k-th best lower-bounds the global cutoff, every shard learns it, and
+   the prefilter skips provably-dead blocks. This is the savings: the
+   GLOBAL_RANK path makes every shard full-scan and ship leg_k hits
+   (at k=10000 over ~10 shards that is the ~10x-k waste); cascade ships
+   roughly k + boundary ties total.
+2. **Tie-complete cutoff.** The pool is `{score >= s_k}` where s_k is
+   the global k-th vector score — score-defined, hence layout-invariant.
+   Floors let docs AT the floor through (only strictly-below is pruned),
+   and the shard's running top-k (StartShardSearch.tie_complete) never
+   evicts candidates tied at its current k-th score, so the whole
+   boundary tie group rides along on every shard. The pool can exceed k
+   by the tie-group size (worst case: a shard of identical scores).
+3. **Phase 2, BM25 rerank.** The query is analyzed (same AnalysisSpec as
+   ingest), each candidate is routed to its owning shard, and just those
+   ids are scored against the postings (`NodeService.Bm25Rescore`:
+   merge-join over the append-only, doc-id-sorted postings lists — no
+   full postings walk) with the global idf stats, so scores are
+   cross-shard comparable. Rerank: BM25 desc, vector desc, doc id asc;
+   return the top k of the pool. Hits carry `vector_score` and
+   `bm25_score` as separate fields plus the final rank — no fused score.
+   The rescore is one stage behind a small seam; more rankers plug in
+   later.
 
-1. The coordinator analyzes the query text (same AnalysisSpec as ingest)
-   and builds global BM25 stats (TermStats fan-out).
-2. `NodeService.ShardLegs` fan-out: each shard returns its RAW per-leg
-   top-`leg_k` lists (no local fusion).
-3. The coordinator merges each leg across shards BY RAW SCORE into
-   global rankings and applies single-level RRF (weights, rrf_k as
-   before). Hits carry the GLOBAL per-leg ranks and raw scores.
+**Honest trade-off**: cascade makes vector recall a GATE for the BM25
+leg — a keyword-strong but vector-weak document never enters the pool
+and is not surfaced by HybridSearch in this mode. Use `Bm25Search` for
+pure lexical queries and GLOBAL_RANK when you want true fusion. The
+k=10000 sweep will benchmark cascade vs GLOBAL_RANK on exactly this
+cutoff saving.
 
-**Tie-breaking**: leg ranks use COMPETITION ranking — docs with exactly
-equal raw scores share one rank (rank = 1 + count of strictly better;
-ranks skip after a tie). This is load-bearing for exactness: quantized
-vector scores tie often, and a positional rank would depend on the
-(shard, doc id) order, which differs between a sharded and a monolithic
-layout. Shared ranks make fused scores layout-invariant. (Only docs
-indistinguishable in EVERY leg can still order differently, and only by
-their layout-dependent ids.) Merge order itself is deterministic: score
-desc, shard asc, doc id asc.
+### FUSION_MODE_GLOBAL_RANK: exact RRF over global rankings
 
-**Calibration handshake** (`SearchService.BroadcastCalibration`): pushes
-ONE TQ+ calibration to every configured shard (fan-out of
-`SetCalibration`), reporting per-node outcomes. Fit once (bootstrap
-sample or a single indexer), broadcast BEFORE ingest, and treat
-recalibration on data drift as a coordinated cluster event: calibration
-is locked for an index's lifetime, so re-seeding means re-ingesting
-every shard together, or scores silently stop being comparable. The
-per-shard `SetCalibration` RPC remains for standalone/two-level use.
-Fork caveat, read from the turbovec source and tested there: seeded
-calibration makes encoding a pure function of (vector, calibration, dim,
-bit width), so scores are comparable across separately built indexes;
-batched multi-query search can differ by ULPs across batch shapes (all
-hybrid queries here are single-query), and comparability requires every
-shard to really share the calibration — broadcast before ingest and
-verify with GetCalibration.
+Shards return raw per-leg top-leg_k lists (`ShardLegs`); the coordinator
+merges each leg across shards BY RAW SCORE into global rankings and
+applies single-level RRF (`fused = Σ weight/(rrf_k + rank)`, rrf_k=60,
+weights default 1.0). With globally comparable scores per leg this is
+EXACTLY the monolithic result for k <= leg_k: a shard's leg is a
+subsequence of the global leg (local rank <= global rank), so the union
+of shard lists contains the exact global top-leg_k and merging by score
+reconstructs it. Leg ranks use competition ranking (tied scores share a
+rank) so fused scores are layout-invariant.
 
-**Fallback**: `FUSION_MODE_TWO_LEVEL` (per request, in
-`HybridLegOptions.fusion_mode`) keeps the previous behavior — each shard
-RRF-fuses its legs locally (`NodeService.HybridShard`) and the
-coordinator RRF-merges the shard lists. Rank-based, so it needs NO
-comparable scores, but it is NOT partition-independent: shard-local
-ranks are compressed relative to global ranks, so results can differ
-from a monolithic index. Use it only when shards cannot share a
-calibration (mixed corpora, third-party indexes).
+### FUSION_MODE_TWO_LEVEL: fallback for incomparable scores
 
-**Per-leg k semantics**: each leg is fetched `leg_k` deep, defaulting to
-`max(k, rrf_k)` — the RRF constant should never exceed a leg's depth.
-`leg_k` is overridable per request; values below `k` are clamped to `k`.
+Each shard RRF-fuses its legs locally (`HybridShard`); the coordinator
+RRF-merges the shard lists. Rank-based, needs NO comparable scores, but
+NOT partition-independent (local ranks are compressed vs global ranks).
+Use only when shards cannot share a calibration.
 
-**Weights**: `vector_weight` / `bm25_weight` (default 1.0 each) act on
-the single-level fusion in GLOBAL_RANK (and at shard level in
-TWO_LEVEL). Proto `0` means "unset -> default"; negatives are rejected.
+### Shared calibration and its caveats
 
+`SearchService.BroadcastCalibration` pushes ONE TQ+ calibration to every
+shard (fan-out of `SetCalibration`, per-node outcomes). Fit once,
+broadcast BEFORE ingest, verify with `GetCalibration`. Calibration is
+locked for an index's lifetime, so recalibration on drift is a
+coordinated re-seed + re-ingest event.
+
+Fork caveats (read from the turbovec source, pinned in
+`tests/score_layout.rs`): with a shared calibration, encoding is a pure
+function of (vector, calibration, dim, bit width), and scores are
+bit-identical across indexes of the SAME shape. Across DIFFERENTLY-SIZED
+indexes the kernel's accumulation order can shift a score by a couple of
+ULPs — so raw vector scores across shards are comparable but only
+bit-exact within same-shape kernel paths; ordering is robust except
+within ULP-ties (the tests assert exact ids/ranks/BM25 bits and vector
+scores within a few ULPs).
+
+**Per-leg k** (GLOBAL_RANK/TWO_LEVEL): leg_k defaults to
+`max(k, rrf_k)`; override in `HybridLegOptions`, clamped to >= k.
+Cascade ignores leg_k/weights/rrf_k (its depth is k plus ties).
 **Deferred alternative**: weighted-linear fusion with global
-normalization stats (normalize each leg's scores with corpus-wide
-min/max or z-stats, then weighted sum). More faithful score mixing, but
-needs global score distribution plumbing — deliberately not built.
+normalization stats — deliberately not built.
 
-Notes: the hybrid vector leg uses local floor seeding only — the
-cross-shard floor-sharing protocol lives on `SearchShard`'s bidi stream
-and does not apply to the unary hybrid path.
+## Ingest flow (write path)
 
 ## Ingest flow (write path)
 
