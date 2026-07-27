@@ -1,0 +1,556 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// VENDORED COPY — do not edit here. Origin:
+//   https://github.com/ai-pipestream/grpc-opennlp-analysis
+//   (src/main/proto/ai/pipestream/opennlp/analysis/v1/analysis.proto)
+// Vendored so this repo can call the OpenNLP analysis sidecar
+// (Analyze → term vectors) without a build-time cross-repo dependency.
+// Sync manually when the upstream proto changes.
+
+syntax = "proto3";
+
+package ai.pipestream.opennlp.analysis.v1;
+
+option java_multiple_files = true;
+option java_package = "ai.pipestream.opennlp.analysis.v1";
+
+// AnalysisService analyzes raw text into the linguistic artifacts that search
+// consumers (BM25 and vector indexing) need: sentences, tokens, stems, entities,
+// term vectors, and chunk embeddings.
+//
+// Offset-fidelity guarantee: every Span in every response is expressed in the
+// character offsets of the ORIGINAL request text, even when the analyzed terms
+// were produced over normalized text (case folding, whitespace collapsing, …).
+// Normalization runs through OpenNLP's offset-aware Alignment, so a term such as
+// "gross" folded from "Groß" still maps back to the exact original span. This is
+// what makes true highlighting in search results possible.
+service AnalysisService {
+  // Analyze runs a configurable annotation pipeline over the request text and
+  // returns the requested layers. The pipeline is model-free by default: no
+  // language model is downloaded or loaded unless the server is explicitly
+  // configured with one.
+  rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+
+  // GetCapabilities reports which features this server instance can actually
+  // serve right now (embeddings on/off and model directory, POS/NER model
+  // availability, available stemmers and normalizer rungs, OpenNLP version).
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+}
+
+// A half-open character span [start, end). ALWAYS in the coordinate space of
+// the original, un-normalized request text — offsets survive normalization via
+// OpenNLP's Alignment, which is what makes true highlighting possible.
+message Span {
+  // Start offset (inclusive), in UTF-16 code units of the original text.
+  int32 start = 1;
+
+  // End offset (exclusive), in UTF-16 code units of the original text.
+  int32 end = 2;
+}
+
+// AnalyzeRequest carries the text and the analysis configuration.
+message AnalyzeRequest {
+  // The text to analyze. Must be non-empty and within the server's size cap
+  // (default 1 MiB). Invalid requests are rejected with INVALID_ARGUMENT.
+  string text = 1;
+
+  // Pipeline configuration. An absent options message selects the server
+  // defaults: whitespace tokenizer, sentence detection on, no stemming,
+  // no term vectors, no embeddings.
+  AnalysisOptions options = 2;
+}
+
+// AnalysisOptions selects the annotators the pipeline runs. All annotators in
+// a single request share one document, so every returned layer refers to the
+// same original text coordinates.
+message AnalysisOptions {
+  // Model-free tokenizers. TOKENIZER_UNSPECIFIED selects the server default
+  // (TOKENIZER_WHITESPACE). Both tokenizers need no language model and produce
+  // tokens with original-text offsets.
+  enum Tokenizer {
+    // Unused zero value; resolves to the server default tokenizer.
+    TOKENIZER_UNSPECIFIED = 0;
+
+    // Splits on whitespace only. Fastest, keeps punctuation attached.
+    TOKENIZER_WHITESPACE = 1;
+
+    // Character-class tokenizer: splits letters, digits, and punctuation into
+    // separate tokens.
+    TOKENIZER_SIMPLE = 2;
+  }
+
+  // Model-free stemmers. STEMMER_UNSPECIFIED behaves as STEMMER_NONE. Every
+  // stemmer except STEMMER_HUNSPELL is algorithmic and needs no language model
+  // or dictionary. STEMMER_HUNSPELL needs a server-configured Hunspell
+  // dictionary (OPENNLP_HUNSPELL_AFF + OPENNLP_HUNSPELL_DIC).
+  //
+  // Stemmers operate on the token surface form as-is: they do not lowercase
+  // and they do not fold case or accents. Fold first (normalizer rungs with
+  // term_vectors, or client-side) if case-insensitive stems are needed.
+  enum Stemmer {
+    // Unused zero value; behaves as STEMMER_NONE.
+    STEMMER_UNSPECIFIED = 0;
+
+    // No stemming; the stems field of the response stays empty.
+    STEMMER_NONE = 1;
+
+    // The classic Porter stemming algorithm (English).
+    STEMMER_PORTER = 2;
+
+    // Snowball English stemmer (Porter2).
+    STEMMER_SNOWBALL_ENGLISH = 3;
+
+    // Snowball German stemmer.
+    STEMMER_SNOWBALL_GERMAN = 4;
+
+    // Snowball French stemmer.
+    STEMMER_SNOWBALL_FRENCH = 5;
+
+    // Snowball Spanish stemmer.
+    STEMMER_SNOWBALL_SPANISH = 6;
+
+    // English minimal stemmer (light, algorithmic).
+    STEMMER_LIGHT_ENGLISH = 7;
+
+    // German light stemmer.
+    STEMMER_LIGHT_GERMAN = 8;
+
+    // French light stemmer.
+    STEMMER_LIGHT_FRENCH = 9;
+
+    // Spanish light stemmer.
+    STEMMER_LIGHT_SPANISH = 10;
+
+    // Snowball Arabic stemmer.
+    STEMMER_SNOWBALL_ARABIC = 11;
+
+    // Snowball Catalan stemmer.
+    STEMMER_SNOWBALL_CATALAN = 12;
+
+    // Snowball Danish stemmer.
+    STEMMER_SNOWBALL_DANISH = 13;
+
+    // Snowball Dutch stemmer.
+    STEMMER_SNOWBALL_DUTCH = 14;
+
+    // Snowball Finnish stemmer.
+    STEMMER_SNOWBALL_FINNISH = 15;
+
+    // Snowball Greek stemmer.
+    STEMMER_SNOWBALL_GREEK = 16;
+
+    // Snowball Hungarian stemmer.
+    STEMMER_SNOWBALL_HUNGARIAN = 17;
+
+    // Snowball Indonesian stemmer.
+    STEMMER_SNOWBALL_INDONESIAN = 18;
+
+    // Snowball Irish stemmer.
+    STEMMER_SNOWBALL_IRISH = 19;
+
+    // Snowball Italian stemmer.
+    STEMMER_SNOWBALL_ITALIAN = 20;
+
+    // Snowball Norwegian stemmer.
+    STEMMER_SNOWBALL_NORWEGIAN = 21;
+
+    // The Snowball Porter program (the reference Porter implementation in
+    // Snowball form; subtly different from STEMMER_PORTER).
+    STEMMER_SNOWBALL_PORTER = 22;
+
+    // Snowball Portuguese stemmer.
+    STEMMER_SNOWBALL_PORTUGUESE = 23;
+
+    // Snowball Romanian stemmer.
+    STEMMER_SNOWBALL_ROMANIAN = 24;
+
+    // Snowball Russian stemmer.
+    STEMMER_SNOWBALL_RUSSIAN = 25;
+
+    // Snowball Swedish stemmer.
+    STEMMER_SNOWBALL_SWEDISH = 26;
+
+    // Snowball Turkish stemmer.
+    STEMMER_SNOWBALL_TURKISH = 27;
+
+    // German minimal stemmer (lighter than STEMMER_LIGHT_GERMAN).
+    STEMMER_MINIMAL_GERMAN = 28;
+
+    // French minimal stemmer (lighter than STEMMER_LIGHT_FRENCH).
+    STEMMER_MINIMAL_FRENCH = 29;
+
+    // Finnish light stemmer.
+    STEMMER_LIGHT_FINNISH = 30;
+
+    // Hungarian light stemmer.
+    STEMMER_LIGHT_HUNGARIAN = 31;
+
+    // Italian light stemmer.
+    STEMMER_LIGHT_ITALIAN = 32;
+
+    // Norwegian light stemmer, Bokmal variety.
+    STEMMER_LIGHT_NORWEGIAN_BOKMAAL = 33;
+
+    // Norwegian light stemmer, Nynorsk variety.
+    STEMMER_LIGHT_NORWEGIAN_NYNORSK = 34;
+
+    // Norwegian minimal stemmer, Bokmal variety.
+    STEMMER_MINIMAL_NORWEGIAN_BOKMAAL = 35;
+
+    // Norwegian minimal stemmer, Nynorsk variety.
+    STEMMER_MINIMAL_NORWEGIAN_NYNORSK = 36;
+
+    // Portuguese light stemmer.
+    STEMMER_LIGHT_PORTUGUESE = 37;
+
+    // Russian light stemmer.
+    STEMMER_LIGHT_RUSSIAN = 38;
+
+    // Spanish minimal stemmer (lighter than STEMMER_LIGHT_SPANISH).
+    STEMMER_MINIMAL_SPANISH = 39;
+
+    // Swedish light stemmer.
+    STEMMER_LIGHT_SWEDISH = 40;
+
+    // Swedish minimal stemmer (lighter than STEMMER_LIGHT_SWEDISH).
+    STEMMER_MINIMAL_SWEDISH = 41;
+
+    // Hunspell dictionary stemmer. Requires the server to be configured with
+    // a dictionary (OPENNLP_HUNSPELL_AFF and OPENNLP_HUNSPELL_DIC); when no
+    // dictionary is configured the request still succeeds, stems stays empty,
+    // and a warning is returned.
+    STEMMER_HUNSPELL = 42;
+  }
+
+  // ISO 639 language code, for example "en" or "de". Informational in the
+  // model-free default pipeline; selects the language of any server-configured
+  // POS/NER models. Defaults to "en".
+  string language = 1;
+
+  // Tokenizer to use. Defaults to TOKENIZER_WHITESPACE.
+  Tokenizer tokenizer = 2;
+
+  // Whether to split the text into sentences. The default sentence detector is
+  // newline-based and model-free, so sentence offsets are always exact.
+  // Sentence spans also scope tokenization when enabled.
+  bool sentence_detection = 3;
+
+  // Whether to run part-of-speech tagging. Requires the server to be
+  // configured with a POS model (OPENNLP_POS_MODEL); when no model is
+  // configured the request still succeeds, pos stays empty, and a warning is
+  // returned. No model is ever downloaded at request time.
+  bool pos_tags = 4;
+
+  // Whether to run named-entity recognition. Requires the server to be
+  // configured with an NER model (OPENNLP_NER_MODEL); when no model is
+  // configured the request still succeeds, entities stays empty, and a warning
+  // is returned. No model is ever downloaded at request time.
+  bool ner = 5;
+
+  // Stemmer to apply per token. Defaults to STEMMER_NONE. When a stemmer is
+  // selected, the response carries one stem per token, parallel to tokens.
+  Stemmer stemmer = 6;
+
+  // Term vector extraction. Absent means disabled.
+  TermVectorOptions term_vectors = 7;
+
+  // Chunk embedding extraction. Absent means disabled. Requires the server to
+  // be configured with an embedding model (OPENNLP_EMBEDDINGS_DIR); when no
+  // model is loaded the request still succeeds, embeddings stays empty, and a
+  // warning is returned.
+  EmbeddingOptions embeddings = 8;
+
+  // Whether to run dictionary lemmatization. Requires the server to be
+  // configured with a lemmatizer dictionary (OPENNLP_LEMMATIZER_DICT); when no
+  // dictionary is configured the request still succeeds, lemmas stays empty,
+  // and a warning is returned. When served, the response carries one lemma per
+  // token, parallel to tokens.
+  bool lemmatize = 9;
+}
+
+// TermVectorOptions controls per-term frequency and occurrence extraction.
+// Terms are produced by running the ORIGINAL text through an aligned
+// normalizer chain and reading each token's normalized form, so equal surface
+// forms ("Groß", "groß", "GROSS" under full case folding) collapse into one
+// term while every occurrence keeps its original-text span.
+message TermVectorOptions {
+  // How much each term vector records.
+  enum Mode {
+    // Unused zero value; resolves to MODE_FULL.
+    MODE_UNSPECIFIED = 0;
+
+    // Frequency plus every occurrence span in ORIGINAL text coordinates.
+    // This is the mode highlighting needs.
+    MODE_FULL = 1;
+
+    // Frequency only; no occurrence spans are recorded or returned. Cheaper
+    // for pure BM25/vector scoring pipelines that never highlight.
+    MODE_SCORING_ONLY = 2;
+  }
+
+  // One rung of the aligned text-normalizer chain. Rungs apply in the fixed
+  // pipeline order of the OpenNLP normalizer builder, not in request order.
+  // Every rung is offset-aware: normalization never breaks original-text
+  // offsets.
+  enum NormalizerRung {
+    // Unused zero value; ignored when present.
+    NORMALIZER_RUNG_UNSPECIFIED = 0;
+
+    // Removes invisible characters (zero-width spaces, soft hyphens, …).
+    NORMALIZER_RUNG_STRIP_INVISIBLE = 1;
+
+    // Collapses runs of whitespace to a single space.
+    NORMALIZER_RUNG_WHITESPACE = 2;
+
+    // Normalizes the Unicode dash zoo to ASCII '-'.
+    NORMALIZER_RUNG_DASHES = 3;
+
+    // Normalizes the Unicode quote zoo to ASCII quotes.
+    NORMALIZER_RUNG_QUOTES = 4;
+
+    // Normalizes Unicode digit variants to ASCII digits.
+    NORMALIZER_RUNG_DIGITS = 5;
+
+    // Unicode full case folding ("Groß" -> "gross"), locale-independent.
+    NORMALIZER_RUNG_FULL_CASE_FOLD = 6;
+
+    // Collapses ellipsis characters ("…") to "...".
+    NORMALIZER_RUNG_ELLIPSIS = 7;
+
+    // Normalizes Unicode bullet characters to '*'.
+    NORMALIZER_RUNG_BULLETS = 8;
+
+    // Converts emoji to their emoticon text equivalents.
+    NORMALIZER_RUNG_EMOJI_TO_EMOTICON = 9;
+
+    // Converts emoticons to their emoji equivalents.
+    NORMALIZER_RUNG_EMOTICON_TO_EMOJI = 10;
+
+    // Expands German umlauts and sharp-s to ASCII digraphs
+    // ("ä" -> "ae", "ö" -> "oe", "ü" -> "ue", "ß" -> "ss").
+    NORMALIZER_RUNG_GERMAN_UMLAUT = 11;
+  }
+
+  // Which layer supplies term identity. This choice decides what a "term" is:
+  //
+  // TOKENS: terms are token surface forms after the aligned normalizer chain;
+  // the rungs define identity (so "Groß"/"GROSS" can collapse under
+  // FULL_CASE_FOLD). The stems layer is not involved.
+  //
+  // STEMS: the stem IS the term identity. Occurrences of different surface
+  // forms group under their common stem ("running"/"runs" -> "run"). The
+  // normalizer rungs are IGNORED for identity in this mode (stems are
+  // computed from the raw token surface forms); the term vector annotator is
+  // bypassed and grouping happens service-side, one entry per distinct stem,
+  // with the occurrence spans of every token carrying that stem, in original
+  // text coordinates. Requires a stemmer other than STEMMER_NONE; requesting
+  // STEMS without a stemmer fails with INVALID_ARGUMENT.
+  enum Source {
+    // Unused zero value; resolves to SOURCE_TOKENS.
+    SOURCE_UNSPECIFIED = 0;
+
+    // Group by normalized token text (the default; rungs define identity).
+    SOURCE_TOKENS = 1;
+
+    // Group by stem (the BM25 mode; the stem defines identity, rungs ignored).
+    SOURCE_STEMS = 2;
+  }
+
+  // Whether term vectors are computed.
+  bool enabled = 1;
+
+  // Recording mode. Defaults to MODE_FULL.
+  Mode mode = 2;
+
+  // Normalizer rungs for term identity. When empty and enabled, the server
+  // default applies: STRIP_INVISIBLE + WHITESPACE + FULL_CASE_FOLD, which is
+  // the chain BM25 consumers usually want. Ignored when source is
+  // SOURCE_STEMS: the stem alone defines identity there.
+  repeated NormalizerRung rungs = 3;
+
+  // Term identity source. Defaults to SOURCE_TOKENS.
+  Source source = 4;
+}
+
+// EmbeddingOptions controls dense vector extraction. The embedding backend is
+// a static (Model2Vec-style) embedding model loaded once at server startup;
+// vectors are computed for the covered text of each annotation of the source
+// layer and stay anchored to original-text spans.
+message EmbeddingOptions {
+  // Which annotation layer is embedded.
+  enum Source {
+    // Unused zero value; resolves to SOURCE_SENTENCES.
+    SOURCE_UNSPECIFIED = 0;
+
+    // Embed each sentence: chunk embeddings for vector search. Implies
+    // sentence detection.
+    SOURCE_SENTENCES = 1;
+
+    // Embed each token: token-level vectors.
+    SOURCE_TOKENS = 2;
+  }
+
+  // Source layer to embed. Defaults to SOURCE_SENTENCES.
+  Source source = 1;
+}
+
+// A token with its original-text span and surface form.
+message Token {
+  // Original-text span of the token.
+  Span span = 1;
+
+  // The exact characters the span covers in the original text.
+  string text = 2;
+
+  // Part-of-speech tag. Empty unless pos_tags was requested AND the server has
+  // a POS model configured.
+  string pos = 3;
+}
+
+// A named entity mention.
+message Entity {
+  // Original-text span of the mention.
+  Span span = 1;
+
+  // Entity type as reported by the model, for example "person" or "location".
+  string type = 2;
+
+  // The exact characters the span covers in the original text.
+  string text = 3;
+}
+
+// A term with its frequency and (in MODE_FULL) every occurrence span in
+// original text coordinates.
+message TermVector {
+  // The normalized term, in the coordinate-free form produced by the
+  // normalizer chain (for example "gross" for "Groß"/"GROSS" under full case
+  // folding).
+  string term = 1;
+
+  // Number of occurrences of the term in the document.
+  int32 frequency = 2;
+
+  // Every occurrence span in ORIGINAL text coordinates. Empty when the mode
+  // was MODE_SCORING_ONLY.
+  repeated Span occurrences = 3;
+}
+
+// A dense vector computed for the covered text of one annotation of the
+// embedding source layer.
+message ChunkEmbedding {
+  // Original-text span the vector was computed from.
+  Span span = 1;
+
+  // The exact characters the span covers in the original text.
+  string text = 2;
+
+  // The embedding vector; dimension depends on the loaded model.
+  repeated float vector = 3;
+}
+
+// AnalyzeResponse carries every requested layer. Layers that were not
+// requested (or that were requested but unavailable — see warnings) are empty.
+message AnalyzeResponse {
+  // Sentence spans in original text coordinates. Present when
+  // sentence_detection was on.
+  repeated Span sentences = 1;
+
+  // Tokens in original text coordinates, in document order.
+  repeated Token tokens = 2;
+
+  // One stem per token, exactly parallel to tokens. Empty when no stemmer was
+  // selected.
+  repeated string stems = 3;
+
+  // Named entity mentions. Empty unless ner was requested AND the server has
+  // an NER model configured.
+  repeated Entity entities = 4;
+
+  // Term vectors in first-occurrence order. Empty unless term vectors were
+  // enabled.
+  repeated TermVector term_vectors = 5;
+
+  // Chunk embeddings, parallel to the annotations of the requested source
+  // layer. Empty unless embeddings were requested AND the server has an
+  // embedding model loaded.
+  repeated ChunkEmbedding embeddings = 6;
+
+  // Non-fatal issues: requested features the server cannot serve (no embedding
+  // model loaded, no POS/NER model configured, …). The analysis itself always
+  // reflects exactly what the response contains.
+  repeated string warnings = 7;
+
+  // One lemma per token, exactly parallel to tokens. Empty unless lemmatize
+  // was requested AND the server has a lemmatizer dictionary configured.
+  // Lookup keys are (lowercased token, POS tag); when no POS model produced
+  // tags, every token looks up with the neutral empty tag, so tag-agnostic
+  // dictionaries work. Words missing from the dictionary come back as "O",
+  // the OpenNLP convention.
+  repeated string lemmas = 8;
+}
+
+// GetCapabilitiesRequest is empty: capabilities describe the whole server.
+message GetCapabilitiesRequest {}
+
+// GetCapabilitiesResponse reports what this server instance can actually serve.
+message GetCapabilitiesResponse {
+  // Version of the wrapped OpenNLP build, for example "3.x-preview-SNAPSHOT".
+  string opennlp_version = 1;
+
+  // Version of this service.
+  string service_version = 2;
+
+  // Whether an embedding model is loaded and embedding requests are served.
+  bool embeddings_enabled = 3;
+
+  // Directory the embedding model was loaded from. Empty when embeddings are
+  // disabled.
+  string embeddings_model_dir = 4;
+
+  // Whether a POS model is configured and pos_tags requests are served.
+  bool pos_tags_available = 5;
+
+  // Whether an NER model is configured and ner requests are served.
+  bool ner_available = 6;
+
+  // Maximum accepted request text size in bytes; larger texts are rejected
+  // with INVALID_ARGUMENT.
+  int32 max_text_bytes = 7;
+
+  // Stemmer option names this build supports (the Stemmer enum values minus
+  // the zero value).
+  repeated string stemmers = 8;
+
+  // Normalizer rung names this build supports (the NormalizerRung enum values
+  // minus the zero value).
+  repeated string normalizer_rungs = 9;
+
+  // Tokenizer option names this build supports (the Tokenizer enum values
+  // minus the zero value).
+  repeated string tokenizers = 10;
+
+  // Server-level warnings, for example "OPENNLP_EMBEDDINGS_DIR is not set;
+  // embedding requests return a warning and no vectors".
+  repeated string warnings = 11;
+
+  // Whether a Hunspell dictionary is configured and STEMMER_HUNSPELL requests
+  // are served.
+  bool hunspell_available = 12;
+
+  // Whether a lemmatizer dictionary is configured and lemmatize requests are
+  // served.
+  bool lemmatizer_available = 13;
+}
