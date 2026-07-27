@@ -215,6 +215,66 @@ query so scoring is uniform.
 versioned binary format, atomic write), flushed with `Flush` and on
 graceful shutdown, loaded at startup when present.
 
+### Live interop with grpc-opennlp-analysis
+
+Verified against the REAL native sidecar (not the test mock). The vendored
+proto is byte-identical to upstream (drift-checked with `diff` before the
+run). Setup:
+
+```bash
+# 1. the sidecar (native binary, no models needed)
+PORT=59101 .../grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis &
+
+# 2. a turbovec-search node+coordinator pointed at it
+turbovec-search --role=both --index=/tmp/tv-live/shard-0.tv \
+    --node-listen=127.0.0.1:50051 --coord-listen=127.0.0.1:50050 \
+    --nodes=127.0.0.1:50051 --analysis-addr=127.0.0.1:59101 &
+
+# 3. ingest + query + highlight (example in this repo)
+cargo run --release --example ingest_demo -- \
+    --node=127.0.0.1:50051 --coordinator=127.0.0.1:50050
+```
+
+`examples/ingest_demo.rs` ingests 4 documents with a real spec (WHITESPACE
+tokenizer, PORTER stemmer, MODE_FULL, SOURCE_STEMS), prints the TermStats
+(terms in the postings are real OpenNLP Porter stems), runs Bm25Search,
+and slices one highlighted span out of the stored raw text. Captured
+output:
+
+```text
+ingested 4 documents (total 4, first global id 0)
+
+TermStats (df per term — these are the REAL Porter stems in the postings):
+  dog        df=2
+  bark       df=2
+  run        df=1
+  runner     df=1
+  fox        df=2
+  kitchen    df=1
+  (shard docs: 4, total doc length: 35)
+
+query "dogs barking":
+  doc 1 score 1.4367  dog@[9,12)  bark@[13,18)
+  doc 0 score 1.3703  dog@[4,8)  bark@[13,20)
+  highlight: doc 1 span [9,12) of "A single dog barks at every passing runner" = "dog" (term "dog")
+
+query "running":
+  doc 0 score 1.1901  run@[35,42)
+  highlight: doc 0 span [35,42) of "The dogs are barking loudly at the running foxes" = "running" (term "run")
+
+query "fox":
+  doc 0 score 0.6851  fox@[43,48)
+  doc 2 score 0.6851  fox@[32,35)
+  highlight: doc 0 span [43,48) of "The dogs are barking loudly at the running foxes" = "foxes" (term "fox")
+```
+
+The evidence proves real interop, not mock behavior: "dogs"/"barking"
+land as stems `dog`/`bark`, "foxes" as `fox` — and doc 2's capitalized
+"Running" does NOT group under `run` (df=1), because the real sidecar's
+stemmers are case-sensitive on the token surface form exactly as its proto
+documents; the mock would have lowercased it. Offsets slice the original
+surface forms out of the stored text (`"running"`, `"foxes"`).
+
 ## Ingest flow (write path)
 
 Shards ingest over gRPC; prebuilt `.tv` files are no longer required.
