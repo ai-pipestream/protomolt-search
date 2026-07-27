@@ -14,6 +14,7 @@
 //! duration of their chunked scan, so a search never observes a
 //! half-applied batch.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -36,7 +37,7 @@ use crate::pb::{
     SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, StartShardSearch,
     StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
 };
-use crate::postings::Bm25Store;
+use crate::postings::{Bm25Index, Bm25Reader, Bm25Store};
 
 /// How a node scans and whether it participates in floor sharing.
 #[derive(Debug, Clone)]
@@ -77,13 +78,53 @@ impl Default for NodeConfig {
 /// Raw leg hits as `(global_doc_id, raw_score)`, score-descending.
 type RawLeg = Vec<(u64, f64)>;
 
+/// The BM25 half's two storage shapes: the heap builder used during
+/// ingest, and the disk-resident mmap reader used after Flush and on
+/// startup. Once resident, a shard holds no postings or document texts
+/// in heap — only the small per-doc tables.
+pub enum Bm25Shard {
+    /// Heap builder (ingest in progress or never flushed).
+    Building(Bm25Store),
+    /// Disk-resident mmap reader over the v3 file.
+    Resident(Bm25Reader),
+}
+
+impl Bm25Shard {
+    fn as_index(&self) -> &dyn Bm25Index {
+        match self {
+            Bm25Shard::Building(s) => s,
+            Bm25Shard::Resident(r) => r,
+        }
+    }
+
+    fn next_doc_id(&self) -> u32 {
+        match self {
+            Bm25Shard::Building(s) => s.next_doc_id(),
+            Bm25Shard::Resident(r) => r.next_doc_id(),
+        }
+    }
+
+    /// Open a `.bm25` path in the right shape: v3 files map
+    /// disk-resident; older formats load into the heap builder (and are
+    /// upgraded to v3 on the next flush).
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let mut magic = [0u8; 8];
+        std::fs::File::open(path)?.read_exact(&mut magic)?;
+        if &magic == b"TVBM2503" {
+            Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
+        } else {
+            Ok(Bm25Shard::Building(Bm25Store::load(path)?))
+        }
+    }
+}
+
 /// The shard's two indexes behind one lock: the turbovec vector index and
 /// the BM25 postings store. Either may be absent (vector-only shards,
 /// docs-only shards, from-scratch shards).
 #[derive(Default)]
 struct ShardState {
     index: Option<TurboQuantIndex>,
-    bm25: Option<Bm25Store>,
+    bm25: Option<Bm25Shard>,
 }
 
 /// The persistence path of a shard's BM25 store: `<index path>.bm25`.
@@ -110,8 +151,8 @@ impl NodeServiceImpl {
         }
     }
 
-    /// Attach a preloaded BM25 store (loaded from `<index path>.bm25`).
-    pub fn with_bm25(self, store: Option<Bm25Store>) -> Self {
+    /// Attach a preloaded BM25 shard (from `<index path>.bm25`).
+    pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         self.state.write().expect("shard state lock poisoned").bm25 = store;
         self
     }
@@ -152,9 +193,9 @@ impl NodeServiceImpl {
     /// Persist the index to its configured path, if any. Shared by the
     /// `Flush` RPC and save-on-shutdown in the binary.
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let mut guard = self.state.write().expect("shard state lock poisoned");
         let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
-        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
+        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.as_index().doc_count());
         let Some(path) = self.config.index_path.clone() else {
             return Ok(FlushResponse {
                 path: String::new(),
@@ -168,11 +209,21 @@ impl NodeServiceImpl {
                 .write(&path)
                 .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
         }
-        if let Some(store) = guard.bm25.as_ref() {
+        // Save the heap builder as v3 and immediately reopen it
+        // disk-resident: after Flush a shard holds no postings or texts
+        // in heap. Already-resident shards have nothing to write.
+        if let Some(Bm25Shard::Building(store)) = guard.bm25.as_ref() {
             let bm25_path = bm25_sidecar_path(&path);
             store
                 .save(&bm25_path)
                 .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
+            guard.bm25 = Some(
+                Bm25Reader::open(&bm25_path)
+                    .map(Bm25Shard::Resident)
+                    .map_err(|e| {
+                        Status::internal(format!("reopen {}: {e}", bm25_path.display()))
+                    })?,
+            );
         }
         let written = guard.index.is_some() || guard.bm25.is_some();
         Ok(FlushResponse {
@@ -342,7 +393,7 @@ impl NodeServiceImpl {
                     total_doc_length: global_total_doc_length,
                     dfs: global_doc_frequencies.to_vec(),
                 };
-                bm25_leg = bm25::top_k(store, terms, &stats, Bm25Params::default(), k)
+                bm25_leg = bm25::top_k(store.as_index(), terms, &stats, Bm25Params::default(), k)
                     .into_iter()
                     .map(|d| (self.config.slot_offset + u64::from(d.doc_id), d.score))
                     .collect();
@@ -667,14 +718,38 @@ impl NodeService for NodeServiceImpl {
             let analyzed =
                 crate::analyzer::analyze_document(&addr, &doc.text, doc.analysis.as_ref()).await?;
             let mut guard = self.state.write().expect("shard state lock poisoned");
+            // A disk-resident shard that receives more documents is first
+            // reloaded into the heap builder (the append path is
+            // bulk-load: build in memory, flush back to v3).
+            if matches!(guard.bm25, Some(Bm25Shard::Resident(_))) {
+                let bm25_path = self
+                    .config
+                    .index_path
+                    .as_ref()
+                    .map(|p| bm25_sidecar_path(p))
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "resident shard has no index path to reload from",
+                        )
+                    })?;
+                let store = Bm25Store::load(&bm25_path).map_err(|e| {
+                    Status::internal(format!("reload {}: {e}", bm25_path.display()))
+                })?;
+                guard.bm25 = Some(Bm25Shard::Building(store));
+            }
             // Shared positional id space with the vector side: the next id
             // is past both indexes' tips.
             let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
-            let store = guard.bm25.get_or_insert_with(Bm25Store::new);
+            let store = guard
+                .bm25
+                .get_or_insert_with(|| Bm25Shard::Building(Bm25Store::new()));
             let doc_id = vector_tip.max(store.next_doc_id());
             if added == 0 {
                 first_id = self.config.slot_offset + u64::from(doc_id);
             }
+            let Bm25Shard::Building(store) = store else {
+                return Err(Status::internal("shard builder unavailable"));
+            };
             store.add_document_with_lineage(
                 doc_id,
                 doc.text,
@@ -694,7 +769,7 @@ impl NodeService for NodeServiceImpl {
             .expect("shard state lock poisoned")
             .bm25
             .as_ref()
-            .map_or(0, |b| b.doc_count());
+            .map_or(0, |b| b.as_index().doc_count());
         Ok(Response::new(AddDocumentsResponse {
             added,
             total,
@@ -710,12 +785,9 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let (doc_count, total_doc_length, doc_frequencies) = match guard.bm25.as_ref() {
             Some(store) => (
-                store.doc_count(),
-                store.total_doc_length(),
-                req.terms
-                    .iter()
-                    .map(|t| store.postings(t).map_or(0, |p| p.len() as u32))
-                    .collect(),
+                store.as_index().doc_count(),
+                store.as_index().total_doc_length(),
+                req.terms.iter().map(|t| store.as_index().df(t)).collect(),
             ),
             None => (0, 0, req.terms.iter().map(|_| 0).collect()),
         };
@@ -756,7 +828,7 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
-                bm25::top_k(store, &req.terms, &stats, params, req.k as usize)
+                bm25::top_k(store.as_index(), &req.terms, &stats, params, req.k as usize)
                     .into_iter()
                     .map(|doc| Bm25Hit {
                         doc_id: self.config.slot_offset + u64::from(doc.doc_id),
@@ -818,7 +890,7 @@ impl NodeService for NodeServiceImpl {
                     .filter(|&&id| id >= offset && (id - offset) <= u64::from(u32::MAX))
                     .map(|id| (id - offset) as u32)
                     .collect();
-                bm25::score_candidates(store, &req.terms, &stats, params, &local)
+                bm25::score_candidates(store.as_index(), &req.terms, &stats, params, &local)
                     .into_iter()
                     .map(|doc| Bm25Hit {
                         doc_id: offset + u64::from(doc.doc_id),
@@ -851,6 +923,7 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let mut documents = Vec::new();
         if let Some(store) = guard.bm25.as_ref() {
+            let store = store.as_index();
             for id in req.doc_ids {
                 if id < offset {
                     continue;
@@ -859,7 +932,7 @@ impl NodeService for NodeServiceImpl {
                 if let Some(text) = store.text(local) {
                     documents.push(StoredDocument {
                         doc_id: id,
-                        text: text.to_string(),
+                        text,
                         lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
                             opinion_id: l.opinion_id,
                             cluster_id: l.cluster_id,

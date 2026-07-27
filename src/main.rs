@@ -133,7 +133,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                         bm25_path.display()
                     );
                     Some(
-                        turbovec_search::postings::Bm25Store::load(&bm25_path)
+                        turbovec_search::node::Bm25Shard::open(&bm25_path)
                             .unwrap_or_else(|e| panic!("load {}: {e}", bm25_path.display())),
                     )
                 } else {
