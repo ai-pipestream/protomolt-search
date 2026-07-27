@@ -1,0 +1,180 @@
+syntax = "proto3";
+
+// Distributed top-k search over turbovec (TurboQuant) shard indexes.
+//
+// Architecture: hub-and-spoke. A client-facing coordinator fans each query
+// out to shard-owner nodes over `NodeService.SearchShard` (bidi stream),
+// merges the per-shard top-k lists, and answers over `SearchService.Search`.
+//
+// Collaborative mid-query floor sharing: while a node scans its shard in
+// chunks, it publishes its current k-th best score (its heap floor) once its
+// top-k heap is full. The coordinator tracks the maximum floor over all
+// shards and pushes it back down to every node; nodes seed the remainder of
+// their scan with it via turbovec's `SearchOptions.initial_threshold`.
+//
+// Lossless invariant: once any shard holds k candidates, its k-th best is a
+// lower bound on the GLOBAL k-th best (the k-th best of a subset never
+// exceeds the k-th best of the union), so pruning candidates that score at
+// or below the max published floor can never drop a true global top-k hit.
+// turbovec keeps candidates scoring exactly at the floor, so ties at the
+// boundary survive.
+package turbovec.search.v1;
+
+// NodeService is the internal shard-owner API. Exactly one node owns a given
+// shard; the coordinator is the only intended client.
+service NodeService {
+  // Runs one distributed search against this node's shard.
+  //
+  // The client sends exactly one `StartShardSearch` first, then any number
+  // of `FloorUpdate` messages (monotonically non-decreasing floors; stale or
+  // lower updates are ignored). The server scans its shard in chunks of
+  // `chunk_blocks` SIMD blocks; between chunks it applies the highest floor
+  // received so far to the next chunk's `initial_threshold`, and after each
+  // chunk in which its local top-k heap is full it emits a `FloorUpdate`
+  // carrying its current k-th best. The stream ends with exactly one
+  // `SearchShardDone` holding the shard's local top-k.
+  //
+  // Cancellation (client closing the stream) aborts the scan between
+  // chunks.
+  rpc SearchShard(stream SearchShardRequest) returns (stream SearchShardResponse);
+
+  // Exposes the shard's TQ+ calibration (per-coordinate shift/scale) plus
+  // basic shape metadata. Scores are only comparable across shards whose
+  // indexes were built with byte-identical calibration, so callers can use
+  // this to verify a cluster is uniformly seeded before serving traffic.
+  rpc GetCalibration(GetCalibrationRequest) returns (GetCalibrationResponse);
+}
+
+// SearchService is the client-facing API served by the coordinator.
+service SearchService {
+  // Fans the query out to every known shard node, merges the shard top-k
+  // lists into one global top-k (score descending; ties broken by shard
+  // index, then vector id), and returns it.
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+// One message on the client-to-server leg of `SearchShard`. The first
+// message on a stream MUST be `start`; `floor_update` messages may follow
+// in any quantity.
+message SearchShardRequest {
+  oneof payload {
+    // Opens the scan: the query vector, the per-shard k, and the
+    // coordinator-assigned request id (log correlation only).
+    StartShardSearch start = 1;
+    // Raises the shard's score floor. Applied to the next chunk boundary,
+    // never retroactively; already-collected candidates are re-validated
+    // by construction because every emitted candidate scored >= every floor
+    // that was in effect when it was collected.
+    FloorUpdate floor_update = 2;
+  }
+}
+
+// Opens a shard scan. Exactly one per `SearchShard` stream, first message.
+message StartShardSearch {
+  // Coordinator-assigned id tying this shard scan to one logical query.
+  // Opaque to the node; echoed in logs only.
+  string request_id = 1;
+  // Number of top hits this shard must return (same k as the global query).
+  uint32 k = 2;
+  // The query vector. Length must equal the shard index dimension.
+  repeated float vector = 3;
+}
+
+// A score floor: a lower bound on the global k-th best score. Flows both
+// directions on the `SearchShard` stream — node to coordinator when the
+// node's heap fills, coordinator to node with the max over all shards.
+message FloorUpdate {
+  // Candidates scoring below this cannot be in the global top-k.
+  // Senders must only raise the floor over the life of a stream; receivers
+  // ignore updates that do not raise their current floor.
+  float floor = 1;
+}
+
+// One message on the server-to-client leg of `SearchShard`.
+message SearchShardResponse {
+  oneof payload {
+    // The node's current k-th best score, emitted after each chunk in which
+    // the local top-k heap is full. Monotonically non-decreasing within a
+    // stream.
+    FloorUpdate floor_update = 1;
+    // Terminal message: the shard's local top-k plus scan statistics.
+    // Exactly one per stream; the server closes the stream after it.
+    SearchShardDone done = 2;
+  }
+}
+
+// Terminal message of a shard scan.
+message SearchShardDone {
+  // The shard's local top-k, score descending, ties broken by vector id.
+  // `vector_id` is the GLOBAL id (node slot offset + local slot), so the
+  // coordinator can merge without knowing shard layouts.
+  repeated ScoredHit hits = 1;
+  // Instrumentation for benchmarking the floor-sharing mechanism.
+  ShardScanStats stats = 2;
+}
+
+// Per-scan counters a node reports in `SearchShardDone`. These exist so the
+// effect of floor sharing is measurable without patching the turbovec scan
+// kernel: `candidates_collected` counts every real (non-padding) candidate
+// the per-chunk searches returned, which is exactly the set of vectors that
+// survived every floor in effect during the scan.
+message ShardScanStats {
+  // How many per-chunk `search_with_options` calls the scan made.
+  uint32 chunk_calls = 1;
+  // Real candidates collected across all chunks (sentinel padding excluded).
+  uint64 candidates_collected = 2;
+  // How many floor values the node published to the coordinator.
+  uint64 floors_published = 3;
+  // How many chunks ran with a coordinator-pushed floor in effect.
+  uint64 floor_updates_applied = 4;
+}
+
+// One scored vector. Ids are global across the cluster (see
+// `SearchShardDone.hits`).
+message ScoredHit {
+  // Global vector id (shard slot offset + local slot).
+  uint64 vector_id = 1;
+  // turbovec score; higher is better. Comparable across shards only when
+  // every shard shares the same TQ+ calibration.
+  float score = 2;
+}
+
+// Empty: the node reports whatever its loaded index holds.
+message GetCalibrationRequest {}
+
+// The shard index's shape and TQ+ calibration.
+message GetCalibrationResponse {
+  // Vector dimensionality the index was built with.
+  uint32 dim = 1;
+  // Quantization bit width (2, 3, or 4).
+  uint32 bit_width = 2;
+  // Number of vectors in this shard.
+  uint64 num_vectors = 3;
+  // Per-coordinate calibration shift (length `dim`). Absent when the index
+  // has no locked calibration (never added to and not seeded).
+  repeated float shift = 4;
+  // Per-coordinate calibration scale (length `dim`); same presence rule as
+  // `shift`.
+  repeated float scale = 5;
+}
+
+// Client-facing search request.
+message SearchRequest {
+  // Optional caller id for log correlation; the coordinator assigns one
+  // when empty and echoes it back.
+  string request_id = 1;
+  // Number of global top hits to return.
+  uint32 k = 2;
+  // The query vector. Length must equal the shard dimension.
+  repeated float vector = 3;
+}
+
+// Client-facing search response.
+message SearchResponse {
+  // Echoes `SearchRequest.request_id` (or the assigned one).
+  string request_id = 1;
+  // Global top-k: score descending, ties broken by shard index then vector
+  // id. Fewer than k entries when the whole corpus holds fewer than k
+  // vectors.
+  repeated ScoredHit hits = 2;
+}

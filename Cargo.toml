@@ -1,0 +1,19 @@
+[package]
+name = "turbovec-search"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Distributed top-k search over turbovec shard indexes with collaborative mid-query floor sharing"
+
+[dependencies]
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream" }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
