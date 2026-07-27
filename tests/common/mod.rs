@@ -9,6 +9,8 @@
 //! sequences) rather than probabilistic.
 #![allow(dead_code, unused_imports)]
 
+pub mod mock;
+
 use tokio::task::JoinHandle;
 use tonic::transport::Error as TransportError;
 use turbovec::TurboQuantIndex;
