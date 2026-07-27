@@ -38,6 +38,7 @@ async fn add_documents(
         tx.send(AddDocumentsRequest {
             text: text.to_string(),
             analysis: spec.clone(),
+            lineage: None,
         })
         .await
         .unwrap();

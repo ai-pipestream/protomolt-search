@@ -398,6 +398,20 @@ message AnalysisSpec {
   repeated int32 normalizer_rungs = 5;
 }
 
+// Lineage for one ingested document: where it came from in the source
+// corpus. Optional and purely additive; documents ingested without it
+// behave exactly as before.
+message DocLineage {
+  // Source opinion id.
+  uint64 opinion_id = 1;
+  // Source cluster id.
+  uint64 cluster_id = 2;
+  // Chunk span start in original-text (char) coordinates.
+  uint32 span_start = 3;
+  // Chunk span end (exclusive).
+  uint32 span_end = 4;
+}
+
 // One document on the `AddDocuments` stream.
 message AddDocumentsRequest {
   // Raw document text. Non-empty, at most 1 MiB (the sidecar's cap).
@@ -405,6 +419,9 @@ message AddDocumentsRequest {
   // Analysis options for this document. Absent = sidecar defaults with
   // term vectors in MODE_FULL over TOKENS.
   AnalysisSpec analysis = 2;
+  // Optional lineage, stored in the doc store and returned by
+  // GetDocuments.
+  DocLineage lineage = 3;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -498,6 +515,8 @@ message StoredDocument {
   uint64 doc_id = 1;
   // The raw text as ingested.
   string text = 2;
+  // Lineage, when the document was ingested with it.
+  optional DocLineage lineage = 3;
 }
 
 // Stored documents, in request order, omitting unknown ids.

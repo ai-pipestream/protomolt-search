@@ -675,7 +675,17 @@ impl NodeService for NodeServiceImpl {
             if added == 0 {
                 first_id = self.config.slot_offset + u64::from(doc_id);
             }
-            store.add_document(doc_id, doc.text, analyzed);
+            store.add_document_with_lineage(
+                doc_id,
+                doc.text,
+                analyzed,
+                doc.lineage.map(|l| crate::postings::DocLineage {
+                    opinion_id: l.opinion_id,
+                    cluster_id: l.cluster_id,
+                    span_start: l.span_start,
+                    span_end: l.span_end,
+                }),
+            );
             added += 1;
         }
         let total = self
@@ -850,6 +860,12 @@ impl NodeService for NodeServiceImpl {
                     documents.push(StoredDocument {
                         doc_id: id,
                         text: text.to_string(),
+                        lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
+                            opinion_id: l.opinion_id,
+                            cluster_id: l.cluster_id,
+                            span_start: l.span_start,
+                            span_end: l.span_end,
+                        }),
                     });
                 }
             }

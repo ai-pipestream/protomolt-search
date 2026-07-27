@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"TVBM2501";
+const MAGIC_V1: &[u8; 8] = b"TVBM2501";
+const MAGIC: &[u8; 8] = b"TVBM2502";
 
 /// One posting: a term occurrence set within one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +31,21 @@ pub struct Posting {
 /// Term data for one document, as produced from the sidecar's term
 /// vectors: `(term, tf, original-text offsets)`.
 pub type DocTerms = Vec<(String, u32, Vec<(u32, u32)>)>;
+
+/// Where a document came from in the source corpus (court pipeline).
+/// Persisted with the doc store; `None` for documents ingested without
+/// lineage (all pre-lineage shards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocLineage {
+    /// Source opinion id.
+    pub opinion_id: u64,
+    /// Source cluster id.
+    pub cluster_id: u64,
+    /// Chunk span start in original-text (char) coordinates.
+    pub span_start: u32,
+    /// Chunk span end (exclusive).
+    pub span_end: u32,
+}
 
 /// One analyzed document ready to be indexed.
 #[derive(Debug, Clone, Default)]
@@ -53,6 +69,9 @@ pub struct Bm25Store {
     total_length: u64,
     /// Raw texts indexed by local doc id; sparse slots hold `None`.
     texts: Vec<Option<String>>,
+    /// Per-document lineage, parallel to `texts` (`None` when the
+    /// document was ingested without lineage).
+    lineages: Vec<Option<DocLineage>>,
 }
 
 impl Bm25Store {
@@ -91,12 +110,28 @@ impl Bm25Store {
         self.texts.get(doc_id as usize).and_then(|t| t.as_deref())
     }
 
+    /// The lineage of a document, if it was ingested with one.
+    pub fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
+        self.lineages.get(doc_id as usize).copied().flatten()
+    }
+
     /// Append one analyzed document with the given local doc id.
     ///
     /// `doc_id` must be `>= next_doc_id()` (append-only); ids above the
     /// current tip create sparse slots, which is how the vector and
     /// document sides share one positional id space.
     pub fn add_document(&mut self, doc_id: u32, text: String, doc: AnalyzedDoc) {
+        self.add_document_with_lineage(doc_id, text, doc, None);
+    }
+
+    /// Like [`Self::add_document`], with corpus lineage attached.
+    pub fn add_document_with_lineage(
+        &mut self,
+        doc_id: u32,
+        text: String,
+        doc: AnalyzedDoc,
+        lineage: Option<DocLineage>,
+    ) {
         let slot = doc_id as usize;
         assert!(
             slot >= self.doc_lengths.len(),
@@ -104,9 +139,11 @@ impl Bm25Store {
         );
         self.doc_lengths.resize(slot + 1, 0);
         self.texts.resize_with(slot + 1, || None);
+        self.lineages.resize_with(slot + 1, || None);
         self.doc_lengths[slot] = doc.length;
         self.total_length += u64::from(doc.length);
         self.texts[slot] = Some(text);
+        self.lineages[slot] = lineage;
         for (term, tf, offsets) in doc.terms {
             self.postings.entry(term).or_default().push(Posting {
                 doc_id,
@@ -148,6 +185,19 @@ impl Bm25Store {
                 None => write_u32(w, u32::MAX)?,
             }
         }
+        // v2: lineage section, parallel to texts.
+        for lineage in &self.lineages {
+            match lineage {
+                Some(l) => {
+                    w.write_all(&[1u8])?;
+                    write_u64(w, l.opinion_id)?;
+                    write_u64(w, l.cluster_id)?;
+                    write_u32(w, l.span_start)?;
+                    write_u32(w, l.span_end)?;
+                }
+                None => w.write_all(&[0u8])?,
+            }
+        }
         write_u32(w, self.postings.len() as u32)?;
         // Term order must be deterministic for a stable file format.
         let mut terms: Vec<&String> = self.postings.keys().collect();
@@ -171,9 +221,14 @@ impl Bm25Store {
 
     fn read_from(r: &mut &[u8]) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
-        if take(r, 8)? != MAGIC {
+        let magic = take(r, 8)?;
+        let has_lineage = if magic == MAGIC {
+            true
+        } else if magic == MAGIC_V1 {
+            false
+        } else {
             return Err(invalid("bad magic"));
-        }
+        };
         let n_slots = read_u32(r)? as usize;
         let mut doc_lengths = Vec::with_capacity(n_slots);
         for _ in 0..n_slots {
@@ -195,6 +250,24 @@ impl Bm25Store {
                     String::from_utf8(bytes.to_vec())
                         .map_err(|_| invalid("invalid utf-8 in doc text"))?,
                 ));
+            }
+        }
+        let mut lineages = vec![None; n_texts];
+        if has_lineage {
+            for lineage in lineages.iter_mut() {
+                let present = take(r, 1)?[0];
+                if present != 0 {
+                    let opinion_id = read_u64(r)?;
+                    let cluster_id = read_u64(r)?;
+                    let span_start = read_u32(r)?;
+                    let span_end = read_u32(r)?;
+                    *lineage = Some(DocLineage {
+                        opinion_id,
+                        cluster_id,
+                        span_start,
+                        span_end,
+                    });
+                }
             }
         }
         let n_terms = read_u32(r)? as usize;
@@ -229,6 +302,7 @@ impl Bm25Store {
             doc_lengths,
             total_length,
             texts,
+            lineages,
         })
     }
 }

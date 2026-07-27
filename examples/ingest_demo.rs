@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tx.send(AddDocumentsRequest {
             text: text.to_string(),
             analysis: Some(spec.clone()),
+            lineage: None,
         })
         .await?;
     }

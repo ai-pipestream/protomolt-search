@@ -57,6 +57,7 @@ async fn add_documents(addr: &str, texts: &[String]) {
             tx.send(AddDocumentsRequest {
                 text,
                 analysis: None,
+                lineage: None,
             })
             .await
             .unwrap();

@@ -114,6 +114,7 @@ async fn start_cluster(
                     tx.send(turbovec_search::pb::AddDocumentsRequest {
                         text,
                         analysis: None,
+                        lineage: None,
                     })
                     .await
                     .unwrap();
@@ -313,7 +314,10 @@ async fn floor_shared_candidates_equal_full_scan_candidates() {
     };
     let pool_on = pool_of(&per_mode[0]);
     let pool_off = pool_of(&per_mode[1]);
-    assert_eq!(pool_on, pool_off, "floor sharing changed the candidate pool");
+    assert_eq!(
+        pool_on, pool_off,
+        "floor sharing changed the candidate pool"
+    );
 
     // The pool is the tie-extended set: doc 0 (top) plus all three
     // boundary-tied docs 1, 4, 8 — 4 members at k=2.
