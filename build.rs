@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "proto/turbovec/search/v1/search.proto",
                 "proto/ai/pipestream/opennlp/analysis/v1/analysis.proto",
+                "proto/tei/v1/tei.proto",
             ],
             &["proto"],
         )?;

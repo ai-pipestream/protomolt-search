@@ -10,6 +10,7 @@ turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "tu
 tonic = "0.12"
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
