@@ -24,15 +24,16 @@ use turbovec::TurboQuantIndex;
 
 use crate::bm25::{self, Bm25Params};
 use crate::chunked::{chunked_topk, DEFAULT_CHUNK_BLOCKS};
+use crate::fusion::{self, Leg};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
     search_shard_request, search_shard_response, AddDocumentsRequest, AddDocumentsResponse,
     AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse,
     FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest, GetCalibrationResponse,
-    GetDocumentsRequest, GetDocumentsResponse, OffsetSpan, ScoredHit, SearchShardDone,
-    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse,
-    ShardScanStats, StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest,
-    TermStatsResponse,
+    GetDocumentsRequest, GetDocumentsResponse, HybridLegHit, HybridShardRequest,
+    HybridShardResponse, OffsetSpan, ScoredHit, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardScanStats,
+    StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
 };
 use crate::postings::Bm25Store;
 
@@ -272,6 +273,125 @@ impl NodeServiceImpl {
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
         Ok(((batch.vectors.len() / dim) as u64, first_id))
     }
+
+    /// Level one of the two-level hybrid fusion: run both legs locally
+    /// and RRF-fuse them (see `SearchService.HybridSearch`).
+    fn run_hybrid(&self, req: HybridShardRequest) -> Result<HybridShardResponse, Status> {
+        let k = req.k as usize;
+        if req.terms.len() != req.global_doc_frequencies.len() {
+            return Err(Status::invalid_argument(
+                "terms and global_doc_frequencies must have the same length",
+            ));
+        }
+        let vector_weight = weight_or_default(req.vector_weight, "vector_weight")?;
+        let bm25_weight = weight_or_default(req.bm25_weight, "bm25_weight")?;
+        let rrf_k = if req.rrf_k == 0.0 {
+            fusion::DEFAULT_RRF_K
+        } else {
+            f64::from(req.rrf_k)
+        };
+        if rrf_k.is_nan() || rrf_k <= 0.0 {
+            return Err(Status::invalid_argument("rrf_k must be positive"));
+        }
+
+        let guard = self.state.read().expect("shard state lock poisoned");
+
+        // Vector leg: the chunked scan (local floor seeding only — the
+        // cross-shard floor-sharing protocol lives on SearchShard's bidi
+        // stream and is not part of the unary hybrid path). A shard with
+        // no vector index, or an empty query vector, contributes an empty
+        // leg rather than failing the whole hybrid query.
+        let mut vector_leg: Vec<(u64, f64)> = Vec::new();
+        if k > 0 && !req.vector.is_empty() {
+            if let Some(index) = guard.index.as_ref() {
+                let dim = index.dim_opt().unwrap_or(0);
+                if req.vector.len() != dim {
+                    return Err(Status::invalid_argument(format!(
+                        "hybrid vector has dim {}, index expects {dim}",
+                        req.vector.len()
+                    )));
+                }
+                if let Some((_, coord, value)) = turbovec::first_invalid_coord(&req.vector, dim) {
+                    return Err(Status::invalid_argument(format!(
+                        "hybrid vector coordinate {coord} is invalid: {value}"
+                    )));
+                }
+                let (hits, _) = chunked_topk(
+                    index,
+                    &req.vector,
+                    k,
+                    self.config.chunk_blocks,
+                    &mut || None,
+                    &mut |_| {},
+                );
+                vector_leg = hits
+                    .into_iter()
+                    .map(|h| {
+                        (
+                            self.config.slot_offset + u64::from(h.slot),
+                            f64::from(h.score),
+                        )
+                    })
+                    .collect();
+            }
+        }
+
+        // BM25 leg: score with the coordinator-supplied GLOBAL stats.
+        let mut bm25_leg: Vec<(u64, f64)> = Vec::new();
+        if k > 0 && !req.terms.is_empty() {
+            if let Some(store) = guard.bm25.as_ref() {
+                let stats = bm25::CorpusStats {
+                    doc_count: req.global_doc_count,
+                    total_doc_length: req.global_total_doc_length,
+                    dfs: req.global_doc_frequencies.clone(),
+                };
+                bm25_leg = bm25::top_k(store, &req.terms, &stats, Bm25Params::default(), k)
+                    .into_iter()
+                    .map(|d| (self.config.slot_offset + u64::from(d.doc_id), d.score))
+                    .collect();
+            }
+        }
+
+        let fused = fusion::rrf_fuse(
+            &[
+                Leg {
+                    hits: vector_leg,
+                    weight: vector_weight,
+                },
+                Leg {
+                    hits: bm25_leg,
+                    weight: bm25_weight,
+                },
+            ],
+            rrf_k,
+            k,
+        );
+        Ok(HybridShardResponse {
+            hits: fused
+                .into_iter()
+                .map(|h| HybridLegHit {
+                    doc_id: h.doc_id,
+                    fused_score: h.fused_score as f32,
+                    vector_rank: h.leg_ranks[0],
+                    vector_score: h.leg_scores[0].unwrap_or(0.0) as f32,
+                    bm25_rank: h.leg_ranks[1],
+                    bm25_score: h.leg_scores[1].unwrap_or(0.0) as f32,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Request weights default to 1.0 (0 means "unset" in the proto);
+/// negatives are rejected.
+fn weight_or_default(value: f32, name: &str) -> Result<f64, Status> {
+    if value == 0.0 {
+        return Ok(1.0);
+    }
+    if value < 0.0 || value.is_nan() {
+        return Err(Status::invalid_argument(format!("{name} must be >= 0")));
+    }
+    Ok(f64::from(value))
 }
 
 #[tonic::async_trait]
@@ -643,5 +763,16 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(GetDocumentsResponse { documents }))
+    }
+
+    async fn hybrid_shard(
+        &self,
+        request: Request<HybridShardRequest>,
+    ) -> Result<Response<HybridShardResponse>, Status> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.run_hybrid(request.into_inner()))
+            .await
+            .map_err(|e| Status::internal(format!("hybrid task failed: {e}")))?
+            .map(Response::new)
     }
 }

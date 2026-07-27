@@ -122,6 +122,12 @@ service NodeService {
   // source). Ids are global; ids outside this shard's range or with no
   // stored text are simply absent from the response.
   rpc GetDocuments(GetDocumentsRequest) returns (GetDocumentsResponse);
+
+  // Runs the shard's LOCAL half of a hybrid query: the chunked vector
+  // scan and the BM25 scoring (with the supplied global stats), fused
+  // with RRF on the node — level one of the settled two-level fusion. The
+  // coordinator fuses the per-shard fused lists again (level two).
+  rpc HybridShard(HybridShardRequest) returns (HybridShardResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
@@ -142,6 +148,14 @@ service SearchService {
   // Hits carry per-term occurrence offsets in original-text coordinates;
   // fetch the raw text with NodeService.GetDocuments to highlight.
   rpc Bm25Search(Bm25SearchRequest) returns (Bm25SearchResponse);
+
+  // Hybrid vector + BM25 search with two-level RRF fusion. Each shard
+  // fuses its LOCAL vector and BM25 legs (HybridShard), then the
+  // coordinator RRF-merges the per-shard fused lists. No score
+  // normalization anywhere: vector and BM25 scores have unrelated scales,
+  // which is exactly what rank fusion sidesteps. Hits carry per-leg ranks
+  // and raw scores from the owning shard for explainability.
+  rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
 }
 
 // One message on the client-to-server leg of `SearchShard`. The first
@@ -475,4 +489,121 @@ message Bm25SearchRequest {
 message Bm25SearchResponse {
   // Global top-k: score descending, ties by shard index then doc id.
   repeated Bm25Hit hits = 1;
+}
+
+// Per-leg options for hybrid (RRF-fused) search. Every field is optional;
+// 0 selects the documented default.
+message HybridLegOptions {
+  // How deep each leg is fetched before fusion. 0 = default
+  // max(k, rrf_k): the RRF constant should never exceed a leg's depth, or
+  // deep-ranked docs could not contribute their 1/(rrf_k + rank) share.
+  // Values below k are clamped to k.
+  uint32 leg_k = 1;
+  // RRF weight of the vector leg at shard-level fusion. 0 = default 1.0.
+  float vector_weight = 2;
+  // RRF weight of the BM25 leg at shard-level fusion. 0 = default 1.0.
+  float bm25_weight = 3;
+  // The RRF constant. 0 = default 60 (the usual value from the RRF paper).
+  float rrf_k = 4;
+}
+
+// One hybrid query against a shard (internal). The shard runs BOTH legs
+// locally — the chunked vector scan and the BM25 scoring with the
+// supplied global stats — and fuses them with RRF before returning.
+// Per-shard-then-coordinator is the settled two-level fusion design; the
+// shared positional doc-ID space is what lets one shard's legs rank the
+// same ids.
+message HybridShardRequest {
+  // Coordinator-assigned request id (log correlation only).
+  string request_id = 1;
+  // Depth of each leg AND of the fused shard list (the coordinator's
+  // leg_k).
+  uint32 k = 2;
+  // Vector leg query (shard dim).
+  repeated float vector = 3;
+  // BM25 leg query terms (already analyzed by the coordinator).
+  repeated string terms = 4;
+  // Global corpus stats for the BM25 leg (see Bm25QueryRequest).
+  uint64 global_doc_count = 5;
+  // Global total document length for the BM25 leg.
+  uint64 global_total_doc_length = 6;
+  // Global per-term document frequencies for the BM25 leg.
+  repeated uint32 global_doc_frequencies = 7;
+  // RRF weight of the vector leg; 0 = default 1.0.
+  float vector_weight = 8;
+  // RRF weight of the BM25 leg; 0 = default 1.0.
+  float bm25_weight = 9;
+  // RRF constant; 0 = default 60.
+  float rrf_k = 10;
+}
+
+// One fused hit in a shard's hybrid result, with per-leg provenance.
+message HybridLegHit {
+  // Global doc id (slot_offset + local id).
+  uint64 doc_id = 1;
+  // Shard-level fused RRF score.
+  float fused_score = 2;
+  // 1-based rank in the shard's vector leg. Absent when the doc is not in
+  // that leg's fetched depth.
+  optional uint32 vector_rank = 3;
+  // Raw vector score (turbovec; comparable across shards via shared
+  // calibration).
+  float vector_score = 4;
+  // 1-based rank in the shard's BM25 leg. Absent when not in that leg.
+  optional uint32 bm25_rank = 5;
+  // Raw BM25 score (computed with global stats; comparable across shards).
+  float bm25_score = 6;
+}
+
+// A shard's fused hybrid top-k.
+message HybridShardResponse {
+  // Fused hits, shard-level RRF score descending.
+  repeated HybridLegHit hits = 1;
+}
+
+// Client-facing hybrid (vector + BM25) search request.
+message HybridSearchRequest {
+  // Optional caller id; assigned when empty and echoed back.
+  string request_id = 1;
+  // BM25 leg query text, analyzed with `analysis` (same options as
+  // ingest).
+  string text = 2;
+  // Vector leg query.
+  repeated float vector = 3;
+  // Number of global fused hits to return.
+  uint32 k = 4;
+  // Analysis options for the BM25 leg query.
+  AnalysisSpec analysis = 5;
+  // Per-leg fusion options; absent = defaults (see HybridLegOptions).
+  HybridLegOptions legs = 6;
+}
+
+// One fused hit, with per-leg provenance from the owning shard so clients
+// can see WHY it ranked. A doc present in only one leg has no rank for
+// the other leg.
+message HybridHit {
+  // Global doc id.
+  uint64 doc_id = 1;
+  // Coordinator-level fused RRF score (this doc appears on exactly one
+  // shard, so this is 1/(rrf_k + shard-list rank)).
+  float fused_score = 2;
+  // Shard that owns the doc.
+  uint32 shard = 3;
+  // 1-based rank in the owning shard's vector leg (absent if not in it).
+  optional uint32 vector_rank = 4;
+  // Raw vector score.
+  float vector_score = 5;
+  // 1-based rank in the owning shard's BM25 leg (absent if not in it).
+  optional uint32 bm25_rank = 6;
+  // Raw BM25 score (global stats).
+  float bm25_score = 7;
+}
+
+// Client-facing hybrid search response.
+message HybridSearchResponse {
+  // Echoes the request id (or the assigned one).
+  string request_id = 1;
+  // Global fused top-k: coordinator-level RRF score descending, ties by
+  // shard then doc id.
+  repeated HybridHit hits = 2;
 }
