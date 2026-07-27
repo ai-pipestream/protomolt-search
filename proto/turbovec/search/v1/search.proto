@@ -43,6 +43,50 @@ service NodeService {
   // indexes were built with byte-identical calibration, so callers can use
   // this to verify a cluster is uniformly seeded before serving traffic.
   rpc GetCalibration(GetCalibrationRequest) returns (GetCalibrationResponse);
+
+  // Pushes a TQ+ calibration to this shard BEFORE its first vector is
+  // added. The shard constructs (or, while still empty, re-constructs) its
+  // index with `TurboQuantIndex::new_with_calibration`, locking the
+  // calibration for the index's lifetime — the same rule turbovec enforces.
+  //
+  // Rules:
+  // - On an empty shard this locks the calibration; sending the SAME
+  //   calibration again is an idempotent no-op (`already_seeded = true`).
+  // - On a non-empty shard, or with a different calibration than the one
+  //   already locked, it is rejected (FAILED_PRECONDITION): calibration
+  //   can never change once vectors exist.
+  // - Field validation errors (bad dim/bit_width, non-finite shift,
+  //   non-positive scale, wrong lengths) are INVALID_ARGUMENT.
+  //
+  // Deployment order for a from-scratch cluster: fit a calibration on a
+  // representative sample, SetCalibration on every shard, then ingest.
+  rpc SetCalibration(SetCalibrationRequest) returns (SetCalibrationResponse);
+
+  // Ingests vectors into this shard. Client-streaming: each message is one
+  // flat batch (`vectors.len()` a multiple of the shard dim); batches are
+  // applied in stream order under the shard's write lock on the blocking
+  // pool, so searches never observe a half-applied batch.
+  //
+  // Ids are SERVER-ASSIGNED and positional: the i-th vector of the shard
+  // gets global id `slot_offset + i` (matching `SearchShardDone.hits`).
+  // turbovec's id-mapped index does not support the masked, floor-seeded
+  // scan this service is built around, so client-chosen ids are out of
+  // scope; ingestion order defines identity.
+  //
+  // If the shard has no index yet (started empty, no SetCalibration), the
+  // first batch constructs one: with `dim` from the request (required then)
+  // and the shard's configured bit width, UNSEEDED — turbovec will fit
+  // calibration from that first batch. Mixing unseeded-from-scratch shards
+  // with seeded shards yields incomparable scores; seed first instead.
+  //
+  // Dimension mismatches and non-finite coordinates are INVALID_ARGUMENT.
+  rpc AddVectors(stream AddVectorsRequest) returns (AddVectorsResponse);
+
+  // Persists the shard's index to its configured path (the `index` path of
+  // its config entry) in turbovec's atomic .tv format. A restarted node
+  // with the same config comes back with all ingested vectors. On a shard
+  // with no persistence path configured this is a no-op (`written=false`).
+  rpc Flush(FlushRequest) returns (FlushResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
@@ -156,6 +200,65 @@ message GetCalibrationResponse {
   // Per-coordinate calibration scale (length `dim`); same presence rule as
   // `shift`.
   repeated float scale = 5;
+}
+
+// Pushes a TQ+ calibration to a shard (see `NodeService.SetCalibration`).
+message SetCalibrationRequest {
+  // Vector dimensionality the shard index must have.
+  uint32 dim = 1;
+  // Quantization bit width (2, 3, or 4).
+  uint32 bit_width = 2;
+  // Per-coordinate calibration shift (length `dim`).
+  repeated float shift = 3;
+  // Per-coordinate calibration scale (length `dim`); every entry > 0.
+  repeated float scale = 4;
+}
+
+// Result of a `SetCalibration` call.
+message SetCalibrationResponse {
+  // True when the pushed calibration was already locked on this shard
+  // (idempotent retry); false when this call locked it.
+  bool already_seeded = 1;
+}
+
+// One batch on the `AddVectors` stream.
+message AddVectorsRequest {
+  // Flat row-major batch: `vectors.len()` must be a multiple of the shard
+  // dim. Every coordinate must be finite and |value| < 1e16 (turbovec's
+  // input rule).
+  repeated float vectors = 1;
+  // Optional explicit dim. 0 means "use the shard's known dim" (from its
+  // index or seeded calibration). Required when the shard has no index
+  // and no seeded calibration yet; rejected if it disagrees with a known
+  // dim.
+  uint32 dim = 2;
+}
+
+// Terminal response of an `AddVectors` stream.
+message AddVectorsResponse {
+  // Vectors added over this stream.
+  uint64 added = 1;
+  // Total vectors in the shard after the stream.
+  uint64 total = 2;
+  // Global id assigned to the first vector of this stream
+  // (`slot_offset + shard count before the stream`). Ids are contiguous
+  // per shard in ingestion order.
+  uint64 first_id = 3;
+}
+
+// Empty: flush whatever the shard holds.
+message FlushRequest {}
+
+// Result of a `Flush` call.
+message FlushResponse {
+  // Path the index was written to (empty when `written` is false).
+  string path = 1;
+  // Vectors in the flushed index.
+  uint64 num_vectors = 2;
+  // False when the shard has no persistence path configured (flush is then
+  // a no-op, not an error — a purely in-memory shard is a legitimate
+  // configuration).
+  bool written = 3;
 }
 
 // Client-facing search request.
