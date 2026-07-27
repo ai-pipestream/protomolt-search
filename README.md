@@ -275,6 +275,63 @@ stemmers are case-sensitive on the token surface form exactly as its proto
 documents; the mock would have lowercased it. Offsets slice the original
 surface forms out of the stored text (`"running"`, `"foxes"`).
 
+## Hybrid search (RRF fusion)
+
+`SearchService.HybridSearch{text, vector, k, analysis, legs}` runs BOTH
+legs and fuses them with **reciprocal rank fusion**. No score
+normalization anywhere: turbovec scores and BM25 scores have unrelated
+scales, and fusing ranks sidesteps that entirely.
+
+```text
+fused(doc) = Σ_legs weight_leg / (rrf_k + rank_leg(doc))     rrf_k = 60
+```
+
+**Two-level fusion** (the shared positional doc-ID space is what makes it
+work — both legs rank the same ids on a shard):
+
+1. **Shard level** (`NodeService.HybridShard`): each node runs its local
+   vector leg (chunked scan) and BM25 leg (global stats supplied by the
+   coordinator) and RRF-fuses them into one ranked list.
+2. **Coordinator level**: the coordinator analyzes the query text (same
+   AnalysisSpec as ingest), builds global BM25 stats (TermStats fan-out),
+   collects the per-shard fused lists, and RRF-merges them into the
+   global top-k.
+
+**Per-leg k semantics**: each leg is fetched `leg_k` deep, defaulting to
+`max(k, rrf_k)` — the RRF constant should never exceed a leg's depth, or
+deep-ranked docs could not contribute their `1/(rrf_k + rank)` share.
+`leg_k` is overridable per request (`HybridLegOptions.leg_k`); values
+below `k` are clamped to `k`.
+
+**Weights**: `vector_weight` / `bm25_weight` (default 1.0 each) act at
+shard-level fusion; the coordinator merge is unweighted. Proto `0` means
+"unset → default"; negatives are rejected.
+
+**Explainability**: every hit carries its per-leg 1-based ranks and raw
+scores from the owning shard (absent when the doc is not in that leg), so
+clients can see why it ranked.
+
+**Approximation note (read this)**: two-level RRF is NOT
+partition-independent — it is not, in general, identical to fusing the
+union of all docs in one shot. Counterexample: docs A1,A2 on shard A and
+B1 on shard B, vector order A1,B1,A2, BM25 order B1,A2,A1. Single-level
+RRF ranks B1 above A1 (1/62+1/61 vs 1/61+1/63); two-level fusion ties
+them at 1/61 and the shard tie-break puts A1 first. The ranks a shard
+reports are LOCAL (compressed), while a monolithic index ranks globally.
+`tests/hybrid.rs` asserts exact distributed == monolithic equality on a
+partition-stable corpus (constructed so local and global orders
+coincide), which proves the machinery lossless; it is not a theorem
+about arbitrary data.
+
+**Deferred alternative**: weighted-linear fusion with global
+normalization stats (normalize each leg's scores with corpus-wide
+min/max or z-stats, then weighted sum). More faithful score mixing, but
+needs global score distribution plumbing — deliberately not built.
+
+Notes: the hybrid vector leg uses local floor seeding only — the
+cross-shard floor-sharing protocol lives on `SearchShard`'s bidi stream
+and does not apply to the unary `HybridShard` path.
+
 ## Ingest flow (write path)
 
 Shards ingest over gRPC; prebuilt `.tv` files are no longer required.
@@ -404,6 +461,8 @@ losslessness at k=1000 over a 24k corpus.
   and the coordinator's floor tracker.
 - `src/postings.rs` / `src/bm25.rs` — the BM25 postings index, doc store,
   persistence, and scoring (with externally supplied global stats).
+- `src/fusion.rs` — reciprocal rank fusion over scored legs, with per-leg
+  provenance. Used at both fusion levels.
 - `src/analyzer.rs` — the analysis-sidecar client (text in, term vectors
   out). No local analysis by design.
 - `src/node.rs` / `src/coordinator.rs` — the two gRPC services. The node
@@ -419,7 +478,8 @@ losslessness at k=1000 over a 24k corpus.
   mid-scan injection, ingest/calibration rules, a multi-process
   ingest-and-restart acceptance test, BM25 tests with a mock analysis
   sidecar (postings, distributed-vs-monolithic equality, local-stats
-  regression guard, STEMS identity, flush persistence), and the
+  regression guard, STEMS identity, flush persistence), hybrid fusion
+  tests (determinism, provenance, partition-stable exactness), and the
   skipped-work benchmark.
 
 ## Limitations
@@ -446,9 +506,10 @@ losslessness at k=1000 over a 24k corpus.
   small patch to the turbovec kernel.
 - **Postings are append-only and unscored-deleted.** No document deletes
   or updates; a changed document must be re-ingested as a new id.
-- **No vector+BM25 fusion yet.** RRF hybrid search (reciprocal rank fusion
-  of the two rankings) was considered for this phase and deferred: the two
-  query paths are independent and composable, but a fused `Search` oneof
-  wants its own design pass (weights, k semantics per leg).
+- **Hybrid fusion is approximate across shards.** Two-level RRF (shard
+  fuses locally, coordinator fuses shard lists) is not
+  partition-independent; see the hybrid section for a counterexample.
+  Weighted-linear fusion with global normalization is the deferred
+  alternative.
 - **No node-local BM25 shortcut.** Single-node deployments go through the
   same coordinator flow (a 1-node fan-out).
