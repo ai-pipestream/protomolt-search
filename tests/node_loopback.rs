@@ -34,6 +34,7 @@ async fn drive_scan(addr: &str, query: &[f32], inject_floor: Option<f32>) -> Sca
             request_id: "loopback".to_string(),
             k: K,
             vector: query.to_vec(),
+            tie_complete: false,
         })),
     })
     .await

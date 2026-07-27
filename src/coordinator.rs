@@ -14,12 +14,12 @@ use crate::merge::{merge_topk, FloorTracker};
 use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
-    search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25SearchRequest,
-    Bm25SearchResponse, BroadcastCalibrationRequest, BroadcastCalibrationResponse,
-    CalibrationApplyResult, FloorUpdate, FusionMode, HybridHit, HybridSearchRequest,
-    HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
-    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
-    ShardLegsRequest, ShardScanStats, StartShardSearch, TermStatsRequest,
+    search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest,
+    Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
+    BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, FloorUpdate, FusionMode,
+    HybridHit, HybridSearchRequest, HybridSearchResponse, HybridShardRequest, ScoredHit,
+    SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse,
+    SetCalibrationRequest, ShardLegsRequest, ShardScanStats, StartShardSearch, TermStatsRequest,
 };
 
 /// Process-unique request id counter for coordinator-assigned ids.
@@ -463,6 +463,7 @@ impl CoordinatorServiceImpl {
         request_id: &str,
         vector: &[f32],
         k: u32,
+        tie_complete: bool,
     ) -> Result<FanoutResult, Status> {
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
@@ -489,6 +490,7 @@ impl CoordinatorServiceImpl {
                         request_id: request_id.to_string(),
                         k,
                         vector: vector.to_vec(),
+                        tie_complete,
                     })),
                 })
                 .await
@@ -572,14 +574,138 @@ impl CoordinatorServiceImpl {
             }
         }
 
-        let hits = merge_topk(shard_hits, k as usize)
+        let hits = merge_topk(shard_hits.iter().cloned(), k as usize)
             .into_iter()
             .map(|h| ScoredHit {
                 vector_id: h.vector_id,
                 score: h.score,
             })
             .collect();
-        Ok(FanoutResult { hits, shard_stats })
+        Ok(FanoutResult {
+            hits,
+            shard_stats,
+            shard_hits,
+        })
+    }
+
+    /// Cascade hybrid (FUSION_MODE_CASCADE): no score fusion.
+    ///
+    /// Phase 1 — candidate generation through the EXISTING floor-sharing
+    /// bidi vector path with the tie-complete option: cross-shard early
+    /// termination applies (the cutoff is the savings), and every doc
+    /// tied at the boundary score survives on every shard. The pool is
+    /// `{score >= s_k}` where `s_k` is the global k-th vector score, so
+    /// it can exceed k by the boundary tie-group size — score-defined,
+    /// hence layout-invariant.
+    ///
+    /// Phase 2 — BM25 rerank behind the rescore seam: analyze the query,
+    /// route each candidate to its owning shard (Bm25Rescore with the
+    /// global stats), then rerank the pool by BM25 desc, vector desc,
+    /// doc id asc, and return the top `k`. More rankers plug in behind
+    /// this same seam later (one stage, no framework).
+    pub async fn fanout_cascade(
+        &self,
+        request_id: &str,
+        text: &str,
+        vector: &[f32],
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+    ) -> Result<Vec<CascadeHit>, Status> {
+        if k == 0 || vector.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Phase 1: floor-shared, tie-complete vector candidates.
+        let phase1 = self.fanout_search(request_id, vector, k, true).await?;
+        let mut all: Vec<(u64, u32, f64)> = Vec::new(); // (doc_id, shard, score)
+        for (shard, hits) in &phase1.shard_hits {
+            for &(doc_id, score) in hits {
+                all.push((doc_id, *shard, f64::from(score)));
+            }
+        }
+        all.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        let boundary = if all.len() >= k as usize {
+            all[k as usize - 1].2
+        } else {
+            f64::NEG_INFINITY
+        };
+        let pool: Vec<(u64, u32, f64)> = all.into_iter().filter(|h| h.2 >= boundary).collect();
+
+        // Query analysis + global BM25 stats for phase 2.
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+        })?;
+        let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+        let mut terms: Vec<String> = Vec::new();
+        for (term, _, _) in analyzed.terms {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+        let global = self.global_bm25_stats(&terms).await?;
+
+        // Phase 2: route candidates to their owning shards for rescoring.
+        let mut by_shard: std::collections::HashMap<u32, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (doc_id, shard, _) in &pool {
+            by_shard.entry(*shard).or_default().push(*doc_id);
+        }
+        let mut rescore_tasks = Vec::with_capacity(by_shard.len());
+        for (shard, ids) in by_shard {
+            let node = self.node_addrs[shard as usize].clone();
+            let request = Bm25RescoreRequest {
+                terms: terms.clone(),
+                global_doc_count: global.doc_count,
+                global_total_doc_length: global.total_doc_length,
+                global_doc_frequencies: global.dfs.clone(),
+                candidate_ids: ids,
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
+            };
+            rescore_tasks.push(tokio::spawn(async move {
+                let mut client = NodeServiceClient::connect(node.clone())
+                    .await
+                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
+                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+                client
+                    .bm25_rescore(request)
+                    .await
+                    .map(|r| r.into_inner().hits)
+            }));
+        }
+        let mut bm25_of: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+        for task in rescore_tasks {
+            for hit in task
+                .await
+                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??
+            {
+                bm25_of.insert(hit.doc_id, f64::from(hit.score));
+            }
+        }
+
+        // Rerank: BM25 desc, vector score desc, doc id asc. Top k of the
+        // (possibly larger) tie-extended pool.
+        let mut ranked: Vec<CascadeHit> = pool
+            .into_iter()
+            .map(|(doc_id, shard, vector_score)| CascadeHit {
+                doc_id,
+                rank: 0,
+                shard,
+                vector_score: vector_score as f32,
+                bm25_score: bm25_of.get(&doc_id).copied().unwrap_or(0.0) as f32,
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.bm25_score
+                .total_cmp(&a.bm25_score)
+                .then_with(|| b.vector_score.total_cmp(&a.vector_score))
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        ranked.truncate(k as usize);
+        for (i, hit) in ranked.iter_mut().enumerate() {
+            hit.rank = i as u32 + 1;
+        }
+        Ok(ranked)
     }
     /// Push one TQ+ calibration to every configured node (the
     /// shared-calibration handshake that makes vector scores globally
@@ -666,6 +792,11 @@ pub struct FanoutResult {
     pub hits: Vec<ScoredHit>,
     /// Per-shard scan stats, one entry per shard, in completion order.
     pub shard_stats: Vec<Option<ShardScanStats>>,
+    /// The raw per-shard lists (shard index, `(doc_id, score)`), in
+    /// completion order. With `tie_complete` set, a shard's list may
+    /// exceed k by its boundary tie group. The cascade pipeline routes
+    /// candidates by these shard assignments.
+    pub shard_hits: Vec<(u32, Vec<(u64, f32)>)>,
 }
 
 #[tonic::async_trait]
@@ -693,7 +824,9 @@ impl SearchService for CoordinatorServiceImpl {
             req.request_id.clone()
         };
 
-        let result = self.fanout_search(&request_id, &req.vector, req.k).await?;
+        let result = self
+            .fanout_search(&request_id, &req.vector, req.k, false)
+            .await?;
         Ok(Response::new(SearchResponse {
             request_id,
             hits: result.hits,
@@ -759,17 +892,41 @@ impl SearchService for CoordinatorServiceImpl {
             rrf_k,
             fusion_mode: options.fusion_mode(),
         };
-        let hits = self
-            .fanout_hybrid(
-                &request_id,
-                &req.text,
-                &req.vector,
-                req.k,
-                req.analysis.as_ref(),
-                legs,
-            )
-            .await?;
-        Ok(Response::new(HybridSearchResponse { request_id, hits }))
+        match legs.fusion_mode {
+            FusionMode::Cascade | FusionMode::Unspecified => {
+                let cascade_hits = self
+                    .fanout_cascade(
+                        &request_id,
+                        &req.text,
+                        &req.vector,
+                        req.k,
+                        req.analysis.as_ref(),
+                    )
+                    .await?;
+                Ok(Response::new(HybridSearchResponse {
+                    request_id,
+                    hits: Vec::new(),
+                    cascade_hits,
+                }))
+            }
+            _ => {
+                let hits = self
+                    .fanout_hybrid(
+                        &request_id,
+                        &req.text,
+                        &req.vector,
+                        req.k,
+                        req.analysis.as_ref(),
+                        legs,
+                    )
+                    .await?;
+                Ok(Response::new(HybridSearchResponse {
+                    request_id,
+                    hits,
+                    cascade_hits: Vec::new(),
+                }))
+            }
+        }
     }
 
     async fn broadcast_calibration(

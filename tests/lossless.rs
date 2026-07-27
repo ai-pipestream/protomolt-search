@@ -28,7 +28,7 @@ async fn assert_lossless(share_floors: bool) {
     for qi in 0..QUERIES {
         let query = unit_vectors(1, DIM, 0x9E4A_0000 + qi as u64);
         let result = coordinator
-            .fanout_search(&format!("lossless-{qi}"), &query, K)
+            .fanout_search(&format!("lossless-{qi}"), &query, K, false)
             .await
             .expect("fanout search");
 
@@ -81,7 +81,7 @@ async fn distributed_matches_monolithic_at_k_1000() {
     for qi in 0..2u64 {
         let query = unit_vectors(1, DIM, 0xB16B_0000 + qi);
         let result = coordinator
-            .fanout_search(&format!("bigk-{qi}"), &query, BIG_K)
+            .fanout_search(&format!("bigk-{qi}"), &query, BIG_K, false)
             .await
             .expect("fanout search");
 
