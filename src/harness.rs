@@ -6,8 +6,10 @@
 //! uniformly-calibrated `.tv` files that the `turbovec-search` binary loads
 //! via `[[shards]]` entries in the cluster config.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -347,4 +349,30 @@ pub mod mock_analysis {
         );
         (format!("http://{addr}"), handle)
     }
+}
+
+/// Spawn the native OpenNLP analysis sidecar on `port` and wait for its
+/// listener. Returns the child (kill on drop) and its `http://` address.
+/// Used by binaries that want the REAL sidecar; tests use the mock.
+pub fn start_sidecar(binary: &str, port: u16) -> Result<(Child, String), String> {
+    if !Path::new(binary).exists() {
+        return Err(format!("sidecar binary not found at {binary}"));
+    }
+    let mut child = Command::new(binary)
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn sidecar: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok((child, format!("http://127.0.0.1:{port}")));
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("sidecar exited early: {status}"));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err("sidecar never opened its port in 30s".to_string())
 }

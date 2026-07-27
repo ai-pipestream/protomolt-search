@@ -27,10 +27,9 @@
 //! cargo run --release --bin wiki_shakedown
 //! ```
 
-use std::net::TcpStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::Child;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -68,29 +67,8 @@ fn arg(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Start the native sidecar on `port`, waiting for its listener.
-/// Returns the child (killed on drop) and its address.
 fn start_sidecar(port: u16) -> Result<(Child, String), String> {
-    if !Path::new(SIDECAR_BIN).exists() {
-        return Err(format!("sidecar binary not found at {SIDECAR_BIN}"));
-    }
-    let mut child = Command::new(SIDECAR_BIN)
-        .env("PORT", port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn sidecar: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok((child, format!("http://127.0.0.1:{port}")));
-        }
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return Err(format!("sidecar exited early: {status}"));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    Err("sidecar never opened its port in 30s".to_string())
+    turbovec_search::harness::start_sidecar(SIDECAR_BIN, port)
 }
 
 async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shard: usize) {
@@ -106,6 +84,7 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
             tx.send(AddDocumentsRequest {
                 text,
                 analysis: Some(spec.clone()),
+                lineage: None,
             })
             .await
             .unwrap();
