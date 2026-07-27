@@ -493,11 +493,38 @@ runs shard 1. Static membership — both configs list the same node set.
    merged top-10). Or call `SearchService.Search` with any gRPC client
    against `host-a:50050` — proto at `proto/turbovec/search/v1/search.proto`.
 
-6. **The large-k two-machine experiment** (manual, not a CI gate): run the
-   sweep in-process for baseline numbers (`--k=10,100,1000,10000`), then
-   repeat against the 2-machine cluster by pointing a sweep-style client at
-   `host-a:50050`. Watch `candidates_collected` and wall medians per k per
-   mode.
+6. **The large-k two-machine experiment** uses `cluster_sweep`, which
+   drives a pre-existing cluster over the network (no in-process shards).
+   Floor sharing is a node-side flag, so run TWO clusters side by side —
+   same shard files, different ports — and point the binary at both:
+
+   ```bash
+   # per shard, on the machine owning it (setsid to survive ssh):
+   setsid nohup turbovec-search --role=node --index=/tmp/wiki-shards/shard-N.tv \
+       --slot-offset=OFFSET --node-listen=0.0.0.0:PORT \
+       --floor-sharing=true  > node-sharing.log 2>&1 &
+   setsid nohup turbovec-search --role=node --index=/tmp/wiki-shards/shard-N.tv \
+       --slot-offset=OFFSET --node-listen=0.0.0.0:PORT2 \
+       --floor-sharing=false > node-nosharing.log 2>&1 &
+
+   # then, anywhere with corpus access for probe vectors:
+   cluster_sweep \
+     --nodes-sharing=host-a:50061,host-a:50062,krick-1:50063,krick-1:50064 \
+     --nodes-nosharing=host-a:50071,host-a:50072,krick-1:50073,krick-1:50074 \
+     --k=10,100,1000,10000 --queries=20
+   ```
+
+   It reports candidates + wall median/p90 per mode per k and asserts the
+   sharing on/off correctness gate (identical hit signatures) per k.
+   Note: the release binary links system OpenBLAS (`libopenblas.so.0` +
+   `libgfortran.so.5`); on a bare host, ship them next to the binary and
+   start nodes with `LD_LIBRARY_PATH=<that dir>`.
+
+   Executed 2026-07-27 on the wiki shards (4 x 61077 bge-m3 1024d docs;
+   shards 0+1 on krick, 2+3 on krick-1): correctness gate green at every
+   k; candidate reduction from sharing fell from ~7% at k=10 to ~3% at
+   k=10000 (the leg approaches a full scan), with wall medians ~20-24ms
+   and no consistent wall win at this scale.
 
 ## Testing and benchmarking
 
