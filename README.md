@@ -636,6 +636,40 @@ losslessness at k=1000 over a 24k corpus.
   tests (determinism, provenance, partition-stable exactness), and the
   skipped-work benchmark.
 
+## Storage and memory model (disk-resident BM25)
+
+Shard storage has two shapes behind one read surface
+(`postings::Bm25Index`):
+
+- **Heap builder** (`Bm25Store`) — ingest appends here. `Flush` writes
+  the v3 `.bm25` format and immediately reopens the shard disk-resident.
+- **Disk-resident** (`Bm25Reader`) — the v3 file is memory-mapped;
+  postings slices and document texts are read from the map on demand.
+  The OS page cache is the buffer pool (the Lucene model): after
+  `Flush` or on startup with a v3 file, a shard holds NO postings or
+  document texts in heap — only the per-doc length table (4 B/doc) and
+  small lookup structures. Measured: opening a 164 MiB v3 file and
+  serving queries grows RSS by ~11 MiB, versus ~159 MiB for the heap
+  load (`tests/mmap_store.rs`).
+
+v3 layout (single file, atomic write): header with absolute section
+offsets, per-doc lengths, document texts, an on-disk text index
+(fixed-stride entries, so text reads never walk the file), lineage,
+sequential postings (sorted terms), and a fixed-stride term directory
+(binary search per term to its postings offset + df). Pre-v3 files
+still load — into the heap builder, upgraded to v3 on the next flush.
+A disk-resident shard that receives more documents first reloads into
+the heap builder (bulk-load discipline: build in memory, flush back).
+
+This is what makes a corpus larger than machine memory work: the
+postings (~130 GB at full CourtListener scale) and doc text (~40 GB)
+live in page cache shared across all consumers, not per-process heap.
+The turbovec vector index remains heap-resident today (v5 `load()`
+reads packed codes into a Vec and the search repacks a blocked copy) —
+at full-court scale that is ~3 GB packed + ~3 GB blocked across the
+cluster, which fits; mmap support there is a fork-level decision
+(see the limitations list).
+
 ## Limitations
 
 - **Static membership.** The coordinator's node list is fixed at startup;
@@ -660,6 +694,12 @@ losslessness at k=1000 over a 24k corpus.
   small patch to the turbovec kernel.
 - **Postings are append-only and unscored-deleted.** No document deletes
   or updates; a changed document must be re-ingested as a new id.
+- **Vector index is heap-resident.** turbovec v5's `load()` reads
+  packed codes into heap Vecs and materializes a blocked copy for
+  search (~2x packed size). Serving truly oversized vector indexes
+  needs a fork-level packed-bytes abstraction (owned Vec or mmap behind
+  one accessor, plus a paged or mmap-backed blocked cache; ~200-400
+  lines in the fork) — reported, not built here.
 - **Hybrid exactness requires shared calibration.** GLOBAL_RANK fusion
   is exactly monolithic for k <= leg_k, but only while every shard
   shares one TQ+ calibration; recalibration is a coordinated
