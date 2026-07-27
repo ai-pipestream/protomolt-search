@@ -49,8 +49,16 @@ fn analysis_spec() -> AnalysisSpec {
     }
 }
 
+/// Remote-shard mode: stream the chunks and embeddings files shard by
+/// shard into already-running nodes (`--nodes`), instead of building the
+/// join in memory. Keeps the ingest client under a few hundred MB.
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let nodes_arg = arg("nodes", "");
+    if !nodes_arg.is_empty() {
+        return run_remote(nodes_arg).await;
+    }
+
     let chunks_path = arg("chunks", "/work/court-corpus/chunks.ndjson");
     let embeddings_path = arg("embeddings", "/work/court-corpus/embeddings.bin");
     let out_dir = arg("out-dir", "/work/court-corpus/shards");
@@ -285,5 +293,160 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = child.kill();
     }
     eprintln!("\ningest complete; shards persisted under {out_dir}");
+    Ok(())
+}
+
+/// Ingest into already-running shard nodes (e.g. on a second host).
+/// Streams both files per shard instead of holding the full join.
+async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>> {
+    let chunks_path = arg("chunks", "/work/court-corpus/chunks.ndjson");
+    let embeddings_path = arg("embeddings", "/work/court-corpus/embeddings-static.bin");
+    let node_addrs: Vec<String> = nodes_arg
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.starts_with("http://") || s.starts_with("https://") {
+                s.to_string()
+            } else {
+                format!("http://{s}")
+            }
+        })
+        .collect();
+    let n_shards = node_addrs.len();
+    if n_shards == 0 {
+        return Err("--nodes must list at least one node".into());
+    }
+
+    // Counts: positional ids == file order, established by the stage-1
+    // integrity check (chunk count == embedding count).
+    let mut m = 0usize;
+    for chunk in court::read_chunks(std::path::Path::new(&chunks_path))? {
+        chunk?;
+        m += 1;
+    }
+    let per = m / n_shards;
+    eprintln!("remote ingest: {m} chunks over {n_shards} nodes ({per}/shard)");
+
+    // Calibration: stride sample streamed from the embeddings file.
+    let (dim, reader) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
+    let dim = dim as usize;
+    let mut sample: Vec<f32> = Vec::new();
+    for (i, record) in reader.enumerate() {
+        let record = record?;
+        if i % 300 == 0 {
+            sample.extend_from_slice(&record.vector);
+        }
+    }
+    let (shift, scale) = harness::fit_calibration(dim, 4, &sample);
+    eprintln!("calibration fitted on {} sample vectors", sample.len() / dim);
+
+    let coordinator = CoordinatorServiceImpl::new(node_addrs.clone()).with_bm25(
+        Some(arg("analysis-addr", "http://127.0.0.1:59111")),
+        Default::default(),
+    );
+    let results = coordinator
+        .fanout_calibration(&BroadcastCalibrationRequest {
+            dim: dim as u32,
+            bit_width: 4,
+            shift: shift.clone(),
+            scale: scale.clone(),
+        })
+        .await;
+    for r in &results {
+        assert!(r.ok, "calibration rejected by {}: {}", r.node, r.error);
+    }
+    eprintln!("calibration broadcast to {} shards OK", results.len());
+
+    let spec = analysis_spec();
+    for (shard, addr) in node_addrs.iter().enumerate() {
+        let t0 = Instant::now();
+        let start = shard * per;
+        let end = if shard == n_shards - 1 { m } else { start + per };
+
+        // This block's lineage keys, then its vectors (key-joined).
+        let mut keys: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
+        let mut block_chunks: Vec<Chunk> = Vec::with_capacity(end - start);
+        for (i, chunk) in court::read_chunks(std::path::Path::new(&chunks_path))?.enumerate() {
+            if i < start {
+                chunk?;
+                continue;
+            }
+            if i >= end {
+                break;
+            }
+            let chunk = chunk?;
+            keys.insert((chunk.opinion_id, chunk.ordinal));
+            block_chunks.push(chunk);
+        }
+        let (_, reader) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(end - start);
+        let mut block_iter = block_chunks.iter();
+        let mut current = block_iter.next();
+        for record in reader {
+            let record = record?;
+            if !keys.contains(&(record.opinion_id, record.ordinal)) {
+                continue;
+            }
+            let Some(chunk) = current else { break };
+            assert_eq!(
+                (chunk.opinion_id, chunk.ordinal),
+                (record.opinion_id, record.ordinal),
+                "chunk/embedding order mismatch at shard {shard}"
+            );
+            vectors.push(record.vector);
+            current = block_iter.next();
+        }
+        assert_eq!(vectors.len(), end - start, "shard {shard} join incomplete");
+        drop(keys);
+
+        // Documents first (ids 0..), then vectors (slots align).
+        let n = block_chunks.len();
+        let mut client = NodeServiceClient::connect(addr.clone()).await?;
+        let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(64);
+        let spec2 = spec.clone();
+        let feeder = tokio::spawn(async move {
+            for chunk in &block_chunks {
+                tx.send(AddDocumentsRequest {
+                    text: chunk.text.clone(),
+                    analysis: Some(spec2.clone()),
+                    lineage: Some(DocLineage {
+                        opinion_id: chunk.opinion_id,
+                        cluster_id: chunk.cluster_id,
+                        span_start: chunk.span_start,
+                        span_end: chunk.span_end,
+                    }),
+                })
+                .await
+                .unwrap();
+            }
+        });
+        let docs = client.add_documents(ReceiverStream::new(rx)).await?.into_inner();
+        feeder.await?;
+        assert_eq!(docs.added as usize, n);
+
+        let (tx, rx) = mpsc::channel(8);
+        let flat: Vec<f32> = vectors.into_iter().flatten().collect();
+        let vf = tokio::spawn(async move {
+            for batch in flat.chunks(512 * dim) {
+                tx.send(AddVectorsRequest { vectors: batch.to_vec(), dim: dim as u32 })
+                    .await
+                    .unwrap();
+            }
+        });
+        let vecs = client.add_vectors(ReceiverStream::new(rx)).await?.into_inner();
+        vf.await?;
+        assert_eq!(vecs.added as usize, n);
+
+        let flushed = client.flush(FlushRequest {}).await?.into_inner();
+        assert!(flushed.written);
+        eprintln!(
+            "shard {shard}: {n} chunks ingested + flushed ({} vectors, {} docs) in {:?}",
+            flushed.num_vectors,
+            flushed.num_documents,
+            t0.elapsed()
+        );
+    }
+    eprintln!("remote ingest complete");
     Ok(())
 }

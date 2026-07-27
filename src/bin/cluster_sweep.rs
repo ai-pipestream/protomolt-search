@@ -23,7 +23,6 @@
 use std::time::{Duration, Instant};
 
 use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::dataset;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 
 const DEFAULT_DATA_DIR: &str = "/work/opensearch-grpc-knn/distributed_test_data/wikipedia";
@@ -31,12 +30,48 @@ const PART_COUNT: usize = 61_077;
 
 fn arg(key: &str) -> Option<String> {
     let prefix = format!("--{key}=");
-    std::env::args()
-        .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+    std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
 }
 
 fn arg_or(key: &str, default: &str) -> String {
     arg(key).unwrap_or_else(|| default.to_string())
+}
+
+/// One probe: optional (opinion_id, ordinal) lineage plus the vector.
+type Probe = (Option<(u64, u32)>, Vec<f32>);
+
+/// Probe vectors: either from the court embeddings file (--probes-from)
+/// or from the wiki corpus parts (--data-dir).
+fn load_probes(
+    probes_from: &str,
+    data_dir: &str,
+    n_queries: usize,
+) -> Vec<Probe> {
+    if probes_from.is_empty() {
+        (0..n_queries)
+            .map(|qi| {
+                let (part, index) = (qi % 4, 1_000 + (qi / 4) * 9_000 % PART_COUNT);
+                let (vector, _) = turbovec_search::dataset::read_embedding_at(
+                    &std::path::PathBuf::from(format!("{data_dir}/embeddings_part_{part}.bin")),
+                    index,
+                )
+                .expect("read probe vector");
+                (None, vector)
+            })
+            .collect()
+    } else {
+        let (_, reader) = turbovec_search::court::EmbeddingReader::open(probes_from.as_ref())
+            .expect("open probes file");
+        let mut probes = Vec::new();
+        for record in reader {
+            if probes.len() >= n_queries {
+                break;
+            }
+            let record = record.expect("read probe record");
+            probes.push((Some((record.opinion_id, record.ordinal)), record.vector));
+        }
+        probes
+    }
 }
 
 fn node_list(key: &str) -> Vec<String> {
@@ -78,25 +113,15 @@ struct Cell {
     signature: Vec<(u64, u32)>,
 }
 
-async fn run_cell(
-    nodes: &[String],
-    probes: &[(usize, usize)],
-    data_dir: &str,
-    k: u32,
-) -> Cell {
+async fn run_cell(nodes: &[String], probes: &[Probe], k: u32) -> Cell {
     let coordinator = CoordinatorServiceImpl::new(nodes.to_vec());
     let mut walls = Vec::with_capacity(probes.len());
     let mut candidates = 0u64;
     let mut signature = Vec::new();
-    for (qi, &(part, index)) in probes.iter().enumerate() {
-        let (vector, _) = dataset::read_embedding_at(
-            &std::path::PathBuf::from(format!("{data_dir}/embeddings_part_{part}.bin")),
-            index,
-        )
-        .expect("read probe vector");
+    for (qi, (_, vector)) in probes.iter().enumerate() {
         let start = Instant::now();
         let result = coordinator
-            .fanout_search(&format!("sweep-{k}-{qi}"), &vector, k, false)
+            .fanout_search(&format!("sweep-{k}-{qi}"), vector, k, false)
             .await
             .expect("fanout search");
         walls.push(start.elapsed().as_secs_f64() * 1e3);
@@ -104,7 +129,11 @@ async fn run_cell(
             candidates += stats.candidates_collected;
         }
         if qi == 0 {
-            signature = result.hits.iter().map(|h| (h.vector_id, h.score.to_bits())).collect();
+            signature = result
+                .hits
+                .iter()
+                .map(|h| (h.vector_id, h.score.to_bits()))
+                .collect();
         }
     }
     walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -138,10 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ks
     );
 
-    // Deterministic probes spread across the four parts.
-    let probes: Vec<(usize, usize)> = (0..n_queries)
-        .map(|qi| (qi % 4, 1_000 + (qi / 4) * 9_000 % PART_COUNT))
-        .collect();
+    let probes = load_probes(&arg_or("probes-from", ""), &data_dir, n_queries);
 
     println!();
     println!(
@@ -150,8 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut gate_failures = 0;
     for &k in &ks {
-        let on = run_cell(&nodes_sharing, &probes, &data_dir, k).await;
-        let off = run_cell(&nodes_nosharing, &probes, &data_dir, k).await;
+        let on = run_cell(&nodes_sharing, &probes, k).await;
+        let off = run_cell(&nodes_nosharing, &probes, k).await;
         println!(
             "{:>8} {:>8} {:>14} {:>14.3} {:>12.3}",
             k, "on", on.candidates, on.wall_median_ms, on.wall_p90_ms
