@@ -577,9 +577,10 @@ runs shard 1. Static membership — both configs list the same node set.
 
    It reports candidates + wall median/p90 per mode per k and asserts the
    sharing on/off correctness gate (identical hit signatures) per k.
-   Note: the release binary links system OpenBLAS (`libopenblas.so.0` +
-   `libgfortran.so.5`); on a bare host, ship them next to the binary and
-   start nodes with `LD_LIBRARY_PATH=<that dir>`.
+   Since turbovec v5 (block-Hadamard rotation) the release binary is
+   fully self-contained — no OpenBLAS/libgfortran to ship. (Pre-v5
+   builds linked system OpenBLAS and needed `libopenblas.so.0` +
+   `libgfortran.so.5` under `LD_LIBRARY_PATH` on bare hosts.)
 
    Executed 2026-07-27 on the wiki shards (4 x 61077 bge-m3 1024d docs;
    shards 0+1 on krick, 2+3 on krick-1): correctness gate green at every
