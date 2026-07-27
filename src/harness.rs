@@ -355,15 +355,28 @@ pub mod mock_analysis {
 /// listener. Returns the child (kill on drop) and its `http://` address.
 /// Used by binaries that want the REAL sidecar; tests use the mock.
 pub fn start_sidecar(binary: &str, port: u16) -> Result<(Child, String), String> {
+    start_sidecar_with_env(binary, port, &[])
+}
+
+/// Like [`start_sidecar`], with extra environment variables (for
+/// example `OPENNLP_EMBEDDINGS_DIR` to enable static embeddings).
+pub fn start_sidecar_with_env(
+    binary: &str,
+    port: u16,
+    envs: &[(&str, &str)],
+) -> Result<(Child, String), String> {
     if !Path::new(binary).exists() {
         return Err(format!("sidecar binary not found at {binary}"));
     }
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .env("PORT", port.to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn sidecar: {e}"))?;
+        .stderr(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().map_err(|e| format!("spawn sidecar: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
