@@ -117,15 +117,130 @@ cargo build --release
     --nodes=node0:50051,node1:50051,node2:50051
 ```
 
-Every flag has a `TURBOVEC_*` env fallback (`--role`/​`TURBOVEC_ROLE`,
-`--nodes`/`TURBOVEC_NODES`, `--chunk-blocks`/`TURBOVEC_CHUNK_BLOCKS`,
-`--floor-sharing`/`TURBOVEC_FLOOR_SHARING`, `--slot-offset`, `--index`,
-`--demo-vectors`, `--dim`, `--bit-width`, `--node-listen`, `--coord-listen`).
+### Cluster configuration file
+
+For real deployments the binary reads a TOML file (`--config cluster.toml`,
+or `TURBOVEC_CONFIG`). Precedence: **CLI flag > env var > config file >
+default**. Every flag takes `--key=value` or `--key value`.
+
+```toml
+role = "both"                                  # node | coordinator | both
+coord_listen = "0.0.0.0:50050"
+nodes = ["host-a:50051", "krick-1:50051"]      # fan-out order = tie-break order
+chunk_blocks = 64                              # scan chunk size (SIMD blocks)
+floor_sharing = true
+max_message_mib = 64                           # gRPC message cap (both directions)
+
+[[shards]]                                     # shards this process serves
+listen = "0.0.0.0:50051"                       # one NodeService listener per shard
+index = "/data/turbovec/shard-0.tv"
+slot_offset = 0                                # global id base for this shard
+
+[[shards]]
+listen = "0.0.0.0:50052"
+index = "/data/turbovec/shard-1.tv"
+slot_offset = 20000
+```
+
+Membership is **static**: the coordinator's `nodes` list and each node's
+`[[shards]]` set are fixed at startup. Changing topology means editing
+configs and restarting — deliberate for this phase. Single-shard shorthand
+(`--index`, `--demo-vectors`, `--node-listen`, `--slot-offset`) overrides
+the file's `[[shards]]` entirely.
+
+## k-sweep benchmark harness
+
+`sweep` is a second binary that builds a deterministic corpus, serves it as
+N shards on loopback (real gRPC), and sweeps k with floor sharing on and
+off, reporting candidates collected and wall medians/p90 per mode — the
+harness for measuring how sharing's payoff varies with k. It also asserts
+sharing never changes results at any k.
+
+```bash
+cargo run --release --bin sweep -- \
+    --vectors=60000 --dim=128 --shards=3 \
+    --k=10,100,1000,10000 --queries=20 \
+    --chunk-blocks=64 --modes=on,off
+```
+
+`--write-indexes DIR` additionally persists the shards as `.tv` files and
+prints ready-to-paste `[[shards]]` config entries — this is how the indexes
+for a real deployment are produced (shared calibration baked in).
+
+## Two-machine runbook
+
+Topology: host A (this host) runs coordinator + shard 0; host B (`krick-1`)
+runs shard 1. Static membership — both configs list the same node set.
+
+1. **Build and produce shard indexes** on host A:
+
+   ```bash
+   cargo build --release
+   ./target/release/sweep --vectors=100000 --shards=2 --k=10 --queries=1 \
+       --modes=off --write-indexes=/data/turbovec
+   # writes /data/turbovec/shard-0.tv, shard-1.tv (same seeded calibration)
+   ```
+
+   (Any source of `.tv` files works as long as every shard was built with
+   the SAME seeded calibration — that is what makes scores mergeable.
+   Verify with `NodeService.GetCalibration` if in doubt.)
+
+2. **Copy the binary and shard 1 to krick-1:**
+
+   ```bash
+   scp target/release/turbovec-search krick-1:/usr/local/bin/
+   scp /data/turbovec/shard-1.tv krick-1:/data/turbovec/
+   ```
+
+3. **Config on krick-1** (`/etc/turbovec/krick-1.toml`):
+
+   ```toml
+   role = "node"
+   [[shards]]
+   listen = "0.0.0.0:50051"
+   index = "/data/turbovec/shard-1.tv"
+   slot_offset = 50000          # = vectors in shard 0 (contiguous offsets)
+   ```
+
+   Start: `turbovec-search --config /etc/turbovec/krick-1.toml`
+
+4. **Config on host A** (`/etc/turbovec/host-a.toml`):
+
+   ```toml
+   role = "both"
+   coord_listen = "0.0.0.0:50050"
+   nodes = ["host-a:50051", "krick-1:50051"]
+
+   [[shards]]
+   listen = "0.0.0.0:50051"
+   index = "/data/turbovec/shard-0.tv"
+   slot_offset = 0
+   ```
+
+   Start: `turbovec-search --config /etc/turbovec/host-a.toml`
+
+5. **Verify.** From host A (or any host that can reach `host-a:50050`),
+   issue a real search. The binary's built-in check does one:
+
+   ```bash
+   turbovec-search --role=coordinator --nodes=host-a:50051,krick-1:50051 \
+       --coord-listen=127.0.0.1:59999 --demo-query --query-dim=128
+   ```
+
+   (spins a throwaway coordinator against the running nodes and prints the
+   merged top-10). Or call `SearchService.Search` with any gRPC client
+   against `host-a:50050` — proto at `proto/turbovec/search/v1/search.proto`.
+
+6. **The large-k two-machine experiment** (manual, not a CI gate): run the
+   sweep in-process for baseline numbers (`--k=10,100,1000,10000`), then
+   repeat against the 2-machine cluster by pointing a sweep-style client at
+   `host-a:50050`. Watch `candidates_collected` and wall medians per k per
+   mode.
 
 ## Testing and benchmarking
 
 ```bash
-cargo test            # unit + integration (lossless, loopback, benchmark)
+cargo test            # unit + integration (lossless incl. k=1000, loopback, benchmark)
 cargo test --release --test bench_sharing -- --nocapture   # with numbers
 ```
 
@@ -135,31 +250,36 @@ corpus on 3 shards, with and without sharing, and reports
 when its chunk ran — the kernel-visible proxy for skipped work, since the
 kernel exposes no block-skip counter) plus wall-time medians. It asserts
 identical hit sequences in both modes and strictly fewer collected
-candidates with sharing.
+candidates with sharing. `tests/lossless.rs` additionally proves exact
+losslessness at k=1000 over a 24k corpus.
 
 ## Layout
 
 - `proto/turbovec/search/v1/search.proto` — the wire API (heavily
   commented), codegen via `build.rs` + tonic-build.
 - `src/chunked.rs` — the chunked scan (mask per chunk, floor seeding,
-  running heap, publish/poll points). Pure and unit-tested.
+  running heap, publish/poll points). Pure and unit-tested, including
+  k=1000.
 - `src/merge.rs` — global top-k merge (total order: score desc, shard, id)
   and the coordinator's floor tracker.
 - `src/node.rs` / `src/coordinator.rs` — the two gRPC services.
-- `src/config.rs` / `src/main.rs` — CLI/env config and the one-binary
-  process wiring.
-- `tests/` — lossless e2e, NodeService loopback with mid-scan injection,
-  and the skipped-work benchmark.
+- `src/config.rs` / `src/main.rs` — TOML/env/CLI config and process wiring
+  (multi-shard, multi-role).
+- `src/harness.rs` — corpus generation, calibration fitting, shard building
+  and loopback server startup shared by tests and the sweep binary.
+- `src/bin/sweep.rs` — the k-sweep benchmark harness.
+- `tests/` — lossless e2e (k=10 and k=1000), NodeService loopback with
+  mid-scan injection, and the skipped-work benchmark.
 
-## Limitations (phase 1)
+## Limitations
 
 - **Static membership.** The coordinator's node list is fixed at startup;
   no discovery, no re-sharding, no node failure handling beyond surfacing
   the error.
 - **No replication.** Each shard lives on exactly one node.
 - **Calibration is manual.** Nodes must be constructed with the same
-  seeded calibration out of band (the tests do it in-process);
-  `GetCalibration` only verifies, it does not distribute.
+  seeded calibration out of band (`sweep --write-indexes` produces such
+  shards); `GetCalibration` only verifies, it does not distribute.
 - **Per-query streams.** Each query opens a fresh channel + `SearchShard`
   stream per node (no pooling), and vector ids are `slot_offset + slot`
   with contiguous disjoint offsets assigned out of band.
