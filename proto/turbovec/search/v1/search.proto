@@ -128,6 +128,14 @@ service NodeService {
   // with RRF on the node — level one of the settled two-level fusion. The
   // coordinator fuses the per-shard fused lists again (level two).
   rpc HybridShard(HybridShardRequest) returns (HybridShardResponse);
+
+  // Returns the shard's RAW per-leg top-k lists for a hybrid query — no
+  // local fusion. This is the shard side of FUSION_MODE_GLOBAL_RANK: the
+  // coordinator merges the legs across shards by raw score into global
+  // rankings and fuses once. Raw scores must be globally comparable per
+  // leg (shared TQ+ calibration for the vector leg; the supplied global
+  // stats for the BM25 leg).
+  rpc ShardLegs(ShardLegsRequest) returns (ShardLegsResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
@@ -149,13 +157,24 @@ service SearchService {
   // fetch the raw text with NodeService.GetDocuments to highlight.
   rpc Bm25Search(Bm25SearchRequest) returns (Bm25SearchResponse);
 
-  // Hybrid vector + BM25 search with two-level RRF fusion. Each shard
-  // fuses its LOCAL vector and BM25 legs (HybridShard), then the
-  // coordinator RRF-merges the per-shard fused lists. No score
-  // normalization anywhere: vector and BM25 scores have unrelated scales,
-  // which is exactly what rank fusion sidesteps. Hits carry per-leg ranks
-  // and raw scores from the owning shard for explainability.
+  // Hybrid vector + BM25 search with RRF fusion. Default
+  // (FUSION_MODE_GLOBAL_RANK): shards return raw per-leg lists and the
+  // coordinator merges each leg by raw score into global rankings, then
+  // applies single-level RRF — EXACTLY the monolithic result for
+  // k <= leg_k when scores are globally comparable per leg (see
+  // FusionMode). FUSION_MODE_TWO_LEVEL is the rank-based fallback for
+  // incomparable scores. Hits carry global per-leg ranks and raw scores.
   rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
+
+  // Pushes ONE TQ+ calibration to every known shard (fan-out of
+  // NodeService.SetCalibration). This is the shared-calibration handshake
+  // that makes vector scores globally comparable — a prerequisite for
+  // FUSION_MODE_GLOBAL_RANK. Fit the calibration once (bootstrap sample
+  // or a single indexer), broadcast before ingest, and treat
+  // recalibration on data drift as a coordinated cluster event: all
+  // shards must be re-seeded and re-ingested together, or their scores
+  // stop being comparable.
+  rpc BroadcastCalibration(BroadcastCalibrationRequest) returns (BroadcastCalibrationResponse);
 }
 
 // One message on the client-to-server leg of `SearchShard`. The first
@@ -491,9 +510,34 @@ message Bm25SearchResponse {
   repeated Bm25Hit hits = 1;
 }
 
+// How the coordinator fuses the per-shard leg results of a hybrid query.
+enum FusionMode {
+  // Unused zero value; resolves to FUSION_MODE_GLOBAL_RANK.
+  FUSION_MODE_UNSPECIFIED = 0;
+
+  // Default. Shards return RAW per-leg lists (ShardLegs); the coordinator
+  // merges each leg across shards by raw score into GLOBAL rankings and
+  // applies single-level RRF over them. With globally comparable scores
+  // per leg (shared calibration for vectors, global stats for BM25) this
+  // is EXACTLY the monolithic result for k <= leg_k: any doc in the true
+  // global top-leg_k of a leg is in its shard's local top-leg_k (local
+  // rank <= global rank), so the union of shard lists contains the exact
+  // global top-leg_k and merging by score reconstructs it.
+  FUSION_MODE_GLOBAL_RANK = 1;
+
+  // Fallback for incomparable scores: each shard RRF-fuses its legs
+  // locally (HybridShard) and the coordinator RRF-merges the shard lists.
+  // Rank-based and therefore scale-free, but NOT partition-independent —
+  // shard-local ranks are compressed relative to global ranks, so the
+  // result can differ from a monolithic index.
+  FUSION_MODE_TWO_LEVEL = 2;
+}
+
 // Per-leg options for hybrid (RRF-fused) search. Every field is optional;
 // 0 selects the documented default.
 message HybridLegOptions {
+  // Fusion strategy. Absent = FUSION_MODE_GLOBAL_RANK.
+  FusionMode fusion_mode = 5;
   // How deep each leg is fetched before fusion. 0 = default
   // max(k, rrf_k): the RRF constant should never exceed a leg's depth, or
   // deep-ranked docs could not contribute their 1/(rrf_k + rank) share.
@@ -606,4 +650,72 @@ message HybridSearchResponse {
   // Global fused top-k: coordinator-level RRF score descending, ties by
   // shard then doc id.
   repeated HybridHit hits = 2;
+}
+
+// A shard's raw per-leg lists for a hybrid query (FUSION_MODE_GLOBAL_RANK).
+message ShardLegsRequest {
+  // Coordinator-assigned request id (log correlation only).
+  string request_id = 1;
+  // Depth of each leg (the coordinator's leg_k).
+  uint32 k = 2;
+  // Vector leg query (shard dim).
+  repeated float vector = 3;
+  // BM25 leg query terms (already analyzed by the coordinator).
+  repeated string terms = 4;
+  // Global corpus stats for the BM25 leg (see Bm25QueryRequest).
+  uint64 global_doc_count = 5;
+  // Global total document length for the BM25 leg.
+  uint64 global_total_doc_length = 6;
+  // Global per-term document frequencies for the BM25 leg.
+  repeated uint32 global_doc_frequencies = 7;
+}
+
+// One raw leg hit.
+message RawLegHit {
+  // Global doc id (slot_offset + local id).
+  uint64 doc_id = 1;
+  // Raw leg score; globally comparable per leg by the caller's
+  // construction (shared calibration / global BM25 stats).
+  float score = 2;
+}
+
+// A shard's unfused legs, each score-descending.
+message ShardLegsResponse {
+  // Vector leg top-k, raw scores.
+  repeated RawLegHit vector_hits = 1;
+  // BM25 leg top-k, raw scores (global stats).
+  repeated RawLegHit bm25_hits = 2;
+}
+
+// Pushes one TQ+ calibration to every shard (see
+// SearchService.BroadcastCalibration).
+message BroadcastCalibrationRequest {
+  // Vector dimensionality.
+  uint32 dim = 1;
+  // Quantization bit width (2, 3, or 4).
+  uint32 bit_width = 2;
+  // Per-coordinate calibration shift (length `dim`).
+  repeated float shift = 3;
+  // Per-coordinate calibration scale (length `dim`).
+  repeated float scale = 4;
+}
+
+// One node's outcome of a calibration broadcast.
+message CalibrationApplyResult {
+  // The node address, as configured on the coordinator.
+  string node = 1;
+  // Whether the calibration was applied (or was already locked
+  // identically).
+  bool ok = 2;
+  // True when the node already had this exact calibration locked.
+  bool already_seeded = 3;
+  // The failure reason when `ok` is false (for example a non-empty shard,
+  // which locks calibration for the index lifetime).
+  string error = 4;
+}
+
+// Per-node outcomes of a calibration broadcast, in configured node order.
+message BroadcastCalibrationResponse {
+  // One result per configured node.
+  repeated CalibrationApplyResult results = 1;
 }

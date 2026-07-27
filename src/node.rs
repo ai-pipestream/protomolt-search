@@ -31,9 +31,10 @@ use crate::pb::{
     AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse,
     FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest, GetCalibrationResponse,
     GetDocumentsRequest, GetDocumentsResponse, HybridLegHit, HybridShardRequest,
-    HybridShardResponse, OffsetSpan, ScoredHit, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardScanStats,
-    StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    HybridShardResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
+    ShardLegsResponse, ShardScanStats, StartShardSearch, StoredDocument, TermOccurrences,
+    TermStatsRequest, TermStatsResponse,
 };
 use crate::postings::Bm25Store;
 
@@ -72,6 +73,9 @@ impl Default for NodeConfig {
         }
     }
 }
+
+/// Raw leg hits as `(global_doc_id, raw_score)`, score-descending.
+type RawLeg = Vec<(u64, f64)>;
 
 /// The shard's two indexes behind one lock: the turbovec vector index and
 /// the BM25 postings store. Either may be absent (vector-only shards,
@@ -274,6 +278,79 @@ impl NodeServiceImpl {
         Ok(((batch.vectors.len() / dim) as u64, first_id))
     }
 
+    /// Compute both raw legs for a hybrid query: `(vector_leg, bm25_leg)`
+    /// as `(global_doc_id, raw_score)` lists, score-descending.
+    ///
+    /// Vector leg: the chunked scan (local floor seeding only — the
+    /// cross-shard floor-sharing protocol lives on SearchShard's bidi
+    /// stream and is not part of the unary hybrid path). A shard with no
+    /// vector index, or an empty query vector, contributes an empty leg
+    /// rather than failing the whole hybrid query. BM25 leg: scored with
+    /// the coordinator-supplied GLOBAL stats.
+    fn compute_legs(
+        &self,
+        vector: &[f32],
+        terms: &[String],
+        global_doc_count: u64,
+        global_total_doc_length: u64,
+        global_doc_frequencies: &[u32],
+        k: usize,
+    ) -> Result<(RawLeg, RawLeg), Status> {
+        let guard = self.state.read().expect("shard state lock poisoned");
+
+        let mut vector_leg: Vec<(u64, f64)> = Vec::new();
+        if k > 0 && !vector.is_empty() {
+            if let Some(index) = guard.index.as_ref() {
+                let dim = index.dim_opt().unwrap_or(0);
+                if vector.len() != dim {
+                    return Err(Status::invalid_argument(format!(
+                        "hybrid vector has dim {}, index expects {dim}",
+                        vector.len()
+                    )));
+                }
+                if let Some((_, coord, value)) = turbovec::first_invalid_coord(vector, dim) {
+                    return Err(Status::invalid_argument(format!(
+                        "hybrid vector coordinate {coord} is invalid: {value}"
+                    )));
+                }
+                let (hits, _) = chunked_topk(
+                    index,
+                    vector,
+                    k,
+                    self.config.chunk_blocks,
+                    &mut || None,
+                    &mut |_| {},
+                );
+                vector_leg = hits
+                    .into_iter()
+                    .map(|h| {
+                        (
+                            self.config.slot_offset + u64::from(h.slot),
+                            f64::from(h.score),
+                        )
+                    })
+                    .collect();
+            }
+        }
+
+        let mut bm25_leg: Vec<(u64, f64)> = Vec::new();
+        if k > 0 && !terms.is_empty() {
+            if let Some(store) = guard.bm25.as_ref() {
+                let stats = bm25::CorpusStats {
+                    doc_count: global_doc_count,
+                    total_doc_length: global_total_doc_length,
+                    dfs: global_doc_frequencies.to_vec(),
+                };
+                bm25_leg = bm25::top_k(store, terms, &stats, Bm25Params::default(), k)
+                    .into_iter()
+                    .map(|d| (self.config.slot_offset + u64::from(d.doc_id), d.score))
+                    .collect();
+            }
+        }
+
+        Ok((vector_leg, bm25_leg))
+    }
+
     /// Level one of the two-level hybrid fusion: run both legs locally
     /// and RRF-fuse them (see `SearchService.HybridSearch`).
     fn run_hybrid(&self, req: HybridShardRequest) -> Result<HybridShardResponse, Status> {
@@ -294,63 +371,14 @@ impl NodeServiceImpl {
             return Err(Status::invalid_argument("rrf_k must be positive"));
         }
 
-        let guard = self.state.read().expect("shard state lock poisoned");
-
-        // Vector leg: the chunked scan (local floor seeding only — the
-        // cross-shard floor-sharing protocol lives on SearchShard's bidi
-        // stream and is not part of the unary hybrid path). A shard with
-        // no vector index, or an empty query vector, contributes an empty
-        // leg rather than failing the whole hybrid query.
-        let mut vector_leg: Vec<(u64, f64)> = Vec::new();
-        if k > 0 && !req.vector.is_empty() {
-            if let Some(index) = guard.index.as_ref() {
-                let dim = index.dim_opt().unwrap_or(0);
-                if req.vector.len() != dim {
-                    return Err(Status::invalid_argument(format!(
-                        "hybrid vector has dim {}, index expects {dim}",
-                        req.vector.len()
-                    )));
-                }
-                if let Some((_, coord, value)) = turbovec::first_invalid_coord(&req.vector, dim) {
-                    return Err(Status::invalid_argument(format!(
-                        "hybrid vector coordinate {coord} is invalid: {value}"
-                    )));
-                }
-                let (hits, _) = chunked_topk(
-                    index,
-                    &req.vector,
-                    k,
-                    self.config.chunk_blocks,
-                    &mut || None,
-                    &mut |_| {},
-                );
-                vector_leg = hits
-                    .into_iter()
-                    .map(|h| {
-                        (
-                            self.config.slot_offset + u64::from(h.slot),
-                            f64::from(h.score),
-                        )
-                    })
-                    .collect();
-            }
-        }
-
-        // BM25 leg: score with the coordinator-supplied GLOBAL stats.
-        let mut bm25_leg: Vec<(u64, f64)> = Vec::new();
-        if k > 0 && !req.terms.is_empty() {
-            if let Some(store) = guard.bm25.as_ref() {
-                let stats = bm25::CorpusStats {
-                    doc_count: req.global_doc_count,
-                    total_doc_length: req.global_total_doc_length,
-                    dfs: req.global_doc_frequencies.clone(),
-                };
-                bm25_leg = bm25::top_k(store, &req.terms, &stats, Bm25Params::default(), k)
-                    .into_iter()
-                    .map(|d| (self.config.slot_offset + u64::from(d.doc_id), d.score))
-                    .collect();
-            }
-        }
+        let (vector_leg, bm25_leg) = self.compute_legs(
+            &req.vector,
+            &req.terms,
+            req.global_doc_count,
+            req.global_total_doc_length,
+            &req.global_doc_frequencies,
+            k,
+        )?;
 
         let fused = fusion::rrf_fuse(
             &[
@@ -774,5 +802,47 @@ impl NodeService for NodeServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("hybrid task failed: {e}")))?
             .map(Response::new)
+    }
+
+    async fn shard_legs(
+        &self,
+        request: Request<ShardLegsRequest>,
+    ) -> Result<Response<ShardLegsResponse>, Status> {
+        let req = request.into_inner();
+        if req.terms.len() != req.global_doc_frequencies.len() {
+            return Err(Status::invalid_argument(
+                "terms and global_doc_frequencies must have the same length",
+            ));
+        }
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let (vector_hits, bm25_hits) = service.compute_legs(
+                &req.vector,
+                &req.terms,
+                req.global_doc_count,
+                req.global_total_doc_length,
+                &req.global_doc_frequencies,
+                req.k as usize,
+            )?;
+            Ok(ShardLegsResponse {
+                vector_hits: vector_hits
+                    .into_iter()
+                    .map(|(doc_id, score)| RawLegHit {
+                        doc_id,
+                        score: score as f32,
+                    })
+                    .collect(),
+                bm25_hits: bm25_hits
+                    .into_iter()
+                    .map(|(doc_id, score)| RawLegHit {
+                        doc_id,
+                        score: score as f32,
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
+        .map(Response::new)
     }
 }

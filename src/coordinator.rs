@@ -15,9 +15,11 @@ use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
     search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25SearchRequest,
-    Bm25SearchResponse, FloorUpdate, HybridHit, HybridSearchRequest, HybridSearchResponse,
-    HybridShardRequest, ScoredHit, SearchRequest, SearchResponse, SearchShardDone,
-    SearchShardRequest, SearchShardResponse, ShardScanStats, StartShardSearch, TermStatsRequest,
+    Bm25SearchResponse, BroadcastCalibrationRequest, BroadcastCalibrationResponse,
+    CalibrationApplyResult, FloorUpdate, FusionMode, HybridHit, HybridSearchRequest,
+    HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
+    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
+    ShardLegsRequest, ShardScanStats, StartShardSearch, TermStatsRequest,
 };
 
 /// Process-unique request id counter for coordinator-assigned ids.
@@ -190,11 +192,26 @@ impl CoordinatorServiceImpl {
             }
         }
 
-        // Global corpus stats for the BM25 leg.
+        let global = self.global_bm25_stats(&terms).await?;
+        match legs.fusion_mode {
+            FusionMode::TwoLevel => {
+                self.fanout_hybrid_two_level(request_id, vector, k, &terms, &global, legs)
+                    .await
+            }
+            _ => {
+                self.fanout_hybrid_global_rank(vector, k, &terms, &global, legs)
+                    .await
+            }
+        }
+    }
+
+    /// TermStats fan-out: sum every shard's share into GLOBAL BM25 corpus
+    /// stats for `terms`.
+    async fn global_bm25_stats(&self, terms: &[String]) -> Result<CorpusStats, Status> {
         let mut share_tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
             let node = node.clone();
-            let terms = terms.clone();
+            let terms = terms.to_vec();
             share_tasks.push(tokio::spawn(async move {
                 let mut client = NodeServiceClient::connect(node.clone())
                     .await
@@ -218,8 +235,138 @@ impl CoordinatorServiceImpl {
                 stats.doc_frequencies,
             ));
         }
-        let global: CorpusStats = bm25::merge_stats(&shares);
+        Ok(bm25::merge_stats(&shares))
+    }
 
+    /// FUSION_MODE_GLOBAL_RANK: shards return RAW per-leg lists; the
+    /// coordinator merges each leg across shards by raw score into global
+    /// rankings and applies single-level RRF over them. With globally
+    /// comparable scores per leg this is exactly the monolithic result
+    /// for k <= leg_k (see the proto's FusionMode comments).
+    async fn fanout_hybrid_global_rank(
+        &self,
+        vector: &[f32],
+        k: u32,
+        terms: &[String],
+        global: &CorpusStats,
+        legs: HybridLegs,
+    ) -> Result<Vec<HybridHit>, Status> {
+        let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let node = node.clone();
+            let request = ShardLegsRequest {
+                request_id: String::new(),
+                k: legs.leg_k,
+                vector: vector.to_vec(),
+                terms: terms.to_vec(),
+                global_doc_count: global.doc_count,
+                global_total_doc_length: global.total_doc_length,
+                global_doc_frequencies: global.dfs.clone(),
+            };
+            shard_tasks.push(tokio::spawn(async move {
+                let mut client = NodeServiceClient::connect(node.clone())
+                    .await
+                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
+                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+                client
+                    .shard_legs(request)
+                    .await
+                    .map(|r| (shard as u32, r.into_inner()))
+            }));
+        }
+        let mut vector_shards = Vec::with_capacity(shard_tasks.len());
+        let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
+        let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for task in shard_tasks {
+            let (shard, response) = task
+                .await
+                .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))??;
+            for h in &response.vector_hits {
+                owner.entry(h.doc_id).or_insert(shard);
+            }
+            for h in &response.bm25_hits {
+                owner.entry(h.doc_id).or_insert(shard);
+            }
+            vector_shards.push((
+                shard,
+                response
+                    .vector_hits
+                    .into_iter()
+                    .map(|h| (h.doc_id, f64::from(h.score)))
+                    .collect::<Vec<_>>(),
+            ));
+            bm25_shards.push((
+                shard,
+                response
+                    .bm25_hits
+                    .into_iter()
+                    .map(|h| (h.doc_id, f64::from(h.score)))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+
+        // Merge each leg into a GLOBAL ranking by raw score (deterministic
+        // total order; see merge_legs_by_score), then single-level RRF.
+        let vector_global = fusion::merge_legs_by_score(vector_shards);
+        let bm25_global = fusion::merge_legs_by_score(bm25_shards);
+        let fused = fusion::rrf_fuse(
+            &[
+                Leg {
+                    hits: vector_global
+                        .iter()
+                        .map(|&(id, score, _)| (id, score))
+                        .collect(),
+                    weight: if legs.vector_weight == 0.0 {
+                        1.0
+                    } else {
+                        f64::from(legs.vector_weight)
+                    },
+                },
+                Leg {
+                    hits: bm25_global
+                        .iter()
+                        .map(|&(id, score, _)| (id, score))
+                        .collect(),
+                    weight: if legs.bm25_weight == 0.0 {
+                        1.0
+                    } else {
+                        f64::from(legs.bm25_weight)
+                    },
+                },
+            ],
+            legs.rrf_k,
+            k as usize,
+        );
+
+        // Provenance: global per-leg ranks, raw scores, and the owning
+        // shard (a doc lives on exactly one shard's lists).
+        Ok(fused
+            .into_iter()
+            .map(|f| HybridHit {
+                doc_id: f.doc_id,
+                fused_score: f.fused_score as f32,
+                shard: owner.get(&f.doc_id).copied().unwrap_or(0),
+                vector_rank: f.leg_ranks[0],
+                vector_score: f.leg_scores[0].unwrap_or(0.0) as f32,
+                bm25_rank: f.leg_ranks[1],
+                bm25_score: f.leg_scores[1].unwrap_or(0.0) as f32,
+            })
+            .collect())
+    }
+
+    /// FUSION_MODE_TWO_LEVEL (fallback for incomparable scores): each
+    /// shard fuses locally; the coordinator RRF-merges the shard lists.
+    /// NOT partition-independent — see the proto's FusionMode comments.
+    async fn fanout_hybrid_two_level(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        terms: &[String],
+        global: &CorpusStats,
+        legs: HybridLegs,
+    ) -> Result<Vec<HybridHit>, Status> {
         // Level one: per-shard local fusion.
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
@@ -228,7 +375,7 @@ impl CoordinatorServiceImpl {
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
                 vector: vector.to_vec(),
-                terms: terms.clone(),
+                terms: terms.to_vec(),
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
                 global_doc_frequencies: global.dfs.clone(),
@@ -434,6 +581,65 @@ impl CoordinatorServiceImpl {
             .collect();
         Ok(FanoutResult { hits, shard_stats })
     }
+    /// Push one TQ+ calibration to every configured node (the
+    /// shared-calibration handshake that makes vector scores globally
+    /// comparable). Per-node outcomes are reported, not fail-fast: a
+    /// non-empty shard legitimately refuses (calibration is locked for
+    /// the index lifetime), and the caller needs to know which nodes
+    /// diverged.
+    pub async fn fanout_calibration(
+        &self,
+        req: &BroadcastCalibrationRequest,
+    ) -> Vec<CalibrationApplyResult> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let node = node.clone();
+            let request = SetCalibrationRequest {
+                dim: req.dim,
+                bit_width: req.bit_width,
+                shift: req.shift.clone(),
+                scale: req.scale.clone(),
+            };
+            tasks.push(tokio::spawn(async move {
+                let result = async {
+                    let mut client = NodeServiceClient::connect(node.clone())
+                        .await
+                        .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
+                        .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+                    client.set_calibration(request).await
+                }
+                .await;
+                match result {
+                    Ok(resp) => CalibrationApplyResult {
+                        node: node.clone(),
+                        ok: true,
+                        already_seeded: resp.into_inner().already_seeded,
+                        error: String::new(),
+                    },
+                    Err(e) => CalibrationApplyResult {
+                        node: node.clone(),
+                        ok: false,
+                        already_seeded: false,
+                        error: e.message().to_string(),
+                    },
+                }
+            }));
+        }
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match task.await {
+                Ok(r) => results.push(r),
+                Err(e) => results.push(CalibrationApplyResult {
+                    node: String::new(),
+                    ok: false,
+                    already_seeded: false,
+                    error: format!("task failed: {e}"),
+                }),
+            }
+        }
+        results
+    }
 }
 
 /// Resolved per-leg options for one hybrid query.
@@ -447,6 +653,8 @@ pub struct HybridLegs {
     pub bm25_weight: f32,
     /// RRF constant.
     pub rrf_k: f64,
+    /// Fusion strategy (default GLOBAL_RANK).
+    pub fusion_mode: FusionMode,
 }
 
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
@@ -549,6 +757,7 @@ impl SearchService for CoordinatorServiceImpl {
             vector_weight: options.vector_weight,
             bm25_weight: options.bm25_weight,
             rrf_k,
+            fusion_mode: options.fusion_mode(),
         };
         let hits = self
             .fanout_hybrid(
@@ -561,5 +770,19 @@ impl SearchService for CoordinatorServiceImpl {
             )
             .await?;
         Ok(Response::new(HybridSearchResponse { request_id, hits }))
+    }
+
+    async fn broadcast_calibration(
+        &self,
+        request: Request<BroadcastCalibrationRequest>,
+    ) -> Result<Response<BroadcastCalibrationResponse>, Status> {
+        let req = request.into_inner();
+        if req.shift.len() != req.dim as usize || req.scale.len() != req.dim as usize {
+            return Err(Status::invalid_argument(
+                "shift and scale must have length dim",
+            ));
+        }
+        let results = self.fanout_calibration(&req).await;
+        Ok(Response::new(BroadcastCalibrationResponse { results }))
     }
 }
