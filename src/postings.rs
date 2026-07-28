@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn round_trip_through_disk() {
-        let dir = std::env::temp_dir().join(format!("tvbm25_{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp").join(format!("tvbm25_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shard.tv.bm25");
 
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn load_rejects_garbage() {
-        let dir = std::env::temp_dir().join(format!("tvbm25_bad_{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp").join(format!("tvbm25_bad_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.bm25");
         std::fs::write(&path, b"not a postings file").unwrap();

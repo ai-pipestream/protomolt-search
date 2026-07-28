@@ -195,7 +195,7 @@ async fn distributed_bm25_matches_monolithic_exactly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bm25_store_persists_through_flush() {
     let (analysis, mock) = start_mock_analysis().await;
-    let dir = std::env::temp_dir().join(format!("tvbm25_node_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tvbm25_node_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let index_path = dir.join("shard.tv");
     let (addr, node) = start_empty_node(NodeConfig {

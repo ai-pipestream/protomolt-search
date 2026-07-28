@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn toml_file_multi_shard() {
-        let dir = std::env::temp_dir();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         let path = dir.join(format!("turbovec_search_cfg_{}.toml", std::process::id()));
         std::fs::write(
             &path,
@@ -553,7 +553,7 @@ slot_offset = 20000
 
     #[test]
     fn cli_overrides_file() {
-        let dir = std::env::temp_dir();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         let path = dir.join(format!("turbovec_search_ovr_{}.toml", std::process::id()));
         std::fs::write(
             &path,
@@ -572,7 +572,7 @@ slot_offset = 20000
 
     #[test]
     fn file_shard_needs_exactly_one_source() {
-        let dir = std::env::temp_dir();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         let path = dir.join(format!("turbovec_search_bad_{}.toml", std::process::id()));
         std::fs::write(&path, "role = \"node\"\n\n[[shards]]\nslot_offset = 7\n").unwrap();
         let result = parse(&args(&[&format!("--config={}", path.display())]));

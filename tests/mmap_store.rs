@@ -44,7 +44,7 @@ fn rss_bytes() -> usize {
 
 #[test]
 fn resident_matches_heap_bit_identical() {
-    let dir = std::env::temp_dir().join(format!("tvbm25_mmap_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tvbm25_mmap_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("shard.tv.bm25");
 
@@ -105,7 +105,7 @@ fn resident_matches_heap_bit_identical() {
 
 #[test]
 fn resident_open_does_not_grow_rss_like_a_heap_load() {
-    let dir = std::env::temp_dir().join(format!("tvbm25_rss_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tvbm25_rss_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("big.tv.bm25");
 

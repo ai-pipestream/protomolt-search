@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn chunk_and_embedding_files_round_trip() {
-        let dir = std::env::temp_dir().join(format!("tvcourt_{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp").join(format!("tvcourt_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let chunks_path = dir.join("chunks.ndjson");
         {

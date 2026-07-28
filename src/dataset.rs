@@ -142,7 +142,7 @@ mod tests {
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tvdataset_{tag}_{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp").join(format!("tvdataset_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
