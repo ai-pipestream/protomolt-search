@@ -9,6 +9,41 @@ remainder of their scan against it — losslessly.
 Phase 1: one crate, one binary, three roles (`node`, `coordinator`, `both`),
 tonic gRPC + tokio, static cluster membership.
 
+## Quickstart: dockerized end-to-end demo (CourtListener)
+
+A one-command installer that syncs real data and proves the whole stack:
+CourtListener bulk opinions (public S3) → [rustfs](https://rustfs.com)
+object store → Rust extraction → chunk + static-embedding via the
+[grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
+sidecar (GraalVM native, Model2Vec table) → a 4-shard turbovec-search
+cluster → an automated search-verification gate. No Python anywhere.
+
+```bash
+cd deploy/court-e2e
+cp .env.example .env            # defaults work out of the box
+./e2e.sh                        # or ./e2e.sh --clean to wipe and reseed
+```
+
+`e2e.sh` exits 0 only after indexing ~50k opinions (~500k chunks) across
+4 shards and passing both gates: a vector self-match through the
+coordinator and a distributed BM25 query. On success the cluster stays
+up — coordinator on `localhost:50050`, rustfs console on
+`localhost:19001`. Details, scale knobs, and architecture:
+[deploy/court-e2e/README.md](deploy/court-e2e/README.md).
+
+Query it with any gRPC client generated from
+[search.proto](proto/turbovec/search/v1/search.proto) — `Search`
+(vector top-k with floor sharing), `Bm25Search` (distributed lexical),
+`HybridSearch` (RRF fusion) — or with the bundled probe tool:
+
+```bash
+docker run --rm --network court-e2e_default -v court-e2e_corpus-data:/corpus \
+  --entrypoint court_query court-e2e-pipeline \
+  --nodes=node1:50051,node2:50051,node3:50051,node4:50051 \
+  --analysis-addr=http://analysis:50051 --embeddings=/corpus/embeddings.bin \
+  --probe-ids=12345 --docs-per-shard=128500
+```
+
 ## Design
 
 ```
@@ -157,7 +192,7 @@ harness for measuring how sharing's payoff varies with k. It also asserts
 sharing never changes results at any k.
 
 ```bash
-cargo run --release --bin sweep -- \
+cargo run --release --example sweep -- \
     --vectors=60000 --dim=128 --shards=3 \
     --k=10,100,1000,10000 --queries=20 \
     --chunk-blocks=64 --modes=on,off
@@ -338,7 +373,7 @@ stage skips work already present (`--limit` everywhere for slices).
 
 ## Real-data shakedown (wikipedia bge-m3)
 
-`src/bin/wiki_shakedown.rs` ingests a REAL corpus end-to-end: the
+`examples/wiki_shakedown.rs` ingests a REAL corpus end-to-end: the
 bge-m3 embeddings + Simple English Wikipedia sentence pairs from the
 earlier Lucene/OpenSearch distributed testing
 (`/work/opensearch-grpc-knn/distributed_test_data/wikipedia/`, not
@@ -352,7 +387,7 @@ The 4 parts are the pre-existing shard partitioning: part N goes to
 shard N, doc id `N * 61077 + index`. The run:
 
 ```bash
-cargo run --release --bin wiki_shakedown   # --data-dir, --out-dir, --sidecar-port
+cargo run --release --example wiki_shakedown   # --data-dir, --out-dir, --sidecar-port
 ```
 
 loads the parts, fits calibration on a sample, pushes it to every shard
@@ -458,8 +493,6 @@ normalization stats — deliberately not built.
 
 ## Ingest flow (write path)
 
-## Ingest flow (write path)
-
 Shards ingest over gRPC; prebuilt `.tv` files are no longer required.
 Deployment order for a from-scratch cluster is **fit → seed → ingest →
 search**:
@@ -486,7 +519,34 @@ search**:
 default) flushes on SIGINT/SIGTERM. A shard whose index path does not
 exist at startup starts empty; after ingest + flush (or graceful
 shutdown), a restart with the same config comes back with all vectors
-and the locked calibration (`.tv` persists it).
+and the locked calibration (`.tv` persists it). Note that an EMPTY but
+calibration-seeded shard also persists on shutdown — restarting a node
+does not "unseed" it; wiping the shard file (or installing a snapshot)
+is the only reset.
+
+### Bulk load: InstallSnapshot
+
+For pre-computed corpora, skip per-node ingest entirely: build the
+shard image once (with the cluster's seeded calibration) and push the
+FINISHED index to every shard owner over one client stream —
+`NodeService.InstallSnapshot`, with `snapshot::install_snapshot(addr,
+tv_path, bm25_path)` as the bundled client.
+
+The node stages the image in a generation directory
+(`<index path>.snap/`), validates it (well-formed index, sidecar opens,
+calibration matches any calibration locked on the shard — a mismatch is
+rejected, keeping scores comparable cluster-wide), then swaps it live
+under the write lock. Both files travel inside ONE directory rename, so
+the pair is installed atomically; a crash mid-swap is recovered
+deterministically at startup (see `recover_generation`). Once a shard
+serves from a generation, Flush and restart loading follow it — the
+legacy layout and the generation never split-brain.
+
+Rules of thumb: seed calibration first (or let an unseeded shard adopt
+the image's), replace every shard together on recalibration, and expect
+an image without a `.bm25` sidecar to wholesale-replace the postings
+store. Covered by `tests/snapshot.rs` (7 cases, incl. restart survival
+and crash recovery).
 
 ## Two-machine runbook
 
@@ -627,7 +687,7 @@ losslessness at k=1000 over a 24k corpus.
   (multi-shard, multi-role, graceful shutdown, `calibrate` subcommand).
 - `src/harness.rs` — corpus generation, calibration fitting, shard building
   and loopback server startup shared by tests and the sweep binary.
-- `src/bin/sweep.rs` — the k-sweep benchmark harness.
+- `examples/sweep.rs` — the k-sweep benchmark harness.
 - `tests/` — lossless e2e (k=10 and k=1000), NodeService loopback with
   mid-scan injection, ingest/calibration rules, a multi-process
   ingest-and-restart acceptance test, BM25 tests with a mock analysis
