@@ -56,8 +56,13 @@ fn build_demo_index(demo: DemoConfig) -> Result<TurboQuantIndex, String> {
 
 /// Load a shard's index, or `None` when the shard starts empty: its index
 /// path does not exist yet (a from-scratch shard awaiting SetCalibration +
-/// AddVectors; Flush later writes exactly that path).
-fn load_shard_index(shard: &ShardConfig) -> Result<Option<TurboQuantIndex>, String> {
+/// AddVectors; Flush later writes exactly that path). When a snapshot
+/// generation is active, the index loads from INSIDE it — the generation
+/// always reflects the newest installed or flushed image.
+fn load_shard_index(
+    shard: &ShardConfig,
+    generation: Option<&Path>,
+) -> Result<Option<TurboQuantIndex>, String> {
     if let Some(demo) = shard.demo {
         eprintln!(
             "building demo index: {} vectors x dim {} @ {} bits",
@@ -65,14 +70,19 @@ fn load_shard_index(shard: &ShardConfig) -> Result<Option<TurboQuantIndex>, Stri
         );
         return build_demo_index(demo).map(Some);
     }
-    let path = shard
-        .index_path
-        .as_ref()
-        .expect("config validated an index source");
-    if !Path::new(path).exists() {
+    let path = match generation {
+        Some(dir) => turbovec_search::node::generation_tv(dir),
+        None => shard
+            .index_path
+            .as_ref()
+            .expect("config validated an index source")
+            .clone(),
+    };
+    if !path.exists() {
         return Ok(None);
     }
-    let index = TurboQuantIndex::load(path).map_err(|e| format!("load {}: {e}", path.display()))?;
+    let index = TurboQuantIndex::load(&path)
+        .map_err(|e| format!("load {}: {e}", path.display()))?;
     index.prepare();
     Ok(Some(index))
 }
@@ -106,7 +116,13 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     if matches!(cfg.role, Role::Node | Role::Both) {
         for shard in &cfg.shards {
-            let index = load_shard_index(shard)?;
+            // Snapshot generations take precedence over the legacy layout
+            // (and recover any interrupted swap) before anything loads.
+            let generation = shard
+                .index_path
+                .as_ref()
+                .and_then(|p| turbovec_search::node::recover_generation(p));
+            let index = load_shard_index(shard, generation.as_deref())?;
             match &index {
                 Some(index) => eprintln!(
                     "shard @{}: {} vectors, dim {:?}, {} bits, slot offset {}",
@@ -125,7 +141,10 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let listener = TcpListener::bind(shard.listen).await?;
             let addr: SocketAddr = listener.local_addr()?;
             let bm25_store = shard.index_path.as_ref().and_then(|p| {
-                let bm25_path = turbovec_search::node::bm25_sidecar_path(p);
+                let bm25_path = match &generation {
+                    Some(dir) => turbovec_search::node::generation_bm25(dir),
+                    None => turbovec_search::node::bm25_sidecar_path(p),
+                };
                 if bm25_path.exists() {
                     eprintln!(
                         "shard @{}: loading BM25 store from {}",
@@ -151,7 +170,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     analysis_addr: shard.analysis_addr.clone(),
                 },
             )
-            .with_bm25(bm25_store);
+            .with_bm25(bm25_store)
+            .with_generation(generation);
             node_services.push(node.clone());
             eprintln!("NodeService listening on {addr}");
             let max = cfg.max_message_bytes;

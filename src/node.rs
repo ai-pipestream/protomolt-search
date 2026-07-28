@@ -15,7 +15,7 @@
 //! half-applied batch.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{mpsc, watch};
@@ -28,14 +28,15 @@ use crate::chunked::{chunked_topk, DEFAULT_CHUNK_BLOCKS};
 use crate::fusion::{self, Leg};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
-    search_shard_request, search_shard_response, AddDocumentsRequest, AddDocumentsResponse,
-    AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse,
-    Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse,
-    GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse,
-    HybridLegHit, HybridShardRequest, HybridShardResponse, OffsetSpan, RawLegHit, ScoredHit,
-    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
-    SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, StartShardSearch,
-    StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    search_shard_request, search_shard_response, snapshot_chunk, AddDocumentsRequest,
+    AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest,
+    Bm25QueryResponse, Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest,
+    FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
+    GetDocumentsResponse, HybridLegHit, HybridShardRequest, HybridShardResponse,
+    InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone,
+    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse,
+    ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest,
+    StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
 };
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store};
 
@@ -125,6 +126,11 @@ impl Bm25Shard {
 struct ShardState {
     index: Option<TurboQuantIndex>,
     bm25: Option<Bm25Shard>,
+    /// The active snapshot generation directory, when the shard's files
+    /// came from (or were replaced by) an `InstallSnapshot` image.
+    /// `Flush` and the AddDocuments reload path read/write THERE, never
+    /// the legacy `<index path>` layout, so the two never split-brain.
+    generation: Option<PathBuf>,
 }
 
 /// The persistence path of a shard's BM25 store: `<index path>.bm25`.
@@ -132,6 +138,76 @@ pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".bm25");
     PathBuf::from(p)
+}
+
+/// Snapshot generation layout, next to the shard's configured index path:
+/// `<index path>.snap/` is the active generation holding the installed
+/// image as `index.tv` + `index.tv.bm25`. Because BOTH files live inside
+/// one directory, installing them is a single directory rename — which is
+/// atomic, so the pair can never tear.
+pub fn generation_dir(index_path: &Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".snap");
+    PathBuf::from(p)
+}
+
+/// The image paths inside a generation directory.
+pub fn generation_tv(dir: &Path) -> PathBuf {
+    dir.join("index.tv")
+}
+/// The BM25 sidecar path inside a generation directory.
+pub fn generation_bm25(dir: &Path) -> PathBuf {
+    dir.join("index.tv.bm25")
+}
+
+/// Receive staging (`<index path>.snap-tmp/`) and swap-out
+/// (`<index path>.snap-old/`) directories for the generation swap.
+fn generation_tmp_dir(index_path: &Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".snap-tmp");
+    PathBuf::from(p)
+}
+fn generation_old_dir(index_path: &Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".snap-old");
+    PathBuf::from(p)
+}
+
+/// Where the shard's files live: the active snapshot generation when one
+/// was installed, else the legacy `<index path>` (+`.bm25`) layout.
+/// Returns `(index, bm25)` paths.
+fn storage_paths(index_path: &Path, generation: Option<&PathBuf>) -> (PathBuf, PathBuf) {
+    match generation {
+        Some(dir) => (generation_tv(dir), generation_bm25(dir)),
+        None => (index_path.to_path_buf(), bm25_sidecar_path(index_path)),
+    }
+}
+
+/// Crash recovery for the generation swap, and the startup answer to
+/// "does this shard have an installed snapshot?". Every interleave of the
+/// two swap renames has a defined outcome:
+///
+/// - `snap-old` present, `snap` missing: crashed between the renames —
+///   the previous generation is whole, rename it back.
+/// - both present: crashed after the second rename — the new generation
+///   is live, delete the old one.
+/// - a stray `snap-tmp` is always deleted: only a COMPLETE staging dir is
+///   ever renamed into place, so a leftover one is unreceived garbage.
+///
+/// Returns the active generation directory when it holds an index.
+pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
+    let snap = generation_dir(index_path);
+    let old = generation_old_dir(index_path);
+    let tmp = generation_tmp_dir(index_path);
+    let _ = std::fs::remove_dir_all(&tmp);
+    if old.exists() {
+        if snap.exists() {
+            let _ = std::fs::remove_dir_all(&old);
+        } else {
+            let _ = std::fs::rename(&old, &snap);
+        }
+    }
+    generation_tv(&snap).exists().then_some(snap)
 }
 
 /// The shard-owner gRPC service. Cheap to clone (state is shared).
@@ -146,7 +222,11 @@ impl NodeServiceImpl {
     /// Wrap an optional preloaded index in a node service.
     pub fn new(index: Option<TurboQuantIndex>, config: NodeConfig) -> Self {
         Self {
-            state: Arc::new(RwLock::new(ShardState { index, bm25: None })),
+            state: Arc::new(RwLock::new(ShardState {
+                index,
+                bm25: None,
+                generation: None,
+            })),
             config,
         }
     }
@@ -154,6 +234,14 @@ impl NodeServiceImpl {
     /// Attach a preloaded BM25 shard (from `<index path>.bm25`).
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         self.state.write().expect("shard state lock poisoned").bm25 = store;
+        self
+    }
+
+    /// Mark the shard as serving from a snapshot generation directory
+    /// (startup found one via [`recover_generation`]): Flush and the
+    /// AddDocuments reload path then read/write inside it.
+    pub fn with_generation(self, dir: Option<PathBuf>) -> Self {
+        self.state.write().expect("shard state lock poisoned").generation = dir;
         self
     }
 
@@ -196,7 +284,7 @@ impl NodeServiceImpl {
         let mut guard = self.state.write().expect("shard state lock poisoned");
         let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
         let num_documents = guard.bm25.as_ref().map_or(0, |b| b.as_index().doc_count());
-        let Some(path) = self.config.index_path.clone() else {
+        let Some(config_path) = self.config.index_path.clone() else {
             return Ok(FlushResponse {
                 path: String::new(),
                 num_vectors,
@@ -204,16 +292,18 @@ impl NodeServiceImpl {
                 written: false,
             });
         };
+        // Flush into the active snapshot generation when one was
+        // installed, else the legacy layout — never split the two.
+        let (tv_path, bm25_path) = storage_paths(&config_path, guard.generation.as_ref());
         if let Some(index) = guard.index.as_ref() {
             index
-                .write(&path)
-                .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
+                .write(&tv_path)
+                .map_err(|e| Status::internal(format!("write {}: {e}", tv_path.display())))?;
         }
         // Save the heap builder as v3 and immediately reopen it
         // disk-resident: after Flush a shard holds no postings or texts
         // in heap. Already-resident shards have nothing to write.
         if let Some(Bm25Shard::Building(store)) = guard.bm25.as_ref() {
-            let bm25_path = bm25_sidecar_path(&path);
             store
                 .save(&bm25_path)
                 .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
@@ -227,10 +317,177 @@ impl NodeServiceImpl {
         }
         let written = guard.index.is_some() || guard.bm25.is_some();
         Ok(FlushResponse {
-            path: path.display().to_string(),
+            path: tv_path.display().to_string(),
             num_vectors,
             num_documents,
             written,
+        })
+    }
+
+    /// Receive one snapshot image into the staging generation directory
+    /// (`index.tv`, plus `index.tv.bm25` when declared). The first
+    /// `manifest.tv_bytes` of data land in the index, the rest in the
+    /// sidecar; both are synced before the caller swaps anything. Returns
+    /// with the staging dir complete or not at all — on error the caller
+    /// removes it.
+    async fn receive_image(
+        inbound: &mut Streaming<SnapshotChunk>,
+        manifest: &SnapshotManifest,
+        tmp_dir: &Path,
+    ) -> Result<(), Status> {
+        use tokio::io::AsyncWriteExt;
+        let io_err = |what: &Path, e: std::io::Error| {
+            Status::internal(format!("snapshot receive {}: {e}", what.display()))
+        };
+        tokio::fs::create_dir_all(tmp_dir)
+            .await
+            .map_err(|e| io_err(tmp_dir, e))?;
+        let tv_tmp = generation_tv(tmp_dir);
+        let bm25_tmp = generation_bm25(tmp_dir);
+        let mut tv = tokio::fs::File::create(&tv_tmp)
+            .await
+            .map_err(|e| io_err(&tv_tmp, e))?;
+        let mut bm25 = if manifest.bm25_bytes > 0 {
+            Some(
+                tokio::fs::File::create(&bm25_tmp)
+                    .await
+                    .map_err(|e| io_err(&bm25_tmp, e))?,
+            )
+        } else {
+            None
+        };
+        let (mut tv_written, mut bm25_written) = (0u64, 0u64);
+        while let Some(chunk) = inbound.message().await? {
+            let Some(snapshot_chunk::Payload::Data(mut data)) = chunk.payload else {
+                return Err(Status::invalid_argument(
+                    "SnapshotChunk after the manifest must carry data",
+                ));
+            };
+            // Fill the .tv first; overflow spills into the .bm25.
+            let tv_take = (manifest.tv_bytes - tv_written).min(data.len() as u64) as usize;
+            if tv_take > 0 {
+                tv.write_all(&data[..tv_take])
+                    .await
+                    .map_err(|e| io_err(&tv_tmp, e))?;
+                tv_written += tv_take as u64;
+                data.drain(..tv_take);
+            }
+            if !data.is_empty() {
+                let Some(sidecar) = bm25.as_mut() else {
+                    return Err(Status::invalid_argument(
+                        "snapshot carries more data than the manifest declares",
+                    ));
+                };
+                if bm25_written + data.len() as u64 > manifest.bm25_bytes {
+                    return Err(Status::invalid_argument(
+                        "snapshot carries more data than the manifest declares",
+                    ));
+                }
+                sidecar
+                    .write_all(&data)
+                    .await
+                    .map_err(|e| io_err(&bm25_tmp, e))?;
+                bm25_written += data.len() as u64;
+            }
+        }
+        if tv_written != manifest.tv_bytes || bm25_written != manifest.bm25_bytes {
+            return Err(Status::invalid_argument(format!(
+                "truncated snapshot: received {tv_written}+{} of declared {}+{} bytes",
+                bm25_written, manifest.tv_bytes, manifest.bm25_bytes
+            )));
+        }
+        tv.sync_all().await.map_err(|e| io_err(&tv_tmp, e))?;
+        if let Some(sidecar) = bm25.as_mut() {
+            sidecar.sync_all().await.map_err(|e| io_err(&bm25_tmp, e))?;
+        }
+        Ok(())
+    }
+
+    /// Validate a received snapshot image and atomically swap it in (the
+    /// blocking half of `InstallSnapshot`). Everything that can fail —
+    /// loading the index, opening the sidecar, the calibration check —
+    /// happens BEFORE the swap, so a rejected install leaves the live
+    /// shard and the on-disk generation untouched.
+    ///
+    /// The swap itself is one directory rename: the whole `.tv` + `.bm25`
+    /// pair travels inside the staging dir, so the two files can never
+    /// tear. Replacing an existing generation renames it aside first; the
+    /// crash window between the two renames is covered by
+    /// [`recover_generation`] at startup.
+    fn apply_snapshot(&self, tmp_dir: &Path, with_bm25: bool) -> Result<InstallSnapshotResponse, Status> {
+        let path = self
+            .config
+            .index_path
+            .as_ref()
+            .expect("handler requires index_path")
+            .clone();
+        let snap = generation_dir(&path);
+        let old = generation_old_dir(&path);
+        let tv_tmp = generation_tv(tmp_dir);
+        let bm25_tmp = generation_bm25(tmp_dir);
+
+        let loaded = TurboQuantIndex::load(&tv_tmp).map_err(|e| {
+            Status::invalid_argument(format!("snapshot is not a valid turbovec index: {e}"))
+        })?;
+        if with_bm25 {
+            // Open-check the sidecar (and drop it again) before the swap;
+            // the live shard re-opens from the generation dir.
+            drop(Bm25Shard::open(&bm25_tmp).map_err(|e| {
+                Status::invalid_argument(format!("snapshot sidecar is not a valid BM25 store: {e}"))
+            })?);
+        }
+
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        // Calibration comparability: a shard with a locked calibration
+        // (seeded or fitted) only accepts an identically calibrated image.
+        if let Some(index) = guard.index.as_ref() {
+            if let Some((shift, scale)) = index.calibration() {
+                let matches = loaded
+                    .calibration()
+                    .is_some_and(|(s, c)| s == shift && c == scale);
+                if !matches {
+                    return Err(Status::failed_precondition(
+                        "snapshot calibration differs from the calibration locked on this \
+                         shard; mixed calibrations make scores incomparable across shards",
+                    ));
+                }
+            }
+        }
+
+        // The atomic swap: previous generation aside (if any), staging
+        // dir into place. Both files move inside ONE directory rename.
+        if snap.exists() {
+            std::fs::rename(&snap, &old)
+                .map_err(|e| Status::internal(format!("retire {}: {e}", old.display())))?;
+        }
+        if let Err(e) = std::fs::rename(tmp_dir, &snap) {
+            // Best-effort rollback so startup recovery sees a clean state.
+            if old.exists() && !snap.exists() {
+                let _ = std::fs::rename(&old, &snap);
+            }
+            return Err(Status::internal(format!("install {}: {e}", snap.display())));
+        }
+        let _ = std::fs::remove_dir_all(&old);
+
+        guard.bm25 = if with_bm25 {
+            Some(Bm25Shard::open(&generation_bm25(&snap)).map_err(|e| {
+                Status::internal(format!("open installed {}: {e}", generation_bm25(&snap).display()))
+            })?)
+        } else {
+            // Wholesale replacement: an image without a sidecar replaces
+            // any existing postings store (its ids would describe a
+            // different corpus). The old store's files left with the old
+            // generation.
+            None
+        };
+        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.as_index().doc_count());
+        let num_vectors = loaded.len() as u64;
+        guard.index = Some(loaded);
+        guard.generation = Some(snap.clone());
+        Ok(InstallSnapshotResponse {
+            path: generation_tv(&snap).display().to_string(),
+            num_vectors,
+            num_documents,
         })
     }
 
@@ -704,6 +961,50 @@ impl NodeService for NodeServiceImpl {
             .map(Response::new)
     }
 
+    async fn install_snapshot(
+        &self,
+        request: Request<Streaming<SnapshotChunk>>,
+    ) -> Result<Response<InstallSnapshotResponse>, Status> {
+        let path = self.config.index_path.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "shard has no persistence path (index_path); a snapshot install IS persistence",
+            )
+        })?;
+        let tmp_dir = generation_tmp_dir(&path);
+
+        let mut inbound = request.into_inner();
+        // Protocol: the first message must be the manifest.
+        let manifest = match inbound.message().await? {
+            Some(SnapshotChunk {
+                payload: Some(snapshot_chunk::Payload::Manifest(m)),
+            }) if m.tv_bytes > 0 => m,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first SnapshotChunk must be a SnapshotManifest with tv_bytes > 0",
+                ))
+            }
+        };
+
+        if let Err(e) = Self::receive_image(&mut inbound, &manifest, &tmp_dir).await {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            return Err(e);
+        }
+
+        let service = self.clone();
+        let cleanup = tmp_dir.clone();
+        let with_bm25 = manifest.bm25_bytes > 0;
+        let result =
+            tokio::task::spawn_blocking(move || service.apply_snapshot(&tmp_dir, with_bm25))
+                .await
+                .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
+        if result.is_err() {
+            // Rejected AFTER receive (bad image, calibration mismatch):
+            // leave no staging dir behind either.
+            let _ = tokio::fs::remove_dir_all(&cleanup).await;
+        }
+        result.map(Response::new)
+    }
+
     async fn add_documents(
         &self,
         request: Request<Streaming<AddDocumentsRequest>>,
@@ -726,7 +1027,7 @@ impl NodeService for NodeServiceImpl {
                     .config
                     .index_path
                     .as_ref()
-                    .map(|p| bm25_sidecar_path(p))
+                    .map(|p| storage_paths(p, guard.generation.as_ref()).1)
                     .ok_or_else(|| {
                         Status::failed_precondition(
                             "resident shard has no index path to reload from",

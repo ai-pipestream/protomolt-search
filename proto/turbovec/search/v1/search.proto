@@ -88,6 +88,45 @@ service NodeService {
   // with no persistence path configured this is a no-op (`written=false`).
   rpc Flush(FlushRequest) returns (FlushResponse);
 
+  // Installs a centrally built shard image (the atomic .tv index plus its
+  // optional .bm25 sidecar) over one client stream — the bulk-load path
+  // for pre-computed corpora. Where AddVectors builds the shard on the
+  // node from streamed vectors, InstallSnapshot ships the FINISHED index:
+  // build once anywhere with the cluster's seeded calibration, push the
+  // artifact to every shard owner, and each node swaps it in atomically —
+  // no per-node re-embedding, and byte-identical calibration everywhere
+  // by construction.
+  //
+  // Protocol: the first message must be `manifest`, then `data` chunks in
+  // any chunking the sender likes. The first `manifest.tv_bytes` of data
+  // are the .tv image; the following `manifest.bm25_bytes` are the .bm25
+  // sidecar. The node stages both files inside a generation directory
+  // (`<index path>.snap/`), loads and validates the image, then swaps the
+  // directory into place with ONE atomic rename — the pair can never
+  // tear, searches never observe a half-installed shard, and a rejected
+  // install leaves both the live shard and the active generation
+  // untouched. Replacing an existing generation renames it aside first;
+  // the crash window between the two renames is recovered deterministically
+  // at startup (snap-old restored or removed).
+  //
+  // Rules:
+  // - The shard must have a persistence path configured
+  //   (FAILED_PRECONDITION otherwise): a snapshot install IS persistence.
+  // - When the shard has a calibration locked (seeded or fitted) and the
+  //   image's calibration differs, the install is rejected
+  //   (FAILED_PRECONDITION): mixed calibrations make scores incomparable
+  //   across shards. Seed first with SetCalibration, or install on an
+  //   unseeded shard, which adopts the image's calibration.
+  // - Byte counts that overrun or truncate the manifest's declared sizes
+  //   are INVALID_ARGUMENT; nothing is installed.
+  //
+  // Replacing a NON-empty shard is allowed and wholesale: the image's ids
+  // restart at the shard's slot_offset, and an image WITHOUT a .bm25
+  // sidecar replaces any existing postings store with none. Callers
+  // rebuilding a cluster (recalibration on data drift) must replace every
+  // shard together, the same rule BroadcastCalibration documents.
+  rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
+
   // Ingests raw-text documents into the shard's BM25 postings index.
   // Client-streaming, one document per message. For each document the node
   // calls the configured analysis sidecar (Analyze, term vectors in
@@ -355,6 +394,39 @@ message FlushResponse {
   // Documents in the flushed BM25 postings store (0 when the shard has no
   // postings).
   uint64 num_documents = 4;
+}
+
+// One message on the `InstallSnapshot` stream. The first message MUST be
+// `manifest`; `data` chunks follow in any chunking.
+message SnapshotChunk {
+  oneof payload {
+    // Declares the byte split between the two image files. Everything
+    // else about the shard (dim, bit width, vector count, calibration)
+    // is read from the image itself — the file is the source of truth.
+    SnapshotManifest manifest = 1;
+    // Opaque image bytes: the first `manifest.tv_bytes` across all data
+    // chunks are the .tv file, the next `manifest.bm25_bytes` the .bm25
+    // sidecar. Senders should keep chunks around 1 MiB.
+    bytes data = 2;
+  }
+}
+
+// The byte layout of an `InstallSnapshot` stream.
+message SnapshotManifest {
+  // Total .tv bytes on the stream. Required (nonzero).
+  uint64 tv_bytes = 1;
+  // Total .bm25 bytes following the .tv bytes; 0 for a vector-only image.
+  uint64 bm25_bytes = 2;
+}
+
+// Result of an `InstallSnapshot` call.
+message InstallSnapshotResponse {
+  // The installed index file (inside the shard's generation directory).
+  string path = 1;
+  // Vectors in the installed index.
+  uint64 num_vectors = 2;
+  // Documents in the installed BM25 sidecar (0 when none was sent).
+  uint64 num_documents = 3;
 }
 
 // Client-facing search request.

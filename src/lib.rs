@@ -36,6 +36,7 @@ pub mod merge;
 pub mod node;
 pub mod pb;
 pub mod postings;
+pub mod snapshot;
 
 /// Max gRPC message size (encoding and decoding) applied to every client
 /// and server this crate builds. 64 MiB leaves headroom for large-k
