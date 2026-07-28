@@ -1,0 +1,8 @@
+target/
+.git/
+# Only the pipeline driver script belongs in the image; the compose
+# project itself is not build context.
+deploy/court-e2e/*
+!deploy/court-e2e/pipeline
+deploy/court-e2e/pipeline/*
+!deploy/court-e2e/pipeline/run.sh

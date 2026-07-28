@@ -1,0 +1,144 @@
+# Court end-to-end demo/test: CourtListener bulk data -> rustfs (S3) ->
+# chunk+embed (OpenNLP analysis sidecar, static MiniLM) -> 4-shard
+# turbovec-search cluster -> verification gate.
+#
+#   docker compose --env-file .env up --build --abort-on-container-exit --exit-code-from pipeline
+#   docker compose down -v          # wipe everything (volumes included)
+#
+# One-shot jobs: seed (S3 sync + sample), model (distill), pipeline
+# (chunk/embed/ingest/verify). Long-running: rustfs, analysis, node1-4,
+# coordinator (published on localhost:50050 for your own queries).
+
+name: court-e2e
+
+x-aws-creds: &aws-creds
+  AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+  AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+
+services:
+  rustfs:
+    image: rustfs/rustfs:${RUSTFS_TAG:-latest}
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_VOLUMES: /data
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${RUSTFS_API_PORT:-19000}:9000"   # S3 API
+      - "${RUSTFS_CONSOLE_PORT:-19001}:9001" # web console
+
+  seed:
+    build: ./seed
+    environment:
+      <<: *aws-creds
+      S3_ENDPOINT: http://rustfs:9000
+      S3_BUCKET: ${S3_BUCKET:-courtlistener}
+      CL_BUCKET: ${CL_BUCKET:-com-courtlistener-storage}
+      BULK_FILE: ${BULK_FILE:-opinions-2024-12-31.csv.bz2}
+      SCRATCH: /corpus
+    volumes:
+      - corpus-data:/corpus
+    depends_on:
+      - rustfs
+
+  model:
+    build: ./model
+    user: root
+    environment:
+      MODEL_REPO: ${MODEL_REPO:-minishlab/potion-retrieval-32M}
+      MODEL_OUT: /models/${MODEL_NAME:-potion-retrieval-32M}
+    volumes:
+      - models:/models
+
+  analysis:
+    build:
+      context: ${OPENNLP_ANALYSIS_REPO:-../../../grpc-opennlp-analysis}
+    environment:
+      OPENNLP_EMBEDDINGS_DIR: /models/${MODEL_NAME:-potion-retrieval-32M}
+    volumes:
+      - models:/models:ro
+    depends_on:
+      model:
+        condition: service_completed_successfully
+
+  node1:
+    build: ../..
+    command: ["--role=node", "--node-listen=0.0.0.0:50051", "--index=/shard/shard.tv",
+              "--slot-offset=0", "--analysis-addr=http://analysis:50051"]
+    volumes:
+      - shard1:/shard
+    depends_on:
+      - analysis
+
+  node2:
+    build: ../..
+    command: ["--role=node", "--node-listen=0.0.0.0:50051", "--index=/shard/shard.tv",
+              "--slot-offset=10000000", "--analysis-addr=http://analysis:50051"]
+    volumes:
+      - shard2:/shard
+    depends_on:
+      - analysis
+
+  node3:
+    build: ../..
+    command: ["--role=node", "--node-listen=0.0.0.0:50051", "--index=/shard/shard.tv",
+              "--slot-offset=20000000", "--analysis-addr=http://analysis:50051"]
+    volumes:
+      - shard3:/shard
+    depends_on:
+      - analysis
+
+  node4:
+    build: ../..
+    command: ["--role=node", "--node-listen=0.0.0.0:50051", "--index=/shard/shard.tv",
+              "--slot-offset=30000000", "--analysis-addr=http://analysis:50051"]
+    volumes:
+      - shard4:/shard
+    depends_on:
+      - analysis
+
+  coordinator:
+    build: ../..
+    command: ["--role=coordinator", "--coord-listen=0.0.0.0:50050",
+              "--nodes=node1:50051,node2:50051,node3:50051,node4:50051",
+              "--analysis-addr=http://analysis:50051"]
+    ports:
+      - "${COORD_PORT:-50050}:50050"
+    depends_on:
+      - node1
+      - node2
+      - node3
+      - node4
+
+  pipeline:
+    build: ../..
+    entrypoint: ["/deploy/pipeline/run.sh"]
+    environment:
+      <<: *aws-creds
+      S3_ENDPOINT: http://rustfs:9000
+      S3_BUCKET: ${S3_BUCKET:-courtlistener}
+      BULK_FILE: ${BULK_FILE:-opinions-2024-12-31.csv.bz2}
+      EXTRACT_CAP: ${EXTRACT_CAP:-50000}
+      EXTRACT_MIN_CHARS: ${EXTRACT_MIN_CHARS:-1000}
+      EXTRACT_PREFIX_GB: ${EXTRACT_PREFIX_GB:-4}
+      NODES: node1:50051,node2:50051,node3:50051,node4:50051
+      COORD: http://coordinator:50050
+      ANALYSIS: http://analysis:50051
+      CONCURRENCY: ${CONCURRENCY:-16}
+    volumes:
+      - corpus-data:/corpus
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_started
+
+volumes:
+  rustfs-data:
+  corpus-data:
+  models:
+  shard1:
+  shard2:
+  shard3:
+  shard4:
