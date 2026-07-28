@@ -58,9 +58,7 @@ async fn analyze(
     text: &str,
     embeddings: Option<EmbeddingOptions>,
 ) -> Result<turbovec_search::pb::analysis::AnalyzeResponse, tonic::Status> {
-    let mut client = AnalysisServiceClient::connect(addr.to_string())
-        .await
-        .map_err(|e| tonic::Status::unavailable(format!("analysis sidecar: {e}")))?
+    let mut client = AnalysisServiceClient::new(turbovec_search::analyzer::shared_channel(addr)?)
         .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES);
     client

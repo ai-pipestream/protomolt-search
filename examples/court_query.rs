@@ -64,7 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shard = ((probe_id / docs_per_shard) as usize).min(nodes.len() - 1);
         let mut client = NodeServiceClient::connect(nodes[shard].clone()).await?;
         let docs = client
-            .get_documents(GetDocumentsRequest { doc_ids: vec![probe_id] })
+            .get_documents(GetDocumentsRequest {
+                doc_ids: vec![probe_id],
+            })
             .await?
             .into_inner();
         let doc = docs
@@ -106,7 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let owner = nodes[(top.shard as usize).min(nodes.len() - 1)].clone();
             let mut client = NodeServiceClient::connect(owner).await?;
             let top_docs = client
-                .get_documents(GetDocumentsRequest { doc_ids: vec![top.doc_id] })
+                .get_documents(GetDocumentsRequest {
+                    doc_ids: vec![top.doc_id],
+                })
                 .await?
                 .into_inner();
             if let Some(top_doc) = top_docs.documents.first() {
@@ -115,7 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  top doc {}: opinion {} cluster {} span {}..{}",
                     top.doc_id, l.opinion_id, l.cluster_id, l.span_start, l.span_end
                 );
-                println!("  top text: {:?}", &top_doc.text[..top_doc.text.len().min(200)]);
+                println!(
+                    "  top text: {:?}",
+                    &top_doc.text[..top_doc.text.len().min(200)]
+                );
             }
         }
     }

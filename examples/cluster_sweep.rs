@@ -42,11 +42,7 @@ type Probe = (Option<(u64, u32)>, Vec<f32>);
 
 /// Probe vectors: either from the court embeddings file (--probes-from)
 /// or from the wiki corpus parts (--data-dir).
-fn load_probes(
-    probes_from: &str,
-    data_dir: &str,
-    n_queries: usize,
-) -> Vec<Probe> {
+fn load_probes(probes_from: &str, data_dir: &str, n_queries: usize) -> Vec<Probe> {
     if probes_from.is_empty() {
         (0..n_queries)
             .map(|qi| {

@@ -339,7 +339,10 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         }
     }
     let (shift, scale) = harness::fit_calibration(dim, 4, &sample);
-    eprintln!("calibration fitted on {} sample vectors", sample.len() / dim);
+    eprintln!(
+        "calibration fitted on {} sample vectors",
+        sample.len() / dim
+    );
 
     let coordinator = CoordinatorServiceImpl::new(node_addrs.clone()).with_bm25(
         Some(arg("analysis-addr", "http://127.0.0.1:59111")),
@@ -362,7 +365,11 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     for (shard, addr) in node_addrs.iter().enumerate() {
         let t0 = Instant::now();
         let start = shard * per;
-        let end = if shard == n_shards - 1 { m } else { start + per };
+        let end = if shard == n_shards - 1 {
+            m
+        } else {
+            start + per
+        };
 
         // This block's lineage keys, then its vectors (key-joined).
         let mut keys: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
@@ -421,7 +428,10 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                 .unwrap();
             }
         });
-        let docs = client.add_documents(ReceiverStream::new(rx)).await?.into_inner();
+        let docs = client
+            .add_documents(ReceiverStream::new(rx))
+            .await?
+            .into_inner();
         feeder.await?;
         assert_eq!(docs.added as usize, n);
 
@@ -429,12 +439,18 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         let flat: Vec<f32> = vectors.into_iter().flatten().collect();
         let vf = tokio::spawn(async move {
             for batch in flat.chunks(512 * dim) {
-                tx.send(AddVectorsRequest { vectors: batch.to_vec(), dim: dim as u32 })
-                    .await
-                    .unwrap();
+                tx.send(AddVectorsRequest {
+                    vectors: batch.to_vec(),
+                    dim: dim as u32,
+                })
+                .await
+                .unwrap();
             }
         });
-        let vecs = client.add_vectors(ReceiverStream::new(rx)).await?.into_inner();
+        let vecs = client
+            .add_vectors(ReceiverStream::new(rx))
+            .await?
+            .into_inner();
         vf.await?;
         assert_eq!(vecs.added as usize, n);
 
