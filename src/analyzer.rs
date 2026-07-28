@@ -5,6 +5,11 @@
 //! no tokenizer/stemmer/normalizer of its own — text in, term vectors out,
 //! offsets always in original-text coordinates.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use tonic::transport::Channel;
+
 use crate::pb::analysis::analysis_service_client::AnalysisServiceClient;
 use crate::pb::analysis::{AnalysisOptions, AnalyzeRequest, TermVectorOptions};
 use crate::pb::AnalysisSpec;
@@ -14,13 +19,37 @@ use tonic::Status;
 /// Matches the sidecar's default text size cap.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
+/// Shared h2 channel to a sidecar address. tonic channels multiplex
+/// concurrent calls over one connection and are cheap to clone; opening
+/// a fresh TCP+h2 connection per Analyze (the previous behavior) buried
+/// the sidecar under connection churn — its listener died after ~28k
+/// rapid-fire calls while the process stayed alive.
+pub fn shared_channel(addr: &str) -> Result<Channel, Status> {
+    static CHANNELS: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
+    let map = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(ch) = map.lock().expect("channel map poisoned").get(addr) {
+        return Ok(ch.clone());
+    }
+    // connect_lazy defers the handshake to the first RPC, so this never
+    // blocks the caller; tonic reconnects inside the channel on failure.
+    let ch = Channel::from_shared(addr.to_string())
+        .map_err(|e| Status::invalid_argument(format!("bad sidecar address {addr:?}: {e}")))?
+        .connect_lazy();
+    map.lock()
+        .expect("channel map poisoned")
+        .insert(addr.to_string(), ch.clone());
+    Ok(ch)
+}
+
 /// Analyze `text` into an [`AnalyzedDoc`] (term, tf, original-text offsets,
 /// and document length) using the sidecar at `addr`.
 ///
 /// `spec` maps straight onto the sidecar's `AnalysisOptions`: term vectors
 /// are always requested (FULL mode with occurrence offsets unless the spec
 /// overrides), everything else defaults. INVALID_ARGUMENT for empty or
-/// oversized text; UNAVAILABLE when the sidecar cannot be reached.
+/// oversized text; UNAVAILABLE when the sidecar cannot be reached (the
+/// shared channel connects lazily, so transport failures surface from the
+/// call itself, not from client construction).
 pub async fn analyze_document(
     addr: &str,
     text: &str,
@@ -60,14 +89,13 @@ pub async fn analyze_document(
             ..Default::default()
         }),
     };
-    let mut client = AnalysisServiceClient::connect(addr.to_string())
-        .await
-        .map_err(|e| Status::unavailable(format!("analysis sidecar at {addr}: {e}")))?;
-    let response = client
-        .analyze(request)
-        .await
-        .map_err(|e| Status::internal(format!("analysis failed: {e}")))?
-        .into_inner();
+    let mut client = AnalysisServiceClient::new(shared_channel(addr)?)
+        .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+    // Raw Status passthrough: transport failures keep tonic's Unavailable
+    // (the channel connects lazily, so "sidecar down" surfaces HERE, not
+    // at client construction), server errors keep their own codes.
+    let response = client.analyze(request).await?.into_inner();
 
     let mut doc = AnalyzedDoc::default();
     for tv in response.term_vectors {
