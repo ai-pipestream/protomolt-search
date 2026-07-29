@@ -837,46 +837,38 @@ the heap builder (bulk-load discipline: build in memory, flush back).
 This is what makes a corpus larger than machine memory work: the
 postings (~130 GB at full CourtListener scale) and doc text (~40 GB)
 live in page cache shared across all consumers, not per-process heap.
-The turbovec vector index remains heap-resident today (v5 `load()`
-reads packed codes into a Vec and the search repacks a blocked copy) —
-at full-court scale that is ~3 GB packed + ~3 GB blocked across the
-cluster, which fits; mmap support there is a fork-level decision
-(see the limitations list).
+The turbovec vector index remains heap-resident today (v6 `load()`
+keeps packed codes in heap Vecs and builds the blocked copy lazily on
+first search) — at full-court scale that is ~3 GB packed + ~3 GB
+blocked across the cluster, which fits; mmap support there is a
+fork-level decision (see the TODO list).
 
-## Limitations
+## TODO
 
-- **Static membership.** The coordinator's node list is fixed at startup;
-  no discovery, no re-sharding, no node failure handling beyond surfacing
-  the error.
-- **No replication.** Each shard lives on exactly one node.
-- **Calibration distribution is manual-trigger.** `SetCalibration` (or the
-  `calibrate` subcommand) pushes a fitted calibration; nothing fits or
-  verifies automatically, and shards with mismatched calibrations produce
-  incomparable scores without warning beyond `GetCalibration` inspection.
-- **Positional ids only.** Ingested vectors are identified by
-  `slot_offset + slot` in insertion order; client-chosen ids would need
-  turbovec's `IdMapIndex`, which lacks the masked, floor-seeded scan.
-  Deletes/updates are not supported (append-only).
-- **Durability is flush-based.** Vectors are durable after `Flush` or a
-  graceful shutdown; an ungraceful kill loses everything since the last
-  flush (no WAL, no save interval).
-- **Per-query streams.** Each query opens a fresh channel + `SearchShard`
-  stream per node (no pooling).
-- **Skipped-work metric is a proxy.** `candidates_collected` is countable
-  through the public API; a true per-block prefilter-skip counter needs a
-  small patch to the turbovec kernel.
-- **Postings are append-only and unscored-deleted.** No document deletes
-  or updates; a changed document must be re-ingested as a new id.
-- **Vector index is heap-resident.** turbovec v5's `load()` reads
-  packed codes into heap Vecs and materializes a blocked copy for
-  search (~2x packed size). Serving truly oversized vector indexes
-  needs a fork-level packed-bytes abstraction (owned Vec or mmap behind
-  one accessor, plus a paged or mmap-backed blocked cache; ~200-400
-  lines in the fork) — reported, not built here.
-- **Hybrid exactness requires shared calibration.** GLOBAL_RANK fusion
-  is exactly monolithic for k <= leg_k, but only while every shard
-  shares one TQ+ calibration; recalibration is a coordinated
-  re-seed + re-ingest event. TWO_LEVEL is the fallback when scores are
-  not comparable.
-- **No node-local BM25 shortcut.** Single-node deployments go through the
-  same coordinator flow (a 1-node fan-out).
+- **Live resharding catch-up.** Split/merge today is offline replay
+  plus an atomic `InstallSnapshot` swap (see "Write log and
+  resharding"). Children tailing the parent's WAL while it keeps
+  serving — a hitless cutover — is the next step; the log format
+  already carries everything catch-up needs.
+- **Hot shard-map reload.** The coordinator reads its shard map at
+  startup. Mid-query generation flips and generation-stamped queries
+  are future work.
+- **Hash-based ingest routing.** Writes go to explicitly addressed
+  shards; routing by `hash(doc_id)` range lands with the map work.
+- **Replication.** A replica is a node that tails a WAL and installs
+  images — the substrate exists, the protocol does not.
+- **Streaming reshard.** Replay buffers each child's vectors in memory;
+  very large shards need a spill-to-disk pass.
+- **Deletes and updates.** Vectors and postings are append-only; a
+  changed document re-ingests under a new id. turbovec's `IdMapIndex`
+  removes in O(1) but lacks the masked, floor-seeded scan.
+- **mmap vector index.** Postings and doc text are disk-resident (page
+  cache); the turbovec index is heap-resident (see above). A
+  packed-bytes abstraction — owned Vec or mmap behind one accessor,
+  with a paged blocked cache — is a fork-level decision, reported not
+  built.
+- **Calibration verification.** Ingest drivers fit and broadcast the
+  shared calibration; mismatched shards score incomparably with no
+  warning beyond `GetCalibration` inspection.
+- **Connection pooling.** Each query opens a fresh channel and
+  `SearchShard` stream per node.
