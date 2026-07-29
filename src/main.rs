@@ -168,6 +168,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     bit_width: cfg.bit_width,
                     index_path: shard.index_path.clone(),
                     analysis_addr: shard.analysis_addr.clone(),
+                    wal: shard.wal,
+                    wal_buckets: shard.wal_buckets,
                 },
             )
             .with_bm25(bm25_store)
@@ -199,6 +201,13 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 b: f64::from(cfg.bm25_b),
             },
         );
+        if let Some(map) = &cfg.shard_map {
+            eprintln!(
+                "shard map generation {} ({} shards)",
+                map.generation,
+                cfg.node_addrs.len()
+            );
+        }
         eprintln!(
             "SearchService listening on {addr} ({} shard nodes)",
             cfg.node_addrs.len()

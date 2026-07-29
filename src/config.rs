@@ -69,6 +69,40 @@ pub struct ShardConfig {
     pub slot_offset: u64,
     /// Analysis sidecar address for AddDocuments on this shard.
     pub analysis_addr: Option<String>,
+    /// Keep a write-ahead log at `<index path>.wal/`. Defaults on for
+    /// shards with an index path, off for demo shards.
+    pub wal: bool,
+    /// Number of WAL hash buckets (a power of two, max 1024). Fixed at
+    /// WAL creation; a resumed log keeps its own.
+    pub wal_buckets: u32,
+}
+
+/// One shard entry of a coordinator shard map (`--shard-map`): which node
+/// owns which id range, plus the hash range it covers when the map was
+/// produced by a hash-partitioned split (see `examples/reshard.rs`).
+/// `hash_lo`/`hash_hi` are inclusive and default to the full range.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardMapShard {
+    /// Node address (`host:port` or `http://host:port`).
+    pub addr: String,
+    /// The shard's global id base.
+    #[serde(default)]
+    pub slot_offset: u64,
+    /// Inclusive hash-range bounds (`fnv1a64(vector_id)` space).
+    pub hash_lo: Option<u64>,
+    pub hash_hi: Option<u64>,
+}
+
+/// The id-to-shard authority for one cluster generation
+/// (`--shard-map=<file>`). Replaces `--nodes`; bumping `generation` is how
+/// a split/merge rollout distinguishes old topology from new.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardMap {
+    /// Topology generation (0 for the implicit `--nodes` topology).
+    #[serde(default)]
+    pub generation: u64,
+    /// One entry per shard, in fan-out order (= merge tie-break order).
+    pub shards: Vec<ShardMapShard>,
 }
 
 /// Full process configuration.
@@ -104,6 +138,10 @@ pub struct Config {
     pub bm25_k1: f32,
     /// BM25 b parameter sent to every shard.
     pub bm25_b: f32,
+    /// The shard map the coordinator's `node_addrs` came from, when
+    /// `--shard-map` was given (`None` for the implicit `--nodes`
+    /// topology, generation 0).
+    pub shard_map: Option<ShardMap>,
 }
 
 /// Raw TOML file shape; every field optional (file < env < CLI).
@@ -128,6 +166,9 @@ struct FileConfig {
     analysis_addr: Option<String>,
     bm25_k1: Option<f32>,
     bm25_b: Option<f32>,
+    wal: Option<bool>,
+    wal_buckets: Option<u32>,
+    shard_map: Option<String>,
     shards: Vec<FileShard>,
 }
 
@@ -140,6 +181,8 @@ struct FileShard {
     slot_offset: Option<u64>,
     demo_vectors: Option<usize>,
     analysis_addr: Option<String>,
+    wal: Option<bool>,
+    wal_buckets: Option<u32>,
 }
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
@@ -217,16 +260,36 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     .parse::<SocketAddr>()
     .map_err(|e| format!("invalid coordinator listen address: {e}"))?;
 
-    // Coordinator fan-out list: CLI (--nodes=a,b) > env > file.
-    let node_addrs = match opt(args, "nodes", "TURBOVEC_NODES", None) {
-        Some(s) => normalize_addrs(
-            s.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        None => normalize_addrs(file.nodes.clone().unwrap_or_default()),
+    // Coordinator fan-out list. A shard map (--shard-map) REPLACES
+    // --nodes: it carries the same addresses plus topology metadata.
+    let shard_map = match opt(args, "shard-map", "TURBOVEC_SHARD_MAP", file.shard_map.as_deref())
+    {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read shard map {path}: {e}"))?;
+            let map: ShardMap =
+                toml::from_str(&text).map_err(|e| format!("parse shard map {path}: {e}"))?;
+            Some(map)
+        }
+        None => None,
+    };
+    let nodes_given =
+        opt(args, "nodes", "TURBOVEC_NODES", None).is_some() || file.nodes.is_some();
+    if shard_map.is_some() && nodes_given {
+        return Err("--shard-map replaces --nodes; pass exactly one".to_string());
+    }
+    let node_addrs = match &shard_map {
+        Some(map) => normalize_addrs(map.shards.iter().map(|s| s.addr.clone()).collect()),
+        None => match opt(args, "nodes", "TURBOVEC_NODES", None) {
+            Some(s) => normalize_addrs(
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            None => normalize_addrs(file.nodes.clone().unwrap_or_default()),
+        },
     };
 
     let dim = opt(
@@ -275,6 +338,35 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     .parse::<u64>()
     .map_err(|e| format!("invalid slot offset: {e}"))?;
 
+    // Write-ahead log: default on for persisted shards, always off for
+    // demo shards (they have no index path to log next to). Bucket count
+    // is a power of two (max 1024) and caps cheap split granularity.
+    let wal_default = match opt(args, "wal", "TURBOVEC_WAL", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.wal.unwrap_or(true),
+    };
+    let wal_buckets_default = opt(
+        args,
+        "wal-buckets",
+        "TURBOVEC_WAL_BUCKETS",
+        file.wal_buckets.map(|b| b.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u32>()
+            .map_err(|e| format!("invalid wal bucket count: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(64);
+    let parse_buckets = |b: u32, what: &str| -> Result<u32, String> {
+        if !b.is_power_of_two() || b == 0 || b > 1024 {
+            return Err(format!(
+                "{what}: wal bucket count must be a power of two in 1..=1024, got {b}"
+            ));
+        }
+        Ok(b)
+    };
+    let wal_buckets_default = parse_buckets(wal_buckets_default, "--wal-buckets")?;
+
     let mut shards: Vec<ShardConfig> = if cli_index.is_some() || cli_demo.is_some() {
         if cli_index.is_some() && cli_demo.is_some() {
             return Err("--index and --demo-vectors are mutually exclusive".to_string());
@@ -295,6 +387,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .transpose()?;
         vec![ShardConfig {
             listen,
+            wal: wal_default && demo.is_none(),
+            wal_buckets: wal_buckets_default,
             index_path: cli_index.map(PathBuf::from),
             demo,
             slot_offset: cli_offset,
@@ -323,6 +417,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                 }
                 Ok(ShardConfig {
                     listen,
+                    wal: shard.wal.unwrap_or(wal_default) && demo.is_none(),
+                    wal_buckets: parse_buckets(
+                        shard.wal_buckets.unwrap_or(wal_buckets_default),
+                        &format!("shards[{i}]"),
+                    )?,
                     index_path: shard.index.as_ref().map(PathBuf::from),
                     demo,
                     slot_offset: shard.slot_offset.unwrap_or(0),
@@ -390,7 +489,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     }
     if matches!(role, Role::Coordinator | Role::Both) && node_addrs.is_empty() {
         return Err(
-            "coordinator role requires --nodes (or `nodes` in the config file)".to_string(),
+            "coordinator role requires --nodes or --shard-map (or `nodes` in the config file)"
+                .to_string(),
         );
     }
     if demo_query && role == Role::Node {
@@ -450,6 +550,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         analysis_addr,
         bm25_k1,
         bm25_b,
+        shard_map,
     })
 }
 
@@ -602,5 +703,61 @@ slot_offset = 20000
         .unwrap();
         assert!(cfg.demo_query);
         assert_eq!(cfg.query_dim, 256);
+    }
+
+    #[test]
+    fn wal_defaults_on_for_index_off_for_demo() {
+        let demo = parse(&args(&["--role=node", "--demo-vectors=10"])).unwrap();
+        assert!(!demo.shards[0].wal);
+        let persisted = parse(&args(&["--role=node", "--index=/tmp/x.tv"])).unwrap();
+        assert!(persisted.shards[0].wal);
+        let off = parse(&args(&["--role=node", "--index=/tmp/x.tv", "--wal=false"])).unwrap();
+        assert!(!off.shards[0].wal);
+    }
+
+    #[test]
+    fn shard_map_replaces_nodes() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join(format!("turbovec_shardmap_{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+generation = 7
+
+[[shards]]
+addr = "host-a:50051"
+slot_offset = 0
+hash_lo = 0
+hash_hi = 9223372036854775807
+
+[[shards]]
+addr = "host-b:50051"
+slot_offset = 25000000
+"#,
+        )
+        .unwrap();
+        let cfg = parse(&args(&[
+            "--role=coordinator",
+            &format!("--shard-map={}", path.display()),
+        ]))
+        .unwrap();
+        let map = cfg.shard_map.expect("shard map parsed");
+        assert_eq!(map.generation, 7);
+        assert_eq!(map.shards.len(), 2);
+        assert_eq!(map.shards[1].slot_offset, 25_000_000);
+        assert_eq!(map.shards[1].hash_lo, None);
+        assert_eq!(
+            cfg.node_addrs,
+            vec!["http://host-a:50051", "http://host-b:50051"]
+        );
+        // Both --nodes and --shard-map is an error.
+        assert!(parse(&args(&[
+            "--role=coordinator",
+            &format!("--shard-map={}", path.display()),
+            "--nodes=a:1",
+        ]))
+        .is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

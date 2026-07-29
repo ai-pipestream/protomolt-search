@@ -38,7 +38,9 @@ use crate::pb::{
     ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest,
     StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
 };
+use crate::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker};
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store};
+use crate::wal::{self, WalWriter};
 
 /// How a node scans and whether it participates in floor sharing.
 #[derive(Debug, Clone)]
@@ -61,6 +63,13 @@ pub struct NodeConfig {
     /// Analysis sidecar address (`http://host:port`) for AddDocuments.
     /// `None` makes AddDocuments fail UNAVAILABLE.
     pub analysis_addr: Option<String>,
+    /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
+    /// Requires `index_path`; the config layer defaults this on for
+    /// persisted shards and off for demo shards.
+    pub wal: bool,
+    /// Number of WAL hash buckets (`bucket-NNN.wal` files per
+    /// generation). Fixed at WAL creation; a resumed log keeps its own.
+    pub wal_buckets: u32,
 }
 
 impl Default for NodeConfig {
@@ -72,6 +81,8 @@ impl Default for NodeConfig {
             bit_width: 4,
             index_path: None,
             analysis_addr: None,
+            wal: false,
+            wal_buckets: 64,
         }
     }
 }
@@ -131,6 +142,9 @@ struct ShardState {
     /// `Flush` and the AddDocuments reload path read/write THERE, never
     /// the legacy `<index path>` layout, so the two never split-brain.
     generation: Option<PathBuf>,
+    /// The write-ahead log (`<index path>.wal/`), behind the same lock as
+    /// the index it precedes. `None` when the shard runs without one.
+    wal: Option<WalWriter>,
 }
 
 /// The persistence path of a shard's BM25 store: `<index path>.bm25`.
@@ -210,6 +224,182 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
     generation_tv(&snap).exists().then_some(snap)
 }
 
+/// The manifest describing a shard's current shape: calibration and dim
+/// from the loaded index when it has them (a seeded or fitted shard),
+/// zeros otherwise — an empty shard completes the manifest lazily, via
+/// `SetCalibration` or its first batch, until calibration locks.
+///
+/// `preexisting` is the (vectors, documents) the shard already holds
+/// that this generation's log will NOT contain — the installed image on
+/// a snapshot rotation, or the whole shard when logging is enabled on an
+/// already-populated index. Nonzero preexisting state marks the log as
+/// partial history, which the reshard tool refuses (a log-only replay
+/// would silently drop that state).
+fn wal_manifest(
+    index: Option<&TurboQuantIndex>,
+    config: &NodeConfig,
+    generation: u64,
+    preexisting: (u64, u64),
+) -> wal::WalManifest {
+    let (dim, bit_width, shift, scale) = match index {
+        Some(index) => {
+            let (shift, scale) = index.calibration().unwrap_or((&[], &[]));
+            (
+                index.dim_opt().unwrap_or(0) as u32,
+                index.bit_width() as u32,
+                shift.to_vec(),
+                scale.to_vec(),
+            )
+        }
+        None => (0, config.bit_width as u32, Vec::new(), Vec::new()),
+    };
+    wal::WalManifest {
+        dim,
+        bit_width,
+        calibration_shift: shift,
+        calibration_scale: scale,
+        slot_offset: config.slot_offset,
+        generation,
+        bucket_bits: config.wal_buckets.trailing_zeros(),
+        bucket_count: config.wal_buckets,
+        preexisting_vectors: preexisting.0,
+        preexisting_documents: preexisting.1,
+        format_version: wal::FORMAT_VERSION,
+    }
+}
+
+/// The persisted document tip of a shard: `next_doc_id` of the on-disk
+/// BM25 sidecar (generation-aware), 0 when none exists. Opened read-only
+/// and dropped — the serving copy is attached separately (`with_bm25`);
+/// this exists so WAL reconciliation can know the applied tip without
+/// depending on attachment order.
+fn persisted_doc_tip(index_path: &Path) -> u64 {
+    let generation = recover_generation(index_path);
+    let (_, bm25_path) = storage_paths(index_path, generation.as_ref());
+    if !bm25_path.exists() {
+        return 0;
+    }
+    match Bm25Shard::open(&bm25_path) {
+        Ok(store) => u64::from(store.next_doc_id()),
+        // Panic, like the rest of the WAL open path: guessing a tip of 0
+        // would truncate legitimate document records, and the binary
+        // would refuse to serve this sidecar at attach time anyway.
+        Err(e) => panic!(
+            "wal reconciliation: cannot read {}: {e}",
+            bm25_path.display()
+        ),
+    }
+}
+
+/// Open the shard's WAL at `<index path>.wal/`: resume the newest
+/// generation after a restart (truncating any torn tails, continuing the
+/// per-file sequences) or start generation 0. A resumed log keeps its own
+/// bucket count — the configured `--wal-buckets` only applies at WAL
+/// creation. Panics on IO failure, like the BM25 load path in the
+/// binary — a shard that cannot log must not silently run unlogged.
+///
+/// Resume reconciles the log against the applied state first: records at
+/// or above the applied tip (`slot_offset + max(vector tip, document
+/// tip)`) are truncated, because appends are buffered and a crash can
+/// leave the on-disk log ahead of the on-disk indexes — the reopening
+/// shard would otherwise re-assign ids the log already holds. The
+/// dropped records were never durable-acked (Flush is the durability
+/// point).
+///
+/// A log CREATED over an already-populated shard records the shard's
+/// current contents as `preexisting_*` in its manifest: it can serve and
+/// recover, but it is not full history and cannot drive a reshard.
+fn open_wal(index: Option<&TurboQuantIndex>, config: &NodeConfig) -> Option<WalWriter> {
+    if !config.wal {
+        return None;
+    }
+    let index_path = config
+        .index_path
+        .as_ref()
+        .expect("wal requires an index path");
+    let vector_tip = index.map_or(0, |i| i.len() as u64);
+    let doc_tip = persisted_doc_tip(index_path);
+    let dir = wal::wal_dir(index_path);
+    let result = match wal::latest_gen(&dir) {
+        Ok(Some((_, gen))) => wal::read_manifest(&gen).and_then(|m| {
+            let cutoff = config.slot_offset + vector_tip.max(doc_tip);
+            let dropped = wal::truncate_records_at_or_above(&gen, cutoff)?;
+            if dropped > 0 {
+                eprintln!(
+                    "wal: truncated {dropped} record(s) at or above applied tip {cutoff} in {} \
+                     (buffered appends that outlived a crash; never durable-acked)",
+                    gen.display()
+                );
+            }
+            WalWriter::resume(&gen, m)
+        }),
+        Ok(None) => {
+            if vector_tip > 0 || doc_tip > 0 {
+                eprintln!(
+                    "wal: shard already holds {vector_tip} vectors / {doc_tip} documents; the new \
+                     log records them as preexisting — this shard can serve but cannot be \
+                     resharded from this log (rebuild via InstallSnapshot for full history)"
+                );
+            }
+            WalWriter::create(&dir, wal_manifest(index, config, 0, (vector_tip, doc_tip)))
+        }
+        Err(e) => Err(e),
+    };
+    let mut writer = result.unwrap_or_else(|e| panic!("open WAL at {}: {e}", dir.display()));
+    if writer.manifest().bucket_count != config.wal_buckets {
+        eprintln!(
+            "wal: --wal-buckets={} ignored; the existing log at {} has bucket_count={}",
+            config.wal_buckets,
+            writer.dir().display(),
+            writer.manifest().bucket_count
+        );
+    }
+    // A resumed generation whose calibration never locked (no records
+    // yet) still accepts manifest completion.
+    writer.update_manifest(|m| {
+        let fresh = wal_manifest(index, config, m.generation, (0, 0));
+        if m.dim == 0 {
+            m.dim = fresh.dim;
+            m.bit_width = fresh.bit_width;
+            m.slot_offset = fresh.slot_offset;
+        }
+        if m.calibration_shift.is_empty() {
+            m.calibration_shift = fresh.calibration_shift;
+            m.calibration_scale = fresh.calibration_scale;
+        }
+    });
+    eprintln!("wal: logging to {}", writer.dir().display());
+    Some(writer)
+}
+
+/// Log `op`, or degrade the shard to unlogged if the append fails.
+///
+/// The mutation was already applied when this runs (apply-then-log, see
+/// [`WalWriter::append`]), so failing the client's request would report a
+/// write that in fact happened. Instead the shard keeps serving and the
+/// log is retired loudly: the generation directory is renamed `.broken`
+/// (so the reshard tool and a restarting node cannot mistake it for
+/// history) and the writer is dropped. Per the resharding policy, a
+/// shard without a WAL serves fine but can only be rebuilt, never
+/// resharded.
+fn wal_append_or_degrade(wal_slot: &mut Option<WalWriter>, op: wal_record::Op) {
+    let Some(wal) = wal_slot.as_mut() else { return };
+    if let Err(e) = wal.append(op) {
+        let dir = wal.dir().to_path_buf();
+        let broken = dir.with_extension("broken");
+        eprintln!(
+            "wal: append to {} failed ({e}); retiring the log as {} — this shard continues \
+             UNLOGGED and can no longer be resharded from its log (rebuild required)",
+            dir.display(),
+            broken.display()
+        );
+        *wal_slot = None;
+        if let Err(e) = std::fs::rename(&dir, &broken) {
+            eprintln!("wal: could not rename the broken generation: {e}");
+        }
+    }
+}
+
 /// The shard-owner gRPC service. Cheap to clone (state is shared).
 #[derive(Clone)]
 pub struct NodeServiceImpl {
@@ -221,11 +411,13 @@ pub struct NodeServiceImpl {
 impl NodeServiceImpl {
     /// Wrap an optional preloaded index in a node service.
     pub fn new(index: Option<TurboQuantIndex>, config: NodeConfig) -> Self {
+        let wal = open_wal(index.as_ref(), &config);
         Self {
             state: Arc::new(RwLock::new(ShardState {
                 index,
                 bm25: None,
                 generation: None,
+                wal,
             })),
             config,
         }
@@ -292,6 +484,15 @@ impl NodeServiceImpl {
                 written: false,
             });
         };
+        // Log before data: fsync the WAL BEFORE the index images are
+        // written, so a crash between the two leaves the log a superset
+        // of the on-disk indexes — never the reverse. An index image
+        // whose records the log lost would silently drop those records
+        // from every future replay (reshard, recovery).
+        if let Some(wal) = guard.wal.as_mut() {
+            wal.flush()
+                .map_err(|e| Status::internal(format!("wal fsync {}: {e}", wal.dir().display())))?;
+        }
         // Flush into the active snapshot generation when one was
         // installed, else the legacy layout — never split the two.
         let (tv_path, bm25_path) = storage_paths(&config_path, guard.generation.as_ref());
@@ -316,6 +517,16 @@ impl NodeServiceImpl {
             );
         }
         let written = guard.index.is_some() || guard.bm25.is_some();
+        // Durability point reached: the log was fsynced above, then the
+        // indexes hit disk. The marker records that a flush happened;
+        // its own fsync failing degrades the log rather than un-flushing
+        // the indexes (they are already durable and consistent).
+        wal_append_or_degrade(&mut guard.wal, wal_record::Op::Flush(FlushMarker {}));
+        if let Some(wal) = guard.wal.as_mut() {
+            if let Err(e) = wal.flush() {
+                eprintln!("wal: post-flush marker fsync failed: {e}");
+            }
+        }
         Ok(FlushResponse {
             path: tv_path.display().to_string(),
             num_vectors,
@@ -484,6 +695,35 @@ impl NodeServiceImpl {
         let num_vectors = loaded.len() as u64;
         guard.index = Some(loaded);
         guard.generation = Some(snap.clone());
+        // The snapshot supersedes the log: fsync and retire the current
+        // generation, open gen-(g+1) with the installed image's
+        // calibration (same bucket geometry), and mark where it came
+        // from. Records before this point describe the OLD shard
+        // contents.
+        if guard.wal.is_some() {
+            let source_generation = guard.wal.as_ref().map_or(0, WalWriter::generation);
+            // The installed image is state this fresh log does NOT
+            // contain: record it as preexisting so the reshard tool
+            // refuses a log-only replay that would drop the image.
+            let mut manifest = wal_manifest(
+                guard.index.as_ref(),
+                &self.config,
+                source_generation + 1,
+                (num_vectors, num_documents),
+            );
+            let previous = guard.wal.as_ref().expect("checked above").manifest();
+            manifest.bucket_bits = previous.bucket_bits;
+            manifest.bucket_count = previous.bucket_count;
+            let wal_err = |e: std::io::Error| Status::internal(format!("wal rotate: {e}"));
+            let wal = guard.wal.as_mut().expect("checked above");
+            wal.flush().map_err(wal_err)?;
+            *wal = WalWriter::create(&wal::wal_dir(&path), manifest).map_err(wal_err)?;
+            wal.append(wal_record::Op::Snapshot(SnapshotMarker {
+                source_generation,
+            }))
+            .map_err(wal_err)?;
+            wal.flush().map_err(wal_err)?;
+        }
         Ok(InstallSnapshotResponse {
             path: generation_tv(&snap).display().to_string(),
             num_vectors,
@@ -500,7 +740,7 @@ impl NodeServiceImpl {
                 .map_err(|e| Status::invalid_argument(format!("invalid calibration: {e}")))
         };
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        match guard.index.as_ref() {
+        let result = match guard.index.as_ref() {
             Some(index) if !index.is_empty() => Err(Status::failed_precondition(format!(
                 "shard holds {} vectors; calibration is locked for the index lifetime",
                 index.len()
@@ -527,7 +767,20 @@ impl NodeServiceImpl {
                 guard.index = Some(build()?);
                 Ok(false)
             }
+        };
+        // Complete the pending WAL manifest with the locked calibration
+        // (no-op once calibration is on disk).
+        if result.is_ok() {
+            if let Some(wal) = guard.wal.as_mut() {
+                wal.update_manifest(|m| {
+                    m.dim = dim as u32;
+                    m.bit_width = bit_width as u32;
+                    m.calibration_shift = req.shift.clone();
+                    m.calibration_scale = req.scale.clone();
+                });
+            }
         }
+        result
     }
 
     /// Apply one ingested batch under the write lock. Returns
@@ -566,23 +819,57 @@ impl NodeServiceImpl {
                 "invalid input value at vector {vi}, coord {ci}: {v}"
             )));
         }
-        let index = match guard.index.as_mut() {
-            Some(index) => index,
-            None => {
-                // From-scratch, unseeded: turbovec fits calibration from
-                // this first batch. Seeded deployment is the SetCalibration
-                // path; this exists for single-shard convenience.
-                guard.index = Some(
-                    TurboQuantIndex::new(dim, self.config.bit_width)
-                        .map_err(|e| Status::invalid_argument(format!("{e}")))?,
-                );
-                guard.index.as_mut().expect("just constructed")
-            }
+        let (first_id, index_bit_width) = {
+            let index = match guard.index.as_mut() {
+                Some(index) => index,
+                None => {
+                    // From-scratch, unseeded: turbovec fits calibration from
+                    // this first batch. Seeded deployment is the SetCalibration
+                    // path; this exists for single-shard convenience.
+                    guard.index = Some(
+                        TurboQuantIndex::new(dim, self.config.bit_width)
+                            .map_err(|e| Status::invalid_argument(format!("{e}")))?,
+                    );
+                    guard.index.as_mut().expect("just constructed")
+                }
+            };
+            (self.config.slot_offset + index.len() as u64, index.bit_width())
         };
-        let first_id = self.config.slot_offset + index.len() as u64;
-        index
+        // Apply first, log after, under this one lock. A failed apply
+        // must never reach the log: its assigned ids would be reused by
+        // the next batch and the duplicate would poison every replay.
+        // Durability is unaffected — both sides are volatile until
+        // Flush, which fsyncs the log BEFORE the index images.
+        guard
+            .index
+            .as_mut()
+            .expect("constructed or present above")
             .add_2d(&batch.vectors, dim)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        // One record PER VECTOR: contiguous ids hash to different
+        // buckets, and a bucket file must never hold vectors that belong
+        // to another bucket. Buffered (no fsync per batch); Flush and
+        // generation rotation fsync.
+        if let Some(wal) = guard.wal.as_mut() {
+            wal.update_manifest(|m| {
+                if m.dim == 0 {
+                    m.dim = dim as u32;
+                    m.bit_width = index_bit_width as u32;
+                }
+            });
+        }
+        for (i, vector) in batch.vectors.chunks_exact(dim).enumerate() {
+            wal_append_or_degrade(
+                &mut guard.wal,
+                wal_record::Op::AddVectors(LoggedAddVectors {
+                    first_id: first_id + i as u64,
+                    batch: Some(AddVectorsRequest {
+                        vectors: vector.to_vec(),
+                        dim: dim as u32,
+                    }),
+                }),
+            );
+        }
         Ok(((batch.vectors.len() / dim) as u64, first_id))
     }
 
@@ -1041,25 +1328,41 @@ impl NodeService for NodeServiceImpl {
             // Shared positional id space with the vector side: the next id
             // is past both indexes' tips.
             let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
+            let doc_id = vector_tip.max(
+                guard
+                    .bm25
+                    .get_or_insert_with(|| Bm25Shard::Building(Bm25Store::new()))
+                    .next_doc_id(),
+            );
+            let global_id = self.config.slot_offset + u64::from(doc_id);
+            if added == 0 {
+                first_id = global_id;
+            }
+            // Apply first, log after, as for vectors: a document that
+            // fails to enter the store must never reach the log, or its
+            // id would be reassigned and poison the replay.
             let store = guard
                 .bm25
                 .get_or_insert_with(|| Bm25Shard::Building(Bm25Store::new()));
-            let doc_id = vector_tip.max(store.next_doc_id());
-            if added == 0 {
-                first_id = self.config.slot_offset + u64::from(doc_id);
-            }
             let Bm25Shard::Building(store) = store else {
                 return Err(Status::internal("shard builder unavailable"));
             };
             store.add_document_with_lineage(
                 doc_id,
-                doc.text,
+                doc.text.clone(),
                 analyzed,
                 doc.lineage.map(|l| crate::postings::DocLineage {
                     opinion_id: l.opinion_id,
                     cluster_id: l.cluster_id,
                     span_start: l.span_start,
                     span_end: l.span_end,
+                }),
+            );
+            wal_append_or_degrade(
+                &mut guard.wal,
+                wal_record::Op::AddDocuments(LoggedAddDocuments {
+                    first_id: global_id,
+                    documents: vec![doc],
                 }),
             );
             added += 1;

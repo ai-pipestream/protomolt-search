@@ -17,3 +17,18 @@ pub mod analysis {
 pub mod tei {
     tonic::include_proto!("tei.v1");
 }
+
+/// The per-shard write-ahead log envelope (`proto/turbovec/search/wal/v1/wal.proto`).
+pub mod wal {
+    pub mod v1 {
+        tonic::include_proto!("turbovec.search.wal.v1");
+    }
+    pub use v1::*;
+}
+
+/// Shim for the generated wal code: it references the search types it
+/// reuses as `super::super::v1::X` (their package path), while this module
+/// includes them flat — re-export the referenced ones under that name.
+pub mod v1 {
+    pub use super::{AddDocumentsRequest, AddVectorsRequest};
+}

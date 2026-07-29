@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+// Per-shard write-ahead log (WAL) for turbovec-search nodes.
+//
+// Every mutation a shard applies (vector batches, document batches, flush
+// points, snapshot installs) is framed into append-only bucket files
+// BEFORE it hits the index, so a shard's full ingest history can be
+// replayed offline — which is what makes split/merge of live shards a
+// replay-from-log operation instead of a re-embed (see `examples/reshard.rs`).
+//
+// On-disk layout (no protobuf framing of its own):
+//
+//   <index path>.wal/gen-<generation:06>/
+//     manifest.toml       shard shape + locked calibration + bucket count
+//     bucket-<NNN>.wal    records, routed by fnv1a64(id) >> (64 - bucket_bits)
+//     markers.wal         FlushMarker / SnapshotMarker records
+//
+// Each frame is `[u32 payload_len LE][u32 crc32-IEEE of payload LE][prost
+// bytes]` carrying one WalRecord; seq is 1-based and gapless per FILE. A
+// snapshot install supersedes the prior log, so the node rotates to
+// `gen-(generation+1)` with a fresh manifest.
+package turbovec.search.wal.v1;
+
+import "turbovec/search/v1/search.proto";
+
+// A logged `AddVectors` batch with its server-assigned id base.
+// `AddVectorsRequest` does not carry assigned ids, so the envelope adds
+// them: the batch's i-th vector got global id `first_id + i`.
+message LoggedAddVectors {
+  // Global id assigned to the batch's first vector.
+  uint64 first_id = 1;
+  // The batch as received (flat row-major vectors, optional dim).
+  turbovec.search.v1.AddVectorsRequest batch = 2;
+}
+
+// A logged `AddDocuments` unit with its server-assigned id base. Documents
+// are applied one at a time on the node, so in practice `documents` holds
+// one entry; it is repeated so a future batched write path can log several
+// documents under one base id (`first_id + i` for the i-th).
+message LoggedAddDocuments {
+  // Global id assigned to the first document.
+  uint64 first_id = 1;
+  // The documents as received (raw text + analysis spec + lineage).
+  repeated turbovec.search.v1.AddDocumentsRequest documents = 2;
+}
+
+// The shard flushed its indexes to disk at this point.
+message FlushMarker {}
+
+// A snapshot install superseded the log: the node rotated to THIS segment
+// right after swapping in the image from `source_generation`. Records in
+// earlier segments describe the old shard contents and must not be
+// replayed against this generation.
+message SnapshotMarker {
+  // The segment generation the installed snapshot replaced.
+  uint64 source_generation = 1;
+}
+
+// One logged mutation. `seq` is 1-based and gapless within its file
+// (bucket files route by id; markers.wal holds the two markers); readers
+// validate continuity and CRC so a corrupted or torn log fails loudly (a
+// truncated TAIL frame — a crash mid-append — is ignored).
+message WalRecord {
+  // 1-based sequence number within the segment.
+  uint64 seq = 1;
+  oneof op {
+    LoggedAddVectors add_vectors = 2;
+    LoggedAddDocuments add_documents = 3;
+    FlushMarker flush = 4;
+    SnapshotMarker snapshot = 5;
+  }
+  // Reserved for multi-writer recovery: 6 for a clock tag (writer id +
+  // logical tick per record, the generalization of per-file `seq` that
+  // replication and live catch-up need to answer "what exactly am I
+  // missing" across writers), 7 for a recovery-point marker. Per-file
+  // sequence numbers are that answer for the single-writer log we have
+  // today; reserving the numbers keeps old logs readable when clocks
+  // arrive.
+  reserved 6, 7;
+}
