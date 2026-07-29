@@ -5,21 +5,20 @@ cluster, as a reproducible installer **and** an end-to-end test. No
 Python anywhere: data movement is the AWS CLI, extraction is Rust,
 embedding/serving is Rust + the GraalVM-native OpenNLP sidecar.
 
-```
-CourtListener bulk CSV.bz2 (public S3 bucket, quarterly snapshots)
-   │  seed job: aws s3 cp (anonymous) → aws s3 cp → rustfs
-   ▼
-rustfs (S3-compatible object store) — single source of truth
-   │  pipeline job: rclone pull
-   ▼
-court_extract (Rust) ──► opinions-sample.ndjson
-   ▼
-court_chunks ──OpenNLP analysis sidecar (native)──► chunks.ndjson + embeddings.bin
-   │            (sentence detect + static Model2Vec embeddings)
-   ▼
-court_ingest ──calibration broadcast, AddDocuments+AddVectors, Flush──► node1..4
-   ▼
-court_verify ──vector self-match + distributed BM25 gate──► exit 0 = PASS
+```mermaid
+flowchart TD
+    A["CourtListener bulk CSV.bz2<br/>(public S3 bucket, quarterly snapshots)"]
+    B["rustfs — S3-compatible object store<br/>single source of truth"]
+    C["court_extract (Rust)"]
+    D["court_chunks"]
+    E["court_ingest"]
+    F["court_verify"]
+    A -->|"seed job: aws s3 cp (anonymous) → rustfs"| B
+    B -->|"pipeline job: rclone pull"| C
+    C -->|"opinions-sample.ndjson"| D
+    D -->|"OpenNLP analysis sidecar (native):<br/>sentence detect + static Model2Vec embeddings<br/>→ chunks.ndjson + embeddings.bin"| E
+    E -->|"calibration broadcast, AddDocuments+AddVectors, Flush → node1..4"| F
+    F -->|"vector self-match + distributed BM25 gate"| G(["exit 0 = PASS"])
 ```
 
 ## Quickstart

@@ -46,23 +46,15 @@ docker run --rm --network court-e2e_default -v court-e2e_corpus-data:/corpus \
 
 ## Design
 
-```
-                        ┌──────────────────────┐
-                        │     coordinator      │
-   client ──Search──▶   │   (SearchService)    │
-                        │                      │
-                        │  FloorTracker: max   │◀──┐ k-th best per shard
-                        │  over shard floors   │   │ (once heap fills)
-                        └───┬───────┬───────┬──┘   │
-              Start+FloorUpdate │       │       │  │ FloorUpdate
-            ┌───────────────────┘       │       └───────────────┐
-            ▼                           ▼                       ▼
-     ┌─────────────┐             ┌─────────────┐         ┌─────────────┐
-     │   node 0    │             │   node 1    │   ...   │   node N    │
-     │ (NodeService)│            │ (NodeService)│         │ (NodeService)│
-     │ shard index │             │ shard index │         │ shard index │
-     │ chunked scan│             │ chunked scan│         │ chunked scan│
-     └─────────────┘             └─────────────┘         └─────────────┘
+```mermaid
+flowchart TB
+    client([client]) -->|Search| coord["coordinator (SearchService)<br/>FloorTracker: max over shard floors"]
+    coord -->|"StartShardSearch + FloorUpdate"| n0["node 0 (NodeService)<br/>shard index · chunked scan"]
+    coord -->|"StartShardSearch + FloorUpdate"| n1["node 1 (NodeService)<br/>shard index · chunked scan"]
+    coord -->|"StartShardSearch + FloorUpdate"| nn["node N (NodeService)<br/>shard index · chunked scan"]
+    n0 -->|"FloorUpdate: k-th best (once heap fills)"| coord
+    n1 -->|"FloorUpdate: k-th best"| coord
+    nn -->|"FloorUpdate: k-th best"| coord
 ```
 
 Floor flow for one query:
@@ -226,14 +218,19 @@ UNAVAILABLE.
 **Query** (`SearchService.Bm25Search`) — distributed correctness via the
 two-phase global-stats flow:
 
-```
-coordinator                                   shards
-    │ 1. Analyze(query text, same options) ──▶ sidecar → query terms
-    │ 2. TermStats{terms} ──────────────────▶ per-shard df, N, Σlen
-    │ 3. global N, avgdl, Σdf ──▶ Bm25Query{terms, globals, k, k1, b}
-    │                                         every shard scores with
-    │                                         IDENTICAL idf/avgdl
-    │ 4. merge (score desc, shard, doc id) ◀── shard top-ks + offsets
+```mermaid
+sequenceDiagram
+    participant C as coordinator
+    participant SC as sidecar
+    participant S as shards
+    C->>SC: 1. Analyze(query text, same options)
+    SC-->>C: query terms
+    C->>S: 2. TermStats{terms}
+    S-->>C: per-shard df, N, Σlen
+    C->>S: 3. Bm25Query{terms, globals, k, k1, b}
+    Note over S: every shard scores with IDENTICAL idf/avgdl
+    S-->>C: 4. shard top-ks + offsets
+    Note over C: merge (score desc, shard, doc id)
 ```
 
 Shard-local BM25 stats would make scores incomparable across shards; the
