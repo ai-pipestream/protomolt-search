@@ -20,6 +20,15 @@ fn arg(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Longest prefix of `s` within `n` bytes that ends on a char boundary.
+fn prefix(s: &str, n: usize) -> &str {
+    let mut end = n.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn analysis_spec() -> AnalysisSpec {
     AnalysisSpec {
         tokenizer: 1,
@@ -94,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\n=== query doc {probe_id} (opinion {} cluster {} span {}..{}):",
             lineage.opinion_id, lineage.cluster_id, lineage.span_start, lineage.span_end
         );
-        println!("text: {:?}", &doc.text[..doc.text.len().min(140)]);
+        println!("text: {:?}", prefix(&doc.text, 140));
         let hits = coordinator
             .fanout_cascade("court-query", &doc.text, &vector, k, Some(&spec))
             .await?;
@@ -119,10 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  top doc {}: opinion {} cluster {} span {}..{}",
                     top.doc_id, l.opinion_id, l.cluster_id, l.span_start, l.span_end
                 );
-                println!(
-                    "  top text: {:?}",
-                    &top_doc.text[..top_doc.text.len().min(200)]
-                );
+                println!("  top text: {:?}", prefix(&top_doc.text, 200));
             }
         }
     }
