@@ -165,7 +165,7 @@ default**. Every flag takes `--key=value` or `--key value`.
 ```toml
 role = "both"                                  # node | coordinator | both
 coord_listen = "0.0.0.0:50050"
-nodes = ["host-a:50051", "krick-1:50051"]      # fan-out order = tie-break order
+nodes = ["host-a:50051", "host-b:50051"]      # fan-out order = tie-break order
 chunk_blocks = 64                              # scan chunk size (SIMD blocks)
 floor_sharing = true
 max_message_mib = 64                           # gRPC message cap (both directions)
@@ -661,7 +661,7 @@ mixed-bucket-count merges are rejected.
 
 ## Two-machine runbook
 
-Topology: host A (this host) runs coordinator + shard 0; host B (`krick-1`)
+Topology: host A (this host) runs coordinator + shard 0; host B (`host-b`)
 runs shard 1. Static membership — both configs list the same node set.
 
 1. **Build and produce shard indexes** on host A:
@@ -679,14 +679,14 @@ runs shard 1. Static membership — both configs list the same node set.
    skip files entirely: point each node's `index` at a fresh path, start
    empty, then seed + ingest over gRPC per "Ingest flow" above.)
 
-2. **Copy the binary and shard 1 to krick-1:**
+2. **Copy the binary and shard 1 to host-b:**
 
    ```bash
-   scp target/release/turbovec-search krick-1:/usr/local/bin/
-   scp /data/turbovec/shard-1.tv krick-1:/data/turbovec/
+   scp target/release/turbovec-search host-b:/usr/local/bin/
+   scp /data/turbovec/shard-1.tv host-b:/data/turbovec/
    ```
 
-3. **Config on krick-1** (`/etc/turbovec/krick-1.toml`):
+3. **Config on host-b** (`/etc/turbovec/host-b.toml`):
 
    ```toml
    role = "node"
@@ -696,14 +696,14 @@ runs shard 1. Static membership — both configs list the same node set.
    slot_offset = 50000          # = vectors in shard 0 (contiguous offsets)
    ```
 
-   Start: `turbovec-search --config /etc/turbovec/krick-1.toml`
+   Start: `turbovec-search --config /etc/turbovec/host-b.toml`
 
 4. **Config on host A** (`/etc/turbovec/host-a.toml`):
 
    ```toml
    role = "both"
    coord_listen = "0.0.0.0:50050"
-   nodes = ["host-a:50051", "krick-1:50051"]
+   nodes = ["host-a:50051", "host-b:50051"]
 
    [[shards]]
    listen = "0.0.0.0:50051"
@@ -717,7 +717,7 @@ runs shard 1. Static membership — both configs list the same node set.
    issue a real search. The binary's built-in check does one:
 
    ```bash
-   turbovec-search --role=coordinator --nodes=host-a:50051,krick-1:50051 \
+   turbovec-search --role=coordinator --nodes=host-a:50051,host-b:50051 \
        --coord-listen=127.0.0.1:59999 --demo-query --query-dim=128
    ```
 
@@ -741,8 +741,8 @@ runs shard 1. Static membership — both configs list the same node set.
 
    # then, anywhere with corpus access for probe vectors:
    cluster_sweep \
-     --nodes-sharing=host-a:50061,host-a:50062,krick-1:50063,krick-1:50064 \
-     --nodes-nosharing=host-a:50071,host-a:50072,krick-1:50073,krick-1:50074 \
+     --nodes-sharing=host-a:50061,host-a:50062,host-b:50063,host-b:50064 \
+     --nodes-nosharing=host-a:50071,host-a:50072,host-b:50073,host-b:50074 \
      --k=10,100,1000,10000 --queries=20
    ```
 
@@ -768,7 +768,7 @@ runs shard 1. Static membership — both configs list the same node set.
    `libgfortran.so.5` under `LD_LIBRARY_PATH` on bare hosts.)
 
    Executed 2026-07-27 on the wiki shards (4 x 61077 bge-m3 1024d docs;
-   shards 0+1 on krick, 2+3 on krick-1): correctness gate green at every
+   shards 0+1 on host-a, 2+3 on host-b): correctness gate green at every
    k; candidate reduction from sharing fell from ~7% at k=10 to ~3% at
    k=10000 (the leg approaches a full scan), with wall medians ~20-24ms
    and no consistent wall win at this scale.
