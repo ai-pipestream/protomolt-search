@@ -18,7 +18,7 @@
 //!
 //! # Static two-machine cluster (see README "Two-machine runbook").
 //! # host-a:    turbovec-search --config /etc/turbovec/host-a.toml
-//! # krick-1:   turbovec-search --config /etc/turbovec/krick-1.toml
+//! # host-b:   turbovec-search --config /etc/turbovec/host-b.toml
 //! ```
 
 use std::net::SocketAddr;

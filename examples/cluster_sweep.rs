@@ -28,8 +28,8 @@
 //!
 //! # A/B floor-sharing gate (two clusters over the same shard files)
 //! cluster_sweep \
-//!   --nodes-sharing=krick:50061,krick:50062,krick-1:50063,krick-1:50064 \
-//!   --nodes-nosharing=krick:50071,krick:50072,krick-1:50073,krick-1:50074 \
+//!   --nodes-sharing=host-a:50061,host-a:50062,host-b:50063,host-b:50064 \
+//!   --nodes-nosharing=host-a:50071,host-a:50072,host-b:50073,host-b:50074 \
 //!   --k=10,100,1000,10000 --queries=20
 //! ```
 

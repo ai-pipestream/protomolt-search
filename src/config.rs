@@ -14,7 +14,7 @@
 //! ```toml
 //! role = "both"                        # node | coordinator | both
 //! coord_listen = "0.0.0.0:50050"
-//! nodes = ["host-a:50051", "krick-1:50051"]  # fan-out order = tie-break order
+//! nodes = ["host-a:50051", "host-b:50051"]  # fan-out order = tie-break order
 //! chunk_blocks = 64
 //! floor_sharing = true
 //! max_message_mib = 64
@@ -614,7 +614,7 @@ mod tests {
             r#"
 role = "both"
 coord_listen = "0.0.0.0:51050"
-nodes = ["host-a:50051", "krick-1:50052"]
+nodes = ["host-a:50051", "host-b:50052"]
 chunk_blocks = 16
 floor_sharing = false
 max_message_mib = 32
@@ -638,7 +638,7 @@ slot_offset = 20000
         assert_eq!(cfg.coord_listen.port(), 51050);
         assert_eq!(
             cfg.node_addrs,
-            vec!["http://host-a:50051", "http://krick-1:50052"]
+            vec!["http://host-a:50051", "http://host-b:50052"]
         );
         assert_eq!(cfg.shards.len(), 2);
         assert_eq!(cfg.shards[1].listen.port(), 50052);
