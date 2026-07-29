@@ -16,7 +16,7 @@
 //!   length/offset tables only).
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC_V1: &[u8; 8] = b"TVBM2501";
@@ -283,6 +283,10 @@ impl Bm25Store {
                 None => {
                     write_u32(w, u32::MAX)?;
                     text_index.push((0, u32::MAX));
+                    // The absent marker still occupies 4 bytes; skipping
+                    // this advance pointed every later text_index entry 4
+                    // bytes early per gap slot.
+                    cursor += 4;
                 }
             }
         }
@@ -582,6 +586,358 @@ impl Bm25Store {
     }
 }
 
+/// Disk-spilling builder producing the SAME v3 file as [`Bm25Store::save`]
+/// (byte-identical), with bounded memory at any corpus size.
+///
+/// The in-memory store keeps every posting and every text in heap until
+/// flush — ~100 GB for a 10M-chunk shard. This builder instead:
+///
+/// - streams document texts to a spill file AT ADD TIME, already in the
+///   final texts-section encoding (gap slots get their `u32::MAX` marker
+///   immediately), so flush byte-copies the file into place;
+/// - accumulates postings in a bounded buffer; when it fills, the buffer
+///   is sorted by `(term, doc_id)` and written out as a run. Doc ids
+///   only grow, so runs never overlap within a term and the flush-time
+///   merge is a heap of run heads concatenating per-term lists in run
+///   order — one sequential pass, no random access.
+///
+/// Heap while building: the sort buffer (default 256 MB) plus the per-doc
+/// length/lineage tables. A spilling shard is NOT searchable (that would
+/// mean scanning every run per term); flush it first.
+pub struct SpillBuilder {
+    dir: PathBuf,
+    /// Pending postings: (term, doc_id, tf, offsets).
+    buf: Vec<(String, u32, u32, Vec<(u32, u32)>)>,
+    buf_bytes: usize,
+    cap_bytes: usize,
+    runs: Vec<PathBuf>,
+    /// Texts spill, encoded exactly as the v3 texts section.
+    texts: io::BufWriter<std::fs::File>,
+    texts_bytes: u64,
+    /// Per-slot text byte length (`u32::MAX` = absent); sizes the final
+    /// sections without rereading the spill.
+    text_lens: Vec<u32>,
+    doc_lengths: Vec<u32>,
+    lineages: Vec<Option<DocLineage>>,
+    total_length: u64,
+    doc_count: u64,
+}
+
+impl SpillBuilder {
+    /// Default sort-buffer capacity before a run is spilled.
+    pub const DEFAULT_BUF_BYTES: usize = 256 << 20;
+
+    /// Create a builder spilling into `dir` (created; must not hold a
+    /// previous builder's files).
+    pub fn create(dir: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let texts = io::BufWriter::new(std::fs::File::create(dir.join("texts.spill"))?);
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            buf: Vec::new(),
+            buf_bytes: 0,
+            cap_bytes: Self::DEFAULT_BUF_BYTES,
+            runs: Vec::new(),
+            texts,
+            texts_bytes: 0,
+            text_lens: Vec::new(),
+            doc_lengths: Vec::new(),
+            lineages: Vec::new(),
+            total_length: 0,
+            doc_count: 0,
+        })
+    }
+
+    /// Override the sort-buffer capacity (tests force multi-run merges
+    /// with tiny caps).
+    pub fn with_buffer_bytes(mut self, cap: usize) -> Self {
+        self.cap_bytes = cap.max(1);
+        self
+    }
+
+    /// The number of document slots ever allocated (the next local doc id).
+    pub fn next_doc_id(&self) -> u32 {
+        self.doc_lengths.len() as u32
+    }
+
+    /// Number of documents with postings.
+    pub fn doc_count(&self) -> u64 {
+        self.doc_count
+    }
+
+    /// Sum of all document lengths (BM25 avgdl numerator).
+    pub fn total_doc_length(&self) -> u64 {
+        self.total_length
+    }
+
+    /// Append one analyzed document; same contract as
+    /// [`Bm25Store::add_document_with_lineage`].
+    pub fn add_document_with_lineage(
+        &mut self,
+        doc_id: u32,
+        text: String,
+        doc: AnalyzedDoc,
+        lineage: Option<DocLineage>,
+    ) -> io::Result<()> {
+        let slot = doc_id as usize;
+        assert!(
+            slot >= self.doc_lengths.len(),
+            "doc id {doc_id} already used"
+        );
+        // Gap slots (ids consumed by the vector side) are written to the
+        // spill NOW so the final texts section is a straight copy.
+        while self.doc_lengths.len() < slot {
+            write_u32(&mut self.texts, u32::MAX)?;
+            self.texts_bytes += 4;
+            self.text_lens.push(u32::MAX);
+            self.doc_lengths.push(0);
+            self.lineages.push(None);
+        }
+        write_u32(&mut self.texts, text.len() as u32)?;
+        self.texts.write_all(text.as_bytes())?;
+        self.texts_bytes += 4 + text.len() as u64;
+        self.text_lens.push(text.len() as u32);
+        self.doc_lengths.push(doc.length);
+        self.lineages.push(lineage);
+        self.total_length += u64::from(doc.length);
+        if doc.length > 0 {
+            self.doc_count += 1;
+        }
+        for (term, tf, offsets) in doc.terms {
+            self.buf_bytes += term.len() + 24 + 16 * offsets.len();
+            self.buf.push((term, doc_id, tf, offsets));
+        }
+        if self.buf_bytes >= self.cap_bytes {
+            self.spill_run()?;
+        }
+        Ok(())
+    }
+
+    /// Sort the buffer by `(term, doc_id)` and write it as one run.
+    fn spill_run(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.buf
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let path = self.dir.join(format!("run-{:06}", self.runs.len()));
+        let mut w = io::BufWriter::new(std::fs::File::create(&path)?);
+        let mut i = 0;
+        while i < self.buf.len() {
+            let term = &self.buf[i].0;
+            let group_end = self.buf[i..]
+                .iter()
+                .position(|e| &e.0 != term)
+                .map_or(self.buf.len(), |p| i + p);
+            write_u16(&mut w, term.len() as u16)?;
+            w.write_all(term.as_bytes())?;
+            write_u32(&mut w, (group_end - i) as u32)?;
+            for (_, doc_id, tf, offsets) in &self.buf[i..group_end] {
+                write_u32(&mut w, *doc_id)?;
+                write_u32(&mut w, *tf)?;
+                write_u32(&mut w, offsets.len() as u32)?;
+                for &(start, end) in offsets {
+                    write_u32(&mut w, start)?;
+                    write_u32(&mut w, end)?;
+                }
+            }
+            i = group_end;
+        }
+        w.flush()?;
+        self.runs.push(path);
+        self.buf.clear();
+        self.buf_bytes = 0;
+        Ok(())
+    }
+
+    /// Merge the runs and assemble the v3 file at `path` (atomically:
+    /// write tmp, rename). The spill directory is removed on success.
+    pub fn finish(&mut self, path: &Path) -> io::Result<()> {
+        self.spill_run()?;
+        self.texts.flush()?;
+
+        // Pass 1: merge runs into the postings section body, collecting
+        // the directory (term, absolute offset comes later, df).
+        let postings_body = self.dir.join("postings.body");
+        let mut directory: Vec<(String, u64, u32)> = Vec::new();
+        {
+            let mut out = io::BufWriter::new(std::fs::File::create(&postings_body)?);
+            let mut heads: Vec<RunHead> = Vec::new();
+            for run in &self.runs {
+                if let Some(head) = RunHead::open(run)? {
+                    heads.push(head);
+                }
+            }
+            let mut cursor = 0u64;
+            while !heads.is_empty() {
+                // Smallest term across run heads; runs are time-ordered,
+                // and ids only grow, so draining matching heads in run
+                // order keeps postings doc-ascending.
+                let term = heads
+                    .iter()
+                    .map(|h| h.term.clone())
+                    .min()
+                    .expect("nonempty heads");
+                let df: u32 = heads
+                    .iter()
+                    .filter(|h| h.term == term)
+                    .map(|h| h.n_postings)
+                    .sum();
+                write_str(&mut out, &term)?;
+                write_u32(&mut out, df)?;
+                directory.push((term.clone(), cursor, df));
+                cursor += 4 + term.len() as u64 + 4;
+                let mut idx = 0;
+                while idx < heads.len() {
+                    if heads[idx].term == term {
+                        cursor += heads[idx].copy_postings(&mut out)?;
+                        if !heads[idx].advance()? {
+                            heads.remove(idx);
+                            continue;
+                        }
+                    }
+                    idx += 1;
+                }
+            }
+            out.flush()?;
+        }
+        let postings_body_len = std::fs::metadata(&postings_body)?.len();
+
+        // Section geometry, identical to Bm25Store::write_to.
+        let n_slots = self.doc_lengths.len() as u64;
+        let header_size = 8 + 8 + 8 * 4 + 4;
+        let doc_lengths_off = header_size as u64;
+        let texts_off = doc_lengths_off + 4 * n_slots;
+        let text_index_off = texts_off + self.texts_bytes;
+        let lineages_off = text_index_off + 12 * n_slots;
+        let lineages_size: u64 = self
+            .lineages
+            .iter()
+            .map(|l| if l.is_some() { 25 } else { 1 })
+            .sum();
+        let postings_off = lineages_off + lineages_size;
+        let directory_off = postings_off + 4 + postings_body_len;
+
+        let tmp = path.with_extension("bm25tmp");
+        {
+            let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
+            w.write_all(MAGIC)?;
+            write_u64(&mut w, self.total_length)?;
+            write_u64(&mut w, texts_off)?;
+            write_u64(&mut w, lineages_off)?;
+            write_u64(&mut w, postings_off)?;
+            write_u64(&mut w, directory_off)?;
+            write_u32(&mut w, self.doc_lengths.len() as u32)?;
+            for &len in &self.doc_lengths {
+                write_u32(&mut w, len)?;
+            }
+            // texts: byte-copy of the spill (already section-encoded).
+            let mut spill = std::fs::File::open(self.dir.join("texts.spill"))?;
+            io::copy(&mut spill, &mut w)?;
+            // text_index, from the in-memory length table.
+            let mut cursor = texts_off;
+            for &len in &self.text_lens {
+                if len == u32::MAX {
+                    write_u64(&mut w, 0)?;
+                    write_u32(&mut w, u32::MAX)?;
+                    cursor += 4;
+                } else {
+                    write_u64(&mut w, cursor + 4)?;
+                    write_u32(&mut w, len)?;
+                    cursor += 4 + len as u64;
+                }
+            }
+            for lineage in &self.lineages {
+                match lineage {
+                    Some(l) => {
+                        w.write_all(&[1u8])?;
+                        write_u64(&mut w, l.opinion_id)?;
+                        write_u64(&mut w, l.cluster_id)?;
+                        write_u32(&mut w, l.span_start)?;
+                        write_u32(&mut w, l.span_end)?;
+                    }
+                    None => w.write_all(&[0u8])?,
+                }
+            }
+            write_u32(&mut w, directory.len() as u32)?;
+            let mut body = std::fs::File::open(&postings_body)?;
+            io::copy(&mut body, &mut w)?;
+            write_u32(&mut w, directory.len() as u32)?;
+            let mut blob_off = directory_off + 4 + 18 * directory.len() as u64;
+            for (term, rel_off, df) in &directory {
+                write_u64(&mut w, postings_off + 4 + rel_off)?;
+                write_u32(&mut w, *df)?;
+                write_u32(&mut w, blob_off as u32)?;
+                write_u16(&mut w, term.len() as u16)?;
+                blob_off += term.len() as u64;
+            }
+            for (term, _, _) in &directory {
+                w.write_all(term.as_bytes())?;
+            }
+            w.flush()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        std::fs::remove_dir_all(&self.dir)?;
+        Ok(())
+    }
+}
+
+/// One run's read cursor for the merge: the current term group's header
+/// plus a reader positioned at its postings.
+struct RunHead {
+    reader: io::BufReader<std::fs::File>,
+    term: String,
+    n_postings: u32,
+}
+
+impl RunHead {
+    fn open(path: &Path) -> io::Result<Option<Self>> {
+        let reader = io::BufReader::new(std::fs::File::open(path)?);
+        let mut head = Self {
+            reader,
+            term: String::new(),
+            n_postings: 0,
+        };
+        Ok(if head.advance()? { Some(head) } else { None })
+    }
+
+    /// Read the next term group header; false at end of run.
+    fn advance(&mut self) -> io::Result<bool> {
+        let mut len_buf = [0u8; 2];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        let term_len = u16::from_le_bytes(len_buf) as usize;
+        let mut term = vec![0u8; term_len];
+        self.reader.read_exact(&mut term)?;
+        self.term = String::from_utf8(term)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8 in run"))?;
+        let mut n = [0u8; 4];
+        self.reader.read_exact(&mut n)?;
+        self.n_postings = u32::from_le_bytes(n);
+        Ok(true)
+    }
+
+    /// Copy this group's postings to `out` in the final v3 encoding
+    /// (which is the run encoding), returning bytes written.
+    fn copy_postings<W: Write>(&mut self, out: &mut W) -> io::Result<u64> {
+        let mut written = 0u64;
+        for _ in 0..self.n_postings {
+            let mut fixed = [0u8; 12];
+            self.reader.read_exact(&mut fixed)?;
+            out.write_all(&fixed)?;
+            let n_offsets = u32::from_le_bytes(fixed[8..12].try_into().expect("4 bytes"));
+            let mut offsets = vec![0u8; 8 * n_offsets as usize];
+            self.reader.read_exact(&mut offsets)?;
+            out.write_all(&offsets)?;
+            written += 12 + 8 * u64::from(n_offsets);
+        }
+        Ok(written)
+    }
+}
+
 /// A memory-mapped, disk-resident view of a v3 `.bm25` file. Postings
 /// and document texts are read from the map on demand; the only heap
 /// state is the per-document length table and a term count.
@@ -760,6 +1116,93 @@ impl Bm25Index for Bm25Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deterministic synthetic corpus: gappy ids, mixed lineages,
+    /// offsets on some terms, shared and unique terms across docs.
+    fn synthetic_corpus() -> Vec<(u32, String, AnalyzedDoc, Option<DocLineage>)> {
+        let vocab = ["court", "plaintiff", "rust", "search", "vector", "quant"];
+        let mut docs = Vec::new();
+        let mut id = 0u32;
+        for i in 0..200u32 {
+            // Every 7th id is a gap (vector-side slot).
+            id += if i % 7 == 0 { 2 } else { 1 };
+            let mut terms: DocTerms = Vec::new();
+            let mut length = 0;
+            for (vi, term) in vocab.iter().enumerate() {
+                if (i as usize + vi) % (vi + 2) == 0 {
+                    let tf = 1 + (i % 3);
+                    let offsets = if vi % 2 == 0 {
+                        (0..tf).map(|o| (o * 10, o * 10 + 4)).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    terms.push((term.to_string(), tf, offsets));
+                    length += tf;
+                }
+            }
+            let lineage = (i % 3 == 0).then_some(DocLineage {
+                opinion_id: u64::from(i) * 17,
+                cluster_id: u64::from(i) * 31,
+                span_start: i,
+                span_end: i + 100,
+            });
+            docs.push((id, format!("document {i} body text"), AnalyzedDoc { terms, length }, lineage));
+        }
+        docs
+    }
+
+    #[test]
+    fn spill_builder_output_is_byte_identical_to_store() {
+        let base = std::env::temp_dir().join(format!("spill-eq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut store = Bm25Store::new();
+        // Tiny buffer forces many runs, so the merge path is exercised
+        // with terms split across runs.
+        let mut builder = SpillBuilder::create(&base.join("build"))
+            .unwrap()
+            .with_buffer_bytes(256);
+        for (id, text, doc, lineage) in synthetic_corpus() {
+            store.add_document_with_lineage(id, text.clone(), doc.clone(), lineage);
+            builder
+                .add_document_with_lineage(id, text, doc, lineage)
+                .unwrap();
+        }
+        assert_eq!(store.doc_count(), builder.doc_count());
+        assert_eq!(store.total_doc_length(), builder.total_doc_length());
+        assert_eq!(store.next_doc_id(), builder.next_doc_id());
+
+        let store_path = base.join("store.bm25");
+        let spill_path = base.join("spill.bm25");
+        store.save(&store_path).unwrap();
+        builder.finish(&spill_path).unwrap();
+
+        let a = std::fs::read(&store_path).unwrap();
+        let b = std::fs::read(&spill_path).unwrap();
+        assert_eq!(a.len(), b.len(), "file sizes differ");
+        assert!(a == b, "spill output is not byte-identical to the store");
+        // Spill scratch is cleaned up on success.
+        assert!(!base.join("build").exists());
+
+        // And the reader serves it.
+        let reader = Bm25Reader::open(&spill_path).unwrap();
+        assert_eq!(Bm25Index::doc_count(&reader), store.doc_count());
+        assert_eq!(reader.df("court"), store.df("court"));
+        let mut seen = Vec::new();
+        reader.for_each_posting("vector", &mut |doc_id, tf, offsets| {
+            seen.push((doc_id, tf, offsets.to_vec()));
+        });
+        let expected: Vec<_> = store
+            .postings("vector")
+            .unwrap()
+            .iter()
+            .map(|p| (p.doc_id, p.tf, p.offsets.clone()))
+            .collect();
+        assert_eq!(seen, expected);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn doc_a() -> AnalyzedDoc {
         AnalyzedDoc {
