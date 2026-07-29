@@ -29,7 +29,7 @@ use turbovec_search::pb::{
 };
 
 const SIDECAR_BIN: &str =
-    "/work/main/grpc-services/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
+    "/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -110,18 +110,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample.len() / dim
     );
 
-    // --- Sidecar (real or mock fallback) ---------------------------------
+    // --- Sidecar (real; mock only with --allow-mock) ----------------------
+    // A mock-analyzed BM25 index looks healthy and scores garbage, so
+    // falling back silently is never acceptable for a real corpus.
     let mut sidecar_child = None;
-    let analysis_addr = match start_sidecar(SIDECAR_BIN, sidecar_port) {
+    let analysis_addr = match start_sidecar(&arg("sidecar-bin", SIDECAR_BIN), sidecar_port) {
         Ok((child, addr)) => {
             eprintln!("analysis sidecar: REAL native binary at {addr}");
             sidecar_child = Some(child);
             addr
         }
-        Err(e) => {
+        Err(e) if std::env::args().any(|a| a == "--allow-mock") => {
             eprintln!("WARNING: real sidecar unavailable ({e}); using the in-repo mock");
             mock_analysis::start_mock_analysis().await.0
         }
+        Err(e) => return Err(format!("analysis sidecar unavailable: {e}").into()),
     };
 
     // --- Shard nodes + coordinator ----------------------------------------

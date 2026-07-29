@@ -74,7 +74,7 @@ services:
   node2:
     build: ../..
     command: ["--role=node", "--node-listen=0.0.0.0:50051", "--index=/shard/shard.tv",
-              "--slot-offset=10000000", "--analysis-addr=http://analysis:50051"]
+              "--slot-offset=25000000", "--analysis-addr=http://analysis:50051"]
     volumes:
       - shard2:/shard
     depends_on:
@@ -83,7 +83,7 @@ services:
   node3:
     build: ../..
     command: ["--role=node", "--node-listen=0.0.0.0:50051", "--index=/shard/shard.tv",
-              "--slot-offset=20000000", "--analysis-addr=http://analysis:50051"]
+              "--slot-offset=50000000", "--analysis-addr=http://analysis:50051"]
     volumes:
       - shard3:/shard
     depends_on:
@@ -92,7 +92,7 @@ services:
   node4:
     build: ../..
     command: ["--role=node", "--node-listen=0.0.0.0:50051", "--index=/shard/shard.tv",
-              "--slot-offset=30000000", "--analysis-addr=http://analysis:50051"]
+              "--slot-offset=75000000", "--analysis-addr=http://analysis:50051"]
     volumes:
       - shard4:/shard
     depends_on:

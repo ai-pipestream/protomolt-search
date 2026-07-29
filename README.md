@@ -548,6 +548,108 @@ an image without a `.bm25` sidecar to wholesale-replace the postings
 store. Covered by `tests/snapshot.rs` (7 cases, incl. restart survival
 and crash recovery).
 
+### Write log and resharding
+
+Design rationale, invariants, and the deferred-work list:
+[docs/resharding.md](docs/resharding.md).
+
+Every shard with an `index` path keeps a write-ahead log at
+`<index path>.wal/` (on by default; `--wal=false` / `TURBOVEC_WAL=false`
+to disable, always off for `--demo-vectors`). The log is a folder of
+hash-bucketed files per generation:
+
+```text
+<index path>.wal/gen-<generation:06>/
+    manifest.toml       dim, bit width, calibration, slot offset,
+                        bucket_bits, bucket_count, format_version
+    bucket-<NNN>.wal    records routed by fnv1a64(id) >> (64 - bucket_bits)
+    markers.wal         FlushMarker / SnapshotMarker records
+```
+
+Frames are `[u32 len][u32 crc32][prost WalRecord]` with a 1-based gapless
+seq per file, written BEFORE the mutation hits the index. Writes are
+buffered; only Flush and generation rotation fsync, and the log is never
+on the search path. A crash can leave a torn tail frame in any file;
+replay ignores it (with a warning), and a restarted node truncates the
+tail and continues that file's sequence — damage stays scoped to the one
+bucket file it happened in. Calibration starts empty on a from-scratch
+shard and the small manifest is rewritten atomically (tmp + rename) when
+it locks, the same lazy-completion semantics as before. A snapshot
+install supersedes the log, so the node rotates to `gen-(g+1)` with a
+fresh manifest (the installed image's calibration, same bucket geometry)
+and a `SnapshotMarker` in its `markers.wal`.
+
+Because records are routed by the SAME partition function the reshard
+tool splits by (`bucket = fnv1a64(vector_id) >> (64 - log2(N))`), each
+bucket file is a pre-partitioned log slice: a split with
+`N <= bucket_count` hands each child a contiguous range of bucket files
+without re-hashing a record. Finer splits still work but re-partition
+every record — **`bucket_count` (default 64, `--wal-buckets` /
+`TURBOVEC_WAL_BUCKETS`, power of two, max 1024) caps cheap split
+granularity**. The count is fixed at WAL creation; a resumed log keeps
+its own and warns if the flag disagrees. Choose it with the bulk load's
+growth in mind.
+
+This is what makes split/merge of live shards replay-from-log instead of
+re-embed:
+
+1. **Snapshot** the shard (InstallSnapshot) — the base image.
+2. **Catch up** by replaying the WAL generation(s) written after the
+   snapshot.
+3. **Swap** the reshaped images in (InstallSnapshot again) and point the
+   coordinator at the new topology with `--shard-map`.
+
+The `reshard` example is the offline tool for step 2:
+
+```sh
+# Split one shard 1 -> N (N a power of two):
+cargo run --release --example reshard -- \
+    --log=/data/shard-0.tv.wal --split=2 --out-dir=/data/split \
+    --slot-base=0 --slot-stride=25000000 --analysis-addr=http://localhost:50051
+
+# Merge several shards -> 1 (identical calibration AND bucket count):
+cargo run --release --example reshard -- \
+    --logs=/data/shard-0.tv.wal,/data/shard-1.tv.wal --out-dir=/data/merged \
+    --analysis-addr=http://localhost:50051
+```
+
+It writes `<out>/shard-<i>.tv` (+ `.bm25`, documents re-analyzed with
+their ingested analysis options), a `shard-map.toml`, and prints the
+matching `[[shards]]` node config blocks. Invariants, enforced hard:
+
+- **One calibration per split/merge.** The WAL manifest must carry a
+  locked calibration (a seeded shard); merge requires byte-identical
+  calibrations and identical bucket counts across all inputs. Unseeded
+  shards cannot be resharded — their scores are not comparable across
+  buckets anyway.
+- **Ids are generation-scoped.** Children re-assign dense local slots in
+  original id order and take their slot base from the new shard map
+  (stride 25M by default, matching deploy/court-e2e); parent ids never
+  leak into a child.
+- **The shard map is the id-to-shard authority.** `--shard-map=<file>`
+  (`TURBOVEC_SHARD_MAP`) on the coordinator replaces `--nodes` (passing
+  both is an error): `generation = N` plus `[[shards]]` with `addr`,
+  `slot_offset`, and the child's `hash_lo`/`hash_hi` range. The
+  coordinator logs the generation at startup; plain `--nodes` keeps
+  working as the implicit generation 0.
+
+Two operational rules follow from the design:
+
+- **A shard without a WAL can serve but can never be split or merged —
+  only rebuilt from source.** The log IS the resharding input; keep it
+  on for any shard you may ever want to reshape.
+- **Live compaction is a self-snapshot.** To bound log growth, push the
+  shard's own flushed image back through InstallSnapshot: the install
+  supersedes the log and rotates to a fresh generation directory, so old
+  `gen-*` directories can be deleted once the swap is confirmed.
+
+Covered by `tests/reshard.rs`: split 1→2 reconstructs the parent's top-k
+bitwise (union of child top-k, ids remapped), a split with
+N == bucket_count consumes every bucket exactly once, a finer-than-
+buckets split re-partitions correctly, merge 2→1 reproduces the
+monolithic top-k and the BM25 doc set, and mixed-calibration or
+mixed-bucket-count merges are rejected.
+
 ## Two-machine runbook
 
 Topology: host A (this host) runs coordinator + shard 0; host B (`krick-1`)
@@ -635,8 +737,22 @@ runs shard 1. Static membership — both configs list the same node set.
      --k=10,100,1000,10000 --queries=20
    ```
 
-   It reports candidates + wall median/p90 per mode per k and asserts the
-   sharing on/off correctness gate (identical hit signatures) per k.
+   It reports candidates, floor counters, and wall p50/p90/p99 per mode
+   per k and asserts the sharing on/off correctness gate (identical hit
+   signatures) per k. `--nodes-nosharing` is optional: omit it to
+   benchmark a single cluster, and add `--warmup=N` (discarded probes,
+   default 2), `--concurrency=N` (parallel clients; the qps column
+   becomes meaningful), `--label=NAME`, and `--json=bench.jsonl`
+   (machine-readable records, appended) for load-test runs:
+
+   ```bash
+   cluster_sweep \
+     --nodes-sharing=node1:50051,node2:50051,node3:50051,node4:50051 \
+     --k=10,100,1000 --queries=100 --warmup=5 --concurrency=8 \
+     --probes-from=/corpus/embeddings.bin --label=4shard-200gb \
+     --json=bench.jsonl
+   ```
+
    Since turbovec v5 (block-Hadamard rotation) the release binary is
    fully self-contained — no OpenBLAS/libgfortran to ship. (Pre-v5
    builds linked system OpenBLAS and needed `libopenblas.so.0` +

@@ -87,6 +87,6 @@ once published.
 
 ## Slot offsets
 
-Nodes use fixed slot offsets 0/10M/20M/30M, so each shard can hold up to
-10M docs before ranges touch. Raise the spacing (or lower `EXTRACT_CAP`)
+Nodes use fixed slot offsets 0/25M/50M/75M, so each shard can hold up to
+25M docs before ranges touch (100M cluster-wide). Raise the spacing (or lower `EXTRACT_CAP`)
 if you change either side of that.

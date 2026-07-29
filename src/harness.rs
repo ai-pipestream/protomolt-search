@@ -47,6 +47,20 @@ pub fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 /// Fit a TQ+ calibration on a representative sample: build a throwaway
 /// index from the sample and read out its locked (shift, scale).
 pub fn fit_calibration(dim: usize, bit_width: usize, sample: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    // Upstream turbovec fits no calibration below ~1000 vectors (TQ+
+    // warm-up): quantile estimates on fewer samples are noise. Mirror
+    // that here as an explicit identity calibration — the same coordinate
+    // system upstream serves during warm-up — but say so, because on a
+    // real corpus an identity fit means the sampling is broken.
+    let n = sample.len() / dim;
+    if n < 1000 {
+        eprintln!(
+            "fit_calibration: sample of {n} vectors is below the TQ+ warm-up \
+             threshold (1000); using identity calibration. Fine for tiny test \
+             corpora, wrong for real ones: widen the sample."
+        );
+        return (vec![0.0; dim], vec![1.0; dim]);
+    }
     let mut fitting = TurboQuantIndex::new(dim, bit_width).unwrap();
     fitting.add(sample);
     let (shift, scale) = fitting.calibration().expect("first add fits calibration");

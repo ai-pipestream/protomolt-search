@@ -36,10 +36,14 @@ pub mod merge;
 pub mod node;
 pub mod pb;
 pub mod postings;
+pub mod reshard;
 pub mod snapshot;
+pub mod wal;
 
 /// Max gRPC message size (encoding and decoding) applied to every client
-/// and server this crate builds. 64 MiB leaves headroom for large-k
-/// responses: k=10000 hits is ~160 KiB, so even pathological future
-/// payloads (vectors in responses, many shards) fit comfortably.
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// and server this crate builds. Sized by the analysis path, not search:
+/// an Analyze response carries per-sentence embeddings plus every token
+/// span, roughly 10-15x the input text, and the corpus holds opinions of
+/// several MB. Search responses are tiny by comparison (k=10000 hits is
+/// ~160 KiB).
+pub const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;

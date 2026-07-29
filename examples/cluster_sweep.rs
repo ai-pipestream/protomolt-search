@@ -1,27 +1,42 @@
-//! k-sweep against a PRE-EXISTING cluster (e.g. the two-machine wiki
-//! shakedown deployment), measuring the floor-sharing payoff on real
-//! data.
+//! Latency / pruning benchmark against a PRE-EXISTING cluster (e.g. the
+//! two-machine wiki shakedown deployment or the court e2e stack).
 //!
 //! Unlike `sweep` (which builds shards in-process), this binary drives
-//! running nodes over the network. Floor sharing is a node-side config
-//! flag, so it takes TWO node lists — one cluster with sharing on, one
-//! with sharing off (same shard files, different ports) — and for each k
-//! runs `--queries` probe vectors against both, reporting candidates
-//! collected and wall median/p90 per mode, with the sharing on/off
-//! correctness gate (identical hit signatures) asserted per k.
+//! running nodes over the network. Two modes:
+//!
+//! * Single-cluster (default): point `--nodes-sharing` at the cluster
+//!   under test. For each k it runs `--warmup` discarded probes, then
+//!   `--queries` timed probes, reporting per-query wall percentiles
+//!   (p50/p90/p99), pruning counters (candidates collected, floors
+//!   published/applied), and QPS when `--concurrency` > 1.
+//! * A/B: also pass `--nodes-nosharing` (same shard files, different
+//!   ports — floor sharing is a node-side startup flag) and each k runs
+//!   against both clusters, with the sharing on/off correctness gate
+//!   (identical hit signatures) asserted per k.
 //!
 //! Probe vectors come from the corpus on disk (`--data-dir`,
-//! `read_embedding_at`), so queries live in the real bge-m3 space.
+//! `read_embedding_at`) or from a court embeddings file
+//! (`--probes-from`), so queries live in the real embedding space.
 //!
 //! ```text
+//! # single cluster, k sweep, 8 concurrent clients
+//! cluster_sweep \
+//!   --nodes-sharing=node1:50051,node2:50051,node3:50051,node4:50051 \
+//!   --k=10,100,1000 --queries=100 --warmup=5 --concurrency=8 \
+//!   --probes-from=/corpus/embeddings.bin --label=4shard-200gb \
+//!   --json=bench.jsonl
+//!
+//! # A/B floor-sharing gate (two clusters over the same shard files)
 //! cluster_sweep \
 //!   --nodes-sharing=krick:50061,krick:50062,krick-1:50063,krick-1:50064 \
 //!   --nodes-nosharing=krick:50071,krick:50072,krick-1:50073,krick-1:50074 \
 //!   --k=10,100,1000,10000 --queries=20
 //! ```
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Semaphore;
 use turbovec_search::coordinator::CoordinatorServiceImpl;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 
@@ -70,20 +85,24 @@ fn load_probes(probes_from: &str, data_dir: &str, n_queries: usize) -> Vec<Probe
     }
 }
 
-fn node_list(key: &str) -> Vec<String> {
-    arg(key)
-        .unwrap_or_else(|| panic!("--{key} is required"))
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            if s.starts_with("http://") || s.starts_with("https://") {
-                s.to_string()
-            } else {
-                format!("http://{s}")
-            }
-        })
-        .collect()
+fn node_list_required(key: &str) -> Vec<String> {
+    node_list(key).unwrap_or_else(|| panic!("--{key} is required"))
+}
+
+fn node_list(key: &str) -> Option<Vec<String>> {
+    arg(key).map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.starts_with("http://") || s.starts_with("https://") {
+                    s.to_string()
+                } else {
+                    format!("http://{s}")
+                }
+            })
+            .collect()
+    })
 }
 
 async fn wait_ready(addr: &str) {
@@ -102,48 +121,171 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
-struct Cell {
+/// One query's outcome: wall time, aggregated shard stats, hit signature.
+struct QueryOutcome {
+    wall_ms: f64,
     candidates: u64,
-    wall_median_ms: f64,
-    wall_p90_ms: f64,
+    floors_published: u64,
+    floor_updates_applied: u64,
     signature: Vec<(u64, u32)>,
 }
 
-async fn run_cell(nodes: &[String], probes: &[Probe], k: u32) -> Cell {
-    let coordinator = CoordinatorServiceImpl::new(nodes.to_vec());
-    let mut walls = Vec::with_capacity(probes.len());
+async fn run_query(
+    coordinator: &CoordinatorServiceImpl,
+    request_id: &str,
+    vector: &[f32],
+    k: u32,
+) -> QueryOutcome {
+    let start = Instant::now();
+    let result = coordinator
+        .fanout_search(request_id, vector, k, false)
+        .await
+        .expect("fanout search");
+    let wall_ms = start.elapsed().as_secs_f64() * 1e3;
     let mut candidates = 0u64;
-    let mut signature = Vec::new();
-    for (qi, (_, vector)) in probes.iter().enumerate() {
-        let start = Instant::now();
-        let result = coordinator
-            .fanout_search(&format!("sweep-{k}-{qi}"), vector, k, false)
-            .await
-            .expect("fanout search");
-        walls.push(start.elapsed().as_secs_f64() * 1e3);
-        for stats in result.shard_stats.iter().flatten() {
-            candidates += stats.candidates_collected;
-        }
-        if qi == 0 {
-            signature = result
-                .hits
-                .iter()
-                .map(|h| (h.vector_id, h.score.to_bits()))
-                .collect();
-        }
+    let mut floors_published = 0u64;
+    let mut floor_updates_applied = 0u64;
+    for stats in result.shard_stats.iter().flatten() {
+        candidates += stats.candidates_collected;
+        floors_published += stats.floors_published;
+        floor_updates_applied += stats.floor_updates_applied;
     }
+    QueryOutcome {
+        wall_ms,
+        candidates,
+        floors_published,
+        floor_updates_applied,
+        signature: result
+            .hits
+            .iter()
+            .map(|h| (h.vector_id, h.score.to_bits()))
+            .collect(),
+    }
+}
+
+struct Cell {
+    n_shards: usize,
+    candidates: u64,
+    floors_published: u64,
+    floor_updates_applied: u64,
+    walls: Vec<f64>,
+    /// Total timed-phase elapsed (for QPS under concurrency).
+    elapsed: Duration,
+    signature: Vec<(u64, u32)>,
+}
+
+impl Cell {
+    fn p(&self, p: f64) -> f64 {
+        percentile(&self.walls, p)
+    }
+    fn qps(&self) -> f64 {
+        self.walls.len() as f64 / self.elapsed.as_secs_f64()
+    }
+}
+
+/// Warm up with the head of the probe set, then time every probe. The
+/// warmup probes are timed too (they run twice total) — harmless for
+/// latency distribution and keeps the probe count exactly `--queries`.
+async fn run_cell(
+    nodes: &[String],
+    probes: &[Probe],
+    k: u32,
+    warmup: usize,
+    concurrency: usize,
+) -> Cell {
+    let coordinator = Arc::new(CoordinatorServiceImpl::new(nodes.to_vec()));
+
+    for (qi, (_, vector)) in probes.iter().take(warmup).enumerate() {
+        run_query(&coordinator, &format!("sweep-{k}-warm-{qi}"), vector, k).await;
+    }
+
+    let start = Instant::now();
+    let mut outcomes: Vec<QueryOutcome> = if concurrency <= 1 {
+        let mut out = Vec::with_capacity(probes.len());
+        for (qi, (_, vector)) in probes.iter().enumerate() {
+            out.push(run_query(&coordinator, &format!("sweep-{k}-{qi}"), vector, k).await);
+        }
+        out
+    } else {
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (qi, (_, vector)) in probes.iter().enumerate() {
+            let coordinator = Arc::clone(&coordinator);
+            let permit = Arc::clone(&semaphore).acquire_owned().await.expect("semaphore");
+            let vector = vector.clone();
+            let request_id = format!("sweep-{k}-{qi}");
+            tasks.spawn(async move {
+                let _permit = permit;
+                (qi, run_query(&coordinator, &request_id, &vector, k).await)
+            });
+        }
+        let mut indexed = Vec::with_capacity(probes.len());
+        while let Some(joined) = tasks.join_next().await {
+            indexed.push(joined.expect("query task panicked"));
+        }
+        indexed.sort_by_key(|(qi, _)| *qi);
+        indexed.into_iter().map(|(_, outcome)| outcome).collect()
+    };
+    let elapsed = start.elapsed();
+
+    let signature = outcomes
+        .first_mut()
+        .map(|o| std::mem::take(&mut o.signature))
+        .unwrap_or_default();
+    let mut walls: Vec<f64> = outcomes.iter().map(|o| o.wall_ms).collect();
     walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Cell {
-        candidates,
-        wall_median_ms: percentile(&walls, 0.5),
-        wall_p90_ms: percentile(&walls, 0.9),
+        n_shards: nodes.len(),
+        candidates: outcomes.iter().map(|o| o.candidates).sum(),
+        floors_published: outcomes.iter().map(|o| o.floors_published).sum(),
+        floor_updates_applied: outcomes.iter().map(|o| o.floor_updates_applied).sum(),
+        walls,
+        elapsed,
         signature,
     }
 }
 
+fn print_row(k: u32, mode: &str, cell: &Cell, n_queries: usize) {
+    println!(
+        "{:>8} {:>8} {:>7} {:>14} {:>12} {:>10} {:>10} {:>9.3} {:>9.3} {:>9.3} {:>8.1}",
+        k,
+        mode,
+        cell.n_shards,
+        cell.candidates,
+        cell.candidates / n_queries.max(1) as u64,
+        cell.floors_published,
+        cell.floor_updates_applied,
+        cell.p(0.5),
+        cell.p(0.9),
+        cell.p(0.99),
+        cell.qps(),
+    );
+}
+
+fn json_line(label: &str, k: u32, mode: &str, cell: &Cell, n_queries: usize) -> String {
+    serde_json::json!({
+        "label": label,
+        "k": k,
+        "floor_sharing": mode,
+        "shards": cell.n_shards,
+        "queries": n_queries,
+        "candidates_collected": cell.candidates,
+        "candidates_per_query": cell.candidates as f64 / n_queries.max(1) as f64,
+        "floors_published": cell.floors_published,
+        "floor_updates_applied": cell.floor_updates_applied,
+        "wall_p50_ms": cell.p(0.5),
+        "wall_p90_ms": cell.p(0.9),
+        "wall_p99_ms": cell.p(0.99),
+        "wall_min_ms": cell.walls.first().copied().unwrap_or(0.0),
+        "wall_max_ms": cell.walls.last().copied().unwrap_or(0.0),
+        "qps": cell.qps(),
+    })
+    .to_string()
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let nodes_sharing = node_list("nodes-sharing");
+    let nodes_sharing = node_list_required("nodes-sharing");
     let nodes_nosharing = node_list("nodes-nosharing");
     let data_dir = arg_or("data-dir", DEFAULT_DATA_DIR);
     let ks: Vec<u32> = arg_or("k", "10,100,1000,10000")
@@ -151,44 +293,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().parse().expect("--k"))
         .collect();
     let n_queries: usize = arg_or("queries", "20").parse()?;
+    let warmup: usize = arg_or("warmup", "2").parse()?;
+    let concurrency: usize = arg_or("concurrency", "1").parse()?;
+    let label = arg_or("label", "");
+    let json_path = arg("json");
 
-    for addr in nodes_sharing.iter().chain(nodes_nosharing.iter()) {
+    for addr in nodes_sharing
+        .iter()
+        .chain(nodes_nosharing.iter().flatten())
+    {
         wait_ready(addr).await;
     }
     eprintln!(
-        "cluster_sweep: {} + {} nodes, {} queries x k={:?}",
+        "cluster_sweep: {} shard(s){}, {} queries (+{} warmup) x k={:?}, concurrency={}",
         nodes_sharing.len(),
-        nodes_nosharing.len(),
+        nodes_nosharing
+            .as_ref()
+            .map(|n| format!(" + {} no-sharing", n.len()))
+            .unwrap_or_default(),
         n_queries,
-        ks
+        warmup,
+        ks,
+        concurrency,
     );
 
     let probes = load_probes(&arg_or("probes-from", ""), &data_dir, n_queries);
 
     println!();
     println!(
-        "{:>8} {:>8} {:>14} {:>14} {:>12}",
-        "k", "sharing", "candidates", "wall_med_ms", "wall_p90_ms"
+        "{:>8} {:>8} {:>7} {:>14} {:>12} {:>10} {:>10} {:>9} {:>9} {:>9} {:>8}",
+        "k", "sharing", "shards", "candidates", "cand/query", "floors_pub", "floors_app",
+        "p50_ms", "p90_ms", "p99_ms", "qps"
     );
+
+    let mut json_lines = Vec::new();
     let mut gate_failures = 0;
     for &k in &ks {
-        let on = run_cell(&nodes_sharing, &probes, k).await;
-        let off = run_cell(&nodes_nosharing, &probes, k).await;
-        println!(
-            "{:>8} {:>8} {:>14} {:>14.3} {:>12.3}",
-            k, "on", on.candidates, on.wall_median_ms, on.wall_p90_ms
-        );
-        println!(
-            "{:>8} {:>8} {:>14} {:>14.3} {:>12.3}",
-            k, "off", off.candidates, off.wall_median_ms, off.wall_p90_ms
-        );
-        if on.signature != off.signature {
-            gate_failures += 1;
-            eprintln!("CORRECTNESS GATE FAILURE at k={k}: sharing changed results");
+        let on = run_cell(&nodes_sharing, &probes, k, warmup, concurrency).await;
+        print_row(k, "on", &on, n_queries);
+        json_lines.push(json_line(&label, k, "on", &on, n_queries));
+
+        if let Some(off_nodes) = &nodes_nosharing {
+            let off = run_cell(off_nodes, &probes, k, warmup, concurrency).await;
+            print_row(k, "off", &off, n_queries);
+            json_lines.push(json_line(&label, k, "off", &off, n_queries));
+            if on.signature != off.signature {
+                gate_failures += 1;
+                eprintln!("CORRECTNESS GATE FAILURE at k={k}: sharing changed results");
+            }
         }
     }
-    if gate_failures == 0 {
-        eprintln!("correctness gate: sharing on/off results identical at every k");
+
+    if let Some(path) = json_path {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        for line in &json_lines {
+            writeln!(file, "{line}")?;
+        }
+        eprintln!("wrote {} JSONL record(s) to {path}", json_lines.len());
     }
-    std::process::exit(if gate_failures == 0 { 0 } else { 1 });
+
+    if nodes_nosharing.is_some() {
+        if gate_failures == 0 {
+            eprintln!("correctness gate: sharing on/off results identical at every k");
+        }
+        std::process::exit(if gate_failures == 0 { 0 } else { 1 });
+    }
+    Ok(())
 }

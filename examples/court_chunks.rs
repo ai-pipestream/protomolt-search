@@ -33,7 +33,7 @@ use turbovec_search::pb::analysis::analysis_service_client::AnalysisServiceClien
 use turbovec_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, EmbeddingOptions};
 
 const SIDECAR_BIN: &str =
-    "/work/main/grpc-services/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
+    "/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
 const MODEL_DIR: &str = "/work/court-corpus/models/minilm-l6-v2-static";
 const DIM: usize = 256;
 
@@ -238,7 +238,7 @@ async fn verify_pooling(
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let input = arg("input", "/work/court-corpus/opinions-sample.ndjson");
+    let input = arg("input", "/work/court-corpus/opinions.ndjson");
     let output = arg("output", "/work/court-corpus/chunks.ndjson");
     let embeddings_out = arg("embeddings-out", "/work/court-corpus/embeddings-static.bin");
     let sidecar_port: u16 = arg("sidecar-port", "59112").parse()?;
@@ -252,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sidecar_child = None;
     let analysis_addr = if analysis_override.is_empty() {
         let (child, addr) = start_sidecar_with_env(
-            SIDECAR_BIN,
+            &arg("sidecar-bin", SIDECAR_BIN),
             sidecar_port,
             &[("OPENNLP_EMBEDDINGS_DIR", MODEL_DIR)],
         )?;
@@ -280,7 +280,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (work_tx, work_rx) = mpsc::channel::<(u64, String)>(concurrency * 4);
     let work_rx = Arc::new(Mutex::new(work_rx));
-    let (done_tx, mut done_rx) = mpsc::channel::<ChunkedOpinion>(concurrency * 4);
+    let failed = Arc::new(AtomicU64::new(0));
+    // Ok(opinion) or Err(src_line of a failed analysis). Failures MUST
+    // reach the writer: its ordered watermark stalls forever on a line
+    // that never arrives, buffering every later opinion in memory (this
+    // OOM-killed the first full-corpus run at 109 GB).
+    let (done_tx, mut done_rx) = mpsc::channel::<Result<ChunkedOpinion, u64>>(concurrency * 4);
     let analyzed = Arc::new(AtomicU64::new(0));
     let chunked_count = Arc::new(AtomicU64::new(0));
 
@@ -291,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = analysis_addr.clone();
         let analyzed = analyzed.clone();
         let chunked_count = chunked_count.clone();
+        let failed = failed.clone();
         workers.push(tokio::spawn(async move {
             loop {
                 let next = work_rx.lock().await.recv().await;
@@ -299,11 +305,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(opinion) => {
                         analyzed.fetch_add(1, Ordering::Relaxed);
                         chunked_count.fetch_add(opinion.chunks.len() as u64, Ordering::Relaxed);
-                        if done_tx.send(opinion).await.is_err() {
+                        if done_tx.send(Ok(opinion)).await.is_err() {
                             return;
                         }
                     }
-                    Err(e) => eprintln!("line {src_line}: {e}"),
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("line {src_line}: {e}");
+                        if done_tx.send(Err(src_line)).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         }));
@@ -325,7 +337,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         EmbeddingWriter::append(emb_file)
     };
-    let mut pending: std::collections::BTreeMap<u64, ChunkedOpinion> =
+    // None marks a line that failed analysis. The written file must stay a
+    // contiguous src_line prefix — resume skips exactly the written lines,
+    // so writing past a gap would silently drop the failed line forever.
+    let mut pending: std::collections::BTreeMap<u64, Option<ChunkedOpinion>> =
         std::collections::BTreeMap::new();
     let mut watermark = skip_lines;
     let embedded_keys = Arc::new(embedded_keys);
@@ -357,17 +372,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         first_chunk_id + opinion.chunks.len() as u64
     };
     let writer_task = tokio::spawn(async move {
-        while let Some(opinion) = done_rx.recv().await {
-            pending.insert(opinion.src_line, opinion);
-            while let Some(opinion) = pending.remove(&watermark) {
+        let mut stalled = false;
+        'recv: while let Some(done) = done_rx.recv().await {
+            match done {
+                Ok(opinion) => pending.insert(opinion.src_line, Some(opinion)),
+                Err(src_line) => pending.insert(src_line, None),
+            };
+            while let Some(slot) = pending.remove(&watermark) {
+                let Some(opinion) = slot else {
+                    eprintln!(
+                        "writer: line {watermark} failed analysis; output ends at the last \
+                         contiguous line so a rerun resumes exactly here"
+                    );
+                    stalled = true;
+                    break 'recv;
+                };
                 next_chunk_id =
                     write_opinion(&mut chunk_writer, &mut emb_writer, &opinion, next_chunk_id);
                 watermark += 1;
             }
         }
-        for (_, opinion) in pending {
-            next_chunk_id =
-                write_opinion(&mut chunk_writer, &mut emb_writer, &opinion, next_chunk_id);
+        if stalled {
+            // Discard everything past the failure instead of buffering the
+            // rest of the corpus in this map.
+            pending.clear();
+            while done_rx.recv().await.is_some() {}
+        } else {
+            for (src_line, slot) in std::mem::take(&mut pending) {
+                let Some(opinion) = slot else { break };
+                if src_line != watermark {
+                    break;
+                }
+                next_chunk_id =
+                    write_opinion(&mut chunk_writer, &mut emb_writer, &opinion, next_chunk_id);
+                watermark += 1;
+            }
         }
         chunk_writer.finish().expect("flush chunks");
         emb_writer.finish().expect("flush embeddings");
@@ -383,6 +422,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         if limit > 0 && fed >= limit {
+            break;
+        }
+        if failed.load(Ordering::Relaxed) > 0 {
+            eprintln!("stopping feed at line {line_no}: an earlier line failed analysis");
             break;
         }
         work_tx.send((line_no, line?)).await?;
@@ -401,6 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_chunks = writer_task.await?;
     let elapsed = t0.elapsed();
     let analyzed_n = analyzed.load(Ordering::Relaxed);
+    let failed_n = failed.load(Ordering::Relaxed);
     eprintln!(
         "done: {analyzed_n} opinions analyzed, {total_chunks} chunks+vectors total in {:?} ({:.0} opinions/s, {:.0} chunks/s)",
         elapsed,
@@ -410,6 +454,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(mut child) = sidecar_child {
         let _ = child.kill();
+    }
+    // Reconcile: a lossy run must never look like a clean one. Every fed
+    // opinion is either analyzed or a counted failure; anything else is a
+    // bug in this driver. Failed lines stay in the input, so a rerun
+    // (resume skips only WRITTEN lines... they are lost from this pass)
+    // must be preceded by fixing the cause; exit nonzero either way.
+    if failed_n > 0 || analyzed_n + failed_n != fed {
+        eprintln!(
+            "LOST OPINIONS: fed {fed}, analyzed {analyzed_n}, failed {failed_n} — \
+             the corpus is NOT fully chunked"
+        );
+        std::process::exit(1);
     }
     Ok(())
 }
