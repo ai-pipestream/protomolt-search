@@ -56,12 +56,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The reshard core is synchronous; the sidecar client is async. Bridge
     // with block_in_place on the multi-thread runtime (same idiom the
-    // court examples use for sync work under tokio).
+    // court examples use for sync work under tokio). The batch's requests
+    // run concurrently — sidecar round-trips bound replay throughput.
     let addr = analysis_addr.clone();
     let handle = tokio::runtime::Handle::current();
-    let mut analyze = move |text: &str, spec: Option<&AnalysisSpec>| -> Result<AnalyzedDoc, String> {
-        tokio::task::block_in_place(|| handle.block_on(analyzer::analyze_document(&addr, text, spec)))
-            .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
+    let mut analyze = move |docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
+        let tasks: Vec<_> = docs
+            .iter()
+            .map(|(text, spec)| {
+                let addr = addr.clone();
+                let text = text.to_string();
+                let spec = spec.cloned();
+                handle.spawn(async move {
+                    analyzer::analyze_document(&addr, &text, spec.as_ref()).await
+                })
+            })
+            .collect();
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut out = Vec::with_capacity(tasks.len());
+                for task in tasks {
+                    out.push(
+                        task.await
+                            .map_err(|e| format!("analysis task: {e}"))?
+                            .map_err(|e| format!("analysis sidecar at {addr}: {e}"))?,
+                    );
+                }
+                Ok(out)
+            })
+        })
     };
 
     let output = match opt("logs") {

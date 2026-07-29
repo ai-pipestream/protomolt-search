@@ -34,16 +34,22 @@ use turbovec::TurboQuantIndex;
 
 use crate::pb::wal::wal_record;
 use crate::pb::{AddDocumentsRequest, AnalysisSpec};
-use crate::postings::{AnalyzedDoc, Bm25Store};
+use crate::postings::{AnalyzedDoc, SpillBuilder};
 use crate::wal::{self, RecordReader, WalManifest};
 
-/// Text analyzer for rebuilding BM25 stores: raw document text + the
-/// analysis spec it was ingested with -> analyzed terms. The example wires
-/// this to the analysis sidecar (the same one ingest used); tests wire it
-/// to the mock sidecar. Split/merge only re-partitions — term identity
-/// must be reproduced EXACTLY as at ingest, hence the spec round-trip.
+/// Text analyzer for rebuilding BM25 stores: a batch of (raw document
+/// text, the analysis spec it was ingested with) -> analyzed terms, one
+/// result per input in order. The example wires this to the analysis
+/// sidecar (the same one ingest used) with the batch's requests in
+/// flight concurrently — replay throughput is bounded by sidecar
+/// round-trips, exactly like ingest. Tests wire it to the mock sidecar.
+/// Split/merge only re-partitions — term identity must be reproduced
+/// EXACTLY as at ingest, hence the spec round-trip.
 pub type Analyzer<'a> =
-    dyn FnMut(&str, Option<&AnalysisSpec>) -> Result<AnalyzedDoc, String> + 'a;
+    dyn FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> + 'a;
+
+/// Batch size handed to the analyzer (the analyzer's concurrency window).
+const ANALYZE_BATCH: usize = 32;
 
 /// FNV-1a 64 over the 8 little-endian bytes of an id (hand-rolled; no
 /// dependency). Stable across platforms and runs — it is the split
@@ -335,25 +341,53 @@ fn build_child(
 
     let mut bm25_path = None;
     if !mapped.is_empty() {
-        let mut store = Bm25Store::new();
-        for (local, doc) in mapped {
-            let analyzed = analyze(&doc.text, doc.analysis.as_ref())
-                .map_err(|e| format!("analyze doc (child slot {local}): {e}"))?;
-            store.add_document_with_lineage(
-                local,
-                doc.text,
-                analyzed,
-                doc.lineage.map(|l| crate::postings::DocLineage {
-                    opinion_id: l.opinion_id,
-                    cluster_id: l.cluster_id,
-                    span_start: l.span_start,
-                    span_end: l.span_end,
-                }),
-            );
-        }
+        // Children rebuild through the disk spiller for the same reason
+        // nodes do: a full-scale child's postings do not fit in heap.
         let path = crate::node::bm25_sidecar_path(tv_path);
-        store
-            .save(&path)
+        let mut spill_dir = path.as_os_str().to_owned();
+        spill_dir.push(".build");
+        let spill_dir = std::path::PathBuf::from(spill_dir);
+        let mut builder = SpillBuilder::create(&spill_dir)
+            .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?;
+        let mut i = 0;
+        while i < mapped.len() {
+            let end = (i + ANALYZE_BATCH).min(mapped.len());
+            let analyzed = {
+                let batch: Vec<(&str, Option<&AnalysisSpec>)> = mapped[i..end]
+                    .iter()
+                    .map(|(_, d)| (d.text.as_str(), d.analysis.as_ref()))
+                    .collect();
+                analyze(&batch)
+                    .map_err(|e| format!("analyze batch at child slot {}: {e}", mapped[i].0))?
+            };
+            if analyzed.len() != end - i {
+                return Err(format!(
+                    "analyzer returned {} results for {} documents",
+                    analyzed.len(),
+                    end - i
+                ));
+            }
+            for (k, analyzed) in analyzed.into_iter().enumerate() {
+                let (local, doc) = &mut mapped[i + k];
+                let text = std::mem::take(&mut doc.text);
+                builder
+                    .add_document_with_lineage(
+                        *local,
+                        text,
+                        analyzed,
+                        doc.lineage.map(|l| crate::postings::DocLineage {
+                            opinion_id: l.opinion_id,
+                            cluster_id: l.cluster_id,
+                            span_start: l.span_start,
+                            span_end: l.span_end,
+                        }),
+                    )
+                    .map_err(|e| format!("spill write (child slot {local}): {e}"))?;
+            }
+            i = end;
+        }
+        builder
+            .finish(&path)
             .map_err(|e| format!("write {}: {e}", path.display()))?;
         bm25_path = Some(path);
     }

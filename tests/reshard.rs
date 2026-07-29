@@ -146,18 +146,36 @@ async fn ingest(
     assert!(flushed.written);
 }
 
-/// The analyzer closure for reshard replay: the same mock sidecar the
-/// node ingested through, bridged into the sync core.
+/// The batch analyzer closure for reshard replay: the same mock sidecar
+/// the node ingested through, bridged into the sync core (sequential
+/// within a batch — test corpora are small).
 fn replay_analyzer(
     analysis_addr: &str,
-) -> impl FnMut(&str, Option<&AnalysisSpec>) -> Result<AnalyzedDoc, String> + '_ {
+) -> impl FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> + '_ {
     let handle = tokio::runtime::Handle::current();
-    move |text, spec| {
+    move |docs| {
         tokio::task::block_in_place(|| {
-            handle.block_on(analyzer::analyze_document(analysis_addr, text, spec))
+            handle.block_on(async {
+                let mut out = Vec::with_capacity(docs.len());
+                for (text, spec) in docs {
+                    out.push(
+                        analyzer::analyze_document(analysis_addr, text, *spec)
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                Ok(out)
+            })
         })
-        .map_err(|e| e.to_string())
     }
+}
+
+/// Analyze one document through a batch analyzer (test convenience).
+fn analyze_one(
+    analyze: &mut impl FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String>,
+    text: &str,
+) -> AnalyzedDoc {
+    analyze(&[(text, None)]).unwrap().remove(0)
 }
 
 /// Top-k of one query as `(global_id, score_bits)`, coordinator order
@@ -307,7 +325,7 @@ async fn merge_reproduces_monolithic() {
     let mut analyze = replay_analyzer(&analysis_addr);
     for i in 0..DOCS {
         let text = doc_text(i);
-        let analyzed = analyze(&text, None).unwrap();
+        let analyzed = analyze_one(&mut analyze, &text);
         reference_store.add_document(i as u32, text, analyzed);
     }
     let bm25_path = child.bm25_path.as_ref().expect("merged image has docs");
@@ -566,10 +584,9 @@ fn reshard_refuses_a_log_with_preexisting_state() {
     let gen = writer.dir().to_path_buf();
     drop(writer);
 
-    let mut analyze =
-        |_text: &str, _spec: Option<&AnalysisSpec>| -> Result<AnalyzedDoc, String> {
-            unreachable!("reshard must refuse before analyzing anything")
-        };
+    let mut analyze = |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
+        unreachable!("reshard must refuse before analyzing anything")
+    };
     let err = reshard::split(&gen, 2, &dir.join("out"), 0, 25_000_000, &mut analyze)
         .expect_err("split must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
