@@ -6,12 +6,24 @@ shard nodes publish their current k-th best score while they scan, the
 coordinator aggregates the maximum and pushes it back, and nodes prune the
 remainder of their scan against it — losslessly.
 
+## Repository map
+
+| Repository | Role | Depends on |
+|---|---|---|
+| [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream` | Patch fork carrying the two core changes distributed search needs: seeded TQ+ calibration and a seedable top-k floor (`initial_threshold`). Rebased onto upstream main | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream` |
+| [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
+
+Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
+
 Phase 1: one crate, one binary, three roles (`node`, `coordinator`, `both`),
 tonic gRPC + tokio, static cluster membership.
 
 ## Quickstart: dockerized end-to-end demo (CourtListener)
 
-A one-command installer that syncs real data and proves the whole stack:
+A one-command installer that syncs real data and exercises the whole stack:
 CourtListener bulk opinions (public S3) → [rustfs](https://rustfs.com)
 object store → Rust extraction → chunk + static-embedding via the
 [grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
@@ -249,7 +261,7 @@ graceful shutdown, loaded at startup when present.
 
 ### Live interop with grpc-opennlp-analysis
 
-Verified against the REAL native sidecar (not the test mock). The vendored
+Verified against the native sidecar rather than the test mock. The vendored
 proto is byte-identical to upstream (drift-checked with `diff` before the
 run). Setup:
 
@@ -276,7 +288,7 @@ output:
 ```text
 ingested 4 documents (total 4, first global id 0)
 
-TermStats (df per term — these are the REAL Porter stems in the postings):
+TermStats (df per term — Porter stems as stored in the postings):
   dog        df=2
   bark       df=2
   run        df=1
@@ -300,11 +312,11 @@ query "fox":
   highlight: doc 0 span [43,48) of "The dogs are barking loudly at the running foxes" = "foxes" (term "fox")
 ```
 
-The evidence proves real interop, not mock behavior: "dogs"/"barking"
+This output distinguishes the sidecar from the mock: "dogs"/"barking"
 land as stems `dog`/`bark`, "foxes" as `fox` — and doc 2's capitalized
-"Running" does NOT group under `run` (df=1), because the real sidecar's
+"Running" does not group under `run` (df=1), because the sidecar's
 stemmers are case-sensitive on the token surface form exactly as its proto
-documents; the mock would have lowercased it. Offsets slice the original
+documents; the mock lowercases it. Offsets slice the original
 surface forms out of the stored text (`"running"`, `"foxes"`).
 
 ## Court-opinion pipeline (chunk + embed + ingest)
@@ -370,7 +382,7 @@ stage skips work already present (`--limit` everywhere for slices).
 
 ## Real-data shakedown (wikipedia bge-m3)
 
-`examples/wiki_shakedown.rs` ingests a REAL corpus end-to-end: the
+`examples/wiki_shakedown.rs` ingests a full corpus end-to-end: the
 bge-m3 embeddings + Simple English Wikipedia sentence pairs from the
 earlier Lucene/OpenSearch distributed testing
 (`/work/opensearch-grpc-knn/distributed_test_data/wikipedia/`, not
@@ -388,7 +400,7 @@ cargo run --release --example wiki_shakedown   # --data-dir, --out-dir, --sideca
 ```
 
 loads the parts, fits calibration on a sample, pushes it to every shard
-with `BroadcastCalibration`, starts the REAL native analysis sidecar
+with `BroadcastCalibration`, starts the native analysis sidecar
 (falls back to the in-repo mock with a loud warning), ingests documents
 (AddDocuments, PORTER stems) and vectors (AddVectors) with aligned ids,
 persists `.tv` + `.bm25` under `--out-dir` for the later two-machine

@@ -367,7 +367,7 @@ pub mod mock_analysis {
 
 /// Spawn the native OpenNLP analysis sidecar on `port` and wait for its
 /// listener. Returns the child (kill on drop) and its `http://` address.
-/// Used by binaries that want the REAL sidecar; tests use the mock.
+/// Used by binaries that run against the sidecar; tests use the mock.
 pub fn start_sidecar(binary: &str, port: u16) -> Result<(Child, String), String> {
     start_sidecar_with_env(binary, port, &[])
 }

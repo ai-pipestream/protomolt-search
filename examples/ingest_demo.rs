@@ -1,5 +1,5 @@
 //! Live-interop demo: ingest documents into a turbovec-search node through
-//! the REAL OpenNLP analysis sidecar, then run distributed BM25 queries
+//! the OpenNLP analysis sidecar, then run distributed BM25 queries
 //! and fetch raw texts for highlighting.
 //!
 //! Usage (sidecar and a turbovec-search node+coordinator already running):
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?
         .into_inner();
-    println!("TermStats (df per term — these are the REAL Porter stems in the postings):");
+    println!("TermStats (df per term — Porter stems as stored in the postings):");
     for (term, df) in ["dog", "bark", "run", "runner", "fox", "kitchen"]
         .iter()
         .zip(stats.doc_frequencies.iter())

@@ -163,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sidecar_child = None;
     let analysis_addr = match start_sidecar(&arg("sidecar-bin", SIDECAR_BIN), sidecar_port) {
         Ok((child, addr)) => {
-            eprintln!("analysis sidecar: REAL native binary at {addr}");
+            eprintln!("analysis sidecar: native binary at {addr}");
             sidecar_child = Some(child);
             addr
         }
