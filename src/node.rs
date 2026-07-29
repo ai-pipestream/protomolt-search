@@ -1382,9 +1382,37 @@ impl NodeService for NodeServiceImpl {
         let mut inbound = request.into_inner();
         let mut added = 0u64;
         let mut first_id = 0u64;
-        while let Some(doc) = inbound.message().await? {
-            let analyzed =
-                crate::analyzer::analyze_document(&addr, &doc.text, doc.analysis.as_ref()).await?;
+        // Analysis round-trips dominate bulk ingest, so they are
+        // pipelined: up to ANALYZE_PIPELINE sidecar calls run ahead of
+        // the apply point, while documents are applied strictly in
+        // arrival order — ids and WAL order stay deterministic.
+        const ANALYZE_PIPELINE: usize = 8;
+        let mut in_flight: std::collections::VecDeque<(
+            AddDocumentsRequest,
+            tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
+        )> = std::collections::VecDeque::new();
+        let mut inbound_open = true;
+        loop {
+            while inbound_open && in_flight.len() < ANALYZE_PIPELINE {
+                match inbound.message().await? {
+                    Some(doc) => {
+                        let addr = addr.clone();
+                        let text = doc.text.clone();
+                        let spec = doc.analysis.clone();
+                        let handle = tokio::spawn(async move {
+                            crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await
+                        });
+                        in_flight.push_back((doc, handle));
+                    }
+                    None => inbound_open = false,
+                }
+            }
+            let Some((doc, handle)) = in_flight.pop_front() else {
+                break;
+            };
+            let analyzed = handle
+                .await
+                .map_err(|e| Status::internal(format!("analysis task failed: {e}")))??;
             let mut guard = self.state.write().expect("shard state lock poisoned");
             // A disk-resident shard that receives more documents is first
             // reloaded into the heap builder (the append path is
