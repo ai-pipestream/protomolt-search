@@ -39,7 +39,7 @@ use crate::pb::{
     StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
 };
 use crate::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker};
-use crate::postings::{Bm25Index, Bm25Reader, Bm25Store};
+use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
 use crate::wal::{self, WalWriter};
 
 /// How a node scans and whether it participates in floor sharing.
@@ -95,24 +95,39 @@ type RawLeg = Vec<(u64, f64)>;
 /// startup. Once resident, a shard holds no postings or document texts
 /// in heap — only the small per-doc tables.
 pub enum Bm25Shard {
-    /// Heap builder (ingest in progress or never flushed).
+    /// Heap builder (small or append ingests; searchable mid-build).
     Building(Bm25Store),
+    /// Disk-spilling bulk builder (fresh persisted shards): bounded heap,
+    /// NOT searchable until flushed.
+    Spilling(SpillBuilder),
     /// Disk-resident mmap reader over the v3 file.
     Resident(Bm25Reader),
 }
 
 impl Bm25Shard {
-    fn as_index(&self) -> &dyn Bm25Index {
+    /// The searchable read surface; `None` while bulk-building (a spill
+    /// builder cannot answer term lookups without scanning every run).
+    fn as_index(&self) -> Option<&dyn Bm25Index> {
         match self {
-            Bm25Shard::Building(s) => s,
-            Bm25Shard::Resident(r) => r,
+            Bm25Shard::Building(s) => Some(s),
+            Bm25Shard::Spilling(_) => None,
+            Bm25Shard::Resident(r) => Some(r),
         }
     }
 
     fn next_doc_id(&self) -> u32 {
         match self {
             Bm25Shard::Building(s) => s.next_doc_id(),
+            Bm25Shard::Spilling(s) => s.next_doc_id(),
             Bm25Shard::Resident(r) => r.next_doc_id(),
+        }
+    }
+
+    fn doc_count(&self) -> u64 {
+        match self {
+            Bm25Shard::Building(s) => s.doc_count(),
+            Bm25Shard::Spilling(s) => s.doc_count(),
+            Bm25Shard::Resident(r) => Bm25Index::doc_count(r),
         }
     }
 
@@ -405,7 +420,21 @@ fn wal_append_or_degrade(wal_slot: &mut Option<WalWriter>, op: wal_record::Op) {
 pub struct NodeServiceImpl {
     /// Locked shard state; see [`ShardState`].
     state: Arc<RwLock<ShardState>>,
+    /// Single-writer gate for ingest streams. Two concurrent AddDocuments
+    /// (or AddVectors) streams would interleave positional ids into one
+    /// shard — every doc logged, none attributable — so the second stream
+    /// is refused outright rather than merged.
+    ingest_busy: Arc<std::sync::atomic::AtomicBool>,
     config: NodeConfig,
+}
+
+/// RAII release for the ingest gate.
+struct IngestGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for IngestGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl NodeServiceImpl {
@@ -419,8 +448,42 @@ impl NodeServiceImpl {
                 generation: None,
                 wal,
             })),
+            ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
         }
+    }
+
+    /// The builder shape for a fresh ingest: persisted shards bulk-build
+    /// through the disk spiller (bounded heap, not searchable until
+    /// Flush); path-less demo shards build in heap.
+    fn new_builder(&self, generation: Option<&PathBuf>) -> Result<Bm25Shard, Status> {
+        match self.config.index_path.as_ref() {
+            Some(p) => {
+                let bm25_path = storage_paths(p, generation).1;
+                let mut dir = bm25_path.as_os_str().to_owned();
+                dir.push(".build");
+                let dir = PathBuf::from(dir);
+                SpillBuilder::create(&dir)
+                    .map(Bm25Shard::Spilling)
+                    .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
+            }
+            None => Ok(Bm25Shard::Building(Bm25Store::new())),
+        }
+    }
+
+    /// Claim the single-writer ingest gate, or refuse the stream.
+    fn claim_ingest(&self) -> Result<IngestGuard, Status> {
+        use std::sync::atomic::Ordering;
+        if self
+            .ingest_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(Status::failed_precondition(
+                "another ingest stream is active on this shard",
+            ));
+        }
+        Ok(IngestGuard(self.ingest_busy.clone()))
     }
 
     /// Attach a preloaded BM25 shard (from `<index path>.bm25`).
@@ -475,7 +538,7 @@ impl NodeServiceImpl {
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let mut guard = self.state.write().expect("shard state lock poisoned");
         let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
-        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.as_index().doc_count());
+        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let Some(config_path) = self.config.index_path.clone() else {
             return Ok(FlushResponse {
                 path: String::new(),
@@ -501,13 +564,25 @@ impl NodeServiceImpl {
                 .write(&tv_path)
                 .map_err(|e| Status::internal(format!("write {}: {e}", tv_path.display())))?;
         }
-        // Save the heap builder as v3 and immediately reopen it
-        // disk-resident: after Flush a shard holds no postings or texts
-        // in heap. Already-resident shards have nothing to write.
-        if let Some(Bm25Shard::Building(store)) = guard.bm25.as_ref() {
-            store
-                .save(&bm25_path)
-                .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
+        // Save the builder as v3 and immediately reopen it disk-resident:
+        // after Flush a shard holds no postings or texts in heap.
+        // Already-resident shards have nothing to write.
+        let built = match guard.bm25.as_mut() {
+            Some(Bm25Shard::Building(store)) => {
+                store
+                    .save(&bm25_path)
+                    .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
+                true
+            }
+            Some(Bm25Shard::Spilling(builder)) => {
+                builder
+                    .finish(&bm25_path)
+                    .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
+                true
+            }
+            _ => false,
+        };
+        if built {
             guard.bm25 = Some(
                 Bm25Reader::open(&bm25_path)
                     .map(Bm25Shard::Resident)
@@ -691,7 +766,7 @@ impl NodeServiceImpl {
             // generation.
             None
         };
-        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.as_index().doc_count());
+        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let num_vectors = loaded.len() as u64;
         guard.index = Some(loaded);
         guard.generation = Some(snap.clone());
@@ -937,7 +1012,10 @@ impl NodeServiceImpl {
                     total_doc_length: global_total_doc_length,
                     dfs: global_doc_frequencies.to_vec(),
                 };
-                bm25_leg = bm25::top_k(store.as_index(), terms, &stats, Bm25Params::default(), k)
+                let index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                bm25_leg = bm25::top_k(index, terms, &stats, Bm25Params::default(), k)
                     .into_iter()
                     .map(|d| (self.config.slot_offset + u64::from(d.doc_id), d.score))
                     .collect();
@@ -1209,6 +1287,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<AddVectorsRequest>>,
     ) -> Result<Response<AddVectorsResponse>, Status> {
+        let _ingest = self.claim_ingest()?;
         let mut inbound = request.into_inner();
         let mut added = 0u64;
         let mut first_id = 0u64;
@@ -1296,6 +1375,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<AddDocumentsRequest>>,
     ) -> Result<Response<AddDocumentsResponse>, Status> {
+        let _ingest = self.claim_ingest()?;
         let addr = self.config.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
         })?;
@@ -1328,10 +1408,15 @@ impl NodeService for NodeServiceImpl {
             // Shared positional id space with the vector side: the next id
             // is past both indexes' tips.
             let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
+            if guard.bm25.is_none() {
+                let builder = self.new_builder(guard.generation.as_ref())?;
+                guard.bm25 = Some(builder);
+            }
             let doc_id = vector_tip.max(
                 guard
                     .bm25
-                    .get_or_insert_with(|| Bm25Shard::Building(Bm25Store::new()))
+                    .as_ref()
+                    .expect("builder just ensured")
                     .next_doc_id(),
             );
             let global_id = self.config.slot_offset + u64::from(doc_id);
@@ -1341,23 +1426,25 @@ impl NodeService for NodeServiceImpl {
             // Apply first, log after, as for vectors: a document that
             // fails to enter the store must never reach the log, or its
             // id would be reassigned and poison the replay.
-            let store = guard
-                .bm25
-                .get_or_insert_with(|| Bm25Shard::Building(Bm25Store::new()));
-            let Bm25Shard::Building(store) = store else {
-                return Err(Status::internal("shard builder unavailable"));
-            };
-            store.add_document_with_lineage(
-                doc_id,
-                doc.text.clone(),
-                analyzed,
-                doc.lineage.map(|l| crate::postings::DocLineage {
-                    opinion_id: l.opinion_id,
-                    cluster_id: l.cluster_id,
-                    span_start: l.span_start,
-                    span_end: l.span_end,
-                }),
-            );
+            let lineage = doc.lineage.map(|l| crate::postings::DocLineage {
+                opinion_id: l.opinion_id,
+                cluster_id: l.cluster_id,
+                span_start: l.span_start,
+                span_end: l.span_end,
+            });
+            match guard.bm25.as_mut().expect("builder just ensured") {
+                Bm25Shard::Building(store) => {
+                    store.add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage);
+                }
+                Bm25Shard::Spilling(builder) => {
+                    builder
+                        .add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage)
+                        .map_err(|e| Status::internal(format!("spill write: {e}")))?;
+                }
+                Bm25Shard::Resident(_) => {
+                    return Err(Status::internal("shard builder unavailable"));
+                }
+            }
             wal_append_or_degrade(
                 &mut guard.wal,
                 wal_record::Op::AddDocuments(LoggedAddDocuments {
@@ -1373,7 +1460,7 @@ impl NodeService for NodeServiceImpl {
             .expect("shard state lock poisoned")
             .bm25
             .as_ref()
-            .map_or(0, |b| b.as_index().doc_count());
+            .map_or(0, |b| b.doc_count());
         Ok(Response::new(AddDocumentsResponse {
             added,
             total,
@@ -1388,11 +1475,16 @@ impl NodeService for NodeServiceImpl {
         let req = request.into_inner();
         let guard = self.state.read().expect("shard state lock poisoned");
         let (doc_count, total_doc_length, doc_frequencies) = match guard.bm25.as_ref() {
-            Some(store) => (
-                store.as_index().doc_count(),
-                store.as_index().total_doc_length(),
-                req.terms.iter().map(|t| store.as_index().df(t)).collect(),
-            ),
+            Some(store) => {
+                let index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                (
+                    store.doc_count(),
+                    index.total_doc_length(),
+                    req.terms.iter().map(|t| index.df(t)).collect(),
+                )
+            }
             None => (0, 0, req.terms.iter().map(|_| 0).collect()),
         };
         Ok(Response::new(TermStatsResponse {
@@ -1432,7 +1524,10 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
-                bm25::top_k(store.as_index(), &req.terms, &stats, params, req.k as usize)
+                let index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                bm25::top_k(index, &req.terms, &stats, params, req.k as usize)
                     .into_iter()
                     .map(|doc| Bm25Hit {
                         doc_id: self.config.slot_offset + u64::from(doc.doc_id),
@@ -1494,7 +1589,10 @@ impl NodeService for NodeServiceImpl {
                     .filter(|&&id| id >= offset && (id - offset) <= u64::from(u32::MAX))
                     .map(|id| (id - offset) as u32)
                     .collect();
-                bm25::score_candidates(store.as_index(), &req.terms, &stats, params, &local)
+                let index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                bm25::score_candidates(index, &req.terms, &stats, params, &local)
                     .into_iter()
                     .map(|doc| Bm25Hit {
                         doc_id: offset + u64::from(doc.doc_id),
@@ -1527,7 +1625,9 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let mut documents = Vec::new();
         if let Some(store) = guard.bm25.as_ref() {
-            let store = store.as_index();
+            let store = store.as_index().ok_or_else(|| {
+                Status::failed_precondition("bm25 bulk build in progress; Flush first")
+            })?;
             for id in req.doc_ids {
                 if id < offset {
                     continue;
