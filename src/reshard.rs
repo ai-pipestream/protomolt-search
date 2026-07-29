@@ -147,6 +147,7 @@ fn replay_buckets(
     buckets: std::ops::Range<u32>,
     bucket_count: usize,
     dim: usize,
+    vectors_only: bool,
     out: &mut Replay,
 ) -> Result<(), String> {
     for bucket in buckets {
@@ -202,6 +203,9 @@ fn replay_buckets(
                             bucket_of(a.first_id, bucket_count)
                         ));
                     }
+                    if vectors_only {
+                        continue;
+                    }
                     for (i, doc) in a.documents.into_iter().enumerate() {
                         if out.documents.insert(a.first_id + i as u64, doc).is_some() {
                             return Err(format!(
@@ -228,6 +232,7 @@ fn replay_gen(gen: &Path) -> Result<(WalManifest, Replay), String> {
         0..manifest.bucket_count,
         manifest.bucket_count as usize,
         manifest.dim as usize,
+        false,
         &mut out,
     )?;
     Ok((manifest, out))
@@ -455,6 +460,7 @@ pub fn split(
     out_dir: &Path,
     slot_base: u64,
     slot_stride: u64,
+    vectors_only: bool,
     analyze: &mut Analyzer,
 ) -> Result<ReshardOutput, String> {
     split_logs(
@@ -463,6 +469,7 @@ pub fn split(
         out_dir,
         slot_base,
         slot_stride,
+        vectors_only,
         analyze,
     )
 }
@@ -484,6 +491,7 @@ pub fn split_logs(
     out_dir: &Path,
     slot_base: u64,
     slot_stride: u64,
+    vectors_only: bool,
     analyze: &mut Analyzer,
 ) -> Result<ReshardOutput, String> {
     if !n.is_power_of_two() || n < 2 {
@@ -536,6 +544,7 @@ pub fn split_logs(
                     first..first + per_child as u32,
                     bucket_count,
                     manifest.dim as usize,
+                    vectors_only,
                     &mut replay,
                 )?;
             }
@@ -568,6 +577,7 @@ pub fn split_logs(
                 0..manifest.bucket_count,
                 bucket_count,
                 manifest.dim as usize,
+                vectors_only,
                 &mut replay,
             )?;
         }
@@ -620,6 +630,7 @@ pub fn merge(
     gens: &[PathBuf],
     out_dir: &Path,
     slot_base: Option<u64>,
+    vectors_only: bool,
     analyze: &mut Analyzer,
 ) -> Result<ReshardOutput, String> {
     if gens.is_empty() {
@@ -659,7 +670,14 @@ pub fn merge(
     let mut merged = Replay::default();
     for bucket in 0..bucket_count {
         for gen in gens {
-            replay_buckets(gen, bucket..bucket + 1, bucket_count as usize, dim, &mut merged)?;
+            replay_buckets(
+                gen,
+                bucket..bucket + 1,
+                bucket_count as usize,
+                dim,
+                vectors_only,
+                &mut merged,
+            )?;
         }
     }
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;

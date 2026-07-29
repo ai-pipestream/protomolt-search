@@ -53,6 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let out_dir = PathBuf::from(out_dir);
     let analysis_addr = arg("analysis-addr", "http://127.0.0.1:50051");
+    // Vector-only replay skips document analysis and the BM25 sidecars
+    // entirely: shard-count and routing experiments only search the
+    // vector leg, and children shrink from tens of GB to the .tv files.
+    let vectors_only = std::env::args().any(|a| a == "--vectors-only");
 
     // The reshard core is synchronous; the sidecar client is async. Bridge
     // with block_in_place on the multi-thread runtime (same idiom the
@@ -104,14 +108,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let slot_base: u64 = arg("slot-base", "0").parse()?;
                     let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
                     reshard::split_logs(
-                        &generations, n, &out_dir, slot_base, slot_stride, &mut analyze,
+                        &generations, n, &out_dir, slot_base, slot_stride, vectors_only,
+                        &mut analyze,
                     )?
                 }
                 None => {
                     let slot_base = opt("slot-base")
                         .map(|s| s.parse::<u64>())
                         .transpose()?;
-                    reshard::merge(&generations, &out_dir, slot_base, &mut analyze)?
+                    reshard::merge(&generations, &out_dir, slot_base, vectors_only, &mut analyze)?
                 }
             }
         }
@@ -122,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let n: usize = arg("split", "2").parse()?;
             let slot_base: u64 = arg("slot-base", "0").parse()?;
             let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
-            reshard::split(&gen, n, &out_dir, slot_base, slot_stride, &mut analyze)?
+            reshard::split(&gen, n, &out_dir, slot_base, slot_stride, vectors_only, &mut analyze)?
         }
     };
 

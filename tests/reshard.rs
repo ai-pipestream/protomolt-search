@@ -217,6 +217,7 @@ async fn split_reconstructs_parent_topk() {
         &out_dir,
         0,
         25_000_000,
+        false,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
@@ -295,7 +296,7 @@ async fn merge_reproduces_monolithic() {
         .map(|p| reshard::resolve_gen(&turbovec_search::wal::wal_dir(p)).unwrap())
         .collect::<Vec<_>>();
     let out_dir = dir.join("merged");
-    let output = reshard::merge(&generations, &out_dir, None, &mut replay_analyzer(&analysis_addr))
+    let output = reshard::merge(&generations, &out_dir, None, false, &mut replay_analyzer(&analysis_addr))
         .unwrap();
     assert_eq!(output.children.len(), 1);
     let child = &output.children[0];
@@ -384,6 +385,7 @@ async fn merge_reproduces_monolithic() {
         &[generations[0].clone(), bad_calibration],
         &dir.join("bad-cal"),
         None,
+        false,
         &mut replay_analyzer(&analysis_addr),
     );
     assert!(bad.is_err(), "mixed calibrations must be rejected");
@@ -392,6 +394,7 @@ async fn merge_reproduces_monolithic() {
         &[generations[0].clone(), bad_buckets],
         &dir.join("bad-buckets"),
         None,
+        false,
         &mut replay_analyzer(&analysis_addr),
     );
     let err = match bad {
@@ -435,6 +438,7 @@ async fn split_consumes_each_bucket_once() {
         &dir.join("split"),
         0,
         25_000_000,
+        false,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
@@ -517,6 +521,7 @@ async fn split_finer_than_buckets_repartitions() {
         &dir.join("split"),
         0,
         25_000_000,
+        false,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
@@ -587,10 +592,10 @@ fn reshard_refuses_a_log_with_preexisting_state() {
     let mut analyze = |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
         unreachable!("reshard must refuse before analyzing anything")
     };
-    let err = reshard::split(&gen, 2, &dir.join("out"), 0, 25_000_000, &mut analyze)
+    let err = reshard::split(&gen, 2, &dir.join("out"), 0, 25_000_000, false, &mut analyze)
         .expect_err("split must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
-    let err = reshard::merge(&[gen], &dir.join("out"), None, &mut analyze)
+    let err = reshard::merge(&[gen], &dir.join("out"), None, false, &mut analyze)
         .expect_err("merge must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
 }
@@ -628,6 +633,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
         &out_dir,
         0,
         25_000_000,
+        false,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
