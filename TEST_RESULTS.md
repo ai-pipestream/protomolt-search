@@ -226,6 +226,41 @@ constant in fleet size while the pruning benefit grows with shard
 count, so the economics improve with scale, but that claim now
 requires the fleet test rather than extrapolation.
 
+## Round 4: five machines, two architectures
+
+Bandwidth-proportional shards (35.25M / 30.2M / 7.06M / 7.06M / 7.06M
+chunks) across one x86 desktop, one x86 server, and three Raspberry
+Pi 5s (NEON kernels, first live run), with no-sharing twins on every
+host. Data-plane connections pin IPv4: hostname resolution through the
+Pis' multi-homed IPv6 routed one gRPC channel to the wrong machine
+during setup, caught by the ingest count check.
+
+| Config | Sharing | Candidates/query | p50 | p99 | QPS |
+|---|---|---|---|---|---|
+| k=10000, c=1 | on | 132,764 | 1,327 ms | 1,360 ms | 0.8 |
+| k=10000, c=1 | off | 269,596 | 1,340 ms | 1,376 ms | 0.8 |
+| k=10000, c=8 | on | 132,711 | 1,977 ms | 2,575 ms | 3.8 |
+| k=10000, c=8 | off | 267,047 | 1,955 ms | 2,837 ms | 3.8 |
+| k=100, c=1 | on | 1,630 | 1,148 ms | 1,159 ms | 0.9 |
+| k=100, c=1 | off | 2,735 | 1,142 ms | 1,154 ms | 0.9 |
+
+The correctness gate passed at every configuration: identical results
+across five machines and two instruction sets simultaneously.
+
+Findings: at five shards the sharing ledger flips. Candidate reduction
+doubles to 51% (from 13% at two shards), the network cost measured in
+Round 3 washes out to parity, and sharing improves p99 under load by
+9% (tail compression: slow shards adopt fast shards' floors). The
+trend across 2 to 5 nodes supports the fleet thesis; each added shard
+raises the benefit while per-node message cost stays constant.
+
+The fleet's absolute latency (1.15 s at k=100) is Round 2's lesson
+recurring: the two big shards scan chunked for floor reactivity and
+straggle while the Pis idle. Kernel-internal shared floors (measured
+in isolation on a branch) would let large shards run whole-shard calls
+without losing reactivity, putting the projected fleet p50 near 250 ms
+at an aggregate-bandwidth QPS around 9.
+
 ## Next steps
 
 The ceiling-raising directions below — block-max-style bounds adapted
