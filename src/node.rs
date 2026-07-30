@@ -137,7 +137,7 @@ impl Bm25Shard {
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let mut magic = [0u8; 8];
         std::fs::File::open(path)?.read_exact(&mut magic)?;
-        if &magic == b"TVBM2503" {
+        if &magic == b"TVBM2503" || &magic == b"TVBM2504" {
             Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
         } else {
             Ok(Bm25Shard::Building(Bm25Store::load(path)?))
