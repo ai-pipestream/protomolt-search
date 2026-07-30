@@ -192,6 +192,40 @@ alone does not move wall time, consistent with the bandwidth model,
 positioning it as the enabler for block-max rather than a win by
 itself.
 
+## Round 3: two machines
+
+First cross-machine measurement: the corpus split into two 43.3M-chunk
+shards, one served locally, one on a second host over the LAN
+(coordinator co-located with shard 0), with a no-sharing twin pair for
+the A/B. k=10,000:
+
+| Clients | Sharing | Candidates/query | p50 | QPS |
+|---|---|---|---|---|
+| 1 | on | 116,465 | 2,085 ms | 0.5 |
+| 1 | off | 133,625 | 1,796 ms | 0.6 |
+| 8 | on | 114,101 | 2,782 ms | 2.7 |
+| 8 | off | 132,846 | 2,608 ms | 3.0 |
+
+The correctness gate passed at both load levels: distributed results
+are bitwise-identical across physical machines, sharing on or off.
+Machine bandwidth pools aggregate as the model predicts (0.6 to 3.0
+QPS as concurrency fills the second machine; the same two shards on
+one machine plateaued at 2.2).
+
+**Negative result**: floor sharing cost 7-16% wall time over the real
+network, against a 13% candidate reduction (two shards have little to
+teach each other; the same reduction was 62% at eight shards). Both
+ends of the floor path are non-blocking by design (fire-and-forget
+try_send, watch-channel adoption; verified in code during follow-up),
+so the cost is second-order: per-message processing during the scan,
+the floor-application paths that only an active floor exercises, or
+transport flow control. A chunk-size isolation run will separate
+message count from application count; delta-gated and coalesced floor
+publishing are the identified mitigations. The cost per node is
+constant in fleet size while the pruning benefit grows with shard
+count, so the economics improve with scale, but that claim now
+requires the fleet test rather than extrapolation.
+
 ## Next steps
 
 The ceiling-raising directions below — block-max-style bounds adapted
