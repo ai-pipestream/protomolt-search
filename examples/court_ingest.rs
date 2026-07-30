@@ -371,6 +371,10 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     // disjoint slice of the SAME full node list. Block offsets stay global
     // (per = m / n_shards), so the union of ranges reproduces the single
     // sequential run exactly.
+    // Vectors-only ingest: skip the document phase and the analysis
+    // sidecar entirely. Used to build vector-leg experiment clusters
+    // (shard-count ladders) straight from the embeddings file.
+    let vectors_only = std::env::args().any(|a| a == "--vectors-only");
     let first_shard: usize = arg("first-shard", "0").parse()?;
     let end_shard: usize = match arg("end-shard", "").as_str() {
         "" => n_shards,
@@ -384,12 +388,21 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     }
 
     // Counts: positional ids == file order, established by the stage-1
-    // integrity check (chunk count == embedding count).
-    let mut m = 0usize;
-    for chunk in court::read_chunks(std::path::Path::new(&chunks_path))? {
-        chunk?;
-        m += 1;
-    }
+    // integrity check (chunk count == embedding count). Vectors-only
+    // ingest reads the count straight off the fixed-stride embeddings
+    // file instead of walking the chunks file.
+    let m = if vectors_only {
+        let (dim_probe, _) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
+        let rec = 12 + dim_probe as u64 * 4;
+        ((std::fs::metadata(&embeddings_path)?.len() - 12) / rec) as usize
+    } else {
+        let mut m = 0usize;
+        for chunk in court::read_chunks(std::path::Path::new(&chunks_path))? {
+            chunk?;
+            m += 1;
+        }
+        m
+    };
     let per = m / n_shards;
     eprintln!(
         "remote ingest: {m} chunks over {n_shards} nodes ({per}/shard), \
@@ -446,6 +459,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         let n = end - start;
         let mut client = NodeServiceClient::connect(addr.clone()).await?;
 
+        if !vectors_only {
         // Documents first (ids 0..), then vectors (slots align). The doc
         // feeder walks the chunks file and the embeddings block in lock
         // step, asserting key equality at every position — both files were
@@ -501,6 +515,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
             .into_inner();
         feeder.await??;
         assert_eq!(docs.added as usize, n);
+        }
 
         // Vectors: a direct seek into the fixed-stride embeddings file;
         // keys were verified during the doc phase.
