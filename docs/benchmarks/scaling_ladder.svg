@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Exact search latency vs shard count">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .panel { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Exact search latency vs shard count</text>
+  <text x="84" y="52" class="subtitle">86.6M chunks (dim 256, 4-bit TQ+), one machine, k=10, p50 of 40 single-client queries, floor sharing on.</text>
+  <text x="84" y="68" class="subtitle">Same corpus at every width; the correctness gate proves results bitwise-identical across layouts.</text>
+  <line x1="84" y1="396.0" x2="860" y2="396.0" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="400.0" class="tick" text-anchor="end">0 s</text>
+  <line x1="84" y1="310.3" x2="860" y2="310.3" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="314.3" class="tick" text-anchor="end">2 s</text>
+  <line x1="84" y1="224.6" x2="860" y2="224.6" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="228.6" class="tick" text-anchor="end">4 s</text>
+  <line x1="84" y1="138.9" x2="860" y2="138.9" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="142.9" class="tick" text-anchor="end">6 s</text>
+  <line x1="84" y1="396" x2="860" y2="396" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M133.0,396.0 L133.0,117.47714285714284 Q133.0,113.47714285714284 137.0,113.47714285714284 L225.0,113.47714285714284 Q229.0,113.47714285714284 229.0,117.47714285714284 L229.0,396.0 Z" fill="#4338ca" />
+  <text x="181.0" y="87.5" class="value" text-anchor="middle">6.6 s</text>
+  <text x="181.0" y="103.5" class="tick" text-anchor="middle">baseline</text>
+  <text x="181.0" y="416" class="label" text-anchor="middle">1 shard</text>
+  <path d="M327.0,396.0 L327.0,316.73285714285714 Q327.0,312.73285714285714 331.0,312.73285714285714 L419.0,312.73285714285714 Q423.0,312.73285714285714 423.0,316.73285714285714 L423.0,396.0 Z" fill="#4338ca" />
+  <text x="375.0" y="286.7" class="value" text-anchor="middle">1.9 s</text>
+  <text x="375.0" y="302.7" class="value-accent" text-anchor="middle">3.4x</text>
+  <text x="375.0" y="416" class="label" text-anchor="middle">2 shards</text>
+  <path d="M521.0,396.0 L521.0,373.17571428571426 Q521.0,369.17571428571426 525.0,369.17571428571426 L613.0,369.17571428571426 Q617.0,369.17571428571426 617.0,373.17571428571426 L617.0,396.0 Z" fill="#4338ca" />
+  <text x="569.0" y="343.2" class="value" text-anchor="middle">626 ms</text>
+  <text x="569.0" y="359.2" class="value-accent" text-anchor="middle">10.5x</text>
+  <text x="569.0" y="416" class="label" text-anchor="middle">4 shards</text>
+  <path d="M715.0,396.0 L715.0,386.56857142857143 Q715.0,382.56857142857143 719.0,382.56857142857143 L807.0,382.56857142857143 Q811.0,382.56857142857143 811.0,386.56857142857143 L811.0,396.0 Z" fill="#4338ca" />
+  <text x="763.0" y="356.6" class="value" text-anchor="middle">313 ms</text>
+  <text x="763.0" y="372.6" class="value-accent" text-anchor="middle">21x</text>
+  <text x="763.0" y="416" class="label" text-anchor="middle">8 shards</text>
+  <text x="472.0" y="440" class="axis" text-anchor="middle">shards (processes), one machine</text>
+</svg>

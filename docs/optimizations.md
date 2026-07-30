@@ -5,6 +5,18 @@ pipeline stage. Numbers cited were measured on the CourtListener corpus:
 9,740,254 opinions chunked into 86,633,399 passages (dim-256 vectors,
 8 shards of 10,829,174 chunks each) on one 121 GB build machine.
 
+## Measured results
+
+![Exact search latency vs shard count](benchmarks/scaling_ladder.svg)
+
+![Recall vs exact fp32 search](benchmarks/recall_rerank.svg)
+
+![Collaborative floor sharing pruning](benchmarks/floor_sharing_pruning.svg)
+
+Raw records: `sweep-8x-cb8192.jsonl`, `sweep-ladder.jsonl` (cluster_sweep),
+plus the `layout_equivalence` and `fp32_recall` example outputs. Charts
+regenerate from `benchmarks/make_charts.py`.
+
 ## Indexing
 
 **One analysis pass per opinion.** The chunker sends each opinion to the

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Recall vs exact fp32 search - 86.6M vectors">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .panel { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Recall vs exact fp32 search - 86.6M vectors</text>
+  <text x="84" y="52" class="subtitle">Quantized (4-bit TQ+) top-k vs exact fp32 brute force over the same corpus, 20 probes.</text>
+  <text x="84" y="68" class="subtitle">Rerank = exact fp32 rescoring of the quantized top-1,000 pool (~1 ms/query, seek reads into the vector file).</text>
+  <line x1="84" y1="396.0" x2="860" y2="396.0" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="400.0" class="tick" text-anchor="end">0.00</text>
+  <line x1="84" y1="324.5" x2="860" y2="324.5" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="328.5" class="tick" text-anchor="end">0.25</text>
+  <line x1="84" y1="253.0" x2="860" y2="253.0" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="257.0" class="tick" text-anchor="end">0.50</text>
+  <line x1="84" y1="181.5" x2="860" y2="181.5" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="185.5" class="tick" text-anchor="end">0.75</text>
+  <line x1="84" y1="110.0" x2="860" y2="110.0" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="114.0" class="tick" text-anchor="end">1.00</text>
+  <line x1="84" y1="396" x2="860" y2="396" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M124.33333333333334,396.0 L124.33333333333334,162.62 Q124.33333333333334,158.62 128.33333333333334,158.62 L208.33333333333334,158.62 Q212.33333333333334,158.62 212.33333333333334,162.62 L212.33333333333334,396.0 Z" fill="#b45309" />
+  <text x="168.3" y="150.6" class="value" text-anchor="middle">0.830</text>
+  <path d="M214.33333333333334,396.0 L214.33333333333334,114.0 Q214.33333333333334,110.0 218.33333333333334,110.0 L298.33333333333337,110.0 Q302.33333333333337,110.0 302.33333333333337,114.0 L302.33333333333337,396.0 Z" fill="#4338ca" />
+  <text x="258.3" y="102.0" class="value" text-anchor="middle">1.000</text>
+  <text x="213.3" y="416" class="label" text-anchor="middle">recall@10</text>
+  <path d="M383.0,396.0 L383.0,163.478 Q383.0,159.478 387.0,159.478 L467.0,159.478 Q471.0,159.478 471.0,163.478 L471.0,396.0 Z" fill="#b45309" />
+  <text x="427.0" y="151.5" class="value" text-anchor="middle">0.827</text>
+  <path d="M473.0,396.0 L473.0,114.0 Q473.0,110.0 477.0,110.0 L557.0,110.0 Q561.0,110.0 561.0,114.0 L561.0,396.0 Z" fill="#4338ca" />
+  <text x="517.0" y="102.0" class="value" text-anchor="middle">1.000</text>
+  <text x="472.0" y="416" class="label" text-anchor="middle">recall@100</text>
+  <path d="M686.6666666666667,396.0 L686.6666666666667,160.33200000000002 Q686.6666666666667,156.33200000000002 690.6666666666667,156.33200000000002 L770.6666666666667,156.33200000000002 Q774.6666666666667,156.33200000000002 774.6666666666667,160.33200000000002 L774.6666666666667,396.0 Z" fill="#b45309" />
+  <text x="730.7" y="148.3" class="value" text-anchor="middle">0.838</text>
+  <text x="820.7" y="384.0" class="tick" text-anchor="middle">(pool depth)</text>
+  <text x="730.7" y="416" class="label" text-anchor="middle">recall@1000</text>
+  <rect x="620" y="88" width="12" height="12" rx="3" fill="#b45309" />
+  <text x="638" y="99" class="legend">quantized scan</text>
+  <rect x="760" y="88" width="12" height="12" rx="3" fill="#4338ca" />
+  <text x="778" y="99" class="legend">+ fp32 rerank</text>
+</svg>

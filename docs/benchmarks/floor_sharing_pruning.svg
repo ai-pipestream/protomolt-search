@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Collaborative floor sharing - candidates per query">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .panel { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Collaborative floor sharing - candidates per query</text>
+  <text x="84" y="52" class="subtitle">Vector candidates entering top-k heaps per query, 8 shards over 86.6M chunks, 40 queries per point.</text>
+  <text x="84" y="68" class="subtitle">Sharing on vs off return bitwise-identical results (correctness gate); each panel has its own scale.</text>
+  <line x1="98.0" y1="380" x2="264.0" y2="380" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M116.0,380.0 L116.0,267.167701863354 Q116.0,263.167701863354 120.0,263.167701863354 L176.0,263.167701863354 Q180.0,263.167701863354 180.0,267.167701863354 L180.0,380.0 Z" fill="#4338ca" />
+  <text x="148.0" y="255.2" class="value" text-anchor="middle">209</text>
+  <path d="M182.0,380.0 L182.0,164.86956521739128 Q182.0,160.86956521739128 186.0,160.86956521739128 L242.0,160.86956521739128 Q246.0,160.86956521739128 246.0,164.86956521739128 L246.0,380.0 Z" fill="#b45309" />
+  <text x="214.0" y="152.9" class="value" text-anchor="middle">392</text>
+  <text x="181.0" y="122.0" class="value-accent" text-anchor="middle">-47%</text>
+  <text x="181.0" y="400" class="panel" text-anchor="middle">k=10</text>
+  <line x1="292.0" y1="380" x2="458.0" y2="380" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M310.0,380.0 L310.0,246.63142658017478 Q310.0,242.63142658017478 314.0,242.63142658017478 L370.0,242.63142658017478 Q374.0,242.63142658017478 374.0,246.63142658017478 L374.0,380.0 Z" fill="#4338ca" />
+  <text x="342.0" y="234.6" class="value" text-anchor="middle">2,542</text>
+  <path d="M376.0,380.0 L376.0,164.8695652173913 Q376.0,160.8695652173913 380.0,160.8695652173913 L436.0,160.8695652173913 Q440.0,160.8695652173913 440.0,164.8695652173913 L440.0,380.0 Z" fill="#b45309" />
+  <text x="408.0" y="152.9" class="value" text-anchor="middle">4,055</text>
+  <text x="375.0" y="122.0" class="value-accent" text-anchor="middle">-37%</text>
+  <text x="375.0" y="400" class="panel" text-anchor="middle">k=100</text>
+  <line x1="486.0" y1="380" x2="652.0" y2="380" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M504.0,380.0 L504.0,232.67526584030702 Q504.0,228.67526584030702 508.0,228.67526584030702 L564.0,228.67526584030702 Q568.0,228.67526584030702 568.0,232.67526584030702 L568.0,380.0 Z" fill="#4338ca" />
+  <text x="536.0" y="220.7" class="value" text-anchor="middle">29k</text>
+  <path d="M570.0,380.0 L570.0,164.86956521739128 Q570.0,160.86956521739128 574.0,160.86956521739128 L630.0,160.86956521739128 Q634.0,160.86956521739128 634.0,164.86956521739128 L634.0,380.0 Z" fill="#b45309" />
+  <text x="602.0" y="152.9" class="value" text-anchor="middle">41k</text>
+  <text x="569.0" y="122.0" class="value-accent" text-anchor="middle">-31%</text>
+  <text x="569.0" y="400" class="panel" text-anchor="middle">k=1,000</text>
+  <line x1="680.0" y1="380" x2="846.0" y2="380" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M698.0,380.0 L698.0,300.13760046480104 Q698.0,296.13760046480104 702.0,296.13760046480104 L758.0,296.13760046480104 Q762.0,296.13760046480104 762.0,300.13760046480104 L762.0,380.0 Z" fill="#4338ca" />
+  <text x="730.0" y="288.1" class="value" text-anchor="middle">247k</text>
+  <path d="M764.0,380.0 L764.0,164.8695652173913 Q764.0,160.8695652173913 768.0,160.8695652173913 L824.0,160.8695652173913 Q828.0,160.8695652173913 828.0,164.8695652173913 L828.0,380.0 Z" fill="#b45309" />
+  <text x="796.0" y="152.9" class="value" text-anchor="middle">647k</text>
+  <text x="763.0" y="122.0" class="value-accent" text-anchor="middle">-62%</text>
+  <text x="763.0" y="400" class="panel" text-anchor="middle">k=10,000</text>
+  <rect x="610" y="84" width="12" height="12" rx="3" fill="#4338ca" />
+  <text x="628" y="95" class="legend">sharing on</text>
+  <rect x="730" y="84" width="12" height="12" rx="3" fill="#b45309" />
+  <text x="748" y="95" class="legend">sharing off</text>
+</svg>
