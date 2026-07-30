@@ -137,6 +137,11 @@ off at every k. Raw records: `sweep-8x-cb8192.jsonl`,
 
 ## Next steps
 
+The ceiling-raising directions below — block-max-style bounds adapted
+from the lexical world, index segmentation/layout, and query-path
+caching — were suggested by krickert on reviewing this round's
+findings; they are listed at summary level pending measurement.
+
 - **Concurrency battery**: QPS and tail latency vs concurrent clients
   (1–32) on the 8-shard cluster. The bandwidth model predicts sub-linear
   scaling to a ~3–4 QPS ceiling; measuring where it flattens, and what
@@ -150,10 +155,15 @@ off at every k. Raw records: `sweep-8x-cb8192.jsonl`,
 - **Two-machine topology**: shards on one host, coordinator on another;
   measures what real network latency does to floor propagation and
   pruning.
-- **Per-block score bounds** (upstream kernel candidate): precomputed
-  block maxima would let floors skip reading blocks, converting the
-  measured 31–62% candidate pruning into wall-time and bandwidth
-  savings.
+- **Block-max pruning for the vector scan** (upstream kernel
+  candidate): Lucene's Block-Max WAND skips whole postings blocks via
+  per-block score maxima; the same shape applies to quantized vector
+  scans, letting shared floors skip reading provably-dead regions and
+  converting the measured 31–62% candidate pruning into wall-time and
+  bandwidth savings.
+- **Query-path caching**: result and pagination-pool caches around the
+  scan (the scan itself has no exploitable locality; caching applies
+  above it).
 - **Domain vocabulary → better embeddings** (two-phase train): the BM25
   index already holds per-term document frequencies for 10–17M terms
   per shard. Mine corpus-distinctive unigrams by frequency ratio
