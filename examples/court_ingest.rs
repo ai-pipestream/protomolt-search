@@ -375,6 +375,16 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     // sidecar entirely. Used to build vector-leg experiment clusters
     // (shard-count ladders) straight from the embeddings file.
     let vectors_only = std::env::args().any(|a| a == "--vectors-only");
+    // Bandwidth-proportional fleets need unequal shards: explicit split
+    // points (chunk indexes, ascending, exclusive ends; the last shard
+    // runs to the corpus end) override the equal m/n block math.
+    let split_points: Vec<usize> = match arg("split-points", "").as_str() {
+        "" => Vec::new(),
+        spec => spec
+            .split(',')
+            .map(|x| x.trim().parse())
+            .collect::<Result<_, _>>()?,
+    };
     let first_shard: usize = arg("first-shard", "0").parse()?;
     let end_shard: usize = match arg("end-shard", "").as_str() {
         "" => n_shards,
@@ -404,8 +414,30 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         m
     };
     let per = m / n_shards;
+    // Shard block bounds: equal blocks, or the explicit split points.
+    let bounds: Vec<(usize, usize)> = if split_points.is_empty() {
+        (0..n_shards)
+            .map(|i| (i * per, if i == n_shards - 1 { m } else { (i + 1) * per }))
+            .collect()
+    } else {
+        if split_points.len() != n_shards - 1 {
+            return Err(format!(
+                "--split-points needs {} points for {} nodes",
+                n_shards - 1,
+                n_shards
+            )
+            .into());
+        }
+        let mut edges = vec![0usize];
+        edges.extend(&split_points);
+        edges.push(m);
+        if !edges.windows(2).all(|w| w[0] < w[1]) {
+            return Err("--split-points must be ascending and inside the corpus".into());
+        }
+        edges.windows(2).map(|w| (w[0], w[1])).collect()
+    };
     eprintln!(
-        "remote ingest: {m} chunks over {n_shards} nodes ({per}/shard), \
+        "remote ingest: {m} chunks over {n_shards} nodes ({per}/shard equal basis), \
          this driver handles shards {first_shard}..{end_shard}"
     );
 
@@ -449,12 +481,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     let spec = analysis_spec();
     for (shard, addr) in node_addrs.iter().enumerate().take(end_shard).skip(first_shard) {
         let t0 = Instant::now();
-        let start = shard * per;
-        let end = if shard == n_shards - 1 {
-            m
-        } else {
-            start + per
-        };
+        let (start, end) = bounds[shard];
 
         let n = end - start;
         let mut client = NodeServiceClient::connect(addr.clone()).await?;
