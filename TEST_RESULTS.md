@@ -159,6 +159,39 @@ Raw records: `sweep-8x-cb8192.jsonl`, `sweep-ladder.jsonl`,
    with an in-place repair; the byte-identity test between the two
    builders held throughout.
 
+## Round 2: scan-call granularity isolated
+
+A follow-up isolated the node's scan-chunking overhead from real
+scaling. Giving the kernel the whole shard in ONE call (chunk-blocks
+above the shard's block count) instead of 8192-block chunks, k=100,
+same probes:
+
+| Configuration | p50 | QPS |
+|---|---|---|
+| Monolith, 8192-block chunking (Round 1) | 6,592 ms | 0.15 |
+| 8 shards, 8192-block chunking (Round 1) | 313 ms | 3.2 |
+| Monolith, whole-shard call | 239 ms | 4.2 |
+| 8 shards, whole-shard calls | 220 ms | 4.5 |
+
+This **corrects Finding 2**: the "21x scaling" in Round 1 measured the
+node's chunked-scan overhead shrinking with shard size, not intrinsic
+scaling. Properly configured, shard count on one machine is nearly
+flat (220 vs 239 ms): the machine is one bandwidth-bound resource
+however it is partitioned, and the kernel's internal range parallelism
+uses it well on its own. Sharding's real value is across machines
+(added bandwidth) plus collaboration; on one box the corrected
+configuration is also the new best result (220 ms p50, 4.5 QPS, 42%
+faster than Round 1's best).
+
+Node chunking existed to give floor sharing mid-query reactivity; the
+correction shows that reactivity was bought with the dominant cost in
+the system. The follow-up direction (kernel-internal shared floors at
+sub-chunk granularity, then block-max bounds so floors skip reads) is
+measured on a separate branch; a first cell shows the shared floor
+alone does not move wall time, consistent with the bandwidth model,
+positioning it as the enabler for block-max rather than a win by
+itself.
+
 ## Next steps
 
 The ceiling-raising directions below — block-max-style bounds adapted
