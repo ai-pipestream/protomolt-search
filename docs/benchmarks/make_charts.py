@@ -167,6 +167,50 @@ def chart_pruning():
     return "".join(p)
 
 
+def chart_concurrency():
+    import math
+    clients = [1, 2, 4, 8, 16, 32]
+    series = [
+        (8, "#2a78d6", [3.16, 3.29, 3.20, 3.16, 3.17, 3.24]),
+        (4, "#eb6834", [1.59, 2.42, 2.58, 2.49, 2.46, 2.52]),
+        (2, "#1baf7a", [0.52, 0.97, 1.66, 2.10, 2.22, 2.16]),
+        (1, "#eda100", [0.15, 0.30, 0.57, 0.99, 1.30, 1.41]),
+    ]
+    p = svg_open(
+        "Throughput vs concurrent clients",
+        [
+            "QPS at k=100 over 86.6M chunks, 64 queries per cell, one machine. Concurrency never reaches",
+            "the 8-shard ceiling from a narrower layout: process parallelism beats query parallelism at equal load.",
+        ],
+    )
+    left, right, top, bottom = 84, 700, 110, 396
+    span = bottom - top
+    vmax = 3.6
+    for g in [0, 1, 2, 3]:
+        y = bottom - span * g / vmax
+        p.append(f'  <line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" stroke="{GRID}" stroke-width="1" />\n')
+        p.append(f'  <text x="{left - 8}" y="{y + 4:.1f}" class="tick" text-anchor="end">{g}</text>\n')
+    p.append(f'  <line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="{AXISLINE}" stroke-width="1" />\n')
+
+    def xpos(c):
+        return left + 40 + (right - left - 80) * math.log2(c) / 5
+
+    for c in clients:
+        p.append(f'  <text x="{xpos(c):.1f}" y="{bottom + 20}" class="tick" text-anchor="middle">{c}</text>\n')
+    p.append(f'  <text x="{(left + right) / 2}" y="{bottom + 44}" class="axis" text-anchor="middle">concurrent clients (log scale)</text>\n')
+    p.append(f'  <text x="30" y="{(top + bottom) / 2}" class="axis" transform="rotate(-90 30 {(top + bottom) / 2})" text-anchor="middle">queries per second</text>\n')
+
+    for shards, color, qps in series:
+        pts = " ".join(f"{xpos(c):.1f},{bottom - span * q / vmax:.1f}" for c, q in zip(clients, qps))
+        p.append(f'  <polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2" />\n')
+        for c, q in zip(clients, qps):
+            p.append(f'  <circle cx="{xpos(c):.1f}" cy="{bottom - span * q / vmax:.1f}" r="4" fill="{color}" stroke="#ffffff" stroke-width="2" />\n')
+        ex, ey = xpos(32), bottom - span * qps[-1] / vmax
+        p.append(f'  <text x="{ex + 14}" y="{ey + 4:.1f}" class="label">{shards} shard{"s" if shards > 1 else ""} - {qps[-1]:.1f} QPS</text>\n')
+    p.append("</svg>\n")
+    return "".join(p)
+
+
 import os
 
 out = "/work/worktrees/turbovec-workspace/turbovec-search/docs/benchmarks"
@@ -175,6 +219,7 @@ for name, svg in [
     ("scaling_ladder.svg", chart_scaling()),
     ("recall_rerank.svg", chart_recall()),
     ("floor_sharing_pruning.svg", chart_pruning()),
+    ("concurrency_throughput.svg", chart_concurrency()),
 ]:
     with open(f"{out}/{name}", "w") as f:
         f.write(svg)

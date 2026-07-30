@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Throughput vs concurrent clients">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .panel { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Throughput vs concurrent clients</text>
+  <text x="84" y="52" class="subtitle">QPS at k=100 over 86.6M chunks, 64 queries per cell, one machine. Concurrency never reaches</text>
+  <text x="84" y="68" class="subtitle">the 8-shard ceiling from a narrower layout: process parallelism beats query parallelism at equal load.</text>
+  <line x1="84" y1="396.0" x2="700" y2="396.0" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="400.0" class="tick" text-anchor="end">0</text>
+  <line x1="84" y1="316.6" x2="700" y2="316.6" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="320.6" class="tick" text-anchor="end">1</text>
+  <line x1="84" y1="237.1" x2="700" y2="237.1" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="241.1" class="tick" text-anchor="end">2</text>
+  <line x1="84" y1="157.7" x2="700" y2="157.7" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="161.7" class="tick" text-anchor="end">3</text>
+  <line x1="84" y1="396" x2="700" y2="396" stroke="#cbd5e1" stroke-width="1" />
+  <text x="124.0" y="416" class="tick" text-anchor="middle">1</text>
+  <text x="231.2" y="416" class="tick" text-anchor="middle">2</text>
+  <text x="338.4" y="416" class="tick" text-anchor="middle">4</text>
+  <text x="445.6" y="416" class="tick" text-anchor="middle">8</text>
+  <text x="552.8" y="416" class="tick" text-anchor="middle">16</text>
+  <text x="660.0" y="416" class="tick" text-anchor="middle">32</text>
+  <text x="392.0" y="440" class="axis" text-anchor="middle">concurrent clients (log scale)</text>
+  <text x="30" y="253.0" class="axis" transform="rotate(-90 30 253.0)" text-anchor="middle">queries per second</text>
+  <polyline points="124.0,145.0 231.2,134.6 338.4,141.8 445.6,145.0 552.8,144.2 660.0,138.6" fill="none" stroke="#2a78d6" stroke-width="2" />
+  <circle cx="124.0" cy="145.0" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2" />
+  <circle cx="231.2" cy="134.6" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2" />
+  <circle cx="338.4" cy="141.8" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2" />
+  <circle cx="445.6" cy="145.0" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2" />
+  <circle cx="552.8" cy="144.2" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2" />
+  <circle cx="660.0" cy="138.6" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2" />
+  <text x="674.0" y="142.6" class="label">8 shards - 3.2 QPS</text>
+  <polyline points="124.0,269.7 231.2,203.7 338.4,191.0 445.6,198.2 552.8,200.6 660.0,195.8" fill="none" stroke="#eb6834" stroke-width="2" />
+  <circle cx="124.0" cy="269.7" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2" />
+  <circle cx="231.2" cy="203.7" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2" />
+  <circle cx="338.4" cy="191.0" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2" />
+  <circle cx="445.6" cy="198.2" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2" />
+  <circle cx="552.8" cy="200.6" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2" />
+  <circle cx="660.0" cy="195.8" r="4" fill="#eb6834" stroke="#ffffff" stroke-width="2" />
+  <text x="674.0" y="199.8" class="label">4 shards - 2.5 QPS</text>
+  <polyline points="124.0,354.7 231.2,318.9 338.4,264.1 445.6,229.2 552.8,219.6 660.0,224.4" fill="none" stroke="#1baf7a" stroke-width="2" />
+  <circle cx="124.0" cy="354.7" r="4" fill="#1baf7a" stroke="#ffffff" stroke-width="2" />
+  <circle cx="231.2" cy="318.9" r="4" fill="#1baf7a" stroke="#ffffff" stroke-width="2" />
+  <circle cx="338.4" cy="264.1" r="4" fill="#1baf7a" stroke="#ffffff" stroke-width="2" />
+  <circle cx="445.6" cy="229.2" r="4" fill="#1baf7a" stroke="#ffffff" stroke-width="2" />
+  <circle cx="552.8" cy="219.6" r="4" fill="#1baf7a" stroke="#ffffff" stroke-width="2" />
+  <circle cx="660.0" cy="224.4" r="4" fill="#1baf7a" stroke="#ffffff" stroke-width="2" />
+  <text x="674.0" y="228.4" class="label">2 shards - 2.2 QPS</text>
+  <polyline points="124.0,384.1 231.2,372.2 338.4,350.7 445.6,317.4 552.8,292.7 660.0,284.0" fill="none" stroke="#eda100" stroke-width="2" />
+  <circle cx="124.0" cy="384.1" r="4" fill="#eda100" stroke="#ffffff" stroke-width="2" />
+  <circle cx="231.2" cy="372.2" r="4" fill="#eda100" stroke="#ffffff" stroke-width="2" />
+  <circle cx="338.4" cy="350.7" r="4" fill="#eda100" stroke="#ffffff" stroke-width="2" />
+  <circle cx="445.6" cy="317.4" r="4" fill="#eda100" stroke="#ffffff" stroke-width="2" />
+  <circle cx="552.8" cy="292.7" r="4" fill="#eda100" stroke="#ffffff" stroke-width="2" />
+  <circle cx="660.0" cy="284.0" r="4" fill="#eda100" stroke="#ffffff" stroke-width="2" />
+  <text x="674.0" y="288.0" class="label">1 shard - 1.4 QPS</text>
+</svg>

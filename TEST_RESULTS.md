@@ -95,8 +95,25 @@ min 302 ms, p99 322 ms over 40 queries.
 | 10,000 | 247,442 | 646,560 | 62% |
 
 Wall time was statistically indistinguishable between sharing on and
-off at every k. Raw records: `sweep-8x-cb8192.jsonl`,
-`sweep-ladder.jsonl`; charts regenerate from
+off at every k.
+
+![Throughput vs concurrent clients](docs/benchmarks/concurrency_throughput.svg)
+
+Concurrency grid (k=100, 64 queries per cell), QPS:
+
+| Shards | c=1 | c=2 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|---|
+| 1 | 0.15 | 0.30 | 0.57 | 0.99 | 1.30 | 1.41 |
+| 2 | 0.52 | 0.97 | 1.66 | 2.10 | 2.22 | 2.16 |
+| 4 | 1.59 | 2.42 | 2.58 | 2.49 | 2.46 | 2.52 |
+| 8 | 3.16 | 3.29 | 3.20 | 3.16 | 3.17 | 3.24 |
+
+Once a layout reaches its plateau, p50 grows linearly with client count
+(Little's law: latency ~ concurrency / QPS), e.g. 8 shards: 315 ms at
+c=1, 9.9 s at c=32, throughput unchanged.
+
+Raw records: `sweep-8x-cb8192.jsonl`, `sweep-ladder.jsonl`,
+`sweep-concurrency.jsonl`; charts regenerate from
 `docs/benchmarks/make_charts.py`.
 
 ## Findings
@@ -128,7 +145,14 @@ off at every k. Raw records: `sweep-8x-cb8192.jsonl`,
    cost 47x at 10.8M vectors/shard (15 s → 313 ms after raising it);
    chunking granularity is a floor-reactivity vs overhead trade that
    should be derived from shard size, not fixed.
-7. **Live sample queries caught a real format defect no unit test
+7. **Concurrency cannot substitute for sharding.** Each layout has its
+   own throughput plateau (8 shards: 3.2 QPS from the first client;
+   4: ~2.5; 2: ~2.2; 1: ~1.4 even at 32 clients) — the monolith with 32
+   queries in flight reaches less than half the 8-shard ceiling.
+   Process-level parallelism beats query-level parallelism at equal
+   load, and past the plateau added clients only add queueing delay,
+   linearly.
+8. **Live sample queries caught a real format defect no unit test
    could**: BM25 directory blob offsets were absolute u32 file
    positions, silently wrapping past 4 GiB and zeroing every lexical
    score on 45 GB shards. Fixed as format v4 (blob-relative offsets)
@@ -142,10 +166,6 @@ from the lexical world, index segmentation/layout, and query-path
 caching — were suggested by krickert on reviewing this round's
 findings; they are listed at summary level pending measurement.
 
-- **Concurrency battery**: QPS and tail latency vs concurrent clients
-  (1–32) on the 8-shard cluster. The bandwidth model predicts sub-linear
-  scaling to a ~3–4 QPS ceiling; measuring where it flattens, and what
-  it does to p99, is the point.
 - **Large-query battery**: 10k–100k probes, including off-corpus query
   text embedded at query time, for statistically strong percentiles and
   recall estimates.
