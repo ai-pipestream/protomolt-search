@@ -20,7 +20,8 @@ use crate::pb::{
     search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest,
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, ClusterHealthRequest,
-    ClusterHealthResponse, FloorUpdate, FusionMode, HealthRequest, HybridHit, HybridSearchRequest,
+    ClusterHealthResponse, FloorUpdate, FusionMode, HealthRequest, HybridDebug, HybridHit,
+    HybridSearchRequest, HybridShardDebug,
     HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
     SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
     ShardLegsRequest, ShardScanStats, StartShardSearch, TermStatsRequest,
@@ -226,15 +227,19 @@ impl CoordinatorServiceImpl {
         k: u32,
         spec: Option<&crate::pb::AnalysisSpec>,
         legs: HybridLegs,
-    ) -> Result<Vec<HybridHit>, Status> {
+        debug: bool,
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         if k == 0 || vector.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
+        let t_total = std::time::Instant::now();
         // Query analysis for the BM25 leg (same options as ingest).
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
+        let t = std::time::Instant::now();
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+        let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
         let mut terms: Vec<String> = Vec::new();
         for (term, _, _) in analyzed.terms {
             if !terms.contains(&term) {
@@ -242,17 +247,26 @@ impl CoordinatorServiceImpl {
             }
         }
 
+        let t = std::time::Instant::now();
         let global = self.global_bm25_stats(&terms).await?;
-        match legs.fusion_mode {
+        let stats_ms = t.elapsed().as_secs_f32() * 1e3;
+        let (hits, mut dbg) = match legs.fusion_mode {
             FusionMode::TwoLevel => {
-                self.fanout_hybrid_two_level(request_id, vector, k, &terms, &global, legs)
-                    .await
+                self.fanout_hybrid_two_level(request_id, vector, k, &terms, &global, legs, debug)
+                    .await?
             }
             _ => {
-                self.fanout_hybrid_global_rank(vector, k, &terms, &global, legs)
-                    .await
+                self.fanout_hybrid_global_rank(vector, k, &terms, &global, legs, debug)
+                    .await?
             }
+        };
+        if let Some(d) = dbg.as_mut() {
+            d.terms = terms;
+            d.analysis_ms = analysis_ms;
+            d.stats_ms = stats_ms;
+            d.total_ms = t_total.elapsed().as_secs_f32() * 1e3;
         }
+        Ok((hits, dbg))
     }
 
     /// TermStats fan-out: sum every shard's share into GLOBAL BM25 corpus
@@ -295,7 +309,9 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         global: &CorpusStats,
         legs: HybridLegs,
-    ) -> Result<Vec<HybridHit>, Status> {
+        debug: bool,
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        let t_legs = std::time::Instant::now();
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = ShardLegsRequest {
@@ -309,19 +325,30 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
                 client
                     .shard_legs(request)
                     .await
-                    .map(|r| (shard as u32, r.into_inner()))
+                    .map(|r| (shard as u32, t0.elapsed().as_secs_f32() * 1e3, r.into_inner()))
             }));
         }
         let mut vector_shards = Vec::with_capacity(shard_tasks.len());
         let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
+        let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
         let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for task in shard_tasks {
-            let (shard, response) = task
+            let (shard, rpc_ms, response) = task
                 .await
                 .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))??;
+            if debug {
+                shard_debug.push(HybridShardDebug {
+                    shard,
+                    rpc_ms,
+                    vector_hits: response.vector_hits.len() as u32,
+                    bm25_hits: response.bm25_hits.len() as u32,
+                    scan: None,
+                });
+            }
             for h in &response.vector_hits {
                 owner.entry(h.doc_id).or_insert(shard);
             }
@@ -346,8 +373,10 @@ impl CoordinatorServiceImpl {
             ));
         }
 
+        let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         // Merge each leg into a GLOBAL ranking by raw score (deterministic
         // total order; see merge_legs_by_score), then single-level RRF.
+        let t_fusion = std::time::Instant::now();
         let vector_global = fusion::merge_legs_by_score(vector_shards);
         let bm25_global = fusion::merge_legs_by_score(bm25_shards);
         let fused = fusion::rrf_fuse(
@@ -381,7 +410,7 @@ impl CoordinatorServiceImpl {
 
         // Provenance: global per-leg ranks, raw scores, and the owning
         // shard (a doc lives on exactly one shard's lists).
-        Ok(fused
+        let hits: Vec<HybridHit> = fused
             .into_iter()
             .map(|f| HybridHit {
                 doc_id: f.doc_id,
@@ -392,7 +421,22 @@ impl CoordinatorServiceImpl {
                 bm25_rank: f.leg_ranks[1],
                 bm25_score: f.leg_scores[1].unwrap_or(0.0) as f32,
             })
-            .collect())
+            .collect();
+        let dbg = debug.then(|| {
+            shard_debug.sort_by_key(|s| s.shard);
+            HybridDebug {
+                fusion_mode: FusionMode::GlobalRank as i32,
+                leg_k: legs.leg_k,
+                terms: Vec::new(),
+                analysis_ms: 0.0,
+                stats_ms: 0.0,
+                legs_ms,
+                fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
+                total_ms: 0.0,
+                shards: shard_debug,
+            }
+        });
+        Ok((hits, dbg))
     }
 
     /// FUSION_MODE_TWO_LEVEL (fallback for incomparable scores): each
@@ -406,7 +450,9 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         global: &CorpusStats,
         legs: HybridLegs,
-    ) -> Result<Vec<HybridHit>, Status> {
+        debug: bool,
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        let t_legs = std::time::Instant::now();
         // Level one: per-shard local fusion.
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
@@ -424,19 +470,34 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
                 client
                     .hybrid_shard(request)
                     .await
-                    .map(|r| (shard as u32, r.into_inner().hits))
+                    .map(|r| (shard as u32, t0.elapsed().as_secs_f32() * 1e3, r.into_inner().hits))
             }));
         }
         let mut shard_lists: Vec<(u32, Vec<crate::pb::HybridLegHit>)> = Vec::new();
+        let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
         for task in shard_tasks {
-            let (shard, hits) = task
+            let (shard, rpc_ms, hits) = task
                 .await
                 .map_err(|e| Status::internal(format!("hybrid shard task failed: {e}")))??;
+            if debug {
+                // A two-level shard returns one FUSED list; per-leg
+                // membership is what provenance carries.
+                shard_debug.push(HybridShardDebug {
+                    shard,
+                    rpc_ms,
+                    vector_hits: hits.iter().filter(|h| h.vector_rank.is_some()).count() as u32,
+                    bm25_hits: hits.iter().filter(|h| h.bm25_rank.is_some()).count() as u32,
+                    scan: None,
+                });
+            }
             shard_lists.push((shard, hits));
         }
+        let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
+        let t_fusion = std::time::Instant::now();
 
         // Level two: RRF over the per-shard fused lists (unweighted; the
         // leg weights already acted at shard level).
@@ -453,7 +514,7 @@ impl CoordinatorServiceImpl {
         let fused = fusion::rrf_fuse(&fused_legs, legs.rrf_k, k as usize);
 
         // Attach per-leg provenance from the owning shard's HybridLegHit.
-        Ok(fused
+        let hits: Vec<HybridHit> = fused
             .into_iter()
             .map(|f| {
                 let (shard, source) = shard_lists
@@ -474,7 +535,23 @@ impl CoordinatorServiceImpl {
                     bm25_score: source.bm25_score,
                 }
             })
-            .collect())
+            .collect();
+        let dbg = debug.then(|| {
+            let mut shard_debug = shard_debug;
+            shard_debug.sort_by_key(|s| s.shard);
+            HybridDebug {
+                fusion_mode: FusionMode::TwoLevel as i32,
+                leg_k: legs.leg_k,
+                terms: Vec::new(),
+                analysis_ms: 0.0,
+                stats_ms: 0.0,
+                legs_ms,
+                fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
+                total_ms: 0.0,
+                shards: shard_debug,
+            }
+        });
+        Ok((hits, dbg))
     }
 
     /// Build the tonic server for this service with explicit message size
@@ -525,7 +602,7 @@ impl CoordinatorServiceImpl {
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
 
         let (done_tx, mut done_rx) =
-            mpsc::channel::<(u32, Result<SearchShardDone, Status>)>(n_nodes);
+            mpsc::channel::<(u32, f32, Result<SearchShardDone, Status>)>(n_nodes);
         for shard in 0..n_nodes {
             let primary = self.node_client(&self.node_addrs[shard])?;
             let replica = match self.replica_addrs.get(shard).and_then(|r| r.as_deref()) {
@@ -536,18 +613,21 @@ impl CoordinatorServiceImpl {
             let limits = self.limits;
             let done_tx = done_tx.clone();
             tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
                 let result =
                     run_shard_with_hedge(shard as u32, primary, replica, ctx, limits).await;
-                let _ = done_tx.send((shard as u32, result)).await;
+                let wall_ms = t0.elapsed().as_secs_f32() * 1e3;
+                let _ = done_tx.send((shard as u32, wall_ms, result)).await;
             });
         }
         drop(done_tx);
 
         let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = Vec::with_capacity(n_nodes);
         let mut shard_stats: Vec<Option<ShardScanStats>> = Vec::with_capacity(n_nodes);
+        let mut shard_wall_ms: Vec<(u32, f32)> = Vec::with_capacity(n_nodes);
         for _ in 0..n_nodes {
             match done_rx.recv().await {
-                Some((shard, Ok(done))) => {
+                Some((shard, wall_ms, Ok(done))) => {
                     shard_hits.push((
                         shard,
                         done.hits
@@ -556,8 +636,9 @@ impl CoordinatorServiceImpl {
                             .collect(),
                     ));
                     shard_stats.push(done.stats);
+                    shard_wall_ms.push((shard, wall_ms));
                 }
-                Some((shard, Err(e))) => {
+                Some((shard, _, Err(e))) => {
                     return Err(Status::internal(format!("shard {shard} failed: {e}")));
                 }
                 None => {
@@ -577,6 +658,7 @@ impl CoordinatorServiceImpl {
             hits,
             shard_stats,
             shard_hits,
+            shard_wall_ms,
             hedges_fired: hedges.load(AtomicOrdering::Relaxed),
             hedge_wins: hedge_wins.load(AtomicOrdering::Relaxed),
         })
@@ -604,12 +686,16 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         spec: Option<&crate::pb::AnalysisSpec>,
-    ) -> Result<Vec<CascadeHit>, Status> {
+        debug: bool,
+    ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
         if k == 0 || vector.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
+        let t_total = std::time::Instant::now();
         // Phase 1: floor-shared, tie-complete vector candidates.
+        let t_legs = std::time::Instant::now();
         let phase1 = self.fanout_search(request_id, vector, k, true).await?;
+        let phase1_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         let mut all: Vec<(u64, u32, f64)> = Vec::new(); // (doc_id, shard, score)
         for (shard, hits) in &phase1.shard_hits {
             for &(doc_id, score) in hits {
@@ -628,16 +714,21 @@ impl CoordinatorServiceImpl {
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
+        let t = std::time::Instant::now();
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+        let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
         let mut terms: Vec<String> = Vec::new();
         for (term, _, _) in analyzed.terms {
             if !terms.contains(&term) {
                 terms.push(term);
             }
         }
+        let t = std::time::Instant::now();
         let global = self.global_bm25_stats(&terms).await?;
+        let stats_ms = t.elapsed().as_secs_f32() * 1e3;
 
         // Phase 2: route candidates to their owning shards for rescoring.
+        let t_rescore = std::time::Instant::now();
         let mut by_shard: std::collections::HashMap<u32, Vec<u64>> =
             std::collections::HashMap::new();
         for (doc_id, shard, _) in &pool {
@@ -657,24 +748,30 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(node)?;
             rescore_tasks.push(tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
                 client
                     .bm25_rescore(request)
                     .await
-                    .map(|r| r.into_inner().hits)
+                    .map(|r| (shard, t0.elapsed().as_secs_f32() * 1e3, r.into_inner().hits))
             }));
         }
         let mut bm25_of: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+        let mut rescore_debug: std::collections::HashMap<u32, (f32, u32)> =
+            std::collections::HashMap::new();
         for task in rescore_tasks {
-            for hit in task
+            let (shard, rpc_ms, hits) = task
                 .await
-                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??
-            {
+                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??;
+            rescore_debug.insert(shard, (rpc_ms, hits.len() as u32));
+            for hit in hits {
                 bm25_of.insert(hit.doc_id, f64::from(hit.score));
             }
         }
+        let rescore_ms = t_rescore.elapsed().as_secs_f32() * 1e3;
 
         // Rerank: BM25 desc, vector score desc, doc id asc. Top k of the
         // (possibly larger) tie-extended pool.
+        let t_fusion = std::time::Instant::now();
         let mut ranked: Vec<CascadeHit> = pool
             .into_iter()
             .map(|(doc_id, shard, vector_score)| CascadeHit {
@@ -695,7 +792,48 @@ impl CoordinatorServiceImpl {
         for (i, hit) in ranked.iter_mut().enumerate() {
             hit.rank = i as u32 + 1;
         }
-        Ok(ranked)
+        let dbg = debug.then(|| {
+            // Per-shard: phase-1 wall + this shard's rescore wall, the
+            // phase-1 candidate count, the rescored count, and the vector
+            // scan's stats. Vectors from fanout_search are in completion
+            // order; re-key by shard.
+            let mut walls: std::collections::HashMap<u32, f32> =
+                phase1.shard_wall_ms.iter().copied().collect();
+            let mut scans: std::collections::HashMap<u32, Option<ShardScanStats>> = phase1
+                .shard_hits
+                .iter()
+                .zip(&phase1.shard_stats)
+                .map(|((shard, _), stats)| (*shard, *stats))
+                .collect();
+            let mut shards: Vec<HybridShardDebug> = phase1
+                .shard_hits
+                .iter()
+                .map(|(shard, hits)| {
+                    let (rescore_wall, rescored) =
+                        rescore_debug.get(shard).copied().unwrap_or((0.0, 0));
+                    HybridShardDebug {
+                        shard: *shard,
+                        rpc_ms: walls.remove(shard).unwrap_or(0.0) + rescore_wall,
+                        vector_hits: hits.len() as u32,
+                        bm25_hits: rescored,
+                        scan: scans.remove(shard).flatten(),
+                    }
+                })
+                .collect();
+            shards.sort_by_key(|s| s.shard);
+            HybridDebug {
+                fusion_mode: FusionMode::Cascade as i32,
+                leg_k: k,
+                terms,
+                analysis_ms,
+                stats_ms,
+                legs_ms: phase1_ms + rescore_ms,
+                fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
+                total_ms: t_total.elapsed().as_secs_f32() * 1e3,
+                shards,
+            }
+        });
+        Ok((ranked, dbg))
     }
     /// Push one TQ+ calibration to every configured node (the
     /// shared-calibration handshake that makes vector scores globally
@@ -975,6 +1113,9 @@ pub struct FanoutResult {
     /// exceed k by its boundary tie group. The cascade pipeline routes
     /// candidates by these shard assignments.
     pub shard_hits: Vec<(u32, Vec<(u64, f32)>)>,
+    /// Per-shard wall time in milliseconds as measured at the
+    /// coordinator (shard index, ms), in completion order.
+    pub shard_wall_ms: Vec<(u32, f32)>,
     /// Hedge legs launched during this fan-out, and how many of them
     /// returned before their primary.
     pub hedges_fired: u64,
@@ -1092,23 +1233,25 @@ impl SearchService for CoordinatorServiceImpl {
         };
         match legs.fusion_mode {
             FusionMode::Cascade | FusionMode::Unspecified => {
-                let cascade_hits = self
+                let (cascade_hits, debug) = self
                     .fanout_cascade(
                         &request_id,
                         &req.text,
                         &req.vector,
                         req.k,
                         req.analysis.as_ref(),
+                        req.debug,
                     )
                     .await?;
                 Ok(Response::new(HybridSearchResponse {
                     request_id,
                     hits: Vec::new(),
                     cascade_hits,
+                    debug,
                 }))
             }
             _ => {
-                let hits = self
+                let (hits, debug) = self
                     .fanout_hybrid(
                         &request_id,
                         &req.text,
@@ -1116,12 +1259,14 @@ impl SearchService for CoordinatorServiceImpl {
                         req.k,
                         req.analysis.as_ref(),
                         legs,
+                        req.debug,
                     )
                     .await?;
                 Ok(Response::new(HybridSearchResponse {
                     request_id,
                     hits,
                     cascade_hits: Vec::new(),
+                    debug,
                 }))
             }
         }

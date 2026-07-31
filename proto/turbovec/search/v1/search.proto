@@ -817,6 +817,48 @@ message HybridSearchRequest {
   AnalysisSpec analysis = 5;
   // Per-leg fusion options; absent = defaults (see HybridLegOptions).
   HybridLegOptions legs = 6;
+  // When true, the response's `debug` block carries coordinator phase
+  // timings, per-shard leg wall times and depths, and (cascade) the
+  // vector scan's stats — the explain/profile surface. Costs a few
+  // clock reads; results are unchanged.
+  bool debug = 7;
+}
+
+// Profile of one hybrid query; populated only when the request set
+// `debug`.
+message HybridDebug {
+  // The fusion mode that actually ran.
+  FusionMode fusion_mode = 1;
+  // Effective per-leg depth after defaulting and clamping.
+  uint32 leg_k = 2;
+  // Query terms after analysis: the BM25 leg's identity.
+  repeated string terms = 3;
+  // Coordinator phases, milliseconds of wall time. `legs_ms` covers the
+  // whole shard fan-out (for cascade: both phases); `fusion_ms` the
+  // coordinator-side merge and fuse.
+  float analysis_ms = 4;
+  float stats_ms = 5;
+  float legs_ms = 6;
+  float fusion_ms = 7;
+  float total_ms = 8;
+  // Per-shard visibility, in shard order.
+  repeated HybridShardDebug shards = 9;
+}
+
+// One shard's contribution to a hybrid query.
+message HybridShardDebug {
+  // Shard index in fan-out order.
+  uint32 shard = 1;
+  // Wall time of this shard's leg work as measured at the coordinator:
+  // the ShardLegs / HybridShard RPC, or for cascade the phase-1
+  // SearchShard stream plus this shard's phase-2 Bm25Rescore.
+  float rpc_ms = 2;
+  // Hits this shard returned per leg; for cascade: phase-1 candidates
+  // generated / phase-2 candidates rescored on this shard.
+  uint32 vector_hits = 3;
+  uint32 bm25_hits = 4;
+  // Cascade only: the phase-1 vector scan's stats.
+  ShardScanStats scan = 5;
 }
 
 // One fused hit, with per-leg provenance from the owning shard so clients
@@ -851,6 +893,8 @@ message HybridSearchResponse {
   // Cascade top-k (BM25 rerank order; pool beyond k is truncated here).
   // Populated for FUSION_MODE_CASCADE; `hits` is then empty.
   repeated CascadeHit cascade_hits = 3;
+  // The profile block; present only when the request set `debug`.
+  HybridDebug debug = 4;
 }
 
 // A shard's raw per-leg lists for a hybrid query (FUSION_MODE_GLOBAL_RANK).

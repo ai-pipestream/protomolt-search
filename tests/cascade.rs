@@ -212,13 +212,13 @@ async fn cascade_includes_whole_boundary_tie_group_and_is_deterministic() {
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
 
     let first = coordinator
-        .fanout_cascade("c1", "zebra", &corpus.query, 2, None)
+        .fanout_cascade("c1", "zebra", &corpus.query, 2, None, false)
         .await
-        .unwrap();
+        .unwrap().0;
     let second = coordinator
-        .fanout_cascade("c2", "zebra", &corpus.query, 2, None)
+        .fanout_cascade("c2", "zebra", &corpus.query, 2, None, false)
         .await
-        .unwrap();
+        .unwrap().0;
     assert_eq!(
         signature(&first),
         signature(&second),
@@ -259,13 +259,13 @@ async fn distributed_cascade_matches_monolithic_exactly() {
 
     for k in [2u32, 4, 12] {
         let got = distributed
-            .fanout_cascade("d", "zebra", &corpus.query, k, None)
+            .fanout_cascade("d", "zebra", &corpus.query, k, None, false)
             .await
-            .unwrap();
+            .unwrap().0;
         let want = monolithic
-            .fanout_cascade("m", "zebra", &corpus.query, k, None)
+            .fanout_cascade("m", "zebra", &corpus.query, k, None, false)
             .await
-            .unwrap();
+            .unwrap().0;
         assert_cascade_equivalent(&got, &want);
     }
 

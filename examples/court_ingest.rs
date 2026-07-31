@@ -302,8 +302,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &chunk.text[..chunk.text.len().min(120)]
         );
         let hits = coordinator
-            .fanout_cascade("court", &chunk.text, vector, 5, Some(&spec))
-            .await?;
+            .fanout_cascade("court", &chunk.text, vector, 5, Some(&spec), false)
+            .await?.0;
         for hit in &hits {
             println!(
                 "  #{} doc {:>7} (shard {}) vector {:.4}  bm25 {:.4}",

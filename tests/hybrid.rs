@@ -164,13 +164,13 @@ async fn hybrid_is_deterministic_and_carries_provenance() {
     let query = corpus[..DIM].to_vec();
 
     let first = coordinator
-        .fanout_hybrid("h1", "zebra", &query, 8, None, legs_default())
+        .fanout_hybrid("h1", "zebra", &query, 8, None, legs_default(), false)
         .await
-        .unwrap();
+        .unwrap().0;
     let second = coordinator
-        .fanout_hybrid("h2", "zebra", &query, 8, None, legs_default())
+        .fanout_hybrid("h2", "zebra", &query, 8, None, legs_default(), false)
         .await
-        .unwrap();
+        .unwrap().0;
     assert_eq!(
         ids(&first),
         ids(&second),
@@ -270,13 +270,13 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
         CoordinatorServiceImpl::new(vec![mono_addr]).with_bm25(Some(analysis), Default::default());
 
     let got = distributed
-        .fanout_hybrid("d", "zebra", &query, N_DOCS as u32, None, legs_default())
+        .fanout_hybrid("d", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
         .await
-        .unwrap();
+        .unwrap().0;
     let want = monolithic
-        .fanout_hybrid("m", "zebra", &query, N_DOCS as u32, None, legs_default())
+        .fanout_hybrid("m", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
         .await
-        .unwrap();
+        .unwrap().0;
 
     // Monolithic sanity: doc 0 (both legs) first, then the vector order.
     let want_originals: Vec<usize> = want
@@ -384,9 +384,9 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
         CoordinatorServiceImpl::new(vec![mono_addr]).with_bm25(Some(analysis), Default::default());
 
     let got = distributed
-        .fanout_hybrid("adv", "zebra", &query, N_DOCS as u32, None, legs_default())
+        .fanout_hybrid("adv", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
         .await
-        .unwrap();
+        .unwrap().0;
     let want = monolithic
         .fanout_hybrid(
             "adv-m",
@@ -395,9 +395,10 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
             N_DOCS as u32,
             None,
             legs_default(),
+            false,
         )
         .await
-        .unwrap();
+        .unwrap().0;
 
     assert_eq!(got.len(), want.len());
     for (pos, (g, w)) in got.iter().zip(want.iter()).enumerate() {
@@ -475,13 +476,13 @@ async fn two_level_fallback_is_reachable_and_deterministic() {
     let query = corpus[..DIM].to_vec();
 
     let first = coordinator
-        .fanout_hybrid("t1", "zebra", &query, 8, None, legs_two_level())
+        .fanout_hybrid("t1", "zebra", &query, 8, None, legs_two_level(), false)
         .await
-        .unwrap();
+        .unwrap().0;
     let second = coordinator
-        .fanout_hybrid("t2", "zebra", &query, 8, None, legs_two_level())
+        .fanout_hybrid("t2", "zebra", &query, 8, None, legs_two_level(), false)
         .await
-        .unwrap();
+        .unwrap().0;
     assert_eq!(ids(&first), ids(&second));
     // Doc 0 (both legs on its shard) wins; provenance is shard-local.
     assert_eq!(first[0].doc_id, 0);
@@ -611,9 +612,10 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
             CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis.clone()), Default::default());
         runs.push(
             coordinator
-                .fanout_hybrid("h", "zebra", &query, 8, None, legs_default())
+                .fanout_hybrid("h", "zebra", &query, 8, None, legs_default(), false)
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
         );
     }
     let sig = |hits: &[turbovec_search::pb::HybridHit]| {
@@ -642,4 +644,102 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
     handle_v5.abort();
     mock.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The debug/profile block: absent unless requested, mode and depth
+/// echoed, one entry per shard with real timings, terms carried, cascade
+/// rich with the vector scan's stats — and enabling it never changes
+/// results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn debug_block_profiles_every_fusion_mode() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x1111_0009);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let mut texts: Vec<String> = (0..2 * SHARD_DOCS)
+        .map(|i| format!("plain document number {i} about nothing special"))
+        .collect();
+    texts[0] = "zebra stripes everywhere".to_string();
+    texts[5] = "another zebra crossing".to_string();
+
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for shard in 0..2usize {
+        let start = shard * SHARD_DOCS;
+        let vecs = corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec();
+        let (addr, handle) = start_hybrid_shard(
+            &analysis,
+            (shard * SHARD_DOCS) as u64,
+            &texts[start..start + SHARD_DOCS],
+            vecs,
+            &shift,
+            &scale,
+        )
+        .await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
+    let query = corpus[..DIM].to_vec();
+
+    for legs in [legs_default(), legs_two_level()] {
+        let (plain, no_debug) = coordinator
+            .fanout_hybrid("p", "zebra", &query, 8, None, legs, false)
+            .await
+            .unwrap();
+        assert!(no_debug.is_none(), "debug=false must not build a profile");
+        let (hits, debug) = coordinator
+            .fanout_hybrid("d", "zebra", &query, 8, None, legs, true)
+            .await
+            .unwrap();
+        assert_eq!(ids(&plain), ids(&hits), "debug changed the results");
+        let debug = debug.unwrap();
+        assert_eq!(debug.fusion_mode, legs.fusion_mode as i32);
+        assert_eq!(debug.leg_k, legs.leg_k);
+        assert_eq!(debug.terms, vec!["zebra".to_string()]);
+        assert_eq!(debug.shards.len(), 2, "one entry per shard");
+        for (i, shard) in debug.shards.iter().enumerate() {
+            assert_eq!(shard.shard, i as u32, "shards sorted by index");
+            assert!(shard.rpc_ms > 0.0);
+        }
+        assert!(
+            debug.shards.iter().any(|s| s.bm25_hits > 0),
+            "zebra must reach some shard's lexical leg"
+        );
+        assert!(debug.analysis_ms > 0.0);
+        assert!(debug.stats_ms > 0.0);
+        assert!(debug.legs_ms > 0.0);
+        assert!(debug.total_ms >= debug.legs_ms);
+    }
+
+    let (plain, no_debug) = coordinator
+        .fanout_cascade("cp", "zebra", &query, 4, None, false)
+        .await
+        .unwrap();
+    assert!(no_debug.is_none());
+    let (hits, debug) = coordinator
+        .fanout_cascade("cd", "zebra", &query, 4, None, true)
+        .await
+        .unwrap();
+    let cascade_sig = |hits: &[turbovec_search::pb::CascadeHit]| {
+        hits.iter().map(|h| (h.doc_id, h.rank)).collect::<Vec<_>>()
+    };
+    assert_eq!(cascade_sig(&plain), cascade_sig(&hits));
+    let debug = debug.unwrap();
+    assert_eq!(
+        debug.fusion_mode,
+        turbovec_search::pb::FusionMode::Cascade as i32
+    );
+    assert_eq!(debug.terms, vec!["zebra".to_string()]);
+    assert_eq!(debug.shards.len(), 2);
+    for shard in &debug.shards {
+        assert!(shard.scan.is_some(), "cascade carries the vector scan stats");
+        assert!(shard.vector_hits > 0, "phase-1 candidates counted");
+    }
+    assert!(debug.total_ms > 0.0);
+
+    mock.abort();
+    for handle in handles {
+        handle.abort();
+    }
 }
