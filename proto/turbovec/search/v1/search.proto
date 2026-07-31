@@ -728,6 +728,66 @@ enum FusionMode {
   // keyword-strong but vector-weak docs are not surfaced — use
   // Bm25Search for pure lexical queries, or GLOBAL_RANK for true fusion.
   FUSION_MODE_CASCADE = 3;
+
+  // Score-based fusion (the normalize + weighted-combine family):
+  // shards return RAW per-leg lists exactly as in GLOBAL_RANK; the
+  // coordinator merges each leg into one global list, truncates it
+  // TIE-COMPLETE to leg_k (the retained set is {score >= s_k} with s_k
+  // the leg's leg_k-th best — score-defined, hence layout-invariant),
+  // normalizes the retained scores per leg (ScoreNormalization) and
+  // combines each doc's normalized leg scores (ScoreCombination)
+  // weighted by vector_weight/bm25_weight. Rank-free: score GAPS
+  // survive fusion — a runaway leg leader stays far ahead where RRF
+  // compresses every gap to the fixed distance between adjacent ranks.
+  // Requires globally comparable scores per leg, same as GLOBAL_RANK.
+  FUSION_MODE_SCORE_BLEND = 4;
+}
+
+// SCORE_BLEND only: how each leg's retained scores are rescaled before
+// combining. Statistics are computed over the leg's GLOBAL retained
+// list (tie-complete top leg_k across all shards) — never per shard,
+// which would break partition-independence.
+enum ScoreNormalization {
+  // Unused zero value; resolves to SCORE_NORMALIZATION_MIN_MAX.
+  SCORE_NORMALIZATION_UNSPECIFIED = 0;
+  // (s - min) / (max - min), onto [0, 1]. A degenerate leg (every
+  // retained score equal) maps to 1.0. The default: bounded and
+  // scale-free, and the boundary doc maps to 0.0 — a doc AT the
+  // truncation boundary blends exactly like an absent one, which makes
+  // min-max robust to boundary-tie membership differences between
+  // layouts.
+  SCORE_NORMALIZATION_MIN_MAX = 1;
+  // (s - mean) / stddev (population stddev over the retained set).
+  // Unbounded and can be negative; a degenerate leg maps to 0.0.
+  // Preserves outlier magnitude that min-max compresses. Caveat: under
+  // ARITHMETIC combination a doc ABSENT from a leg contributes 0 (the
+  // leg mean), which outscores a present-but-weak (negative z) doc;
+  // GEOMETRIC/HARMONIC skip non-positive scores entirely.
+  SCORE_NORMALIZATION_Z_SCORE = 2;
+  // No rescaling: raw leg scores combine directly. Only meaningful when
+  // the legs already share a scale (or to inspect the blend itself).
+  SCORE_NORMALIZATION_NONE = 3;
+}
+
+// SCORE_BLEND only: how one doc's normalized per-leg scores combine
+// into its fused score, weighted by vector_weight/bm25_weight.
+enum ScoreCombination {
+  // Unused zero value; resolves to SCORE_COMBINATION_ARITHMETIC.
+  SCORE_COMBINATION_UNSPECIFIED = 0;
+  // Weighted arithmetic mean over ALL weighted legs: a leg the doc is
+  // absent from contributes 0 with its weight still in the denominator,
+  // so single-leg docs are proportionally penalized. This is the
+  // classic weighted-sum hybrid formula (union-flavored). The default.
+  SCORE_COMBINATION_ARITHMETIC = 1;
+  // Weighted geometric mean over the legs where the doc has a POSITIVE
+  // normalized score, weights renormalized over those legs; a doc with
+  // no positive leg scores 0. Favors docs that are good in EVERY leg
+  // without zeroing single-leg docs.
+  SCORE_COMBINATION_GEOMETRIC = 2;
+  // Weighted harmonic mean over the positive legs (same skip rule as
+  // GEOMETRIC). The most AND-flavored: dominated by the doc's WEAKEST
+  // leg.
+  SCORE_COMBINATION_HARMONIC = 3;
 }
 
 // Per-leg options for hybrid (RRF-fused) search. Every field is optional;
@@ -740,12 +800,19 @@ message HybridLegOptions {
   // deep-ranked docs could not contribute their 1/(rrf_k + rank) share.
   // Values below k are clamped to k.
   uint32 leg_k = 1;
-  // RRF weight of the vector leg at shard-level fusion. 0 = default 1.0.
+  // Weight of the vector leg: its RRF weight under GLOBAL_RANK and
+  // TWO_LEVEL, its blend weight under SCORE_BLEND. 0 = default 1.0.
   float vector_weight = 2;
-  // RRF weight of the BM25 leg at shard-level fusion. 0 = default 1.0.
+  // Weight of the BM25 leg (same dual role). 0 = default 1.0.
   float bm25_weight = 3;
   // The RRF constant. 0 = default 60 (the usual value from the RRF paper).
   float rrf_k = 4;
+  // SCORE_BLEND only: per-leg score normalization before combining.
+  // Absent = MIN_MAX.
+  ScoreNormalization normalization = 6;
+  // SCORE_BLEND only: how normalized leg scores combine. Absent =
+  // ARITHMETIC.
+  ScoreCombination combination = 7;
 }
 
 // One hybrid query against a shard (internal). The shard runs BOTH legs

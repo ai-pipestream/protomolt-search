@@ -210,15 +210,16 @@ impl CoordinatorServiceImpl {
         Ok(all.into_iter().map(|(_, h)| h).collect())
     }
 
-    /// Hybrid vector + BM25 search with two-level RRF fusion:
+    /// Hybrid vector + BM25 search:
     ///
     /// 1. analyze `text` into query terms (same analysis options as
     ///    ingest, as in [`Self::fanout_bm25`]);
     /// 2. TermStats fan-out and merge into GLOBAL corpus stats;
-    /// 3. `HybridShard` fan-out: each shard runs both legs and RRF-fuses
-    ///    them locally (level one);
-    /// 4. the coordinator RRF-merges the per-shard fused lists (level
-    ///    two) and attaches per-leg provenance from the owning shard.
+    /// 3. fuse per `legs.fusion_mode`: GLOBAL_RANK and SCORE_BLEND fetch
+    ///    raw shard legs and fuse once on the coordinator (RRF over
+    ///    global ranks, or normalize-and-combine over global scores);
+    ///    TWO_LEVEL lets each shard RRF-fuse locally and RRF-merges the
+    ///    shard lists (the fallback for incomparable scores).
     pub async fn fanout_hybrid(
         &self,
         request_id: &str,
@@ -375,38 +376,49 @@ impl CoordinatorServiceImpl {
 
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         // Merge each leg into a GLOBAL ranking by raw score (deterministic
-        // total order; see merge_legs_by_score), then single-level RRF.
+        // total order; see merge_legs_by_score), then fuse once: RRF for
+        // GLOBAL_RANK, normalize-and-combine for SCORE_BLEND. The two
+        // modes share this whole leg-fetch path; only the fusion function
+        // differs.
         let t_fusion = std::time::Instant::now();
         let vector_global = fusion::merge_legs_by_score(vector_shards);
         let bm25_global = fusion::merge_legs_by_score(bm25_shards);
-        let fused = fusion::rrf_fuse(
-            &[
-                Leg {
-                    hits: vector_global
-                        .iter()
-                        .map(|&(id, score, _)| (id, score))
-                        .collect(),
-                    weight: if legs.vector_weight == 0.0 {
-                        1.0
-                    } else {
-                        f64::from(legs.vector_weight)
-                    },
+        let leg_inputs = [
+            Leg {
+                hits: vector_global
+                    .iter()
+                    .map(|&(id, score, _)| (id, score))
+                    .collect(),
+                weight: if legs.vector_weight == 0.0 {
+                    1.0
+                } else {
+                    f64::from(legs.vector_weight)
                 },
-                Leg {
-                    hits: bm25_global
-                        .iter()
-                        .map(|&(id, score, _)| (id, score))
-                        .collect(),
-                    weight: if legs.bm25_weight == 0.0 {
-                        1.0
-                    } else {
-                        f64::from(legs.bm25_weight)
-                    },
+            },
+            Leg {
+                hits: bm25_global
+                    .iter()
+                    .map(|&(id, score, _)| (id, score))
+                    .collect(),
+                weight: if legs.bm25_weight == 0.0 {
+                    1.0
+                } else {
+                    f64::from(legs.bm25_weight)
                 },
-            ],
-            legs.rrf_k,
-            k as usize,
-        );
+            },
+        ];
+        let blend = legs.fusion_mode == FusionMode::ScoreBlend;
+        let fused = if blend {
+            fusion::blend_fuse(
+                &leg_inputs,
+                legs.leg_k as usize,
+                legs.normalization,
+                legs.combination,
+                k as usize,
+            )
+        } else {
+            fusion::rrf_fuse(&leg_inputs, legs.rrf_k, k as usize)
+        };
 
         // Provenance: global per-leg ranks, raw scores, and the owning
         // shard (a doc lives on exactly one shard's lists).
@@ -425,7 +437,11 @@ impl CoordinatorServiceImpl {
         let dbg = debug.then(|| {
             shard_debug.sort_by_key(|s| s.shard);
             HybridDebug {
-                fusion_mode: FusionMode::GlobalRank as i32,
+                fusion_mode: if blend {
+                    FusionMode::ScoreBlend as i32
+                } else {
+                    FusionMode::GlobalRank as i32
+                },
                 leg_k: legs.leg_k,
                 terms: Vec::new(),
                 analysis_ms: 0.0,
@@ -1089,14 +1105,18 @@ fn both_failed(shard: u32, primary: &Status, replica: &Status) -> Status {
 pub struct HybridLegs {
     /// Depth each leg (and each shard's fused list) is fetched to.
     pub leg_k: u32,
-    /// Vector-leg RRF weight.
+    /// Vector-leg weight (RRF weight, or blend weight under SCORE_BLEND).
     pub vector_weight: f32,
-    /// BM25-leg RRF weight.
+    /// BM25-leg weight (same dual role).
     pub bm25_weight: f32,
     /// RRF constant.
     pub rrf_k: f64,
     /// Fusion strategy (default GLOBAL_RANK).
     pub fusion_mode: FusionMode,
+    /// SCORE_BLEND: per-leg score normalization.
+    pub normalization: fusion::Normalization,
+    /// SCORE_BLEND: combination of normalized leg scores.
+    pub combination: fusion::Combination,
 }
 
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
@@ -1230,6 +1250,16 @@ impl SearchService for CoordinatorServiceImpl {
             bm25_weight: options.bm25_weight,
             rrf_k,
             fusion_mode: options.fusion_mode(),
+            normalization: match options.normalization() {
+                crate::pb::ScoreNormalization::ZScore => fusion::Normalization::ZScore,
+                crate::pb::ScoreNormalization::None => fusion::Normalization::None,
+                _ => fusion::Normalization::MinMax,
+            },
+            combination: match options.combination() {
+                crate::pb::ScoreCombination::Geometric => fusion::Combination::Geometric,
+                crate::pb::ScoreCombination::Harmonic => fusion::Combination::Harmonic,
+                _ => fusion::Combination::Arithmetic,
+            },
         };
         match legs.fusion_mode {
             FusionMode::Cascade | FusionMode::Unspecified => {

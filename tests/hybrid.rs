@@ -26,6 +26,7 @@ use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::{AddDocumentsRequest, AddVectorsRequest, SetCalibrationRequest};
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
+use turbovec_search::fusion::{Combination, Normalization};
 
 const DIM: usize = 64;
 const SHARD_DOCS: usize = 4;
@@ -89,12 +90,23 @@ fn legs_default() -> HybridLegs {
         bm25_weight: 1.0,
         rrf_k: 60.0,
         fusion_mode: turbovec_search::pb::FusionMode::GlobalRank,
+        normalization: Normalization::MinMax,
+        combination: Combination::Arithmetic,
     }
 }
 
 fn legs_two_level() -> HybridLegs {
     HybridLegs {
         fusion_mode: turbovec_search::pb::FusionMode::TwoLevel,
+        ..legs_default()
+    }
+}
+
+fn legs_blend(normalization: Normalization, combination: Combination) -> HybridLegs {
+    HybridLegs {
+        fusion_mode: turbovec_search::pb::FusionMode::ScoreBlend,
+        normalization,
+        combination,
         ..legs_default()
     }
 }
@@ -320,7 +332,10 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
 /// relative to the global ranks (their local #1 is globally #5 / #9).
 /// Two-level fusion overvalues those docs; GLOBAL_RANK must reproduce the
 /// monolithic result EXACTLY (id order, fused scores, per-leg ranks and
-/// raw scores).
+/// raw scores). SCORE_BLEND shares the same leg-fetch path and global
+/// merge, so the same exactness must hold for every normalization and
+/// combination — its stats are computed over the GLOBAL retained set,
+/// which is identical in both layouts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn global_rank_fusion_is_exact_on_adversarial_partition() {
     let (analysis, mock) = start_mock_analysis().await;
@@ -383,61 +398,194 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
     let monolithic =
         CoordinatorServiceImpl::new(vec![mono_addr]).with_bm25(Some(analysis), Default::default());
 
-    let got = distributed
-        .fanout_hybrid("adv", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
-        .await
-        .unwrap().0;
-    let want = monolithic
-        .fanout_hybrid(
-            "adv-m",
-            "zebra",
-            &query,
-            N_DOCS as u32,
-            None,
-            legs_default(),
-            false,
-        )
-        .await
-        .unwrap().0;
+    // Every normalization and combination is covered, in collapse-free
+    // pairings: Z_SCORE with GEOMETRIC/HARMONIC zeroes every doc whose
+    // legs are all non-positive (the proto documents the skip rule), and
+    // ordering INSIDE a fused-score tie group is by layout-dependent doc
+    // ids — the same documented caveat as RRF ties, just bigger groups.
+    for legs in [
+        legs_default(),
+        legs_blend(Normalization::MinMax, Combination::Arithmetic),
+        legs_blend(Normalization::ZScore, Combination::Arithmetic),
+        legs_blend(Normalization::MinMax, Combination::Geometric),
+        legs_blend(Normalization::None, Combination::Harmonic),
+    ] {
+        let got = distributed
+            .fanout_hybrid("adv", "zebra", &query, N_DOCS as u32, None, legs, false)
+            .await
+            .unwrap()
+            .0;
+        let want = monolithic
+            .fanout_hybrid("adv-m", "zebra", &query, N_DOCS as u32, None, legs, false)
+            .await
+            .unwrap()
+            .0;
 
-    assert_eq!(got.len(), want.len());
-    for (pos, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-        // Original doc w.doc_id sits in the distributed layout at global
-        // id = its position in the monolithic vector order.
-        assert_eq!(
-            g.doc_id as usize, pos_in_order[w.doc_id as usize],
-            "id mismatch at fused position"
-        );
-        assert_eq!(
-            g.fused_score.to_bits(),
-            w.fused_score.to_bits(),
-            "pos {pos} fused"
-        );
-        assert_eq!(g.vector_rank, w.vector_rank, "pos {pos} vrank");
-        assert_eq!(g.bm25_rank, w.bm25_rank, "pos {pos} brank");
-        assert_eq!(
-            g.vector_score.to_bits(),
-            w.vector_score.to_bits(),
-            "pos {pos} vscore: got id {} want id {}",
-            g.doc_id,
-            w.doc_id
-        );
-        assert_eq!(
-            g.bm25_score.to_bits(),
-            w.bm25_score.to_bits(),
-            "pos {pos} bscore"
-        );
+        let mode = legs.fusion_mode;
+        assert_eq!(got.len(), want.len(), "{mode:?}");
+        for (pos, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            // Original doc w.doc_id sits in the distributed layout at
+            // global id = its position in the monolithic vector order.
+            assert_eq!(
+                g.doc_id as usize, pos_in_order[w.doc_id as usize],
+                "{mode:?}: id mismatch at fused position {pos}"
+            );
+            assert_eq!(
+                g.fused_score.to_bits(),
+                w.fused_score.to_bits(),
+                "{mode:?}: pos {pos} fused"
+            );
+            assert_eq!(g.vector_rank, w.vector_rank, "{mode:?}: pos {pos} vrank");
+            assert_eq!(g.bm25_rank, w.bm25_rank, "{mode:?}: pos {pos} brank");
+            assert_eq!(
+                g.vector_score.to_bits(),
+                w.vector_score.to_bits(),
+                "{mode:?}: pos {pos} vscore: got id {} want id {}",
+                g.doc_id,
+                w.doc_id
+            );
+            assert_eq!(
+                g.bm25_score.to_bits(),
+                w.bm25_score.to_bits(),
+                "{mode:?}: pos {pos} bscore"
+            );
+        }
+
+        // The zebra docs are the fused leaders (both legs) and both
+        // surface with bm25_rank present; the vector leader is doc 0.
+        let top = &got[0];
+        assert!(top.bm25_rank.is_some() || top.doc_id as usize == pos_in_order[0]);
     }
-
-    // The zebra docs are the fused leaders (both legs) and both surface
-    // with bm25_rank present; the leader of the vector leg is doc 0.
-    let top = &got[0];
-    assert!(top.bm25_rank.is_some() || top.doc_id as usize == pos_in_order[0]);
 
     for h in handles {
         h.abort();
     }
     mono.abort();
+    mock.abort();
+}
+
+/// SCORE_BLEND end to end: deterministic, provenance-carrying, and the
+/// fused scores follow the documented normalize-and-combine arithmetic.
+/// The corpus is built so the hand calculation is exact: doc 0 tops BOTH
+/// legs (vector self-match + "zebra"), doc 5 is the only other BM25
+/// match, so the BM25 retained set is {0, 5} — both at the same score
+/// (identical tf and dl), a degenerate leg that min-max maps to 1.0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn score_blend_follows_documented_arithmetic() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x6666_0001);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let mut texts: Vec<String> = (0..2 * SHARD_DOCS)
+        .map(|i| format!("plain document number {i} about nothing special"))
+        .collect();
+    texts[0] = "zebra stripes everywhere".to_string();
+    texts[5] = "another zebra crossing".to_string();
+
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for shard in 0..2usize {
+        let start = shard * SHARD_DOCS;
+        let vecs = corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec();
+        let (addr, handle) = start_hybrid_shard(
+            &analysis,
+            (shard * SHARD_DOCS) as u64,
+            &texts[start..start + SHARD_DOCS],
+            vecs,
+            &shift,
+            &scale,
+        )
+        .await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
+    let query = corpus[..DIM].to_vec();
+    let blend = legs_blend(Normalization::MinMax, Combination::Arithmetic);
+
+    let first = coordinator
+        .fanout_hybrid("b1", "zebra", &query, 8, None, blend, false)
+        .await
+        .unwrap()
+        .0;
+    let second = coordinator
+        .fanout_hybrid("b2", "zebra", &query, 8, None, blend, false)
+        .await
+        .unwrap()
+        .0;
+    let sig = |hits: &[turbovec_search::pb::HybridHit]| {
+        hits.iter()
+            .map(|h| (h.doc_id, h.fused_score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(sig(&first), sig(&second), "blend must be deterministic");
+
+    // Doc 0: normalized 1.0 in the vector leg (its own vector is the
+    // max) and 1.0 in the degenerate BM25 leg -> fused (1+1)/2 = 1.0.
+    let top = &first[0];
+    assert_eq!(top.doc_id, 0);
+    assert!(
+        (top.fused_score - 1.0).abs() < 1e-6,
+        "doc 0 blends to 1.0, got {}",
+        top.fused_score
+    );
+    assert_eq!(top.vector_rank, Some(1));
+    assert_eq!(top.bm25_rank, Some(1));
+    assert!(top.vector_score > 0.0 && top.bm25_score > 0.0);
+
+    // Vector-only docs blend to at most vector_weight/(2 weights) = 0.5.
+    for h in first.iter().filter(|h| h.bm25_rank.is_none()) {
+        assert!(
+            h.fused_score <= 0.5 + 1e-6,
+            "vector-only doc {} above the weight ceiling: {}",
+            h.doc_id,
+            h.fused_score
+        );
+    }
+
+    // Weight sensitivity: bm25_weight 4 makes doc 5 (BM25 1.0, vector
+    // weak) blend to at least 0.8 while every vector-only doc is capped
+    // at 0.2 -> docs 0 and 5 must take the top two positions.
+    let weighted = HybridLegs {
+        bm25_weight: 4.0,
+        ..blend
+    };
+    let boosted = coordinator
+        .fanout_hybrid("b3", "zebra", &query, 8, None, weighted, false)
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(boosted[0].doc_id, 0);
+    assert_eq!(boosted[1].doc_id, 5, "high bm25_weight must lift doc 5");
+    assert!(boosted[1].fused_score >= 0.8 - 1e-6);
+    for h in boosted.iter().filter(|h| h.bm25_rank.is_none()) {
+        assert!(h.fused_score <= 0.2 + 1e-6);
+    }
+
+    // The other normalizations and combinations stay deterministic and
+    // keep the both-legs leader on top.
+    for legs in [
+        legs_blend(Normalization::ZScore, Combination::Arithmetic),
+        legs_blend(Normalization::MinMax, Combination::Geometric),
+        legs_blend(Normalization::MinMax, Combination::Harmonic),
+    ] {
+        let hits = coordinator
+            .fanout_hybrid("bx", "zebra", &query, 8, None, legs, false)
+            .await
+            .unwrap()
+            .0;
+        let again = coordinator
+            .fanout_hybrid("by", "zebra", &query, 8, None, legs, false)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(sig(&hits), sig(&again));
+        assert_eq!(hits[0].doc_id, 0, "{:?}/{:?}", legs.normalization, legs.combination);
+    }
+
+    for h in handles {
+        h.abort();
+    }
     mock.abort();
 }
 
@@ -682,7 +830,11 @@ async fn debug_block_profiles_every_fusion_mode() {
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
     let query = corpus[..DIM].to_vec();
 
-    for legs in [legs_default(), legs_two_level()] {
+    for legs in [
+        legs_default(),
+        legs_two_level(),
+        legs_blend(Normalization::MinMax, Combination::Arithmetic),
+    ] {
         let (plain, no_debug) = coordinator
             .fanout_hybrid("p", "zebra", &query, 8, None, legs, false)
             .await

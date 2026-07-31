@@ -49,7 +49,8 @@ up — coordinator on `localhost:50050`, rustfs console on
 Query it with any gRPC client generated from
 [search.proto](proto/turbovec/search/v1/search.proto) — `Search`
 (vector top-k with floor sharing), `Bm25Search` (distributed lexical),
-`HybridSearch` (RRF fusion) — or with the bundled probe tool:
+`HybridSearch` (cascade, RRF, or score-blend fusion) — or with the
+bundled probe tool:
 
 ```bash
 docker run --rm --network court-e2e_default -v court-e2e_corpus-data:/corpus \
@@ -462,10 +463,10 @@ dim=1024 is just config (the parser reads it from the header). The ULP
 caveat from `tests/score_layout.rs` applies: raw vector scores are
 bit-exact only within same-shape kernel paths.
 
-## Hybrid search: cascade (default), global-rank RRF, two-level RRF
+## Hybrid search: cascade (default), global-rank RRF, score blend, two-level RRF
 
 `SearchService.HybridSearch{text, vector, k, analysis, legs}` offers
-three modes (`HybridLegOptions.fusion_mode`); unspecified resolves to
+four modes (`HybridLegOptions.fusion_mode`); unspecified resolves to
 **FUSION_MODE_CASCADE**.
 
 ### FUSION_MODE_CASCADE (default): vector gate, then BM25 rerank
@@ -518,6 +519,26 @@ of shard lists contains the exact global top-leg_k and merging by score
 reconstructs it. Leg ranks use competition ranking (tied scores share a
 rank) so fused scores are layout-invariant.
 
+### FUSION_MODE_SCORE_BLEND: normalize and weighted-combine
+
+Same leg-fetch path as GLOBAL_RANK (raw `ShardLegs`, global merge per
+leg); only the fusion function differs. Each merged leg is truncated
+TIE-COMPLETE to leg_k (the retained set is `{score >= s_k}`,
+score-defined and thus layout-invariant), its retained scores are
+normalized (`ScoreNormalization`: min-max onto [0,1] / z-score / none),
+and each doc's normalized leg scores combine (`ScoreCombination`:
+weighted arithmetic, geometric, or harmonic mean) with
+vector_weight/bm25_weight. Rank-free, so score GAPS survive fusion — a
+runaway leg leader stays far ahead where RRF compresses every gap to
+the distance between adjacent ranks. Normalization statistics are
+computed over the GLOBAL retained set, never per shard, which is what
+keeps the mode partition-independent (pinned bitwise on the adversarial
+partition test for every normalization). Semantics corners are on the
+proto enums: absent legs under arithmetic contribute 0 with their
+weight still counted (the classic weighted-sum formula);
+geometric/harmonic skip non-positive scores and renormalize weights, so
+pair them with min-max, not z-score.
+
 ### FUSION_MODE_TWO_LEVEL: fallback for incomparable scores
 
 Each shard RRF-fuses its legs locally (`HybridShard`); the coordinator
@@ -543,11 +564,9 @@ bit-exact within same-shape kernel paths; ordering is robust except
 within ULP-ties (the tests assert exact ids/ranks/BM25 bits and vector
 scores within a few ULPs).
 
-**Per-leg k** (GLOBAL_RANK/TWO_LEVEL): leg_k defaults to
+**Per-leg k** (GLOBAL_RANK/SCORE_BLEND/TWO_LEVEL): leg_k defaults to
 `max(k, rrf_k)`; override in `HybridLegOptions`, clamped to >= k.
 Cascade ignores leg_k/weights/rrf_k (its depth is k plus ties).
-**Deferred alternative**: weighted-linear fusion with global
-normalization stats — deliberately not built.
 
 ## Ingest flow (write path)
 
@@ -850,8 +869,9 @@ losslessness at k=1000 over a 24k corpus.
   and the coordinator's floor tracker.
 - `src/postings.rs` / `src/bm25.rs` — the BM25 postings index, doc store,
   persistence, and scoring (with externally supplied global stats).
-- `src/fusion.rs` — reciprocal rank fusion over scored legs, with per-leg
-  provenance. Used at both fusion levels.
+- `src/fusion.rs` — reciprocal rank fusion (used at both fusion levels)
+  and score-blend fusion (normalize + weighted-combine) over scored
+  legs, with per-leg provenance.
 - `src/analyzer.rs` — the analysis-sidecar client (text in, term vectors
   out). No local analysis by design.
 - `src/node.rs` / `src/coordinator.rs` — the two gRPC services. The node
