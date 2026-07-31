@@ -40,6 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunks_path = arg("chunks", "/work/court-corpus/chunks.ndjson");
     let output = arg("output", "/work/court-corpus/embeddings.bin");
     let tei_addr = arg("tei-addr", "http://127.0.0.1:8095");
+    // Models with short input caps (all-MiniLM-L6-v2: 256 tokens) need
+    // server-side truncation or every long chunk errors; bge-m3 (8192)
+    // keeps the historical default of no truncation.
+    let truncate = arg("truncate", "false") == "true";
     let concurrency: usize = arg("concurrency", "32").parse()?;
     let limit: u64 = arg("limit", "0").parse()?;
 
@@ -68,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let response = client
                     .embed(EmbedRequest {
                         inputs: chunk.text,
-                        truncate: false,
+                        truncate,
                         normalize: Some(true),
                         truncation_direction: 0,
                         prompt_name: None,

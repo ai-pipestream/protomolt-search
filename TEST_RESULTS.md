@@ -534,3 +534,24 @@ material regret = real quality loss from quantization. Not yet run.
 
 Also: the topical-seed numbers remain true for topical queries; what
 died is their generalization to an unbiased query mix.
+
+**Round 7 resolution: SCORE REGRET ~ ZERO, tie hypothesis CONFIRMED.**
+Same 500-query run with the decisive column: at each rank compare the
+TEI cosine the quantized pool SERVES vs what the lossless pool serves.
+Mean regret@10 is NEGATIVE (-0.0013 to -0.0016 cosine points across
+all pool depths) and p90 regret is +0.001 to +0.004: three thousandths
+of a cosine point, i.e. nothing, and on average the quantized pool's
+reranked top-10 serves marginally HIGHER TEI scores than the exact
+pool's (quantization noise promotes different but equally good
+near-duplicates). Verdict: the 0.87-0.91 id agreement is tie-shuffling
+among interchangeable results, NOT quality loss. After the TEI rerank,
+the 4-bit quantized model2vec index delivers results score-equivalent
+to a lossless index. Raw: docs/benchmarks/tei-regret-500.csv.
+
+Consequences: (1) re-embedding the corpus is NOT justified by
+quantization loss; the TEI corpus embedding still gets built as the
+stored rescore space (multi-space plan) to kill live-embed latency;
+(2) the real perceived-quality lever remains the corpus hygiene pass
+(tiny chunks, boilerplate dedup, case normalization); (3) the honest
+claim for the rerank story: id churn 9-13% at the top, served-score
+parity within +/-0.003 cosine (p90).

@@ -467,26 +467,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .filter(|p| *p <= pool_k)
         .collect();
-    let mut csv = String::from("pool_k,k,mean_recall,min_recall,max_recall,p10_recall\n");
+    // Score regret: what the quantized pool SERVES at each rank vs what
+    // the lossless pool serves, in TEI cosine points. Regret ~0 with low
+    // id agreement means the disagreements are interchangeable ties;
+    // material regret is real quantization loss.
+    let mut csv =
+        String::from("pool_k,k,mean_recall,min_recall,max_recall,p10_recall,mean_regret,p90_regret\n");
 
-    let tei_sort = |pool: &[u64], qi: usize| -> Vec<u64> {
+    let tei_sort = |pool: &[u64], qi: usize| -> Vec<(u64, f64)> {
         let mut scored: Vec<(u64, f64)> = pool
             .iter()
             .filter_map(|gid| tei_of.get(gid).map(|v| (*gid, cosine(v, &tei_queries[qi]))))
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.into_iter().map(|(gid, _)| gid).collect()
+        scored
     };
-    let quant_ranked_full: Vec<Vec<u64>> = (0..queries.len())
+    let quant_ranked_full: Vec<Vec<(u64, f64)>> = (0..queries.len())
         .map(|qi| tei_sort(&quant_pools[qi], qi))
         .collect();
-    let exact_ranked_full: Vec<Vec<u64>> = (0..queries.len())
+    let exact_ranked_full: Vec<Vec<(u64, f64)>> = (0..queries.len())
         .map(|qi| tei_sort(&exact_pools_gid[qi], qi))
         .collect();
 
     println!("\npool_k | trusted depth (mean >= 0.98) | mean@10 | p10@10 | mean@100 | p10@100");
     for &pk in &pool_grid {
-        let per_query: Vec<(Vec<u64>, Vec<u64>)> = (0..queries.len())
+        let per_query: Vec<(Vec<(u64, f64)>, Vec<(u64, f64)>)> = (0..queries.len())
             .map(|qi| {
                 let quant_members: HashSet<u64> = quant_pools[qi]
                     [..pk.min(quant_pools[qi].len())]
@@ -501,49 +506,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (
                     quant_ranked_full[qi]
                         .iter()
-                        .filter(|g| quant_members.contains(g))
+                        .filter(|(g, _)| quant_members.contains(g))
                         .copied()
-                        .collect(),
+                        .collect::<Vec<(u64, f64)>>(),
                     exact_ranked_full[qi]
                         .iter()
-                        .filter(|g| exact_members.contains(g))
+                        .filter(|(g, _)| exact_members.contains(g))
                         .copied()
-                        .collect(),
+                        .collect::<Vec<(u64, f64)>>(),
                 )
             })
             .collect();
         let mut trusted = 0usize;
         let mut stopped = false;
-        let mut at: HashMap<usize, (f64, f64)> = HashMap::new();
+        let mut at: HashMap<usize, (f64, f64, f64, f64)> = HashMap::new();
         for &k in k_grid.iter().filter(|&&k| k <= pk) {
-            let mut recalls: Vec<f64> = per_query
-                .iter()
-                .map(|(q, e)| overlap(&q[..k.min(q.len())], &e[..k.min(e.len())]))
-                .collect();
+            let mut recalls: Vec<f64> = Vec::with_capacity(per_query.len());
+            let mut regrets: Vec<f64> = Vec::with_capacity(per_query.len());
+            for (q, e) in &per_query {
+                let kq = k.min(q.len());
+                let ke = k.min(e.len());
+                let q_ids: Vec<u64> = q[..kq].iter().map(|(g, _)| *g).collect();
+                let e_ids: Vec<u64> = e[..ke].iter().map(|(g, _)| *g).collect();
+                recalls.push(overlap(&q_ids, &e_ids));
+                // Per-rank served-score gap, lossless minus quantized.
+                let n = kq.min(ke);
+                if n > 0 {
+                    regrets.push(
+                        (0..n).map(|i| e[i].1 - q[i].1).sum::<f64>() / n as f64,
+                    );
+                }
+            }
             recalls.sort_by(f64::total_cmp);
+            regrets.sort_by(f64::total_cmp);
             let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
             let min = recalls[0];
             let max = recalls[recalls.len() - 1];
             let p10 = recalls[recalls.len() / 10];
-            csv.push_str(&format!("{pk},{k},{mean:.4},{min:.4},{max:.4},{p10:.4}\n"));
+            let mean_regret = regrets.iter().sum::<f64>() / regrets.len() as f64;
+            let p90_regret = regrets[(regrets.len() * 9) / 10];
+            csv.push_str(&format!(
+                "{pk},{k},{mean:.4},{min:.4},{max:.4},{p10:.4},{mean_regret:.5},{p90_regret:.5}\n"
+            ));
             if mean >= 0.98 && !stopped {
                 trusted = k;
             } else {
                 stopped = true;
             }
-            at.insert(k, (mean, p10));
+            at.insert(k, (mean, p10, mean_regret, p90_regret));
         }
         let cell = |k: usize, which: usize| {
-            at.get(&k).map_or("-".to_string(), |v| {
-                format!("{:.4}", if which == 0 { v.0 } else { v.1 })
+            at.get(&k).map_or("-".to_string(), |v| match which {
+                0 => format!("{:.4}", v.0),
+                1 => format!("{:.4}", v.1),
+                2 => format!("{:.5}", v.2),
+                _ => format!("{:.5}", v.3),
             })
         };
         println!(
-            "{pk} | {trusted} | {} | {} | {} | {}",
+            "{pk} | {trusted} | {} | {} | {} | {} | regret@10 {} (p90 {}) | regret@100 {} (p90 {})",
             cell(10, 0),
             cell(10, 1),
             cell(100, 0),
             cell(100, 1),
+            cell(10, 2),
+            cell(10, 3),
+            cell(100, 2),
+            cell(100, 3),
         );
     }
     std::fs::write(&csv_path, csv)?;
