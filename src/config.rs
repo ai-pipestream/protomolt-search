@@ -129,6 +129,12 @@ pub struct Config {
     /// (v5 files). `false` forces the exhaustive scorer — the A/B
     /// baseline; results are identical either way.
     pub block_max: bool,
+    /// Coalesce concurrent vector scans into batched kernel calls (up to
+    /// four queries per pass over the packed codes). `false` runs one
+    /// scan per RPC — the A/B baseline; results are identical either way.
+    pub coalesce: bool,
+    /// Concurrent batched scans per node (0 = half the cores).
+    pub scan_parallel: usize,
     /// Minimum score improvement before a node publishes its next floor
     /// (0.0 = publish every raise).
     pub floor_delta: f32,
@@ -180,6 +186,8 @@ struct FileConfig {
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
     block_max: Option<bool>,
+    coalesce: Option<bool>,
+    scan_parallel: Option<usize>,
     floor_delta: Option<f32>,
     shard_deadline_ms: Option<u64>,
     hedge_delay_ms: Option<u64>,
@@ -476,6 +484,22 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         Some(s) => parse_env_bool(&s),
         None => file.block_max.unwrap_or(true),
     };
+    let coalesce = match opt(args, "coalesce", "TURBOVEC_COALESCE", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.coalesce.unwrap_or(true),
+    };
+    let scan_parallel = opt(
+        args,
+        "scan-parallel",
+        "TURBOVEC_SCAN_PARALLEL",
+        file.scan_parallel.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<usize>()
+            .map_err(|e| format!("invalid scan parallel: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(0);
     let floor_delta = opt(
         args,
         "floor-delta",
@@ -617,6 +641,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         chunk_blocks,
         share_floors,
         block_max,
+        coalesce,
+        scan_parallel,
         floor_delta,
         shard_deadline_ms,
         hedge_delay_ms,

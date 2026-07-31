@@ -166,6 +166,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     chunk_blocks: cfg.chunk_blocks,
                     share_floors: cfg.share_floors,
                     block_max: cfg.block_max,
+                    coalesce: cfg.coalesce,
+                    scan_parallel: cfg.scan_parallel,
                     floor_delta: cfg.floor_delta,
                     bit_width: cfg.bit_width,
                     index_path: shard.index_path.clone(),

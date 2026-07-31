@@ -24,7 +24,9 @@ use tonic::{Request, Response, Status, Streaming};
 use turbovec::TurboQuantIndex;
 
 use crate::bm25::{self, Bm25Params};
-use crate::chunked::{chunked_topk, DEFAULT_CHUNK_BLOCKS};
+use crate::chunked::{
+    chunked_topk, chunked_topk_batch, BatchQuery, ChunkHit, ScanStats, DEFAULT_CHUNK_BLOCKS,
+};
 use crate::fusion::{self, Leg};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
@@ -81,6 +83,15 @@ pub struct NodeConfig {
     /// Number of WAL hash buckets (`bucket-NNN.wal` files per
     /// generation). Fixed at WAL creation; a resumed log keeps its own.
     pub wal_buckets: u32,
+    /// Coalesce concurrent shard scans into batched kernel calls (up to
+    /// [`MAX_COALESCE`] queries share each pass over the packed codes —
+    /// the scan is bandwidth-bound, so batched queries ride the same
+    /// memory traffic). `false` runs one scan per RPC — the A/B
+    /// baseline; results are identical either way.
+    pub coalesce: bool,
+    /// Concurrent batched scans (blocking threads). 0 sizes from the
+    /// machine: half the available cores, at least one.
+    pub scan_parallel: usize,
 }
 
 impl Default for NodeConfig {
@@ -96,6 +107,8 @@ impl Default for NodeConfig {
             analysis_addr: None,
             wal: false,
             wal_buckets: 64,
+            coalesce: true,
+            scan_parallel: 0,
         }
     }
 }
@@ -439,6 +452,144 @@ pub struct NodeServiceImpl {
     /// is refused outright rather than merged.
     ingest_busy: Arc<std::sync::atomic::AtomicBool>,
     config: NodeConfig,
+    /// Shared scan queue for coalesced searches; the scheduler task is
+    /// spawned on first use (shared across service clones).
+    scan_jobs: Arc<std::sync::OnceLock<mpsc::Sender<ScanJob>>>,
+}
+
+/// Kernel batch width: turbovec's multi-query scan scores up to four
+/// queries per pass over each block, so batches beyond four stop
+/// amortizing memory traffic.
+const MAX_COALESCE: usize = 4;
+
+static SCAN_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SCAN_BATCHED_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide coalescing telemetry: `(batches formed, jobs in them)`.
+/// Jobs exceeding batches means multi-query batches actually formed —
+/// the observable that coalescing engaged, used by tests and benchmarks.
+pub fn scan_batch_counters() -> (u64, u64) {
+    (
+        SCAN_BATCHES.load(std::sync::atomic::Ordering::Relaxed),
+        SCAN_BATCHED_JOBS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// One shard scan queued for a batched kernel pass.
+struct ScanJob {
+    vector: Vec<f32>,
+    k: usize,
+    tie_complete: bool,
+    /// Polled between chunks for the best coordinator-pushed floor
+    /// (returns `None` when floor sharing is off or no floor arrived).
+    external: Box<dyn FnMut() -> Option<f32> + Send>,
+    /// Receives this query's k-th-best raises (the caller bakes in the
+    /// share gate and delta filter).
+    publish: Box<dyn FnMut(f32) + Send>,
+    done: tokio::sync::oneshot::Sender<Result<(Vec<ChunkHit>, ScanStats), Status>>,
+}
+
+/// Batch former: one scan slot at a time per permit, and every job that
+/// queued while all slots were busy coalesces into the next drain. Under
+/// light load batches are singletons and scans run as parallel as before;
+/// under heavy load freed slots pick up to [`MAX_COALESCE`] waiting
+/// queries and score them in one pass over the packed codes.
+async fn scan_scheduler(
+    state: Arc<std::sync::RwLock<ShardState>>,
+    chunk_blocks: usize,
+    parallel: usize,
+    mut jobs: mpsc::Receiver<ScanJob>,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(parallel.max(1)));
+    loop {
+        // A slot first, then the batch: the wait for a slot is exactly
+        // when coalescable jobs accumulate.
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("scan semaphore never closes");
+        let Some(first) = jobs.recv().await else {
+            break;
+        };
+        let mut batch = vec![first];
+        while batch.len() < MAX_COALESCE {
+            match jobs.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        SCAN_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SCAN_BATCHED_JOBS.fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let _slot = permit;
+            run_scan_batch(&state, chunk_blocks, batch);
+        });
+    }
+}
+
+/// Run one batched scan under the shard read lock and deliver every job's
+/// result. Blocking-pool context.
+fn run_scan_batch(
+    state: &std::sync::RwLock<ShardState>,
+    chunk_blocks: usize,
+    batch: Vec<ScanJob>,
+) {
+    let guard = state.read().expect("shard state lock poisoned");
+    let index = match guard.index.as_ref() {
+        Some(index) => index,
+        None => {
+            for job in batch {
+                let _ = job.done.send(Err(Status::failed_precondition(
+                    "shard has no index yet (set calibration or add vectors)",
+                )));
+            }
+            return;
+        }
+    };
+    // Re-validate dimensions against the CURRENT index: the shard may have
+    // been swapped (InstallSnapshot) between the RPC's validation and this
+    // batch winning a slot.
+    let dim = index.dim_opt();
+    let mut specs: Vec<(Vec<f32>, usize, bool)> = Vec::with_capacity(batch.len());
+    let mut externals: Vec<Box<dyn FnMut() -> Option<f32> + Send>> = Vec::new();
+    let mut publishers: Vec<Box<dyn FnMut(f32) + Send>> = Vec::new();
+    let mut dones = Vec::new();
+    for job in batch {
+        if Some(job.vector.len()) != dim {
+            let _ = job.done.send(Err(Status::failed_precondition(format!(
+                "query dim {} no longer matches the index",
+                job.vector.len()
+            ))));
+            continue;
+        }
+        specs.push((job.vector, job.k, job.tie_complete));
+        externals.push(job.external);
+        publishers.push(job.publish);
+        dones.push(job.done);
+    }
+    if dones.is_empty() {
+        return;
+    }
+    let queries: Vec<BatchQuery> = specs
+        .iter()
+        .map(|(vector, k, keep_ties)| BatchQuery {
+            vector,
+            k: *k,
+            keep_ties: *keep_ties,
+        })
+        .collect();
+    let results = chunked_topk_batch(
+        index,
+        &queries,
+        chunk_blocks,
+        &mut |qi| (externals[qi])(),
+        &mut |qi, floor| (publishers[qi])(floor),
+    );
+    for (done, result) in dones.into_iter().zip(results) {
+        let _ = done.send(Ok(result));
+    }
 }
 
 /// RAII release for the ingest gate.
@@ -463,7 +614,33 @@ impl NodeServiceImpl {
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
+            scan_jobs: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// The shared scan queue, spawning the scheduler on first use (RPC
+    /// handlers guarantee a runtime here).
+    fn scan_queue(&self) -> mpsc::Sender<ScanJob> {
+        self.scan_jobs
+            .get_or_init(|| {
+                let (tx, rx) = mpsc::channel(4096);
+                let parallel = if self.config.scan_parallel > 0 {
+                    self.config.scan_parallel
+                } else {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(2)
+                        .div_ceil(2)
+                };
+                tokio::spawn(scan_scheduler(
+                    self.state.clone(),
+                    self.config.chunk_blocks,
+                    parallel,
+                    rx,
+                ));
+                tx
+            })
+            .clone()
     }
 
     /// The builder shape for a fresh ingest: persisted shards bulk-build
@@ -1392,6 +1569,7 @@ impl NodeService for NodeServiceImpl {
         let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
         let state = self.state.clone();
         let config = self.config.clone();
+        let scan_queue = config.coalesce.then(|| self.scan_queue());
 
         tokio::spawn(async move {
             // Protocol: the first message must be Start.
@@ -1447,54 +1625,108 @@ impl NodeService for NodeServiceImpl {
             let chunk_blocks = config.chunk_blocks;
             let slot_offset = config.slot_offset;
             let scan_tx = tx.clone();
-            let scan = tokio::task::spawn_blocking(move || {
-                // The read guard is held for the whole chunked scan: adds
-                // (write lock) never interleave with a scan, so a search
-                // sees one consistent index snapshot.
-                let guard = state.read().expect("shard state lock poisoned");
-                let index = guard.index.as_ref().ok_or_else(|| {
-                    Status::failed_precondition(
-                        "shard has no index yet (set calibration or add vectors)",
-                    )
-                })?;
-                Self::validate_start(index, &start)?;
-                // Publish only raises that clear the delta gate, and never
-                // block the scan on a full channel: intermediate floors are
-                // disposable (they are monotone, so the next chunk's publish
-                // supersedes any dropped one). The terminal Done is sent
-                // with `.await` below and cannot be dropped.
-                let mut last_published = f32::NEG_INFINITY;
-                let mut publish_floor = |floor: f32| {
-                    if share && floor > last_published + floor_delta {
-                        last_published = floor;
-                        let _ = scan_tx.try_send(Ok(SearchShardResponse {
-                            payload: Some(search_shard_response::Payload::FloorUpdate(
-                                FloorUpdate { floor },
-                            )),
-                        }));
-                    }
-                };
-                let mut external_floor = || {
-                    if share {
-                        let f = *floor_rx.borrow();
-                        (f != f32::NEG_INFINITY).then_some(f)
-                    } else {
-                        None
-                    }
-                };
-                Ok(chunked_topk(
-                    index,
-                    &start.vector,
-                    start.k as usize,
-                    chunk_blocks,
-                    &mut external_floor,
-                    &mut publish_floor,
-                    start.tie_complete,
-                ))
-            });
+            // Publish only raises that clear the delta gate, and never
+            // block the scan on a full channel: intermediate floors are
+            // disposable (they are monotone, so the next chunk's publish
+            // supersedes any dropped one). The terminal Done is sent
+            // with `.await` below and cannot be dropped.
+            let mut last_published = f32::NEG_INFINITY;
+            let publish_floor = move |floor: f32| {
+                if share && floor > last_published + floor_delta {
+                    last_published = floor;
+                    let _ = scan_tx.try_send(Ok(SearchShardResponse {
+                        payload: Some(search_shard_response::Payload::FloorUpdate(
+                            FloorUpdate { floor },
+                        )),
+                    }));
+                }
+            };
+            let external_floor = move || {
+                if share {
+                    let f = *floor_rx.borrow();
+                    (f != f32::NEG_INFINITY).then_some(f)
+                } else {
+                    None
+                }
+            };
 
-            match scan.await {
-                Ok(Ok((hits, stats))) => {
+            let outcome: Result<(Vec<ChunkHit>, ScanStats), Status> = match scan_queue {
+                Some(jobs) => {
+                    // Coalesced path: validate against the current index
+                    // cheaply, then queue for a batched kernel pass. The
+                    // batch runner holds the read lock for the scan, the
+                    // same consistency the solo path gets.
+                    let validated = {
+                        let guard = state.read().expect("shard state lock poisoned");
+                        match guard.index.as_ref() {
+                            Some(index) => Self::validate_start(index, &start),
+                            None => Err(Status::failed_precondition(
+                                "shard has no index yet (set calibration or add vectors)",
+                            )),
+                        }
+                    };
+                    match validated {
+                        Ok(()) => {
+                            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                            let job = ScanJob {
+                                vector: start.vector.clone(),
+                                k: start.k as usize,
+                                tie_complete: start.tie_complete,
+                                external: Box::new(external_floor),
+                                publish: Box::new(publish_floor),
+                                done: done_tx,
+                            };
+                            if jobs.send(job).await.is_err() {
+                                Err(Status::internal("scan scheduler unavailable"))
+                            } else {
+                                match done_rx.await {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        Err(Status::internal("scan batch dropped before finishing"))
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                None => {
+                    // Solo path (the coalescing A/B baseline): one
+                    // blocking scan per RPC, exactly the historical
+                    // behavior.
+                    let mut external_floor = external_floor;
+                    let mut publish_floor = publish_floor;
+                    let scan = tokio::task::spawn_blocking(move || {
+                        // The read guard is held for the whole chunked
+                        // scan: adds (write lock) never interleave with a
+                        // scan, so a search sees one consistent index
+                        // snapshot.
+                        let guard = state.read().expect("shard state lock poisoned");
+                        let index = guard.index.as_ref().ok_or_else(|| {
+                            Status::failed_precondition(
+                                "shard has no index yet (set calibration or add vectors)",
+                            )
+                        })?;
+                        Self::validate_start(index, &start)?;
+                        Ok(chunked_topk(
+                            index,
+                            &start.vector,
+                            start.k as usize,
+                            chunk_blocks,
+                            &mut external_floor,
+                            &mut publish_floor,
+                            start.tie_complete,
+                        ))
+                    });
+                    match scan.await {
+                        Ok(result) => result,
+                        Err(e) => Err(Status::internal(format!("scan task failed: {e}"))),
+                    }
+                }
+            };
+
+            match outcome {
+                Ok((hits, stats)) => {
                     let done = SearchShardDone {
                         hits: hits
                             .into_iter()
@@ -1516,13 +1748,8 @@ impl NodeService for NodeServiceImpl {
                         }))
                         .await;
                 }
-                Ok(Err(e)) => {
-                    let _ = tx.send(Err(e)).await;
-                }
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("scan task failed: {e}"))))
-                        .await;
+                    let _ = tx.send(Err(e)).await;
                 }
             }
         });

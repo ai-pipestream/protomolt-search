@@ -349,6 +349,73 @@ opens a different connection. It cannot insure against a machine
 running out of bandwidth; that needs a replica on separate hardware.
 The defaults stay off, which these numbers support.
 
+## Round 6: request coalescing, and the 2-bit question answered
+
+Two single-box rounds against the two levers a bandwidth-bound scan
+actually has: share each pass over the packed codes between queries
+(coalescing), or halve the bytes per pass (2-bit codes).
+
+### Request coalescing into the multi-query kernel
+
+turbovec's scan kernel already scores up to FOUR queries per pass over
+each block — but every `SearchShard` RPC ran alone, so concurrent
+queries each paid a full sweep. The node now queues scans behind a
+bounded set of scan slots (`--scan-parallel`, default half the cores)
+and each freed slot drains up to four waiting queries into one batched
+chunked scan. Exactness is structural: the batch's kernel calls share
+one threshold, so it is seeded with the MINIMUM of the per-query
+floors (a lower floor only collects more), and each query's own floor
+re-applies at its merge — per-query hits and published floor sequences
+are bitwise identical to solo scans, gated by tests at both the scan
+and the RPC layer. `--coalesce=false` is the A/B baseline.
+
+1M x dim-256 4-bit corpus, k=10, in-process node (8 queries per client
+on the 32-core rows, 4 on the taskset rows):
+
+| cores | clients | solo QPS | coalesced QPS | solo mean latency | coalesced mean latency |
+|---|---:|---:|---:|---:|---:|
+| 32 | 16 | 81.1 | 78.0 | 195 ms | 202 ms |
+| 32 | 32 | 109.5 | 114.6 | 283 ms | 238 ms |
+| 4 (taskset) | 8 | 40.2 | 40.5 | 194 ms | 170 ms |
+| 4 (taskset) | 32 | 42.5 | **96.5** | 736 ms | **303 ms** |
+
+The regime matters and the numbers say so honestly: with idle cores
+(32-core box, light load) batches never form — a free slot takes every
+query solo, and coalescing is neutral by design. When concurrency
+exceeds cores (the Pi fleet's shape: 4 cores, 32 clients), batches
+average 3.7 of the kernel's maximum 4 and throughput MORE THAN DOUBLES
+(2.27x) while mean latency drops 2.4x. Reproduce:
+`cargo run --release --example coalesce_bench`.
+
+### 2-bit + rerank: measured, and the answer is no
+
+The bytes lever: 2-bit codes halve the scan traffic on the same SIMD
+path (the LUT build takes `bits`; packing is `8/bits`). The question
+was whether an exact f32 rerank of the top k' recovers the recall the
+coarser codes lose. Real corpus embeddings (1M chunks, 64 held-out
+query embeddings, exact f32 ground truth):
+
+| config | recall@10 |
+|---|---:|
+| raw 4-bit | 0.8406 |
+| raw 2-bit | 0.4109 |
+| 2-bit + f32 rerank of top 50 | 0.8734 |
+| **4-bit + f32 rerank of top 100** | **1.0000** |
+| 2-bit + f32 rerank of top 100 | 0.9422 |
+| 2-bit + f32 rerank of top 200 | 0.9672 |
+| 2-bit + f32 rerank of top 500 | 0.9875 |
+| 2-bit + f32 rerank of top 1000 | 0.9984 |
+
+The scan is exactly the promised 2x (0.79 ms vs 1.64 ms median full
+sweep at 1M) — and it is not worth it. 4-bit + rerank of the top 100
+is EXACT on this corpus, which is the production configuration's
+measured behavior at cluster scale. 2-bit never gets there: even
+reranking the top 1000 (10x the rerank fetches per shard) still loses
+a hit in six hundred, and every practical k' loses more. The
+production answer stays 4-bit + rerank@100; the bytes lever costs
+recall we refuse to pay. Negative result, posted as measured.
+Reproduce: `cargo run --release --example twobit_rerank`.
+
 ## Next steps
 
 The ceiling-raising directions below — block-max-style bounds adapted

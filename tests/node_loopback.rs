@@ -169,3 +169,83 @@ async fn overhigh_floor_yields_fewer_hits() {
 
     handle.abort();
 }
+
+/// Sixteen concurrent searches through the coalescing scheduler
+/// (scan_parallel=1, so every query after the first must share batches
+/// with its neighbors) return exactly the hits a non-coalescing node
+/// returns for the same queries — and the batch counters prove
+/// multi-query batches actually formed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_coalesced_scans_match_solo() {
+    let corpus = unit_vectors(N, DIM, 0x10AD_0007);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus[..2_000 * DIM]);
+    let build = || {
+        let mut index =
+            turbovec::TurboQuantIndex::new_with_calibration(DIM, 4, &shift, &scale).unwrap();
+        index.add(&corpus);
+        index.prepare();
+        index
+    };
+    let (solo_addr, solo_handle) = common::start_node(
+        build(),
+        NodeConfig {
+            coalesce: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    // chunk_blocks=2 keeps each scan slow enough that concurrent arrivals
+    // genuinely queue behind the single scan slot.
+    let (batched_addr, batched_handle) = common::start_node(
+        build(),
+        NodeConfig {
+            coalesce: true,
+            scan_parallel: 1,
+            chunk_blocks: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let queries: Vec<Vec<f32>> = (0..16)
+        .map(|i| unit_vectors(1, DIM, 0xC0A1_0000 + i))
+        .collect();
+    let mut solo = Vec::new();
+    for query in &queries {
+        solo.push(drive_scan(&solo_addr, query, None).await.done);
+    }
+
+    let (batches_before, jobs_before) = turbovec_search::node::scan_batch_counters();
+    let tasks: Vec<_> = queries
+        .iter()
+        .map(|query| {
+            let addr = batched_addr.clone();
+            let query = query.clone();
+            tokio::spawn(async move { drive_scan(&addr, &query, None).await.done })
+        })
+        .collect();
+    let mut batched = Vec::new();
+    for task in tasks {
+        batched.push(task.await.unwrap());
+    }
+    let (batches_after, jobs_after) = turbovec_search::node::scan_batch_counters();
+
+    let hits_of = |done: &SearchShardDone| {
+        done.hits
+            .iter()
+            .map(|h| (h.vector_id, h.score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    for (i, (s, b)) in solo.iter().zip(&batched).enumerate() {
+        assert_eq!(hits_of(s), hits_of(b), "query {i} differs under coalescing");
+    }
+    let jobs = jobs_after - jobs_before;
+    let batches = batches_after - batches_before;
+    assert!(
+        jobs > batches,
+        "no multi-query batch formed ({jobs} jobs in {batches} batches)"
+    );
+
+    solo_handle.abort();
+    batched_handle.abort();
+}

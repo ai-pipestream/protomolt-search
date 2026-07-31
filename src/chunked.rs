@@ -136,6 +136,17 @@ fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize, 
     *heap = merged;
 }
 
+/// One query of a batched chunked scan.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchQuery<'a> {
+    /// The query vector, of the index's dimension.
+    pub vector: &'a [f32],
+    /// Result count for this query.
+    pub k: usize,
+    /// Tie-complete collection for this query (see [`chunked_topk`]).
+    pub keep_ties: bool,
+}
+
 /// Scan `index` for the top-`k` of `query` in chunks, adopting external
 /// floors between chunks and publishing the local k-th best once the heap
 /// fills.
@@ -159,84 +170,154 @@ pub fn chunked_topk(
     publish_floor: &mut dyn FnMut(f32),
     keep_ties: bool,
 ) -> (Vec<ChunkHit>, ScanStats) {
+    let queries = [BatchQuery {
+        vector: query,
+        k,
+        keep_ties,
+    }];
+    chunked_topk_batch(
+        index,
+        &queries,
+        chunk_blocks,
+        &mut |_| external_floor(),
+        &mut |_, f| publish_floor(f),
+    )
+    .pop()
+    .expect("one query in, one result out")
+}
+
+/// Scan `index` for several queries' top-k in ONE pass: each chunk is a
+/// single `search_with_options` call scoring every query, so the packed
+/// codes are streamed from memory once per chunk for the whole batch
+/// instead of once per query. turbovec's multi-query kernel scores up to
+/// four queries per block pass; this is the scan-side amortization that
+/// makes a bandwidth-bound shard serve concurrent queries at better than
+/// one-full-sweep each.
+///
+/// Exactness: the kernel call shares one threshold, so it is seeded with
+/// the MINIMUM of the per-query floors — a lower floor only collects
+/// more, never less, so every query's result is exactly its solo result.
+/// Each query's own floor (external max local k-th best) is re-applied
+/// when its chunk candidates are filtered before the merge, keeping ties
+/// at the floor, so per-query heaps and published floors are bitwise
+/// identical to a solo [`chunked_topk`]. What coalescing costs is
+/// collection: a query batched with a lower-floored neighbor sees more
+/// candidates returned by the kernel than it would alone (they are
+/// filtered before its merge), so `candidates_collected` can exceed the
+/// solo count while results stay identical.
+///
+/// `external_floor` and `publish_floor` receive the query's position in
+/// `queries` as their first argument.
+pub fn chunked_topk_batch(
+    index: &TurboQuantIndex,
+    queries: &[BatchQuery<'_>],
+    chunk_blocks: usize,
+    external_floor: &mut dyn FnMut(usize) -> Option<f32>,
+    publish_floor: &mut dyn FnMut(usize, f32),
+) -> Vec<(Vec<ChunkHit>, ScanStats)> {
     let n = index.len();
-    let mut stats = ScanStats::default();
-    if k == 0 || n == 0 {
-        return (Vec::new(), stats);
+    let nq = queries.len();
+    let mut out: Vec<(Vec<ChunkHit>, ScanStats)> = queries
+        .iter()
+        .map(|_| (Vec::new(), ScanStats::default()))
+        .collect();
+    let max_k = queries.iter().map(|q| q.k).max().unwrap_or(0);
+    if n == 0 || nq == 0 || max_k == 0 {
+        return out;
     }
     let chunk_size = chunk_blocks.max(1) * BLOCK_VECTORS;
-    let mut heap: Vec<ChunkHit> = Vec::with_capacity(k);
+    let mut heaps: Vec<Vec<ChunkHit>> = queries.iter().map(|q| Vec::with_capacity(q.k)).collect();
     let mut mask = vec![false; n];
+    let mut flat: Vec<f32> = Vec::with_capacity(queries.iter().map(|q| q.vector.len()).sum());
+    for q in queries {
+        flat.extend_from_slice(q.vector);
+    }
+    // Any tie-complete query forbids capping the kernel's collection at k
+    // (its boundary tie group must survive whole); the cap costs only
+    // collection, never correctness, so one such query widens the batch.
+    let any_ties = queries.iter().any(|q| q.keep_ties);
+    let chunk_k = if any_ties { usize::MAX } else { max_k };
+    let mut query_floors = vec![f32::NEG_INFINITY; nq];
 
     let mut start = 0;
     while start < n {
         let end = (start + chunk_size).min(n);
 
-        // Best known floor for this chunk: the external (coordinator) floor
-        // and the local heap floor are each valid lower bounds on the final
-        // k-th best, so their max is too.
-        let mut floor = f32::NEG_INFINITY;
-        if let Some(f) = external_floor() {
-            if !f.is_nan() {
-                floor = floor.max(f);
-                if floor != f32::NEG_INFINITY {
-                    stats.floor_updates_applied += 1;
+        // Per-query floor: the external (coordinator) floor and the local
+        // heap floor are each valid lower bounds on that query's final
+        // k-th best, so their max is too. The kernel floor is the batch
+        // minimum: valid for every query, prunes least.
+        let mut kernel_floor = f32::INFINITY;
+        for (qi, q) in queries.iter().enumerate() {
+            let mut floor = f32::NEG_INFINITY;
+            if let Some(f) = external_floor(qi) {
+                if !f.is_nan() {
+                    floor = floor.max(f);
+                    if floor != f32::NEG_INFINITY {
+                        out[qi].1.floor_updates_applied += 1;
+                    }
                 }
             }
-        }
-        if heap.len() >= k {
-            floor = floor.max(heap[k - 1].score);
+            if q.k > 0 && heaps[qi].len() >= q.k {
+                floor = floor.max(heaps[qi][q.k - 1].score);
+            }
+            query_floors[qi] = floor;
+            kernel_floor = kernel_floor.min(floor);
         }
 
-        // In tie-complete mode the chunk search must NOT cap at k: a
-        // boundary tie group larger than k would be truncated inside the
-        // kernel before the merge could retain it. Collecting everything
-        // at-or-above the floor keeps the whole group; the merge then
-        // retains top-k plus the boundary ties. (The floor still does the
-        // pruning — collection beyond it is what tie-completeness costs.)
-        let chunk_k = if keep_ties { usize::MAX } else { k };
         for slot in mask.iter_mut().take(end).skip(start) {
             *slot = true;
         }
         let results = index.search_with_options(
-            query,
+            &flat,
             chunk_k,
             SearchOptions::new()
                 .with_mask(&mask)
-                .with_initial_threshold(floor),
+                .with_initial_threshold(kernel_floor),
         );
-        stats.chunk_calls += 1;
         for slot in mask.iter_mut().take(end).skip(start) {
             *slot = false;
         }
 
-        let mut chunk_hits = Vec::new();
-        for (&score, &slot) in results
-            .scores_for_query(0)
-            .iter()
-            .zip(results.indices_for_query(0))
-        {
-            // Floored searches pad short rows with (-inf, -1) sentinels.
-            if slot < 0 {
+        for (qi, q) in queries.iter().enumerate() {
+            out[qi].1.chunk_calls += 1;
+            if q.k == 0 {
                 continue;
             }
-            stats.candidates_collected += 1;
-            chunk_hits.push(ChunkHit {
-                slot: slot as u32,
-                score,
-            });
-        }
-        merge_chunk_hits(&mut heap, &mut chunk_hits, k, keep_ties);
+            let mut chunk_hits = Vec::new();
+            for (&score, &slot) in results
+                .scores_for_query(qi)
+                .iter()
+                .zip(results.indices_for_query(qi))
+            {
+                // Floored searches pad short rows with (-inf, -1)
+                // sentinels; candidates below THIS query's floor were
+                // collected only for a lower-floored neighbor (>= keeps
+                // ties at the floor, the same boundary the kernel keeps).
+                if slot < 0 || score < query_floors[qi] {
+                    continue;
+                }
+                out[qi].1.candidates_collected += 1;
+                chunk_hits.push(ChunkHit {
+                    slot: slot as u32,
+                    score,
+                });
+            }
+            merge_chunk_hits(&mut heaps[qi], &mut chunk_hits, q.k, q.keep_ties);
 
-        if heap.len() >= k {
-            publish_floor(heap[k - 1].score);
-            stats.floors_published += 1;
+            if heaps[qi].len() >= q.k {
+                publish_floor(qi, heaps[qi][q.k - 1].score);
+                out[qi].1.floors_published += 1;
+            }
         }
 
         start = end;
     }
 
-    (heap, stats)
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        out[qi].0 = heap;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -434,6 +515,104 @@ mod tests {
         assert_eq!(tied.len(), 6, "whole boundary tie group must survive");
         assert!(tied.iter().all(|h| h.score == tied[0].score));
         assert!(tied.windows(2).all(|w| w[0].slot < w[1].slot));
+    }
+
+    /// Every member of a mixed batch (small k, large k, tie-complete) must
+    /// produce exactly the hits AND the published floor sequence of its
+    /// solo chunked scan, across chunkings. This is the coalescing
+    /// exactness contract: batching changes bandwidth, never results.
+    #[test]
+    fn batch_matches_solo_bitwise() {
+        let (n, dim) = (6_000, 64);
+        let index = build(n, dim);
+        let specs = [(10usize, false), (100, false), (3, true), (1000, false)];
+        let queries: Vec<Vec<f32>> = (0..specs.len())
+            .map(|i| unit_vectors(1, dim, 0xBA7C_0000 + i as u64))
+            .collect();
+        for chunk_blocks in [1, 7, 64] {
+            let mut solo = Vec::new();
+            for (q, &(k, ties)) in queries.iter().zip(&specs) {
+                let mut published = Vec::new();
+                let (hits, _) = chunked_topk(
+                    &index,
+                    q,
+                    k,
+                    chunk_blocks,
+                    &mut || None,
+                    &mut |f| published.push(f),
+                    ties,
+                );
+                solo.push((hits, published));
+            }
+            let batch: Vec<BatchQuery> = queries
+                .iter()
+                .zip(&specs)
+                .map(|(q, &(k, ties))| BatchQuery {
+                    vector: q,
+                    k,
+                    keep_ties: ties,
+                })
+                .collect();
+            let mut published: Vec<Vec<f32>> = vec![Vec::new(); specs.len()];
+            let results = chunked_topk_batch(&index, &batch, chunk_blocks, &mut |_| None, &mut |qi,
+                                                                                              f| {
+                published[qi].push(f)
+            });
+            for (qi, ((hits, _), (solo_hits, solo_published))) in
+                results.iter().zip(&solo).enumerate()
+            {
+                assert_eq!(hits, solo_hits, "query {qi} chunk_blocks {chunk_blocks}");
+                assert_eq!(
+                    &published[qi], solo_published,
+                    "query {qi} floor sequence, chunk_blocks {chunk_blocks}"
+                );
+            }
+        }
+    }
+
+    /// An external floor on ONE member must prune that member's collection
+    /// while leaving every member's results identical to solo — the
+    /// batch-minimum kernel floor and the per-query re-filter in action.
+    #[test]
+    fn per_query_floor_stays_isolated() {
+        let (n, dim, k) = (8_192, 64, 10);
+        let index = build(n, dim);
+        let q0 = unit_vectors(1, dim, 0xBA7C_1000);
+        let q1 = unit_vectors(1, dim, 0xBA7C_1001);
+        let kth0 = index.search(&q0, k).scores_for_query(0)[k - 1];
+
+        let solo1 = chunked_topk(&index, &q1, k, 2, &mut || None, &mut |_| {}, false).0;
+        let solo0 = chunked_topk(&index, &q0, k, 2, &mut || Some(kth0), &mut |_| {}, false).0;
+
+        let batch = [
+            BatchQuery {
+                vector: &q0,
+                k,
+                keep_ties: false,
+            },
+            BatchQuery {
+                vector: &q1,
+                k,
+                keep_ties: false,
+            },
+        ];
+        // The true k-th best floors query 0 from the start; query 1 runs
+        // unseeded.
+        let results = chunked_topk_batch(
+            &index,
+            &batch,
+            2,
+            &mut |qi| (qi == 0).then_some(kth0),
+            &mut |_, _| {},
+        );
+        assert_eq!(results[0].0, solo0, "floored member");
+        assert_eq!(results[1].0, solo1, "unfloored member");
+        assert!(
+            results[0].1.candidates_collected < results[1].1.candidates_collected,
+            "the floored member should collect less: {} vs {}",
+            results[0].1.candidates_collected,
+            results[1].1.candidates_collected
+        );
     }
 
     /// An over-high floor (above the true k-th best) is allowed by the
