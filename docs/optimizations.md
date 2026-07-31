@@ -105,6 +105,24 @@ prunes from the first block instead of only after its heap fills. Every
 heap initialization site in the kernels honors the seed; a chunked-scan
 test enforces this against upstream changes.
 
+**Conflated floor relay.** Floors are monotone maxima, so only the
+latest value matters. The coordinator folds every raise into one watch
+cell per query; a per-stream forwarder relays whatever is newest when it
+wakes, collapsing a burst of raises into one message per stream. Nodes
+add a configurable delta gate (`floor_delta`): a raise smaller than the
+delta stays local. Both trim exactly the overhead the two-machine
+experiments measured, and neither can change results — a delayed or
+skipped floor only defers pruning.
+
+**Pooled channels, deadlines, hedged retries.** One lazily-established
+HTTP/2 channel per node serves every concurrent query (per-query
+connection setup was pure overhead on the fan-out path). Per-shard
+deadlines (`shard_deadline_ms`) convert a stalled shard into a fast
+failure, and shards with a configured replica get a hedged second
+search after `hedge_delay_ms` — first success wins, and exactness makes
+the two answers interchangeable, so tail latency compresses without a
+correctness cost.
+
 **Global ids without coordination.** Shards are assigned disjoint slot
 offsets (stride 25M); a global document id is `slot_offset + local id`.
 No id allocator, no consensus, and any subset of shards can be queried

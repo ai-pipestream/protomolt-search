@@ -85,6 +85,10 @@ pub struct ShardConfig {
 pub struct ShardMapShard {
     /// Node address (`host:port` or `http://host:port`).
     pub addr: String,
+    /// Optional replica serving the same data — the target for the
+    /// coordinator's hedged retries and failover. Exact search over
+    /// identical data returns identical results from either copy.
+    pub replica: Option<String>,
     /// The shard's global id base.
     #[serde(default)]
     pub slot_offset: u64,
@@ -121,6 +125,18 @@ pub struct Config {
     pub chunk_blocks: usize,
     /// Participate in floor sharing (publish + adopt floors).
     pub share_floors: bool,
+    /// Minimum score improvement before a node publishes its next floor
+    /// (0.0 = publish every raise).
+    pub floor_delta: f32,
+    /// Coordinator: per-shard wall-clock deadline in milliseconds for one
+    /// query's shard attempt (0 = no deadline).
+    pub shard_deadline_ms: u64,
+    /// Coordinator: delay before hedging a slow shard to its replica
+    /// (0 = no hedging; replicas then serve as failover only).
+    pub hedge_delay_ms: u64,
+    /// Coordinator: optional replica address per shard, aligned with
+    /// `node_addrs` (from the shard map's `replica` fields).
+    pub replica_addrs: Vec<Option<String>>,
     /// gRPC message size cap applied to clients and servers.
     pub max_message_bytes: usize,
     /// Issue one demo search against the coordinator at startup.
@@ -159,6 +175,9 @@ struct FileConfig {
     bit_width: Option<usize>,
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
+    floor_delta: Option<f32>,
+    shard_deadline_ms: Option<u64>,
+    hedge_delay_ms: Option<u64>,
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
     query_dim: Option<usize>,
@@ -448,6 +467,52 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         Some(s) => parse_env_bool(&s),
         None => file.floor_sharing.unwrap_or(true),
     };
+    let floor_delta = opt(
+        args,
+        "floor-delta",
+        "TURBOVEC_FLOOR_DELTA",
+        file.floor_delta.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<f32>()
+            .map_err(|e| format!("invalid floor delta: {e}"))
+            .and_then(|v| {
+                if v.is_finite() && v >= 0.0 {
+                    Ok(v)
+                } else {
+                    Err(format!("floor delta must be finite and >= 0, got {v}"))
+                }
+            })
+    })
+    .transpose()?
+    .unwrap_or(0.0);
+    let parse_ms = |key: &str, env: &str, file_val: Option<u64>| -> Result<u64, String> {
+        opt(args, key, env, file_val.map(|v| v.to_string()).as_deref())
+            .map(|s| {
+                s.parse::<u64>()
+                    .map_err(|e| format!("invalid --{key}: {e}"))
+            })
+            .transpose()
+            .map(|v| v.unwrap_or(0))
+    };
+    let shard_deadline_ms = parse_ms(
+        "shard-deadline-ms",
+        "TURBOVEC_SHARD_DEADLINE_MS",
+        file.shard_deadline_ms,
+    )?;
+    let hedge_delay_ms = parse_ms("hedge-delay-ms", "TURBOVEC_HEDGE_DELAY_MS", file.hedge_delay_ms)?;
+    let replica_addrs: Vec<Option<String>> = match &shard_map {
+        Some(map) => map
+            .shards
+            .iter()
+            .map(|s| {
+                s.replica
+                    .clone()
+                    .map(|a| normalize_addrs(vec![a]).remove(0))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
 
     let max_message_bytes = opt(
         args,
@@ -542,6 +607,10 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         shards,
         chunk_blocks,
         share_floors,
+        floor_delta,
+        shard_deadline_ms,
+        hedge_delay_ms,
+        replica_addrs,
         max_message_bytes,
         demo_query,
         query_dim,
@@ -713,6 +782,64 @@ slot_offset = 20000
         assert!(persisted.shards[0].wal);
         let off = parse(&args(&["--role=node", "--index=/tmp/x.tv", "--wal=false"])).unwrap();
         assert!(!off.shards[0].wal);
+    }
+
+    #[test]
+    fn maturity_knobs_parse_with_safe_defaults() {
+        let defaults = parse(&args(&["--role=node", "--demo-vectors=10"])).unwrap();
+        assert_eq!(defaults.floor_delta, 0.0);
+        assert_eq!(defaults.shard_deadline_ms, 0);
+        assert_eq!(defaults.hedge_delay_ms, 0);
+        assert!(defaults.replica_addrs.is_empty());
+
+        let cfg = parse(&args(&[
+            "--role=node",
+            "--demo-vectors=10",
+            "--floor-delta=0.005",
+            "--shard-deadline-ms=1500",
+            "--hedge-delay-ms=200",
+        ]))
+        .unwrap();
+        assert_eq!(cfg.floor_delta, 0.005);
+        assert_eq!(cfg.shard_deadline_ms, 1500);
+        assert_eq!(cfg.hedge_delay_ms, 200);
+
+        // Negative or non-finite deltas are rejected.
+        assert!(parse(&args(&[
+            "--role=node",
+            "--demo-vectors=10",
+            "--floor-delta=-0.1"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn shard_map_parses_replicas() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join(format!("turbovec_replicas_{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+[[shards]]
+addr = "host-a:50051"
+replica = "host-a2:50051"
+
+[[shards]]
+addr = "host-b:50051"
+"#,
+        )
+        .unwrap();
+        let cfg = parse(&args(&[
+            "--role=coordinator",
+            &format!("--shard-map={}", path.display()),
+        ]))
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            cfg.replica_addrs,
+            vec![Some("http://host-a2:50051".to_string()), None]
+        );
     }
 
     #[test]

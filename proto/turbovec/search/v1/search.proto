@@ -180,6 +180,11 @@ service NodeService {
   // leg (shared TQ+ calibration for the vector leg; the supplied global
   // stats for the BM25 leg).
   rpc ShardLegs(ShardLegsRequest) returns (ShardLegsResponse);
+
+  // Liveness + shape of this shard: vector count, dim, bit width, BM25
+  // doc count, and whether an ingest stream currently holds the shard's
+  // single-writer slot. Cheap enough to poll.
+  rpc Health(HealthRequest) returns (HealthResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
@@ -219,6 +224,56 @@ service SearchService {
   // shards must be re-seeded and re-ingested together, or their scores
   // stop being comparable.
   rpc BroadcastCalibration(BroadcastCalibrationRequest) returns (BroadcastCalibrationResponse);
+
+  // Fans NodeService.Health out to every shard (and any configured
+  // replica) and reports per-target reachability plus the shard's own
+  // health. Never fails on an unreachable node — that is a reported
+  // outcome, not an error.
+  rpc ClusterHealth(ClusterHealthRequest) returns (ClusterHealthResponse);
+}
+
+message HealthRequest {}
+
+// One shard's liveness and shape.
+message HealthResponse {
+  // Vectors resident in the turbovec index (0 for an empty shard).
+  uint64 num_vectors = 1;
+  // Vector dimensionality (0 until the first add locks it).
+  uint32 dim = 2;
+  // Quantization bit width.
+  uint32 bit_width = 3;
+  // The shard's global id base.
+  uint64 slot_offset = 4;
+  // Documents in the BM25 store (0 when the shard has none).
+  uint64 bm25_docs = 5;
+  // True while a bulk BM25 build is spilling (searchable only after Flush).
+  bool bm25_building = 6;
+  // True while an AddVectors/AddDocuments stream holds the single-writer
+  // ingest slot.
+  bool ingest_active = 7;
+}
+
+message ClusterHealthRequest {}
+
+// Health of one fan-out target (a shard's primary or replica).
+message ShardHealth {
+  // Shard index in fan-out order.
+  uint32 shard = 1;
+  // The address probed.
+  string addr = 2;
+  // True when this target is a configured replica rather than a primary.
+  bool is_replica = 3;
+  // Whether the probe got an answer; `error` says why not.
+  bool reachable = 4;
+  string error = 5;
+  // The target's own report, when reachable.
+  HealthResponse health = 6;
+}
+
+message ClusterHealthResponse {
+  // One entry per probed target: every primary, then every configured
+  // replica, in shard order.
+  repeated ShardHealth targets = 1;
 }
 
 // One message on the client-to-server leg of `SearchShard`. The first

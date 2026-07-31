@@ -32,7 +32,8 @@ use crate::pb::{
     AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest,
     Bm25QueryResponse, Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest,
     FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
-    GetDocumentsResponse, HybridLegHit, HybridShardRequest, HybridShardResponse,
+    GetDocumentsResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
+    HybridShardResponse,
     InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone,
     SearchShardRequest, SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse,
     ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest,
@@ -54,6 +55,11 @@ pub struct NodeConfig {
     /// floor updates and does not publish its own floor — the
     /// "sharing disabled" baseline for A/B benchmarking.
     pub share_floors: bool,
+    /// Minimum improvement over the last PUBLISHED floor before the next
+    /// one goes on the wire. 0.0 publishes every raise (the historical
+    /// behavior); a small positive delta trades a sliver of pruning
+    /// reactivity for far fewer floor messages on real networks.
+    pub floor_delta: f32,
     /// Bit width used when `AddVectors` constructs an index from scratch
     /// (no loaded index, no seeded calibration).
     pub bit_width: usize,
@@ -78,6 +84,7 @@ impl Default for NodeConfig {
             slot_offset: 0,
             chunk_blocks: DEFAULT_CHUNK_BLOCKS,
             share_floors: true,
+            floor_delta: 0.0,
             bit_width: 4,
             index_path: None,
             analysis_addr: None,
@@ -1159,6 +1166,7 @@ impl NodeService for NodeServiceImpl {
             });
 
             let share = config.share_floors;
+            let floor_delta = config.floor_delta;
             let chunk_blocks = config.chunk_blocks;
             let slot_offset = config.slot_offset;
             let scan_tx = tx.clone();
@@ -1173,14 +1181,14 @@ impl NodeService for NodeServiceImpl {
                     )
                 })?;
                 Self::validate_start(index, &start)?;
-                // Publish only raises, and never block the scan on a full
-                // channel: intermediate floors are disposable (they are
-                // monotone, so the next chunk's publish supersedes any
-                // dropped one). The terminal Done is sent with `.await`
-                // below and cannot be dropped.
+                // Publish only raises that clear the delta gate, and never
+                // block the scan on a full channel: intermediate floors are
+                // disposable (they are monotone, so the next chunk's publish
+                // supersedes any dropped one). The terminal Done is sent
+                // with `.await` below and cannot be dropped.
                 let mut last_published = f32::NEG_INFINITY;
                 let mut publish_floor = |floor: f32| {
-                    if share && floor > last_published {
+                    if share && floor > last_published + floor_delta {
                         last_published = floor;
                         let _ = scan_tx.try_send(Ok(SearchShardResponse {
                             payload: Some(search_shard_response::Payload::FloorUpdate(
@@ -1243,6 +1251,36 @@ impl NodeService for NodeServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn health(
+        &self,
+        _request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let (num_vectors, dim, bit_width) = match guard.index.as_ref() {
+            Some(index) => (
+                index.len() as u64,
+                index.dim_opt().unwrap_or(0) as u32,
+                index.bit_width() as u32,
+            ),
+            None => (0, 0, self.config.bit_width as u32),
+        };
+        let (bm25_docs, bm25_building) = match guard.bm25.as_ref() {
+            Some(shard) => (shard.doc_count(), matches!(shard, Bm25Shard::Spilling(_))),
+            None => (0, false),
+        };
+        Ok(Response::new(HealthResponse {
+            num_vectors,
+            dim,
+            bit_width,
+            slot_offset: self.config.slot_offset,
+            bm25_docs,
+            bm25_building,
+            ingest_active: self
+                .ingest_busy
+                .load(std::sync::atomic::Ordering::Acquire),
+        }))
     }
 
     async fn get_calibration(

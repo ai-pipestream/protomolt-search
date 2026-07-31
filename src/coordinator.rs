@@ -1,11 +1,14 @@
 //! Coordinator side: client-facing [`SearchService`] that fans queries out
 //! to shard nodes, aggregates their floors mid-scan, and merges results.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use crate::bm25::{self, Bm25Params, CorpusStats};
@@ -16,31 +19,51 @@ use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
     search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest,
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
-    BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, FloorUpdate, FusionMode,
-    HybridHit, HybridSearchRequest, HybridSearchResponse, HybridShardRequest, ScoredHit,
-    SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse,
-    SetCalibrationRequest, ShardLegsRequest, ShardScanStats, StartShardSearch, TermStatsRequest,
+    BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, ClusterHealthRequest,
+    ClusterHealthResponse, FloorUpdate, FusionMode, HealthRequest, HybridHit, HybridSearchRequest,
+    HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
+    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
+    ShardLegsRequest, ShardScanStats, StartShardSearch, TermStatsRequest,
 };
 
 /// Process-unique request id counter for coordinator-assigned ids.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Per-shard timing controls for the fan-out (all off by default).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FanoutLimits {
+    /// Hard bound on one shard's whole attempt (primary + any hedge).
+    /// A shard that blows the deadline fails the query with
+    /// DEADLINE_EXCEEDED rather than stalling it forever.
+    pub shard_deadline: Option<Duration>,
+    /// How long to wait on the primary before opening the identical
+    /// search on the shard's replica and racing the two. Only acts on
+    /// shards that have a replica configured.
+    pub hedge_delay: Option<Duration>,
+}
+
 /// The coordinator gRPC service.
 ///
-/// Phase 1 keeps membership static: the node address list is fixed at
-/// construction and every query fans out to every node. Each query opens a
-/// fresh `SearchShard` stream per node (no connection pooling yet — tonic
-/// channels are per-query here, which is simple and correct, if not the
-/// cheapest).
+/// Membership is static: the node address list is fixed at construction
+/// and every query fans out to every node. Connections are pooled: one
+/// lazily-established HTTP/2 channel per node address, multiplexing every
+/// concurrent query and reconnecting on its own after a node restart.
 #[derive(Clone)]
 pub struct CoordinatorServiceImpl {
     /// Node addresses in `http://host:port` form, in stable shard order
     /// (index in this list is the shard index used for tie-breaking).
     node_addrs: Vec<String>,
+    /// Optional replica address per shard (same data, exact same
+    /// results), the target for hedged retries.
+    replica_addrs: Vec<Option<String>>,
     /// Analysis sidecar address for query analysis in Bm25Search.
     analysis_addr: Option<String>,
     /// BM25 tuning sent to every shard (identical scoring everywhere).
     bm25_params: Bm25Params,
+    /// Per-shard deadline and hedging controls.
+    limits: FanoutLimits,
+    /// One reusable channel per address, created on first use.
+    channels: Arc<Mutex<HashMap<String, Channel>>>,
 }
 
 impl CoordinatorServiceImpl {
@@ -49,8 +72,11 @@ impl CoordinatorServiceImpl {
     pub fn new(node_addrs: Vec<String>) -> Self {
         Self {
             node_addrs,
+            replica_addrs: Vec::new(),
             analysis_addr: None,
             bm25_params: Bm25Params::default(),
+            limits: FanoutLimits::default(),
+            channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -60,6 +86,45 @@ impl CoordinatorServiceImpl {
         self.analysis_addr = analysis_addr;
         self.bm25_params = params;
         self
+    }
+
+    /// Configure per-shard deadlines and hedging.
+    pub fn with_limits(mut self, limits: FanoutLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Configure replica addresses (one optional entry per shard, same
+    /// order as the node list). A replica must serve identical data —
+    /// searches are exact, so either copy returns identical results.
+    pub fn with_replicas(mut self, replica_addrs: Vec<Option<String>>) -> Self {
+        self.replica_addrs = replica_addrs;
+        self
+    }
+
+    /// The pooled channel for `addr`, created lazily on first use.
+    /// `connect_lazy` defers the TCP/HTTP2 handshake to the first RPC and
+    /// transparently reconnects after failures, so one entry serves the
+    /// address for the process lifetime.
+    fn channel_to(&self, addr: &str) -> Result<Channel, Status> {
+        let mut cache = self.channels.lock().expect("channel cache mutex poisoned");
+        if let Some(ch) = cache.get(addr) {
+            return Ok(ch.clone());
+        }
+        let endpoint = Endpoint::from_shared(addr.to_string())
+            .map_err(|e| Status::unavailable(format!("invalid node address {addr}: {e}")))?
+            .tcp_nodelay(true);
+        let ch = endpoint.connect_lazy();
+        cache.insert(addr.to_string(), ch.clone());
+        Ok(ch)
+    }
+
+    /// A client over the pooled channel for `addr` with the message size
+    /// limits applied. Cheap: clones the channel, no new connection.
+    fn node_client(&self, addr: &str) -> Result<NodeServiceClient<Channel>, Status> {
+        Ok(NodeServiceClient::new(self.channel_to(addr)?)
+            .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
     }
 
     /// Distributed BM25 with the two-phase global-stats flow (see the
@@ -87,40 +152,12 @@ impl CoordinatorServiceImpl {
         }
 
         // (b) TermStats fan-out: each shard's share of the corpus stats.
-        let mut share_tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
-            let node = node.clone();
-            let terms = terms.clone();
-            share_tasks.push(tokio::spawn(async move {
-                let mut client = NodeServiceClient::connect(node.clone())
-                    .await
-                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
-                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
-                client
-                    .term_stats(TermStatsRequest { terms })
-                    .await
-                    .map(|r| r.into_inner())
-            }));
-        }
-        let mut shares = Vec::with_capacity(share_tasks.len());
-        for task in share_tasks {
-            let stats = task
-                .await
-                .map_err(|e| Status::internal(format!("term stats task failed: {e}")))??;
-            shares.push((
-                stats.doc_count,
-                stats.total_doc_length,
-                stats.doc_frequencies,
-            ));
-        }
-        let global: CorpusStats = bm25::merge_stats(&shares);
+        let global: CorpusStats = self.global_bm25_stats(&terms).await?;
 
         // (c) Bm25Query fan-out with the GLOBAL stats: every shard scores
         // identically, so (d) the merge is a straight top-k.
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
-            let node = node.clone();
             let request = Bm25QueryRequest {
                 terms: terms.clone(),
                 k,
@@ -130,12 +167,8 @@ impl CoordinatorServiceImpl {
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
             };
+            let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
-                let mut client = NodeServiceClient::connect(node.clone())
-                    .await
-                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
-                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
                 client
                     .bm25_query(request)
                     .await
@@ -210,14 +243,9 @@ impl CoordinatorServiceImpl {
     async fn global_bm25_stats(&self, terms: &[String]) -> Result<CorpusStats, Status> {
         let mut share_tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
-            let node = node.clone();
             let terms = terms.to_vec();
+            let mut client = self.node_client(node)?;
             share_tasks.push(tokio::spawn(async move {
-                let mut client = NodeServiceClient::connect(node.clone())
-                    .await
-                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
-                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
                 client
                     .term_stats(TermStatsRequest { terms })
                     .await
@@ -253,7 +281,6 @@ impl CoordinatorServiceImpl {
     ) -> Result<Vec<HybridHit>, Status> {
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
-            let node = node.clone();
             let request = ShardLegsRequest {
                 request_id: String::new(),
                 k: legs.leg_k,
@@ -263,12 +290,8 @@ impl CoordinatorServiceImpl {
                 global_total_doc_length: global.total_doc_length,
                 global_doc_frequencies: global.dfs.clone(),
             };
+            let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
-                let mut client = NodeServiceClient::connect(node.clone())
-                    .await
-                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
-                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
                 client
                     .shard_legs(request)
                     .await
@@ -370,7 +393,6 @@ impl CoordinatorServiceImpl {
         // Level one: per-shard local fusion.
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
-            let node = node.clone();
             let request = HybridShardRequest {
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
@@ -383,12 +405,8 @@ impl CoordinatorServiceImpl {
                 bm25_weight: legs.bm25_weight,
                 rrf_k: legs.rrf_k as f32,
             };
+            let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
-                let mut client = NodeServiceClient::connect(node.clone())
-                    .await
-                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
-                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
                 client
                     .hybrid_shard(request)
                     .await
@@ -455,9 +473,16 @@ impl CoordinatorServiceImpl {
     ///
     /// Floor flow per query:
     /// 1. open a `SearchShard` stream per node and send `StartShardSearch`;
-    /// 2. each node pump task feeds shard floor updates into one shared
-    ///    [`FloorTracker`]; every raise is broadcast to all node streams;
+    /// 2. each stream pump feeds shard floor updates into one shared
+    ///    [`FloorTracker`]; raises land in a conflating `watch` cell that
+    ///    per-stream forwarders relay — a burst of raises collapses to the
+    ///    latest value instead of one message per raise;
     /// 3. each pump ends on the node's terminal `SearchShardDone`.
+    ///
+    /// Per shard, [`FanoutLimits`] adds a hedged retry to the shard's
+    /// replica after `hedge_delay` (first success wins; identical data
+    /// plus exact search means identical results either way) and bounds
+    /// the whole attempt with `shard_deadline`.
     pub async fn fanout_search(
         &self,
         request_id: &str,
@@ -470,83 +495,30 @@ impl CoordinatorServiceImpl {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
 
+        let ctx = ShardQueryCtx {
+            request_id: Arc::from(request_id),
+            vector: Arc::new(vector.to_vec()),
+            k,
+            tie_complete,
+            tracker: Arc::new(Mutex::new(FloorTracker::new())),
+            gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
+        };
+
         let (done_tx, mut done_rx) =
             mpsc::channel::<(u32, Result<SearchShardDone, Status>)>(n_nodes);
-        let senders: Arc<Mutex<Vec<mpsc::Sender<SearchShardRequest>>>> =
-            Arc::new(Mutex::new(Vec::with_capacity(n_nodes)));
-        let tracker = Arc::new(Mutex::new(FloorTracker::new()));
-
-        for (shard, addr) in self.node_addrs.iter().enumerate() {
-            let mut client = NodeServiceClient::connect(addr.clone())
-                .await
-                .map_err(|e| Status::unavailable(format!("connect {addr}: {e}")))?
-                .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
-
-            let (req_tx, req_rx) = mpsc::channel::<SearchShardRequest>(64);
-            req_tx
-                .send(SearchShardRequest {
-                    payload: Some(search_shard_request::Payload::Start(StartShardSearch {
-                        request_id: request_id.to_string(),
-                        k,
-                        vector: vector.to_vec(),
-                        tie_complete,
-                    })),
-                })
-                .await
-                .map_err(|_| Status::internal("node request channel closed before Start"))?;
-            senders.lock().expect("senders mutex poisoned").push(req_tx);
-
-            let mut responses = client
-                .search_shard(ReceiverStream::new(req_rx))
-                .await?
-                .into_inner();
-
-            let tracker = tracker.clone();
-            let senders = senders.clone();
+        for shard in 0..n_nodes {
+            let primary = self.node_client(&self.node_addrs[shard])?;
+            let replica = match self.replica_addrs.get(shard).and_then(|r| r.as_deref()) {
+                Some(addr) => Some(self.node_client(addr)?),
+                None => None,
+            };
+            let ctx = ctx.clone();
+            let limits = self.limits;
             let done_tx = done_tx.clone();
-            let shard = shard as u32;
             tokio::spawn(async move {
-                let result = loop {
-                    match responses.message().await {
-                        Ok(Some(SearchShardResponse {
-                            payload: Some(search_shard_response::Payload::FloorUpdate(u)),
-                        })) => {
-                            let raised = tracker
-                                .lock()
-                                .expect("floor tracker mutex poisoned")
-                                .observe(u.floor);
-                            if let Some(floor) = raised {
-                                // Broadcast the new max to every node,
-                                // including the publisher (a no-op there).
-                                // try_send: a full channel only delays a
-                                // floor, never corrupts results.
-                                let txs: Vec<_> =
-                                    senders.lock().expect("senders mutex poisoned").clone();
-                                for tx in txs {
-                                    let _ = tx.try_send(SearchShardRequest {
-                                        payload: Some(search_shard_request::Payload::FloorUpdate(
-                                            FloorUpdate { floor },
-                                        )),
-                                    });
-                                }
-                            }
-                        }
-                        Ok(Some(SearchShardResponse {
-                            payload: Some(search_shard_response::Payload::Done(done)),
-                        })) => {
-                            break Ok(done);
-                        }
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            break Err(Status::data_loss(format!(
-                                "shard {shard}: stream closed before Done"
-                            )));
-                        }
-                        Err(e) => break Err(e),
-                    }
-                };
-                let _ = done_tx.send((shard, result)).await;
+                let result =
+                    run_shard_with_hedge(shard as u32, primary, replica, ctx, limits).await;
+                let _ = done_tx.send((shard as u32, result)).await;
             });
         }
         drop(done_tx);
@@ -651,7 +623,7 @@ impl CoordinatorServiceImpl {
         }
         let mut rescore_tasks = Vec::with_capacity(by_shard.len());
         for (shard, ids) in by_shard {
-            let node = self.node_addrs[shard as usize].clone();
+            let node = &self.node_addrs[shard as usize];
             let request = Bm25RescoreRequest {
                 terms: terms.clone(),
                 global_doc_count: global.doc_count,
@@ -661,12 +633,8 @@ impl CoordinatorServiceImpl {
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
             };
+            let mut client = self.node_client(node)?;
             rescore_tasks.push(tokio::spawn(async move {
-                let mut client = NodeServiceClient::connect(node.clone())
-                    .await
-                    .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
-                    .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
                 client
                     .bm25_rescore(request)
                     .await
@@ -726,16 +694,12 @@ impl CoordinatorServiceImpl {
                 shift: req.shift.clone(),
                 scale: req.scale.clone(),
             };
+            let client = self.node_client(&node);
             tasks.push(tokio::spawn(async move {
-                let result = async {
-                    let mut client = NodeServiceClient::connect(node.clone())
-                        .await
-                        .map_err(|e| Status::unavailable(format!("connect {node}: {e}")))?
-                        .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-                        .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
-                    client.set_calibration(request).await
-                }
-                .await;
+                let result = match client {
+                    Ok(mut client) => client.set_calibration(request).await,
+                    Err(e) => Err(e),
+                };
                 match result {
                     Ok(resp) => CalibrationApplyResult {
                         node: node.clone(),
@@ -766,6 +730,188 @@ impl CoordinatorServiceImpl {
         }
         results
     }
+}
+
+/// Everything one shard-stream attempt needs, cheap to clone per attempt
+/// (a hedged retry is just a second attempt with the same context).
+#[derive(Clone)]
+struct ShardQueryCtx {
+    request_id: Arc<str>,
+    vector: Arc<Vec<f32>>,
+    k: u32,
+    tie_complete: bool,
+    /// Merges every shard's published floor into the running global max.
+    tracker: Arc<Mutex<FloorTracker>>,
+    /// Conflating broadcast cell for the global floor: pumps write raises
+    /// here; per-stream forwarders relay whatever is LATEST when they
+    /// wake, so a burst of raises becomes one message per stream.
+    gfloor: Arc<watch::Sender<f32>>,
+}
+
+fn floor_message(floor: f32) -> SearchShardRequest {
+    SearchShardRequest {
+        payload: Some(search_shard_request::Payload::FloorUpdate(FloorUpdate {
+            floor,
+        })),
+    }
+}
+
+/// One `SearchShard` stream attempt against one node: Start, pump floors
+/// both ways, return the terminal Done.
+async fn run_shard_stream(
+    shard: u32,
+    mut client: NodeServiceClient<Channel>,
+    ctx: ShardQueryCtx,
+) -> Result<SearchShardDone, Status> {
+    let (req_tx, req_rx) = mpsc::channel::<SearchShardRequest>(8);
+    req_tx
+        .send(SearchShardRequest {
+            payload: Some(search_shard_request::Payload::Start(StartShardSearch {
+                request_id: ctx.request_id.to_string(),
+                k: ctx.k,
+                vector: ctx.vector.as_ref().clone(),
+                tie_complete: ctx.tie_complete,
+            })),
+        })
+        .await
+        .map_err(|_| Status::internal("node request channel closed before Start"))?;
+    let mut responses = client
+        .search_shard(ReceiverStream::new(req_rx))
+        .await?
+        .into_inner();
+
+    // A late starter (a hedged replica) joins with the floor already
+    // raised — seed it immediately instead of waiting for the next raise.
+    let current = *ctx.gfloor.borrow();
+    if current != f32::NEG_INFINITY {
+        let _ = req_tx.try_send(floor_message(current));
+    }
+
+    // Conflating forwarder: on every wake, relay only the LATEST floor.
+    // try_send on a full channel just drops this raise — floors are
+    // monotone, so the next raise supersedes it; a dropped floor delays
+    // pruning but never affects results.
+    let mut floor_rx = ctx.gfloor.subscribe();
+    let forwarder = tokio::spawn(async move {
+        while floor_rx.changed().await.is_ok() {
+            let floor = *floor_rx.borrow_and_update();
+            if let Err(mpsc::error::TrySendError::Closed(_)) = req_tx.try_send(floor_message(floor))
+            {
+                break;
+            }
+        }
+    });
+
+    let result = loop {
+        match responses.message().await {
+            Ok(Some(SearchShardResponse {
+                payload: Some(search_shard_response::Payload::FloorUpdate(u)),
+            })) => {
+                let raised = ctx
+                    .tracker
+                    .lock()
+                    .expect("floor tracker mutex poisoned")
+                    .observe(u.floor);
+                if let Some(floor) = raised {
+                    // send_if_modified with a strict raise: two racing
+                    // pumps can never lower the broadcast value.
+                    ctx.gfloor.send_if_modified(|cur| {
+                        if floor > *cur {
+                            *cur = floor;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+            }
+            Ok(Some(SearchShardResponse {
+                payload: Some(search_shard_response::Payload::Done(done)),
+            })) => break Ok(done),
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                break Err(Status::data_loss(format!(
+                    "shard {shard}: stream closed before Done"
+                )))
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    forwarder.abort();
+    result
+}
+
+/// One shard's full query attempt: primary stream, hedged replica after
+/// `hedge_delay` (first success wins), failover on primary error, all
+/// bounded by `shard_deadline`.
+async fn run_shard_with_hedge(
+    shard: u32,
+    primary: NodeServiceClient<Channel>,
+    replica: Option<NodeServiceClient<Channel>>,
+    ctx: ShardQueryCtx,
+    limits: FanoutLimits,
+) -> Result<SearchShardDone, Status> {
+    let attempt = async {
+        let primary_run = run_shard_stream(shard, primary, ctx.clone());
+        match (replica, limits.hedge_delay) {
+            (Some(rep), Some(delay)) => {
+                tokio::pin!(primary_run);
+                tokio::select! {
+                    r = &mut primary_run => match r {
+                        Ok(done) => Ok(done),
+                        // Primary failed before the hedge window: go
+                        // straight to the replica.
+                        Err(pe) => run_shard_stream(shard, rep, ctx.clone())
+                            .await
+                            .map_err(|re| both_failed(shard, &pe, &re)),
+                    },
+                    _ = tokio::time::sleep(delay) => {
+                        let replica_run = run_shard_stream(shard, rep, ctx.clone());
+                        tokio::pin!(replica_run);
+                        tokio::select! {
+                            r = &mut primary_run => match r {
+                                Ok(done) => Ok(done),
+                                Err(pe) => replica_run
+                                    .await
+                                    .map_err(|re| both_failed(shard, &pe, &re)),
+                            },
+                            r = &mut replica_run => match r {
+                                Ok(done) => Ok(done),
+                                Err(re) => primary_run
+                                    .await
+                                    .map_err(|pe| both_failed(shard, &pe, &re)),
+                            },
+                        }
+                    }
+                }
+            }
+            // Replica without a hedge delay: pure failover.
+            (Some(rep), None) => match primary_run.await {
+                Ok(done) => Ok(done),
+                Err(pe) => run_shard_stream(shard, rep, ctx.clone())
+                    .await
+                    .map_err(|re| both_failed(shard, &pe, &re)),
+            },
+            (None, _) => primary_run.await,
+        }
+    };
+    match limits.shard_deadline {
+        Some(deadline) => tokio::time::timeout(deadline, attempt)
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "shard {shard} exceeded its {}ms deadline",
+                    deadline.as_millis()
+                ))
+            })?,
+        None => attempt.await,
+    }
+}
+
+fn both_failed(shard: u32, primary: &Status, replica: &Status) -> Status {
+    Status::unavailable(format!(
+        "shard {shard}: primary failed ({primary}); replica failed ({replica})"
+    ))
 }
 
 /// Resolved per-leg options for one hybrid query.
@@ -927,6 +1073,72 @@ impl SearchService for CoordinatorServiceImpl {
                 }))
             }
         }
+    }
+
+    async fn cluster_health(
+        &self,
+        _request: Request<ClusterHealthRequest>,
+    ) -> Result<Response<ClusterHealthResponse>, Status> {
+        // Probe every primary, then every configured replica. Unreachable
+        // is a reported outcome, never an error; a 2s probe timeout keeps
+        // one filtered port from stalling the whole report.
+        let mut probes: Vec<(u32, String, bool)> = Vec::new();
+        for (shard, addr) in self.node_addrs.iter().enumerate() {
+            probes.push((shard as u32, addr.clone(), false));
+        }
+        for (shard, replica) in self.replica_addrs.iter().enumerate() {
+            if let Some(addr) = replica {
+                probes.push((shard as u32, addr.clone(), true));
+            }
+        }
+        let mut tasks = Vec::with_capacity(probes.len());
+        for (shard, addr, is_replica) in probes {
+            let client = self.node_client(&addr);
+            tasks.push(tokio::spawn(async move {
+                let outcome = match client {
+                    Ok(mut client) => {
+                        match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            client.health(HealthRequest {}),
+                        )
+                        .await
+                        {
+                            Ok(reply) => reply.map(|r| r.into_inner()),
+                            Err(_) => Err(Status::deadline_exceeded("health probe timed out")),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(health) => ShardHealth {
+                        shard,
+                        addr,
+                        is_replica,
+                        reachable: true,
+                        error: String::new(),
+                        health: Some(health),
+                    },
+                    Err(e) => ShardHealth {
+                        shard,
+                        addr,
+                        is_replica,
+                        reachable: false,
+                        error: e.message().to_string(),
+                        health: None,
+                    },
+                }
+            }));
+        }
+        let mut targets = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match task.await {
+                Ok(target) => targets.push(target),
+                Err(e) => {
+                    return Err(Status::internal(format!("health probe task failed: {e}")))
+                }
+            }
+        }
+        Ok(Response::new(ClusterHealthResponse { targets }))
     }
 
     async fn broadcast_calibration(

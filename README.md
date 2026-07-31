@@ -168,6 +168,9 @@ coord_listen = "0.0.0.0:50050"
 nodes = ["host-a:50051", "host-b:50051"]      # fan-out order = tie-break order
 chunk_blocks = 64                              # scan chunk size (SIMD blocks)
 floor_sharing = true
+floor_delta = 0.0                              # min raise before a floor publishes (0 = every raise)
+shard_deadline_ms = 0                          # per-shard query deadline (0 = none)
+hedge_delay_ms = 0                             # hedge slow shards to their replica after this (0 = failover only)
 max_message_mib = 64                           # gRPC message cap (both directions)
 
 [[shards]]                                     # shards this process serves
@@ -186,6 +189,28 @@ Membership is **static**: the coordinator's `nodes` list and each node's
 configs and restarting — deliberate for this phase. Single-shard shorthand
 (`--index`, `--demo-vectors`, `--node-listen`, `--slot-offset`) overrides
 the file's `[[shards]]` entirely.
+
+### Operability
+
+- **Pooled connections.** The coordinator keeps one lazily-established
+  HTTP/2 channel per node address; every concurrent query multiplexes
+  over it, and it reconnects on its own after a node restart.
+- **Health.** `NodeService.Health` reports one shard's shape (vector
+  count, dim, bit width, BM25 docs, ingest/build activity);
+  `SearchService.ClusterHealth` fans it out to every primary and replica
+  and reports per-target reachability without failing on down nodes.
+- **Replicas, failover, and hedging.** A shard-map entry may name a
+  `replica` serving the same data. On a primary error the coordinator
+  fails over to it; with `hedge_delay_ms` set, a shard still running
+  when the delay expires gets a second identical search on its replica
+  and the first success wins. Search is exact, so either copy returns
+  identical results.
+- **Deadlines.** `shard_deadline_ms` bounds one query's whole per-shard
+  attempt (primary plus any hedge); a shard that exceeds it fails the
+  query with DEADLINE_EXCEEDED instead of stalling it.
+- **Floor delta.** `floor_delta` suppresses floor publishes that improve
+  the last published floor by less than the delta — fewer messages on
+  real networks at a sliver of pruning reactivity, results unchanged.
 
 ## k-sweep benchmark harness
 
@@ -638,9 +663,10 @@ matching `[[shards]]` node config blocks. Invariants, enforced hard:
 - **The shard map is the id-to-shard authority.** `--shard-map=<file>`
   (`TURBOVEC_SHARD_MAP`) on the coordinator replaces `--nodes` (passing
   both is an error): `generation = N` plus `[[shards]]` with `addr`,
-  `slot_offset`, and the child's `hash_lo`/`hash_hi` range. The
-  coordinator logs the generation at startup; plain `--nodes` keeps
-  working as the implicit generation 0.
+  an optional `replica` (failover and hedged retries; see
+  "Operability"), `slot_offset`, and the child's `hash_lo`/`hash_hi`
+  range. The coordinator logs the generation at startup; plain `--nodes`
+  keeps working as the implicit generation 0.
 
 Two operational rules follow from the design:
 
@@ -867,8 +893,10 @@ fork-level decision (see the TODO list).
   are future work.
 - **Hash-based ingest routing.** Writes go to explicitly addressed
   shards; routing by `hash(doc_id)` range lands with the map work.
-- **Replication.** A replica is a node that tails a WAL and installs
-  images — the substrate exists, the protocol does not.
+- **Replication.** A shard-map `replica` serves failover and hedged
+  reads today, but keeping it current is manual (copy or snapshot
+  install). A replica that tails the primary's WAL — the substrate
+  exists, the protocol does not.
 - **Streaming reshard.** Replay buffers each child's vectors in memory;
   very large shards need a spill-to-disk pass.
 - **Deletes and updates.** Vectors and postings are append-only; a
@@ -882,5 +910,3 @@ fork-level decision (see the TODO list).
 - **Calibration verification.** Ingest drivers fit and broadcast the
   shared calibration; mismatched shards score incomparably with no
   warning beyond `GetCalibration` inspection.
-- **Connection pooling.** Each query opens a fresh channel and
-  `SearchShard` stream per node.

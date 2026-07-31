@@ -165,6 +165,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     slot_offset: shard.slot_offset,
                     chunk_blocks: cfg.chunk_blocks,
                     share_floors: cfg.share_floors,
+                    floor_delta: cfg.floor_delta,
                     bit_width: cfg.bit_width,
                     index_path: shard.index_path.clone(),
                     analysis_addr: shard.analysis_addr.clone(),
@@ -194,13 +195,20 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cfg.role, Role::Coordinator | Role::Both) {
         let listener = TcpListener::bind(cfg.coord_listen).await?;
         let addr: SocketAddr = listener.local_addr()?;
-        let coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone()).with_bm25(
-            cfg.analysis_addr.clone(),
-            turbovec_search::bm25::Bm25Params {
-                k1: f64::from(cfg.bm25_k1),
-                b: f64::from(cfg.bm25_b),
-            },
-        );
+        let to_duration = |ms: u64| (ms > 0).then(|| std::time::Duration::from_millis(ms));
+        let coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone())
+            .with_bm25(
+                cfg.analysis_addr.clone(),
+                turbovec_search::bm25::Bm25Params {
+                    k1: f64::from(cfg.bm25_k1),
+                    b: f64::from(cfg.bm25_b),
+                },
+            )
+            .with_limits(turbovec_search::coordinator::FanoutLimits {
+                shard_deadline: to_duration(cfg.shard_deadline_ms),
+                hedge_delay: to_duration(cfg.hedge_delay_ms),
+            })
+            .with_replicas(cfg.replica_addrs.clone());
         if let Some(map) = &cfg.shard_map {
             eprintln!(
                 "shard map generation {} ({} shards)",
