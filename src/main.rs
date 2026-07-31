@@ -246,6 +246,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 request_id: String::new(),
                 k: 10,
                 vector: query,
+                collapse_parents: false,
             })
             .await?
             .into_inner();

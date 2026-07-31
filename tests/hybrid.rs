@@ -813,6 +813,7 @@ async fn leg_disabling_and_vector_floor() {
             request_id: String::new(),
             k: 8,
             vector: query.clone(),
+            collapse_parents: false,
         }))
         .await
         .unwrap()

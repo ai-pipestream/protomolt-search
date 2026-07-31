@@ -123,6 +123,7 @@ async fn search_service_over_loopback_matches_monolithic() {
                 request_id: format!("grpc-{qi}"),
                 k: K,
                 vector: query.clone(),
+                collapse_parents: false,
             })
             .await
             .unwrap()

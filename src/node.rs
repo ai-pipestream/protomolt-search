@@ -24,7 +24,7 @@ use tonic::{Request, Response, Status, Streaming};
 use turbovec::TurboQuantIndex;
 
 use crate::bm25::{self, Bm25Params};
-use crate::chunked::{
+use crate::chunked::{chunked_topk_collapsed, 
     chunked_topk, chunked_topk_batch, BatchQuery, ChunkHit, ScanStats, DEFAULT_CHUNK_BLOCKS,
 };
 use crate::fusion::{self, Leg};
@@ -186,6 +186,10 @@ struct ShardState {
     /// The write-ahead log (`<index path>.wal/`), behind the same lock as
     /// the index it precedes. `None` when the shard runs without one.
     wal: Option<WalWriter>,
+    /// Cached slot -> parent map for collapse scans (lineage opinion_id
+    /// per slot). Self-validating: rebuilt whenever its length disagrees
+    /// with the index, cleared on snapshot install.
+    parents: Option<std::sync::Arc<Vec<u64>>>,
 }
 
 /// The persistence path of a shard's BM25 store: `<index path>.bm25`.
@@ -611,6 +615,7 @@ impl NodeServiceImpl {
                 bm25: None,
                 generation: None,
                 wal,
+                parents: None,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -705,6 +710,46 @@ impl NodeServiceImpl {
     /// Validate an incoming `StartShardSearch` against the index shape.
     /// turbovec panics on wrong-dim or non-finite queries; the service
     /// turns both into `INVALID_ARGUMENT` before the scan starts.
+    /// The slot -> parent map for collapse scans: lineage `opinion_id`
+    /// per slot, or a high-bit-tagged global id for slots without
+    /// lineage (self-parents; the tag keeps them disjoint from real
+    /// opinion ids). Cached on the shard and rebuilt whenever the index
+    /// length disagrees (append-only ingest makes length the only
+    /// staleness signal; snapshot installs clear the cache explicitly).
+    fn parent_map(
+        state: &Arc<std::sync::RwLock<ShardState>>,
+        slot_offset: u64,
+        n: usize,
+    ) -> Arc<Vec<u64>> {
+        const SELF_PARENT_TAG: u64 = 1 << 63;
+        {
+            let guard = state.read().expect("shard state lock poisoned");
+            if let Some(p) = guard.parents.as_ref() {
+                if p.len() == n {
+                    return Arc::clone(p);
+                }
+            }
+        }
+        let built = {
+            let guard = state.read().expect("shard state lock poisoned");
+            let store = guard.bm25.as_ref().and_then(|b| b.as_index());
+            let mut parents = Vec::with_capacity(n);
+            for slot in 0..n {
+                let parent = store
+                    .and_then(|s| s.lineage(slot as u32))
+                    .map(|l| l.opinion_id)
+                    .unwrap_or(SELF_PARENT_TAG | (slot_offset + slot as u64));
+                parents.push(parent);
+            }
+            Arc::new(parents)
+        };
+        state
+            .write()
+            .expect("shard state lock poisoned")
+            .parents = Some(Arc::clone(&built));
+        built
+    }
+
     fn validate_start(index: &TurboQuantIndex, start: &StartShardSearch) -> Result<(), Status> {
         let dim = index
             .dim_opt()
@@ -1650,6 +1695,88 @@ impl NodeService for NodeServiceImpl {
                 }
             };
 
+            // Collapse-by-parent scans run their own solo path: the
+            // collection semantics (one entry per parent, parent floors,
+            // saturation escalation) do not batch with plain scans.
+            if start.collapse_parents {
+                if start.tie_complete {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument(
+                            "collapse_parents and tie_complete are mutually exclusive",
+                        )))
+                        .await;
+                    return;
+                }
+                let mut external_floor = external_floor;
+                let mut publish_floor = publish_floor;
+                let scan = tokio::task::spawn_blocking(move || {
+                    let n = {
+                        let guard = state.read().expect("shard state lock poisoned");
+                        let index = guard.index.as_ref().ok_or_else(|| {
+                            Status::failed_precondition(
+                                "shard has no index yet (set calibration or add vectors)",
+                            )
+                        })?;
+                        Self::validate_start(index, &start)?;
+                        index.len()
+                    };
+                    // parent_map takes its own locks (read to build, write
+                    // to cache), so the validation guard is dropped first.
+                    let parents = Self::parent_map(&state, slot_offset, n);
+                    let guard = state.read().expect("shard state lock poisoned");
+                    let index = guard.index.as_ref().ok_or_else(|| {
+                        Status::failed_precondition("shard index disappeared mid-setup")
+                    })?;
+                    if index.len() != parents.len() {
+                        return Err(Status::aborted(
+                            "shard grew between setup and scan; retry",
+                        ));
+                    }
+                    Ok(chunked_topk_collapsed(
+                        index,
+                        &start.vector,
+                        start.k as usize,
+                        chunk_blocks,
+                        &parents,
+                        &mut external_floor,
+                        &mut publish_floor,
+                    ))
+                });
+                let outcome = match scan.await {
+                    Ok(result) => result,
+                    Err(e) => Err(Status::internal(format!("collapse scan task failed: {e}"))),
+                };
+                match outcome {
+                    Ok((hits, stats)) => {
+                        let done = SearchShardDone {
+                            hits: hits
+                                .into_iter()
+                                .map(|h| ScoredHit {
+                                    vector_id: slot_offset + u64::from(h.slot),
+                                    score: h.score,
+                                    parent_id: h.parent,
+                                })
+                                .collect(),
+                            stats: Some(ShardScanStats {
+                                chunk_calls: stats.chunk_calls,
+                                candidates_collected: stats.candidates_collected,
+                                floors_published: stats.floors_published,
+                                floor_updates_applied: stats.floor_updates_applied,
+                            }),
+                        };
+                        let _ = tx
+                            .send(Ok(SearchShardResponse {
+                                payload: Some(search_shard_response::Payload::Done(done)),
+                            }))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                }
+                return;
+            }
+
             let outcome: Result<(Vec<ChunkHit>, ScanStats), Status> = match scan_queue {
                 Some(jobs) => {
                     // Coalesced path: validate against the current index
@@ -1733,6 +1860,7 @@ impl NodeService for NodeServiceImpl {
                             .map(|h| ScoredHit {
                                 vector_id: slot_offset + u64::from(h.slot),
                                 score: h.score,
+                                parent_id: 0,
                             })
                             .collect(),
                         stats: Some(ShardScanStats {

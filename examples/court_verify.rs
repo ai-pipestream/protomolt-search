@@ -52,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             request_id: "verify".into(),
             k,
             vector: first.vector,
+            collapse_parents: false,
         })
         .await?
         .into_inner();

@@ -320,6 +320,158 @@ pub fn chunked_topk_batch(
     out
 }
 
+/// One collapsed candidate: a parent document represented by its best
+/// chunk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CollapsedHit {
+    /// The parent id (`parents[slot]` of the best chunk).
+    pub parent: u64,
+    /// The best-scoring slot of this parent (the entry-point chunk c').
+    pub slot: u32,
+    /// That slot's score: the parent's score under max aggregation.
+    pub score: f32,
+}
+
+/// Collapse-by-parent chunked scan: the top-`k` DISTINCT parents of
+/// `query`, each represented by its best chunk. `parents[slot]` maps
+/// every slot to its parent id (length must equal the index length).
+///
+/// Collection keeps ONE running entry per parent (max score, ties to the
+/// lower slot), so a parent with 20,000 chunks costs a running max and
+/// emits one candidate. The published floor is the k-th best PARENT
+/// score — a valid lower bound on the global k-th best parent (the k-th
+/// best of a subset never exceeds the union's) and always >= the plain
+/// chunk floor, so collaborative pruning only strengthens. A chunk
+/// scoring below the floor can never matter: it cannot beat its own
+/// parent's best (which is >= any floor that parent ever defined) nor
+/// introduce a new top-k parent.
+///
+/// Exactness under per-chunk truncation: the kernel returns its top
+/// `chunk_k` slots per call. When that set is SATURATED (exactly
+/// `chunk_k` real candidates came back, so slots above the floor may
+/// have been dropped — possibly a hidden parent's best crowded out by a
+/// many-chunk sibling), the chunk is rescanned with doubled `chunk_k`
+/// until unsaturated; the final call provably returned every slot at or
+/// above the floor in that chunk. Escalations count in
+/// [`ScanStats::chunk_calls`].
+pub fn chunked_topk_collapsed(
+    index: &TurboQuantIndex,
+    query: &[f32],
+    k: usize,
+    chunk_blocks: usize,
+    parents: &[u64],
+    external_floor: &mut dyn FnMut() -> Option<f32>,
+    publish_floor: &mut dyn FnMut(f32),
+) -> (Vec<CollapsedHit>, ScanStats) {
+    let n = index.len();
+    assert_eq!(
+        parents.len(),
+        n,
+        "parents must map every slot of the index"
+    );
+    let mut stats = ScanStats::default();
+    if n == 0 || k == 0 {
+        return (Vec::new(), stats);
+    }
+    let chunk_size = chunk_blocks.max(1) * BLOCK_VECTORS;
+    // Running best per parent. Pruned against the floor after each chunk,
+    // so it holds the current top-k parents plus this chunk's newcomers.
+    let mut best: std::collections::HashMap<u64, ChunkHit> = std::collections::HashMap::new();
+    let mut floor = f32::NEG_INFINITY;
+    let mut mask = vec![false; n];
+
+    let mut start = 0;
+    while start < n {
+        let end = (start + chunk_size).min(n);
+        if let Some(f) = external_floor() {
+            if !f.is_nan() && f > floor {
+                floor = f;
+                stats.floor_updates_applied += 1;
+            }
+        }
+
+        for slot in mask.iter_mut().take(end).skip(start) {
+            *slot = true;
+        }
+        // Escalate until the kernel provably returned everything at or
+        // above the floor in this chunk (an unsaturated call).
+        let mut chunk_k = k.max(1);
+        let hits: Vec<ChunkHit> = loop {
+            stats.chunk_calls += 1;
+            let results = index.search_with_options(
+                query,
+                chunk_k.min(end - start),
+                SearchOptions::new()
+                    .with_mask(&mask)
+                    .with_initial_threshold(floor),
+            );
+            let mut hits = Vec::new();
+            for (&score, &slot) in results
+                .scores_for_query(0)
+                .iter()
+                .zip(results.indices_for_query(0))
+            {
+                if slot < 0 || score < floor {
+                    continue;
+                }
+                hits.push(ChunkHit {
+                    slot: slot as u32,
+                    score,
+                });
+            }
+            if hits.len() < chunk_k.min(end - start) || chunk_k >= end - start {
+                break hits;
+            }
+            chunk_k *= 2;
+        };
+        for slot in mask.iter_mut().take(end).skip(start) {
+            *slot = false;
+        }
+
+        stats.candidates_collected += hits.len() as u64;
+        for hit in hits {
+            let parent = parents[hit.slot as usize];
+            let entry = best.entry(parent).or_insert(hit);
+            if ranks_before(hit, *entry) {
+                *entry = hit;
+            }
+        }
+
+        // Publish the k-th best parent score and prune the map to the
+        // parents still at or above it (ties survive, exactly like the
+        // plain scan's boundary handling).
+        if best.len() >= k {
+            let mut scores: Vec<f32> = best.values().map(|h| h.score).collect();
+            scores.sort_by(|a, b| b.total_cmp(a));
+            let kth = scores[k - 1];
+            if kth > floor {
+                floor = kth;
+            }
+            best.retain(|_, h| h.score >= kth);
+            publish_floor(kth);
+            stats.floors_published += 1;
+        }
+
+        start = end;
+    }
+
+    let mut out: Vec<CollapsedHit> = best
+        .into_iter()
+        .map(|(parent, h)| CollapsedHit {
+            parent,
+            slot: h.slot,
+            score: h.score,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.slot.cmp(&b.slot))
+    });
+    out.truncate(k);
+    (out, stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +787,192 @@ mod tests {
             false,
         );
         assert!(hits.is_empty());
+    }
+
+    /// Deterministic parent layout: contiguous runs with lengths cycling
+    /// 1..=max_run, mirroring opinions as contiguous chunk ranges.
+    fn run_parents(n: usize, max_run: usize) -> Vec<u64> {
+        let mut parents = Vec::with_capacity(n);
+        let (mut parent, mut run, mut len) = (100u64, 0usize, 1usize);
+        for _ in 0..n {
+            parents.push(parent);
+            run += 1;
+            if run >= len {
+                parent += 1;
+                run = 0;
+                len = len % max_run + 1;
+            }
+        }
+        parents
+    }
+
+    /// Brute-force reference: exact scores for every slot, grouped by
+    /// parent under max aggregation, top-k parents by (score desc, slot
+    /// asc).
+    fn collapse_reference(
+        index: &TurboQuantIndex,
+        query: &[f32],
+        parents: &[u64],
+        k: usize,
+    ) -> Vec<CollapsedHit> {
+        let n = index.len();
+        let all = index.search(query, n);
+        let mut best: std::collections::HashMap<u64, ChunkHit> = std::collections::HashMap::new();
+        for (&score, &slot) in all
+            .scores_for_query(0)
+            .iter()
+            .zip(all.indices_for_query(0))
+        {
+            let hit = ChunkHit {
+                slot: slot as u32,
+                score,
+            };
+            let entry = best.entry(parents[slot as usize]).or_insert(hit);
+            if ranks_before(hit, *entry) {
+                *entry = hit;
+            }
+        }
+        let mut out: Vec<CollapsedHit> = best
+            .into_iter()
+            .map(|(parent, h)| CollapsedHit {
+                parent,
+                slot: h.slot,
+                score: h.score,
+            })
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.slot.cmp(&b.slot)));
+        out.truncate(k);
+        out
+    }
+
+    fn signature(hits: &[CollapsedHit]) -> Vec<(u64, u32, u32)> {
+        hits.iter()
+            .map(|h| (h.parent, h.slot, h.score.to_bits()))
+            .collect()
+    }
+
+    /// Collapsed scan must equal the brute-force group-by reference
+    /// bitwise, across chunkings from one block to whole-shard.
+    #[test]
+    fn collapsed_matches_brute_force_reference() {
+        let (n, dim, k) = (5_000, 64, 10);
+        let index = build(n, dim);
+        let query = unit_vectors(1, dim, 0xC0AA_0001);
+        for max_run in [1, 7, 40] {
+            let parents = run_parents(n, max_run);
+            let want = signature(&collapse_reference(&index, &query, &parents, k));
+            for chunk_blocks in [1, 2, 7, 64, 10_000] {
+                let (hits, stats) = chunked_topk_collapsed(
+                    &index,
+                    &query,
+                    k,
+                    chunk_blocks,
+                    &parents,
+                    &mut || None,
+                    &mut |_| {},
+                );
+                assert_eq!(
+                    signature(&hits),
+                    want,
+                    "max_run={max_run} chunk_blocks={chunk_blocks}"
+                );
+                assert!(stats.chunk_calls > 0);
+            }
+        }
+    }
+
+    /// A monster parent: hundreds of near-identical strong chunks in one
+    /// contiguous run. Its siblings crowd every kernel top-k, forcing the
+    /// saturation escalation; results must still match the reference and
+    /// the monster must surface exactly once.
+    #[test]
+    fn collapsed_survives_a_monster_parent() {
+        let (n, dim, k) = (4_096, 32, 5);
+        let mut vectors = unit_vectors(n, dim, 0xC0AB_0001);
+        let query = unit_vectors(1, dim, 0xC0AB_0009);
+        // Slots 1024..1424: the monster, near-copies of the query with
+        // tiny deterministic jitter, all scoring far above everything.
+        for (i, row) in vectors[1024 * dim..1424 * dim].chunks_mut(dim).enumerate() {
+            for (d, x) in row.iter_mut().enumerate() {
+                *x = query[d] + ((i * 31 + d) % 17) as f32 * 1e-4;
+            }
+        }
+        let mut index = TurboQuantIndex::new(dim, 4).unwrap();
+        index.add(&vectors);
+        let mut parents = run_parents(n, 5);
+        for parent in parents.iter_mut().take(1424).skip(1024) {
+            *parent = 7_777_777;
+        }
+
+        let want = signature(&collapse_reference(&index, &query, &parents, k));
+        for chunk_blocks in [2, 8, 64, 10_000] {
+            let (hits, stats) = chunked_topk_collapsed(
+                &index,
+                &query,
+                k,
+                chunk_blocks,
+                &parents,
+                &mut || None,
+                &mut |_| {},
+            );
+            assert_eq!(signature(&hits), want, "chunk_blocks={chunk_blocks}");
+            assert_eq!(
+                hits.iter().filter(|h| h.parent == 7_777_777).count(),
+                1,
+                "monster surfaces exactly once"
+            );
+        }
+    }
+
+    /// Published parent floors are non-decreasing, become lower bounds on
+    /// the final k-th parent score, and an adopted external floor prunes
+    /// without changing results.
+    #[test]
+    fn collapsed_floors_are_sound_and_external_floor_is_lossless() {
+        let (n, dim, k) = (5_000, 64, 10);
+        let index = build(n, dim);
+        let query = unit_vectors(1, dim, 0xC0AC_0001);
+        let parents = run_parents(n, 9);
+
+        let mut published = Vec::new();
+        let (hits, _) = chunked_topk_collapsed(
+            &index,
+            &query,
+            k,
+            8,
+            &parents,
+            &mut || None,
+            &mut |f| published.push(f),
+        );
+        assert!(!published.is_empty());
+        assert!(
+            published.windows(2).all(|w| w[0] <= w[1]),
+            "floors must be monotone"
+        );
+        let kth = hits[k - 1].score;
+        assert!(published.iter().all(|&f| f <= kth));
+
+        // Seed the true k-th best as an external floor: results identical,
+        // strictly fewer candidates collected.
+        let (unseeded, base) = chunked_topk_collapsed(
+            &index,
+            &query,
+            k,
+            8,
+            &parents,
+            &mut || None,
+            &mut |_| {},
+        );
+        let (seeded, pruned) = chunked_topk_collapsed(
+            &index,
+            &query,
+            k,
+            8,
+            &parents,
+            &mut || Some(kth),
+            &mut |_| {},
+        );
+        assert_eq!(signature(&unseeded), signature(&seeded));
+        assert!(pruned.candidates_collected < base.candidates_collected);
     }
 }

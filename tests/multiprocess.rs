@@ -138,6 +138,7 @@ async fn coordinator_topk(coord: &str, query: &[f32], k: u32) -> Vec<(u64, u32)>
             request_id: String::new(),
             k,
             vector: query.to_vec(),
+            collapse_parents: false,
         })
         .await
         .unwrap()

@@ -103,6 +103,7 @@ async fn search_topk(
             k,
             vector,
             tie_complete: false,
+            collapse_parents: false,
         })),
     })
     .await

@@ -35,6 +35,7 @@ async fn one_query(addr: &str, vector: Vec<f32>, k: u32) -> usize {
             k,
             vector,
             tie_complete: false,
+            collapse_parents: false,
         })),
     })
     .await

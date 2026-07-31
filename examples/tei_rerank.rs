@@ -383,6 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             request_id: String::new(),
                             k: pool_k as u32,
                             vector,
+                            collapse_parents: false,
                         })
                         .await
                         .expect("search")

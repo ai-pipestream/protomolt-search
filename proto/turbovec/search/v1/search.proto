@@ -309,6 +309,19 @@ message StartShardSearch {
   // must include every tied doc on every shard. Off by default, leaving
   // plain vector Search semantics untouched.
   bool tie_complete = 4;
+  // When true, the shard collapses by PARENT DOCUMENT: k means k
+  // distinct parents, each represented by its best-scoring chunk (the
+  // entry point c'), and `SearchShardDone.hits` carry `parent_id`. The
+  // parent of a slot is its doc-store lineage `opinion_id`; slots
+  // without lineage parent themselves (high-bit-tagged global id).
+  // Published floors become k-th best PARENT scores, which are >= the
+  // plain chunk floors, so collaborative pruning only strengthens; the
+  // lossless invariant holds unchanged (a chunk below the floor can
+  // neither beat its own parent's best nor introduce a new top-k
+  // parent). Mutually exclusive with `tie_complete`. Requires a doc
+  // store on shards that should map real parents; a vector-only shard
+  // degrades to self-parents (no collapse effect, still correct).
+  bool collapse_parents = 5;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -368,6 +381,10 @@ message ScoredHit {
   // turbovec score; higher is better. Comparable across shards only when
   // every shard shares the same TQ+ calibration.
   float score = 2;
+  // Collapse mode only: the parent document this hit represents
+  // (lineage opinion_id, or a high-bit-tagged global id for slots
+  // without lineage). 0 outside collapse mode.
+  uint64 parent_id = 3;
 }
 
 // Empty: the node reports whatever its loaded index holds.
@@ -493,6 +510,10 @@ message SearchRequest {
   uint32 k = 2;
   // The query vector. Length must equal the shard dimension.
   repeated float vector = 3;
+  // Collapse by parent document (Lucene-style field collapsing): k
+  // means k distinct parents, each hit is a parent's best chunk and
+  // carries `parent_id`. See StartShardSearch.collapse_parents.
+  bool collapse_parents = 4;
 }
 
 // Client-facing search response.

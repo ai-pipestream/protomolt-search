@@ -629,6 +629,7 @@ impl CoordinatorServiceImpl {
             vector: Arc::new(vector.to_vec()),
             k,
             tie_complete,
+            collapse: false,
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
             hedges: Arc::new(AtomicU64::new(0)),
@@ -687,8 +688,114 @@ impl CoordinatorServiceImpl {
             .map(|h| ScoredHit {
                 vector_id: h.vector_id,
                 score: h.score,
+                parent_id: 0,
             })
             .collect();
+        Ok(FanoutResult {
+            hits,
+            shard_stats,
+            shard_hits,
+            shard_wall_ms,
+            hedges_fired: hedges.load(AtomicOrdering::Relaxed),
+            hedge_wins: hedge_wins.load(AtomicOrdering::Relaxed),
+        })
+    }
+
+    /// [`Self::fanout_search`] in collapse-by-parent mode: `k` means k
+    /// distinct parent documents, each represented by its best chunk.
+    /// Shards collapse locally (their floors are k-th best PARENT
+    /// scores, so collaborative pruning strengthens); the coordinator
+    /// dedupes parents that appear on multiple shards (opinions
+    /// straddling a shard cut) keeping the better representative, then
+    /// takes the global top-k parents.
+    pub async fn fanout_search_collapse(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+    ) -> Result<FanoutResult, Status> {
+        let n_nodes = self.node_addrs.len();
+        if n_nodes == 0 {
+            return Err(Status::failed_precondition("no shard nodes configured"));
+        }
+        let ctx = ShardQueryCtx {
+            request_id: Arc::from(request_id),
+            vector: Arc::new(vector.to_vec()),
+            k,
+            tie_complete: false,
+            collapse: true,
+            tracker: Arc::new(Mutex::new(FloorTracker::new())),
+            gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
+            hedges: Arc::new(AtomicU64::new(0)),
+            hedge_wins: Arc::new(AtomicU64::new(0)),
+        };
+        let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
+
+        let (done_tx, mut done_rx) =
+            mpsc::channel::<(u32, f32, Result<SearchShardDone, Status>)>(n_nodes);
+        for shard in 0..n_nodes {
+            let primary = self.node_client(&self.node_addrs[shard])?;
+            let replica = match self.replica_addrs.get(shard).and_then(|r| r.as_deref()) {
+                Some(addr) => Some(self.node_client(addr)?),
+                None => None,
+            };
+            let ctx = ctx.clone();
+            let limits = self.limits;
+            let done_tx = done_tx.clone();
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                let result =
+                    run_shard_with_hedge(shard as u32, primary, replica, ctx, limits).await;
+                let wall_ms = t0.elapsed().as_secs_f32() * 1e3;
+                let _ = done_tx.send((shard as u32, wall_ms, result)).await;
+            });
+        }
+        drop(done_tx);
+
+        let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = Vec::with_capacity(n_nodes);
+        let mut shard_stats: Vec<Option<ShardScanStats>> = Vec::with_capacity(n_nodes);
+        let mut shard_wall_ms: Vec<(u32, f32)> = Vec::with_capacity(n_nodes);
+        // Parent -> best hit. Tie-break inside a parent: score desc, then
+        // vector id asc (globally unique), deterministic across arrival
+        // orders.
+        let mut best: HashMap<u64, ScoredHit> = HashMap::new();
+        for _ in 0..n_nodes {
+            match done_rx.recv().await {
+                Some((shard, wall_ms, Ok(done))) => {
+                    shard_hits.push((
+                        shard,
+                        done.hits
+                            .iter()
+                            .map(|h| (h.vector_id, h.score))
+                            .collect(),
+                    ));
+                    for hit in done.hits {
+                        let entry = best.entry(hit.parent_id).or_insert_with(|| hit.clone());
+                        if hit.score > entry.score
+                            || (hit.score == entry.score && hit.vector_id < entry.vector_id)
+                        {
+                            *entry = hit;
+                        }
+                    }
+                    shard_stats.push(done.stats);
+                    shard_wall_ms.push((shard, wall_ms));
+                }
+                Some((shard, _, Err(e))) => {
+                    return Err(Status::internal(format!("shard {shard} failed: {e}")));
+                }
+                None => {
+                    return Err(Status::internal("fan-out completed without all shards"));
+                }
+            }
+        }
+
+        let mut hits: Vec<ScoredHit> = best.into_values().collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.vector_id.cmp(&b.vector_id))
+        });
+        hits.truncate(k as usize);
         Ok(FanoutResult {
             hits,
             shard_stats,
@@ -1079,6 +1186,8 @@ struct ShardQueryCtx {
     vector: Arc<Vec<f32>>,
     k: u32,
     tie_complete: bool,
+    /// Collapse-by-parent mode (see StartShardSearch.collapse_parents).
+    collapse: bool,
     /// Merges every shard's published floor into the running global max.
     tracker: Arc<Mutex<FloorTracker>>,
     /// Conflating broadcast cell for the global floor: pumps write raises
@@ -1116,6 +1225,7 @@ async fn run_shard_stream(
                 k: ctx.k,
                 vector: ctx.vector.as_ref().clone(),
                 tie_complete: ctx.tie_complete,
+                collapse_parents: ctx.collapse,
             })),
         })
         .await
@@ -1333,9 +1443,13 @@ impl SearchService for CoordinatorServiceImpl {
             req.request_id.clone()
         };
 
-        let result = self
-            .fanout_search(&request_id, &req.vector, req.k, false)
-            .await?;
+        let result = if req.collapse_parents {
+            self.fanout_search_collapse(&request_id, &req.vector, req.k)
+                .await?
+        } else {
+            self.fanout_search(&request_id, &req.vector, req.k, false)
+                .await?
+        };
         Ok(Response::new(SearchResponse {
             request_id,
             hits: result.hits,
