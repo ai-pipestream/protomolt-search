@@ -12,13 +12,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-// VENDORED COPY — do not edit here. Origin:
-//   https://github.com/ai-pipestream/grpc-opennlp-analysis
-//   (src/main/proto/ai/pipestream/opennlp/analysis/v1/analysis.proto)
-// Vendored so this repo can call the OpenNLP analysis sidecar
-// (Analyze → term vectors) without a build-time cross-repo dependency.
-// Sync manually when the upstream proto changes.
 
 syntax = "proto3";
 
@@ -43,6 +36,29 @@ service AnalysisService {
   // language model is downloaded or loaded unless the server is explicitly
   // configured with one.
   rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+
+  // AnalyzeStream analyzes many documents over one call. The FIRST message
+  // must carry the options; it fixes the pipeline for the whole stream (a
+  // client with two option-sets opens two streams — streams are cheap on
+  // HTTP/2). Every later message carries one document, tagged with a
+  // client-chosen sequence number that the response echoes back.
+  //
+  // Responses are NOT guaranteed to arrive in request order: the server
+  // analyzes documents concurrently and returns each result as it
+  // completes, so a slow document never blocks the finished ones behind
+  // it. Match responses to requests by sequence.
+  //
+  // Error contract: a document that fails on its own (empty text, text over
+  // the size cap, an analysis failure) produces an AnalyzeStreamResponse
+  // carrying an error for that sequence, and the stream continues. Only
+  // protocol violations fail the whole call: a first message that is not
+  // options, or a second options message, end the stream with
+  // INVALID_ARGUMENT.
+  //
+  // Flow control is the transport's: the server grants messages from its
+  // actual worker capacity, so a client that just writes as the stream
+  // allows is automatically paced — no client-side concurrency tuning.
+  rpc AnalyzeStream(stream AnalyzeStreamRequest) returns (stream AnalyzeStreamResponse);
 
   // GetCapabilities reports which features this server instance can actually
   // serve right now (embeddings on/off and model directory, POS/NER model
@@ -500,6 +516,60 @@ message AnalyzeResponse {
   // dictionaries work. Words missing from the dictionary come back as "O",
   // the OpenNLP convention.
   repeated string lemmas = 8;
+}
+
+// One message of the AnalyzeStream request direction. The first message of a
+// stream must be options; every later message must be a doc.
+message AnalyzeStreamRequest {
+  oneof msg {
+    // Pipeline configuration for the whole stream. Exactly once, first. An
+    // empty AnalysisOptions selects the server defaults, the same way an
+    // absent options message does on Analyze.
+    AnalysisOptions options = 1;
+
+    // One document to analyze.
+    AnalyzeStreamDoc doc = 2;
+  }
+}
+
+// One document in an AnalyzeStream call.
+message AnalyzeStreamDoc {
+  // Client-chosen identifier, echoed verbatim on the response for this
+  // document. The server never interprets it: reusing a value returns two
+  // responses with the same sequence, which only the client can tell apart.
+  uint64 sequence = 1;
+
+  // The text to analyze. Same per-document cap as Analyze (max_text_bytes in
+  // GetCapabilities); an empty or oversized text produces a per-document
+  // error response, not a stream failure.
+  string text = 2;
+}
+
+// One result of an AnalyzeStream call, in completion order, matched to its
+// request by sequence.
+message AnalyzeStreamResponse {
+  // The sequence of the AnalyzeStreamDoc this responds to.
+  uint64 sequence = 1;
+
+  oneof result {
+    // The analysis, identical in shape and content to what Analyze would
+    // have returned for the same text and options.
+    AnalyzeResponse ok = 2;
+
+    // Why this document failed. The stream itself continues.
+    AnalyzeStreamError error = 3;
+  }
+}
+
+// A per-document failure inside an otherwise healthy stream.
+message AnalyzeStreamError {
+  // Canonical gRPC status code (INVALID_ARGUMENT for empty/oversized text,
+  // INTERNAL for an analysis failure) — the code Analyze would have failed
+  // the whole call with.
+  int32 code = 1;
+
+  // Human-readable description of the failure.
+  string message = 2;
 }
 
 // GetCapabilitiesRequest is empty: capabilities describe the whole server.

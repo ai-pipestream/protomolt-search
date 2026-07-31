@@ -220,15 +220,20 @@ pub async fn start_coordinator(
 /// documented fallback when the real native sidecar is unavailable.
 /// Corpora are ASCII, so byte offsets == char offsets == UTF-16 units.
 pub mod mock_analysis {
+    use std::pin::Pin;
+
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_stream::Stream;
     use tonic::transport::{Error as TransportError, Server};
-    use tonic::{Request, Response, Status};
+    use tonic::{Request, Response, Status, Streaming};
 
     use crate::pb::analysis::analysis_service_server::{AnalysisService, AnalysisServiceServer};
     use crate::pb::analysis::{
-        AnalyzeRequest, AnalyzeResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, Span,
-        TermVector, Token,
+        analyze_stream_request, analyze_stream_response, AnalysisOptions, AnalyzeRequest,
+        AnalyzeResponse, AnalyzeStreamError, AnalyzeStreamRequest, AnalyzeStreamResponse,
+        GetCapabilitiesRequest, GetCapabilitiesResponse, Span, TermVector, Token,
     };
     use crate::MAX_MESSAGE_BYTES;
 
@@ -256,23 +261,17 @@ pub mod mock_analysis {
     #[derive(Default)]
     pub struct MockAnalysis;
 
-    #[tonic::async_trait]
-    impl AnalysisService for MockAnalysis {
-        async fn analyze(
-            &self,
-            request: Request<AnalyzeRequest>,
-        ) -> Result<Response<AnalyzeResponse>, Status> {
-            let req = request.into_inner();
-            if req.text.is_empty() {
-                return Err(Status::invalid_argument("empty text"));
-            }
-            let options = req.options.unwrap_or_default();
-
-            // Whitespace tokenize with original-text spans.
+    /// The analysis itself, shared verbatim by the unary and streaming
+    /// paths — the same guarantee the real sidecar tests prove.
+    fn analyze_text(text: &str, options: &AnalysisOptions) -> Result<AnalyzeResponse, Status> {
+        if text.is_empty() {
+            return Err(Status::invalid_argument("empty text"));
+        }
+        // Whitespace tokenize with original-text spans.
             let mut tokens = Vec::new();
             let mut offset = 0usize;
-            for word in req.text.split_whitespace() {
-                let start = req.text[offset..].find(word).map(|i| offset + i).unwrap();
+            for word in text.split_whitespace() {
+                let start = text[offset..].find(word).map(|i| offset + i).unwrap();
                 let end = start + word.len();
                 tokens.push(Token {
                     span: Some(Span {
@@ -293,7 +292,7 @@ pub mod mock_analysis {
             };
 
             let mut term_vectors: Vec<TermVector> = Vec::new();
-            if let Some(tv) = options.term_vectors {
+            if let Some(tv) = &options.term_vectors {
                 if tv.enabled {
                     const SOURCE_STEMS: i32 = 2;
                     const MODE_SCORING_ONLY: i32 = 2;
@@ -328,7 +327,7 @@ pub mod mock_analysis {
                 }
             }
 
-            Ok(Response::new(AnalyzeResponse {
+            Ok(AnalyzeResponse {
                 sentences: Vec::new(),
                 tokens,
                 stems,
@@ -337,7 +336,103 @@ pub mod mock_analysis {
                 embeddings: Vec::new(),
                 warnings: Vec::new(),
                 lemmas: Vec::new(),
-            }))
+            })
+    }
+
+    #[tonic::async_trait]
+    impl AnalysisService for MockAnalysis {
+        async fn analyze(
+            &self,
+            request: Request<AnalyzeRequest>,
+        ) -> Result<Response<AnalyzeResponse>, Status> {
+            let req = request.into_inner();
+            let options = req.options.unwrap_or_default();
+            Ok(Response::new(analyze_text(&req.text, &options)?))
+        }
+
+        type AnalyzeStreamStream =
+            Pin<Box<dyn Stream<Item = Result<AnalyzeStreamResponse, Status>> + Send>>;
+
+        /// The streaming contract of the real sidecar: options must come
+        /// first (once), per-document failures come back as error results
+        /// on their sequence, and responses are delivered DELIBERATELY out
+        /// of request order (each pair swapped) so client reorder logic is
+        /// actually exercised by the tests.
+        async fn analyze_stream(
+            &self,
+            request: Request<Streaming<AnalyzeStreamRequest>>,
+        ) -> Result<Response<Self::AnalyzeStreamStream>, Status> {
+            let mut inbound = request.into_inner();
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AnalyzeStreamResponse, Status>>(16);
+            tokio::spawn(async move {
+                let mut options: Option<AnalysisOptions> = None;
+                let mut held: Option<AnalyzeStreamResponse> = None;
+                loop {
+                    let message = match inbound.message().await {
+                        Ok(Some(message)) => message,
+                        Ok(None) => break,
+                        Err(_) => return,
+                    };
+                    match message.msg {
+                        Some(analyze_stream_request::Msg::Options(o)) => {
+                            if options.is_some() {
+                                let _ = tx
+                                    .send(Err(Status::invalid_argument(
+                                        "options may only be the first message of the stream",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            options = Some(o);
+                        }
+                        Some(analyze_stream_request::Msg::Doc(doc)) => {
+                            let Some(options) = options.as_ref() else {
+                                let _ = tx
+                                    .send(Err(Status::invalid_argument(
+                                        "the first message of the stream must carry options",
+                                    )))
+                                    .await;
+                                return;
+                            };
+                            let result = match analyze_text(&doc.text, options) {
+                                Ok(ok) => analyze_stream_response::Result::Ok(ok),
+                                Err(status) => analyze_stream_response::Result::Error(
+                                    AnalyzeStreamError {
+                                        code: status.code() as i32,
+                                        message: status.message().to_string(),
+                                    },
+                                ),
+                            };
+                            let response = AnalyzeStreamResponse {
+                                sequence: doc.sequence,
+                                result: Some(result),
+                            };
+                            match held.take() {
+                                None => held = Some(response),
+                                Some(previous) => {
+                                    if tx.send(Ok(response)).await.is_err()
+                                        || tx.send(Ok(previous)).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = tx
+                                .send(Err(Status::invalid_argument(
+                                    "message carries neither options nor doc",
+                                )))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                if let Some(last) = held {
+                    let _ = tx.send(Ok(last)).await;
+                }
+            });
+            Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
         }
 
         async fn get_capabilities(

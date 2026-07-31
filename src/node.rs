@@ -1130,6 +1130,256 @@ fn weight_or_default(value: f32, name: &str) -> Result<f64, Status> {
     Ok(f64::from(value))
 }
 
+/// Bulk-ingest internals: the two analysis transports and the shared
+/// per-document apply step.
+impl NodeServiceImpl {
+    /// Apply one analyzed document: id assignment, store insert, WAL
+    /// append. Must be called in arrival order — both transports
+    /// guarantee it.
+    fn apply_analyzed_document(
+        &self,
+        doc: AddDocumentsRequest,
+        analyzed: crate::postings::AnalyzedDoc,
+        added: &mut u64,
+        first_id: &mut u64,
+    ) -> Result<(), Status> {
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        // A disk-resident shard that receives more documents is first
+        // reloaded into the heap builder (the append path is
+        // bulk-load: build in memory, flush back to v3).
+        if matches!(guard.bm25, Some(Bm25Shard::Resident(_))) {
+            let bm25_path = self
+                .config
+                .index_path
+                .as_ref()
+                .map(|p| storage_paths(p, guard.generation.as_ref()).1)
+                .ok_or_else(|| {
+                    Status::failed_precondition("resident shard has no index path to reload from")
+                })?;
+            let store = Bm25Store::load(&bm25_path)
+                .map_err(|e| Status::internal(format!("reload {}: {e}", bm25_path.display())))?;
+            guard.bm25 = Some(Bm25Shard::Building(store));
+        }
+        // Shared positional id space with the vector side: the next id
+        // is past both indexes' tips.
+        let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
+        if guard.bm25.is_none() {
+            let builder = self.new_builder(guard.generation.as_ref())?;
+            guard.bm25 = Some(builder);
+        }
+        let doc_id = vector_tip.max(
+            guard
+                .bm25
+                .as_ref()
+                .expect("builder just ensured")
+                .next_doc_id(),
+        );
+        let global_id = self.config.slot_offset + u64::from(doc_id);
+        if *added == 0 {
+            *first_id = global_id;
+        }
+        // Apply first, log after, as for vectors: a document that
+        // fails to enter the store must never reach the log, or its
+        // id would be reassigned and poison the replay.
+        let lineage = doc.lineage.map(|l| crate::postings::DocLineage {
+            opinion_id: l.opinion_id,
+            cluster_id: l.cluster_id,
+            span_start: l.span_start,
+            span_end: l.span_end,
+        });
+        match guard.bm25.as_mut().expect("builder just ensured") {
+            Bm25Shard::Building(store) => {
+                store.add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage);
+            }
+            Bm25Shard::Spilling(builder) => {
+                builder
+                    .add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage)
+                    .map_err(|e| Status::internal(format!("spill write: {e}")))?;
+            }
+            Bm25Shard::Resident(_) => {
+                return Err(Status::internal("shard builder unavailable"));
+            }
+        }
+        wal_append_or_degrade(
+            &mut guard.wal,
+            wal_record::Op::AddDocuments(LoggedAddDocuments {
+                first_id: global_id,
+                documents: vec![doc],
+            }),
+        );
+        *added += 1;
+        Ok(())
+    }
+
+    /// Bulk ingest over one AnalyzeStream: submissions run ahead of the
+    /// apply point as far as the sidecar grants credit, results return
+    /// in completion order, and the apply wavefront advances over
+    /// consecutive sequences so application stays in arrival order.
+    async fn ingest_streamed(
+        &self,
+        mut session: crate::analyzer::AnalyzeStream,
+        first: AddDocumentsRequest,
+        inbound: &mut Streaming<AddDocumentsRequest>,
+        addr: &str,
+        added: &mut u64,
+        first_id: &mut u64,
+    ) -> Result<(), Status> {
+        // Documents held for ordered apply; bounds this side's memory the
+        // way ANALYZE_PIPELINE bounded the unary path.
+        const MAX_PENDING: usize = 32;
+        fn store_result(
+            results: &mut std::collections::HashMap<u64, crate::postings::AnalyzedDoc>,
+            item: Option<(u64, Result<crate::postings::AnalyzedDoc, Status>)>,
+        ) -> Result<(), Status> {
+            match item {
+                Some((sequence, Ok(analyzed))) => {
+                    results.insert(sequence, analyzed);
+                    Ok(())
+                }
+                // One document failing fails the ingest call, exactly as
+                // a failed unary analysis did.
+                Some((_, Err(status))) => Err(status),
+                None => Err(Status::internal(
+                    "analysis stream completed with documents in flight",
+                )),
+            }
+        }
+        enum Step {
+            Doc(AddDocumentsRequest),
+            InboundClosed,
+            Result(Option<(u64, Result<crate::postings::AnalyzedDoc, Status>)>),
+        }
+        let mut spec = first.analysis.clone();
+        let mut submit = Some(session.submitter());
+        let mut pending: std::collections::BTreeMap<u64, AddDocumentsRequest> =
+            std::collections::BTreeMap::new();
+        let mut results: std::collections::HashMap<u64, crate::postings::AnalyzedDoc> =
+            std::collections::HashMap::new();
+        submit
+            .as_ref()
+            .expect("submitter set above")
+            .submit(0, &first.text)
+            .await?;
+        pending.insert(0, first);
+        let mut next_seq = 1u64;
+        let mut next_apply = 0u64;
+        let mut inbound_open = true;
+        loop {
+            while let Some(analyzed) = results.remove(&next_apply) {
+                let doc = pending
+                    .remove(&next_apply)
+                    .expect("every result has a pending document");
+                self.apply_analyzed_document(doc, analyzed, added, first_id)?;
+                next_apply += 1;
+            }
+            if pending.is_empty() && !inbound_open {
+                break;
+            }
+            let step = if inbound_open && pending.len() < MAX_PENDING {
+                tokio::select! {
+                    message = inbound.message() => match message? {
+                        Some(doc) => Step::Doc(doc),
+                        None => Step::InboundClosed,
+                    },
+                    result = session.next() => Step::Result(result?),
+                }
+            } else {
+                Step::Result(session.next().await?)
+            };
+            match step {
+                Step::Doc(doc) => {
+                    if doc.analysis != spec {
+                        // A mid-stream spec change (rare): drain the
+                        // current session completely so ordering holds,
+                        // then open a new one for the new spec. Dropping
+                        // the submitter clone is what lets the old
+                        // session half-close and drain.
+                        drop(submit.take());
+                        session.finish();
+                        while !pending.is_empty() {
+                            store_result(&mut results, session.next().await?)?;
+                            while let Some(analyzed) = results.remove(&next_apply) {
+                                let done = pending
+                                    .remove(&next_apply)
+                                    .expect("every result has a pending document");
+                                self.apply_analyzed_document(done, analyzed, added, first_id)?;
+                                next_apply += 1;
+                            }
+                        }
+                        session =
+                            crate::analyzer::AnalyzeStream::open(addr, doc.analysis.as_ref())
+                                .await?;
+                        spec = doc.analysis.clone();
+                        submit = Some(session.submitter());
+                    }
+                    submit
+                        .as_ref()
+                        .expect("stream open while inbound open")
+                        .submit(next_seq, &doc.text)
+                        .await?;
+                    pending.insert(next_seq, doc);
+                    next_seq += 1;
+                }
+                Step::InboundClosed => {
+                    inbound_open = false;
+                    submit = None;
+                    session.finish();
+                }
+                Step::Result(item) => store_result(&mut results, item)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The pre-stream transport, kept for sidecars that predate
+    /// AnalyzeStream: up to ANALYZE_PIPELINE unary sidecar calls run
+    /// ahead of the apply point.
+    async fn ingest_unary(
+        &self,
+        first: AddDocumentsRequest,
+        inbound: &mut Streaming<AddDocumentsRequest>,
+        addr: &str,
+        added: &mut u64,
+        first_id: &mut u64,
+    ) -> Result<(), Status> {
+        const ANALYZE_PIPELINE: usize = 8;
+        let spawn_analysis = |doc: &AddDocumentsRequest| {
+            let addr = addr.to_string();
+            let text = doc.text.clone();
+            let spec = doc.analysis.clone();
+            tokio::spawn(
+                async move { crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await },
+            )
+        };
+        let mut in_flight: std::collections::VecDeque<(
+            AddDocumentsRequest,
+            tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
+        )> = std::collections::VecDeque::new();
+        let handle = spawn_analysis(&first);
+        in_flight.push_back((first, handle));
+        let mut inbound_open = true;
+        loop {
+            while inbound_open && in_flight.len() < ANALYZE_PIPELINE {
+                match inbound.message().await? {
+                    Some(doc) => {
+                        let handle = spawn_analysis(&doc);
+                        in_flight.push_back((doc, handle));
+                    }
+                    None => inbound_open = false,
+                }
+            }
+            let Some((doc, handle)) = in_flight.pop_front() else {
+                break;
+            };
+            let analyzed = handle
+                .await
+                .map_err(|e| Status::internal(format!("analysis task failed: {e}")))??;
+            self.apply_analyzed_document(doc, analyzed, added, first_id)?;
+        }
+        Ok(())
+    }
+}
+
 #[tonic::async_trait]
 impl NodeService for NodeServiceImpl {
     type SearchShardStream = ReceiverStream<Result<SearchShardResponse, Status>>;
@@ -1447,105 +1697,31 @@ impl NodeService for NodeServiceImpl {
         let mut inbound = request.into_inner();
         let mut added = 0u64;
         let mut first_id = 0u64;
-        // Analysis round-trips dominate bulk ingest, so they are
-        // pipelined: up to ANALYZE_PIPELINE sidecar calls run ahead of
-        // the apply point, while documents are applied strictly in
-        // arrival order — ids and WAL order stay deterministic.
-        const ANALYZE_PIPELINE: usize = 8;
-        let mut in_flight: std::collections::VecDeque<(
-            AddDocumentsRequest,
-            tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
-        )> = std::collections::VecDeque::new();
-        let mut inbound_open = true;
-        loop {
-            while inbound_open && in_flight.len() < ANALYZE_PIPELINE {
-                match inbound.message().await? {
-                    Some(doc) => {
-                        let addr = addr.clone();
-                        let text = doc.text.clone();
-                        let spec = doc.analysis.clone();
-                        let handle = tokio::spawn(async move {
-                            crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await
-                        });
-                        in_flight.push_back((doc, handle));
-                    }
-                    None => inbound_open = false,
+        // Analysis dominates bulk ingest. The preferred transport is one
+        // AnalyzeStream for the whole call, paced by the sidecar's own
+        // flow control; a sidecar that predates the RPC (UNIMPLEMENTED
+        // on open) gets the previous pipelined-unary path. Either way,
+        // documents are applied strictly in arrival order — ids and WAL
+        // order stay deterministic.
+        if let Some(first) = inbound.message().await? {
+            match crate::analyzer::AnalyzeStream::open(&addr, first.analysis.as_ref()).await {
+                Ok(session) => {
+                    self.ingest_streamed(
+                        session,
+                        first,
+                        &mut inbound,
+                        &addr,
+                        &mut added,
+                        &mut first_id,
+                    )
+                    .await?;
                 }
-            }
-            let Some((doc, handle)) = in_flight.pop_front() else {
-                break;
-            };
-            let analyzed = handle
-                .await
-                .map_err(|e| Status::internal(format!("analysis task failed: {e}")))??;
-            let mut guard = self.state.write().expect("shard state lock poisoned");
-            // A disk-resident shard that receives more documents is first
-            // reloaded into the heap builder (the append path is
-            // bulk-load: build in memory, flush back to v3).
-            if matches!(guard.bm25, Some(Bm25Shard::Resident(_))) {
-                let bm25_path = self
-                    .config
-                    .index_path
-                    .as_ref()
-                    .map(|p| storage_paths(p, guard.generation.as_ref()).1)
-                    .ok_or_else(|| {
-                        Status::failed_precondition(
-                            "resident shard has no index path to reload from",
-                        )
-                    })?;
-                let store = Bm25Store::load(&bm25_path).map_err(|e| {
-                    Status::internal(format!("reload {}: {e}", bm25_path.display()))
-                })?;
-                guard.bm25 = Some(Bm25Shard::Building(store));
-            }
-            // Shared positional id space with the vector side: the next id
-            // is past both indexes' tips.
-            let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
-            if guard.bm25.is_none() {
-                let builder = self.new_builder(guard.generation.as_ref())?;
-                guard.bm25 = Some(builder);
-            }
-            let doc_id = vector_tip.max(
-                guard
-                    .bm25
-                    .as_ref()
-                    .expect("builder just ensured")
-                    .next_doc_id(),
-            );
-            let global_id = self.config.slot_offset + u64::from(doc_id);
-            if added == 0 {
-                first_id = global_id;
-            }
-            // Apply first, log after, as for vectors: a document that
-            // fails to enter the store must never reach the log, or its
-            // id would be reassigned and poison the replay.
-            let lineage = doc.lineage.map(|l| crate::postings::DocLineage {
-                opinion_id: l.opinion_id,
-                cluster_id: l.cluster_id,
-                span_start: l.span_start,
-                span_end: l.span_end,
-            });
-            match guard.bm25.as_mut().expect("builder just ensured") {
-                Bm25Shard::Building(store) => {
-                    store.add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage);
+                Err(status) if status.code() == tonic::Code::Unimplemented => {
+                    self.ingest_unary(first, &mut inbound, &addr, &mut added, &mut first_id)
+                        .await?;
                 }
-                Bm25Shard::Spilling(builder) => {
-                    builder
-                        .add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage)
-                        .map_err(|e| Status::internal(format!("spill write: {e}")))?;
-                }
-                Bm25Shard::Resident(_) => {
-                    return Err(Status::internal("shard builder unavailable"));
-                }
+                Err(status) => return Err(status),
             }
-            wal_append_or_degrade(
-                &mut guard.wal,
-                wal_record::Op::AddDocuments(LoggedAddDocuments {
-                    first_id: global_id,
-                    documents: vec![doc],
-                }),
-            );
-            added += 1;
         }
         let total = self
             .state

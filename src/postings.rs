@@ -148,7 +148,7 @@ pub struct DocLineage {
 }
 
 /// One analyzed document ready to be indexed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnalyzedDoc {
     /// Per-term data; see [`DocTerms`].
     pub terms: DocTerms,

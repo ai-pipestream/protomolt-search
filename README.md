@@ -251,9 +251,13 @@ sidecar's job (`AnalysisService.Analyze` → term vectors; its proto is
 vendored at `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`, see
 the file header).
 
-**Ingest** (`NodeService.AddDocuments`, client-streaming): for each
-document the node calls the sidecar (term vectors, MODE_FULL → offsets in
-ORIGINAL text coordinates), builds postings, and stores the raw text. Doc
+**Ingest** (`NodeService.AddDocuments`, client-streaming): the node
+carries the whole call's documents over one sidecar `AnalyzeStream`
+(term vectors, MODE_FULL → offsets in ORIGINAL text coordinates), paced
+end to end by the sidecar's server-side flow control; results return in
+completion order and are applied in arrival order. A sidecar that
+predates the stream RPC (UNIMPLEMENTED) gets pipelined unary calls
+instead. Either way the node builds postings and stores the raw text. Doc
 ids share the shard's positional id space with vectors (next id =
 max(vectors, docs)). Analysis options pass through (`AnalysisSpec`:
 tokenizer/stemmer/term-vector mode+source/normalizer rungs, as the
