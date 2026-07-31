@@ -1,26 +1,24 @@
-//! The live-rerank experiment: does a REAL transformer (TEI,
-//! all-MiniLM-L6-v2 — the teacher family of the static model2vec index
-//! embeddings) reranking the quantized index's k=1000 pool recover the
-//! loss from 4-bit quantization?
+//! The live-rerank falloff experiment: rerank the quantized index's
+//! k' pool with a REAL transformer (TEI, all-MiniLM-L6-v2 — the teacher
+//! family of the static model2vec index embeddings) and measure, against
+//! the same rerank over the EXACT fp32 pool (the no-quantization
+//! counterfactual), how deep the reranked list can be trusted.
 //!
-//! Design: for each query text,
-//!   1. embed with the sidecar's model2vec (the index's space) and take
-//!      turbovec's k=1000 over the LIVE cluster (quantized pool);
-//!   2. compute the EXACT fp32 model2vec top-1000 by streaming the full
-//!      embeddings file (exact pool) — the no-quantization counterfactual;
-//!   3. fetch both pools' chunk texts from the owning shards, re-embed
-//!      them (and the query) with TEI, and rerank each pool by TEI cosine;
-//!   4. recall@k = overlap of the two TEI-reranked top-k lists.
+//! Per query: (a) quantized pool = Search k' over the live cluster;
+//! (b) exact pool = fp32 model2vec top-k' from one streaming pass over
+//! the full embeddings file; (c) both pools' texts re-embedded through
+//! TEI and reranked by cosine; (d) recall@k = overlap of the two
+//! reranked top-k lists, for a dense k grid and every pool prefix
+//! (smaller pools are prefixes of the largest, so one run yields the
+//! whole (pool k', depth k) matrix).
 //!
-//! A recall of 1.0 means the quantized index's pool, after the live TEI
-//! rerank, ends in EXACTLY the results the lossless index would have
-//! produced — the quantization loss is invisible behind the reranker.
-//! Pool overlap@1000 is reported alongside as the pre-rerank baseline.
+//! Queries: a fixed topical seed set plus deterministic span samples
+//! drawn from random corpus chunks (real legal language, all unique),
+//! up to `--queries` total. CSV per (pool, k): mean/min/max/p10 recall
+//! over the query set.
 //!
 //! ```text
-//! tei_rerank --coordinator=http://127.0.0.1:59291 \
-//!     --nodes=127.0.0.1:59300,...,127.0.0.1:59307 \
-//!     --analysis=http://127.0.0.1:59202 --tei=http://127.0.0.1:8085
+//! tei_rerank --queries=500 --pool-k=20000 --csv=/tmp/tei_falloff.csv
 //! ```
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -37,7 +35,8 @@ use turbovec_search::pb::{GetDocumentsRequest, HealthRequest, SearchRequest};
 const DIM: usize = 256;
 const RECORD_HEADER: usize = 12;
 const SLOT_STRIDE: u64 = 25_000_000;
-const QUERIES: &[&str] = &[
+/// Topical seed queries; the rest are sampled from the corpus.
+const SEED_QUERIES: &[&str] = &[
     "artificial intelligence copyright law",
     "habeas corpus ineffective assistance of counsel",
     "fourth amendment warrantless search of a vehicle",
@@ -62,6 +61,18 @@ fn arg(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Deterministic LCG so query sampling is reproducible run to run.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 11
+    }
+}
+
 /// Min-heap entry so the heap root is the weakest of the kept top-k.
 #[derive(PartialEq)]
 struct Entry(f32, u64);
@@ -80,12 +91,31 @@ impl Ord for Entry {
     }
 }
 
+fn dot(vec_bytes: &[u8], q: &[f32]) -> f32 {
+    // Four accumulators for ILP; the compiler cannot reassociate f32
+    // adds on its own and this loop is the experiment's hot path.
+    let (mut a0, mut a1, mut a2, mut a3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let mut d = 0;
+    while d + 4 <= DIM {
+        let f = |i: usize| {
+            f32::from_le_bytes(vec_bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"))
+        };
+        a0 += f(d) * q[d];
+        a1 += f(d + 1) * q[d + 1];
+        a2 += f(d + 2) * q[d + 2];
+        a3 += f(d + 3) * q[d + 3];
+        d += 4;
+    }
+    (a0 + a1) + (a2 + a3)
+}
+
 /// Stream the whole embeddings file once, keeping the exact fp32 top-k
-/// per query. Returns per-query `(file_index, score)` lists, best first.
+/// per query. Threads own QUERY SUBSETS (not row slices): with hundreds
+/// of queries the dot products dominate, and per-thread global heaps
+/// avoid any merge structure entirely.
 fn exact_pools(path: &str, queries: &[Vec<f32>], k: usize) -> Vec<Vec<(u64, f32)>> {
     let file = std::fs::File::open(path).expect("open embeddings");
     let mut reader = std::io::BufReader::with_capacity(1 << 24, file);
-    // File header: 8-byte magic + u32 dim, then the records.
     let mut header = [0u8; 12];
     reader.read_exact(&mut header).expect("embeddings header");
     assert_eq!(
@@ -96,9 +126,11 @@ fn exact_pools(path: &str, queries: &[Vec<f32>], k: usize) -> Vec<Vec<(u64, f32)
     let record_bytes = RECORD_HEADER + DIM * 4;
     const BLOCK_ROWS: usize = 262_144;
     let mut block = vec![0u8; BLOCK_ROWS * record_bytes];
+    let threads = std::thread::available_parallelism().map_or(16, |n| n.get());
+    let per_thread = queries.len().div_ceil(threads);
     let mut heaps: Vec<BinaryHeap<Entry>> = queries.iter().map(|_| BinaryHeap::new()).collect();
     let mut base_row: u64 = 0;
-    let threads = std::thread::available_parallelism().map_or(16, |n| n.get());
+    let t0 = Instant::now();
     loop {
         let mut filled = 0;
         while filled < block.len() {
@@ -114,60 +146,40 @@ fn exact_pools(path: &str, queries: &[Vec<f32>], k: usize) -> Vec<Vec<(u64, f32)
         assert_eq!(filled % record_bytes, 0, "torn record at row {base_row}");
         let rows = filled / record_bytes;
         let data = &block[..filled];
-        // Score the block in parallel slices; each slice returns its own
-        // top-k per query, merged into the global heaps afterwards.
-        let per_slice = rows.div_ceil(threads);
-        let partials: Vec<Vec<Vec<(f32, u64)>>> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|t| {
-                    let start = t * per_slice;
-                    let end = ((t + 1) * per_slice).min(rows);
-                    let queries = &queries;
-                    scope.spawn(move || {
-                        let mut local: Vec<Vec<(f32, u64)>> =
-                            queries.iter().map(|_| Vec::new()).collect();
-                        for row in start..end {
-                            let rec = &data[row * record_bytes..(row + 1) * record_bytes];
-                            let vec_bytes = &rec[RECORD_HEADER..];
-                            for (qi, q) in queries.iter().enumerate() {
-                                let mut dot = 0.0f32;
-                                for d in 0..DIM {
-                                    let v = f32::from_le_bytes(
-                                        vec_bytes[d * 4..d * 4 + 4].try_into().expect("4 bytes"),
-                                    );
-                                    dot += v * q[d];
-                                }
-                                local[qi].push((dot, base_row + row as u64));
+        std::thread::scope(|scope| {
+            for (heap_chunk, query_chunk) in
+                heaps.chunks_mut(per_thread).zip(queries.chunks(per_thread))
+            {
+                scope.spawn(move || {
+                    for row in 0..rows {
+                        let vec_bytes = &data
+                            [row * record_bytes + RECORD_HEADER..(row + 1) * record_bytes];
+                        let gid = base_row + row as u64;
+                        for (heap, q) in heap_chunk.iter_mut().zip(query_chunk) {
+                            let score = dot(vec_bytes, q);
+                            if heap.len() < k {
+                                heap.push(Entry(score, gid));
+                            } else if score > heap.peek().expect("non-empty").0 {
+                                heap.pop();
+                                heap.push(Entry(score, gid));
                             }
                         }
-                        for l in &mut local {
-                            l.sort_by(|a, b| b.0.total_cmp(&a.0));
-                            l.truncate(k);
-                        }
-                        local
-                    })
-                })
-                .collect();
-            workers.into_iter().map(|w| w.join().unwrap()).collect()
-        });
-        for partial in partials {
-            for (qi, list) in partial.into_iter().enumerate() {
-                for (score, idx) in list {
-                    if heaps[qi].len() < k {
-                        heaps[qi].push(Entry(score, idx));
-                    } else if score > heaps[qi].peek().expect("non-empty").0 {
-                        heaps[qi].pop();
-                        heaps[qi].push(Entry(score, idx));
                     }
-                }
+                });
             }
-        }
+        });
         base_row += rows as u64;
+        if base_row % (BLOCK_ROWS as u64 * 64) == 0 {
+            eprintln!(
+                "  exact scan: {base_row} rows in {:?}",
+                t0.elapsed()
+            );
+        }
         if rows < BLOCK_ROWS {
             break;
         }
     }
-    eprintln!("exact scan covered {base_row} rows");
+    eprintln!("exact scan covered {base_row} rows in {:?}", t0.elapsed());
     heaps
         .into_iter()
         .map(|h| {
@@ -179,18 +191,87 @@ fn exact_pools(path: &str, queries: &[Vec<f32>], k: usize) -> Vec<Vec<(u64, f32)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut d, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
     for (x, y) in a.iter().zip(b) {
-        dot += f64::from(*x) * f64::from(*y);
+        d += f64::from(*x) * f64::from(*y);
         na += f64::from(*x) * f64::from(*x);
         nb += f64::from(*y) * f64::from(*y);
     }
-    dot / (na.sqrt() * nb.sqrt())
+    d / (na.sqrt() * nb.sqrt())
 }
 
 fn overlap(a: &[u64], b: &[u64]) -> f64 {
     let set: HashSet<u64> = b.iter().copied().collect();
     a.iter().filter(|x| set.contains(x)).count() as f64 / b.len() as f64
+}
+
+fn tei_request(text: String) -> EmbedRequest {
+    EmbedRequest {
+        inputs: text,
+        truncate: true,
+        normalize: Some(true),
+        truncation_direction: 0,
+        prompt_name: None,
+        dimensions: None,
+    }
+}
+
+/// Embed `texts` through TEI over one shared h2 channel with bounded
+/// concurrency and per-call retry; inputs pre-truncated by the caller.
+async fn tei_embed_batch(
+    channel: &tonic::transport::Channel,
+    tei_addr: &str,
+    texts: Vec<(u64, String)>,
+    concurrency: usize,
+    out: &mut HashMap<u64, Vec<f32>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut inflight = tokio::task::JoinSet::new();
+    let mut next = 0usize;
+    while next < texts.len() || !inflight.is_empty() {
+        while next < texts.len() && inflight.len() < concurrency {
+            let (id, text) = texts[next].clone();
+            let mut client = EmbedClient::new(channel.clone());
+            let addr = tei_addr.to_string();
+            inflight.spawn(async move {
+                let mut attempt = 0;
+                loop {
+                    match client.embed(tei_request(text.clone())).await {
+                        Ok(r) => return (id, r.into_inner().embeddings),
+                        Err(_) if attempt < 3 => {
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt))
+                                .await;
+                            client = EmbedClient::connect(addr.clone())
+                                .await
+                                .expect("reconnect TEI");
+                        }
+                        Err(e) => panic!("TEI embed after {attempt} retries: {e}"),
+                    }
+                }
+            });
+            next += 1;
+        }
+        if let Some(done) = inflight.join_next().await {
+            let (id, v) = done?;
+            out.insert(id, v);
+        }
+    }
+    Ok(())
+}
+
+/// A query-worthy span from a chunk: ~10 words from a third of the way
+/// in. None when the text is too short to make one.
+fn span_query(text: &str) -> Option<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 8 {
+        return None;
+    }
+    let start = words.len() / 3;
+    let span: Vec<&str> = words[start..(start + 10).min(words.len())].to_vec();
+    if span.len() < 6 {
+        return None;
+    }
+    Some(span.join(" "))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -206,17 +287,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let analysis = arg("analysis", "http://127.0.0.1:59202");
     let tei = arg("tei", "http://127.0.0.1:8085");
     let embeddings = arg("embeddings", "/work/court-corpus/embeddings-full.bin");
-    let rerank_ks: Vec<usize> = vec![10, 100];
-    let pool_k: usize = arg("pool-k", "1000").parse()?;
+    let pool_k: usize = arg("pool-k", "20000").parse()?;
+    let n_queries: usize = arg("queries", "500").parse()?;
+    let csv_path = arg("csv", "/tmp/tei_falloff.csv");
+    let concurrency = 32;
 
-    // Per-shard vector counts -> contiguous file-range starts, for the
-    // global-id <-> file-index mapping (shard i holds file rows
-    // [start_i, start_i + n_i) as global ids i*25M + local).
+    // Per-shard vector counts -> contiguous file-range starts for the
+    // global-id <-> file-index mapping.
     let mut counts = Vec::new();
     for node in &nodes {
         let mut client = NodeServiceClient::connect(node.clone()).await?;
         counts.push(client.health(HealthRequest {}).await?.into_inner().num_vectors);
     }
+    let total_docs: u64 = counts.iter().sum();
     let mut starts = vec![0u64; counts.len()];
     for i in 1..counts.len() {
         starts[i] = starts[i - 1] + counts[i - 1];
@@ -230,44 +313,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let gid_to_shard = |gid: u64| (gid / SLOT_STRIDE) as usize;
 
-    // Model2vec query embeddings (the index's space).
-    let mut m2v_queries = Vec::new();
-    for q in QUERIES {
-        m2v_queries.push(analyzer::embed_text(&analysis, q).await?);
-    }
-
-    // Quantized pools from the live cluster.
-    let mut search = SearchServiceClient::connect(coordinator.clone()).await?;
-    let mut quant_pools: Vec<Vec<u64>> = Vec::new();
+    // Query set: seeds + deterministic span samples from random chunks.
     let t = Instant::now();
-    for q in &m2v_queries {
-        let hits = search
-            .search(SearchRequest {
-                request_id: String::new(),
-                k: pool_k as u32,
-                vector: q.clone(),
-            })
-            .await?
-            .into_inner()
-            .hits;
-        quant_pools.push(hits.into_iter().map(|h| h.vector_id).collect());
+    let mut queries: Vec<String> = SEED_QUERIES.iter().map(|s| s.to_string()).collect();
+    let mut seen: HashSet<String> = queries.iter().map(|q| q.to_lowercase()).collect();
+    let mut rng = Lcg(0x5eed_c0de_2026_0731);
+    while queries.len() < n_queries {
+        let mut batch: HashMap<usize, Vec<u64>> = HashMap::new();
+        for _ in 0..256 {
+            let r = rng.next() % total_docs;
+            let shard = match starts.binary_search(&r) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            };
+            batch
+                .entry(shard)
+                .or_default()
+                .push(shard as u64 * SLOT_STRIDE + (r - starts[shard]));
+        }
+        for (shard, doc_ids) in batch {
+            let mut client = NodeServiceClient::connect(nodes[shard].clone()).await?;
+            let found = client
+                .get_documents(GetDocumentsRequest { doc_ids })
+                .await?
+                .into_inner();
+            for doc in found.documents {
+                if queries.len() >= n_queries {
+                    break;
+                }
+                if let Some(span) = span_query(&doc.text) {
+                    if seen.insert(span.to_lowercase()) {
+                        queries.push(span);
+                    }
+                }
+            }
+        }
     }
     eprintln!(
-        "quantized pools: {} queries x k={pool_k} in {:?}",
-        QUERIES.len(),
+        "query set: {} seeds + {} sampled spans in {:?}",
+        SEED_QUERIES.len(),
+        queries.len() - SEED_QUERIES.len(),
         t.elapsed()
     );
 
-    // Exact fp32 pools from one streaming pass over the embeddings file.
+    // Model2vec query embeddings (the index's space), then the
+    // quantized pools from the live cluster, bounded concurrency.
     let t = Instant::now();
-    let exact = exact_pools(&embeddings, &m2v_queries, pool_k);
-    eprintln!("exact fp32 pools in {:?}", t.elapsed());
+    let mut m2v_queries = Vec::new();
+    for q in &queries {
+        m2v_queries.push(analyzer::embed_text(&analysis, q).await?);
+    }
+    eprintln!("model2vec embedded {} queries in {:?}", queries.len(), t.elapsed());
+
+    let t = Instant::now();
+    let quant_pools: Vec<Vec<u64>> = {
+        let mut out: Vec<Option<Vec<u64>>> = vec![None; queries.len()];
+        let mut inflight = tokio::task::JoinSet::new();
+        let mut next = 0usize;
+        while next < m2v_queries.len() || !inflight.is_empty() {
+            while next < m2v_queries.len() && inflight.len() < 8 {
+                let vector = m2v_queries[next].clone();
+                let qi = next;
+                let mut client = SearchServiceClient::connect(coordinator.clone())
+                    .await?
+                    .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES);
+                inflight.spawn(async move {
+                    let hits = client
+                        .search(SearchRequest {
+                            request_id: String::new(),
+                            k: pool_k as u32,
+                            vector,
+                        })
+                        .await
+                        .expect("search")
+                        .into_inner()
+                        .hits;
+                    (qi, hits.into_iter().map(|h| h.vector_id).collect::<Vec<u64>>())
+                });
+                next += 1;
+            }
+            if let Some(done) = inflight.join_next().await {
+                let (qi, pool) = done?;
+                out[qi] = Some(pool);
+            }
+        }
+        out.into_iter().map(|p| p.expect("pool")).collect()
+    };
+    eprintln!(
+        "quantized pools: {} queries x k={pool_k} in {:?}",
+        queries.len(),
+        t.elapsed()
+    );
+
+    let m2v_refs: Vec<Vec<f32>> = m2v_queries.clone();
+    let exact = exact_pools(&embeddings, &m2v_refs, pool_k);
     let exact_pools_gid: Vec<Vec<u64>> = exact
         .iter()
         .map(|pool| pool.iter().map(|&(idx, _)| file_to_gid(idx)).collect())
         .collect();
 
-    // Texts for the union of both pools, one GetDocuments per shard.
+    // Fetch + TEI-embed the union of all pools, streamed per shard so
+    // raw text never accumulates: fetch a batch, embed it, keep only
+    // the vector.
     let t = Instant::now();
     let mut wanted: HashSet<u64> = HashSet::new();
     for pool in quant_pools.iter().chain(exact_pools_gid.iter()) {
@@ -277,111 +424,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for gid in &wanted {
         by_shard.entry(gid_to_shard(*gid)).or_default().push(*gid);
     }
-    let mut texts: HashMap<u64, String> = HashMap::new();
+    let tei_channel = tonic::transport::Endpoint::from_shared(tei.clone())?
+        .connect()
+        .await?;
+    let mut tei_of: HashMap<u64, Vec<f32>> = HashMap::with_capacity(wanted.len());
+    let total_wanted = wanted.len();
     for (shard, doc_ids) in by_shard {
-        let mut client = NodeServiceClient::connect(nodes[shard].clone()).await?
+        let mut client = NodeServiceClient::connect(nodes[shard].clone())
+            .await?
             .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES);
         for ids in doc_ids.chunks(2000) {
             let found = client
                 .get_documents(GetDocumentsRequest { doc_ids: ids.to_vec() })
                 .await?
                 .into_inner();
-            for doc in found.documents {
-                texts.insert(doc.doc_id, doc.text);
+            let batch: Vec<(u64, String)> = found
+                .documents
+                .into_iter()
+                .map(|d| (d.doc_id, d.text.chars().take(4000).collect()))
+                .collect();
+            tei_embed_batch(&tei_channel, &tei, batch, concurrency, &mut tei_of).await?;
+            if tei_of.len() % 500_000 < 2000 {
+                eprintln!("  TEI: {}/{total_wanted} in {:?}", tei_of.len(), t.elapsed());
             }
         }
     }
-    eprintln!(
-        "fetched {} texts for {} wanted ids in {:?}",
-        texts.len(),
-        wanted.len(),
-        t.elapsed()
-    );
+    eprintln!("TEI embedded {}/{total_wanted} texts in {:?}", tei_of.len(), t.elapsed());
 
-    // TEI embeddings for every pooled text + the queries, concurrently.
-    let t = Instant::now();
-    let ids: Vec<u64> = texts.keys().copied().collect();
-    let concurrency = 32;
-    // ONE h2 channel, cloned per call: tonic multiplexes concurrent
-    // requests, and a connect-per-text at this volume reset the server
-    // (the same lesson as the analysis sidecar's shared_channel).
-    let tei_channel = tonic::transport::Endpoint::from_shared(tei.clone())?
-        .connect()
-        .await?;
-    let tei_of: HashMap<u64, Vec<f32>> = {
-        let mut out = HashMap::new();
-        let mut inflight = tokio::task::JoinSet::new();
-        let mut next = 0usize;
-        while next < ids.len() || !inflight.is_empty() {
-            while next < ids.len() && inflight.len() < concurrency {
-                let id = ids[next];
-                // MiniLM truncates at 256 tokens; 4000 chars covers that
-                // with margin, and a multi-MB outlier chunk would tear
-                // down the whole shared h2 connection.
-                let text: String = texts[&id].chars().take(4000).collect();
-                let mut client = EmbedClient::new(tei_channel.clone());
-                let addr = tei.clone();
-                inflight.spawn(async move {
-                    let request = || EmbedRequest {
-                        inputs: text.clone(),
-                        truncate: true,
-                        normalize: Some(true),
-                        truncation_direction: 0,
-                        prompt_name: None,
-                        dimensions: None,
-                    };
-                    let mut attempt = 0;
-                    loop {
-                        match client.embed(request()).await {
-                            Ok(r) => return (id, r.into_inner().embeddings),
-                            Err(e) if attempt < 3 => {
-                                attempt += 1;
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    200 * attempt,
-                                ))
-                                .await;
-                                // Fresh connection: the shared channel may
-                                // be the casualty of another task's failure.
-                                client = EmbedClient::connect(addr.clone())
-                                    .await
-                                    .expect("reconnect TEI");
-                            }
-                            Err(e) => panic!("TEI embed after {attempt} retries: {e}"),
-                        }
-                    }
-                });
-                next += 1;
-            }
-            if let Some(done) = inflight.join_next().await {
-                let (id, v) = done?;
-                out.insert(id, v);
-            }
-        }
-        out
-    };
     let mut tei_queries = Vec::new();
-    let mut tei_client = EmbedClient::connect(tei.clone()).await?;
-    for q in QUERIES {
-        let r = tei_client
-            .embed(EmbedRequest {
-                inputs: q.to_string(),
-                truncate: true,
-                normalize: Some(true),
-                truncation_direction: 0,
-                prompt_name: None,
-                dimensions: None,
-            })
-            .await?
-            .into_inner();
+    for q in &queries {
+        let mut client = EmbedClient::new(tei_channel.clone());
+        let r = client.embed(tei_request(q.clone())).await?.into_inner();
         tei_queries.push(r.embeddings);
     }
-    let tei_ms = t.elapsed();
-    eprintln!("TEI embedded {} texts in {:?}", tei_of.len(), tei_ms);
 
-    // Falloff sweep: TEI-rank the FULL pools once per query; every
-    // smaller pool k' is a prefix of the model2vec-ranked pool, so its
-    // reranked list is the full reranked list filtered to prefix
-    // members. recall@k = overlap of the two reranked top-k lists.
+    // Falloff sweep over pool prefixes and the dense k grid.
     let k_grid: Vec<usize> = vec![
         1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000, 1500,
         2000, 3000, 5000, 7000, 10000, 15000, 20000,
@@ -390,10 +467,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .filter(|p| *p <= pool_k)
         .collect();
-    let csv_path = arg("csv", "/tmp/tei_falloff.csv");
-    let mut csv = String::from("pool_k,k,mean_recall,min_recall,max_recall\n");
+    let mut csv = String::from("pool_k,k,mean_recall,min_recall,max_recall,p10_recall\n");
 
-    // Per query: full TEI-sorted lists for both pools.
     let tei_sort = |pool: &[u64], qi: usize| -> Vec<u64> {
         let mut scored: Vec<(u64, f64)> = pool
             .iter()
@@ -402,22 +477,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.into_iter().map(|(gid, _)| gid).collect()
     };
-    let quant_ranked_full: Vec<Vec<u64>> = (0..QUERIES.len())
+    let quant_ranked_full: Vec<Vec<u64>> = (0..queries.len())
         .map(|qi| tei_sort(&quant_pools[qi], qi))
         .collect();
-    let exact_ranked_full: Vec<Vec<u64>> = (0..QUERIES.len())
+    let exact_ranked_full: Vec<Vec<u64>> = (0..queries.len())
         .map(|qi| tei_sort(&exact_pools_gid[qi], qi))
         .collect();
 
-    println!("\npool_k | trusted depth (mean recall >= 0.98) | recall@10 | recall@100 | recall@1000");
+    println!("\npool_k | trusted depth (mean >= 0.98) | mean@10 | p10@10 | mean@100 | p10@100");
     for &pk in &pool_grid {
-        // Reranked lists restricted to the k'-prefix pools.
-        let per_query: Vec<(Vec<u64>, Vec<u64>)> = (0..QUERIES.len())
+        let per_query: Vec<(Vec<u64>, Vec<u64>)> = (0..queries.len())
             .map(|qi| {
-                let quant_members: HashSet<u64> =
-                    quant_pools[qi][..pk.min(quant_pools[qi].len())].iter().copied().collect();
-                let exact_members: HashSet<u64> =
-                    exact_pools_gid[qi][..pk.min(exact_pools_gid[qi].len())].iter().copied().collect();
+                let quant_members: HashSet<u64> = quant_pools[qi]
+                    [..pk.min(quant_pools[qi].len())]
+                    .iter()
+                    .copied()
+                    .collect();
+                let exact_members: HashSet<u64> = exact_pools_gid[qi]
+                    [..pk.min(exact_pools_gid[qi].len())]
+                    .iter()
+                    .copied()
+                    .collect();
                 (
                     quant_ranked_full[qi]
                         .iter()
@@ -433,26 +513,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         let mut trusted = 0usize;
-        let mut at = HashMap::new();
+        let mut stopped = false;
+        let mut at: HashMap<usize, (f64, f64)> = HashMap::new();
         for &k in k_grid.iter().filter(|&&k| k <= pk) {
-            let recalls: Vec<f64> = per_query
+            let mut recalls: Vec<f64> = per_query
                 .iter()
                 .map(|(q, e)| overlap(&q[..k.min(q.len())], &e[..k.min(e.len())]))
                 .collect();
+            recalls.sort_by(f64::total_cmp);
             let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
-            let min = recalls.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max = recalls.iter().cloned().fold(0.0f64, f64::max);
-            csv.push_str(&format!("{pk},{k},{mean:.4},{min:.4},{max:.4}\n"));
-            if mean >= 0.98 {
+            let min = recalls[0];
+            let max = recalls[recalls.len() - 1];
+            let p10 = recalls[recalls.len() / 10];
+            csv.push_str(&format!("{pk},{k},{mean:.4},{min:.4},{max:.4},{p10:.4}\n"));
+            if mean >= 0.98 && !stopped {
                 trusted = k;
+            } else {
+                stopped = true;
             }
-            at.insert(k, mean);
+            at.insert(k, (mean, p10));
         }
+        let cell = |k: usize, which: usize| {
+            at.get(&k).map_or("-".to_string(), |v| {
+                format!("{:.4}", if which == 0 { v.0 } else { v.1 })
+            })
+        };
         println!(
-            "{pk} | {trusted} | {} | {} | {}",
-            at.get(&10).map_or("-".into(), |r| format!("{r:.4}")),
-            at.get(&100).map_or("-".into(), |r| format!("{r:.4}")),
-            at.get(&1000).map_or("-".into(), |r| format!("{r:.4}")),
+            "{pk} | {trusted} | {} | {} | {} | {}",
+            cell(10, 0),
+            cell(10, 1),
+            cell(100, 0),
+            cell(100, 1),
         );
     }
     std::fs::write(&csv_path, csv)?;

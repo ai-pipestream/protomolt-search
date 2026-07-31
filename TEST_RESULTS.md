@@ -510,3 +510,27 @@ Read-offs: trusting the top-10 at 0.98 needs a ~5k pool; trusting the
 top-100 needs ~20k. Every curve decays toward its pool-overlap floor
 (0.92-0.93) as k approaches k'. Cost scales linearly and stays small:
 ~100ms of CPU TEI per 1000 pooled chunks.
+
+**Round 7 correction, the 500-query rerun (NEGATIVE)**. The 15-query
+tree did not survive scale. Same test with 500 unique queries (15
+topical seeds + 485 span samples drawn from random corpus chunks;
+9.1M pool texts through TEI, ~18 min): mean agreement@10 drops to
+0.87-0.91 (was 0.93-0.99 on seeds alone), 11-14% of queries FLIP THEIR
+TOP-1 vs lossless and pool depth barely moves that (0.856 at k'=1000
+-> 0.888 at 20000), p10@1 = 0 for every pool, one query has ZERO
+top-100 overlap at a 20k pool, and the 0.98 bar is unreachable at any
+depth. Pool-overlap floors drop to 0.86-0.89; "full pool" now starts
+at tau ~0.84-0.86. Raw data docs/benchmarks/tei-falloff-500.csv.
+
+Interpretation, not yet proven: depth-insensitive top-1 flips are the
+signature of exact ties being reshuffled, and corpus-drawn span
+queries land in boilerplate-dense neighborhoods (near-verbatim legal
+formulas, tiny chunks - the known corpus pathologies) where thousands
+of chunks score near-identically, so id-agreement punishes
+interchangeable results. The decisive follow-up is SCORE REGRET:
+compare the TEI cosine served at each rank by the quantized pool vs
+the lossless pool. Regret ~0 with id agreement 0.87 = ties, harmless;
+material regret = real quality loss from quantization. Not yet run.
+
+Also: the topical-seed numbers remain true for topical queries; what
+died is their generalization to an unbiased query mix.
