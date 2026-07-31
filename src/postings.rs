@@ -21,7 +21,13 @@ use std::path::{Path, PathBuf};
 
 const MAGIC_V1: &[u8; 8] = b"TVBM2501";
 const MAGIC_V2: &[u8; 8] = b"TVBM2502";
-const MAGIC: &[u8; 8] = b"TVBM2503";
+/// v3 stored ABSOLUTE term-blob offsets as u32, which overflow once the
+/// file passes 4 GiB; kept readable for files below that size.
+const MAGIC_V3: &[u8; 8] = b"TVBM2503";
+/// v4 layout: identical to v3 except directory blob offsets are relative
+/// to the term blob's start (the blob is at most a few hundred MB, so
+/// u32 offsets are safe at any file size).
+const MAGIC: &[u8; 8] = b"TVBM2504";
 
 /// Callback for [`Bm25Index::for_each_posting`]: `(doc_id, tf,
 /// original-text offsets)`; the offsets slice is valid only inside the
@@ -332,11 +338,11 @@ impl Bm25Store {
         // directory: fixed-stride entries (binary-searchable), then the
         // term blob.
         write_u32(w, terms.len() as u32)?;
-        let mut blob_off = directory_off + 4 + 18 * terms.len() as u64;
+        let mut blob_off = 0u64; // relative to the term blob start (v4)
         for (term, &(offset, df)) in terms.iter().zip(directory.iter()) {
             write_u64(w, offset)?;
             write_u32(w, df)?;
-            write_u32(w, blob_off as u32)?;
+            write_u32(w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
             write_u16(w, term.len() as u16)?;
             blob_off += term.len() as u64;
         }
@@ -349,7 +355,7 @@ impl Bm25Store {
     fn read_from(r: &mut &[u8]) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let magic = take(r, 8)?;
-        if magic == MAGIC {
+        if magic == MAGIC || magic == MAGIC_V3 {
             return Self::read_v3_from(r);
         }
         let has_lineage = if magic == MAGIC_V2 {
@@ -863,11 +869,11 @@ impl SpillBuilder {
             let mut body = std::fs::File::open(&postings_body)?;
             io::copy(&mut body, &mut w)?;
             write_u32(&mut w, directory.len() as u32)?;
-            let mut blob_off = directory_off + 4 + 18 * directory.len() as u64;
+            let mut blob_off = 0u64; // relative to the term blob start (v4)
             for (term, rel_off, df) in &directory {
                 write_u64(&mut w, postings_off + 4 + rel_off)?;
                 write_u32(&mut w, *df)?;
-                write_u32(&mut w, blob_off as u32)?;
+                write_u32(&mut w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
                 write_u16(&mut w, term.len() as u16)?;
                 blob_off += term.len() as u64;
             }
@@ -949,6 +955,9 @@ pub struct Bm25Reader {
     lineages_off: u64,
     directory_off: u64,
     n_terms: u32,
+    /// v4 directories store blob offsets relative to the blob start;
+    /// v3 stored absolute file offsets.
+    blob_relative: bool,
 }
 
 impl Bm25Reader {
@@ -964,9 +973,10 @@ impl Bm25Reader {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let file = std::fs::File::open(path)?;
         let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        if map.len() < 52 || &map[..8] != MAGIC {
-            return Err(invalid("not a v3 .bm25 file"));
+        if map.len() < 52 || (&map[..8] != MAGIC && &map[..8] != MAGIC_V3) {
+            return Err(invalid("not a v3/v4 .bm25 file"));
         }
+        let blob_relative = &map[..8] == MAGIC;
         let mut cur = 8usize;
         let rd_u64 = |cur: &mut usize| -> u64 {
             let v = u64::from_le_bytes(map[*cur..*cur + 8].try_into().unwrap());
@@ -999,6 +1009,7 @@ impl Bm25Reader {
             lineages_off,
             directory_off,
             n_terms,
+            blob_relative,
         })
     }
 
@@ -1006,8 +1017,15 @@ impl Bm25Reader {
         let e = self.directory_off as usize + 4 + 18 * i as usize;
         let postings_off = u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap());
         let df = u32::from_le_bytes(self.map[e + 8..e + 12].try_into().unwrap());
-        let blob_off = u32::from_le_bytes(self.map[e + 12..e + 16].try_into().unwrap()) as usize;
+        let stored = u32::from_le_bytes(self.map[e + 12..e + 16].try_into().unwrap()) as usize;
         let len = u16::from_le_bytes(self.map[e + 16..e + 18].try_into().unwrap()) as usize;
+        // v4 stores offsets relative to the term blob; v3 stored absolute
+        // file offsets (only valid below 4 GiB).
+        let blob_off = if self.blob_relative {
+            self.directory_off as usize + 4 + 18 * self.n_terms as usize + stored
+        } else {
+            stored
+        };
         (&self.map[blob_off..blob_off + len], postings_off, df)
     }
 
