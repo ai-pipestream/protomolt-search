@@ -223,21 +223,6 @@ fn replay_buckets(
     Ok(())
 }
 
-/// Replay a whole generation: manifest plus every bucket file.
-fn replay_gen(gen: &Path) -> Result<(WalManifest, Replay), String> {
-    let manifest = read_gen_manifest(gen)?;
-    let mut out = Replay::default();
-    replay_buckets(
-        gen,
-        0..manifest.bucket_count,
-        manifest.bucket_count as usize,
-        manifest.dim as usize,
-        false,
-        &mut out,
-    )?;
-    Ok((manifest, out))
-}
-
 /// Require a usable, locked calibration in the manifest (see the module
 /// docs for why unseeded logs cannot be resharded).
 fn require_calibration(manifest: &WalManifest, what: &Path) -> Result<(), String> {

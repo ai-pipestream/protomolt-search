@@ -128,12 +128,28 @@ impl CoordinatorServiceImpl {
     }
 
     /// Distributed BM25 with the two-phase global-stats flow (see the
-    /// proto comments on `SearchService.Bm25Search`).
+    /// proto comments on `SearchService.Bm25Search`), unseeded.
     pub async fn fanout_bm25(
         &self,
         text: &str,
         k: u32,
         spec: Option<&crate::pb::AnalysisSpec>,
+    ) -> Result<Vec<Bm25Hit>, Status> {
+        self.fanout_bm25_seeded(text, k, spec, 0.0).await
+    }
+
+    /// [`Self::fanout_bm25`] with a client-supplied floor: `min_score`
+    /// is forwarded verbatim to every shard's `Bm25QueryRequest`, which
+    /// prunes postings that provably cannot reach it (docs/block-max.md,
+    /// stage 4). 0 means unseeded. There is deliberately NO mid-query
+    /// relay: `Bm25Query` is unary, so a fleet-wide floor can only ever
+    /// arrive with the request.
+    pub async fn fanout_bm25_seeded(
+        &self,
+        text: &str,
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
@@ -166,6 +182,7 @@ impl CoordinatorServiceImpl {
                 global_doc_frequencies: global.dfs.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
+                min_score,
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -1004,9 +1021,16 @@ impl SearchService for CoordinatorServiceImpl {
     ) -> Result<Response<Bm25SearchResponse>, Status> {
         let req = request.into_inner();
         let hits = self
-            .fanout_bm25(&req.text, req.k, req.analysis.as_ref())
+            .fanout_bm25_seeded(&req.text, req.k, req.analysis.as_ref(), req.min_score)
             .await?;
-        Ok(Response::new(Bm25SearchResponse { hits }))
+        // The merged k-th best: the last hit's score when k hits were
+        // returned, 0 otherwise (seed a later re-query with it).
+        let kth_best = if hits.len() == req.k as usize {
+            hits.last().map(|h| h.score).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Ok(Response::new(Bm25SearchResponse { hits, kth_best }))
     }
 
     async fn hybrid_search(

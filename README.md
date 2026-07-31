@@ -17,6 +17,8 @@ remainder of their scan against it — losslessly.
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
+Block-max pruning, designed for the lexical leg and measured dead on the
+vector leg: [docs/block-max.md](docs/block-max.md).
 
 Phase 1: one crate, one binary, three roles (`node`, `coordinator`, `both`),
 tonic gRPC + tokio, static cluster membership.
@@ -284,6 +286,18 @@ per-term occurrence offsets; fetch raw text with
 `NodeService.GetDocuments` to highlight. BM25 k1/b are configurable
 (`bm25_k1`/`bm25_b`, defaults 1.2/0.75) and sent to every shard with the
 query so scoring is uniform.
+
+**Block-max pruning** (see `docs/block-max.md`): the v5 `.bm25` format
+stores per-term doc/occurrence/skip runs with two-level impact blocks
+(Lucene-style block-max), and scoring skips postings that provably
+cannot reach the running floor — bit-identical results, measured up to
+~70x on high-df terms at k=10. `Bm25SearchRequest.min_score` seeds the
+whole fleet with a floor the client already holds (e.g. a previous
+query's `kth_best`, re-issued after appends); `min_score` and `kth_best`
+are additive, optional, and 0 means unseeded. `--block-max=false`
+(`TURBOVEC_BLOCK_MAX`) forces the exhaustive scorer for A/B; results are
+identical either way. `cluster_sweep --bm25-terms` sweeps the
+`{seeding} x {block-max}` factorial with a hit-signature gate.
 
 **Persistence**: postings + doc store live in `<index path>.bm25` (custom
 versioned binary format, atomic write), flushed with `Flush` and on
@@ -858,22 +872,24 @@ Shard storage has two shapes behind one read surface
 (`postings::Bm25Index`):
 
 - **Heap builder** (`Bm25Store`) — ingest appends here. `Flush` writes
-  the v3 `.bm25` format and immediately reopens the shard disk-resident.
-- **Disk-resident** (`Bm25Reader`) — the v3 file is memory-mapped;
+  the v5 `.bm25` format and immediately reopens the shard disk-resident.
+- **Disk-resident** (`Bm25Reader`) — the v5 file is memory-mapped;
   postings slices and document texts are read from the map on demand.
   The OS page cache is the buffer pool (the Lucene model): after
-  `Flush` or on startup with a v3 file, a shard holds NO postings or
+  `Flush` or on startup with a v5 file, a shard holds NO postings or
   document texts in heap — only the per-doc length table (4 B/doc) and
-  small lookup structures. Measured: opening a 164 MiB v3 file and
+  small lookup structures. Measured: opening a 164 MiB file and
   serving queries grows RSS by ~11 MiB, versus ~159 MiB for the heap
   load (`tests/mmap_store.rs`).
 
-v3 layout (single file, atomic write): header with absolute section
+v5 layout (single file, atomic write): header with absolute section
 offsets, per-doc lengths, document texts, an on-disk text index
 (fixed-stride entries, so text reads never walk the file), lineage,
-sequential postings (sorted terms), and a fixed-stride term directory
-(binary search per term to its postings offset + df). Pre-v3 files
-still load — into the heap builder, upgraded to v3 on the next flush.
+then per sorted term a fixed-stride doc run, an occurrence run, and a
+skip run of two-level impact blocks (see `docs/block-max.md`), and a
+fixed-stride term directory (binary search per term to its run offsets
++ df). v3/v4 files still load and serve — into the heap builder on the
+append path, upgraded to v5 on the next flush.
 A disk-resident shard that receives more documents first reloads into
 the heap builder (bulk-load discipline: build in memory, flush back).
 

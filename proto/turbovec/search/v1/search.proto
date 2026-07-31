@@ -594,6 +594,13 @@ message Bm25QueryRequest {
   float k1 = 6;
   // BM25 length-normalization parameter; 0 selects the default (0.75).
   float b = 7;
+  // Seeded floor: the lexical twin of the vector leg's
+  // `SearchOptions.initial_threshold`. A coordinator that already holds
+  // a merged k-th best can seed the shard with it; the shard then
+  // returns only hits with score >= min_score (ties at the floor
+  // survive) and block-max pruning skips postings that provably cannot
+  // reach it. 0 means unseeded (scores are always positive).
+  float min_score = 8;
 }
 
 // A half-open span [start, end) in original-text coordinates.
@@ -628,6 +635,12 @@ message Bm25Hit {
 message Bm25QueryResponse {
   // Hits, score descending, ties by doc id.
   repeated Bm25Hit hits = 1;
+  // The shard's k-th best score: the score of the k-th hit when the
+  // shard returned k hits, 0 otherwise (no seedable floor — the shard
+  // could not fill the requested k). A caller that re-queries later
+  // (e.g. after appends) can seed the fleet with it via
+  // Bm25QueryRequest.min_score / Bm25SearchRequest.min_score.
+  float kth_best = 2;
 }
 
 // Reads raw texts from the doc store.
@@ -661,12 +674,22 @@ message Bm25SearchRequest {
   // Analysis options for the query. MUST match the options documents were
   // ingested with (term identity source above all).
   AnalysisSpec analysis = 3;
+  // Seeded floor for the whole fleet: forwarded to every shard's
+  // Bm25QueryRequest.min_score. A client that already holds a floor
+  // (e.g. the kth_best of a previous identical query, re-issued after
+  // appends) seeds every shard, which then skips postings that provably
+  // cannot reach it. 0 means unseeded (scores are always positive).
+  float min_score = 4;
 }
 
 // Client-facing distributed BM25 response.
 message Bm25SearchResponse {
   // Global top-k: score descending, ties by shard index then doc id.
   repeated Bm25Hit hits = 1;
+  // The merged k-th best score: the score of the k-th hit when k hits
+  // were returned, 0 otherwise. Seed a later re-query with it via
+  // Bm25SearchRequest.min_score.
+  float kth_best = 2;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.

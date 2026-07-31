@@ -106,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 text: query.to_string(),
                 k: 10,
                 analysis: Some(spec.clone()),
+                min_score: 0.0,
             })
             .await?
             .into_inner();

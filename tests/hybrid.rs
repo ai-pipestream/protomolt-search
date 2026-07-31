@@ -555,3 +555,91 @@ async fn broadcast_calibration_reaches_all_shards() {
     handle_b.abort();
     handle_c.abort();
 }
+
+/// The HybridSearch lexical leg routes through block-max
+/// (`top_k_pruned`) on a v5-resident shard: the fused result must be
+/// bit-identical to the heap-backed fallback path (which keeps top_k).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(SHARD_DOCS, DIM, 0x1111_0002);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let texts: Vec<String> = (0..SHARD_DOCS)
+        .map(|i| format!("plain document number {i} about nothing special"))
+        .collect();
+    let mut zebra = texts.clone();
+    zebra[0] = "zebra stripes everywhere".to_string();
+    zebra[3] = "another zebra crossing".to_string();
+
+    // Heap-backed shard (Building store → top_k fallback).
+    let (addr_heap, handle_heap) = start_hybrid_shard(
+        &analysis,
+        0,
+        &zebra,
+        corpus.clone(),
+        &shift,
+        &scale,
+    )
+    .await;
+    // v5-resident shard (index path → Flush → Bm25Reader → pruned leg).
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hybrid_v5_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr_v5, handle_v5) = start_empty_node(NodeConfig {
+        analysis_addr: Some(analysis.clone()),
+        index_path: Some(dir.join("shard.tv")),
+        ..Default::default()
+    })
+    .await;
+    set_calibration(&addr_v5, &shift, &scale).await;
+    add_documents(&addr_v5, &zebra).await;
+    add_vectors(&addr_v5, corpus.clone()).await;
+    {
+        let mut client = NodeServiceClient::connect(addr_v5.clone()).await.unwrap();
+        let flushed = client
+            .flush(turbovec_search::pb::FlushRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(flushed.written);
+    }
+
+    let query = corpus[..DIM].to_vec();
+    let mut runs = Vec::new();
+    for addr in [addr_heap, addr_v5] {
+        let coordinator =
+            CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis.clone()), Default::default());
+        runs.push(
+            coordinator
+                .fanout_hybrid("h", "zebra", &query, 8, None, legs_default())
+                .await
+                .unwrap(),
+        );
+    }
+    let sig = |hits: &[turbovec_search::pb::HybridHit]| {
+        hits.iter()
+            .map(|h| {
+                (
+                    h.doc_id,
+                    h.fused_score.to_bits(),
+                    h.vector_rank,
+                    h.bm25_rank,
+                    h.vector_score.to_bits(),
+                    h.bm25_score.to_bits(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sig(&runs[0]),
+        sig(&runs[1]),
+        "heap and v5-resident hybrid results diverged"
+    );
+    // Sanity: the zebra docs really came through the lexical leg.
+    assert!(runs[1].iter().any(|h| h.bm25_rank.is_some()));
+
+    handle_heap.abort();
+    handle_v5.abort();
+    mock.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}

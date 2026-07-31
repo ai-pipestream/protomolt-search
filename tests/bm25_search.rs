@@ -122,6 +122,7 @@ async fn ingest_through_mock_builds_postings() {
             global_doc_frequencies: vec![2],
             k1: 0.0,
             b: 0.0,
+            min_score: 0.0,
         })
         .await
         .unwrap()
@@ -229,6 +230,258 @@ async fn bm25_store_persists_through_flush() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `Bm25QueryRequest.min_score` (the lexical twin of the vector leg's
+/// initial_threshold): a seeded floor filters the result identically to
+/// filtering the unseeded result, on BOTH storage shapes — the heap
+/// store (filter fallback) and, after Flush, the resident v5 reader
+/// (block-max path). Also proves the field round-trips over gRPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bm25_query_min_score_seeds_floor() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tvbm25_floor_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Node A: heap-store shape (no index path → in-memory builder).
+    let (addr_a, node_a) = start_empty_node(NodeConfig {
+        analysis_addr: Some(analysis.clone()),
+        ..Default::default()
+    })
+    .await;
+    // Node B: spilling builder; becomes resident v5 at Flush.
+    let (addr_b, node_b) = start_empty_node(NodeConfig {
+        analysis_addr: Some(analysis),
+        index_path: Some(dir.join("shard.tv")),
+        ..Default::default()
+    })
+    .await;
+    add_documents(&addr_a, SHARD_DOCS[0], None).await;
+    add_documents(&addr_b, SHARD_DOCS[0], None).await;
+
+    let query = |addr: &str, min_score: f32| {
+        let addr = addr.to_string();
+        async move {
+            let mut c = NodeServiceClient::connect(addr).await.unwrap();
+            c.bm25_query(Bm25QueryRequest {
+                terms: vec!["rust".into()],
+                k: 10,
+                global_doc_count: 2,
+                global_total_doc_length: 7,
+                global_doc_frequencies: vec![2],
+                k1: 0.0,
+                b: 0.0,
+                min_score,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+        }
+    };
+
+    let unseeded = query(&addr_a, 0.0).await;
+    assert_eq!(unseeded.len(), 2);
+    assert!(unseeded[0].score > unseeded[1].score);
+    // The filter expectation must use the docs' TRUE f64 scores (the
+    // node compares the floor against those, not against the
+    // f32-rounded hit scores). The corpus is known: N=2, avgdl=3.5,
+    // doc0 rust tf=2 dl=4, doc1 rust tf=1 dl=3, k1/b defaults.
+    let idf = turbovec_search::bm25::idf(2, 2);
+    let params = turbovec_search::bm25::Bm25Params::default();
+    let true_scores = [
+        idf * turbovec_search::bm25::tf_norm(params, 2, 4, 3.5),
+        idf * turbovec_search::bm25::tf_norm(params, 1, 3, 3.5),
+    ];
+    assert_eq!(unseeded[0].score, true_scores[0] as f32);
+    assert_eq!(unseeded[1].score, true_scores[1] as f32);
+    let filtered = |floor: f32| -> Vec<(u64, u32)> {
+        true_scores
+            .iter()
+            .enumerate()
+            .filter(|&(_, &s)| s >= f64::from(floor))
+            .map(|(id, &s)| (id as u64, (s as f32).to_bits()))
+            .collect()
+    };
+    let floors = [
+        unseeded[1].score,                             // the weakest hit itself
+        (unseeded[0].score + unseeded[1].score) / 2.0, // between the two
+        unseeded[0].score + 1.0,                       // above everything
+    ];
+
+    // Heap-store shape (Building): filter fallback.
+    for floor in floors {
+        assert_eq!(
+            hit_signature(&query(&addr_a, floor).await),
+            filtered(floor),
+            "heap shape, floor {floor}"
+        );
+    }
+    // Resident v5 shape (after Flush): the block-max pruned path must
+    // produce the same filtered results.
+    let mut client = NodeServiceClient::connect(addr_b.clone()).await.unwrap();
+    let flushed = client
+        .flush(turbovec_search::pb::FlushRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(flushed.written);
+    // The resident unseeded result matches the heap one...
+    assert_eq!(
+        hit_signature(&query(&addr_b, 0.0).await),
+        hit_signature(&unseeded)
+    );
+    // ...and every seeded floor filters identically.
+    for floor in floors {
+        assert_eq!(
+            hit_signature(&query(&addr_b, floor).await),
+            filtered(floor),
+            "resident v5 shape, floor {floor}"
+        );
+    }
+
+    // kth_best: the last hit's score when the shard fills k, else 0.
+    let mut client = NodeServiceClient::connect(addr_b.clone()).await.unwrap();
+    let resp = client
+        .bm25_query(Bm25QueryRequest {
+            terms: vec!["rust".into()],
+            k: 2,
+            global_doc_count: 2,
+            global_total_doc_length: 7,
+            global_doc_frequencies: vec![2],
+            k1: 0.0,
+            b: 0.0,
+            min_score: 0.0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.hits.len(), 2);
+    assert_eq!(resp.kth_best, resp.hits[1].score, "heap filled k=2");
+    let resp = client
+        .bm25_query(Bm25QueryRequest {
+            terms: vec!["rust".into()],
+            k: 10,
+            global_doc_count: 2,
+            global_total_doc_length: 7,
+            global_doc_frequencies: vec![2],
+            k1: 0.0,
+            b: 0.0,
+            min_score: 0.0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.hits.len(), 2);
+    assert_eq!(resp.kth_best, 0.0, "fewer than k hits: no seedable floor");
+
+    node_a.abort();
+    node_b.abort();
+    mock.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stage-4 factorial across the fleet: {block-max on, off} x
+/// {unseeded, client-seeded}. Two v5-resident clusters over the same
+/// corpus — one with `NodeConfig.block_max = false` forcing the
+/// exhaustive scorer — must return identical hit signatures in every
+/// cell, and a mid-range client floor must filter identically to
+/// filtering the unseeded result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bm25_search_min_score_factorial_across_the_fleet() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("bm25_factorial_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let start_cluster = |block_max: bool, tag: &'static str| {
+        let analysis = analysis.clone();
+        let dir = dir.clone();
+        async move {
+            let mut addrs = Vec::new();
+            let mut handles = Vec::new();
+            for (i, _) in SHARD_DOCS.iter().enumerate() {
+                let (addr, handle) = start_empty_node(NodeConfig {
+                    slot_offset: OFFSETS[i],
+                    analysis_addr: Some(analysis.clone()),
+                    index_path: Some(dir.join(format!("shard-{tag}-{i}.tv"))),
+                    block_max,
+                    ..Default::default()
+                })
+                .await;
+                addrs.push(addr);
+                handles.push(handle);
+            }
+            for (i, docs) in SHARD_DOCS.iter().enumerate() {
+                add_documents(&addrs[i], docs, None).await;
+                let mut client = NodeServiceClient::connect(addrs[i].clone()).await.unwrap();
+                assert!(
+                    client
+                        .flush(turbovec_search::pb::FlushRequest {})
+                        .await
+                        .unwrap()
+                        .into_inner()
+                        .written,
+                    "flush shard {i} ({tag})"
+                );
+            }
+            (addrs, handles)
+        }
+    };
+    let (addrs_on, handles_on) = start_cluster(true, "on").await;
+    let (addrs_off, handles_off) = start_cluster(false, "off").await;
+
+    let coord = |addrs: &[String]| {
+        CoordinatorServiceImpl::new(addrs.to_vec())
+            .with_bm25(Some(analysis.clone()), Default::default())
+    };
+    // "rust" is in 4 of the 6 docs: k=4 fills exactly.
+    let k = 4;
+    let reference = coord(&addrs_on).fanout_bm25("rust", k, None).await.unwrap();
+    let reference_sig = hit_signature(&reference);
+    assert_eq!(reference.len(), k as usize, "corpus sanity");
+
+    // Cell 2: block-max on, seeded with the one-ULP-down k-th best (the
+    // realistic re-query recipe: every doc at or above the true k-th
+    // best survives, so seeded == unseeded exactly).
+    let kth = reference[k as usize - 1].score;
+    let seed = f32::from_bits(kth.to_bits() - 1);
+    let on_seeded = coord(&addrs_on)
+        .fanout_bm25_seeded("rust", k, None, seed)
+        .await
+        .unwrap();
+    assert_eq!(reference_sig, hit_signature(&on_seeded), "on/seeded");
+
+    // Cells 3-4: block-max off (exhaustive path on the same v5 files).
+    let off_unseeded = coord(&addrs_off).fanout_bm25("rust", k, None).await.unwrap();
+    assert_eq!(reference_sig, hit_signature(&off_unseeded), "off/unseeded");
+    let off_seeded = coord(&addrs_off)
+        .fanout_bm25_seeded("rust", k, None, seed)
+        .await
+        .unwrap();
+    assert_eq!(reference_sig, hit_signature(&off_seeded), "off/seeded");
+
+    // A mid-range client floor filters identically to filtering the
+    // unseeded result (the gap between the top two scores is wide).
+    assert!(reference[0].score - reference[1].score > 1e-3);
+    let mid = (reference[0].score + reference[1].score) / 2.0;
+    let expected: Vec<(u64, u32)> = hit_signature(&reference)
+        .into_iter()
+        .take(1)
+        .collect();
+    for addrs in [&addrs_on, &addrs_off] {
+        let seeded = coord(addrs)
+            .fanout_bm25_seeded("rust", k, None, mid)
+            .await
+            .unwrap();
+        assert_eq!(expected, hit_signature(&seeded), "mid floor");
+    }
+
+    for h in handles_on.into_iter().chain(handles_off) {
+        h.abort();
+    }
+    mock.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Regression guard: shard-LOCAL stats must produce different scores than
 /// the global-stats flow. If the coordinator ever regresses to local
 /// stats, this test fails.
@@ -266,6 +519,7 @@ async fn shard_local_stats_would_differ() {
                 global_doc_frequencies: stats.doc_frequencies,
                 k1: 0.0,
                 b: 0.0,
+                min_score: 0.0,
             })
             .await
             .unwrap()

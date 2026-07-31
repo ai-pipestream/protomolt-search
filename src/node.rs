@@ -55,6 +55,11 @@ pub struct NodeConfig {
     /// floor updates and does not publish its own floor — the
     /// "sharing disabled" baseline for A/B benchmarking.
     pub share_floors: bool,
+    /// When false, BM25 scoring always takes the exhaustive path
+    /// (`top_k`) even on v5 shards with a skip run — the "block-max
+    /// disabled" baseline for A/B benchmarking. Results are identical
+    /// either way; only the cost changes.
+    pub block_max: bool,
     /// Minimum improvement over the last PUBLISHED floor before the next
     /// one goes on the wire. 0.0 publishes every raise (the historical
     /// behavior); a small positive delta trades a sliver of pruning
@@ -84,6 +89,7 @@ impl Default for NodeConfig {
             slot_offset: 0,
             chunk_blocks: DEFAULT_CHUNK_BLOCKS,
             share_floors: true,
+            block_max: true,
             floor_delta: 0.0,
             bit_width: 4,
             index_path: None,
@@ -1022,7 +1028,28 @@ impl NodeServiceImpl {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
-                bm25_leg = bm25::top_k(index, terms, &stats, Bm25Params::default(), k)
+                // Block-max path when every scored term has impacts
+                // (v5 shards) and the node flag allows it; heap store,
+                // v3/v4, and --block-max=false keep top_k. The results
+                // are bit-identical either way.
+                let prunable = self.config.block_max
+                    && terms
+                        .iter()
+                        .enumerate()
+                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.impacts(t).is_some());
+                let docs = if prunable {
+                    bm25::top_k_pruned(
+                        index,
+                        terms,
+                        &stats,
+                        Bm25Params::default(),
+                        k,
+                        f64::NEG_INFINITY,
+                    )
+                } else {
+                    bm25::top_k(index, terms, &stats, Bm25Params::default(), k)
+                };
+                bm25_leg = docs
                     .into_iter()
                     .map(|d| (self.config.slot_offset + u64::from(d.doc_id), d.score))
                     .collect();
@@ -1593,8 +1620,31 @@ impl NodeService for NodeServiceImpl {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
-                bm25::top_k(index, &req.terms, &stats, params, req.k as usize)
-                    .into_iter()
+                // 0/absent means unseeded (scores are always positive).
+                let floor = if req.min_score == 0.0 {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::from(req.min_score)
+                };
+                // Block-max path when every scored term has impacts (v5
+                // shards) and the node flag allows it; the heap store,
+                // v3/v4 files, and --block-max=false keep top_k with the
+                // floor applied as a filter — same contract.
+                let prunable = self.config.block_max
+                    && req
+                        .terms
+                        .iter()
+                        .enumerate()
+                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.impacts(t).is_some());
+                let docs = if prunable {
+                    bm25::top_k_pruned(index, &req.terms, &stats, params, req.k as usize, floor)
+                } else {
+                    bm25::filter_to_floor(
+                        bm25::top_k(index, &req.terms, &stats, params, req.k as usize),
+                        floor,
+                    )
+                };
+                docs.into_iter()
                     .map(|doc| Bm25Hit {
                         doc_id: self.config.slot_offset + u64::from(doc.doc_id),
                         score: doc.score as f32,
@@ -1614,7 +1664,14 @@ impl NodeService for NodeServiceImpl {
             }
             _ => Vec::new(),
         };
-        Ok(Response::new(Bm25QueryResponse { hits }))
+        // The shard's k-th best: the last hit's score when the heap
+        // filled, 0 otherwise (no seedable floor).
+        let kth_best = if hits.len() == req.k as usize {
+            hits.last().map(|h| h.score).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Ok(Response::new(Bm25QueryResponse { hits, kth_best }))
     }
 
     async fn bm25_rescore(

@@ -125,6 +125,10 @@ pub struct Config {
     pub chunk_blocks: usize,
     /// Participate in floor sharing (publish + adopt floors).
     pub share_floors: bool,
+    /// Use block-max pruning on BM25 queries when shards support it
+    /// (v5 files). `false` forces the exhaustive scorer — the A/B
+    /// baseline; results are identical either way.
+    pub block_max: bool,
     /// Minimum score improvement before a node publishes its next floor
     /// (0.0 = publish every raise).
     pub floor_delta: f32,
@@ -175,6 +179,7 @@ struct FileConfig {
     bit_width: Option<usize>,
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
+    block_max: Option<bool>,
     floor_delta: Option<f32>,
     shard_deadline_ms: Option<u64>,
     hedge_delay_ms: Option<u64>,
@@ -467,6 +472,10 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         Some(s) => parse_env_bool(&s),
         None => file.floor_sharing.unwrap_or(true),
     };
+    let block_max = match opt(args, "block-max", "TURBOVEC_BLOCK_MAX", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.block_max.unwrap_or(true),
+    };
     let floor_delta = opt(
         args,
         "floor-delta",
@@ -607,6 +616,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         shards,
         chunk_blocks,
         share_floors,
+        block_max,
         floor_delta,
         shard_deadline_ms,
         hedge_delay_ms,

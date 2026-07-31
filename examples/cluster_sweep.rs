@@ -369,6 +369,11 @@ fn json_line(
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Lexical mode: --bm25-terms runs the block-max factorial instead of
+    // the vector sweep.
+    if arg("bm25-terms").is_some() {
+        return run_lexical_factorial().await;
+    }
     let nodes_sharing = node_list_required("nodes-sharing");
     let nodes_nosharing = node_list("nodes-nosharing");
     let replicas = replica_list("replicas", nodes_sharing.len());
@@ -490,4 +495,240 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(if gate_failures == 0 { 0 } else { 1 });
     }
     Ok(())
+}
+
+// --- lexical mode: the block-max factorial -------------------------------
+//
+// `--bm25-terms="court,state,appeal"` switches to the lexical leg
+// (docs/block-max.md, stage 4): the terms form ONE multi-term
+// Bm25Search (the realistic query shape), repeated --queries times per
+// cell. The 2x2 factorial is {block-max on, off} x {unseeded, seeded}:
+//
+// * block-max on is `--nodes-sharing` (nodes started normally); off is
+//   `--nodes-nosharing` (same shard files, nodes started with
+//   --block-max=false — a node startup flag, exactly like the sharing
+//   A/B). With no second cluster only the "on" column runs.
+// * seeded re-issues the same query with min_score set to one f32 ULP
+//   below the merged k-th best captured from that cluster's unseeded
+//   cell (`seed_from_kth`): the ULP-down recipe guarantees every doc at
+//   or above the true k-th best survives, so seeded must equal unseeded
+//   EXACTLY.
+//
+// Every cell's hit signature is gated against the on/unseeded
+// reference; any mismatch exits non-zero.
+//
+// ```text
+// cluster_sweep --bm25-terms="court,state,appeal" \
+//   --analysis=localhost:50052 \
+//   --nodes-sharing=host-a:50061,host-b:50063 \
+//   --nodes-nosharing=host-a:50071,host-b:50073 \
+//   --k=10,1000 --queries=20
+// ```
+
+/// The one-ULP-down seed: the largest f32 strictly below `kth`. Every
+/// doc whose true f64 score is >= the true k-th best survives it
+/// (f64::from(seed) < kth_f32 <= true_kth + half-ULP, and the next f32
+/// up would round at or above the true score). 0 stays 0 (no floor).
+fn seed_from_kth(kth: f32) -> f32 {
+    if kth > 0.0 {
+        f32::from_bits(kth.to_bits() - 1)
+    } else {
+        0.0
+    }
+}
+
+struct LexCell {
+    walls: Vec<f64>,
+    signature: Vec<(u64, u32)>,
+    kth_best: f32,
+}
+
+/// One factorial cell: the same multi-term query, --queries times
+/// (plus warmup), wall percentiles and the hit signature.
+async fn run_lexical_cell(
+    addrs: &[String],
+    analysis: &str,
+    text: &str,
+    k: u32,
+    n_queries: usize,
+    warmup: usize,
+    seed: f32,
+) -> LexCell {
+    let coordinator = CoordinatorServiceImpl::new(addrs.to_vec())
+        .with_bm25(Some(analysis.to_string()), Default::default());
+    let mut walls = Vec::with_capacity(n_queries);
+    let mut signature = Vec::new();
+    let mut kth_best = 0.0f32;
+    for qi in 0..warmup + n_queries {
+        let start = Instant::now();
+        let hits = coordinator
+            .fanout_bm25_seeded(text, k, None, seed)
+            .await
+            .expect("bm25 fanout");
+        if qi >= warmup {
+            walls.push(start.elapsed().as_secs_f64() * 1e3);
+            if signature.is_empty() {
+                signature = hits
+                    .iter()
+                    .map(|h| (h.doc_id, h.score.to_bits()))
+                    .collect();
+                kth_best = if hits.len() == k as usize {
+                    hits.last().map(|h| h.score).unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    LexCell {
+        walls,
+        signature,
+        kth_best,
+    }
+}
+
+async fn run_lexical_factorial() -> Result<(), Box<dyn std::error::Error>> {
+    let terms = arg("bm25-terms").expect("lexical mode checked");
+    let text = terms
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!text.is_empty(), "--bm25-terms: no usable terms");
+    let analysis = arg("analysis").expect("--analysis is required in lexical mode");
+    let analysis = if analysis.starts_with("http://") || analysis.starts_with("https://") {
+        analysis
+    } else {
+        format!("http://{analysis}")
+    };
+    let nodes_on = node_list_required("nodes-sharing");
+    let nodes_off = node_list("nodes-nosharing");
+    let ks: Vec<u32> = arg_or("k", "10,1000")
+        .split(',')
+        .map(|s| s.trim().parse().expect("--k"))
+        .collect();
+    let n_queries: usize = arg_or("queries", "20").parse()?;
+    let warmup: usize = arg_or("warmup", "2").parse()?;
+
+    for addr in nodes_on
+        .iter()
+        .chain(nodes_off.iter().flatten())
+    {
+        wait_ready(addr).await;
+    }
+    eprintln!(
+        "cluster_sweep lexical: {text:?} over {} block-max shard(s){}, {} queries x k={ks:?}",
+        nodes_on.len(),
+        nodes_off
+            .as_ref()
+            .map(|n| format!(" + {} block-max-off", n.len()))
+            .unwrap_or_default(),
+        n_queries,
+    );
+    println!();
+    println!(
+        "{:>8} {:>9} {:>8} {:>9} {:>9} {:>9}",
+        "k", "blockmax", "seeded", "p50_ms", "p90_ms", "p99_ms"
+    );
+
+    let mut gate_failures = 0u64;
+    for &k in &ks {
+        // The on/unseeded cell is the reference signature for this k.
+        let reference = run_lexical_cell(&nodes_on, &analysis, &text, k, n_queries, warmup, 0.0).await;
+        println!(
+            "{:>8} {:>9} {:>8} {:>9.3} {:>9.3} {:>9.3}",
+            k,
+            "on",
+            "no",
+            percentile(&reference.walls, 0.5),
+            percentile(&reference.walls, 0.9),
+            percentile(&reference.walls, 0.99)
+        );
+        let clusters: Vec<(&str, &[String])> = match &nodes_off {
+            Some(off) => vec![("on", &nodes_on[..]), ("off", &off[..])],
+            None => vec![("on", &nodes_on[..])],
+        };
+        for (label, addrs) in clusters {
+            // Each cluster seeds from its own unseeded k-th best.
+            let base = if label == "on" {
+                seed_from_kth(reference.kth_best)
+            } else {
+                let unseeded =
+                    run_lexical_cell(addrs, &analysis, &text, k, n_queries, warmup, 0.0).await;
+                println!(
+                    "{:>8} {:>9} {:>8} {:>9.3} {:>9.3} {:>9.3}",
+                    k,
+                    label,
+                    "no",
+                    percentile(&unseeded.walls, 0.5),
+                    percentile(&unseeded.walls, 0.9),
+                    percentile(&unseeded.walls, 0.99)
+                );
+                if unseeded.signature != reference.signature {
+                    gate_failures += 1;
+                    eprintln!(
+                        "CORRECTNESS GATE FAILURE at k={k}: block-max {label} unseeded changed results"
+                    );
+                }
+                seed_from_kth(unseeded.kth_best)
+            };
+            let seeded = run_lexical_cell(addrs, &analysis, &text, k, n_queries, warmup, base).await;
+            println!(
+                "{:>8} {:>9} {:>8} {:>9.3} {:>9.3} {:>9.3}",
+                k,
+                label,
+                "yes",
+                percentile(&seeded.walls, 0.5),
+                percentile(&seeded.walls, 0.9),
+                percentile(&seeded.walls, 0.99)
+            );
+            if seeded.signature != reference.signature {
+                gate_failures += 1;
+                eprintln!(
+                    "CORRECTNESS GATE FAILURE at k={k}: block-max {label} seeded changed results"
+                );
+            }
+        }
+    }
+    if gate_failures == 0 {
+        eprintln!("correctness gate: results identical across every cell at every k");
+    }
+    std::process::exit(if gate_failures == 0 { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_from_kth_is_one_ulp_down() {
+        let x = 0.5f32;
+        let seed = seed_from_kth(x);
+        assert!(seed < x, "seed must be strictly below the k-th best");
+        assert_eq!(seed_from_kth(seed), f32::from_bits(seed.to_bits() - 1));
+        assert_eq!(seed.to_bits(), x.to_bits() - 1, "exactly one f32 ULP down");
+        // Anything that rounds to x (i.e. the true k-th best, within
+        // half a ULP) is strictly above the seed.
+        assert!(f64::from(seed) < f64::from(x));
+    }
+
+    #[test]
+    fn seed_from_kth_zero_stays_zero() {
+        assert_eq!(seed_from_kth(0.0), 0.0, "no floor available: stay unseeded");
+        assert_eq!(seed_from_kth(-1.0), 0.0);
+    }
+
+    #[test]
+    fn signature_comparison_is_exact() {
+        let a: Vec<(u64, u32)> = vec![(1, 0x3f80_0000), (5, 0x3f00_0000)];
+        let b = a.clone();
+        assert_eq!(a, b);
+        let mut c = a.clone();
+        c[1].1 ^= 1;
+        assert_ne!(a, c, "one flipped score bit must fail the gate");
+        let d = a.clone().into_iter().rev().collect::<Vec<_>>();
+        assert_ne!(a, d, "order matters in the signature");
+    }
 }
