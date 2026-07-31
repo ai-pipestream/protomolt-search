@@ -41,7 +41,10 @@ coordinator re-query case).
 | high-df (450k) | 160 ms | 40 ms | 0.02 ms | 0.01 ms |
 | mixed (1.84M) | 700 ms | 185 ms | 3.8 / 16 ms | 1.3 / 13 ms |
 | mid (1.5M) | 617 ms | 169 ms | 2.9 / 8 ms | 2.5 / 6 ms |
-| rare (5.2k) | 0.7 ms | 0.4 ms | 0.3 ms | 0.2 ms |
+| rare (5.2k) | 0.7 ms | 0.4 ms | 0.03 / 0.3 ms | 0.01 / 0.2 ms |
+
+(old v4 and v5 columns are k=10 — they walk every posting regardless;
+pruned/seeded cells are k=10 / k=1000.)
 
 Allocations per query fell from ~2 per posting walked to ~40 total
 (counting-allocator instrumented). The shape matters more than the
@@ -82,8 +85,13 @@ tree permanently as the oracle every optimization is gated against.
 
 ## Upgrading existing shards
 
-Nothing breaks: v3/v4 files serve on the exhaustive path (which is
-itself ~4× faster now). To get v5 on a live shard, no pipeline rerun —
+Nothing breaks: v3/v4 files load and serve — but they are **legacy
+formats, kept for migration only**. They serve on the unoptimized
+exhaustive path, and the occurrence-split scorer does O(k·df)
+survivor-offset lookups on them, so large-k `Bm25Search` against an
+unmigrated v4 file is slower than it was before v5 (crossover around
+k≈300). There is no backward-compatibility commitment to that path:
+production shards should be migrated to v5. No pipeline rerun needed —
 the full document history is in the shard's WAL, so a `reshard` replay
 (merge or split) plus `InstallSnapshot` rebuilds it, and any shard that
 receives new documents writes v5 on its next flush.

@@ -635,10 +635,12 @@ message Bm25Hit {
 message Bm25QueryResponse {
   // Hits, score descending, ties by doc id.
   repeated Bm25Hit hits = 1;
-  // The shard's k-th best score: the score of the k-th hit when the
-  // shard returned k hits, 0 otherwise (no seedable floor — the shard
-  // could not fill the requested k). A caller that re-queries later
-  // (e.g. after appends) can seed the fleet with it via
+  // The shard's k-th best score: one f32 ULP below the k-th hit's score
+  // when the shard returned k hits (emitted one ULP down so a later f32
+  // seed can never exceed the true f64 k-th best — scoring is f64, the
+  // wire is f32), 0 otherwise (no seedable floor — the shard could not
+  // fill the requested k). A caller that re-queries later (e.g. after
+  // appends) can seed the fleet with it via
   // Bm25QueryRequest.min_score / Bm25SearchRequest.min_score.
   float kth_best = 2;
 }
@@ -686,8 +688,9 @@ message Bm25SearchRequest {
 message Bm25SearchResponse {
   // Global top-k: score descending, ties by shard index then doc id.
   repeated Bm25Hit hits = 1;
-  // The merged k-th best score: the score of the k-th hit when k hits
-  // were returned, 0 otherwise. Seed a later re-query with it via
+  // The merged k-th best score: one f32 ULP below the k-th hit's score
+  // when k hits were returned (see Bm25QueryResponse.kth_best for why),
+  // 0 otherwise. Seed a later re-query with it via
   // Bm25SearchRequest.min_score.
   float kth_best = 2;
 }

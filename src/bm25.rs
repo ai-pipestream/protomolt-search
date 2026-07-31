@@ -70,6 +70,22 @@ pub fn tf_norm(params: Bm25Params, tf: u32, doc_len: u32, avgdl: f64) -> f64 {
         / (tf + params.k1 * (1.0 - params.b + params.b * f64::from(doc_len) / avgdl))
 }
 
+/// The floor to EMIT as `kth_best`: one f32 ULP below the wire k-th
+/// best. Scoring is f64 while `kth_best`/`min_score` travel as f32, and
+/// `f32(kth)` rounds UP half the time — seeding with the rounded value
+/// would filter the boundary hit, contradicting "ties at the floor
+/// survive". One ULP down can never exceed the true f64 k-th best
+/// (rounded down: strictly below it; rounded up: at most half a ULP
+/// above it, minus a full ULP). 0 stays 0 (no seedable floor).
+/// (`f32::next_down` is stable since Rust 1.86; the toolchain is 1.97.)
+pub fn floor_seed(kth_best: f32) -> f32 {
+    if kth_best > 0.0 {
+        kth_best.next_down()
+    } else {
+        0.0
+    }
+}
+
 /// Score one posting for one query term.
 pub fn score_posting(
     params: Bm25Params,
@@ -415,9 +431,12 @@ impl PartialOrd for HeapEntry {
 ///    inert is non-essential. Only essential terms generate candidates.
 /// 4. **Candidate test**: a candidate's bound is its essential (true)
 ///    contributions plus the non-essential block maxes; if inert, the
-///    doc is dropped unevaluated and the floor only rises. Otherwise the
-///    doc is fully evaluated (every cursor advances to it inside the
-///    window), scored in term order, and inserted into the heap.
+///    doc is dropped unevaluated AND every cursor advances past it —
+///    cursors move in lockstep, so candidate selection is strictly
+///    doc-id increasing (debug_assert'ed; see the drop path for the
+///    soundness proof). Otherwise the doc is fully evaluated (every
+///    cursor advances to it inside the window), scored in term order,
+///    and inserted into the heap.
 ///
 /// EXACTNESS CONTRACT (load-bearing): the skip test is `bound <=
 /// cutoff`; candidates are evaluated in doc-id order; the heap replaces
@@ -557,6 +576,8 @@ pub fn top_k_pruned_stats(
     let mut prefix: Vec<usize> = Vec::new();
     // Skip counts (level-0 blocks, level-1 groups) of retired cursors.
     let mut finished: (u64, u64) = (0, 0);
+    // Last processed candidate doc id (doc-order invariant witness).
+    let mut last_selected: Option<u32> = None;
 
     while !state.is_empty() {
         let heap_full = heap.len() >= k;
@@ -682,6 +703,16 @@ pub fn top_k_pruned_stats(
         // 5. Candidate test with an exact bound: essential terms
         // contribute their TRUE value when present (zero when absent —
         // their cursor proves it), non-essential terms their block max.
+        // Every candidate is processed exactly once and strictly in
+        // doc-id order: the inert-drop path below advances ALL cursors
+        // past the doc, so no cursor can lag the wavefront.
+        if let Some(prev) = last_selected {
+            debug_assert!(
+                doc > prev,
+                "candidate selection out of doc order: {doc} after {prev}"
+            );
+        }
+        last_selected = Some(doc);
         let doc_len = store.doc_length(doc);
         let mut bound = 0.0;
         for ti in 0..terms.len() {
@@ -695,13 +726,25 @@ pub fn top_k_pruned_stats(
             }
         }
         if inert(bound) {
-            // Not insertable now, and the floor only rises: drop it and
-            // move the essential cursors on.
-            for (pos, ts) in state.iter_mut().enumerate() {
-                if !nonessential[pos] && ts.cursor.doc_id() == doc {
+            // Not insertable now, and the floor only rises: drop it.
+            // Advance EVERY cursor past the doc — essential and
+            // non-essential alike — so candidate selection stays
+            // strictly doc-id ordered. Sound: an unconsumed doc behind
+            // the wavefront has postings only in currently
+            // non-essential terms (every essential cursor sits at or
+            // past the wavefront, so its earlier postings are already
+            // consumed), the partition just proved the sum of those
+            // terms' block bounds inert — valid over the whole window,
+            // which covers the wavefront — and inertness only
+            // strengthens as the floor and the k-th best rise
+            // (`inert` is monotone in both). Such docs can never become
+            // insertable later, so skipping them changes nothing.
+            for ts in state.iter_mut() {
+                ts.cursor.advance_shallow(doc);
+                if ts.cursor.doc_id() == doc {
                     ts.cursor.next_posting();
-                    ts.refresh(params, avgdl);
                 }
+                ts.refresh(params, avgdl);
             }
             retain_live(&mut state, &mut finished);
             continue;

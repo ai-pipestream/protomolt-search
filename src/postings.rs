@@ -103,6 +103,13 @@ pub trait Bm25Index {
         let _ = term;
         None
     }
+    /// Whether [`Self::impacts`] would return a cursor, WITHOUT
+    /// building one (the v5 reader answers with a directory lookup
+    /// only). Used by callers selecting the pruned path, which builds
+    /// the cursors itself.
+    fn has_impacts(&self, term: &str) -> bool {
+        self.impacts(term).is_some()
+    }
     /// The raw text of a document, if stored.
     fn text(&self, doc_id: u32) -> Option<String>;
     /// The lineage of a document, if ingested with one.
@@ -1743,6 +1750,240 @@ impl RunHead {
     }
 }
 
+/// Full structural validation of a `.bm25` file, run at open for every
+/// supported version. Every read is bounds-checked; anything malformed
+/// is an `InvalidData` error, never a panic and never a silently wrong
+/// offset. Checked: header fields and section offsets (ordered, within
+/// the file), the text index and lineage walk, the directory (entries
+/// within the directory region, blob offsets, strict term ordering),
+/// and per term the run offsets — v3/v4 postings headers must match the
+/// directory entry exactly, v5 run offsets must be consistent
+/// (doc_run + sentinel == occ_run, occ run length == sentinel x 8,
+/// skip run walks out exactly, block `last_doc_id`s cross-checked
+/// against the doc run). Payload bytes (postings, occurrences, frontier
+/// pairs, texts) are data, not structure: they are not checksum-able
+/// without a format change and are not validated.
+fn validate_structure(map: &[u8], v5: bool, blob_relative: bool) -> io::Result<()> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let file_len = map.len() as u64;
+    let u32_at = |off: u64| -> io::Result<u32> {
+        let b = map
+            .get(off as usize..off as usize + 4)
+            .ok_or_else(|| invalid(format!("read past end at {off}")))?;
+        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    };
+    let u64_at = |off: u64| -> io::Result<u64> {
+        let b = map
+            .get(off as usize..off as usize + 8)
+            .ok_or_else(|| invalid(format!("read past end at {off}")))?;
+        Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+    };
+    let bytes_at = |off: u64, len: u64| -> io::Result<&[u8]> {
+        map.get(off as usize..(off + len) as usize)
+            .ok_or_else(|| invalid(format!("range [{off}, {}) out of file", off + len)))
+    };
+
+    // Header (fixed 52 bytes; magic already checked by the caller).
+    let total_length = u64_at(8)?;
+    let texts_off = u64_at(16)?;
+    let lineages_off = u64_at(24)?;
+    let postings_off = u64_at(32)?;
+    let directory_off = u64_at(40)?;
+    let n_slots = u64::from(u32_at(48)?);
+    let doc_lengths_off = 52u64;
+    if texts_off != doc_lengths_off + 4 * n_slots || texts_off > file_len {
+        return Err(invalid(format!("doc_lengths section [{doc_lengths_off}, {texts_off}) out of file ({file_len})")));
+    }
+    // The header total must agree with the doc-length table.
+    let mut length_sum = 0u64;
+    for slot in 0..n_slots {
+        length_sum += u64::from(u32_at(doc_lengths_off + 4 * slot)?);
+    }
+    if length_sum != total_length {
+        return Err(invalid("header total_length != sum of doc lengths".into()));
+    }
+    let text_index_off = lineages_off
+        .checked_sub(12 * n_slots)
+        .ok_or_else(|| invalid("lineages_off before the text index".into()))?;
+    if text_index_off < texts_off || lineages_off > file_len {
+        return Err(invalid("texts/text_index sections out of file".into()));
+    }
+    if postings_off < lineages_off || directory_off < postings_off + 4 || directory_off + 4 > file_len
+    {
+        return Err(invalid("section offsets unordered or out of file".into()));
+    }
+    // Text index: each entry within the texts section (or the absent
+    // marker).
+    for slot in 0..n_slots {
+        let e = text_index_off + 12 * slot;
+        let offset = u64_at(e)?;
+        let len = u32_at(e + 8)?;
+        if len != u32::MAX && (offset < texts_off + 4 || offset + u64::from(len) > text_index_off) {
+            return Err(invalid(format!("text index entry {slot} out of the texts section")));
+        }
+    }
+    // Lineage walk: variable-stride entries must end exactly at the
+    // postings section.
+    let mut cur = lineages_off;
+    for _ in 0..n_slots {
+        let flag = *bytes_at(cur, 1)?
+            .first()
+            .ok_or_else(|| invalid("lineage section overruns postings".into()))?;
+        cur += if flag == 0 { 1 } else { 25 };
+    }
+    if cur != postings_off {
+        return Err(invalid("lineage section does not end at the postings section".into()));
+    }
+    // Directory: count, fixed-stride entries within the file, then the
+    // term blob (which runs to EOF).
+    let stride: u64 = if v5 { 34 } else { 18 };
+    let n_terms = u64::from(u32_at(directory_off)?);
+    if u64::from(u32_at(postings_off)?) != n_terms {
+        return Err(invalid("postings and directory term counts differ".into()));
+    }
+    let blob_start = directory_off + 4 + stride * n_terms;
+    if blob_start > file_len {
+        return Err(invalid("directory overruns the file".into()));
+    }
+    let mut prev_term: Vec<u8> = Vec::new();
+    let mut prev_skip_end: u64 = 0;
+    for i in 0..n_terms {
+        let e = directory_off + 4 + stride * i;
+        let (term, df) = if v5 {
+            let doc_run_off = u64_at(e)?;
+            let skip_run_off = u64_at(e + 8)?;
+            let occ_run_off = u64_at(e + 16)?;
+            let df = u32_at(e + 24)?;
+            let blob_off = u64::from(u32_at(e + 28)?);
+            let term_len = u64::from(u16_at(bytes_at(e + 32, 2)?));
+            let term = bytes_at(blob_start + blob_off, term_len)?;
+            if term_len == 0 {
+                return Err(invalid(format!("directory entry {i}: empty term")));
+            }
+            // Run offsets: consistent with each other and with the
+            // previous term's region.
+            if doc_run_off < prev_skip_end || doc_run_off < postings_off + 4 {
+                return Err(invalid(format!("directory entry {i}: doc run overlaps previous regions")));
+            }
+            if occ_run_off != doc_run_off + 12 * u64::from(df) + 4 || occ_run_off > skip_run_off {
+                return Err(invalid(format!("directory entry {i}: inconsistent run offsets")));
+            }
+            let skip_end = if i + 1 < n_terms {
+                u64_at(e + stride)?
+            } else {
+                directory_off
+            };
+            if skip_end < skip_run_off + 8 || skip_end > directory_off {
+                return Err(invalid(format!("directory entry {i}: skip run out of the postings section")));
+            }
+            // Occurrence run: length divisible by 8 and equal to the
+            // sentinel occ_start.
+            if (skip_run_off - occ_run_off) % 8 != 0 {
+                return Err(invalid(format!("directory entry {i}: occurrence run not pair-aligned")));
+            }
+            let sentinel = u32_at(doc_run_off + 12 * u64::from(df))?;
+            if u64::from(sentinel) != (skip_run_off - occ_run_off) / 8 {
+                return Err(invalid(format!("directory entry {i}: sentinel occ_start mismatch")));
+            }
+            if df > 0 && u32_at(doc_run_off + 8)? != 0 {
+                return Err(invalid(format!("directory entry {i}: first occ_start is not 0")));
+            }
+            // Skip run: walk level-0 and level-1 records exactly,
+            // cross-checking block last_doc_ids against the doc run.
+            let region = skip_run_off;
+            let region_end = skip_end;
+            let l1_rel = u64_at(region)?;
+            let n_l0 = u64::from(df).div_ceil(BLOCK as u64);
+            let mut cur = region + 8;
+            let mut prev_last = 0u32;
+            let mut l0_record_offs: Vec<u64> = Vec::with_capacity(n_l0 as usize);
+            for b in 0..n_l0 {
+                l0_record_offs.push(cur - region);
+                let last_doc = u32_at(cur)?;
+                let n_pairs = u64::from(bytes_at(cur + 4, 1)?[0]);
+                if n_pairs == 0 || n_pairs > MAX_FRONTIER as u64 {
+                    return Err(invalid(format!("term {i} block {b}: n_pairs {n_pairs} out of range")));
+                }
+                if last_doc < prev_last {
+                    return Err(invalid(format!("term {i} block {b}: last_doc_id goes backwards")));
+                }
+                prev_last = last_doc;
+                // Cross-check the block bound against the doc run.
+                let last_posting = ((b + 1) * BLOCK as u64).min(u64::from(df)) - 1;
+                if u32_at(doc_run_off + 12 * last_posting)? != last_doc {
+                    return Err(invalid(format!("term {i} block {b}: last_doc_id != doc run")));
+                }
+                cur += 5 + 8 * n_pairs;
+                if cur > region_end {
+                    return Err(invalid(format!("term {i}: level-0 records overrun the skip run")));
+                }
+            }
+            if cur != region + l1_rel {
+                return Err(invalid(format!("term {i}: level-1 region offset mismatch")));
+            }
+            let n_l1 = n_l0.div_ceil(LEVEL1_FACTOR as u64);
+            for g in 0..n_l1 {
+                let last_doc = u32_at(cur)?;
+                let l0_off = u64_at(cur + 4)?;
+                let n_pairs = u64::from(bytes_at(cur + 12, 1)?[0]);
+                if n_pairs == 0 || n_pairs > MAX_FRONTIER as u64 {
+                    return Err(invalid(format!("term {i} group {g}: n_pairs out of range")));
+                }
+                let last_block = ((g + 1) * LEVEL1_FACTOR as u64).min(n_l0) - 1;
+                let last_posting = ((last_block + 1) * BLOCK as u64).min(u64::from(df)) - 1;
+                if u32_at(doc_run_off + 12 * last_posting)? != last_doc {
+                    return Err(invalid(format!("term {i} group {g}: last_doc_id != doc run")));
+                }
+                if l0_off != l0_record_offs[(g * LEVEL1_FACTOR as u64) as usize] {
+                    return Err(invalid(format!("term {i} group {g}: l0_off != group start")));
+                }
+                cur += 13 + 8 * n_pairs;
+            }
+            if cur != region_end {
+                return Err(invalid(format!("term {i}: skip run does not end at the next region")));
+            }
+            prev_skip_end = skip_end;
+            (term, df)
+        } else {
+            let postings_entry_off = u64_at(e)?;
+            let df = u32_at(e + 8)?;
+            let stored = u32_at(e + 12)?;
+            let term_len = u64::from(u16_at(bytes_at(e + 16, 2)?));
+            let term = if blob_relative {
+                bytes_at(blob_start + u64::from(stored), term_len)?
+            } else {
+                bytes_at(u64::from(stored), term_len)?
+            };
+            if term_len == 0 {
+                return Err(invalid(format!("directory entry {i}: empty term")));
+            }
+            if postings_entry_off < postings_off + 4 || postings_entry_off >= directory_off {
+                return Err(invalid(format!("directory entry {i}: postings offset out of section")));
+            }
+            // The postings entry's inline header must match the
+            // directory entry exactly.
+            let inline_len = u64::from(u32_at(postings_entry_off)?);
+            if inline_len != term_len
+                || bytes_at(postings_entry_off + 4, term_len)? != term
+                || u32_at(postings_entry_off + 4 + term_len)? != df
+            {
+                return Err(invalid(format!("directory entry {i}: postings header mismatch")));
+            }
+            (term, df)
+        };
+        let _ = df;
+        if !prev_term.is_empty() && term <= prev_term.as_slice() {
+            return Err(invalid(format!("directory entry {i}: terms not strictly ordered")));
+        }
+        prev_term = term.to_vec();
+    }
+    Ok(())
+}
+
+fn u16_at(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().expect("2 bytes"))
+}
+
 /// A memory-mapped, disk-resident view of a `.bm25` file (v3, v4, or
 /// v5). Postings and document texts are read from the map on demand; the
 /// only heap state is the per-document length table and a term count.
@@ -1773,9 +2014,11 @@ impl Bm25Reader {
         self.doc_lengths.len() as u32
     }
 
-    /// Open a v3/v4/v5 `.bm25` file read-only. Touches only the header,
-    /// the doc-length table, and the directory header — no postings or
-    /// text pages are faulted in until queries ask for them.
+    /// Open a v3/v4/v5 `.bm25` file read-only after full structural
+    /// validation (see [`validate_structure`] — malformed files error,
+    /// never panic). Touches only the header, the doc-length table, the
+    /// directory, and the skip runs — no postings or text pages beyond
+    /// those are faulted in until queries ask for them.
     pub fn open(path: &Path) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let file = std::fs::File::open(path)?;
@@ -1787,6 +2030,7 @@ impl Bm25Reader {
         }
         let v5 = &map[..8] == MAGIC_V5;
         let blob_relative = &map[..8] != MAGIC_V3;
+        validate_structure(&map, v5, blob_relative)?;
         let mut cur = 8usize;
         let rd_u64 = |cur: &mut usize| -> u64 {
             let v = u64::from_le_bytes(map[*cur..*cur + 8].try_into().unwrap());
@@ -1995,11 +2239,11 @@ impl Bm25Reader {
 }
 
 /// Zero-copy cursor over one term's v5 doc run and skip run — the
-/// block-max surface (`docs/block-max.md`, stage 2). Level-0 impact
-/// records (one per 128-posting block) are read straight from the map,
-/// and `advance_shallow` skips whole blocks by their `last_doc_id`
-/// without decoding doc-run entries. Level-1 records exist in the file
-/// but are not walked yet (stage 3).
+/// block-max surface (`docs/block-max.md`). Level-0 impact records (one
+/// per 128-posting block) are read straight from the map, and
+/// `advance_shallow` first leaps whole level-1 groups (32 blocks = 4096
+/// postings) by their `last_doc_id`, then skips level-0 blocks the same
+/// way, never decoding doc-run entries it passes.
 pub struct ImpactCursor<'a> {
     map: &'a [u8],
     doc_run_off: usize,
@@ -2417,6 +2661,9 @@ impl Bm25Index for Bm25Reader {
             skip_run_off as usize,
             df,
         ))
+    }
+    fn has_impacts(&self, term: &str) -> bool {
+        self.v5 && self.directory_lookup_v5(term).is_some()
     }
     fn text(&self, doc_id: u32) -> Option<String> {
         let slot = doc_id as usize;
@@ -3189,6 +3436,185 @@ mod tests {
         assert_eq!(good_offs.len(), bad_offs.len());
         assert_ne!(good_offs, bad_offs);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod malformed_tests {
+    use super::*;
+
+    /// Build a store whose v5 file exercises every validated structure:
+    /// one term with >4096 postings (2 level-1 groups), other terms,
+    /// gap slots, lineages, offsets.
+    fn malformed_corpus_store() -> Bm25Store {
+        let mut store = Bm25Store::new();
+        for i in 0..4300u32 {
+            let id = i * 2; // gap slots
+            let lineage = (i % 3 == 0).then_some(DocLineage {
+                opinion_id: u64::from(i),
+                cluster_id: u64::from(i) * 7,
+                span_start: i,
+                span_end: i + 10,
+            });
+            let mut terms: DocTerms = vec![
+                ("hot".to_string(), 1 + i % 3, vec![(i, i + 2)]),
+                (format!("t{}", i % 7), 1, vec![(0, 1)]),
+            ];
+            if i % 11 == 0 {
+                terms.push(("cold".to_string(), 2, vec![(3, 9)]));
+            }
+            let length = terms.iter().map(|t| t.1).sum();
+            store.add_document_with_lineage(
+                id,
+                format!("d{i}"),
+                AnalyzedDoc { terms, length },
+                lineage,
+            );
+        }
+        store
+    }
+
+    fn write_v4(store: &Bm25Store, path: &Path) {
+        let mut w = io::BufWriter::new(std::fs::File::create(path).unwrap());
+        store.write_v4_for_bench(&mut w).unwrap();
+        w.flush().unwrap();
+    }
+
+    /// A small store (~few KB on disk) for the every-byte truncation
+    /// sweep: gaps, lineages, one multi-block term, offsets.
+    fn small_corpus_store() -> Bm25Store {
+        let mut store = Bm25Store::new();
+        for i in 0..140u32 {
+            let id = i * 2;
+            let lineage = (i % 3 == 0).then_some(DocLineage {
+                opinion_id: u64::from(i),
+                cluster_id: u64::from(i) * 7,
+                span_start: i,
+                span_end: i + 10,
+            });
+            let terms: DocTerms = vec![
+                ("hot".to_string(), 1 + i % 3, vec![(i, i + 2)]),
+                (format!("t{}", i % 3), 1, vec![(0, 1)]),
+            ];
+            let length = terms.iter().map(|t| t.1).sum();
+            store.add_document_with_lineage(
+                id,
+                format!("d{i}"),
+                AnalyzedDoc { terms, length },
+                lineage,
+            );
+        }
+        store
+    }
+
+    /// Truncation at EVERY byte length must error, never panic — on a
+    /// small file so the sweep stays fast. v5 and v4.
+    #[test]
+    fn truncated_open_errors_never_panics() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp")
+            .join(format!("truncate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = small_corpus_store();
+        let v5_path = dir.join("small.v5.bm25");
+        let v4_path = dir.join("small.v4.bm25");
+        store.save(&v5_path).unwrap();
+        write_v4(&store, &v4_path);
+        for (tag, src) in [("v5", &v5_path), ("v4", &v4_path)] {
+            let bytes = std::fs::read(src).unwrap();
+            Bm25Reader::open(src).unwrap();
+            let trunc = dir.join(format!("trunc.{tag}"));
+            for len in 0..bytes.len() {
+                std::fs::write(&trunc, &bytes[..len]).unwrap();
+                assert!(
+                    Bm25Reader::open(&trunc).is_err(),
+                    "{tag}: truncation to {len} bytes opened successfully"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupted_open_errors_never_panics() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp")
+            .join(format!("malformed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = malformed_corpus_store();
+        let v5_path = dir.join("corpus.v5.bm25");
+        let v4_path = dir.join("corpus.v4.bm25");
+        store.save(&v5_path).unwrap();
+        write_v4(&store, &v4_path);
+
+        for (tag, src) in [("v5", &v5_path), ("v4", &v4_path)] {
+            let bytes = std::fs::read(src).unwrap();
+            // Sanity: the intact file opens.
+            Bm25Reader::open(src).unwrap();
+
+            // Random single-byte flips in the header, directory, and
+            // skip-run regions: error or valid open, never a panic.
+            let mut s = 0xC0FFEEu64;
+            let mut next = move || {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as usize
+            };
+            // Skip-run regions (v5 only): from the directory. Header:
+            // magic(8) total_length(8) texts(8) lineages(8) postings(8)
+            // directory(8) n_slots(4).
+            let directory_off = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+            let n_terms = u32::from_le_bytes(
+                bytes[directory_off..directory_off + 4].try_into().unwrap(),
+            ) as usize;
+            let mut regions: Vec<(usize, usize)> = vec![
+                (0, 52),
+                (directory_off, bytes.len()),
+            ];
+            if tag == "v5" {
+                for i in 0..n_terms {
+                    let e = directory_off + 4 + 34 * i;
+                    let skip_off = u64::from_le_bytes(
+                        bytes[e + 8..e + 16].try_into().unwrap(),
+                    ) as usize;
+                    let end = if i + 1 < n_terms {
+                        u64::from_le_bytes(bytes[e + 34..e + 42].try_into().unwrap()) as usize
+                    } else {
+                        directory_off
+                    };
+                    regions.push((skip_off, end));
+                }
+            }
+            // v3/v4 flips stay in the header and directory: postings
+            // record payloads are data (like occurrence bytes and
+            // frontier pairs), not validated structure.
+            let flipped = dir.join(format!("flip.{tag}"));
+            let (mut errors, mut opens) = (0usize, 0usize);
+            for _ in 0..2000 {
+                let &(lo, hi) = &regions[next() % regions.len()];
+                let pos = lo + next() % (hi - lo).max(1);
+                let mut bad = bytes.clone();
+                bad[pos] ^= 1 + (next() % 255) as u8;
+                std::fs::write(&flipped, &bad).unwrap();
+                match Bm25Reader::open(&flipped) {
+                    Ok(reader) => {
+                        opens += 1;
+                        // A valid open must stay usable on the read
+                        // paths the structure guards (no panics).
+                        let _ = reader.df("hot");
+                        reader.for_each_doc_tf("hot", &mut |_, _| {});
+                        let _ = reader.posting_offsets("hot", 0);
+                    }
+                    Err(_) => errors += 1,
+                }
+            }
+            assert!(errors > 0, "{tag}: no flip was ever rejected");
+            eprintln!("{tag}: flips: {errors} rejected, {opens} opened-valid");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1036,7 +1036,7 @@ impl NodeServiceImpl {
                     && terms
                         .iter()
                         .enumerate()
-                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.impacts(t).is_some());
+                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.has_impacts(t));
                 let docs = if prunable {
                     bm25::top_k_pruned(
                         index,
@@ -1592,6 +1592,11 @@ impl NodeService for NodeServiceImpl {
         request: Request<Bm25QueryRequest>,
     ) -> Result<Response<Bm25QueryResponse>, Status> {
         let req = request.into_inner();
+        if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
+            return Err(Status::invalid_argument(
+                "min_score must be finite (NaN and -inf are not valid floors)",
+            ));
+        }
         let params = Bm25Params {
             k1: if req.k1 == 0.0 {
                 bm25::DEFAULT_K1
@@ -1635,7 +1640,7 @@ impl NodeService for NodeServiceImpl {
                         .terms
                         .iter()
                         .enumerate()
-                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.impacts(t).is_some());
+                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.has_impacts(t));
                 let docs = if prunable {
                     bm25::top_k_pruned(index, &req.terms, &stats, params, req.k as usize, floor)
                 } else {
@@ -1664,10 +1669,11 @@ impl NodeService for NodeServiceImpl {
             }
             _ => Vec::new(),
         };
-        // The shard's k-th best: the last hit's score when the heap
-        // filled, 0 otherwise (no seedable floor).
+        // The shard's k-th best: one f32 ULP below the last hit's score
+        // when the heap filled (so a later f32 seed never exceeds the
+        // true k-th best — ties at the floor survive), 0 otherwise.
         let kth_best = if hits.len() == req.k as usize {
-            hits.last().map(|h| h.score).unwrap_or(0.0)
+            hits.last().map(|h| bm25::floor_seed(h.score)).unwrap_or(0.0)
         } else {
             0.0
         };

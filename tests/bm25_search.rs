@@ -355,7 +355,11 @@ async fn bm25_query_min_score_seeds_floor() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.hits.len(), 2);
-    assert_eq!(resp.kth_best, resp.hits[1].score, "heap filled k=2");
+    assert!(
+        resp.kth_best < resp.hits[1].score
+            && f64::from(resp.kth_best) > f64::from(resp.hits[1].score) - 1e-6,
+        "kth_best is one f32 ULP below the k-th hit"
+    );
     let resp = client
         .bm25_query(Bm25QueryRequest {
             terms: vec!["rust".into()],
@@ -372,6 +376,44 @@ async fn bm25_query_min_score_seeds_floor() {
         .into_inner();
     assert_eq!(resp.hits.len(), 2);
     assert_eq!(resp.kth_best, 0.0, "fewer than k hits: no seedable floor");
+
+    // NaN and -inf floors are rejected at the RPC boundary (NaN used to
+    // silently disable pruning and return nothing after a full scan).
+    for bad in [f32::NAN, f32::NEG_INFINITY] {
+        let err = client
+            .bm25_query(Bm25QueryRequest {
+                terms: vec!["rust".into()],
+                k: 10,
+                global_doc_count: 2,
+                global_total_doc_length: 7,
+                global_doc_frequencies: vec![2],
+                k1: 0.0,
+                b: 0.0,
+                min_score: bad,
+            })
+            .await
+            .expect_err("non-finite min_score must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "min_score {bad}");
+    }
+    // The kth_best emission rule: one f32 ULP below the k-th hit, so a
+    // re-query seeded with it keeps the boundary hit.
+    let resp = client
+        .bm25_query(Bm25QueryRequest {
+            terms: vec!["rust".into()],
+            k: 2,
+            global_doc_count: 2,
+            global_total_doc_length: 7,
+            global_doc_frequencies: vec![2],
+            k1: 0.0,
+            b: 0.0,
+            min_score: 0.0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.kth_best < resp.hits[1].score, "kth_best is ULP-down");
+    let seeded = query(&addr_b, resp.kth_best).await;
+    assert_eq!(hit_signature(&seeded), hit_signature(&resp.hits), "ULP-down seed round trip");
 
     node_a.abort();
     node_b.abort();

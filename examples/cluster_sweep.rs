@@ -525,13 +525,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //   --k=10,1000 --queries=20
 // ```
 
-/// The one-ULP-down seed: the largest f32 strictly below `kth`. Every
-/// doc whose true f64 score is >= the true k-th best survives it
-/// (f64::from(seed) < kth_f32 <= true_kth + half-ULP, and the next f32
-/// up would round at or above the true score). 0 stays 0 (no floor).
+/// The one-ULP-down seed: the largest f32 strictly below `kth`
+/// (`f32::next_down`, stable since Rust 1.86). Every doc whose true f64
+/// score is >= the true k-th best survives it. 0 stays 0 (no floor).
 fn seed_from_kth(kth: f32) -> f32 {
     if kth > 0.0 {
-        f32::from_bits(kth.to_bits() - 1)
+        kth.next_down()
     } else {
         0.0
     }

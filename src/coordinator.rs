@@ -1020,13 +1020,22 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
         let req = request.into_inner();
+        if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
+            return Err(Status::invalid_argument(
+                "min_score must be finite (NaN and -inf are not valid floors)",
+            ));
+        }
         let hits = self
             .fanout_bm25_seeded(&req.text, req.k, req.analysis.as_ref(), req.min_score)
             .await?;
-        // The merged k-th best: the last hit's score when k hits were
-        // returned, 0 otherwise (seed a later re-query with it).
+        // The merged k-th best: one f32 ULP below the last hit's score
+        // when k hits were returned (see `bm25::floor_seed` — a later
+        // seed can never exceed the true k-th best), 0 otherwise.
         let kth_best = if hits.len() == req.k as usize {
-            hits.last().map(|h| h.score).unwrap_or(0.0)
+            hits
+                .last()
+                .map(|h| crate::bm25::floor_seed(h.score))
+                .unwrap_or(0.0)
         } else {
             0.0
         };

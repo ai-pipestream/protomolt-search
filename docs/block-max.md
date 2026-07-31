@@ -135,7 +135,8 @@ decompressed either.
 ## Build side
 
 `SpillBuilder` already merges runs per term in doc-id order, which is
-exactly the order impacts must be accumulated in. Add to the merge loop:
+exactly the order impacts must be accumulated in. The merge loop
+carries:
 
 - a running Pareto frontier over the current 128 postings, flushed to the
   skip run at each block boundary and merged into the level-1 accumulator;
@@ -147,85 +148,91 @@ memory the spill builder buys is untouched. Lucene structures this the
 same way: `CompetitiveImpactAccumulator` is fed per document and drained
 at each block boundary by the postings writer.
 
-## Query side: MaxScore
+## Query side: the pruned scorer
 
-Two classical scorers consume impacts. WAND advances a pivot over a heap
-of per-term iterators; MaxScore partitions terms into *essential* (whose
-max scores can still reach the floor) and *non-essential* (which can only
-top up a document some essential term already produced). MaxScore is the
-better first target here: it needs no scorer heap, it works block at a
-time which matches a fixed-stride doc run, and Lucene made it the default
-for top-k disjunctions.
+`bm25::top_k_pruned` is a block-max MaxScore. Per term, an
+`ImpactCursor` (returned by `Bm25Index::impacts`, `None` for the heap
+store and v3/v4 files, which keep the exhaustive path) holds the current
+128-posting block's frontier — `idf * max over the frontier of
+tf_norm(.., avgdl)` upper-bounds that term's contribution anywhere in
+the block — a bound for the current level-1 group, and a static
+whole-term bound. Each iteration:
 
-```rust
-// bm25.rs, alongside top_k / score_candidates
-pub fn top_k_pruned(
-    store: &dyn Bm25Index,
-    terms: &[String],
-    stats: &CorpusStats,
-    params: Bm25Params,
-    k: usize,
-    floor: f64,          // seeded cutoff, NEG_INFINITY when unseeded
-) -> Vec<ScoredDoc>
-```
+1. **Termination**: the sum of the static whole-term bounds can no
+   longer clear the floor — nothing remaining can enter, stop.
+2. **Level skips**: if the sum of level-1 group bounds cannot clear the
+   floor, every cursor leaps past the shallowest group end (4096
+   postings per term at one test); else if the sum of level-0 block
+   bounds cannot, every cursor shallow-advances past the shallowest
+   block end.
+3. **MaxScore partition**: inside a competitive window (up to the
+   shallowest block end, where every block bound is valid), the largest
+   prefix of terms — sorted by block max — whose maxes sum inert is
+   non-essential. Only essential terms generate candidates.
+4. **Candidate test**: a candidate's bound is its essential (true)
+   contributions plus the non-essential block maxes; if inert, the doc
+   is dropped unevaluated. Otherwise the doc is fully evaluated, scored
+   in term order, and inserted into the heap on the exact contract.
 
-The loop, per window of doc ids:
-
-1. For each term, read the level-0 (or level-1) impact record covering
-   the window and evaluate `idf * max over frontier of tf_norm(.., avgdl)`
-   with the query's global stats. That is the term's window max.
-2. Sort terms by window max and split at the largest prefix whose maxes
-   sum below the current floor: that prefix is non-essential for this
-   window.
-3. Iterate only the essential terms' doc runs. For each candidate,
-   add the non-essential terms' contributions only if the partial score
-   plus the remaining maxes can still clear the floor.
-4. On every heap replacement, raise the floor; the partition is
-   recomputed when the floor crosses the next threshold.
-
-A block whose level-0 max is below the floor is skipped by advancing the
-cursor past `last_doc_id`; a level-1 record below the floor skips 4096
-postings with one test. `Bm25Index` gains one method,
-`fn impacts(&self, term: &str) -> Option<ImpactCursor>`, returning `None`
-for the heap builder and for v3/v4 files, so those fall back to the
-existing exhaustive `top_k` and the two paths can be compared directly in
-tests.
-
-As landed: stage 2 shipped the pruned scorer (`bm25::top_k_pruned`)
-with range skips and static-bound termination; stage 3 completed the
-sketch above — level-1 leaps in `advance_shallow` and the MaxScore
-essential / non-essential partition inside competitive windows, with a
-candidate test whose bound is the essential (true) contributions plus
-the non-essential block maxes. The exactness contract below held
-unchanged throughout; the only place exactness constrained the design
-is that every bound sum (termination, skips, partition, candidate test)
-is accumulated in term-index order, because IEEE addition is not
-associative and only the identical association order provably dominates
-the true score.
+On every heap replacement the floor rises and every bound test
+re-evaluates against it.
 
 Occurrences are read only for the k survivors, through `occ_start`. That
 alone removes the per-posting `Vec` allocation that dominates the 550 ns,
-and it is independent of any skipping: worth landing first as its own
-step, since it is a pure win with no format-level pruning risk.
+and it is independent of any skipping.
+
+**Legacy formats.** v3/v4 files load and serve, but they are kept for
+migration only: they serve on the unoptimized exhaustive path, and the
+occurrence-split scorer does O(k·df) survivor-offset lookups on them, so
+large-k `Bm25Search` against an unmigrated v4 file is slower than it was
+before v5 (crossover around k≈300). There is no backward-compatibility
+commitment to that path — production shards should be migrated to v5
+(via a WAL `reshard` replay plus `InstallSnapshot`, or simply by taking
+new documents, which flush v5).
 
 ## Exactness and its gate
 
 The skip test is `bound <= cutoff` against the current k-th best, and
 `<=` rather than `<` is load-bearing on the tie case, so it is worth
-spelling out. Today's `top_k` sorts by score descending, doc id
-ascending, so at equal scores the smaller doc id wins. A doc-ordered
-scan reproduces that ordering exactly when the heap replaces only on a
-strictly greater score: the incumbent is always the smaller doc id. A
-block whose bound equals the cutoff therefore lies later in doc-id order
-than the incumbent and can contain nothing that displaces it, so `<=` is
-safe. Reverse either half of that (scan out of doc order, or let ties
+spelling out. `top_k` sorts by score descending, doc id ascending, so
+at equal scores the smaller doc id wins. A doc-ordered scan reproduces
+that ordering exactly when the heap replaces only on a strictly greater
+score: the incumbent is always the smaller doc id. A block whose bound
+equals the cutoff therefore lies later in doc-id order than the
+incumbent and can contain nothing that displaces it, so `<=` is safe.
+Reverse either half of that (scan out of doc order, or let ties
 displace) and the test has to weaken to `<`.
+
+Doc order is maintained **structurally**: on the inert-drop path every
+cursor — essential and non-essential — advances past the dropped doc, so
+no cursor ever lags the wavefront and candidate selection is strictly
+doc-id increasing (a `debug_assert!` checks it on every selection). The
+advance is sound: an unconsumed doc behind the wavefront has postings
+only in currently non-essential terms (every essential cursor sits at or
+past the wavefront, so its earlier postings are consumed), the partition
+proved the sum of those terms' block bounds inert over the whole window,
+and inertness only strengthens as the floor and the k-th best rise —
+such docs can never become insertable later. (An earlier revision let
+non-essential cursors lag and relied on that argument alone to keep
+results exact; the argument held, but the *stated* doc-order invariant
+was false, so the code now enforces it.)
+
+One more subtlety that is load-bearing: every bound sum — termination,
+both skip tiers, the partition, the candidate test — is accumulated in
+**term-index order**. IEEE addition is not associative, and only the
+identical association order provably dominates the true (term-ordered)
+score; a reordered bound can dip an ULP below a tied floor and prune a
+doc that must survive.
 
 Skipping then only removes candidates that would have been rejected, so
 the returned top-k is bit-for-bit the exhaustive result. This is the same
 contract the vector side already carries for `initial_threshold`: ties at
 the floor survive, and a seeded floor above the true k-th best returns
-the unseeded result filtered to that floor.
+the unseeded result filtered to that floor. The wire floor is f32 while
+scoring is f64, and `f32(kth)` rounds up half the time — so every
+`kth_best` is **emitted one f32 ULP down** (`bm25::floor_seed`), which
+can never exceed the true k-th best; seeding with the emitted value is
+provably lossless (the round-trip gate below).
 
 Gates, in the project's existing style:
 
@@ -235,6 +242,13 @@ Gates, in the project's existing style:
 - a test asserting the truncated frontier never under-bounds: for every
   block, the stored frontier's max is `>=` the max over the block's real
   postings, at several `avgdl` values;
+- a seeded round-trip test: for random corpora and every `k`, seeding
+  with the emitted `kth_best` and re-querying returns the unseeded
+  result exactly (zero lost boundary hits), including engineered tie
+  clusters at the boundary;
+- a level-1-scale fuzz (20k-44k docs, clone tie pressure, duplicate and
+  absent terms, floors including exact-kth and mid-range) that runs with
+  the doc-order `debug_assert!` armed;
 - `cluster_sweep`'s cross-cell hit-signature gate extended to the lexical
   leg, so a fleet sweep with pruning on is compared against pruning off
   the way sharing on/off already is.

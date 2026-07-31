@@ -440,3 +440,199 @@ fn score_candidates_advance_matches_merge_join() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Seeded-floor f32 round trip (review issue: `f32(kth)` rounds up half
+/// the time and filters the boundary hit). `bm25::floor_seed` emits one
+/// ULP below the wire k-th best, so seeding with the emitted value is
+/// lossless: seeded == unseeded for EVERY k, tie clusters included.
+/// Expected lost boundary hits across the whole sweep: 0.
+#[test]
+fn seeded_round_trip_never_loses_boundary_hits() {
+    let dir = test_dir("roundtrip");
+    let mut rng = Lcg::new(0x5EED_CAFE);
+    let mut checked = 0usize;
+    for round in 0..15 {
+        let n_vocab = 2 + rng.below(12);
+        let vocab: Vec<String> = (0..n_vocab).map(|i| format!("t{i}")).collect();
+        let n_docs = 30 + rng.below(200);
+        let constant_dl = rng.below(2) == 0;
+        let wide = rng.below(3) == 0;
+        let corpus = random_corpus(&mut rng, n_docs, &vocab, constant_dl, wide);
+        let store = build_store(&corpus);
+        let path = dir.join(format!("rt{round}.bm25"));
+        store.save(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+        let n_take = 1 + rng.below(4) as usize;
+        let terms: Vec<String> = vocab
+            .iter()
+            .filter(|_| rng.below(2) == 0)
+            .take(n_take)
+            .cloned()
+            .collect();
+        let terms = if terms.is_empty() {
+            vec![vocab[0].clone()]
+        } else {
+            terms
+        };
+        let stats = CorpusStats {
+            doc_count: store.doc_count(),
+            total_doc_length: store.total_doc_length(),
+            dfs: terms.iter().map(|t| Bm25Index::df(&store, t)).collect(),
+        };
+        let params = Bm25Params {
+            k1: 0.4 + rng.below(20) as f64 / 10.0,
+            b: rng.below(10) as f64 / 10.0,
+        };
+        let k_max = (store.doc_count() as usize).min(60);
+        for k in 1..=k_max {
+            let unseeded =
+                bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::NEG_INFINITY);
+            if unseeded.len() < k {
+                break; // heap cannot fill: no kth_best emitted for larger k
+            }
+            // The wire emission: f32 of the k-th score, one ULP down.
+            let emitted = bm25::floor_seed(unseeded[k - 1].score as f32);
+            let seeded =
+                bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::from(emitted));
+            assert_eq!(
+                sig(&unseeded),
+                sig(&seeded),
+                "round {round} k {k}: boundary hit lost (emitted {emitted:e})"
+            );
+            checked += 1;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    assert!(checked > 200, "round-trip sweep too thin: {checked}");
+
+    // Engineered tie cluster at the boundary: identical docs, identical
+    // scores — the exact case f32 rounding used to drop.
+    let mut store = Bm25Store::new();
+    for i in 0..200u32 {
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            AnalyzedDoc {
+                terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
+                length: 3,
+            },
+        );
+    }
+    let path = dir.join("ties.bm25");
+    store.save(&path).unwrap();
+    let reader = Bm25Reader::open(&path).unwrap();
+    let terms = vec!["court".to_string()];
+    let stats = CorpusStats {
+        doc_count: store.doc_count(),
+        total_doc_length: store.total_doc_length(),
+        dfs: vec![200],
+    };
+    let params = Bm25Params::default();
+    let unseeded = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, f64::NEG_INFINITY);
+    assert!(unseeded.iter().all(|h| h.score == unseeded[0].score));
+    let emitted = bm25::floor_seed(unseeded[9].score as f32);
+    assert!(
+        f64::from(emitted) < unseeded[9].score,
+        "seed must sit strictly below the tie score"
+    );
+    let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, f64::from(emitted));
+    assert_eq!(sig(&unseeded), sig(&seeded), "tie cluster at the boundary");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Level-1-scale fuzz: corpora big enough for terms to span multiple
+/// level-1 groups (128 blocks x 128 postings), heavy tie pressure from
+/// cloned doc patterns, duplicate and absent query terms, and floors
+/// including exact-kth and mid-range. Bitwise vs the exhaustive oracle.
+/// With debug assertions armed (the default for `cargo test`), the
+/// doc-order invariant inside `top_k_pruned` is checked on every
+/// candidate selection — this fuzz must produce zero out-of-order
+/// selections. (Adopted shape from the review's level-1 harness.)
+#[test]
+fn pruned_level1_scale_fuzz() {
+    let dir = test_dir("l1fuzz");
+    let mut rng = Lcg::new(0x1E11_F022);
+    // Cloned doc patterns are the tie pressure: every clone produces an
+    // identical score for the terms it carries.
+    for round in 0..24u64 {
+        let n_vocab = 6 + rng.below(10);
+        let vocab: Vec<String> = (0..n_vocab).map(|i| format!("t{i}")).collect();
+        let n_patterns = 30 + rng.below(30);
+        let patterns: Vec<AnalyzedDoc> = (0..n_patterns)
+            .map(|_| {
+                let mut terms: DocTerms = Vec::new();
+                let mut length = 0;
+                for _ in 0..1 + rng.below(4) {
+                    let term = vocab[rng.below(vocab.len() as u64) as usize].clone();
+                    if terms.iter().any(|(t, _, _)| *t == term) {
+                        continue;
+                    }
+                    let tf = 1 + rng.below(3) as u32;
+                    let offsets = (0..tf).map(|o| (o * 10, o * 10 + 4)).collect();
+                    length += tf;
+                    terms.push((term, tf, offsets));
+                }
+                AnalyzedDoc { terms, length }
+            })
+            .collect();
+        let n_docs = 20_000 + rng.below(24_000);
+        let mut store = Bm25Store::new();
+        let mut id = 0u32;
+        for _ in 0..n_docs {
+            id += 1 + rng.below(2) as u32;
+            let doc = patterns[rng.below(patterns.len() as u64) as usize].clone();
+            store.add_document(id, format!("doc {id}"), doc);
+        }
+        let path = dir.join(format!("f{round}.bm25"));
+        store.save(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+
+        for _ in 0..40 {
+            // Duplicate and absent terms on purpose.
+            let n_terms = 1 + rng.below(4) as usize;
+            let mut terms: Vec<String> = (0..n_terms)
+                .map(|_| vocab[rng.below(vocab.len() as u64) as usize].clone())
+                .collect();
+            if rng.below(3) == 0 && !terms.is_empty() {
+                let dup = terms[0].clone();
+                terms.push(dup);
+            }
+            if rng.below(4) == 0 {
+                terms.push("absent-term".to_string());
+            }
+            let stats = CorpusStats {
+                doc_count: store.doc_count(),
+                total_doc_length: store.total_doc_length(),
+                dfs: terms.iter().map(|t| Bm25Index::df(&store, t)).collect(),
+            };
+            let params = Bm25Params {
+                k1: [0.0, 1.2, 2.0][rng.below(3) as usize],
+                b: [0.0, 0.75, 1.0][rng.below(3) as usize],
+            };
+            let k = 1 + rng.below(30) as usize;
+            let oracle = bm25::top_k_exhaustive(&store, &terms, &stats, params, k);
+            let mut floors = vec![f64::NEG_INFINITY];
+            if oracle.len() == k {
+                floors.push(oracle[k - 1].score); // exact k-th best
+            }
+            if oracle.len() > 2 {
+                floors.push(oracle[oracle.len() / 2].score); // mid-range
+            }
+            for floor in floors {
+                let want = bm25::filter_to_floor(oracle.clone(), floor);
+                let mut prune = PruneStats::default();
+                let got = bm25::top_k_pruned_stats(
+                    &reader, &terms, &stats, params, k, floor, &mut prune,
+                );
+                assert_eq!(
+                    sig(&want),
+                    sig(&got),
+                    "round {round}, terms {terms:?}, k {k}, floor {floor:e}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
