@@ -568,6 +568,24 @@ scores within a few ULPs).
 `max(k, rrf_k)`; override in `HybridLegOptions`, clamped to >= k.
 Cascade ignores leg_k/weights/rrf_k (its depth is k plus ties).
 
+### The console (test harness UI)
+
+`cargo run --release --bin console -- --coordinator=host:port
+--nodes=host:port,... --analysis=host:port [--listen=127.0.0.1:8600]`
+serves a single-file web UI for exercising every hybrid knob by hand
+against a RUNNING cluster (the console is purely a client). Query text
+is embedded through the sidecar's Model2Vec model (`EmbeddingOptions`,
+sentence embeddings mean-pooled and L2-normalized), the search runs
+through the coordinator's `HybridSearch` with `debug` always on, and
+hit texts come from the owning nodes (`GetDocuments`, which is why the
+console takes the node list in shard order). The UI exposes fusion
+mode, leg_k/rrf_k/weights, score-blend normalization + combination,
+boost rescore, and the analysis spec (tokenizer/stemmer/term source —
+must match ingest); renders per-hit provenance with term highlighting,
+the phase-timing bar, and the per-shard waterfall (cascade scan stats
+included); and holds any result as "A" for side-by-side comparison
+with movement markers.
+
 ### Boost rescore (any mode)
 
 `HybridSearchRequest.boost{text, window, base_weight, boost_weight}`

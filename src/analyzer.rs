@@ -88,6 +88,55 @@ fn client(addr: &str) -> Result<AnalysisServiceClient<Channel>, Status> {
         .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
 }
 
+/// Embed `text` through the sidecar's embedding model (Model2Vec-style,
+/// `EmbeddingOptions` over sentences) into ONE query vector: sentence
+/// embeddings are mean-pooled and L2-normalized, matching the
+/// unit-normalized corpus vectors. Fails FAILED_PRECONDITION when the
+/// sidecar has no embedding model loaded (its warning is passed
+/// through).
+pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
+    use crate::pb::analysis::{embedding_options, EmbeddingOptions};
+    if text.is_empty() {
+        return Err(Status::invalid_argument("empty text"));
+    }
+    let request = AnalyzeRequest {
+        text: text.to_string(),
+        options: Some(AnalysisOptions {
+            embeddings: Some(EmbeddingOptions {
+                source: embedding_options::Source::Sentences as i32,
+            }),
+            ..Default::default()
+        }),
+    };
+    let response = client(addr)?.analyze(request).await?.into_inner();
+    if response.embeddings.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "sidecar returned no embeddings ({})",
+            if response.warnings.is_empty() {
+                "no warning given".to_string()
+            } else {
+                response.warnings.join("; ")
+            }
+        )));
+    }
+    let dim = response.embeddings[0].vector.len();
+    let mut pooled = vec![0.0f64; dim];
+    for chunk in &response.embeddings {
+        if chunk.vector.len() != dim {
+            return Err(Status::internal("sidecar embeddings disagree on dim"));
+        }
+        for (acc, &v) in pooled.iter_mut().zip(&chunk.vector) {
+            *acc += f64::from(v);
+        }
+    }
+    let n = response.embeddings.len() as f64;
+    let norm = pooled.iter().map(|v| (v / n).powi(2)).sum::<f64>().sqrt();
+    if norm == 0.0 {
+        return Err(Status::failed_precondition("embedding pooled to zero"));
+    }
+    Ok(pooled.iter().map(|v| ((v / n) / norm) as f32).collect())
+}
+
 /// Maps `spec` straight onto the sidecar's `AnalysisOptions`: term vectors
 /// are always requested (FULL mode with occurrence offsets unless the spec
 /// overrides), everything else defaults.
