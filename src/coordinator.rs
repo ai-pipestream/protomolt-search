@@ -502,7 +502,10 @@ impl CoordinatorServiceImpl {
             tie_complete,
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
+            hedges: Arc::new(AtomicU64::new(0)),
+            hedge_wins: Arc::new(AtomicU64::new(0)),
         };
+        let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
 
         let (done_tx, mut done_rx) =
             mpsc::channel::<(u32, Result<SearchShardDone, Status>)>(n_nodes);
@@ -557,6 +560,8 @@ impl CoordinatorServiceImpl {
             hits,
             shard_stats,
             shard_hits,
+            hedges_fired: hedges.load(AtomicOrdering::Relaxed),
+            hedge_wins: hedge_wins.load(AtomicOrdering::Relaxed),
         })
     }
 
@@ -746,6 +751,12 @@ struct ShardQueryCtx {
     /// here; per-stream forwarders relay whatever is LATEST when they
     /// wake, so a burst of raises becomes one message per stream.
     gfloor: Arc<watch::Sender<f32>>,
+    /// Hedge legs launched (a shard's primary outran its hedge delay) and
+    /// hedge legs that beat their primary. Both are pure accounting: a
+    /// benchmark cannot otherwise tell "no hedge fired" from "the hedge
+    /// fired and did not help".
+    hedges: Arc<AtomicU64>,
+    hedge_wins: Arc<AtomicU64>,
 }
 
 fn floor_message(floor: f32) -> SearchShardRequest {
@@ -866,6 +877,7 @@ async fn run_shard_with_hedge(
                             .map_err(|re| both_failed(shard, &pe, &re)),
                     },
                     _ = tokio::time::sleep(delay) => {
+                        ctx.hedges.fetch_add(1, AtomicOrdering::Relaxed);
                         let replica_run = run_shard_stream(shard, rep, ctx.clone());
                         tokio::pin!(replica_run);
                         tokio::select! {
@@ -876,7 +888,10 @@ async fn run_shard_with_hedge(
                                     .map_err(|re| both_failed(shard, &pe, &re)),
                             },
                             r = &mut replica_run => match r {
-                                Ok(done) => Ok(done),
+                                Ok(done) => {
+                                    ctx.hedge_wins.fetch_add(1, AtomicOrdering::Relaxed);
+                                    Ok(done)
+                                }
                                 Err(re) => primary_run
                                     .await
                                     .map_err(|pe| both_failed(shard, &pe, &re)),
@@ -943,6 +958,10 @@ pub struct FanoutResult {
     /// exceed k by its boundary tie group. The cascade pipeline routes
     /// candidates by these shard assignments.
     pub shard_hits: Vec<(u32, Vec<(u64, f32)>)>,
+    /// Hedge legs launched during this fan-out, and how many of them
+    /// returned before their primary.
+    pub hedges_fired: u64,
+    pub hedge_wins: u64,
 }
 
 #[tonic::async_trait]

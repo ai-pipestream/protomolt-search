@@ -167,6 +167,54 @@ def chart_pruning():
     return "".join(p)
 
 
+def chart_hedging():
+    """Hedged replicas change sign with the failure mode: harmful on a
+    healthy bandwidth-bound fleet, useful against a stalled node. One
+    shared millisecond scale, because the gap between the two baselines
+    is part of the story."""
+    panels = [
+        ("Healthy fleet", "hedge 1700 ms", 1721.0, 3005.0, 4.8, 3.6),
+        ("Stalled node", "hedge 2000 ms", 5034.6, 3467.0, 3.9, 4.1),
+    ]
+    p = svg_open(
+        "Hedged replicas - p99 by failure mode",
+        [
+            "Five-machine fleet, 86.6M chunks, k=10, 8 concurrent clients; replicas are the no-sharing twins on the same hosts.",
+            "Stalled-node cells inject two 4 s SIGSTOP pauses on one primary and average two replicates. Results gated identical throughout.",
+        ],
+    )
+    left, right, top, bottom = 84, 860, 128, 380
+    span = bottom - top
+    vmax = 5800.0
+    for g in [0, 2000, 4000]:
+        y = bottom - span * g / vmax
+        p.append(f'  <line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" stroke="{GRID}" stroke-width="1" />\n')
+        p.append(f'  <text x="{left - 8}" y="{y + 4:.1f}" class="tick" text-anchor="end">{g // 1000} s</text>\n')
+    n = len(panels)
+    panel_w = (right - left) / n
+    bw, gap = 80, 2
+    for i, (name, delay, off, on, qps_off, qps_on) in enumerate(panels):
+        cx = left + panel_w * i + panel_w / 2
+        p.append(f'  <line x1="{cx - panel_w / 2 + 14:.1f}" y1="{bottom}" x2="{cx + panel_w / 2 - 14:.1f}" y2="{bottom}" stroke="{AXISLINE}" stroke-width="1" />\n')
+        for j, (v, q, color) in enumerate([(off, qps_off, INDIGO), (on, qps_on, AMBER)]):
+            x = cx - bw - gap / 2 + j * (bw + gap)
+            h = span * v / vmax
+            p.append(rounded_top_bar(x, bottom - h, bw, h, color))
+            p.append(f'  <text x="{x + bw / 2:.1f}" y="{bottom - h - 24:.1f}" class="value" text-anchor="middle">{fmt_ms(v)}</text>\n')
+            p.append(f'  <text x="{x + bw / 2:.1f}" y="{bottom - h - 8:.1f}" class="tick" text-anchor="middle">{q:.1f} QPS</text>\n')
+        delta = on / off - 1
+        p.append(f'  <text x="{cx:.1f}" y="{top - 6:.1f}" class="value-accent" text-anchor="middle">p99 {delta * 100:+.0f}%</text>\n')
+        p.append(f'  <text x="{cx:.1f}" y="{bottom + 20}" class="panel" text-anchor="middle">{name}</text>\n')
+        p.append(f'  <text x="{cx:.1f}" y="{bottom + 38}" class="tick" text-anchor="middle">{delay}</text>\n')
+    lx = right - 250
+    p.append(f'  <rect x="{lx}" y="84" width="12" height="12" rx="3" fill="{INDIGO}" />\n')
+    p.append(f'  <text x="{lx + 18}" y="95" class="legend">hedging off</text>\n')
+    p.append(f'  <rect x="{lx + 120}" y="84" width="12" height="12" rx="3" fill="{AMBER}" />\n')
+    p.append(f'  <text x="{lx + 138}" y="95" class="legend">hedging on</text>\n')
+    p.append("</svg>\n")
+    return "".join(p)
+
+
 def chart_concurrency():
     import math
     clients = [1, 2, 4, 8, 16, 32]
@@ -220,6 +268,7 @@ for name, svg in [
     ("recall_rerank.svg", chart_recall()),
     ("floor_sharing_pruning.svg", chart_pruning()),
     ("concurrency_throughput.svg", chart_concurrency()),
+    ("hedging_by_failure_mode.svg", chart_hedging()),
 ]:
     with open(f"{out}/{name}", "w") as f:
         f.write(svg)

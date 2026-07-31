@@ -18,6 +18,12 @@
 //! `read_embedding_at`) or from a court embeddings file
 //! (`--probes-from`), so queries live in the real embedding space.
 //!
+//! With `--replicas` (one entry per shard, empty slots allowed) the
+//! sharing cluster can also be swept over hedge delays: `--hedge-ms`
+//! takes a comma list where `off` disables hedging, and every hedged
+//! cell's hit signature is gated against the un-hedged cell — hedging
+//! races two copies of an exact search, so it must never move a result.
+//!
 //! ```text
 //! # single cluster, k sweep, 8 concurrent clients
 //! cluster_sweep \
@@ -31,13 +37,19 @@
 //!   --nodes-sharing=host-a:50061,host-a:50062,host-b:50063,host-b:50064 \
 //!   --nodes-nosharing=host-a:50071,host-a:50072,host-b:50073,host-b:50074 \
 //!   --k=10,100,1000,10000 --queries=20
+//!
+//! # hedge sweep against replicas of the same shards
+//! cluster_sweep \
+//!   --nodes-sharing=host-a:50061,host-b:50063 \
+//!   --replicas=host-a:50071,host-b:50073 \
+//!   --hedge-ms=off,400,800 --k=10 --queries=200 --concurrency=8
 //! ```
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
+use turbovec_search::coordinator::{CoordinatorServiceImpl, FanoutLimits};
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 
 const DEFAULT_DATA_DIR: &str = "/work/opensearch-grpc-knn/distributed_test_data/wikipedia";
@@ -105,6 +117,44 @@ fn node_list(key: &str) -> Option<Vec<String>> {
     })
 }
 
+/// Replica addresses, positionally aligned with the sharing node list.
+/// An empty slot (`a,,c`) means "this shard has no replica".
+fn replica_list(key: &str, shards: usize) -> Vec<Option<String>> {
+    let Some(raw) = arg(key) else {
+        return vec![None; shards];
+    };
+    let mut replicas: Vec<Option<String>> = raw
+        .split(',')
+        .map(str::trim)
+        .map(|s| match s {
+            "" => None,
+            s if s.starts_with("http://") || s.starts_with("https://") => Some(s.to_string()),
+            s => Some(format!("http://{s}")),
+        })
+        .collect();
+    assert!(
+        replicas.len() <= shards,
+        "--{key} has {} entries for {shards} shard(s)",
+        replicas.len()
+    );
+    replicas.resize(shards, None);
+    replicas
+}
+
+/// `--hedge-ms=off,400,800` -> [None, 400ms, 800ms]. `off` and `0` both
+/// disable hedging for that cell.
+fn hedge_list() -> Vec<Option<Duration>> {
+    arg_or("hedge-ms", "off")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| match s {
+            "off" | "0" => None,
+            ms => Some(Duration::from_millis(ms.parse().expect("--hedge-ms"))),
+        })
+        .collect()
+}
+
 async fn wait_ready(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -127,6 +177,8 @@ struct QueryOutcome {
     candidates: u64,
     floors_published: u64,
     floor_updates_applied: u64,
+    hedges_fired: u64,
+    hedge_wins: u64,
     signature: Vec<(u64, u32)>,
 }
 
@@ -155,6 +207,8 @@ async fn run_query(
         candidates,
         floors_published,
         floor_updates_applied,
+        hedges_fired: result.hedges_fired,
+        hedge_wins: result.hedge_wins,
         signature: result
             .hits
             .iter()
@@ -168,6 +222,8 @@ struct Cell {
     candidates: u64,
     floors_published: u64,
     floor_updates_applied: u64,
+    hedges_fired: u64,
+    hedge_wins: u64,
     walls: Vec<f64>,
     /// Total timed-phase elapsed (for QPS under concurrency).
     elapsed: Duration,
@@ -188,12 +244,18 @@ impl Cell {
 /// latency distribution and keeps the probe count exactly `--queries`.
 async fn run_cell(
     nodes: &[String],
+    replicas: &[Option<String>],
+    limits: FanoutLimits,
     probes: &[Probe],
     k: u32,
     warmup: usize,
     concurrency: usize,
 ) -> Cell {
-    let coordinator = Arc::new(CoordinatorServiceImpl::new(nodes.to_vec()));
+    let coordinator = Arc::new(
+        CoordinatorServiceImpl::new(nodes.to_vec())
+            .with_replicas(replicas.to_vec())
+            .with_limits(limits),
+    );
 
     for (qi, (_, vector)) in probes.iter().take(warmup).enumerate() {
         run_query(&coordinator, &format!("sweep-{k}-warm-{qi}"), vector, k).await;
@@ -239,22 +301,34 @@ async fn run_cell(
         candidates: outcomes.iter().map(|o| o.candidates).sum(),
         floors_published: outcomes.iter().map(|o| o.floors_published).sum(),
         floor_updates_applied: outcomes.iter().map(|o| o.floor_updates_applied).sum(),
+        hedges_fired: outcomes.iter().map(|o| o.hedges_fired).sum(),
+        hedge_wins: outcomes.iter().map(|o| o.hedge_wins).sum(),
         walls,
         elapsed,
         signature,
     }
 }
 
-fn print_row(k: u32, mode: &str, cell: &Cell, n_queries: usize) {
+fn hedge_label(hedge: Option<Duration>) -> String {
+    match hedge {
+        None => "off".to_string(),
+        Some(d) => format!("{}ms", d.as_millis()),
+    }
+}
+
+fn print_row(k: u32, mode: &str, hedge: &str, cell: &Cell, n_queries: usize) {
     println!(
-        "{:>8} {:>8} {:>7} {:>14} {:>12} {:>10} {:>10} {:>9.3} {:>9.3} {:>9.3} {:>8.1}",
+        "{:>8} {:>8} {:>8} {:>7} {:>14} {:>12} {:>10} {:>10} {:>8} {:>6} {:>9.3} {:>9.3} {:>9.3} {:>8.1}",
         k,
         mode,
+        hedge,
         cell.n_shards,
         cell.candidates,
         cell.candidates / n_queries.max(1) as u64,
         cell.floors_published,
         cell.floor_updates_applied,
+        cell.hedges_fired,
+        cell.hedge_wins,
         cell.p(0.5),
         cell.p(0.9),
         cell.p(0.99),
@@ -262,17 +336,27 @@ fn print_row(k: u32, mode: &str, cell: &Cell, n_queries: usize) {
     );
 }
 
-fn json_line(label: &str, k: u32, mode: &str, cell: &Cell, n_queries: usize) -> String {
+fn json_line(
+    label: &str,
+    k: u32,
+    mode: &str,
+    hedge: &str,
+    cell: &Cell,
+    n_queries: usize,
+) -> String {
     serde_json::json!({
         "label": label,
         "k": k,
         "floor_sharing": mode,
+        "hedge": hedge,
         "shards": cell.n_shards,
         "queries": n_queries,
         "candidates_collected": cell.candidates,
         "candidates_per_query": cell.candidates as f64 / n_queries.max(1) as f64,
         "floors_published": cell.floors_published,
         "floor_updates_applied": cell.floor_updates_applied,
+        "hedges_fired": cell.hedges_fired,
+        "hedge_wins": cell.hedge_wins,
         "wall_p50_ms": cell.p(0.5),
         "wall_p90_ms": cell.p(0.9),
         "wall_p99_ms": cell.p(0.99),
@@ -287,6 +371,10 @@ fn json_line(label: &str, k: u32, mode: &str, cell: &Cell, n_queries: usize) -> 
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nodes_sharing = node_list_required("nodes-sharing");
     let nodes_nosharing = node_list("nodes-nosharing");
+    let replicas = replica_list("replicas", nodes_sharing.len());
+    let hedges = hedge_list();
+    let shard_deadline: u64 = arg_or("shard-deadline-ms", "0").parse()?;
+    let shard_deadline = (shard_deadline > 0).then(|| Duration::from_millis(shard_deadline));
     let data_dir = arg_or("data-dir", DEFAULT_DATA_DIR);
     let ks: Vec<u32> = arg_or("k", "10,100,1000,10000")
         .split(',')
@@ -301,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for addr in nodes_sharing
         .iter()
         .chain(nodes_nosharing.iter().flatten())
+        .chain(replicas.iter().flatten())
     {
         wait_ready(addr).await;
     }
@@ -321,23 +410,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "{:>8} {:>8} {:>7} {:>14} {:>12} {:>10} {:>10} {:>9} {:>9} {:>9} {:>8}",
-        "k", "sharing", "shards", "candidates", "cand/query", "floors_pub", "floors_app",
-        "p50_ms", "p90_ms", "p99_ms", "qps"
+        "{:>8} {:>8} {:>8} {:>7} {:>14} {:>12} {:>10} {:>10} {:>8} {:>6} {:>9} {:>9} {:>9} {:>8}",
+        "k", "sharing", "hedge", "shards", "candidates", "cand/query", "floors_pub", "floors_app",
+        "hedged", "won", "p50_ms", "p90_ms", "p99_ms", "qps"
     );
 
     let mut json_lines = Vec::new();
     let mut gate_failures = 0;
     for &k in &ks {
-        let on = run_cell(&nodes_sharing, &probes, k, warmup, concurrency).await;
-        print_row(k, "on", &on, n_queries);
-        json_lines.push(json_line(&label, k, "on", &on, n_queries));
+        // The first hedge value is the reference cell for this k: every
+        // other cell's hit signature is gated against it. Hedging races
+        // two copies of the same exact search, so it must not move a hit.
+        let mut reference: Option<Vec<(u64, u32)>> = None;
+        for &hedge in &hedges {
+            let limits = FanoutLimits {
+                shard_deadline,
+                hedge_delay: hedge,
+            };
+            let cell = run_cell(
+                &nodes_sharing,
+                &replicas,
+                limits,
+                &probes,
+                k,
+                warmup,
+                concurrency,
+            )
+            .await;
+            let hedge = hedge_label(hedge);
+            print_row(k, "on", &hedge, &cell, n_queries);
+            json_lines.push(json_line(&label, k, "on", &hedge, &cell, n_queries));
+            match &reference {
+                None => reference = Some(cell.signature.clone()),
+                Some(expected) if *expected != cell.signature => {
+                    gate_failures += 1;
+                    eprintln!("CORRECTNESS GATE FAILURE at k={k}: hedge={hedge} changed results");
+                }
+                Some(_) => {}
+            }
+        }
 
         if let Some(off_nodes) = &nodes_nosharing {
-            let off = run_cell(off_nodes, &probes, k, warmup, concurrency).await;
-            print_row(k, "off", &off, n_queries);
-            json_lines.push(json_line(&label, k, "off", &off, n_queries));
-            if on.signature != off.signature {
+            let off = run_cell(
+                off_nodes,
+                &vec![None; off_nodes.len()],
+                FanoutLimits::default(),
+                &probes,
+                k,
+                warmup,
+                concurrency,
+            )
+            .await;
+            print_row(k, "off", "off", &off, n_queries);
+            json_lines.push(json_line(&label, k, "off", "off", &off, n_queries));
+            if reference.as_ref().is_some_and(|r| *r != off.signature) {
                 gate_failures += 1;
                 eprintln!("CORRECTNESS GATE FAILURE at k={k}: sharing changed results");
             }
@@ -356,9 +482,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("wrote {} JSONL record(s) to {path}", json_lines.len());
     }
 
-    if nodes_nosharing.is_some() {
+    let gated = nodes_nosharing.is_some() || hedges.len() > 1;
+    if gated {
         if gate_failures == 0 {
-            eprintln!("correctness gate: sharing on/off results identical at every k");
+            eprintln!("correctness gate: results identical across every cell at every k");
         }
         std::process::exit(if gate_failures == 0 { 0 } else { 1 });
     }

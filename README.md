@@ -170,7 +170,7 @@ chunk_blocks = 64                              # scan chunk size (SIMD blocks)
 floor_sharing = true
 floor_delta = 0.0                              # min raise before a floor publishes (0 = every raise)
 shard_deadline_ms = 0                          # per-shard query deadline (0 = none)
-hedge_delay_ms = 0                             # hedge slow shards to their replica after this (0 = failover only)
+hedge_delay_ms = 0                             # hedge slow shards to their replica after this (0 = failover only; set above healthy p99)
 max_message_mib = 64                           # gRPC message cap (both directions)
 
 [[shards]]                                     # shards this process serves
@@ -204,7 +204,12 @@ the file's `[[shards]]` entirely.
   fails over to it; with `hedge_delay_ms` set, a shard still running
   when the delay expires gets a second identical search on its replica
   and the first success wins. Search is exact, so either copy returns
-  identical results.
+  identical results. Hedging is stall insurance, not a latency
+  optimization: set the delay ABOVE the healthy p99, or the timer fires
+  on ordinary bottleneck shards and the duplicate scan compounds the
+  saturation it was meant to escape. Measured both ways in Round 5 of
+  TEST_RESULTS.md — a 26–37% p99 improvement against a stalled node, a
+  25–40% throughput loss when hedging a healthy bandwidth-bound fleet.
 - **Deadlines.** `shard_deadline_ms` bounds one query's whole per-shard
   attempt (primary plus any hedge); a shard that exceeds it fails the
   query with DEADLINE_EXCEEDED instead of stalling it.

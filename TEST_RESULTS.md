@@ -261,6 +261,94 @@ in isolation on a branch) would let large shards run whole-shard calls
 without losing reactivity, putting the projected fleet p50 near 250 ms
 at an aggregate-bandwidth QPS around 9.
 
+## Round 5: hedged replicas on the fleet
+
+The maturity round added replica failover and hedged retries: a shard
+whose primary has not answered within `hedge_delay_ms` gets the same
+search opened on its replica, and the first success wins. Because the
+search is exact, the two answers are interchangeable, so the only
+question is what hedging costs and what it buys. The fleet's
+no-sharing twins (`:59701`, the same shard files on the same hosts)
+were registered as replicas and the delay swept at eight concurrent
+clients, k=10, 200 probes per cell. The hit signature of every cell is
+gated against the un-hedged cell.
+
+Two counters were added to the fan-out for this round — hedge legs
+launched and hedge legs that beat their primary — because otherwise a
+null result cannot be told apart from a hedge that never fired.
+
+![Hedged replicas by failure mode](docs/benchmarks/hedging_by_failure_mode.svg)
+
+**Healthy fleet.** Baseline p50 1,634 ms / p99 1,721 ms at 4.9 QPS:
+a p99/p50 ratio of 1.05, which is to say no straggler tail at all.
+
+| Hedge delay | Legs hedged | Won | p50 | p99 | QPS |
+|---|---|---|---|---|---|
+| off | 0 | 0 | 1,657 ms | 1,721 ms | 4.8 |
+| 100 ms | 1000 (all) | 92 | 2,738 ms | 2,840 ms | 2.9 |
+| 800 ms | 431 | 0 | 2,748 ms | 2,924 ms | 2.9 |
+| 1500 ms | 199 | 0 | 2,722 ms | 2,912 ms | 3.0 |
+| 1700 ms | 109 | 0 | 2,504 ms | 3,005 ms | 3.6 |
+
+Negative result, and a strong one: hedging a healthy bandwidth-bound
+fleet is harmful at every delay. The 100 ms cell doubles cluster work
+and pays for it almost exactly, dropping throughput 40%. The
+interesting cell is 1700 ms, where only 109 of 1,000 shard legs hedge
+— 11% more work for a 25% throughput loss and a 51% worse p50. The
+damage is disproportionate because a latency-triggered hedge *selects
+for the bottleneck*: the only legs slow enough to trip the timer are
+the ones already on the critical path, so the remedy adds duplicate
+work exactly where the query is already waiting.
+
+Selective replicas isolate this directly. Hedging only the three small
+Pi shards fires zero legs at a 1700 ms delay (they finish long before
+the timer) and costs nothing. Hedging only the two large shards
+reproduces essentially the entire penalty of the full configuration:
+
+| Replicas | Legs hedged | Won | p50 | p99 | QPS |
+|---|---|---|---|---|---|
+| none (reference) | 0 | 0 | 1,678 ms | 1,760 ms | 4.8 |
+| 3 small shards only | 0 | 0 | 1,678 ms | 1,765 ms | 4.8 |
+| 2 large shards only | 190 | 0 | 2,731 ms | 2,885 ms | 3.0 |
+
+Zero wins in either large-shard cell: a copy started 1.7 s late on a
+machine already at its bandwidth ceiling never catches the original.
+
+**Stalled node.** Hedging is insurance against a stall, not against
+saturation, so the case it exists for was measured too. One Pi's
+primary was paused (`SIGSTOP`) twice for 4 s during each run; its
+`:59701` twin is a separate process over the same shard file, so it
+stayed live and could serve the hedge. Two replicates of each cell:
+
+| Hedge | Legs hedged | Won | p50 | p90 | p99 | max | QPS |
+|---|---|---|---|---|---|---|---|
+| off | 0 | 0 | 1,718 ms | 1,855 ms | 5,037 ms | 5,121 ms | 3.9 |
+| 2000 ms | 33 | 32 | 1,677 ms | 2,841 ms | 3,740 ms | 3,851 ms | 4.1 |
+| off | 0 | 0 | 1,679 ms | 2,247 ms | 5,032 ms | 5,065 ms | 3.9 |
+| 2000 ms | 36 | 21 | 1,721 ms | 2,775 ms | 3,194 ms | 3,226 ms | 4.1 |
+
+Here the hedge earns its keep: p99 falls 26% and 37% across the two
+replicates, the maximum falls with it, p50 and throughput are
+unchanged, and the hedge legs win 97% and 58% of their races — the
+timer is landing on precisely the stalled queries rather than on
+healthy ones. p90 rises, which is the trade being made: queries that
+would have waited out the full stall are pulled forward to roughly
+`hedge_delay + one scan`, compressing the extreme tail into the upper
+middle rather than eliminating it.
+
+Findings. Hedging is not a latency optimization; it is a stall
+mitigation, and the two cases have opposite signs on the same fleet.
+The delay must sit above the healthy p99 (2000 ms here, against a
+1,721 ms p99) or the timer fires on ordinary bottleneck legs and the
+duplicate work compounds the saturation it was meant to escape. A
+replica co-located with its primary insures against process-level and
+connection-level stalls, which is what the pooled-channel design makes
+most likely to matter — every concurrent query to a node shares one
+HTTP/2 channel, so one stuck channel stalls all of them and the hedge
+opens a different connection. It cannot insure against a machine
+running out of bandwidth; that needs a replica on separate hardware.
+The defaults stay off, which these numbers support.
+
 ## Next steps
 
 The ceiling-raising directions below — block-max-style bounds adapted

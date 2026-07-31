@@ -134,7 +134,40 @@ async fn hedged_query_returns_identical_results() {
             .await
             .expect("hedged fan-out must succeed");
         assert_eq!(fanout_hits(&result), expected, "round {round}");
+        assert!(result.hedge_wins <= result.hedges_fired);
     }
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn hedge_counters_record_a_fired_leg() {
+    // A stalled primary is the case hedging exists for, and the only
+    // deterministic way to make a leg hedge: the loopback shards answer
+    // faster than any delay worth configuring. The counters are what a
+    // benchmark reads to tell "no hedge fired" from "the hedge fired and
+    // did not help", so they are pinned here rather than inferred.
+    let cluster = Cluster::start(6_000, 64, true).await;
+    let query = unit_vectors(1, DIM, 0x8ED6_1234);
+    let expected = monolithic_topk(&cluster.monolithic, &query, K as usize);
+
+    let (hanging, guard) = hanging_addr().await;
+    let mut addrs = cluster.node_addrs.clone();
+    let real = std::mem::replace(&mut addrs[1], hanging);
+    let coordinator = CoordinatorServiceImpl::new(addrs)
+        .with_replicas(vec![None, Some(real), None])
+        .with_limits(FanoutLimits {
+            shard_deadline: Some(std::time::Duration::from_secs(30)),
+            hedge_delay: Some(std::time::Duration::from_millis(100)),
+        });
+
+    let result = coordinator
+        .fanout_search("hedge-counter-test", &query, K, false)
+        .await
+        .expect("the hedge must rescue the stalled shard");
+    assert_eq!(fanout_hits(&result), expected);
+    assert_eq!(result.hedges_fired, 1, "exactly one shard should hedge");
+    assert_eq!(result.hedge_wins, 1, "the hedge must beat a stalled primary");
+    guard.abort();
     cluster.shutdown().await;
 }
 

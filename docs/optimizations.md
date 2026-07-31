@@ -13,6 +13,8 @@ pipeline stage. Numbers cited were measured on the CourtListener corpus:
 
 ![Collaborative floor sharing pruning](benchmarks/floor_sharing_pruning.svg)
 
+![Hedged replicas by failure mode](benchmarks/hedging_by_failure_mode.svg)
+
 Raw records: `sweep-8x-cb8192.jsonl`, `sweep-ladder.jsonl` (cluster_sweep),
 plus the `layout_equivalence` and `fp32_recall` example outputs. Charts
 regenerate from `benchmarks/make_charts.py`.
@@ -120,8 +122,14 @@ connection setup was pure overhead on the fan-out path). Per-shard
 deadlines (`shard_deadline_ms`) convert a stalled shard into a fast
 failure, and shards with a configured replica get a hedged second
 search after `hedge_delay_ms` — first success wins, and exactness makes
-the two answers interchangeable, so tail latency compresses without a
-correctness cost.
+the two answers interchangeable, so a hedge can never cost correctness.
+It can cost throughput: a latency-triggered hedge selects for the
+bottleneck shard by construction, so on a healthy bandwidth-bound fleet
+it duplicates work exactly where the query is already waiting (measured:
+25–40% throughput lost, no tail to recover). Against a stalled process
+it does what it is for, cutting fleet p99 by 26–37% with the hedge legs
+winning most of their races. The rule the measurements give is to set
+the delay above the healthy p99, and to keep it off otherwise.
 
 **Global ids without coordination.** Shards are assigned disjoint slot
 offsets (stride 25M); a global document id is `slot_offset + local id`.

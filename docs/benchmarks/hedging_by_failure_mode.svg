@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Hedged replicas - p99 by failure mode">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .panel { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Hedged replicas - p99 by failure mode</text>
+  <text x="84" y="52" class="subtitle">Five-machine fleet, 86.6M chunks, k=10, 8 concurrent clients; replicas are the no-sharing twins on the same hosts.</text>
+  <text x="84" y="68" class="subtitle">Stalled-node cells inject two 4 s SIGSTOP pauses on one primary and average two replicates. Results gated identical throughout.</text>
+  <line x1="84" y1="380.0" x2="860" y2="380.0" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="384.0" class="tick" text-anchor="end">0 s</text>
+  <line x1="84" y1="293.1" x2="860" y2="293.1" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="297.1" class="tick" text-anchor="end">2 s</text>
+  <line x1="84" y1="206.2" x2="860" y2="206.2" stroke="#e2e8f0" stroke-width="1" />
+  <text x="76" y="210.2" class="tick" text-anchor="end">4 s</text>
+  <line x1="98.0" y1="380" x2="458.0" y2="380" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M197.0,380.0 L197.0,309.2255172413793 Q197.0,305.2255172413793 201.0,305.2255172413793 L273.0,305.2255172413793 Q277.0,305.2255172413793 277.0,309.2255172413793 L277.0,380.0 Z" fill="#4338ca" />
+  <text x="237.0" y="281.2" class="value" text-anchor="middle">1.7 s</text>
+  <text x="237.0" y="297.2" class="tick" text-anchor="middle">4.8 QPS</text>
+  <path d="M279.0,380.0 L279.0,253.43793103448274 Q279.0,249.43793103448274 283.0,249.43793103448274 L355.0,249.43793103448274 Q359.0,249.43793103448274 359.0,253.43793103448274 L359.0,380.0 Z" fill="#b45309" />
+  <text x="319.0" y="225.4" class="value" text-anchor="middle">3.0 s</text>
+  <text x="319.0" y="241.4" class="tick" text-anchor="middle">3.6 QPS</text>
+  <text x="278.0" y="122.0" class="value-accent" text-anchor="middle">p99 +75%</text>
+  <text x="278.0" y="400" class="panel" text-anchor="middle">Healthy fleet</text>
+  <text x="278.0" y="418" class="tick" text-anchor="middle">hedge 1700 ms</text>
+  <line x1="486.0" y1="380" x2="846.0" y2="380" stroke="#cbd5e1" stroke-width="1" />
+  <path d="M585.0,380.0 L585.0,165.25531034482756 Q585.0,161.25531034482756 589.0,161.25531034482756 L661.0,161.25531034482756 Q665.0,161.25531034482756 665.0,165.25531034482756 L665.0,380.0 Z" fill="#4338ca" />
+  <text x="625.0" y="137.3" class="value" text-anchor="middle">5.0 s</text>
+  <text x="625.0" y="153.3" class="tick" text-anchor="middle">3.9 QPS</text>
+  <path d="M667.0,380.0 L667.0,233.3648275862069 Q667.0,229.3648275862069 671.0,229.3648275862069 L743.0,229.3648275862069 Q747.0,229.3648275862069 747.0,233.3648275862069 L747.0,380.0 Z" fill="#b45309" />
+  <text x="707.0" y="205.4" class="value" text-anchor="middle">3.5 s</text>
+  <text x="707.0" y="221.4" class="tick" text-anchor="middle">4.1 QPS</text>
+  <text x="666.0" y="122.0" class="value-accent" text-anchor="middle">p99 -31%</text>
+  <text x="666.0" y="400" class="panel" text-anchor="middle">Stalled node</text>
+  <text x="666.0" y="418" class="tick" text-anchor="middle">hedge 2000 ms</text>
+  <rect x="610" y="84" width="12" height="12" rx="3" fill="#4338ca" />
+  <text x="628" y="95" class="legend">hedging off</text>
+  <rect x="730" y="84" width="12" height="12" rx="3" fill="#b45309" />
+  <text x="748" y="95" class="legend">hedging on</text>
+</svg>
