@@ -75,6 +75,13 @@ fn main() {
     eprintln!("reading {n} corpus rows + {n_queries} held-out queries from {path}...");
     let file = std::fs::File::open(&path).expect("open embeddings");
     let mut reader = std::io::BufReader::with_capacity(1 << 22, file);
+    // Skip the 12-byte file header (8-byte magic + u32 dim). Earlier
+    // runs read from byte 0, shifting every parsed vector by 12 bytes;
+    // the codec comparison stayed internally consistent (all codecs and
+    // the ground truth saw identical vectors), but absolute vectors were
+    // not the true corpus rows.
+    let mut header = [0u8; 12];
+    reader.read_exact(&mut header).expect("embeddings header");
     let corpus = read_rows(&mut reader, n);
     let queries = read_rows(&mut reader, n_queries);
 

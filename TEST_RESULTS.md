@@ -453,3 +453,40 @@ findings; they are listed at summary level pending measurement.
   embedding table from a teacher model over court text so the new
   tokens get real vectors. Re-index and rerun this battery for the
   before/after.
+
+## Round 7: live TEI rerank vs the lossless counterfactual (2026-07-31)
+
+**Question**: does re-embedding turbovec's quantized top-k' with the REAL
+transformer (TEI, all-MiniLM-L6-v2 — the teacher family of the static
+model2vec index embeddings) and reranking recover the loss from 4-bit
+quantization? **Measurement** (`examples/tei_rerank.rs`, full 86.6M-chunk
+live cluster): per query, (a) quantized pool = Search k' against the
+fleet; (b) exact pool = fp32 model2vec top-k' from one streaming pass
+over the 89.75 GB embeddings file (the no-quantization counterfactual;
+17s wall, all cores); (c) both pools' texts fetched from the owning
+shards, re-embedded through TEI, reranked by cosine; (d) recall@k =
+overlap of the two TEI-reranked top-k lists. Five legal query texts.
+
+| pool k' | pool overlap | TEI recall@10 | TEI recall@100 |
+|---------|-------------|---------------|----------------|
+| 1,000   | 0.9186      | 0.9000        | 0.9420         |
+| 10,000  | 0.9287      | 0.9800        | 0.9740         |
+
+At k'=10,000, four of five queries hit 1.0000@10. Recovery is NEARLY
+full, not exactly full: the rerank cannot resurrect docs the quantized
+scan never surfaced, so recall is bounded by pool membership — the
+lever is pool depth, and @10 goes 0.90 -> 0.98 for a 10x deeper pool.
+**Cost of the live rerank**: TEI on CPU embeds ~9,500 chunks/s over one
+shared h2 channel (52,381 chunks in 5.5s), so a k'=1000 rerank is
+~100ms of embedding plus one GetDocuments per owning shard.
+
+Ops notes: (1) the embeddings file has a 12-byte file header (magic +
+dim) — earlier `twobit_rerank` runs read from byte 0, shifting every
+parsed vector by 12 bytes; the codec comparison stayed internally
+consistent (all codecs and the ground truth saw identical vectors), so
+the 2-bit verdict stands, but the reader is now fixed in both examples.
+(2) A connect-per-text client at 50k+ texts resets TEI exactly like it
+reset the analysis sidecar (share one channel), and one multi-MB
+outlier chunk can tear down the shared h2 connection — inputs are
+truncated client-side to 4000 chars (MiniLM truncates at 256 tokens
+regardless, so scores are unchanged).
