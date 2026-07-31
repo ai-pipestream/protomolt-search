@@ -18,7 +18,8 @@ remainder of their scan against it — losslessly.
 
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
 Block-max pruning, designed for the lexical leg and measured dead on the
-vector leg: [docs/block-max.md](docs/block-max.md).
+vector leg: [README-block-max.md](README-block-max.md) (overview) and
+[docs/block-max.md](docs/block-max.md) (design doc).
 
 Phase 1: one crate, one binary, three roles (`node`, `coordinator`, `both`),
 tonic gRPC + tokio, static cluster membership.
