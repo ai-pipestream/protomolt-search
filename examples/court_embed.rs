@@ -45,6 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // keeps the historical default of no truncation.
     let truncate = arg("truncate", "false") == "true";
     let concurrency: usize = arg("concurrency", "32").parse()?;
+    // Embedding dimension the output header declares. MUST match what
+    // the TEI model actually produces (validated on the first record):
+    // bge-m3 1024, all-MiniLM-L6-v2 384.
+    let dim: usize = arg("dim", "1024").parse()?;
     let limit: u64 = arg("limit", "0").parse()?;
 
     let done = court::embedded_keys(std::path::Path::new(&output))?;
@@ -65,20 +69,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = tei_addr.clone();
         let embedded = embedded.clone();
         workers.push(tokio::spawn(async move {
-            let mut client = EmbedClient::connect(addr).await.expect("connect TEI");
+            let mut client = EmbedClient::connect(addr.clone()).await.expect("connect TEI");
             loop {
                 let next = work_rx.lock().await.recv().await;
                 let Some(chunk) = next else { break };
-                let response = client
-                    .embed(EmbedRequest {
-                        inputs: chunk.text,
-                        truncate,
-                        normalize: Some(true),
-                        truncation_direction: 0,
-                        prompt_name: None,
-                        dimensions: None,
-                    })
-                    .await
+                // Short-cap models read ~256 tokens; capping the payload
+                // client-side keeps one outlier chunk from tearing down
+                // the connection for every in-flight request.
+                let text: String = if truncate {
+                    chunk.text.chars().take(4000).collect()
+                } else {
+                    chunk.text
+                };
+                let request = || EmbedRequest {
+                    inputs: text.clone(),
+                    truncate,
+                    normalize: Some(true),
+                    truncation_direction: 0,
+                    prompt_name: None,
+                    dimensions: None,
+                };
+                let mut attempt = 0;
+                let response = loop {
+                    match client.embed(request()).await {
+                        Ok(r) => break Ok(r),
+                        Err(_) if attempt < 5 => {
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500 * attempt,
+                            ))
+                            .await;
+                            if let Ok(fresh) = EmbedClient::connect(addr.clone()).await {
+                                client = fresh;
+                            }
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
                     .expect("embed");
                 let vector = response.into_inner().embeddings;
                 embedded.fetch_add(1, Ordering::Relaxed);
@@ -105,10 +132,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = if append {
         EmbeddingWriter::append(out_file)
     } else {
-        EmbeddingWriter::create(out_file, 1024)?
+        EmbeddingWriter::create(out_file, dim as u32)?
     };
     let writer_task = tokio::spawn(async move {
         while let Some(record) = done_rx.recv().await {
+        assert_eq!(
+            record.vector.len(),
+            dim,
+            "TEI returned a different dim than the output declares (fix --dim)"
+        );
             writer
                 .write(record.opinion_id, record.ordinal, &record.vector)
                 .expect("write embedding");
