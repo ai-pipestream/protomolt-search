@@ -259,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let global_probe_id = (part * counts[0] + index) as u64;
         println!("\n=== query (doc {global_probe_id}): {text:?}");
         let hits = coordinator
-            .fanout_cascade("shakedown", text, &vector, 5, Some(&spec), false)
+            .fanout_cascade("shakedown", text, &vector, 5, Some(&spec), 0.0, false)
             .await?.0;
         for hit in &hits {
             println!(

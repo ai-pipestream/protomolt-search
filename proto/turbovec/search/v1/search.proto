@@ -801,10 +801,16 @@ message HybridLegOptions {
   // Values below k are clamped to k.
   uint32 leg_k = 1;
   // Weight of the vector leg: its RRF weight under GLOBAL_RANK and
-  // TWO_LEVEL, its blend weight under SCORE_BLEND. 0 = default 1.0.
-  float vector_weight = 2;
-  // Weight of the BM25 leg (same dual role). 0 = default 1.0.
-  float bm25_weight = 3;
+  // TWO_LEVEL, its blend weight under SCORE_BLEND. ABSENT = default
+  // 1.0; an EXPLICIT 0 disables the leg entirely (GLOBAL_RANK and
+  // SCORE_BLEND only — a single-leg query is how "vector primary" or
+  // "lexical primary" runs through the hybrid path, composing with
+  // boost and debug; TWO_LEVEL rejects explicit 0, its wire format
+  // cannot distinguish 0 from unset at the node; CASCADE ignores
+  // weights). Disabling both legs is INVALID_ARGUMENT.
+  optional float vector_weight = 2;
+  // Weight of the BM25 leg (same dual role, same disable rule).
+  optional float bm25_weight = 3;
   // The RRF constant. 0 = default 60 (the usual value from the RRF paper).
   float rrf_k = 4;
   // SCORE_BLEND only: per-leg score normalization before combining.
@@ -813,6 +819,15 @@ message HybridLegOptions {
   // SCORE_BLEND only: how normalized leg scores combine. Absent =
   // ARITHMETIC.
   ScoreCombination combination = 7;
+  // Vector-score floor on the RESULT SET: every returned hit must have
+  // a vector-leg score >= this (docs absent from the vector leg are
+  // dropped too). Applied BEFORE fusion, truncation, and boost, so
+  // deeper qualifying docs are promoted rather than the list just
+  // shrinking, and (SCORE_BLEND) normalization statistics are computed
+  // over the filtered retained set. Score-defined, hence
+  // layout-invariant. Applies to every mode including cascade (where
+  // it tightens the phase-1 gate before the BM25 rerank). 0 = off.
+  float min_vector_score = 8;
 }
 
 // One hybrid query against a shard (internal). The shard runs BOTH legs

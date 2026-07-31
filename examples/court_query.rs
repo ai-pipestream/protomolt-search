@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("text: {:?}", prefix(&doc.text, 140));
         let hits = coordinator
-            .fanout_cascade("court-query", &doc.text, &vector, k, Some(&spec), false)
+            .fanout_cascade("court-query", &doc.text, &vector, k, Some(&spec), 0.0, false)
             .await?.0;
         for hit in &hits {
             println!(

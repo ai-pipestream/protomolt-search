@@ -92,6 +92,7 @@ fn legs_default() -> HybridLegs {
         fusion_mode: turbovec_search::pb::FusionMode::GlobalRank,
         normalization: Normalization::MinMax,
         combination: Combination::Arithmetic,
+        min_vector_score: 0.0,
     }
 }
 
@@ -741,6 +742,184 @@ async fn boost_rescore_reorders_the_window() {
     mock.abort();
 }
 
+/// Leg disabling and the vector-score floor through the HybridSearch
+/// handler: an explicit weight of 0 turns a leg off (vector-only order
+/// == the plain Search RPC's order; bm25-only surfaces only matching
+/// docs), disabling both legs or a TWO_LEVEL leg is rejected, and
+/// min_vector_score drops every hit below the floor BEFORE fusion in
+/// every mode (deeper qualifying docs get promoted, not truncated).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leg_disabling_and_vector_floor() {
+    use turbovec_search::pb::search_service_server::SearchService as _;
+    use turbovec_search::pb::{HybridLegOptions, HybridSearchRequest, SearchRequest};
+
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x8888_0001);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let mut texts: Vec<String> = (0..2 * SHARD_DOCS)
+        .map(|i| format!("plain document number {i} about nothing special"))
+        .collect();
+    texts[0] = "zebra stripes everywhere".to_string();
+    texts[5] = "another zebra crossing".to_string();
+
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for shard in 0..2usize {
+        let start = shard * SHARD_DOCS;
+        let vecs = corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec();
+        let (addr, handle) = start_hybrid_shard(
+            &analysis,
+            (shard * SHARD_DOCS) as u64,
+            &texts[start..start + SHARD_DOCS],
+            vecs,
+            &shift,
+            &scale,
+        )
+        .await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
+    let query = corpus[..DIM].to_vec();
+    let request = |legs: HybridLegOptions| {
+        tonic::Request::new(HybridSearchRequest {
+            request_id: String::new(),
+            text: "zebra".to_string(),
+            vector: query.clone(),
+            k: 8,
+            analysis: None,
+            legs: Some(legs),
+            debug: false,
+            boost: None,
+        })
+    };
+    let global_rank = HybridLegOptions {
+        fusion_mode: turbovec_search::pb::FusionMode::GlobalRank as i32,
+        ..Default::default()
+    };
+
+    // Vector-only: the fused order must be exactly the Search RPC's.
+    let vector_only = coordinator
+        .hybrid_search(request(HybridLegOptions {
+            bm25_weight: Some(0.0),
+            ..global_rank
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let plain = coordinator
+        .search(tonic::Request::new(SearchRequest {
+            request_id: String::new(),
+            k: 8,
+            vector: query.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        ids(&vector_only.hits),
+        plain.hits.iter().map(|h| h.vector_id).collect::<Vec<_>>(),
+        "vector-only hybrid must reproduce the plain vector order"
+    );
+    assert!(vector_only.hits.iter().all(|h| h.bm25_rank.is_none()));
+
+    // BM25-only: exactly the zebra docs, no vector provenance.
+    let bm25_only = coordinator
+        .hybrid_search(request(HybridLegOptions {
+            vector_weight: Some(0.0),
+            ..global_rank
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bm25_ids = ids(&bm25_only.hits);
+    bm25_ids.sort_unstable();
+    assert_eq!(bm25_ids, vec![0, 5], "bm25-only surfaces only matches");
+    assert!(bm25_only.hits.iter().all(|h| h.vector_rank.is_none()));
+
+    // Both legs off, or a TWO_LEVEL leg off: rejected.
+    let err = coordinator
+        .hybrid_search(request(HybridLegOptions {
+            vector_weight: Some(0.0),
+            bm25_weight: Some(0.0),
+            ..global_rank
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    let err = coordinator
+        .hybrid_search(request(HybridLegOptions {
+            fusion_mode: turbovec_search::pb::FusionMode::TwoLevel as i32,
+            bm25_weight: Some(0.0),
+            ..global_rank
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // Vector floor: pick the 3rd-best vector score as the floor; every
+    // mode must then return exactly the docs at or above it, with the
+    // bm25-strong-but-vector-weak docs gone unless they qualify.
+    let scores: Vec<f32> = plain.hits.iter().map(|h| h.score).collect();
+    let floor = scores[2];
+    let qualifying: Vec<u64> = plain
+        .hits
+        .iter()
+        .filter(|h| h.score >= floor)
+        .map(|h| h.vector_id)
+        .collect();
+    for mode in [
+        turbovec_search::pb::FusionMode::GlobalRank,
+        turbovec_search::pb::FusionMode::ScoreBlend,
+        turbovec_search::pb::FusionMode::TwoLevel,
+    ] {
+        let filtered = coordinator
+            .hybrid_search(request(HybridLegOptions {
+                fusion_mode: mode as i32,
+                min_vector_score: floor,
+                ..global_rank
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut got = ids(&filtered.hits);
+        got.sort_unstable();
+        let mut want = qualifying.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "{mode:?}: floor must keep exactly the qualifying docs");
+        assert!(filtered
+            .hits
+            .iter()
+            .all(|h| h.vector_rank.is_some() && h.vector_score >= floor));
+    }
+    // Cascade: same floor, applied to the phase-1 pool.
+    let cascade = coordinator
+        .hybrid_search(request(HybridLegOptions {
+            fusion_mode: turbovec_search::pb::FusionMode::Cascade as i32,
+            min_vector_score: floor,
+            ..global_rank
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut got = cascade
+        .cascade_hits
+        .iter()
+        .map(|h| h.doc_id)
+        .collect::<Vec<_>>();
+    got.sort_unstable();
+    let mut want = qualifying;
+    want.sort_unstable();
+    assert_eq!(got, want, "cascade floor must keep exactly the qualifying docs");
+    assert!(cascade.cascade_hits.iter().all(|h| h.vector_score >= floor));
+
+    for h in handles {
+        h.abort();
+    }
+    mock.abort();
+}
+
 /// The two-level fallback stays reachable and deterministic under
 /// FUSION_MODE_TWO_LEVEL, with shard-local (compressed) ranks in the
 /// provenance — its documented, non-partition-independent semantics.
@@ -1017,12 +1196,12 @@ async fn debug_block_profiles_every_fusion_mode() {
     }
 
     let (plain, no_debug) = coordinator
-        .fanout_cascade("cp", "zebra", &query, 4, None, false)
+        .fanout_cascade("cp", "zebra", &query, 4, None, 0.0, false)
         .await
         .unwrap();
     assert!(no_debug.is_none());
     let (hits, debug) = coordinator
-        .fanout_cascade("cd", "zebra", &query, 4, None, true)
+        .fanout_cascade("cd", "zebra", &query, 4, None, 0.0, true)
         .await
         .unwrap();
     let cascade_sig = |hits: &[turbovec_search::pb::CascadeHit]| {

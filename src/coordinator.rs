@@ -379,32 +379,38 @@ impl CoordinatorServiceImpl {
         // total order; see merge_legs_by_score), then fuse once: RRF for
         // GLOBAL_RANK, normalize-and-combine for SCORE_BLEND. The two
         // modes share this whole leg-fetch path; only the fusion function
-        // differs.
+        // differs. Weights arrive RESOLVED (the handler defaults absent
+        // to 1.0); an exact 0 disables its leg, which both fusion
+        // functions honor by skipping it.
         let t_fusion = std::time::Instant::now();
-        let vector_global = fusion::merge_legs_by_score(vector_shards);
-        let bm25_global = fusion::merge_legs_by_score(bm25_shards);
+        let mut vector_global = fusion::merge_legs_by_score(vector_shards);
+        let mut bm25_global = fusion::merge_legs_by_score(bm25_shards);
+        // The vector-score floor: a hit must have a qualifying vector
+        // score to survive, so docs below it (or absent from the vector
+        // leg) drop from BOTH legs BEFORE fusion and truncation —
+        // deeper qualifying docs are promoted, and blend statistics see
+        // only the filtered set. Score-defined, hence layout-invariant.
+        if legs.min_vector_score > 0.0 {
+            let min = f64::from(legs.min_vector_score);
+            vector_global.retain(|&(_, score, _)| score >= min);
+            let allowed: std::collections::HashSet<u64> =
+                vector_global.iter().map(|&(id, _, _)| id).collect();
+            bm25_global.retain(|&(id, _, _)| allowed.contains(&id));
+        }
         let leg_inputs = [
             Leg {
                 hits: vector_global
                     .iter()
                     .map(|&(id, score, _)| (id, score))
                     .collect(),
-                weight: if legs.vector_weight == 0.0 {
-                    1.0
-                } else {
-                    f64::from(legs.vector_weight)
-                },
+                weight: f64::from(legs.vector_weight),
             },
             Leg {
                 hits: bm25_global
                     .iter()
                     .map(|&(id, score, _)| (id, score))
                     .collect(),
-                weight: if legs.bm25_weight == 0.0 {
-                    1.0
-                } else {
-                    f64::from(legs.bm25_weight)
-                },
+                weight: f64::from(legs.bm25_weight),
             },
         ];
         let blend = legs.fusion_mode == FusionMode::ScoreBlend;
@@ -499,9 +505,16 @@ impl CoordinatorServiceImpl {
         let mut shard_lists: Vec<(u32, Vec<crate::pb::HybridLegHit>)> = Vec::new();
         let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
         for task in shard_tasks {
-            let (shard, rpc_ms, hits) = task
+            let (shard, rpc_ms, mut hits) = task
                 .await
                 .map_err(|e| Status::internal(format!("hybrid shard task failed: {e}")))??;
+            // Vector-score floor: drop non-qualifying docs from the
+            // shard's fused list before level-two fusion.
+            if legs.min_vector_score > 0.0 {
+                hits.retain(|h| {
+                    h.vector_rank.is_some() && h.vector_score >= legs.min_vector_score
+                });
+            }
             if debug {
                 // A two-level shard returns one FUSED list; per-leg
                 // membership is what provenance carries.
@@ -708,6 +721,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         spec: Option<&crate::pb::AnalysisSpec>,
+        min_vector_score: f32,
         debug: bool,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
         if k == 0 || vector.is_empty() {
@@ -730,6 +744,14 @@ impl CoordinatorServiceImpl {
         } else {
             f64::NEG_INFINITY
         };
+        // The vector-score floor tightens the gate: the effective cutoff
+        // is max(k-th score, floor), applied before the rescore fan-out
+        // so filtered-out candidates cost nothing in phase 2.
+        let boundary = boundary.max(if min_vector_score > 0.0 {
+            f64::from(min_vector_score)
+        } else {
+            f64::NEG_INFINITY
+        });
         let pool: Vec<(u64, u32, f64)> = all.into_iter().filter(|h| h.2 >= boundary).collect();
 
         // Query analysis + global BM25 stats for phase 2.
@@ -1246,9 +1268,10 @@ fn both_failed(shard: u32, primary: &Status, replica: &Status) -> Status {
 pub struct HybridLegs {
     /// Depth each leg (and each shard's fused list) is fetched to.
     pub leg_k: u32,
-    /// Vector-leg weight (RRF weight, or blend weight under SCORE_BLEND).
+    /// Vector-leg weight (RRF weight, or blend weight under
+    /// SCORE_BLEND). RESOLVED: exactly 0 disables the leg.
     pub vector_weight: f32,
-    /// BM25-leg weight (same dual role).
+    /// BM25-leg weight (same dual role, same disable rule).
     pub bm25_weight: f32,
     /// RRF constant.
     pub rrf_k: f64,
@@ -1258,6 +1281,8 @@ pub struct HybridLegs {
     pub normalization: fusion::Normalization,
     /// SCORE_BLEND: combination of normalized leg scores.
     pub combination: fusion::Combination,
+    /// Vector-score floor on the result set (see the proto); 0 = off.
+    pub min_vector_score: f32,
 }
 
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
@@ -1381,14 +1406,34 @@ impl SearchService for CoordinatorServiceImpl {
         } else {
             f64::from(options.rrf_k)
         };
+        // Weights: absent = 1.0; an explicit 0 disables the leg (the
+        // proto documents which modes support that).
+        let vector_weight = options.vector_weight.unwrap_or(1.0);
+        let bm25_weight = options.bm25_weight.unwrap_or(1.0);
+        if vector_weight == 0.0 && bm25_weight == 0.0 {
+            return Err(Status::invalid_argument(
+                "both legs disabled: at least one of vector_weight/bm25_weight must be nonzero",
+            ));
+        }
+        if options.fusion_mode() == FusionMode::TwoLevel
+            && (vector_weight == 0.0 || bm25_weight == 0.0)
+        {
+            return Err(Status::invalid_argument(
+                "TWO_LEVEL cannot disable a leg (its node wire format cannot distinguish \
+                 0 from unset); use GLOBAL_RANK or SCORE_BLEND",
+            ));
+        }
+        if options.min_vector_score.is_nan() {
+            return Err(Status::invalid_argument("min_vector_score must not be NaN"));
+        }
         let legs = HybridLegs {
             leg_k: if options.leg_k == 0 {
                 req.k.max(rrf_k as u32)
             } else {
                 options.leg_k.max(req.k)
             },
-            vector_weight: options.vector_weight,
-            bm25_weight: options.bm25_weight,
+            vector_weight,
+            bm25_weight,
             rrf_k,
             fusion_mode: options.fusion_mode(),
             normalization: match options.normalization() {
@@ -1401,6 +1446,7 @@ impl SearchService for CoordinatorServiceImpl {
                 crate::pb::ScoreCombination::Harmonic => fusion::Combination::Harmonic,
                 _ => fusion::Combination::Arithmetic,
             },
+            min_vector_score: options.min_vector_score,
         };
         let (mut hits, mut cascade_hits, mut debug) = match legs.fusion_mode {
             FusionMode::Cascade | FusionMode::Unspecified => {
@@ -1411,6 +1457,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.vector,
                         req.k,
                         req.analysis.as_ref(),
+                        legs.min_vector_score,
                         req.debug,
                     )
                     .await?;

@@ -253,6 +253,9 @@ struct SearchBody {
     tokenizer: String,
     stemmer: String,
     term_source: String,
+    vector_leg: bool,
+    bm25_leg: bool,
+    min_vector_score: f32,
     fetch_docs: bool,
 }
 
@@ -276,6 +279,9 @@ impl Default for SearchBody {
             tokenizer: String::new(),
             stemmer: String::new(),
             term_source: String::new(),
+            vector_leg: true,
+            bm25_leg: true,
+            min_vector_score: 0.0,
             fetch_docs: true,
         }
     }
@@ -363,11 +369,22 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         legs: Some(HybridLegOptions {
             fusion_mode: fusion_mode as i32,
             leg_k: req.leg_k,
-            vector_weight: req.vector_weight,
-            bm25_weight: req.bm25_weight,
+            // Unchecked leg = explicit 0 (disabled); weight 0 in the
+            // form = absent (server default 1.0).
+            vector_weight: if req.vector_leg {
+                (req.vector_weight != 0.0).then_some(req.vector_weight)
+            } else {
+                Some(0.0)
+            },
+            bm25_weight: if req.bm25_leg {
+                (req.bm25_weight != 0.0).then_some(req.bm25_weight)
+            } else {
+                Some(0.0)
+            },
             rrf_k: req.rrf_k,
             normalization: normalization as i32,
             combination: combination as i32,
+            min_vector_score: req.min_vector_score,
         }),
         debug: true,
         boost,

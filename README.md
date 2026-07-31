@@ -568,6 +568,22 @@ scores within a few ULPs).
 `max(k, rrf_k)`; override in `HybridLegOptions`, clamped to >= k.
 Cascade ignores leg_k/weights/rrf_k (its depth is k plus ties).
 
+**Leg disabling**: the weights are presence-aware (`optional`): absent
+= 1.0, an EXPLICIT 0 turns the leg off (GLOBAL_RANK/SCORE_BLEND only;
+both-off and TWO_LEVEL-off are rejected). A single-leg query is how
+"vector primary" or "lexical primary" runs through the hybrid path,
+composing with boost and debug — e.g. vector-only SCORE_BLEND with
+`normalization=none` ranks by raw vector score, and a boost then adds
+`boost_weight * bm25(boost text)` on top.
+
+**Vector-score floor**: `HybridLegOptions.min_vector_score` requires
+every returned hit to have a vector-leg score at or above the floor
+(docs absent from the vector leg drop too). Applied BEFORE fusion,
+truncation, and boost in every mode — deeper qualifying docs are
+promoted rather than the list shrinking, blend statistics see only the
+filtered set, and in cascade it tightens the phase-1 gate ahead of the
+rescore fan-out. Score-defined, hence layout-invariant. 0 = off.
+
 ### The console (test harness UI)
 
 `cargo run --release --bin console -- --coordinator=host:port
