@@ -432,6 +432,7 @@ impl CoordinatorServiceImpl {
                 vector_score: f.leg_scores[0].unwrap_or(0.0) as f32,
                 bm25_rank: f.leg_ranks[1],
                 bm25_score: f.leg_scores[1].unwrap_or(0.0) as f32,
+                boost_score: 0.0,
             })
             .collect();
         let dbg = debug.then(|| {
@@ -450,6 +451,8 @@ impl CoordinatorServiceImpl {
                 fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
                 total_ms: 0.0,
                 shards: shard_debug,
+                boost_ms: 0.0,
+                boost_terms: Vec::new(),
             }
         });
         Ok((hits, dbg))
@@ -549,6 +552,7 @@ impl CoordinatorServiceImpl {
                     vector_score: source.vector_score,
                     bm25_rank: source.bm25_rank,
                     bm25_score: source.bm25_score,
+                    boost_score: 0.0,
                 }
             })
             .collect();
@@ -565,6 +569,8 @@ impl CoordinatorServiceImpl {
                 fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
                 total_ms: 0.0,
                 shards: shard_debug,
+                boost_ms: 0.0,
+                boost_terms: Vec::new(),
             }
         });
         Ok((hits, dbg))
@@ -796,6 +802,7 @@ impl CoordinatorServiceImpl {
                 shard,
                 vector_score: vector_score as f32,
                 bm25_score: bm25_of.get(&doc_id).copied().unwrap_or(0.0) as f32,
+                boost_score: 0.0,
             })
             .collect();
         ranked.sort_by(|a, b| {
@@ -847,10 +854,144 @@ impl CoordinatorServiceImpl {
                 fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
                 total_ms: t_total.elapsed().as_secs_f32() * 1e3,
                 shards,
+                boost_ms: 0.0,
+                boost_terms: Vec::new(),
             }
         });
         Ok((ranked, dbg))
     }
+    /// Second-pass lexical boost (see the proto's `BoostRescore`): score
+    /// the top-`window` hits against the boost query's terms through the
+    /// candidate-scoped `Bm25Rescore` seam and reorder the window by
+    /// `base_weight * base + boost_weight * boost`; hits beyond the
+    /// window keep their relative order after it. Exactly one of
+    /// `hits` / `cascade_hits` is non-empty; `base` is the fused score
+    /// for the former, the phase-2 BM25 score for the latter (whose
+    /// ranks are reassigned to the final order).
+    pub async fn apply_boost(
+        &self,
+        boost: &crate::pb::BoostRescore,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        hits: &mut [HybridHit],
+        cascade_hits: &mut [CascadeHit],
+        debug: &mut Option<HybridDebug>,
+    ) -> Result<(), Status> {
+        if boost.text.is_empty() {
+            return Err(Status::invalid_argument(
+                "boost.text must be non-empty when boost is present",
+            ));
+        }
+        let t0 = std::time::Instant::now();
+        let base_w = if boost.base_weight == 0.0 {
+            1.0
+        } else {
+            f64::from(boost.base_weight)
+        };
+        let boost_w = if boost.boost_weight == 0.0 {
+            1.0
+        } else {
+            f64::from(boost.boost_weight)
+        };
+        let len = hits.len().max(cascade_hits.len());
+        let window = if boost.window == 0 {
+            len
+        } else {
+            (boost.window as usize).min(len)
+        };
+
+        // Analyze the boost text with the SAME options as the main query
+        // (term identity must match the index, as everywhere).
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+        })?;
+        let analyzed = crate::analyzer::analyze_document(&addr, &boost.text, spec).await?;
+        let mut terms: Vec<String> = Vec::new();
+        for (term, _, _) in analyzed.terms {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+
+        // Candidate-scoped scoring of the window, routed by owning shard.
+        let mut scores: HashMap<u64, f64> = HashMap::new();
+        if window > 0 && !terms.is_empty() {
+            let global = self.global_bm25_stats(&terms).await?;
+            let mut by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
+            for (doc_id, shard) in hits[..window.min(hits.len())]
+                .iter()
+                .map(|h| (h.doc_id, h.shard))
+                .chain(
+                    cascade_hits[..window.min(cascade_hits.len())]
+                        .iter()
+                        .map(|h| (h.doc_id, h.shard)),
+                )
+            {
+                by_shard.entry(shard).or_default().push(doc_id);
+            }
+            let mut rescore_tasks = Vec::with_capacity(by_shard.len());
+            for (shard, ids) in by_shard {
+                let node = &self.node_addrs[shard as usize];
+                let request = Bm25RescoreRequest {
+                    terms: terms.clone(),
+                    global_doc_count: global.doc_count,
+                    global_total_doc_length: global.total_doc_length,
+                    global_doc_frequencies: global.dfs.clone(),
+                    candidate_ids: ids,
+                    k1: self.bm25_params.k1 as f32,
+                    b: self.bm25_params.b as f32,
+                };
+                let mut client = self.node_client(node)?;
+                rescore_tasks.push(tokio::spawn(async move {
+                    client.bm25_rescore(request).await.map(|r| r.into_inner().hits)
+                }));
+            }
+            for task in rescore_tasks {
+                let shard_hits = task
+                    .await
+                    .map_err(|e| Status::internal(format!("boost rescore task failed: {e}")))??;
+                for hit in shard_hits {
+                    scores.insert(hit.doc_id, f64::from(hit.score));
+                }
+            }
+        }
+
+        if !hits.is_empty() {
+            let window = window.min(hits.len());
+            for h in &mut hits[..window] {
+                h.boost_score = scores.get(&h.doc_id).copied().unwrap_or(0.0) as f32;
+            }
+            hits[..window].sort_by(|a, b| {
+                let fa = base_w * f64::from(a.fused_score) + boost_w * f64::from(a.boost_score);
+                let fb = base_w * f64::from(b.fused_score) + boost_w * f64::from(b.boost_score);
+                fb.total_cmp(&fa)
+                    .then_with(|| a.shard.cmp(&b.shard))
+                    .then_with(|| a.doc_id.cmp(&b.doc_id))
+            });
+        } else if !cascade_hits.is_empty() {
+            let window = window.min(cascade_hits.len());
+            for h in &mut cascade_hits[..window] {
+                h.boost_score = scores.get(&h.doc_id).copied().unwrap_or(0.0) as f32;
+            }
+            cascade_hits[..window].sort_by(|a, b| {
+                let fa = base_w * f64::from(a.bm25_score) + boost_w * f64::from(a.boost_score);
+                let fb = base_w * f64::from(b.bm25_score) + boost_w * f64::from(b.boost_score);
+                fb.total_cmp(&fa)
+                    .then_with(|| b.vector_score.total_cmp(&a.vector_score))
+                    .then_with(|| a.doc_id.cmp(&b.doc_id))
+            });
+            for (i, hit) in cascade_hits.iter_mut().enumerate() {
+                hit.rank = i as u32 + 1;
+            }
+        }
+
+        if let Some(d) = debug.as_mut() {
+            d.boost_terms = terms;
+            d.boost_ms = t0.elapsed().as_secs_f32() * 1e3;
+            d.total_ms += d.boost_ms;
+        }
+        Ok(())
+    }
+
     /// Push one TQ+ calibration to every configured node (the
     /// shared-calibration handshake that makes vector scores globally
     /// comparable). Per-node outcomes are reported, not fail-fast: a
@@ -1261,7 +1402,7 @@ impl SearchService for CoordinatorServiceImpl {
                 _ => fusion::Combination::Arithmetic,
             },
         };
-        match legs.fusion_mode {
+        let (mut hits, mut cascade_hits, mut debug) = match legs.fusion_mode {
             FusionMode::Cascade | FusionMode::Unspecified => {
                 let (cascade_hits, debug) = self
                     .fanout_cascade(
@@ -1273,12 +1414,7 @@ impl SearchService for CoordinatorServiceImpl {
                         req.debug,
                     )
                     .await?;
-                Ok(Response::new(HybridSearchResponse {
-                    request_id,
-                    hits: Vec::new(),
-                    cascade_hits,
-                    debug,
-                }))
+                (Vec::new(), cascade_hits, debug)
             }
             _ => {
                 let (hits, debug) = self
@@ -1292,14 +1428,25 @@ impl SearchService for CoordinatorServiceImpl {
                         req.debug,
                     )
                     .await?;
-                Ok(Response::new(HybridSearchResponse {
-                    request_id,
-                    hits,
-                    cascade_hits: Vec::new(),
-                    debug,
-                }))
+                (hits, Vec::new(), debug)
             }
+        };
+        if let Some(boost) = &req.boost {
+            self.apply_boost(
+                boost,
+                req.analysis.as_ref(),
+                &mut hits,
+                &mut cascade_hits,
+                &mut debug,
+            )
+            .await?;
         }
+        Ok(Response::new(HybridSearchResponse {
+            request_id,
+            hits,
+            cascade_hits,
+            debug,
+        }))
     }
 
     async fn cluster_health(

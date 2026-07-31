@@ -568,6 +568,20 @@ scores within a few ULPs).
 `max(k, rrf_k)`; override in `HybridLegOptions`, clamped to >= k.
 Cascade ignores leg_k/weights/rrf_k (its depth is k plus ties).
 
+### Boost rescore (any mode)
+
+`HybridSearchRequest.boost{text, window, base_weight, boost_weight}`
+adds a second-pass lexical boost after fusion: the top `window` hits
+(0 = all) are rescored as `base_weight * base + boost_weight *
+bm25(boost text)` and reordered; hits beyond the window keep their
+relative order after it. `base` is the mode's ordering score (fused
+score, or phase-2 BM25 for cascade). The boost runs candidate-scoped
+through the existing `Bm25Rescore` seam with global stats fetched for
+the BOOST terms — one TermStats fan-out plus one Bm25Rescore per
+owning shard, never a full postings walk. Hits carry `boost_score`
+separately so clients see both parts; the debug block reports
+`boost_terms` and `boost_ms`.
+
 ## Ingest flow (write path)
 
 Shards ingest over gRPC; prebuilt `.tv` files are no longer required.

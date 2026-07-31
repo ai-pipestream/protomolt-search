@@ -869,6 +869,35 @@ message HybridShardResponse {
   repeated HybridLegHit hits = 1;
 }
 
+// A second-pass lexical boost applied AFTER fusion (the rescore-window
+// pattern): the top `window` hits are rescored as
+//
+//   final = base_weight * base + boost_weight * bm25(text)
+//
+// and reordered by it; hits beyond the window keep their relative order
+// after the reordered window. `base` is the mode's ordering score: the
+// fused score for the fused modes, the phase-2 BM25 score for cascade.
+// The boost BM25 runs CANDIDATE-SCOPED through NodeService.Bm25Rescore
+// with global stats fetched for the boost terms, so a boost costs one
+// TermStats fan-out plus one Bm25Rescore per owning shard — never a
+// full postings walk.
+//
+// Scale note: `base` and the boost BM25 live on unrelated scales (RRF
+// fused scores are ~1/rrf_k; BM25 is unbounded), exactly as in the
+// classic rescore pattern — the weights are the scale knob, and hits
+// carry `boost_score` separately so clients can see both parts.
+message BoostRescore {
+  // Boost query text, analyzed with the request's `analysis` options
+  // (same identity rules as the main query). Must be non-empty.
+  string text = 1;
+  // How many top hits are rescored. 0 = the whole result list.
+  uint32 window = 2;
+  // Weight of the base score. 0 = default 1.0.
+  float base_weight = 3;
+  // Weight of the boost BM25 score. 0 = default 1.0.
+  float boost_weight = 4;
+}
+
 // Client-facing hybrid (vector + BM25) search request.
 message HybridSearchRequest {
   // Optional caller id; assigned when empty and echoed back.
@@ -889,6 +918,8 @@ message HybridSearchRequest {
   // vector scan's stats — the explain/profile surface. Costs a few
   // clock reads; results are unchanged.
   bool debug = 7;
+  // Optional second-pass boost over the top hits (any fusion mode).
+  BoostRescore boost = 8;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -910,6 +941,11 @@ message HybridDebug {
   float total_ms = 8;
   // Per-shard visibility, in shard order.
   repeated HybridShardDebug shards = 9;
+  // Wall time of the boost pass (boost analysis + stats + rescore
+  // fan-out), included in total_ms; 0 when no boost was requested.
+  float boost_ms = 10;
+  // The boost query's terms after analysis; empty without boost.
+  repeated string boost_terms = 11;
 }
 
 // One shard's contribution to a hybrid query.
@@ -947,6 +983,12 @@ message HybridHit {
   optional uint32 bm25_rank = 6;
   // Raw BM25 score (global stats).
   float bm25_score = 7;
+  // Raw BM25 score of the boost query against this doc (global stats
+  // over the BOOST terms). 0 when no boost was requested, the doc fell
+  // outside the boost window, or no boost term matches it. When a boost
+  // ran, the window is ordered by
+  // base_weight * fused_score + boost_weight * boost_score.
+  float boost_score = 8;
 }
 
 // Client-facing hybrid search response.
@@ -1076,4 +1118,9 @@ message CascadeHit {
   float vector_score = 4;
   // Raw BM25 score from phase 2 (global stats; globally comparable).
   float bm25_score = 5;
+  // Raw BM25 score of the boost query (see HybridHit.boost_score; for
+  // cascade the boosted window orders by
+  // base_weight * bm25_score + boost_weight * boost_score, and `rank`
+  // reflects the final order).
+  float boost_score = 6;
 }

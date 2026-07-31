@@ -589,6 +589,158 @@ async fn score_blend_follows_documented_arithmetic() {
     mock.abort();
 }
 
+/// Boost-rescore end to end through the HybridSearch handler: the top
+/// `window` hits are rescored by base_weight*base + boost_weight*bm25
+/// (boost terms, candidate-scoped) and reordered; hits outside the
+/// window keep their order; cascade ranks are reassigned. The corpus
+/// plants "quagga" on doc 3 only, so the boost lifts exactly one doc.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boost_rescore_reorders_the_window() {
+    use turbovec_search::pb::search_service_server::SearchService as _;
+    use turbovec_search::pb::{BoostRescore, HybridLegOptions, HybridSearchRequest};
+
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x7777_0001);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let mut texts: Vec<String> = (0..2 * SHARD_DOCS)
+        .map(|i| format!("plain document number {i} about nothing special"))
+        .collect();
+    texts[0] = "zebra stripes everywhere".to_string();
+    texts[5] = "another zebra crossing".to_string();
+    texts[3] = "quagga herds roam free".to_string();
+
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for shard in 0..2usize {
+        let start = shard * SHARD_DOCS;
+        let vecs = corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec();
+        let (addr, handle) = start_hybrid_shard(
+            &analysis,
+            (shard * SHARD_DOCS) as u64,
+            &texts[start..start + SHARD_DOCS],
+            vecs,
+            &shift,
+            &scale,
+        )
+        .await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
+    let query = corpus[..DIM].to_vec();
+    let request = |boost: Option<BoostRescore>, legs: Option<HybridLegOptions>, debug: bool| {
+        tonic::Request::new(HybridSearchRequest {
+            request_id: String::new(),
+            text: "zebra".to_string(),
+            vector: query.clone(),
+            k: 8,
+            analysis: None,
+            legs,
+            debug,
+            boost,
+        })
+    };
+    let global_rank = || {
+        Some(HybridLegOptions {
+            fusion_mode: turbovec_search::pb::FusionMode::GlobalRank as i32,
+            ..Default::default()
+        })
+    };
+    let boost = |window: u32| {
+        Some(BoostRescore {
+            text: "quagga".to_string(),
+            window,
+            base_weight: 0.0,
+            boost_weight: 0.0,
+        })
+    };
+
+    let baseline = coordinator
+        .hybrid_search(request(None, global_rank(), false))
+        .await
+        .unwrap()
+        .into_inner();
+    // Doc 0 and 5 (both legs) lead; doc 3 is vector-only somewhere below.
+    assert_eq!(baseline.hits[0].doc_id, 0);
+    assert_eq!(baseline.hits[1].doc_id, 5);
+    assert!(baseline.hits.iter().all(|h| h.boost_score == 0.0));
+
+    // Full-window boost: doc 3 is the only quagga match, its boost BM25
+    // dwarfs every RRF fused score, so it takes position 0 and everyone
+    // else keeps the fused order behind it.
+    let boosted = coordinator
+        .hybrid_search(request(boost(0), global_rank(), false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(boosted.hits[0].doc_id, 3, "boost must lift the quagga doc");
+    assert!(boosted.hits[0].boost_score > 0.0);
+    assert!(
+        boosted
+            .hits
+            .iter()
+            .filter(|h| h.doc_id != 3)
+            .all(|h| h.boost_score == 0.0),
+        "only doc 3 matches the boost terms"
+    );
+    let rest: Vec<u64> = boosted.hits.iter().skip(1).map(|h| h.doc_id).collect();
+    let baseline_minus_3: Vec<u64> = baseline
+        .hits
+        .iter()
+        .map(|h| h.doc_id)
+        .filter(|&id| id != 3)
+        .collect();
+    assert_eq!(rest, baseline_minus_3, "non-boosted hits keep fused order");
+    // The returned fields obey the documented formula (weights 1.0).
+    let finals: Vec<f64> = boosted
+        .hits
+        .iter()
+        .map(|h| f64::from(h.fused_score) + f64::from(h.boost_score))
+        .collect();
+    assert!(finals.windows(2).all(|w| w[0] >= w[1]), "{finals:?}");
+
+    // A window of 2 excludes doc 3: nothing changes, no boost scores.
+    let windowed = coordinator
+        .hybrid_search(request(boost(2), global_rank(), false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&windowed.hits), ids(&baseline.hits));
+    assert!(windowed.hits.iter().all(|h| h.boost_score == 0.0));
+
+    // Debug: the boost pass is profiled and does not change results.
+    let debugged = coordinator
+        .hybrid_search(request(boost(0), global_rank(), true))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&debugged.hits), ids(&boosted.hits));
+    let dbg = debugged.debug.unwrap();
+    assert_eq!(dbg.boost_terms, vec!["quagga".to_string()]);
+    assert!(dbg.boost_ms > 0.0);
+    assert!(dbg.total_ms >= dbg.boost_ms);
+
+    // Cascade (legs absent): base is the phase-2 BM25 score; the boost
+    // lifts doc 3 to rank 1 and ranks are reassigned sequentially.
+    let cascade = coordinator
+        .hybrid_search(request(boost(0), None, false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(cascade.hits.is_empty());
+    assert_eq!(cascade.cascade_hits[0].doc_id, 3);
+    assert!(cascade.cascade_hits[0].boost_score > 0.0);
+    for (i, hit) in cascade.cascade_hits.iter().enumerate() {
+        assert_eq!(hit.rank, i as u32 + 1, "ranks reassigned after boost");
+    }
+
+    for h in handles {
+        h.abort();
+    }
+    mock.abort();
+}
+
 /// The two-level fallback stays reachable and deterministic under
 /// FUSION_MODE_TWO_LEVEL, with shard-local (compressed) ranks in the
 /// provenance — its documented, non-partition-independent semantics.
