@@ -43,6 +43,16 @@ const QUERIES: &[&str] = &[
     "fourth amendment warrantless search of a vehicle",
     "patent claim construction doctrine of equivalents",
     "employment discrimination retaliation burden shifting",
+    "eminent domain just compensation fair market value",
+    "products liability failure to warn defective design",
+    "securities fraud scienter pleading standard",
+    "first amendment commercial speech regulation",
+    "bankruptcy automatic stay relief from creditors",
+    "child custody best interests of the child",
+    "antitrust price fixing per se rule",
+    "insurance bad faith denial of coverage",
+    "medical malpractice standard of care expert testimony",
+    "contract breach consequential damages foreseeability",
 ];
 
 fn arg(key: &str, default: &str) -> String {
@@ -368,51 +378,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tei_ms = t.elapsed();
     eprintln!("TEI embedded {} texts in {:?}", tei_of.len(), tei_ms);
 
-    // Rerank both pools by TEI cosine; recall = top-k overlap.
-    println!(
-        "\nquery | pool overlap@{pool_k} | {}",
-        rerank_ks
+    // Falloff sweep: TEI-rank the FULL pools once per query; every
+    // smaller pool k' is a prefix of the model2vec-ranked pool, so its
+    // reranked list is the full reranked list filtered to prefix
+    // members. recall@k = overlap of the two reranked top-k lists.
+    let k_grid: Vec<usize> = vec![
+        1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000, 1500,
+        2000, 3000, 5000, 7000, 10000, 15000, 20000,
+    ];
+    let pool_grid: Vec<usize> = vec![1000, 2000, 5000, 10000, 20000]
+        .into_iter()
+        .filter(|p| *p <= pool_k)
+        .collect();
+    let csv_path = arg("csv", "/tmp/tei_falloff.csv");
+    let mut csv = String::from("pool_k,k,mean_recall,min_recall,max_recall\n");
+
+    // Per query: full TEI-sorted lists for both pools.
+    let tei_sort = |pool: &[u64], qi: usize| -> Vec<u64> {
+        let mut scored: Vec<(u64, f64)> = pool
             .iter()
-            .map(|k| format!("TEI recall@{k}"))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
-    let mut sums = vec![0.0f64; rerank_ks.len() + 1];
-    for (qi, q) in QUERIES.iter().enumerate() {
-        let rank = |pool: &[u64]| -> Vec<u64> {
-            let mut scored: Vec<(u64, f64)> = pool
+            .filter_map(|gid| tei_of.get(gid).map(|v| (*gid, cosine(v, &tei_queries[qi]))))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.into_iter().map(|(gid, _)| gid).collect()
+    };
+    let quant_ranked_full: Vec<Vec<u64>> = (0..QUERIES.len())
+        .map(|qi| tei_sort(&quant_pools[qi], qi))
+        .collect();
+    let exact_ranked_full: Vec<Vec<u64>> = (0..QUERIES.len())
+        .map(|qi| tei_sort(&exact_pools_gid[qi], qi))
+        .collect();
+
+    println!("\npool_k | trusted depth (mean recall >= 0.98) | recall@10 | recall@100 | recall@1000");
+    for &pk in &pool_grid {
+        // Reranked lists restricted to the k'-prefix pools.
+        let per_query: Vec<(Vec<u64>, Vec<u64>)> = (0..QUERIES.len())
+            .map(|qi| {
+                let quant_members: HashSet<u64> =
+                    quant_pools[qi][..pk.min(quant_pools[qi].len())].iter().copied().collect();
+                let exact_members: HashSet<u64> =
+                    exact_pools_gid[qi][..pk.min(exact_pools_gid[qi].len())].iter().copied().collect();
+                (
+                    quant_ranked_full[qi]
+                        .iter()
+                        .filter(|g| quant_members.contains(g))
+                        .copied()
+                        .collect(),
+                    exact_ranked_full[qi]
+                        .iter()
+                        .filter(|g| exact_members.contains(g))
+                        .copied()
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut trusted = 0usize;
+        let mut at = HashMap::new();
+        for &k in k_grid.iter().filter(|&&k| k <= pk) {
+            let recalls: Vec<f64> = per_query
                 .iter()
-                .filter_map(|gid| {
-                    tei_of
-                        .get(gid)
-                        .map(|v| (*gid, cosine(v, &tei_queries[qi])))
-                })
+                .map(|(q, e)| overlap(&q[..k.min(q.len())], &e[..k.min(e.len())]))
                 .collect();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            scored.into_iter().map(|(gid, _)| gid).collect()
-        };
-        let quant_ranked = rank(&quant_pools[qi]);
-        let exact_ranked = rank(&exact_pools_gid[qi]);
-        let pool_overlap = overlap(&quant_pools[qi], &exact_pools_gid[qi]);
-        sums[0] += pool_overlap;
-        let mut cells = Vec::new();
-        for (ki, &k) in rerank_ks.iter().enumerate() {
-            let r = overlap(&quant_ranked[..k.min(quant_ranked.len())],
-                            &exact_ranked[..k.min(exact_ranked.len())]);
-            sums[ki + 1] += r;
-            cells.push(format!("{r:.4}"));
+            let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+            let min = recalls.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = recalls.iter().cloned().fold(0.0f64, f64::max);
+            csv.push_str(&format!("{pk},{k},{mean:.4},{min:.4},{max:.4}\n"));
+            if mean >= 0.98 {
+                trusted = k;
+            }
+            at.insert(k, mean);
         }
-        println!("{q:?} | {pool_overlap:.4} | {}", cells.join(" | "));
+        println!(
+            "{pk} | {trusted} | {} | {} | {}",
+            at.get(&10).map_or("-".into(), |r| format!("{r:.4}")),
+            at.get(&100).map_or("-".into(), |r| format!("{r:.4}")),
+            at.get(&1000).map_or("-".into(), |r| format!("{r:.4}")),
+        );
     }
-    let n = QUERIES.len() as f64;
-    println!(
-        "MEAN | {:.4} | {}",
-        sums[0] / n,
-        sums[1..]
-            .iter()
-            .map(|s| format!("{:.4}", s / n))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
+    std::fs::write(&csv_path, csv)?;
+    eprintln!("falloff CSV written to {csv_path}");
     Ok(())
 }

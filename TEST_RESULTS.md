@@ -490,3 +490,23 @@ reset the analysis sidecar (share one channel), and one multi-MB
 outlier chunk can tear down the shared h2 connection — inputs are
 truncated client-side to 4000 chars (MiniLM truncates at 256 tokens
 regardless, so scores are unchanged).
+
+**Round 7 addendum, the falloff sweep** (15 queries, pools to 20k, one
+run: smaller pools are prefixes of the largest, so the whole matrix
+costs one measurement; raw data `docs/benchmarks/tei-falloff.csv`).
+Instead of spot recalls, measure recall@k for a dense k grid per pool
+k', and derive TRUSTED DEPTH per quality bar tau: how deep the
+reranked list stays >= tau, contiguous from the top.
+
+| pool k' | trusted depth @0.98 | recall@10 | recall@100 | recall@1000 |
+|---------|--------------------|-----------|------------|-------------|
+| 1,000   | 0                  | 0.927     | 0.941      | 0.926       |
+| 2,000   | 7                  | 0.967     | 0.947      | 0.942       |
+| 5,000   | 10                 | 0.980     | 0.971      | 0.953       |
+| 10,000  | 15                 | 0.980     | 0.965      | 0.948       |
+| 20,000  | 100                | 0.993     | 0.981      | 0.970       |
+
+Read-offs: trusting the top-10 at 0.98 needs a ~5k pool; trusting the
+top-100 needs ~20k. Every curve decays toward its pool-overlap floor
+(0.92-0.93) as k approaches k'. Cost scales linearly and stays small:
+~100ms of CPU TEI per 1000 pooled chunks.
