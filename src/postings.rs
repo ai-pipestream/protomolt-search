@@ -254,6 +254,48 @@ impl Bm25Store {
         Self::default()
     }
 
+    /// An empty store with the given field table, in field-id order.
+    /// Field 0 is the body (the stored text); `new()` is
+    /// `with_fields(&["body"])`. Names must be non-empty and unique
+    /// (the v6 reader validates the same on open).
+    pub fn with_fields(names: &[&str]) -> Self {
+        assert!(!names.is_empty(), "a store needs at least one field");
+        for (i, name) in names.iter().enumerate() {
+            assert!(!name.is_empty(), "field {i} has an empty name");
+            assert!(
+                u16::try_from(name.len()).is_ok(),
+                "field name exceeds u16 length"
+            );
+            assert!(!names[..i].contains(name), "duplicate field name {name:?}");
+        }
+        Self {
+            fields: names.iter().map(|n| FieldStore::new(n)).collect(),
+            texts: Vec::new(),
+            lineages: Vec::new(),
+        }
+    }
+
+    /// Number of fields in the field table.
+    pub fn field_count(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// The name of field `f`. Panics when out of range.
+    pub fn field_name(&self, f: usize) -> &str {
+        &self.fields[f].name
+    }
+
+    /// Field `f` as its own [`Bm25Index`]: per-field postings, lengths,
+    /// and total; shared texts, lineages, and doc count. Every scorer
+    /// runs against one of these views (`docs/multi-field.md`). Panics
+    /// when `f` is out of range.
+    pub fn field(&self, f: usize) -> StoreFieldView<'_> {
+        StoreFieldView {
+            store: self,
+            field: &self.fields[f],
+        }
+    }
+
     /// The number of document slots ever allocated (the next local doc id).
     pub fn next_doc_id(&self) -> u32 {
         self.texts.len() as u32
@@ -341,8 +383,23 @@ impl Bm25Store {
         }
     }
 
-    /// Persist to `path` (atomically: write tmp, rename).
+    /// Persist to `path` (atomically: write tmp, rename). Writes THE
+    /// format, v6 (`TVBM2506`); see [`Self::write_v6_to`].
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        let tmp: PathBuf = path.with_extension("bm25tmp");
+        {
+            let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
+            self.write_v6_to(&mut w)?;
+            w.flush()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist in the v5 format. Correctness oracle only — the
+    /// v5-vs-v6 section-parity and query-identity tests; production
+    /// saves are v6 and multi-field stores are refused here.
+    pub fn save_v5(&self, path: &Path) -> io::Result<()> {
         let tmp: PathBuf = path.with_extension("bm25tmp");
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -608,19 +665,6 @@ impl Bm25Store {
         self.write_shared_sections(w, texts_off)?;
         let directory = Self::write_field_postings(w, field, &terms, &run_sizes, postings_off)?;
         Self::write_field_directory(w, &terms, &directory)?;
-        Ok(())
-    }
-
-    /// Persist to `path` in the v6 format (atomically: write tmp,
-    /// rename). See [`Self::write_v6_to`].
-    pub fn save_v6(&self, path: &Path) -> io::Result<()> {
-        let tmp: PathBuf = path.with_extension("bm25tmp");
-        {
-            let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-            self.write_v6_to(&mut w)?;
-            w.flush()?;
-        }
-        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -1176,35 +1220,49 @@ fn push_posting_v5<D: Write, O: Write, S: Write>(
     Ok(occ_start + offsets.len() as u32)
 }
 
-impl Bm25Index for Bm25Store {
+/// One field of a [`Bm25Store`] as its own [`Bm25Index`]
+/// (`docs/multi-field.md`): postings, document lengths, and total
+/// length come from the field; texts, lineages, and the document count
+/// are the store's shared ones (a document is a document — idf's N is
+/// corpus-wide, never per field).
+pub struct StoreFieldView<'a> {
+    store: &'a Bm25Store,
+    field: &'a FieldStore,
+}
+
+impl Bm25Index for StoreFieldView<'_> {
     fn doc_count(&self) -> u64 {
-        self.doc_count()
+        self.store.doc_count()
     }
     fn total_doc_length(&self) -> u64 {
-        self.total_doc_length()
+        self.field.total_length
     }
     fn doc_length(&self, doc_id: u32) -> u32 {
-        self.doc_length(doc_id)
+        self.field
+            .doc_lengths
+            .get(doc_id as usize)
+            .copied()
+            .unwrap_or(0)
     }
     fn df(&self, term: &str) -> u32 {
-        self.fields[0].postings.get(term).map_or(0, |p| p.len() as u32)
+        self.field.postings.get(term).map_or(0, |p| p.len() as u32)
     }
     fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
-        if let Some(postings) = self.fields[0].postings.get(term) {
+        if let Some(postings) = self.field.postings.get(term) {
             for p in postings {
                 f(p.doc_id, p.tf, &p.offsets);
             }
         }
     }
     fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
-        if let Some(postings) = self.fields[0].postings.get(term) {
+        if let Some(postings) = self.field.postings.get(term) {
             for p in postings {
                 f(p.doc_id, p.tf);
             }
         }
     }
     fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
-        let Some(postings) = self.fields[0].postings.get(term) else {
+        let Some(postings) = self.field.postings.get(term) else {
             return Vec::new();
         };
         match postings.binary_search_by_key(&doc_id, |p| p.doc_id) {
@@ -1213,10 +1271,43 @@ impl Bm25Index for Bm25Store {
         }
     }
     fn text(&self, doc_id: u32) -> Option<String> {
-        self.text(doc_id).map(str::to_string)
+        self.store.text(doc_id).map(str::to_string)
     }
     fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
-        self.lineage(doc_id)
+        self.store.lineage(doc_id)
+    }
+}
+
+/// The store itself scores as its body field (field 0) — the surface
+/// every single-field caller uses; multi-field scoring goes through
+/// [`Bm25Store::field`].
+impl Bm25Index for Bm25Store {
+    fn doc_count(&self) -> u64 {
+        self.field(0).doc_count()
+    }
+    fn total_doc_length(&self) -> u64 {
+        self.field(0).total_doc_length()
+    }
+    fn doc_length(&self, doc_id: u32) -> u32 {
+        self.field(0).doc_length(doc_id)
+    }
+    fn df(&self, term: &str) -> u32 {
+        self.field(0).df(term)
+    }
+    fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
+        self.field(0).for_each_posting(term, f);
+    }
+    fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
+        self.field(0).for_each_doc_tf(term, f);
+    }
+    fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
+        self.field(0).posting_offsets(term, doc_id)
+    }
+    fn text(&self, doc_id: u32) -> Option<String> {
+        self.field(0).text(doc_id)
+    }
+    fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
+        self.field(0).lineage(doc_id)
     }
 }
 
@@ -1537,7 +1628,35 @@ impl Bm25Store {
     }
 }
 
-/// Disk-spilling builder producing the SAME v5 file as [`Bm25Store::save`]
+/// One field's slice of a [`SpillBuilder`]: its pending postings
+/// buffer, spilled runs, and per-document lengths — the spill-side
+/// mirror of [`FieldStore`].
+struct FieldSpill {
+    name: String,
+    /// Hash of the field's AnalysisSpec, persisted in the v6 field
+    /// table. 0 until the ingest layer wires real fingerprints.
+    analysis_fingerprint: u64,
+    /// Pending postings: (term, doc_id, tf, offsets).
+    buf: Vec<(String, u32, u32, Vec<(u32, u32)>)>,
+    runs: Vec<PathBuf>,
+    doc_lengths: Vec<u32>,
+    total_length: u64,
+}
+
+impl FieldSpill {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            analysis_fingerprint: 0,
+            buf: Vec::new(),
+            runs: Vec::new(),
+            doc_lengths: Vec::new(),
+            total_length: 0,
+        }
+    }
+}
+
+/// Disk-spilling builder producing the SAME v6 file as [`Bm25Store::save`]
 /// (byte-identical), with bounded memory at any corpus size.
 ///
 /// The in-memory store keeps every posting and every text in heap until
@@ -1546,68 +1665,82 @@ impl Bm25Store {
 /// - streams document texts to a spill file AT ADD TIME, already in the
 ///   final texts-section encoding (gap slots get their `u32::MAX` marker
 ///   immediately), so flush byte-copies the file into place;
-/// - accumulates postings in a bounded buffer; when it fills, the buffer
-///   is sorted by `(term, doc_id)` and written out as a run. Doc ids
-///   only grow, so runs never overlap within a term and the flush-time
-///   merge is a heap of run heads concatenating per-term lists in run
-///   order — one sequential pass, no random access.
+/// - accumulates postings in a bounded per-field buffer; when the total
+///   fills, every field's buffer is sorted by `(term, doc_id)` and
+///   written out as that field's next run. Doc ids only grow, so runs
+///   never overlap within a term and the flush-time merge is a heap of
+///   run heads concatenating per-term lists in run order — one
+///   sequential pass per field, no random access.
 ///
-/// Heap while building: the sort buffer (default 256 MB) plus the per-doc
-/// length/lineage tables. A spilling shard is NOT searchable (that would
-/// mean scanning every run per term); flush it first.
+/// Heap while building: the sort buffers (default 256 MB total) plus the
+/// per-doc length/lineage tables. A spilling shard is NOT searchable
+/// (that would mean scanning every run per term); flush it first.
 pub struct SpillBuilder {
     dir: PathBuf,
-    /// Pending postings: (term, doc_id, tf, offsets).
-    buf: Vec<(String, u32, u32, Vec<(u32, u32)>)>,
+    /// Per-field state, field-id order; never empty. Field 0 is the
+    /// body.
+    fields: Vec<FieldSpill>,
+    /// Total bytes buffered across every field's `buf`.
     buf_bytes: usize,
     cap_bytes: usize,
-    runs: Vec<PathBuf>,
     /// Texts spill, encoded exactly as the v3 texts section.
     texts: io::BufWriter<std::fs::File>,
     texts_bytes: u64,
     /// Per-slot text byte length (`u32::MAX` = absent); sizes the final
     /// sections without rereading the spill.
     text_lens: Vec<u32>,
-    doc_lengths: Vec<u32>,
     lineages: Vec<Option<DocLineage>>,
-    total_length: u64,
+    /// Documents with postings in any field.
     doc_count: u64,
-    /// Write the v4 format instead of v5 (benchmarking/migration only).
+    /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
 
 impl SpillBuilder {
-    /// Default sort-buffer capacity before a run is spilled.
+    /// Default sort-buffer capacity before runs are spilled.
     pub const DEFAULT_BUF_BYTES: usize = 256 << 20;
 
-    /// Create a builder spilling into `dir` (created; must not hold a
-    /// previous builder's files). `finish` writes the v5 format.
+    /// Create a single-field ("body") builder spilling into `dir`
+    /// (created; must not hold a previous builder's files). `finish`
+    /// writes the v6 format.
     pub fn create(dir: &Path) -> io::Result<Self> {
-        Self::create_format(dir, false)
+        Self::create_format(dir, &["body"], false)
+    }
+
+    /// Create a builder with the given field table; same contract as
+    /// [`Bm25Store::with_fields`].
+    pub fn create_with_fields(dir: &Path, names: &[&str]) -> io::Result<Self> {
+        Self::create_format(dir, names, false)
     }
 
     /// A builder whose `finish` writes the v4 format. Exists for
-    /// benchmarking (v4-vs-v5 scorer comparisons) and migration checks;
-    /// new shards are always v5.
+    /// benchmarking (v4-vs-v6 scorer comparisons) and migration checks;
+    /// new shards are always v6.
     pub fn create_v4_for_bench(dir: &Path) -> io::Result<Self> {
-        Self::create_format(dir, true)
+        Self::create_format(dir, &["body"], true)
     }
 
-    fn create_format(dir: &Path, v4_only: bool) -> io::Result<Self> {
+    fn create_format(dir: &Path, names: &[&str], v4_only: bool) -> io::Result<Self> {
+        assert!(!names.is_empty(), "a builder needs at least one field");
+        for (i, name) in names.iter().enumerate() {
+            assert!(!name.is_empty(), "field {i} has an empty name");
+            assert!(
+                u16::try_from(name.len()).is_ok(),
+                "field name exceeds u16 length"
+            );
+            assert!(!names[..i].contains(name), "duplicate field name {name:?}");
+        }
         std::fs::create_dir_all(dir)?;
         let texts = io::BufWriter::new(std::fs::File::create(dir.join("texts.spill"))?);
         Ok(Self {
             dir: dir.to_path_buf(),
-            buf: Vec::new(),
+            fields: names.iter().map(|n| FieldSpill::new(n)).collect(),
             buf_bytes: 0,
             cap_bytes: Self::DEFAULT_BUF_BYTES,
-            runs: Vec::new(),
             texts,
             texts_bytes: 0,
             text_lens: Vec::new(),
-            doc_lengths: Vec::new(),
             lineages: Vec::new(),
-            total_length: 0,
             doc_count: 0,
             v4_only,
         })
@@ -1622,17 +1755,17 @@ impl SpillBuilder {
 
     /// The number of document slots ever allocated (the next local doc id).
     pub fn next_doc_id(&self) -> u32 {
-        self.doc_lengths.len() as u32
+        self.fields[0].doc_lengths.len() as u32
     }
 
-    /// Number of documents with postings.
+    /// Number of documents with postings (in any field).
     pub fn doc_count(&self) -> u64 {
         self.doc_count
     }
 
-    /// Sum of all document lengths (BM25 avgdl numerator).
+    /// Sum of all body document lengths (BM25 avgdl numerator).
     pub fn total_doc_length(&self) -> u64 {
-        self.total_length
+        self.fields[0].total_length
     }
 
     /// Append one analyzed document; same contract as
@@ -1645,37 +1778,47 @@ impl SpillBuilder {
         lineage: Option<DocLineage>,
     ) -> io::Result<()> {
         assert!(
-            doc.fields.len() <= 1,
-            "SpillBuilder is single-field (v4/v5); multi-field builds land with the v6 spill path"
+            doc.fields.len() <= self.fields.len(),
+            "document carries {} fields, builder has {}",
+            doc.fields.len(),
+            self.fields.len()
         );
-        let body = doc.fields.into_iter().next().unwrap_or_default();
         let slot = doc_id as usize;
         assert!(
-            slot >= self.doc_lengths.len(),
+            slot >= self.fields[0].doc_lengths.len(),
             "doc id {doc_id} already used"
         );
         // Gap slots (ids consumed by the vector side) are written to the
         // spill NOW so the final texts section is a straight copy.
-        while self.doc_lengths.len() < slot {
+        while self.fields[0].doc_lengths.len() < slot {
             write_u32(&mut self.texts, u32::MAX)?;
             self.texts_bytes += 4;
             self.text_lens.push(u32::MAX);
-            self.doc_lengths.push(0);
+            for field in &mut self.fields {
+                field.doc_lengths.push(0);
+            }
             self.lineages.push(None);
         }
         write_u32(&mut self.texts, text.len() as u32)?;
         self.texts.write_all(text.as_bytes())?;
         self.texts_bytes += 4 + text.len() as u64;
         self.text_lens.push(text.len() as u32);
-        self.doc_lengths.push(body.length);
         self.lineages.push(lineage);
-        self.total_length += u64::from(body.length);
-        if body.length > 0 {
+        let mut lengths = vec![0u32; self.fields.len()];
+        for (fi, analyzed) in doc.fields.into_iter().enumerate() {
+            lengths[fi] = analyzed.length;
+            let field = &mut self.fields[fi];
+            field.total_length += u64::from(analyzed.length);
+            for (term, tf, offsets) in analyzed.terms {
+                self.buf_bytes += term.len() + 24 + 16 * offsets.len();
+                field.buf.push((term, doc_id, tf, offsets));
+            }
+        }
+        if lengths.iter().any(|&l| l > 0) {
             self.doc_count += 1;
         }
-        for (term, tf, offsets) in body.terms {
-            self.buf_bytes += term.len() + 24 + 16 * offsets.len();
-            self.buf.push((term, doc_id, tf, offsets));
+        for (field, &length) in self.fields.iter_mut().zip(&lengths) {
+            field.doc_lengths.push(length);
         }
         if self.buf_bytes >= self.cap_bytes {
             self.spill_run()?;
@@ -1683,146 +1826,184 @@ impl SpillBuilder {
         Ok(())
     }
 
-    /// Sort the buffer by `(term, doc_id)` and write it as one run.
+    /// Sort every field's buffer by `(term, doc_id)` and write each as
+    /// that field's next run.
     fn spill_run(&mut self) -> io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        self.buf
-            .sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        let path = self.dir.join(format!("run-{:06}", self.runs.len()));
-        let mut w = io::BufWriter::new(std::fs::File::create(&path)?);
-        let mut i = 0;
-        while i < self.buf.len() {
-            let term = &self.buf[i].0;
-            let group_end = self.buf[i..]
-                .iter()
-                .position(|e| &e.0 != term)
-                .map_or(self.buf.len(), |p| i + p);
-            write_u16(&mut w, term.len() as u16)?;
-            w.write_all(term.as_bytes())?;
-            write_u32(&mut w, (group_end - i) as u32)?;
-            for (_, doc_id, tf, offsets) in &self.buf[i..group_end] {
-                write_u32(&mut w, *doc_id)?;
-                write_u32(&mut w, *tf)?;
-                write_u32(&mut w, offsets.len() as u32)?;
-                for &(start, end) in offsets {
-                    write_u32(&mut w, start)?;
-                    write_u32(&mut w, end)?;
-                }
+        for (fi, field) in self.fields.iter_mut().enumerate() {
+            if field.buf.is_empty() {
+                continue;
             }
-            i = group_end;
+            field
+                .buf
+                .sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            let path = self
+                .dir
+                .join(format!("run-f{fi:03}-{:06}", field.runs.len()));
+            let mut w = io::BufWriter::new(std::fs::File::create(&path)?);
+            let mut i = 0;
+            while i < field.buf.len() {
+                let term = &field.buf[i].0;
+                let group_end = field.buf[i..]
+                    .iter()
+                    .position(|e| &e.0 != term)
+                    .map_or(field.buf.len(), |p| i + p);
+                write_u16(&mut w, term.len() as u16)?;
+                w.write_all(term.as_bytes())?;
+                write_u32(&mut w, (group_end - i) as u32)?;
+                for (_, doc_id, tf, offsets) in &field.buf[i..group_end] {
+                    write_u32(&mut w, *doc_id)?;
+                    write_u32(&mut w, *tf)?;
+                    write_u32(&mut w, offsets.len() as u32)?;
+                    for &(start, end) in offsets {
+                        write_u32(&mut w, start)?;
+                        write_u32(&mut w, end)?;
+                    }
+                }
+                i = group_end;
+            }
+            w.flush()?;
+            field.runs.push(path);
+            field.buf.clear();
         }
-        w.flush()?;
-        self.runs.push(path);
-        self.buf.clear();
         self.buf_bytes = 0;
         Ok(())
     }
 
     /// Merge the runs and assemble the file at `path` (atomically:
     /// write tmp, rename). The spill directory is removed on success.
-    /// Writes v5, byte-identical to [`Bm25Store::save`] on the same
+    /// Writes v6, byte-identical to [`Bm25Store::save`] on the same
     /// corpus, unless built with [`Self::create_v4_for_bench`].
     pub fn finish(&mut self, path: &Path) -> io::Result<()> {
         if self.v4_only {
             self.finish_v4(path)
         } else {
-            self.finish_v5(path)
+            self.finish_v6(path)
         }
     }
 
-    /// Merge the runs and assemble the v5 file at `path`. Merge side of
-    /// the v5 format: the doc run streams into the postings body while
-    /// occurrence bytes divert to a per-term stage file and the skip
-    /// builder accumulates `(tf, dl)` per 128-posting block — all
-    /// single-pass with O(1) state per term, so the sub-1 GB build
-    /// memory the spill builder buys is untouched.
-    fn finish_v5(&mut self, path: &Path) -> io::Result<()> {
+    /// Merge one field's runs into a postings-section body file at
+    /// `body_path` (per-term doc/occurrence/skip runs, WITHOUT the
+    /// section's leading u32 n_terms), returning the directory
+    /// `(term, doc_rel, skip_rel, occ_rel, df)` with offsets relative
+    /// to the body start. Merge side of the v5-shaped postings layout:
+    /// the doc run streams into the body while occurrence bytes divert
+    /// to a per-term stage file and the skip builder accumulates
+    /// `(tf, dl)` per 128-posting block — all single-pass with O(1)
+    /// state per term, so the sub-1 GB build memory the spill builder
+    /// buys is untouched.
+    fn merge_field_runs(
+        runs: &[PathBuf],
+        doc_lengths: &[u32],
+        body_path: &Path,
+        occ_stage_path: &Path,
+    ) -> io::Result<Vec<(String, u64, u64, u64, u32)>> {
+        let mut directory: Vec<(String, u64, u64, u64, u32)> = Vec::new();
+        let mut out = io::BufWriter::new(std::fs::File::create(body_path)?);
+        let mut heads: Vec<RunHead> = Vec::new();
+        for run in runs {
+            if let Some(head) = RunHead::open(run)? {
+                heads.push(head);
+            }
+        }
+        let mut cursor = 0u64;
+        while !heads.is_empty() {
+            // Smallest term across run heads; runs are time-ordered,
+            // and ids only grow, so draining matching heads in run
+            // order keeps postings doc-ascending.
+            let term = heads
+                .iter()
+                .map(|h| h.term.clone())
+                .min()
+                .expect("nonempty heads");
+            let doc_rel = cursor;
+            let mut df = 0u64;
+            let mut occ_bytes = 0u64;
+            let mut occ_start = 0u32;
+            let mut skip_l0: Vec<u8> = Vec::new();
+            let mut skip = SkipRunBuilder::new();
+            {
+                let mut occ_stage = io::BufWriter::new(std::fs::File::create(occ_stage_path)?);
+                let mut idx = 0;
+                while idx < heads.len() {
+                    if heads[idx].term == term {
+                        for _ in 0..heads[idx].n_postings {
+                            let (doc_id, tf, offsets) = heads[idx].next_posting_raw()?;
+                            let dl = doc_lengths[doc_id as usize];
+                            write_u32(&mut out, doc_id)?;
+                            write_u32(&mut out, tf)?;
+                            write_u32(&mut out, occ_start)?;
+                            // The run encoding's offset bytes are
+                            // exactly the occurrence-run pairs.
+                            occ_stage.write_all(&offsets)?;
+                            skip.push(tf, dl, doc_id, &mut skip_l0)?;
+                            occ_start += offsets.len() as u32 / 8;
+                            occ_bytes += offsets.len() as u64;
+                            df += 1;
+                        }
+                        if !heads[idx].advance()? {
+                            heads.remove(idx);
+                            continue;
+                        }
+                    }
+                    idx += 1;
+                }
+                occ_stage.flush()?;
+            }
+            write_u32(&mut out, occ_start)?; // sentinel
+            {
+                let mut stage = std::fs::File::open(occ_stage_path)?;
+                io::copy(&mut stage, &mut out)?;
+            }
+            let (l0_bytes, l1) = skip.finish(&mut skip_l0)?;
+            debug_assert_eq!(l0_bytes, skip_l0.len() as u64);
+            let occ_rel = doc_rel + 12 * df + 4;
+            let skip_rel = occ_rel + occ_bytes;
+            let skip_bytes = skip_run_size(l0_bytes, &l1);
+            write_skip_run(&mut out, &skip_l0, &l1)?;
+            directory.push((term, doc_rel, skip_rel, occ_rel, df as u32));
+            cursor = skip_rel + skip_bytes;
+        }
+        out.flush()?;
+        Ok(directory)
+    }
+
+    /// Merge every field's runs and assemble the v6 file at `path`,
+    /// mirroring [`Bm25Store::write_v6_to`] section for section (the
+    /// dual-writer byte-identity test pins the two).
+    fn finish_v6(&mut self, path: &Path) -> io::Result<()> {
         self.spill_run()?;
         self.texts.flush()?;
 
-        let postings_body = self.dir.join("postings.body");
         let occ_stage_path = self.dir.join("occ.stage");
-        // (term, doc_run_rel, skip_run_rel, occ_run_rel, df), offsets
-        // relative to the postings-section body start.
-        let mut directory: Vec<(String, u64, u64, u64, u32)> = Vec::new();
-        {
-            let mut out = io::BufWriter::new(std::fs::File::create(&postings_body)?);
-            let mut heads: Vec<RunHead> = Vec::new();
-            for run in &self.runs {
-                if let Some(head) = RunHead::open(run)? {
-                    heads.push(head);
-                }
-            }
-            let mut cursor = 0u64;
-            while !heads.is_empty() {
-                // Smallest term across run heads; runs are time-ordered,
-                // and ids only grow, so draining matching heads in run
-                // order keeps postings doc-ascending.
-                let term = heads
-                    .iter()
-                    .map(|h| h.term.clone())
-                    .min()
-                    .expect("nonempty heads");
-                let doc_rel = cursor;
-                let mut df = 0u64;
-                let mut occ_bytes = 0u64;
-                let mut occ_start = 0u32;
-                let mut skip_l0: Vec<u8> = Vec::new();
-                let mut skip = SkipRunBuilder::new();
-                {
-                    let mut occ_stage =
-                        io::BufWriter::new(std::fs::File::create(&occ_stage_path)?);
-                    let mut idx = 0;
-                    while idx < heads.len() {
-                        if heads[idx].term == term {
-                            for _ in 0..heads[idx].n_postings {
-                                let (doc_id, tf, offsets) = heads[idx].next_posting_raw()?;
-                                let dl = self.doc_lengths[doc_id as usize];
-                                write_u32(&mut out, doc_id)?;
-                                write_u32(&mut out, tf)?;
-                                write_u32(&mut out, occ_start)?;
-                                // The run encoding's offset bytes are
-                                // exactly the v5 occurrence-run pairs.
-                                occ_stage.write_all(&offsets)?;
-                                skip.push(tf, dl, doc_id, &mut skip_l0)?;
-                                occ_start += offsets.len() as u32 / 8;
-                                occ_bytes += offsets.len() as u64;
-                                df += 1;
-                            }
-                            if !heads[idx].advance()? {
-                                heads.remove(idx);
-                                continue;
-                            }
-                        }
-                        idx += 1;
-                    }
-                    occ_stage.flush()?;
-                }
-                write_u32(&mut out, occ_start)?; // sentinel
-                {
-                    let mut stage = std::fs::File::open(&occ_stage_path)?;
-                    io::copy(&mut stage, &mut out)?;
-                }
-                let (l0_bytes, l1) = skip.finish(&mut skip_l0)?;
-                debug_assert_eq!(l0_bytes, skip_l0.len() as u64);
-                let occ_rel = doc_rel + 12 * df + 4;
-                let skip_rel = occ_rel + occ_bytes;
-                let skip_bytes = skip_run_size(l0_bytes, &l1);
-                write_skip_run(&mut out, &skip_l0, &l1)?;
-                directory.push((term, doc_rel, skip_rel, occ_rel, df as u32));
-                cursor = skip_rel + skip_bytes;
-            }
-            out.flush()?;
+        let mut directories: Vec<Vec<(String, u64, u64, u64, u32)>> =
+            Vec::with_capacity(self.fields.len());
+        let mut body_paths: Vec<PathBuf> = Vec::with_capacity(self.fields.len());
+        let mut body_lens: Vec<u64> = Vec::with_capacity(self.fields.len());
+        for (fi, field) in self.fields.iter().enumerate() {
+            let body_path = self.dir.join(format!("postings-f{fi:03}.body"));
+            let directory = Self::merge_field_runs(
+                &field.runs,
+                &field.doc_lengths,
+                &body_path,
+                &occ_stage_path,
+            )?;
+            body_lens.push(std::fs::metadata(&body_path)?.len());
+            body_paths.push(body_path);
+            directories.push(directory);
         }
-        let postings_body_len = std::fs::metadata(&postings_body)?.len();
 
-        // Section geometry, identical to Bm25Store::write_to.
-        let n_slots = self.doc_lengths.len() as u64;
-        let header_size = 8 + 8 + 8 * 4 + 4;
-        let doc_lengths_off = header_size as u64;
-        let texts_off = doc_lengths_off + 4 * n_slots;
+        // Section geometry, identical to Bm25Store::write_v6_to.
+        let n_slots = self.fields[0].doc_lengths.len() as u64;
+        let header_size: u64 = 8
+            + 4
+            + 4
+            + 8 * 3
+            + self
+                .fields
+                .iter()
+                .map(|f| 2 + f.name.len() as u64 + 8 * 5)
+                .sum::<u64>();
+        let texts_off = header_size;
         let text_index_off = texts_off + self.texts_bytes;
         let lineages_off = text_index_off + 12 * n_slots;
         let lineages_size: u64 = self
@@ -1830,36 +2011,56 @@ impl SpillBuilder {
             .iter()
             .map(|l| if l.is_some() { 25 } else { 1 })
             .sum();
-        let postings_off = lineages_off + lineages_size;
-        let directory_off = postings_off + 4 + postings_body_len;
+        let mut cursor = lineages_off + lineages_size;
+        // (doc_lengths_off, postings_off, directory_off) per field.
+        let mut section_offs: Vec<(u64, u64, u64)> = Vec::with_capacity(self.fields.len());
+        for fi in 0..self.fields.len() {
+            let doc_lengths_off = cursor;
+            let postings_off = doc_lengths_off + 4 * n_slots;
+            let directory_off = postings_off + 4 + body_lens[fi];
+            let directory_size = 4
+                + 34 * directories[fi].len() as u64
+                + directories[fi]
+                    .iter()
+                    .map(|(t, ..)| t.len() as u64)
+                    .sum::<u64>();
+            section_offs.push((doc_lengths_off, postings_off, directory_off));
+            cursor = directory_off + directory_size;
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(MAGIC_V5)?;
-            write_u64(&mut w, self.total_length)?;
+            w.write_all(MAGIC_V6)?;
+            write_u32(&mut w, self.fields.len() as u32)?;
+            write_u32(&mut w, n_slots as u32)?;
             write_u64(&mut w, texts_off)?;
+            write_u64(&mut w, text_index_off)?;
             write_u64(&mut w, lineages_off)?;
-            write_u64(&mut w, postings_off)?;
-            write_u64(&mut w, directory_off)?;
-            write_u32(&mut w, self.doc_lengths.len() as u32)?;
-            for &len in &self.doc_lengths {
-                write_u32(&mut w, len)?;
+            for (field, &(dl_off, p_off, d_off)) in self.fields.iter().zip(&section_offs) {
+                write_u16(&mut w, field.name.len() as u16)?;
+                w.write_all(field.name.as_bytes())?;
+                write_u64(&mut w, field.analysis_fingerprint)?;
+                write_u64(&mut w, field.total_length)?;
+                write_u64(&mut w, dl_off)?;
+                write_u64(&mut w, p_off)?;
+                write_u64(&mut w, d_off)?;
             }
             // texts: byte-copy of the spill (already section-encoded).
             let mut spill = std::fs::File::open(self.dir.join("texts.spill"))?;
             io::copy(&mut spill, &mut w)?;
-            // text_index, from the in-memory length table.
-            let mut cursor = texts_off;
+            // text_index, from the in-memory length table; entries are
+            // relative to the texts section start (v6).
+            let mut tcur = 0u64;
             for &len in &self.text_lens {
                 if len == u32::MAX {
                     write_u64(&mut w, 0)?;
                     write_u32(&mut w, u32::MAX)?;
-                    cursor += 4;
+                    tcur += 4;
                 } else {
-                    write_u64(&mut w, cursor + 4)?;
+                    write_u64(&mut w, tcur + 4)?;
                     write_u32(&mut w, len)?;
-                    cursor += 4 + len as u64;
+                    tcur += 4 + len as u64;
                 }
             }
             for lineage in &self.lineages {
@@ -1874,22 +2075,29 @@ impl SpillBuilder {
                     None => w.write_all(&[0u8])?,
                 }
             }
-            write_u32(&mut w, directory.len() as u32)?;
-            let mut body = std::fs::File::open(&postings_body)?;
-            io::copy(&mut body, &mut w)?;
-            write_u32(&mut w, directory.len() as u32)?;
-            let mut blob_off = 0u64; // relative to the term blob start
-            for (term, doc_rel, skip_rel, occ_rel, df) in &directory {
-                write_u64(&mut w, postings_off + 4 + doc_rel)?;
-                write_u64(&mut w, postings_off + 4 + skip_rel)?;
-                write_u64(&mut w, postings_off + 4 + occ_rel)?;
-                write_u32(&mut w, *df)?;
-                write_u32(&mut w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
-                write_u16(&mut w, term.len() as u16)?;
-                blob_off += term.len() as u64;
-            }
-            for (term, _, _, _, _) in &directory {
-                w.write_all(term.as_bytes())?;
+            for (fi, field) in self.fields.iter().enumerate() {
+                for &len in &field.doc_lengths {
+                    write_u32(&mut w, len)?;
+                }
+                write_u32(&mut w, directories[fi].len() as u32)?;
+                let mut body = std::fs::File::open(&body_paths[fi])?;
+                io::copy(&mut body, &mut w)?;
+                write_u32(&mut w, directories[fi].len() as u32)?;
+                let mut blob_off = 0u64; // relative to the term blob start
+                for (term, doc_rel, skip_rel, occ_rel, df) in &directories[fi] {
+                    // Section-relative run offsets: past the section's
+                    // leading u32 n_terms.
+                    write_u64(&mut w, 4 + doc_rel)?;
+                    write_u64(&mut w, 4 + skip_rel)?;
+                    write_u64(&mut w, 4 + occ_rel)?;
+                    write_u32(&mut w, *df)?;
+                    write_u32(&mut w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
+                    write_u16(&mut w, term.len() as u16)?;
+                    blob_off += term.len() as u64;
+                }
+                for (term, ..) in &directories[fi] {
+                    w.write_all(term.as_bytes())?;
+                }
             }
             w.flush()?;
         }
@@ -1911,7 +2119,7 @@ impl SpillBuilder {
         {
             let mut out = io::BufWriter::new(std::fs::File::create(&postings_body)?);
             let mut heads: Vec<RunHead> = Vec::new();
-            for run in &self.runs {
+            for run in &self.fields[0].runs {
                 if let Some(head) = RunHead::open(run)? {
                     heads.push(head);
                 }
@@ -1952,7 +2160,8 @@ impl SpillBuilder {
         let postings_body_len = std::fs::metadata(&postings_body)?.len();
 
         // Section geometry, identical to Bm25Store::write_to.
-        let n_slots = self.doc_lengths.len() as u64;
+        let field = &self.fields[0];
+        let n_slots = field.doc_lengths.len() as u64;
         let header_size = 8 + 8 + 8 * 4 + 4;
         let doc_lengths_off = header_size as u64;
         let texts_off = doc_lengths_off + 4 * n_slots;
@@ -1970,13 +2179,13 @@ impl SpillBuilder {
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
             w.write_all(MAGIC_V4)?;
-            write_u64(&mut w, self.total_length)?;
+            write_u64(&mut w, field.total_length)?;
             write_u64(&mut w, texts_off)?;
             write_u64(&mut w, lineages_off)?;
             write_u64(&mut w, postings_off)?;
             write_u64(&mut w, directory_off)?;
-            write_u32(&mut w, self.doc_lengths.len() as u32)?;
-            for &len in &self.doc_lengths {
+            write_u32(&mut w, field.doc_lengths.len() as u32)?;
+            for &len in &field.doc_lengths {
                 write_u32(&mut w, len)?;
             }
             // texts: byte-copy of the spill (already section-encoded).
@@ -2400,7 +2609,7 @@ pub struct TranscodeStats {
 /// skip builder's O(1) state, so a 50 GB shard transcodes in one
 /// sequential read + write.
 ///
-/// The output is byte-identical to what [`Bm25Store::save`] would
+/// The output is byte-identical to what [`Bm25Store::save_v5`] would
 /// write for the same corpus (pinned by test), so everything proven of
 /// written-v5 files (dual-writer identity, pruned == exhaustive) holds
 /// of transcoded ones. The source must be v3 or v4; the write is
@@ -2419,7 +2628,8 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
     let lineages_off = u64::from_le_bytes(map[24..32].try_into().unwrap());
     let postings_off = u64::from_le_bytes(map[32..40].try_into().unwrap());
     let n_slots = u32_at(48);
-    let n_terms = reader.n_terms;
+    let field0 = &reader.fields[0];
+    let n_terms = field0.n_terms;
 
     let tmp = dst.with_extension("bm25tmp");
     let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -2440,7 +2650,7 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
     let mut cursor = postings_off + 4;
     let mut postings_walked = 0u64;
     for i in 0..n_terms {
-        let (_, term_off, df) = reader.directory_entry(i);
+        let (_, term_off, df) = reader.directory_entry(field0, i);
         // Step over the term's inline header: u32 len, term, u32 count.
         let term_len = u32_at(term_off as usize) as usize;
         let mut p = term_off as usize + 4 + term_len + 4;
@@ -2478,7 +2688,7 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
     write_u32(&mut w, n_terms)?;
     let mut blob_off = 0u64; // relative to the term blob start
     for (i, &(doc_off, skip_off, occ_off, df)) in directory.iter().enumerate() {
-        let (term, _, _) = reader.directory_entry(i as u32);
+        let (term, _, _) = reader.directory_entry(field0, i as u32);
         write_u64(&mut w, doc_off)?;
         write_u64(&mut w, skip_off)?;
         write_u64(&mut w, occ_off)?;
@@ -2488,7 +2698,7 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
         blob_off += term.len() as u64;
     }
     for i in 0..n_terms {
-        let (term, _, _) = reader.directory_entry(i);
+        let (term, _, _) = reader.directory_entry(field0, i);
         w.write_all(term)?;
     }
     w.flush()?;
@@ -2669,11 +2879,30 @@ fn u16_at(bytes: &[u8]) -> u16 {
 /// or single-field v6). Postings and document texts are read from the
 /// map on demand; the only heap state is the per-document length table
 /// and a term count.
+/// Per-field read state of one open `.bm25` file: the field's decoded
+/// doc-length table plus the map offsets of its directory and postings
+/// sections. v3/v4/v5 files have exactly one ("body"); a v6 file one
+/// per field-table entry.
+struct FieldSlice {
+    name: String,
+    doc_lengths: Vec<u32>,
+    total_length: u64,
+    directory_off: u64,
+    n_terms: u32,
+    /// Base added to directory run offsets: 0 for v3/v4/v5 (absolute
+    /// entries), the field's postings section offset for v6
+    /// (section-relative entries).
+    run_base: u64,
+}
+
 pub struct Bm25Reader {
     map: memmap2::Mmap,
-    doc_lengths: Vec<u32>,
+    /// Per-field state, field-id order; never empty. Field 0 is the
+    /// body.
+    fields: Vec<FieldSlice>,
+    /// Documents with postings in any field — the corpus-wide N (a
+    /// document is a document; idf never uses a per-field count).
     doc_count: u64,
-    total_length: u64,
     lineages_off: u64,
     /// Start of the on-disk text index (explicit in the v6 header;
     /// derived as `lineages_off - 12 * n_slots` for v3/v4/v5).
@@ -2682,16 +2911,10 @@ pub struct Bm25Reader {
     /// (absolute entries), the texts section offset for v6 (relative
     /// entries).
     text_base: u64,
-    directory_off: u64,
-    n_terms: u32,
     /// v5-shaped postings (v5 and v6 files): 34 B directory entries
     /// and the doc/occurrence/skip run layout; v3/v4: 18 B entries and
     /// interleaved postings.
     v5_runs: bool,
-    /// Base added to directory run offsets: 0 for v5 (absolute
-    /// entries), the field's postings section offset for v6
-    /// (section-relative entries).
-    run_base: u64,
     /// v4+ directories store blob offsets relative to the blob start;
     /// v3 stored absolute file offsets.
     blob_relative: bool,
@@ -2705,22 +2928,49 @@ pub struct Bm25Reader {
 impl Bm25Reader {
     /// The next local doc id (number of document slots).
     pub fn next_doc_id(&self) -> u32 {
-        self.doc_lengths.len() as u32
+        self.n_slots() as u32
     }
 
-    /// Number of terms in the directory.
+    /// The shared slot count (every field's doc-length table has it).
+    fn n_slots(&self) -> usize {
+        self.fields[0].doc_lengths.len()
+    }
+
+    /// Number of fields in the field table.
+    pub fn field_count(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// The name of field `f`. Panics when out of range.
+    pub fn field_name(&self, f: usize) -> &str {
+        &self.fields[f].name
+    }
+
+    /// Field `f` as its own [`Bm25Index`]: directory lookups, postings
+    /// walks, and impact cursors run against the field's sections;
+    /// texts, lineages, and the document count are the file's shared
+    /// ones (`docs/multi-field.md`). Panics when `f` is out of range.
+    pub fn field(&self, f: usize) -> FieldView<'_> {
+        FieldView {
+            reader: self,
+            field: &self.fields[f],
+        }
+    }
+
+    /// Number of terms in field 0's directory.
     pub fn term_count(&self) -> u32 {
-        self.n_terms
+        self.fields[0].n_terms
     }
 
-    /// The `i`th term in directory (sorted) order. Panics when out of
-    /// range; verification tooling only.
+    /// The `i`th term of field 0 in directory (sorted) order. Panics
+    /// when out of range; verification tooling only.
     pub fn term_at(&self, i: u32) -> String {
-        assert!(i < self.n_terms, "term index {i} out of range");
+        let field = &self.fields[0];
+        assert!(i < field.n_terms, "term index {i} out of range");
         let bytes = if self.v5_runs {
-            self.directory_entry_v5(i).0
+            self.directory_entry_v5(field, i).0
         } else {
-            self.directory_entry(i).0
+            self.directory_entry(field, i).0
         };
         String::from_utf8_lossy(bytes).into_owned()
     }
@@ -2773,74 +3023,82 @@ impl Bm25Reader {
         );
         Ok(Self {
             map,
-            doc_lengths,
+            fields: vec![FieldSlice {
+                name: "body".to_string(),
+                doc_lengths,
+                total_length,
+                directory_off,
+                n_terms,
+                run_base: 0,
+            }],
             doc_count,
-            total_length,
             lineages_off,
             text_index_off: lineages_off - 12 * n_slots as u64,
             text_base: 0,
-            directory_off,
-            n_terms,
             v5_runs: v5,
-            run_base: 0,
             blob_relative,
             lineage_index: std::sync::OnceLock::new(),
         })
     }
 
-    /// Open a validated v6 map. Single-field files only for now: the
-    /// reader's query surface has no field parameter yet, so a
-    /// multi-field file cannot be served faithfully (increment 2 of
-    /// `docs/multi-field.md` lifts this). The one field's sections are
-    /// v5-shaped, so the entire v5 read machinery applies with run
-    /// offsets rebased by the field's postings section offset.
+    /// Open a validated v6 map, one [`FieldSlice`] per field-table
+    /// entry. Every field's sections are v5-shaped, so the entire v5
+    /// read machinery serves each field with run offsets rebased by
+    /// that field's postings section offset.
     fn open_v6(map: memmap2::Mmap) -> io::Result<Self> {
-        let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         validate_structure_v6(&map)?;
         let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().unwrap());
         let u64_at = |off: usize| u64::from_le_bytes(map[off..off + 8].try_into().unwrap());
-        let n_fields = u32_at(8);
-        if n_fields != 1 {
-            return Err(invalid(
-                "multi-field v6 files are not readable yet (docs/multi-field.md increment 2)",
-            ));
-        }
+        let n_fields = u32_at(8) as usize;
         let n_slots = u32_at(12) as usize;
         let texts_off = u64_at(16);
         let text_index_off = u64_at(24);
         let lineages_off = u64_at(32);
-        // Field 0's table entry (validation checked the walk).
-        let name_len = u16::from_le_bytes(map[40..42].try_into().unwrap()) as usize;
-        let base = 42 + name_len;
-        let total_length = u64_at(base + 8);
-        let doc_lengths_off = u64_at(base + 16) as usize;
-        let postings_off = u64_at(base + 24);
-        let directory_off = u64_at(base + 32);
-        let mut doc_lengths = Vec::with_capacity(n_slots);
-        for slot in 0..n_slots {
-            doc_lengths.push(u32_at(doc_lengths_off + 4 * slot));
+        // Field table walk (validation already checked the geometry and
+        // the names).
+        let mut fields = Vec::with_capacity(n_fields);
+        let mut cursor = 40usize;
+        for _ in 0..n_fields {
+            let name_len = u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
+            let name = String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
+            let base = cursor + 2 + name_len;
+            let total_length = u64_at(base + 8);
+            let doc_lengths_off = u64_at(base + 16) as usize;
+            let postings_off = u64_at(base + 24);
+            let directory_off = u64_at(base + 32);
+            let mut doc_lengths = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots {
+                doc_lengths.push(u32_at(doc_lengths_off + 4 * slot));
+            }
+            let n_terms = u32_at(directory_off as usize);
+            fields.push(FieldSlice {
+                name,
+                doc_lengths,
+                total_length,
+                directory_off,
+                n_terms,
+                run_base: postings_off,
+            });
+            cursor = base + 40;
         }
-        let doc_count = doc_lengths.iter().filter(|&&l| l > 0).count() as u64;
-        let n_terms = u32_at(directory_off as usize);
+        let doc_count = (0..n_slots)
+            .filter(|&slot| fields.iter().any(|f| f.doc_lengths[slot] > 0))
+            .count() as u64;
         Ok(Self {
             map,
-            doc_lengths,
+            fields,
             doc_count,
-            total_length,
             lineages_off,
             text_index_off,
             text_base: texts_off,
-            directory_off,
-            n_terms,
             v5_runs: true,
-            run_base: postings_off,
             blob_relative: true,
             lineage_index: std::sync::OnceLock::new(),
         })
     }
 
-    fn directory_entry(&self, i: u32) -> (&[u8], u64, u32) {
-        let e = self.directory_off as usize + 4 + 18 * i as usize;
+    fn directory_entry(&self, field: &FieldSlice, i: u32) -> (&[u8], u64, u32) {
+        let e = field.directory_off as usize + 4 + 18 * i as usize;
         let postings_off = u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap());
         let df = u32::from_le_bytes(self.map[e + 8..e + 12].try_into().unwrap());
         let stored = u32::from_le_bytes(self.map[e + 12..e + 16].try_into().unwrap()) as usize;
@@ -2848,7 +3106,7 @@ impl Bm25Reader {
         // v4 stores offsets relative to the term blob; v3 stored absolute
         // file offsets (only valid below 4 GiB).
         let blob_off = if self.blob_relative {
-            self.directory_off as usize + 4 + 18 * self.n_terms as usize + stored
+            field.directory_off as usize + 4 + 18 * field.n_terms as usize + stored
         } else {
             stored
         };
@@ -2856,22 +3114,22 @@ impl Bm25Reader {
     }
 
     /// The 34 B v5-shaped directory entry: `(term bytes, doc_run_off,
-    /// skip_run_off, occ_run_off, df)`. Run offsets are rebased by
-    /// `run_base` (0 on v5 files, where entries are absolute; the
-    /// field's postings section offset on v6, where they are
+    /// skip_run_off, occ_run_off, df)`. Run offsets are rebased by the
+    /// field's `run_base` (0 on v5 files, where entries are absolute;
+    /// the field's postings section offset on v6, where they are
     /// section-relative), so callers always see absolute offsets.
-    fn directory_entry_v5(&self, i: u32) -> (&[u8], u64, u64, u64, u32) {
-        let e = self.directory_off as usize + 4 + 34 * i as usize;
+    fn directory_entry_v5(&self, field: &FieldSlice, i: u32) -> (&[u8], u64, u64, u64, u32) {
+        let e = field.directory_off as usize + 4 + 34 * i as usize;
         let doc_run_off =
-            u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap()) + self.run_base;
+            u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap()) + field.run_base;
         let skip_run_off =
-            u64::from_le_bytes(self.map[e + 8..e + 16].try_into().unwrap()) + self.run_base;
+            u64::from_le_bytes(self.map[e + 8..e + 16].try_into().unwrap()) + field.run_base;
         let occ_run_off =
-            u64::from_le_bytes(self.map[e + 16..e + 24].try_into().unwrap()) + self.run_base;
+            u64::from_le_bytes(self.map[e + 16..e + 24].try_into().unwrap()) + field.run_base;
         let df = u32::from_le_bytes(self.map[e + 24..e + 28].try_into().unwrap());
         let stored = u32::from_le_bytes(self.map[e + 28..e + 32].try_into().unwrap()) as usize;
         let len = u16::from_le_bytes(self.map[e + 32..e + 34].try_into().unwrap()) as usize;
-        let blob_off = self.directory_off as usize + 4 + 34 * self.n_terms as usize + stored;
+        let blob_off = field.directory_off as usize + 4 + 34 * field.n_terms as usize + stored;
         (
             &self.map[blob_off..blob_off + len],
             doc_run_off,
@@ -2881,16 +3139,16 @@ impl Bm25Reader {
         )
     }
 
-    fn directory_lookup(&self, term: &str) -> Option<(u64, u32)> {
-        let (mut lo, mut hi) = (0u32, self.n_terms);
+    fn directory_lookup(&self, field: &FieldSlice, term: &str) -> Option<(u64, u32)> {
+        let (mut lo, mut hi) = (0u32, field.n_terms);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let (bytes, _, _) = self.directory_entry(mid);
+            let (bytes, _, _) = self.directory_entry(field, mid);
             match bytes.cmp(term.as_bytes()) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    let (_, off, df) = self.directory_entry(mid);
+                    let (_, off, df) = self.directory_entry(field, mid);
                     return Some((off, df));
                 }
             }
@@ -2898,18 +3156,18 @@ impl Bm25Reader {
         None
     }
 
-    /// `(doc_run_off, skip_run_off, occ_run_off, df)` for `term`, or
-    /// `None` when the term is absent. v5 files only.
-    fn directory_lookup_v5(&self, term: &str) -> Option<(u64, u64, u64, u32)> {
-        let (mut lo, mut hi) = (0u32, self.n_terms);
+    /// `(doc_run_off, skip_run_off, occ_run_off, df)` for `term` in
+    /// `field`, or `None` when the term is absent. v5-shaped files only.
+    fn directory_lookup_v5(&self, field: &FieldSlice, term: &str) -> Option<(u64, u64, u64, u32)> {
+        let (mut lo, mut hi) = (0u32, field.n_terms);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let (bytes, _, _, _, _) = self.directory_entry_v5(mid);
+            let (bytes, _, _, _, _) = self.directory_entry_v5(field, mid);
             match bytes.cmp(term.as_bytes()) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    let (_, doc, skip, occ, df) = self.directory_entry_v5(mid);
+                    let (_, doc, skip, occ, df) = self.directory_entry_v5(field, mid);
                     return Some((doc, skip, occ, df));
                 }
             }
@@ -3321,129 +3579,11 @@ impl<'a> ImpactCursor<'a> {
     }
 }
 
-impl Bm25Index for Bm25Reader {
-    fn doc_count(&self) -> u64 {
-        self.doc_count
-    }
-    fn total_doc_length(&self) -> u64 {
-        self.total_length
-    }
-    fn doc_length(&self, doc_id: u32) -> u32 {
-        self.doc_lengths.get(doc_id as usize).copied().unwrap_or(0)
-    }
-    fn df(&self, term: &str) -> u32 {
-        if self.v5_runs {
-            self.directory_lookup_v5(term).map_or(0, |(_, _, _, df)| df)
-        } else {
-            self.directory_lookup(term).map_or(0, |(_, df)| df)
-        }
-    }
-    fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
-        if self.v5_runs {
-            let Some((doc_run_off, _, occ_run_off, df)) = self.directory_lookup_v5(term) else {
-                return;
-            };
-            let (doc_run_off, occ_run_off) = (doc_run_off as usize, occ_run_off as usize);
-            for i in 0..df as usize {
-                let (doc_id, tf, occ_start) = self.v5_doc_entry(doc_run_off, i);
-                let occ_end = self.v5_occ_start(doc_run_off, df as usize, i + 1);
-                let offsets = self.v5_occ_slice(occ_run_off, occ_start, occ_end);
-                f(doc_id, tf, &offsets);
-            }
-        } else {
-            let Some((off, df)) = self.directory_lookup(term) else {
-                return;
-            };
-            self.v3_for_each_posting(off, df, f);
-        }
-    }
-    fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
-        if self.v5_runs {
-            let Some((doc_run_off, _, _, df)) = self.directory_lookup_v5(term) else {
-                return;
-            };
-            self.v5_for_each_doc_tf(doc_run_off as usize, df, f);
-        } else {
-            self.for_each_posting(term, &mut |doc_id, tf, _offsets| {
-                f(doc_id, tf);
-            });
-        }
-    }
-    fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
-        if self.v5_runs {
-            let Some((doc_run_off, _, occ_run_off, df)) = self.directory_lookup_v5(term) else {
-                return Vec::new();
-            };
-            // Binary search the fixed-stride doc run (doc ids ascending).
-            let doc_run_off = doc_run_off as usize;
-            let (mut lo, mut hi) = (0usize, df as usize);
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if self.u32_at(doc_run_off + 12 * mid) < doc_id {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            let i = lo;
-            if i >= df as usize || self.u32_at(doc_run_off + 12 * i) != doc_id {
-                return Vec::new();
-            }
-            let occ_start = self.u32_at(doc_run_off + 12 * i + 8);
-            let occ_end = self.v5_occ_start(doc_run_off, df as usize, i + 1);
-            self.v5_occ_slice(occ_run_off as usize, occ_start, occ_end)
-        } else {
-            // v3/v4: sequential walk with early exit — postings are
-            // doc-id-ordered by construction, so stop at the first doc
-            // past the target; offset bytes before it are stepped over
-            // undecoded. (The trait default walks the whole list, which
-            // costs O(df) per survivor at k=1000.)
-            let Some((off, df)) = self.directory_lookup(term) else {
-                return Vec::new();
-            };
-            let mut cur = off as usize;
-            let term_len =
-                u32::from_le_bytes(self.map[cur..cur + 4].try_into().unwrap()) as usize;
-            cur += 4 + term_len + 4; // term header + posting count
-            for _ in 0..df {
-                let doc = self.u32_at(cur);
-                let n_offsets = self.u32_at(cur + 8) as usize;
-                if doc == doc_id {
-                    let mut offsets = Vec::with_capacity(n_offsets);
-                    let mut o = cur + 12;
-                    for _ in 0..n_offsets {
-                        offsets.push((self.u32_at(o), self.u32_at(o + 4)));
-                        o += 8;
-                    }
-                    return offsets;
-                }
-                if doc > doc_id {
-                    return Vec::new();
-                }
-                cur += 12 + 8 * n_offsets;
-            }
-            Vec::new()
-        }
-    }
-    fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
-        if !self.v5_runs {
-            return None;
-        }
-        let (doc_run_off, skip_run_off, occ_run_off, df) = self.directory_lookup_v5(term)?;
-        Some(ImpactCursor::new(
-            &self.map,
-            doc_run_off as usize,
-            occ_run_off as usize,
-            skip_run_off as usize,
-            df,
-        ))
-    }
-    fn has_impacts(&self, term: &str) -> bool {
-        self.v5_runs && self.directory_lookup_v5(term).is_some()
-    }
-    fn text(&self, doc_id: u32) -> Option<String> {
+impl Bm25Reader {
+    /// The shared stored text of a document, if present.
+    fn read_text(&self, doc_id: u32) -> Option<String> {
         let slot = doc_id as usize;
-        if slot >= self.doc_lengths.len() {
+        if slot >= self.n_slots() {
             return None;
         }
         // The on-disk text index: 12-byte entries; offsets absolute in
@@ -3457,9 +3597,11 @@ impl Bm25Index for Bm25Reader {
         let bytes = &self.map[offset as usize..offset as usize + len as usize];
         String::from_utf8(bytes.to_vec()).ok()
     }
-    fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
+
+    /// The shared lineage of a document, if ingested with one.
+    fn read_lineage(&self, doc_id: u32) -> Option<DocLineage> {
         let slot = doc_id as usize;
-        if slot >= self.doc_lengths.len() {
+        if slot >= self.n_slots() {
             return None;
         }
         // The lineage section is variable stride (1 B absent marker,
@@ -3468,9 +3610,9 @@ impl Bm25Index for Bm25Reader {
         // per-slot offset index makes random access exact.
         let index = self.lineage_index.get_or_init(|| {
             let base = self.lineages_off as usize;
-            let mut offsets = Vec::with_capacity(self.doc_lengths.len());
+            let mut offsets = Vec::with_capacity(self.n_slots());
             let mut cur = base;
-            for _ in 0..self.doc_lengths.len() {
+            for _ in 0..self.n_slots() {
                 offsets.push((cur - base) as u32);
                 cur += if self.map[cur] == 0 { 1 } else { 25 };
             }
@@ -3490,6 +3632,207 @@ impl Bm25Index for Bm25Reader {
             span_start,
             span_end,
         })
+    }
+}
+
+/// One field of an open `.bm25` file as its own [`Bm25Index`]
+/// (`docs/multi-field.md`): directory lookups, postings walks, and
+/// impact cursors run against the field's sections; texts, lineages,
+/// and the document count are the file's shared ones.
+#[derive(Clone, Copy)]
+pub struct FieldView<'a> {
+    reader: &'a Bm25Reader,
+    field: &'a FieldSlice,
+}
+
+impl<'a> FieldView<'a> {
+    /// [`Bm25Index::impacts`] with the cursor's borrow tied to the
+    /// underlying reader rather than this view value, so a temporary
+    /// view (`reader.field(0).impacts(..)`) can hand out a cursor.
+    fn impacts_inner(self, term: &str) -> Option<ImpactCursor<'a>> {
+        if !self.reader.v5_runs {
+            return None;
+        }
+        let (doc_run_off, skip_run_off, occ_run_off, df) =
+            self.reader.directory_lookup_v5(self.field, term)?;
+        Some(ImpactCursor::new(
+            &self.reader.map,
+            doc_run_off as usize,
+            occ_run_off as usize,
+            skip_run_off as usize,
+            df,
+        ))
+    }
+}
+
+impl Bm25Index for FieldView<'_> {
+    fn doc_count(&self) -> u64 {
+        self.reader.doc_count
+    }
+    fn total_doc_length(&self) -> u64 {
+        self.field.total_length
+    }
+    fn doc_length(&self, doc_id: u32) -> u32 {
+        self.field
+            .doc_lengths
+            .get(doc_id as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+    fn df(&self, term: &str) -> u32 {
+        if self.reader.v5_runs {
+            self.reader
+                .directory_lookup_v5(self.field, term)
+                .map_or(0, |(_, _, _, df)| df)
+        } else {
+            self.reader
+                .directory_lookup(self.field, term)
+                .map_or(0, |(_, df)| df)
+        }
+    }
+    fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
+        let r = self.reader;
+        if r.v5_runs {
+            let Some((doc_run_off, _, occ_run_off, df)) =
+                r.directory_lookup_v5(self.field, term)
+            else {
+                return;
+            };
+            let (doc_run_off, occ_run_off) = (doc_run_off as usize, occ_run_off as usize);
+            for i in 0..df as usize {
+                let (doc_id, tf, occ_start) = r.v5_doc_entry(doc_run_off, i);
+                let occ_end = r.v5_occ_start(doc_run_off, df as usize, i + 1);
+                let offsets = r.v5_occ_slice(occ_run_off, occ_start, occ_end);
+                f(doc_id, tf, &offsets);
+            }
+        } else {
+            let Some((off, df)) = r.directory_lookup(self.field, term) else {
+                return;
+            };
+            r.v3_for_each_posting(off, df, f);
+        }
+    }
+    fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
+        let r = self.reader;
+        if r.v5_runs {
+            let Some((doc_run_off, _, _, df)) = r.directory_lookup_v5(self.field, term) else {
+                return;
+            };
+            r.v5_for_each_doc_tf(doc_run_off as usize, df, f);
+        } else {
+            self.for_each_posting(term, &mut |doc_id, tf, _offsets| {
+                f(doc_id, tf);
+            });
+        }
+    }
+    fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
+        let r = self.reader;
+        if r.v5_runs {
+            let Some((doc_run_off, _, occ_run_off, df)) =
+                r.directory_lookup_v5(self.field, term)
+            else {
+                return Vec::new();
+            };
+            // Binary search the fixed-stride doc run (doc ids ascending).
+            let doc_run_off = doc_run_off as usize;
+            let (mut lo, mut hi) = (0usize, df as usize);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if r.u32_at(doc_run_off + 12 * mid) < doc_id {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let i = lo;
+            if i >= df as usize || r.u32_at(doc_run_off + 12 * i) != doc_id {
+                return Vec::new();
+            }
+            let occ_start = r.u32_at(doc_run_off + 12 * i + 8);
+            let occ_end = r.v5_occ_start(doc_run_off, df as usize, i + 1);
+            r.v5_occ_slice(occ_run_off as usize, occ_start, occ_end)
+        } else {
+            // v3/v4: sequential walk with early exit — postings are
+            // doc-id-ordered by construction, so stop at the first doc
+            // past the target; offset bytes before it are stepped over
+            // undecoded. (The trait default walks the whole list, which
+            // costs O(df) per survivor at k=1000.)
+            let Some((off, df)) = r.directory_lookup(self.field, term) else {
+                return Vec::new();
+            };
+            let mut cur = off as usize;
+            let term_len = u32::from_le_bytes(r.map[cur..cur + 4].try_into().unwrap()) as usize;
+            cur += 4 + term_len + 4; // term header + posting count
+            for _ in 0..df {
+                let doc = r.u32_at(cur);
+                let n_offsets = r.u32_at(cur + 8) as usize;
+                if doc == doc_id {
+                    let mut offsets = Vec::with_capacity(n_offsets);
+                    let mut o = cur + 12;
+                    for _ in 0..n_offsets {
+                        offsets.push((r.u32_at(o), r.u32_at(o + 4)));
+                        o += 8;
+                    }
+                    return offsets;
+                }
+                if doc > doc_id {
+                    return Vec::new();
+                }
+                cur += 12 + 8 * n_offsets;
+            }
+            Vec::new()
+        }
+    }
+    fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
+        (*self).impacts_inner(term)
+    }
+    fn has_impacts(&self, term: &str) -> bool {
+        self.reader.v5_runs && self.reader.directory_lookup_v5(self.field, term).is_some()
+    }
+    fn text(&self, doc_id: u32) -> Option<String> {
+        self.reader.read_text(doc_id)
+    }
+    fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
+        self.reader.read_lineage(doc_id)
+    }
+}
+
+/// The reader itself scores as its body field (field 0) — the surface
+/// every single-field caller uses; multi-field scoring goes through
+/// [`Bm25Reader::field`].
+impl Bm25Index for Bm25Reader {
+    fn doc_count(&self) -> u64 {
+        self.doc_count
+    }
+    fn total_doc_length(&self) -> u64 {
+        self.field(0).total_doc_length()
+    }
+    fn doc_length(&self, doc_id: u32) -> u32 {
+        self.field(0).doc_length(doc_id)
+    }
+    fn df(&self, term: &str) -> u32 {
+        self.field(0).df(term)
+    }
+    fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
+        self.field(0).for_each_posting(term, f);
+    }
+    fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
+        self.field(0).for_each_doc_tf(term, f);
+    }
+    fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
+        self.field(0).posting_offsets(term, doc_id)
+    }
+    fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
+        self.field(0).impacts_inner(term)
+    }
+    fn has_impacts(&self, term: &str) -> bool {
+        self.field(0).has_impacts(term)
+    }
+    fn text(&self, doc_id: u32) -> Option<String> {
+        self.read_text(doc_id)
+    }
+    fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
+        self.read_lineage(doc_id)
     }
 }
 
@@ -3581,6 +3924,51 @@ mod tests {
             .collect();
         assert_eq!(seen, expected);
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The dual-writer contract on a MULTI-FIELD corpus: the spill
+    /// builder's v6 file is byte-identical to the store writer's, with
+    /// a tiny buffer forcing per-field multi-run merges.
+    #[test]
+    fn spill_builder_v6_multi_field_byte_identical() {
+        let base = std::env::temp_dir().join(format!("spill-eq-v6mf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut store = Bm25Store::with_fields(&["body", "case_name"]);
+        let mut builder =
+            SpillBuilder::create_with_fields(&base.join("build"), &["body", "case_name"])
+                .unwrap()
+                .with_buffer_bytes(128);
+        for (id, text, doc, lineage) in two_field_corpus() {
+            store.add_document_with_lineage(id, text.clone(), doc.clone(), lineage);
+            builder
+                .add_document_with_lineage(id, text, doc, lineage)
+                .unwrap();
+        }
+        assert_eq!(store.doc_count(), builder.doc_count());
+        assert_eq!(store.total_doc_length(), builder.total_doc_length());
+        assert_eq!(store.next_doc_id(), builder.next_doc_id());
+
+        let store_path = base.join("store.bm25");
+        let spill_path = base.join("spill.bm25");
+        store.save(&store_path).unwrap();
+        builder.finish(&spill_path).unwrap();
+        let a = std::fs::read(&store_path).unwrap();
+        let b = std::fs::read(&spill_path).unwrap();
+        assert_eq!(a.len(), b.len(), "file sizes differ");
+        assert!(
+            a == b,
+            "multi-field spill output is not byte-identical to the store"
+        );
+        assert!(!base.join("build").exists());
+
+        // And the reader serves both fields.
+        let reader = Bm25Reader::open(&spill_path).unwrap();
+        assert_eq!(reader.field_count(), 2);
+        assert_eq!(reader.field(1).df("smith"), store.field(1).df("smith"));
+        assert_eq!(reader.field(0).df("t1"), store.field(0).df("t1"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3879,7 +4267,7 @@ mod tests {
         for (id, text, doc, lineage) in &corpus {
             store.add_document_with_lineage(*id, text.clone(), doc.clone(), *lineage);
         }
-        store.save(&path).unwrap();
+        store.save_v5(&path).unwrap();
         let reader = Bm25Reader::open(&path).unwrap();
 
         assert_eq!(Bm25Index::doc_count(&reader), store.doc_count());
@@ -3959,7 +4347,7 @@ mod tests {
             let store = build_store(&corpus);
             let v5_path = dir.join(format!("r{round}.v5.bm25"));
             let v4_path = dir.join(format!("r{round}.v4.bm25"));
-            store.save(&v5_path).unwrap();
+            store.save_v5(&v5_path).unwrap();
             {
                 let mut w = io::BufWriter::new(std::fs::File::create(&v4_path).unwrap());
                 store.write_v4_for_bench(&mut w).unwrap();
@@ -4051,7 +4439,9 @@ mod tests {
             let avgdl = store.total_doc_length() as f64 / store.doc_count() as f64;
             let mut saw_collapsed = false;
             for term in terms {
-                let Some((_, skip_off, _, df)) = reader.directory_lookup_v5(term) else {
+                let Some((_, skip_off, _, df)) =
+                    reader.directory_lookup_v5(&reader.fields[0], term)
+                else {
                     continue;
                 };
                 let records = reader.v5_l0_records(skip_off, df);
@@ -4150,7 +4540,9 @@ mod tests {
         }
         store.save(&path).unwrap();
         let reader = Bm25Reader::open(&path).unwrap();
-        let (_, skip_off, occ_off, _) = reader.directory_lookup_v5("court").unwrap();
+        let (_, skip_off, occ_off, _) = reader
+            .directory_lookup_v5(&reader.fields[0], "court")
+            .unwrap();
 
         let corrupted = dir.join("corrupted.bm25");
         let mut bytes = std::fs::read(&path).unwrap();
@@ -4312,7 +4704,7 @@ mod tests {
         let dir = test_dir("v6rt");
         let path = dir.join("shard.bm25");
         let store = synthetic_store();
-        store.save_v6(&path).unwrap();
+        store.save(&path).unwrap();
         let reader = Bm25Reader::open(&path).unwrap();
 
         assert_eq!(Bm25Index::doc_count(&reader), store.doc_count());
@@ -4365,6 +4757,194 @@ mod tests {
         assert_eq!(loaded.fields[0].total_length, store.fields[0].total_length);
         assert_eq!(loaded.texts, store.texts);
         assert_eq!(loaded.lineages, store.lineages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deterministic two-field corpus ("body", "case_name"): gappy
+    /// ids, terms shared across fields with different postings, docs
+    /// without a case name, a doc with an empty body but an indexed
+    /// case name, and one slot with stored text but no postings at all.
+    fn two_field_corpus() -> Vec<(u32, String, AnalyzedDoc, Option<DocLineage>)> {
+        let mut docs = Vec::new();
+        for i in 0..40u32 {
+            let id = i * 3 + (i % 2);
+            let mut body: DocTerms = vec![
+                ("court".to_string(), 1 + i % 4, vec![(i, i + 5)]),
+                (format!("t{}", i % 6), 1, vec![(i + 7, i + 9)]),
+            ];
+            if i % 8 == 0 {
+                body.push(("smith".to_string(), 2, vec![(0, 5), (9, 14)]));
+            }
+            if i % 10 == 7 {
+                body.clear();
+            }
+            let body_len: u32 = body.iter().map(|t| t.1).sum();
+            let mut fields = vec![AnalyzedField {
+                terms: body,
+                length: body_len,
+            }];
+            if i % 3 != 2 {
+                // "smith" and "court" appear in BOTH fields, with
+                // different postings; "n*" terms only here.
+                fields.push(AnalyzedField {
+                    terms: vec![
+                        ("smith".to_string(), 1, vec![(0, 5)]),
+                        ("court".to_string(), 1, Vec::new()),
+                        (format!("n{}", i % 4), 1, Vec::new()),
+                    ],
+                    length: 3,
+                });
+            }
+            let lineage = (i % 4 == 0).then_some(DocLineage {
+                opinion_id: u64::from(i) * 11,
+                cluster_id: u64::from(i) * 13,
+                span_start: i,
+                span_end: i + 40,
+            });
+            docs.push((id, format!("case {i} body"), AnalyzedDoc { fields }, lineage));
+        }
+        docs
+    }
+
+    fn two_field_store() -> Bm25Store {
+        let mut store = Bm25Store::with_fields(&["body", "case_name"]);
+        for (id, text, doc, lineage) in two_field_corpus() {
+            store.add_document_with_lineage(id, text, doc, lineage);
+        }
+        store
+    }
+
+    /// Increment 2 (`docs/multi-field.md` build order step 2): a
+    /// two-field store round-trips through the v6 file and the reader
+    /// serves BOTH fields via [`Bm25Reader::field`], each view
+    /// answering exactly like the heap store's view of the same field,
+    /// with shared texts, lineages, and document count.
+    #[test]
+    fn multi_field_v6_round_trip() {
+        let dir = test_dir("v6multi");
+        let path = dir.join("shard.bm25");
+        let store = two_field_store();
+        store.save(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+
+        assert_eq!(reader.field_count(), 2);
+        assert_eq!(reader.field_name(0), "body");
+        assert_eq!(reader.field_name(1), "case_name");
+        assert_eq!(Bm25Index::doc_count(&reader), store.doc_count());
+
+        let terms = ["court", "smith", "t1", "n1", "missing"];
+        for f in 0..2 {
+            let rv = reader.field(f);
+            let sv = store.field(f);
+            assert_eq!(rv.doc_count(), sv.doc_count(), "field {f} doc_count");
+            assert_eq!(
+                rv.total_doc_length(),
+                sv.total_doc_length(),
+                "field {f} total_doc_length"
+            );
+            for term in terms {
+                assert_eq!(rv.df(term), sv.df(term), "field {f} df({term})");
+                let mut got = Vec::new();
+                rv.for_each_posting(term, &mut |d, tf, o| got.push((d, tf, o.to_vec())));
+                let mut want = Vec::new();
+                sv.for_each_posting(term, &mut |d, tf, o| want.push((d, tf, o.to_vec())));
+                assert_eq!(got, want, "field {f} postings({term})");
+                assert_eq!(
+                    rv.has_impacts(term),
+                    sv.df(term) > 0,
+                    "field {f} has_impacts({term})"
+                );
+                for (d, _, offs) in &want {
+                    assert_eq!(
+                        &rv.posting_offsets(term, *d),
+                        offs,
+                        "field {f} posting_offsets({term}, {d})"
+                    );
+                }
+            }
+            for slot in 0..store.next_doc_id() {
+                assert_eq!(rv.doc_length(slot), sv.doc_length(slot), "field {f} dl({slot})");
+            }
+        }
+        // The two fields are genuinely different indexes over the
+        // shared slot space.
+        assert_ne!(reader.field(0).df("smith"), reader.field(1).df("smith"));
+        assert_eq!(reader.field(0).df("n1"), 0);
+        assert_ne!(reader.field(1).df("n1"), 0);
+        // Shared text/lineage through any view.
+        for slot in (0..store.next_doc_id()).step_by(7) {
+            assert_eq!(
+                reader.field(1).text(slot),
+                store.text(slot).map(str::to_string),
+                "text({slot})"
+            );
+            assert_eq!(reader.field(1).lineage(slot), store.lineage(slot), "lineage({slot})");
+        }
+        // Heap reload (the shard append path) reproduces both fields.
+        let loaded = Bm25Store::load(&path).unwrap();
+        assert_eq!(loaded.field_count(), 2);
+        for f in 0..2 {
+            assert_eq!(loaded.fields[f].name, store.fields[f].name);
+            assert_eq!(loaded.fields[f].postings, store.fields[f].postings);
+            assert_eq!(loaded.fields[f].doc_lengths, store.fields[f].doc_lengths);
+            assert_eq!(loaded.fields[f].total_length, store.fields[f].total_length);
+        }
+        assert_eq!(loaded.texts, store.texts);
+        assert_eq!(loaded.lineages, store.lineages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fused multi-field scoring through the v6 READER's field views
+    /// is bit-identical to scoring the heap store's views — the mmap
+    /// read path changes nothing about the scores.
+    #[test]
+    fn fused_scoring_v6_reader_matches_store() {
+        use crate::bm25::{top_k_fused_exhaustive, Bm25Params, CorpusStats, FieldQuery};
+        let dir = test_dir("v6fused");
+        let path = dir.join("shard.bm25");
+        let store = two_field_store();
+        store.save(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+
+        let body_terms = vec!["court".to_string(), "smith".to_string(), "t3".to_string()];
+        let name_terms = vec!["smith".to_string(), "n2".to_string()];
+        let stats_for = |f: usize, terms: &[String]| CorpusStats {
+            doc_count: store.doc_count(),
+            total_doc_length: store.field(f).total_doc_length(),
+            dfs: terms.iter().map(|t| store.field(f).df(t)).collect(),
+        };
+        let body_stats = stats_for(0, &body_terms);
+        let name_stats = stats_for(1, &name_terms);
+        let queries = |v0: &dyn Bm25Index, v1: &dyn Bm25Index| {
+            top_k_fused_exhaustive(
+                &[
+                    FieldQuery {
+                        index: v0,
+                        terms: &body_terms,
+                        stats: body_stats.clone(),
+                        params: Bm25Params::default(),
+                        weight: 1.0,
+                    },
+                    FieldQuery {
+                        index: v1,
+                        terms: &name_terms,
+                        stats: name_stats.clone(),
+                        params: Bm25Params { k1: 0.6, b: 0.2 },
+                        weight: 2.5,
+                    },
+                ],
+                15,
+            )
+        };
+        let want = queries(&store.field(0), &store.field(1));
+        let got = queries(&reader.field(0), &reader.field(1));
+        assert!(!want.is_empty());
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(&got) {
+            assert_eq!(w.doc_id, g.doc_id);
+            assert_eq!(w.score.to_bits(), g.score.to_bits(), "doc {}", w.doc_id);
+            assert_eq!(w.term_offsets, g.term_offsets, "doc {}", w.doc_id);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4423,7 +5003,7 @@ mod tests {
         let dir = test_dir("v6bad");
         let path = dir.join("shard.bm25");
         let store = synthetic_store();
-        store.save_v6(&path).unwrap();
+        store.save(&path).unwrap();
         let good = std::fs::read(&path).unwrap();
         assert!(Bm25Reader::open(&path).is_ok());
 
@@ -4540,7 +5120,7 @@ mod malformed_tests {
     }
 
     /// Truncation at EVERY byte length must error, never panic — on a
-    /// small file so the sweep stays fast. v5 and v4.
+    /// small file so the sweep stays fast. v6, v5, and v4.
     #[test]
     fn truncated_open_errors_never_panics() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4549,11 +5129,13 @@ mod malformed_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = small_corpus_store();
+        let v6_path = dir.join("small.v6.bm25");
         let v5_path = dir.join("small.v5.bm25");
         let v4_path = dir.join("small.v4.bm25");
-        store.save(&v5_path).unwrap();
+        store.save(&v6_path).unwrap();
+        store.save_v5(&v5_path).unwrap();
         write_v4(&store, &v4_path);
-        for (tag, src) in [("v5", &v5_path), ("v4", &v4_path)] {
+        for (tag, src) in [("v6", &v6_path), ("v5", &v5_path), ("v4", &v4_path)] {
             let bytes = std::fs::read(src).unwrap();
             Bm25Reader::open(src).unwrap();
             let trunc = dir.join(format!("trunc.{tag}"));
@@ -4576,12 +5158,14 @@ mod malformed_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = malformed_corpus_store();
+        let v6_path = dir.join("corpus.v6.bm25");
         let v5_path = dir.join("corpus.v5.bm25");
         let v4_path = dir.join("corpus.v4.bm25");
-        store.save(&v5_path).unwrap();
+        store.save(&v6_path).unwrap();
+        store.save_v5(&v5_path).unwrap();
         write_v4(&store, &v4_path);
 
-        for (tag, src) in [("v5", &v5_path), ("v4", &v4_path)] {
+        for (tag, src) in [("v6", &v6_path), ("v5", &v5_path), ("v4", &v4_path)] {
             let bytes = std::fs::read(src).unwrap();
             // Sanity: the intact file opens.
             Bm25Reader::open(src).unwrap();
@@ -4595,31 +5179,39 @@ mod malformed_tests {
                     .wrapping_add(1442695040888963407);
                 (s >> 33) as usize
             };
-            // Skip-run regions (v5 only): from the directory. Header:
-            // magic(8) total_length(8) texts(8) lineages(8) postings(8)
-            // directory(8) n_slots(4).
-            let directory_off = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
-            let n_terms = u32::from_le_bytes(
-                bytes[directory_off..directory_off + 4].try_into().unwrap(),
-            ) as usize;
-            let mut regions: Vec<(usize, usize)> = vec![
-                (0, 52),
-                (directory_off, bytes.len()),
-            ];
-            if tag == "v5" {
-                for i in 0..n_terms {
-                    let e = directory_off + 4 + 34 * i;
-                    let skip_off = u64::from_le_bytes(
-                        bytes[e + 8..e + 16].try_into().unwrap(),
-                    ) as usize;
-                    let end = if i + 1 < n_terms {
-                        u64::from_le_bytes(bytes[e + 34..e + 42].try_into().unwrap()) as usize
-                    } else {
-                        directory_off
-                    };
-                    regions.push((skip_off, end));
+            // v6: flips anywhere — the explicit section table makes
+            // the whole file validated structure. v5/v4: header,
+            // directory, and (v5) skip-run regions from the fixed
+            // header: magic(8) total_length(8) texts(8) lineages(8)
+            // postings(8) directory(8) n_slots(4).
+            let regions: Vec<(usize, usize)> = if tag == "v6" {
+                vec![(0, bytes.len())]
+            } else {
+                let directory_off =
+                    u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+                let n_terms = u32::from_le_bytes(
+                    bytes[directory_off..directory_off + 4].try_into().unwrap(),
+                ) as usize;
+                let mut regions: Vec<(usize, usize)> = vec![
+                    (0, 52),
+                    (directory_off, bytes.len()),
+                ];
+                if tag == "v5" {
+                    for i in 0..n_terms {
+                        let e = directory_off + 4 + 34 * i;
+                        let skip_off = u64::from_le_bytes(
+                            bytes[e + 8..e + 16].try_into().unwrap(),
+                        ) as usize;
+                        let end = if i + 1 < n_terms {
+                            u64::from_le_bytes(bytes[e + 34..e + 42].try_into().unwrap()) as usize
+                        } else {
+                            directory_off
+                        };
+                        regions.push((skip_off, end));
+                    }
                 }
-            }
+                regions
+            };
             // v3/v4 flips stay in the header and directory: postings
             // record payloads are data (like occurrence bytes and
             // frontier pairs), not validated structure.

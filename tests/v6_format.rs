@@ -83,8 +83,8 @@ fn v6_reader_answers_identically_to_v5() {
 
     let v5_path = dir.join("shard.v5.bm25");
     let v6_path = dir.join("shard.v6.bm25");
-    store.save(&v5_path).unwrap();
-    store.save_v6(&v6_path).unwrap();
+    store.save_v5(&v5_path).unwrap();
+    store.save(&v6_path).unwrap();
     let v5 = Bm25Reader::open(&v5_path).unwrap();
     let v6 = Bm25Reader::open(&v6_path).unwrap();
 
