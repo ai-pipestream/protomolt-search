@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             text: text.to_string(),
             analysis: Some(spec.clone()),
             lineage: None,
+            fields: Vec::new(),
         })
         .await?;
     }
@@ -83,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fields: Vec::new(),
         })
         .await?
         .into_inner();
@@ -107,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 k: 10,
                 analysis: Some(spec.clone()),
                 min_score: 0.0,
+                fields: Vec::new(),
             })
             .await?
             .into_inner();

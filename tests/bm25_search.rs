@@ -39,6 +39,7 @@ async fn add_documents(
             text: text.to_string(),
             analysis: spec.clone(),
             lineage: None,
+            fields: Vec::new(),
         })
         .await
         .unwrap();
@@ -94,6 +95,7 @@ async fn ingest_through_mock_builds_postings() {
     let stats = client
         .term_stats(TermStatsRequest {
             terms: vec!["rust".into(), "vector".into(), "nope".into()],
+            fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -123,6 +125,7 @@ async fn ingest_through_mock_builds_postings() {
             k1: 0.0,
             b: 0.0,
             min_score: 0.0,
+            fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -270,6 +273,7 @@ async fn bm25_query_min_score_seeds_floor() {
                 k1: 0.0,
                 b: 0.0,
                 min_score,
+                fields: Vec::new(),
             })
             .await
             .unwrap()
@@ -350,6 +354,7 @@ async fn bm25_query_min_score_seeds_floor() {
             k1: 0.0,
             b: 0.0,
             min_score: 0.0,
+            fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -370,6 +375,7 @@ async fn bm25_query_min_score_seeds_floor() {
             k1: 0.0,
             b: 0.0,
             min_score: 0.0,
+            fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -390,6 +396,7 @@ async fn bm25_query_min_score_seeds_floor() {
                 k1: 0.0,
                 b: 0.0,
                 min_score: bad,
+                fields: Vec::new(),
             })
             .await
             .expect_err("non-finite min_score must be rejected");
@@ -407,6 +414,7 @@ async fn bm25_query_min_score_seeds_floor() {
             k1: 0.0,
             b: 0.0,
             min_score: 0.0,
+            fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -548,6 +556,7 @@ async fn shard_local_stats_would_differ() {
         let stats = client
             .term_stats(TermStatsRequest {
                 terms: terms.clone(),
+                fields: Vec::new(),
             })
             .await
             .unwrap()
@@ -562,6 +571,7 @@ async fn shard_local_stats_would_differ() {
                 k1: 0.0,
                 b: 0.0,
                 min_score: 0.0,
+                fields: Vec::new(),
             })
             .await
             .unwrap()

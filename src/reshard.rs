@@ -37,14 +37,16 @@ use crate::pb::{AddDocumentsRequest, AnalysisSpec};
 use crate::postings::{AnalyzedDoc, SpillBuilder};
 use crate::wal::{self, RecordReader, WalManifest};
 
-/// Text analyzer for rebuilding BM25 stores: a batch of (raw document
-/// text, the analysis spec it was ingested with) -> analyzed terms, one
-/// result per input in order. The example wires this to the analysis
-/// sidecar (the same one ingest used) with the batch's requests in
-/// flight concurrently — replay throughput is bounded by sidecar
-/// round-trips, exactly like ingest. Tests wire it to the mock sidecar.
-/// Split/merge only re-partitions — term identity must be reproduced
-/// EXACTLY as at ingest, hence the spec round-trip.
+/// Text analyzer for rebuilding BM25 stores: a batch of (raw text, the
+/// analysis spec it was ingested with) -> analyzed terms, one result
+/// per input in order. The example wires this to the analysis sidecar
+/// (the same one ingest used) with the batch's requests in flight
+/// concurrently — replay throughput is bounded by sidecar round-trips,
+/// exactly like ingest. Tests wire it to the mock sidecar. Split/merge
+/// only re-partitions — term identity must be reproduced EXACTLY as at
+/// ingest, hence the spec round-trip. Multi-field documents
+/// (docs/multi-field.md) flatten into the batch as one entry per field
+/// (body first, extras in record order); the caller reassembles.
 pub type Analyzer<'a> =
     dyn FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> + 'a;
 
@@ -285,6 +287,7 @@ fn build_child(
     vectors: Vec<(u64, Vec<f32>)>,
     documents: Vec<(u64, AddDocumentsRequest)>,
     tv_path: &Path,
+    bm25_fields: Option<&[String]>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let dim = manifest.dim as usize;
@@ -331,40 +334,87 @@ fn build_child(
 
     let mut bm25_path = None;
     if !mapped.is_empty() {
+        // The child field table (docs/multi-field.md): the caller's
+        // fleet table when given, else "body" plus every extra field
+        // name in this child's records in first-sight order (the replay
+        // is id-ordered, so the derivation is deterministic). Old logs
+        // carry no extra fields and derive the single-field table.
+        let table: Vec<String> = match bm25_fields {
+            Some(t) => t.to_vec(),
+            None => {
+                let mut t = vec!["body".to_string()];
+                for (_, doc) in &mapped {
+                    for f in &doc.fields {
+                        if !t.iter().any(|n| n == &f.field) {
+                            t.push(f.field.clone());
+                        }
+                    }
+                }
+                t
+            }
+        };
+        if table.first().map(String::as_str) != Some("body") {
+            return Err("bm25 field table must start with \"body\"".to_string());
+        }
         // Children rebuild through the disk spiller for the same reason
         // nodes do: a full-scale child's postings do not fit in heap.
         let path = crate::node::bm25_sidecar_path(tv_path);
         let mut spill_dir = path.as_os_str().to_owned();
         spill_dir.push(".build");
         let spill_dir = std::path::PathBuf::from(spill_dir);
-        let mut builder = SpillBuilder::create(&spill_dir)
+        let names: Vec<&str> = table.iter().map(String::as_str).collect();
+        let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
             .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?;
         let mut i = 0;
         while i < mapped.len() {
-            let end = (i + ANALYZE_BATCH).min(mapped.len());
+            // Batch by document, one analyzer entry per field (body
+            // first, extras in record order), batches aligned to
+            // document boundaries so reassembly is positional.
+            let mut end = i;
+            let mut entries = 0usize;
+            while end < mapped.len() && (entries == 0 || entries < ANALYZE_BATCH) {
+                entries += 1 + mapped[end].1.fields.len();
+                end += 1;
+            }
             let analyzed = {
-                let batch: Vec<(&str, Option<&AnalysisSpec>)> = mapped[i..end]
-                    .iter()
-                    .map(|(_, d)| (d.text.as_str(), d.analysis.as_ref()))
-                    .collect();
+                let mut batch: Vec<(&str, Option<&AnalysisSpec>)> = Vec::with_capacity(entries);
+                for (_, d) in &mapped[i..end] {
+                    batch.push((d.text.as_str(), d.analysis.as_ref()));
+                    for f in &d.fields {
+                        batch.push((f.text.as_str(), f.analysis.as_ref()));
+                    }
+                }
                 analyze(&batch)
                     .map_err(|e| format!("analyze batch at child slot {}: {e}", mapped[i].0))?
             };
-            if analyzed.len() != end - i {
+            if analyzed.len() != entries {
                 return Err(format!(
-                    "analyzer returned {} results for {} documents",
-                    analyzed.len(),
-                    end - i
+                    "analyzer returned {} results for {entries} field texts",
+                    analyzed.len()
                 ));
             }
-            for (k, analyzed) in analyzed.into_iter().enumerate() {
-                let (local, doc) = &mut mapped[i + k];
+            let mut results = analyzed.into_iter();
+            for (local, doc) in &mut mapped[i..end] {
+                let body = results.next().expect("counted above").into_body();
+                let mut fields = vec![crate::postings::AnalyzedField::default(); table.len()];
+                fields[0] = body;
+                for f in &doc.fields {
+                    let analyzed_field = results.next().expect("counted above").into_body();
+                    let Some(fi) = table.iter().position(|n| n == &f.field) else {
+                        return Err(format!(
+                            "record at child slot {local} names field {:?} outside the \
+                             table {table:?}",
+                            f.field
+                        ));
+                    };
+                    fields[fi] = analyzed_field;
+                }
                 let text = std::mem::take(&mut doc.text);
                 builder
                     .add_document_with_lineage(
                         *local,
                         text,
-                        analyzed,
+                        crate::postings::AnalyzedDoc { fields },
                         doc.lineage.map(|l| crate::postings::DocLineage {
                             opinion_id: l.opinion_id,
                             cluster_id: l.cluster_id,
@@ -404,6 +454,7 @@ fn finish_child(
     slot_offset: u64,
     hash_lo: u64,
     hash_hi: u64,
+    bm25_fields: Option<&[String]>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let tv_path = out_dir.join(format!("shard-{ordinal}.tv"));
@@ -418,6 +469,7 @@ fn finish_child(
         replay.vectors.into_iter().collect(),
         replay.documents.into_iter().collect(),
         &tv_path,
+        bm25_fields,
         analyze,
     )?;
     child.slot_offset = slot_offset;
@@ -446,6 +498,7 @@ pub fn split(
     slot_base: u64,
     slot_stride: u64,
     vectors_only: bool,
+    bm25_fields: Option<&[String]>,
     analyze: &mut Analyzer,
 ) -> Result<ReshardOutput, String> {
     split_logs(
@@ -455,6 +508,7 @@ pub fn split(
         slot_base,
         slot_stride,
         vectors_only,
+        bm25_fields,
         analyze,
     )
 }
@@ -477,6 +531,7 @@ pub fn split_logs(
     slot_base: u64,
     slot_stride: u64,
     vectors_only: bool,
+    bm25_fields: Option<&[String]>,
     analyze: &mut Analyzer,
 ) -> Result<ReshardOutput, String> {
     if !n.is_power_of_two() || n < 2 {
@@ -547,6 +602,7 @@ pub fn split_logs(
                 slot_base + i as u64 * slot_stride,
                 hash_lo,
                 hash_hi,
+                bm25_fields,
                 analyze,
             )?);
         }
@@ -593,6 +649,7 @@ pub fn split_logs(
                 slot_base + i as u64 * slot_stride,
                 hash_lo,
                 hash_hi,
+                bm25_fields,
                 analyze,
             )?);
         }
@@ -616,6 +673,7 @@ pub fn merge(
     out_dir: &Path,
     slot_base: Option<u64>,
     vectors_only: bool,
+    bm25_fields: Option<&[String]>,
     analyze: &mut Analyzer,
 ) -> Result<ReshardOutput, String> {
     if gens.is_empty() {
@@ -680,6 +738,7 @@ pub fn merge(
         slot_base.unwrap_or(min_slot_offset),
         0,
         u64::MAX,
+        bm25_fields,
         analyze,
     )?;
     Ok(ReshardOutput {

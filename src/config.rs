@@ -169,6 +169,11 @@ pub struct Config {
     pub bm25_k1: f32,
     /// BM25 b parameter sent to every shard.
     pub bm25_b: f32,
+    /// The BM25 field table for NEW shard builders
+    /// (`docs/multi-field.md`): "body" first, then the extra indexed
+    /// fields. Existing `.bm25` files keep the table they were written
+    /// with. Documents naming fields outside the table are refused.
+    pub bm25_fields: Vec<String>,
     /// The shard map the coordinator's `node_addrs` came from, when
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
@@ -204,6 +209,7 @@ struct FileConfig {
     analysis_addr: Option<String>,
     bm25_k1: Option<f32>,
     bm25_b: Option<f32>,
+    bm25_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
     shard_map: Option<String>,
@@ -645,6 +651,27 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     .transpose()?
     .unwrap_or(0.75);
 
+    let bm25_fields = match opt(args, "bm25-fields", "TURBOVEC_BM25_FIELDS", None) {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => file
+            .bm25_fields
+            .clone()
+            .unwrap_or_else(|| vec!["body".to_string()]),
+    };
+    if bm25_fields.first().map(String::as_str) != Some("body") {
+        return Err("bm25 fields must start with \"body\" (field 0 is the stored body)".to_string());
+    }
+    for (i, name) in bm25_fields.iter().enumerate() {
+        if bm25_fields[..i].contains(name) {
+            return Err(format!("bm25 field {name:?} repeats in the field table"));
+        }
+    }
+
     Ok(Config {
         role,
         coord_listen,
@@ -668,6 +695,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         analysis_addr,
         bm25_k1,
         bm25_b,
+        bm25_fields,
         shard_map,
     })
 }
@@ -678,6 +706,28 @@ mod tests {
 
     fn args(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bm25_fields_default_body_and_validation() {
+        let base = ["--role=node", "--demo-vectors=10", "--node-listen=127.0.0.1:9001"];
+        let cfg = parse(&args(&base)).unwrap();
+        assert_eq!(cfg.bm25_fields, vec!["body".to_string()]);
+
+        let mut with = base.to_vec();
+        with.push("--bm25-fields=body, case_name");
+        let cfg = parse(&args(&with)).unwrap();
+        assert_eq!(
+            cfg.bm25_fields,
+            vec!["body".to_string(), "case_name".to_string()]
+        );
+
+        let mut bad = base.to_vec();
+        bad.push("--bm25-fields=case_name,body");
+        assert!(parse(&args(&bad)).is_err(), "body must come first");
+        let mut dup = base.to_vec();
+        dup.push("--bm25-fields=body,case_name,case_name");
+        assert!(parse(&args(&dup)).is_err(), "duplicates are refused");
     }
 
     #[test]

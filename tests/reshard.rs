@@ -119,6 +119,7 @@ async fn ingest(
                 text: doc_text(i),
                 analysis: None,
                 lineage: None,
+                fields: Vec::new(),
             })
             .await
             .unwrap();
@@ -218,6 +219,7 @@ async fn split_reconstructs_parent_topk() {
         0,
         25_000_000,
         false,
+        None,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
@@ -296,8 +298,15 @@ async fn merge_reproduces_monolithic() {
         .map(|p| reshard::resolve_gen(&turbovec_search::wal::wal_dir(p)).unwrap())
         .collect::<Vec<_>>();
     let out_dir = dir.join("merged");
-    let output = reshard::merge(&generations, &out_dir, None, false, &mut replay_analyzer(&analysis_addr))
-        .unwrap();
+    let output = reshard::merge(
+        &generations,
+        &out_dir,
+        None,
+        false,
+        None,
+        &mut replay_analyzer(&analysis_addr),
+    )
+    .unwrap();
     assert_eq!(output.children.len(), 1);
     let child = &output.children[0];
     assert_eq!(child.num_vectors, N as u64);
@@ -386,6 +395,7 @@ async fn merge_reproduces_monolithic() {
         &dir.join("bad-cal"),
         None,
         false,
+        None,
         &mut replay_analyzer(&analysis_addr),
     );
     assert!(bad.is_err(), "mixed calibrations must be rejected");
@@ -395,6 +405,7 @@ async fn merge_reproduces_monolithic() {
         &dir.join("bad-buckets"),
         None,
         false,
+        None,
         &mut replay_analyzer(&analysis_addr),
     );
     let err = match bad {
@@ -439,6 +450,7 @@ async fn split_consumes_each_bucket_once() {
         0,
         25_000_000,
         false,
+        None,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
@@ -522,6 +534,7 @@ async fn split_finer_than_buckets_repartitions() {
         0,
         25_000_000,
         false,
+        None,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
@@ -592,10 +605,10 @@ fn reshard_refuses_a_log_with_preexisting_state() {
     let mut analyze = |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
         unreachable!("reshard must refuse before analyzing anything")
     };
-    let err = reshard::split(&gen, 2, &dir.join("out"), 0, 25_000_000, false, &mut analyze)
+    let err = reshard::split(&gen, 2, &dir.join("out"), 0, 25_000_000, false, None, &mut analyze)
         .expect_err("split must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
-    let err = reshard::merge(&[gen], &dir.join("out"), None, false, &mut analyze)
+    let err = reshard::merge(&[gen], &dir.join("out"), None, false, None, &mut analyze)
         .expect_err("merge must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
 }
@@ -634,6 +647,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
         0,
         25_000_000,
         false,
+        None,
         &mut replay_analyzer(&analysis_addr),
     )
     .unwrap();
@@ -682,5 +696,208 @@ async fn split_logs_redistributes_two_shards_into_four() {
         merged.truncate(k);
         assert_eq!(merged, expected, "query {q}: redistribution changed the top-k");
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Multi-field WAL replay (docs/multi-field.md, build order step 4):
+/// documents ingested with a case_name DocumentField reshard into
+/// children that carry BOTH fields — the WAL is the durable record and
+/// replay is the field-migration lever. Children derive the two-field
+/// table from the replayed records, conserve per-field postings
+/// exactly, and the merged children reproduce the parent's FUSED
+/// ranking bit for bit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_preserves_multi_field_postings_and_fused_ranking() {
+    use turbovec_search::pb::DocumentField;
+
+    let dir = tempdir("multifield");
+    let n = 600usize;
+    let corpus = unit_vectors(n, DIM, 0x5EED_F1E1);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
+    let (analysis_addr, analysis) = mock_analysis::start_mock_analysis().await;
+    std::mem::forget(analysis);
+
+    // A two-field node: same shape as start_wal_node plus the table.
+    let index_path = dir.join("shard.tv");
+    let (addr, _node) = common::start_empty_node(NodeConfig {
+        slot_offset: 0,
+        index_path: Some(index_path.clone()),
+        analysis_addr: Some(analysis_addr.to_string()),
+        bm25_fields: vec!["body".to_string(), "case_name".to_string()],
+        wal: true,
+        wal_buckets: 64,
+        ..Default::default()
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    client
+        .set_calibration(SetCalibrationRequest {
+            dim: DIM as u32,
+            bit_width: BIT_WIDTH as u32,
+            shift: shift.to_vec(),
+            scale: scale.to_vec(),
+        })
+        .await
+        .unwrap();
+
+    // Every third document carries a case name; names reuse body terms
+    // ("alpha") plus name-only terms ("smith", "acme").
+    let name_of = |i: usize| -> Option<String> {
+        (i % 3 == 0).then(|| {
+            format!(
+                "{} v {}",
+                ["smith", "acme", "alpha"][i % 4 % 3],
+                ["jones", "smith"][i % 2]
+            )
+        })
+    };
+    let (tx, rx) = mpsc::channel(8);
+    let names: Vec<Option<String>> = (0..n).map(name_of).collect();
+    let names_feed = names.clone();
+    tokio::spawn(async move {
+        for (i, name) in names_feed.iter().enumerate() {
+            tx.send(AddDocumentsRequest {
+                text: doc_text(i),
+                analysis: None,
+                lineage: None,
+                fields: name
+                    .as_ref()
+                    .map(|name| {
+                        vec![DocumentField {
+                            field: "case_name".to_string(),
+                            text: name.clone(),
+                            analysis: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
+            })
+            .await
+            .unwrap();
+        }
+    });
+    let resp = client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+    assert_eq!(resp.into_inner().added as usize, n);
+    let (tx, rx) = mpsc::channel(8);
+    let flat = corpus.clone();
+    tokio::spawn(async move {
+        for chunk in flat.chunks(500 * DIM) {
+            tx.send(AddVectorsRequest {
+                vectors: chunk.to_vec(),
+                dim: 0,
+            })
+            .await
+            .unwrap();
+        }
+    });
+    client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
+    let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert!(flushed.written);
+
+    // Parent reference: the flushed two-field sidecar.
+    let parent = Bm25Reader::open(&turbovec_search::node::bm25_sidecar_path(&index_path)).unwrap();
+    assert_eq!(parent.field_count(), 2);
+    assert_eq!(parent.field_name(1), "case_name");
+
+    let output = reshard::split(
+        &reshard::resolve_gen(&turbovec_search::wal::wal_dir(&index_path)).unwrap(),
+        2,
+        &dir.join("split"),
+        0,
+        25_000_000,
+        false,
+        None,
+        &mut replay_analyzer(&analysis_addr),
+    )
+    .unwrap();
+    assert_eq!(output.children.len(), 2);
+
+    let children: Vec<(&reshard::ChildImage, Bm25Reader)> = output
+        .children
+        .iter()
+        .map(|c| {
+            let reader = Bm25Reader::open(c.bm25_path.as_ref().unwrap()).unwrap();
+            assert_eq!(reader.field_count(), 2, "children must derive both fields");
+            assert_eq!(reader.field_name(0), "body");
+            assert_eq!(reader.field_name(1), "case_name");
+            (c, reader)
+        })
+        .collect();
+
+    // Per-field conservation: shard shares sum to the parent's stats.
+    for (f, terms) in [
+        (0usize, vec!["alpha", "gamma", "one"]),
+        (1usize, vec!["smith", "acme", "alpha", "jones"]),
+    ] {
+        let parent_view = parent.field(f);
+        assert_eq!(
+            children.iter().map(|(_, r)| r.field(f).total_doc_length()).sum::<u64>(),
+            parent_view.total_doc_length(),
+            "field {f} total length"
+        );
+        for term in terms {
+            assert_eq!(
+                children.iter().map(|(_, r)| r.field(f).df(term)).sum::<u32>(),
+                parent_view.df(term),
+                "field {f} df({term})"
+            );
+        }
+    }
+    assert!(parent.field(1).df("smith") > 0, "name postings must exist");
+
+    // Fused ranking: parent fused pruned == merged children, bitwise,
+    // with the parent's stats as the shared globals (they ARE the
+    // merged shares, checked above).
+    let body_terms = vec!["alpha".to_string(), "one".to_string()];
+    let name_terms = vec!["smith".to_string(), "alpha".to_string()];
+    let k = 25;
+    let run = |r: &Bm25Reader| {
+        bm25::top_k_fused_pruned(
+            &[
+                bm25::FieldQuery {
+                    index: &r.field(0),
+                    terms: &body_terms,
+                    stats: CorpusStats {
+                        doc_count: Bm25Index::doc_count(&parent),
+                        total_doc_length: parent.field(0).total_doc_length(),
+                        dfs: body_terms.iter().map(|t| parent.field(0).df(t)).collect(),
+                    },
+                    params: bm25::Bm25Params::default(),
+                    weight: 1.0,
+                },
+                bm25::FieldQuery {
+                    index: &r.field(1),
+                    terms: &name_terms,
+                    stats: CorpusStats {
+                        doc_count: Bm25Index::doc_count(&parent),
+                        total_doc_length: parent.field(1).total_doc_length(),
+                        dfs: name_terms.iter().map(|t| parent.field(1).df(t)).collect(),
+                    },
+                    params: bm25::Bm25Params { k1: 0.9, b: 0.2 },
+                    weight: 1.75,
+                },
+            ],
+            k,
+            f64::NEG_INFINITY,
+        )
+    };
+    let want: Vec<(u64, u64)> = run(&parent)
+        .into_iter()
+        .map(|d| (u64::from(d.doc_id), d.score.to_bits()))
+        .collect();
+    let mut merged: Vec<(u64, u64)> = children
+        .iter()
+        .flat_map(|(child, reader)| {
+            run(reader).into_iter().map(|d| {
+                (
+                    child.parent_ids[d.doc_id as usize],
+                    d.score.to_bits(),
+                )
+            })
+        })
+        .collect();
+    merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    merged.truncate(k);
+    assert_eq!(want, merged, "fused ranking must survive the reshard");
+
     std::fs::remove_dir_all(&dir).ok();
 }

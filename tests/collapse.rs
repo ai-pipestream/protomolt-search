@@ -38,6 +38,7 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
                     span_start: 0,
                     span_end: 10,
                 }),
+                fields: Vec::new(),
             })
             .await
             .unwrap();

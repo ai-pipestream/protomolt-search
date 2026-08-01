@@ -285,6 +285,11 @@ impl Bm25Store {
         &self.fields[f].name
     }
 
+    /// The index of the field named `name`, if the table has it.
+    pub fn field_index(&self, name: &str) -> Option<usize> {
+        self.fields.iter().position(|f| f.name == name)
+    }
+
     /// Field `f` as its own [`Bm25Index`]: per-field postings, lengths,
     /// and total; shared texts, lineages, and doc count. Every scorer
     /// runs against one of these views (`docs/multi-field.md`). Panics
@@ -1763,6 +1768,16 @@ impl SpillBuilder {
         self.doc_count
     }
 
+    /// Number of fields in the field table.
+    pub fn field_count(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// The name of field `f`. Panics when out of range.
+    pub fn field_name(&self, f: usize) -> &str {
+        &self.fields[f].name
+    }
+
     /// Sum of all body document lengths (BM25 avgdl numerator).
     pub fn total_doc_length(&self) -> u64 {
         self.fields[0].total_length
@@ -2958,6 +2973,11 @@ impl Bm25Reader {
     /// The name of field `f`. Panics when out of range.
     pub fn field_name(&self, f: usize) -> &str {
         &self.fields[f].name
+    }
+
+    /// The index of the field named `name`, if the table has it.
+    pub fn field_index(&self, name: &str) -> Option<usize> {
+        self.fields.iter().position(|f| f.name == name)
     }
 
     /// Field `f` as its own [`Bm25Index`]: directory lookups, postings

@@ -179,6 +179,7 @@ async fn ingest_falls_back_to_unary_on_unimplemented() {
             text: text.to_string(),
             analysis: None,
             lineage: None,
+            fields: Vec::new(),
         })
         .await
         .unwrap();

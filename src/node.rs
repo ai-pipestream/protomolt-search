@@ -80,6 +80,11 @@ pub struct NodeConfig {
     /// Analysis sidecar address (`http://host:port`) for AddDocuments.
     /// `None` makes AddDocuments fail UNAVAILABLE.
     pub analysis_addr: Option<String>,
+    /// The BM25 field table for NEW builders (`docs/multi-field.md`):
+    /// "body" first, then the extra indexed fields. Shards loaded from
+    /// existing `.bm25` files keep the table they were written with;
+    /// documents naming fields outside the active table are refused.
+    pub bm25_fields: Vec<String>,
     /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
     /// Requires `index_path`; the config layer defaults this on for
     /// persisted shards and off for demo shards.
@@ -109,6 +114,7 @@ impl Default for NodeConfig {
             bit_width: 4,
             index_path: None,
             analysis_addr: None,
+            bm25_fields: vec!["body".to_string()],
             wal: false,
             wal_buckets: 64,
             coalesce: true,
@@ -161,13 +167,55 @@ impl Bm25Shard {
         }
     }
 
-    /// Open a `.bm25` path in the right shape: v3 files map
-    /// disk-resident; older formats load into the heap builder (and are
-    /// upgraded to v3 on the next flush).
+    /// Fields in the active table (`docs/multi-field.md`).
+    fn field_count(&self) -> usize {
+        match self {
+            Bm25Shard::Building(s) => s.field_count(),
+            Bm25Shard::Spilling(s) => s.field_count(),
+            Bm25Shard::Resident(r) => r.field_count(),
+        }
+    }
+
+    /// The name of field `f` in the active table.
+    fn field_name(&self, f: usize) -> &str {
+        match self {
+            Bm25Shard::Building(s) => s.field_name(f),
+            Bm25Shard::Spilling(s) => s.field_name(f),
+            Bm25Shard::Resident(r) => r.field_name(f),
+        }
+    }
+
+    /// The table index of the field named `name`, if present. `None`
+    /// while bulk-building (no searchable surface to resolve against).
+    fn field_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.field_index(name),
+            Bm25Shard::Spilling(_) => None,
+            Bm25Shard::Resident(r) => r.field_index(name),
+        }
+    }
+
+    /// Field `f` as its own searchable [`Bm25Index`]; `None` while
+    /// bulk-building, exactly like [`Self::as_index`].
+    fn field_view(&self, f: usize) -> Option<Box<dyn Bm25Index + '_>> {
+        match self {
+            Bm25Shard::Building(s) => Some(Box::new(s.field(f))),
+            Bm25Shard::Spilling(_) => None,
+            Bm25Shard::Resident(r) => Some(Box::new(r.field(f))),
+        }
+    }
+
+    /// Open a `.bm25` path in the right shape: every reader-supported
+    /// format (v3 through v6) maps disk-resident; only the pre-v3
+    /// formats load into the heap builder (and are upgraded to the
+    /// current format on the next flush). v5/v6 were missing from this
+    /// list, so a restarted node heap-loaded its whole postings file —
+    /// at real shard sizes that is the exact failure the resident
+    /// reader exists to prevent.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let mut magic = [0u8; 8];
         std::fs::File::open(path)?.read_exact(&mut magic)?;
-        if &magic == b"TVBM2503" || &magic == b"TVBM2504" {
+        if matches!(&magic, b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506") {
             Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
         } else {
             Ok(Bm25Shard::Building(Bm25Store::load(path)?))
@@ -725,17 +773,18 @@ impl NodeServiceImpl {
     /// through the disk spiller (bounded heap, not searchable until
     /// Flush); path-less demo shards build in heap.
     fn new_builder(&self, generation: Option<&PathBuf>) -> Result<Bm25Shard, Status> {
+        let names: Vec<&str> = self.config.bm25_fields.iter().map(String::as_str).collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let bm25_path = storage_paths(p, generation).1;
                 let mut dir = bm25_path.as_os_str().to_owned();
                 dir.push(".build");
                 let dir = PathBuf::from(dir);
-                SpillBuilder::create(&dir)
+                SpillBuilder::create_with_fields(&dir, &names)
                     .map(Bm25Shard::Spilling)
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
             }
-            None => Ok(Bm25Shard::Building(Bm25Store::new())),
+            None => Ok(Bm25Shard::Building(Bm25Store::with_fields(&names))),
         }
     }
 
@@ -1265,6 +1314,125 @@ impl NodeServiceImpl {
     /// vector index, or an empty query vector, contributes an empty leg
     /// rather than failing the whole hybrid query. BM25 leg: scored with
     /// the coordinator-supplied GLOBAL stats.
+    /// The fused multi-field Bm25Query route (`docs/multi-field.md`):
+    /// legs resolve to field views by name, score through
+    /// [`bm25::top_k_fused_pruned`] (exhaustive when impacts are
+    /// missing or `--block-max=false`; results identical), and the
+    /// floor applies to the FUSED score. A leg naming a field this
+    /// shard lacks is skipped: its documents hold no postings there, so
+    /// every fused score is unchanged — the graceful path for a fleet
+    /// mid-migration.
+    fn bm25_query_fused(&self, req: &Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
+        for leg in &req.fields {
+            if leg.terms.len() != leg.global_doc_frequencies.len() {
+                return Err(Status::invalid_argument(format!(
+                    "leg {:?}: terms and global_doc_frequencies must have the same length",
+                    leg.field
+                )));
+            }
+            if leg.weight < 0.0 || leg.weight.is_nan() {
+                return Err(Status::invalid_argument(format!(
+                    "leg {:?}: weight must be >= 0",
+                    leg.field
+                )));
+            }
+        }
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
+            Some(store) if req.k > 0 => {
+                if store.as_index().is_none() {
+                    return Err(Status::failed_precondition(
+                        "bm25 bulk build in progress; Flush first",
+                    ));
+                }
+                let mut views: Vec<Box<dyn Bm25Index + '_>> = Vec::new();
+                let mut leg_of_view: Vec<usize> = Vec::new();
+                for (li, leg) in req.fields.iter().enumerate() {
+                    if let Some(fi) = store.field_index(&leg.field) {
+                        views.push(store.field_view(fi).expect("searchable, checked above"));
+                        leg_of_view.push(li);
+                    }
+                }
+                // Leg list order is the pinned accumulation order; the
+                // coordinator sends the same order to every shard, so
+                // distributed fused scores are bit-identical to the
+                // monolith's.
+                let queries: Vec<bm25::FieldQuery> = views
+                    .iter()
+                    .zip(&leg_of_view)
+                    .map(|(view, &li)| {
+                        let leg = &req.fields[li];
+                        bm25::FieldQuery {
+                            index: view.as_ref(),
+                            terms: &leg.terms,
+                            stats: bm25::CorpusStats {
+                                doc_count: req.global_doc_count,
+                                total_doc_length: leg.global_total_doc_length,
+                                dfs: leg.global_doc_frequencies.clone(),
+                            },
+                            params: params_from(leg.k1, leg.b),
+                            weight: if leg.weight == 0.0 {
+                                1.0
+                            } else {
+                                f64::from(leg.weight)
+                            },
+                        }
+                    })
+                    .collect();
+                let floor = if req.min_score == 0.0 {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::from(req.min_score)
+                };
+                let prunable = self.config.block_max
+                    && queries.iter().all(|fq| {
+                        fq.terms
+                            .iter()
+                            .enumerate()
+                            .all(|(ti, t)| fq.stats.dfs[ti] == 0 || fq.index.has_impacts(t))
+                    });
+                let docs = if prunable {
+                    bm25::top_k_fused_pruned(&queries, req.k as usize, floor)
+                } else {
+                    bm25::filter_fused_to_floor(
+                        bm25::top_k_fused_exhaustive(&queries, req.k as usize),
+                        floor,
+                    )
+                };
+                docs.into_iter()
+                    .map(|doc| Bm25Hit {
+                        doc_id: self.config.slot_offset + u64::from(doc.doc_id),
+                        score: doc.score as f32,
+                        terms: doc
+                            .term_offsets
+                            .into_iter()
+                            .map(|(fi, ti, offsets)| {
+                                let leg = &req.fields[leg_of_view[fi]];
+                                TermOccurrences {
+                                    term: leg.terms[ti].clone(),
+                                    field: leg.field.clone(),
+                                    offsets: offsets
+                                        .into_iter()
+                                        .map(|(start, end)| OffsetSpan { start, end })
+                                        .collect(),
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        // Same seed rule as the flat path: one f32 ULP below the k-th
+        // fused score when the heap filled, 0 otherwise.
+        let kth_best = if hits.len() == req.k as usize {
+            hits.last().map(|h| bm25::floor_seed(h.score)).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Ok(Bm25QueryResponse { hits, kth_best })
+    }
+
     fn compute_legs(
         &self,
         vector: &[f32],
@@ -1272,6 +1440,7 @@ impl NodeServiceImpl {
         global_doc_count: u64,
         global_total_doc_length: u64,
         global_doc_frequencies: &[u32],
+        params: Bm25Params,
         k: usize,
     ) -> Result<(RawLeg, RawLeg), Status> {
         let guard = self.state.read().expect("shard state lock poisoned");
@@ -1333,16 +1502,9 @@ impl NodeServiceImpl {
                         .enumerate()
                         .all(|(ti, t)| stats.dfs[ti] == 0 || index.has_impacts(t));
                 let docs = if prunable {
-                    bm25::top_k_pruned(
-                        index,
-                        terms,
-                        &stats,
-                        Bm25Params::default(),
-                        k,
-                        f64::NEG_INFINITY,
-                    )
+                    bm25::top_k_pruned(index, terms, &stats, params, k, f64::NEG_INFINITY)
                 } else {
-                    bm25::top_k(index, terms, &stats, Bm25Params::default(), k)
+                    bm25::top_k(index, terms, &stats, params, k)
                 };
                 bm25_leg = docs
                     .into_iter()
@@ -1380,6 +1542,7 @@ impl NodeServiceImpl {
             req.global_doc_count,
             req.global_total_doc_length,
             &req.global_doc_frequencies,
+            params_from(req.k1, req.b),
             k,
         )?;
 
@@ -1413,6 +1576,22 @@ impl NodeServiceImpl {
     }
 }
 
+/// Request-carried BM25 params: 0 selects the default (proto3 "absent").
+fn params_from(k1: f32, b: f32) -> Bm25Params {
+    Bm25Params {
+        k1: if k1 == 0.0 {
+            bm25::DEFAULT_K1
+        } else {
+            f64::from(k1)
+        },
+        b: if b == 0.0 {
+            bm25::DEFAULT_B
+        } else {
+            f64::from(b)
+        },
+    }
+}
+
 /// Request weights default to 1.0 (0 means "unset" in the proto);
 /// negatives are rejected.
 fn weight_or_default(value: f32, name: &str) -> Result<f64, Status> {
@@ -1425,9 +1604,97 @@ fn weight_or_default(value: f32, name: &str) -> Result<f64, Status> {
     Ok(f64::from(value))
 }
 
+/// Spawned per-field analysis tasks for one document's extra fields:
+/// `(field table index, task)` pairs (`docs/multi-field.md`).
+type FieldAnalyses = Vec<(
+    usize,
+    tokio::task::JoinHandle<Result<crate::postings::AnalyzedField, Status>>,
+)>;
+
+/// Await one document's extra-field analyses and assemble the
+/// positional [`crate::postings::AnalyzedDoc`]: body at field 0, extras
+/// at their table indexes, gaps empty. Body-only documents pass through
+/// untouched (the exact pre-multi-field shape).
+async fn join_fields(
+    body: crate::postings::AnalyzedDoc,
+    extras: FieldAnalyses,
+) -> Result<crate::postings::AnalyzedDoc, Status> {
+    if extras.is_empty() {
+        return Ok(body);
+    }
+    let n = extras.iter().map(|&(fi, _)| fi + 1).max().unwrap_or(1);
+    let mut fields = vec![crate::postings::AnalyzedField::default(); n];
+    fields[0] = body.into_body();
+    for (fi, handle) in extras {
+        fields[fi] = handle
+            .await
+            .map_err(|e| Status::internal(format!("field analysis task failed: {e}")))??;
+    }
+    Ok(crate::postings::AnalyzedDoc { fields })
+}
+
 /// Bulk-ingest internals: the two analysis transports and the shared
 /// per-document apply step.
 impl NodeServiceImpl {
+    /// Validate a document's extra fields against the shard's
+    /// configured field table and start their sidecar analyses
+    /// (concurrent unary calls — field texts are captions and titles,
+    /// small next to the body, so a dedicated stream buys nothing).
+    /// Validation failures surface BEFORE any store or WAL effect.
+    fn spawn_field_analyses(&self, doc: &AddDocumentsRequest) -> Result<FieldAnalyses, Status> {
+        if doc.fields.is_empty() {
+            return Ok(Vec::new());
+        }
+        let addr = self.config.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
+        })?;
+        let mut handles = FieldAnalyses::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for field in &doc.fields {
+            if field.field == "body" {
+                return Err(Status::invalid_argument(
+                    "\"body\" is the top-level text; DocumentField names extra fields only",
+                ));
+            }
+            if seen.contains(&field.field.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?} repeats in one document",
+                    field.field
+                )));
+            }
+            seen.push(&field.field);
+            let Some(fi) = self
+                .config
+                .bm25_fields
+                .iter()
+                .position(|n| *n == field.field)
+            else {
+                return Err(Status::invalid_argument(format!(
+                    "unknown field {:?}; this shard indexes {:?}",
+                    field.field, self.config.bm25_fields
+                )));
+            };
+            if field.text.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?} has empty text; omit absent fields instead",
+                    field.field
+                )));
+            }
+            let addr = addr.clone();
+            let text = field.text.clone();
+            let spec = field.analysis.clone();
+            handles.push((
+                fi,
+                tokio::spawn(async move {
+                    crate::analyzer::analyze_document(&addr, &text, spec.as_ref())
+                        .await
+                        .map(crate::postings::AnalyzedDoc::into_body)
+                }),
+            ));
+        }
+        Ok(handles)
+    }
+
     /// Apply one analyzed document: id assignment, store insert, WAL
     /// append. Must be called in arrival order — both transports
     /// guarantee it.
@@ -1469,6 +1736,34 @@ impl NodeServiceImpl {
                 .expect("builder just ensured")
                 .next_doc_id(),
         );
+        // Multi-field documents were positioned against the CONFIGURED
+        // table; the ACTIVE table (possibly loaded from a file) must be
+        // at least as wide and agree on names, or the document would
+        // index under the wrong field — refuse as a Status instead of
+        // tripping the store's positional assert. Body-only documents
+        // skip this entirely (any table serves them).
+        if analyzed.fields.len() > 1 {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            if analyzed.fields.len() > shard.field_count() {
+                return Err(Status::failed_precondition(format!(
+                    "document carries {} fields but the shard's table has {}; the shard \
+                     predates the configured field table — rebuild or reshard it",
+                    analyzed.fields.len(),
+                    shard.field_count()
+                )));
+            }
+            for fi in 1..analyzed.fields.len() {
+                let want = self.config.bm25_fields.get(fi).map(String::as_str);
+                if want != Some(shard.field_name(fi)) {
+                    return Err(Status::failed_precondition(format!(
+                        "shard field {fi} is {:?} but the configured table names {:?}; \
+                         field tables must agree",
+                        shard.field_name(fi),
+                        want.unwrap_or("<missing>")
+                    )));
+                }
+            }
+        }
         let global_id = self.config.slot_offset + u64::from(doc_id);
         if *added == 0 {
             *first_id = global_id;
@@ -1546,24 +1841,29 @@ impl NodeServiceImpl {
         }
         let mut spec = first.analysis.clone();
         let mut submit = Some(session.submitter());
-        let mut pending: std::collections::BTreeMap<u64, AddDocumentsRequest> =
+        // Each pending document carries its spawned extra-field
+        // analyses; the session covers the BODY only (extra fields ride
+        // concurrent unary calls, joined at apply time).
+        let mut pending: std::collections::BTreeMap<u64, (AddDocumentsRequest, FieldAnalyses)> =
             std::collections::BTreeMap::new();
         let mut results: std::collections::HashMap<u64, crate::postings::AnalyzedDoc> =
             std::collections::HashMap::new();
+        let first_extras = self.spawn_field_analyses(&first)?;
         submit
             .as_ref()
             .expect("submitter set above")
             .submit(0, &first.text)
             .await?;
-        pending.insert(0, first);
+        pending.insert(0, (first, first_extras));
         let mut next_seq = 1u64;
         let mut next_apply = 0u64;
         let mut inbound_open = true;
         loop {
             while let Some(analyzed) = results.remove(&next_apply) {
-                let doc = pending
+                let (doc, extras) = pending
                     .remove(&next_apply)
                     .expect("every result has a pending document");
+                let analyzed = join_fields(analyzed, extras).await?;
                 self.apply_analyzed_document(doc, analyzed, added, first_id)?;
                 next_apply += 1;
             }
@@ -1583,20 +1883,25 @@ impl NodeServiceImpl {
             };
             match step {
                 Step::Doc(doc) => {
+                    // Extra-field analyses start on arrival (validated
+                    // now, so a bad field fails before the body enters
+                    // the session).
+                    let extras = self.spawn_field_analyses(&doc)?;
                     if doc.analysis != spec {
-                        // A mid-stream spec change (rare): drain the
-                        // current session completely so ordering holds,
-                        // then open a new one for the new spec. Dropping
-                        // the submitter clone is what lets the old
-                        // session half-close and drain.
+                        // A mid-stream BODY spec change (rare): drain
+                        // the current session completely so ordering
+                        // holds, then open a new one for the new spec.
+                        // Dropping the submitter clone is what lets the
+                        // old session half-close and drain.
                         drop(submit.take());
                         session.finish();
                         while !pending.is_empty() {
                             store_result(&mut results, session.next().await?)?;
                             while let Some(analyzed) = results.remove(&next_apply) {
-                                let done = pending
+                                let (done, done_extras) = pending
                                     .remove(&next_apply)
                                     .expect("every result has a pending document");
+                                let analyzed = join_fields(analyzed, done_extras).await?;
                                 self.apply_analyzed_document(done, analyzed, added, first_id)?;
                                 next_apply += 1;
                             }
@@ -1612,7 +1917,7 @@ impl NodeServiceImpl {
                         .expect("stream open while inbound open")
                         .submit(next_seq, &doc.text)
                         .await?;
-                    pending.insert(next_seq, doc);
+                    pending.insert(next_seq, (doc, extras));
                     next_seq += 1;
                 }
                 Step::InboundClosed => {
@@ -1638,26 +1943,33 @@ impl NodeServiceImpl {
         first_id: &mut u64,
     ) -> Result<(), Status> {
         const ANALYZE_PIPELINE: usize = 8;
-        let spawn_analysis = |doc: &AddDocumentsRequest| {
-            let addr = addr.to_string();
-            let text = doc.text.clone();
-            let spec = doc.analysis.clone();
-            tokio::spawn(
-                async move { crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await },
-            )
-        };
+        let spawn_analysis =
+            |doc: &AddDocumentsRequest| -> Result<
+                tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
+                Status,
+            > {
+                let extras = self.spawn_field_analyses(doc)?;
+                let addr = addr.to_string();
+                let text = doc.text.clone();
+                let spec = doc.analysis.clone();
+                Ok(tokio::spawn(async move {
+                    let body =
+                        crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await?;
+                    join_fields(body, extras).await
+                }))
+            };
         let mut in_flight: std::collections::VecDeque<(
             AddDocumentsRequest,
             tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
         )> = std::collections::VecDeque::new();
-        let handle = spawn_analysis(&first);
+        let handle = spawn_analysis(&first)?;
         in_flight.push_back((first, handle));
         let mut inbound_open = true;
         loop {
             while inbound_open && in_flight.len() < ANALYZE_PIPELINE {
                 match inbound.message().await? {
                     Some(doc) => {
-                        let handle = spawn_analysis(&doc);
+                        let handle = spawn_analysis(&doc)?;
                         in_flight.push_back((doc, handle));
                     }
                     None => inbound_open = false,
@@ -2359,23 +2671,58 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<TermStatsResponse>, Status> {
         let req = request.into_inner();
         let guard = self.state.read().expect("shard state lock poisoned");
-        let (doc_count, total_doc_length, doc_frequencies) = match guard.bm25.as_ref() {
+        let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard.bm25.as_ref()
+        {
             Some(store) => {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
+                // Per-field shares: a shard without a named field
+                // answers zeros — that IS its share of the globals.
+                let field_stats = req
+                    .fields
+                    .iter()
+                    .map(|ft| match store.field_index(&ft.field) {
+                        Some(fi) => {
+                            let view = store
+                                .field_view(fi)
+                                .expect("as_index above proves the shard is searchable");
+                            crate::pb::FieldStats {
+                                total_doc_length: view.total_doc_length(),
+                                doc_frequencies: ft.terms.iter().map(|t| view.df(t)).collect(),
+                            }
+                        }
+                        None => crate::pb::FieldStats {
+                            total_doc_length: 0,
+                            doc_frequencies: vec![0; ft.terms.len()],
+                        },
+                    })
+                    .collect();
                 (
                     store.doc_count(),
                     index.total_doc_length(),
                     req.terms.iter().map(|t| index.df(t)).collect(),
+                    field_stats,
                 )
             }
-            None => (0, 0, req.terms.iter().map(|_| 0).collect()),
+            None => (
+                0,
+                0,
+                req.terms.iter().map(|_| 0).collect(),
+                req.fields
+                    .iter()
+                    .map(|ft| crate::pb::FieldStats {
+                        total_doc_length: 0,
+                        doc_frequencies: vec![0; ft.terms.len()],
+                    })
+                    .collect(),
+            ),
         };
         Ok(Response::new(TermStatsResponse {
             doc_count,
             total_doc_length,
             doc_frequencies,
+            field_stats,
         }))
     }
 
@@ -2389,18 +2736,12 @@ impl NodeService for NodeServiceImpl {
                 "min_score must be finite (NaN and -inf are not valid floors)",
             ));
         }
-        let params = Bm25Params {
-            k1: if req.k1 == 0.0 {
-                bm25::DEFAULT_K1
-            } else {
-                f64::from(req.k1)
-            },
-            b: if req.b == 0.0 {
-                bm25::DEFAULT_B
-            } else {
-                f64::from(req.b)
-            },
-        };
+        // Fused multi-field legs replace the flat single-field query
+        // (docs/multi-field.md).
+        if !req.fields.is_empty() {
+            return self.bm25_query_fused(&req).map(Response::new);
+        }
+        let params = params_from(req.k1, req.b);
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
             total_doc_length: req.global_total_doc_length,
@@ -2454,6 +2795,7 @@ impl NodeService for NodeServiceImpl {
                                     .into_iter()
                                     .map(|(start, end)| OffsetSpan { start, end })
                                     .collect(),
+                                field: String::new(),
                             })
                             .collect(),
                     })
@@ -2527,6 +2869,7 @@ impl NodeService for NodeServiceImpl {
                                     .into_iter()
                                     .map(|(start, end)| OffsetSpan { start, end })
                                     .collect(),
+                                field: String::new(),
                             })
                             .collect(),
                     })
@@ -2600,6 +2943,7 @@ impl NodeService for NodeServiceImpl {
                 req.global_doc_count,
                 req.global_total_doc_length,
                 &req.global_doc_frequencies,
+                params_from(req.k1, req.b),
                 req.k as usize,
             )?;
             Ok(ShardLegsResponse {

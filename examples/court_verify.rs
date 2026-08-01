@@ -92,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 normalizer_rungs: vec![],
             }),
             min_score: 0.0,
+            fields: Vec::new(),
         })
         .await?
         .into_inner();

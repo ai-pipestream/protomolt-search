@@ -25,6 +25,7 @@ use turbovec_search::node::NodeConfig;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastCalibrationRequest, DocLineage,
+    DocumentField,
     FlushRequest, GetDocumentsRequest,
 };
 
@@ -46,6 +47,63 @@ fn analysis_spec() -> AnalysisSpec {
         term_vector_mode: 1,
         term_vector_source: 2,
         normalizer_rungs: vec![],
+    }
+}
+
+/// The case_name field's analysis (docs/multi-field.md): names stay
+/// UNSTEMMED (a party called "Fishing" must not match queries for
+/// "fish"), tokens as identity, offsets kept for highlighting.
+fn case_name_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        tokenizer: 1,
+        stemmer: 1,
+        term_vector_mode: 1,
+        term_vector_source: 1,
+        normalizer_rungs: vec![],
+    }
+}
+
+/// Optional cluster metadata for the case_name field: a TSV of
+/// `<cluster_id>\t<case name>` (one line per cluster; the rebuild
+/// runbook exports it from the CourtListener clusters table with one
+/// `\copy`). Absent = body-only ingest, exactly as before.
+fn load_case_names(path: &str) -> Result<std::collections::HashMap<u64, String>, String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let mut map = std::collections::HashMap::new();
+    for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("{path}:{}: {e}", i + 1))?;
+        if line.is_empty() {
+            continue;
+        }
+        let Some((id, name)) = line.split_once('\t') else {
+            return Err(format!("{path}:{}: expected <cluster_id>\\t<name>", i + 1));
+        };
+        let id: u64 = id
+            .trim()
+            .parse()
+            .map_err(|e| format!("{path}:{}: cluster id: {e}", i + 1))?;
+        let name = name.trim();
+        if !name.is_empty() {
+            map.insert(id, name.to_string());
+        }
+    }
+    Ok(map)
+}
+
+/// The extra-field entries for one chunk: a case_name DocumentField
+/// when the cluster map knows the chunk's cluster.
+fn chunk_fields(
+    case_names: &Option<std::sync::Arc<std::collections::HashMap<u64, String>>>,
+    cluster_id: u64,
+) -> Vec<DocumentField> {
+    match case_names.as_ref().and_then(|m| m.get(&cluster_id)) {
+        Some(name) => vec![DocumentField {
+            field: "case_name".to_string(),
+            text: name.clone(),
+            analysis: Some(case_name_spec()),
+        }],
+        None => Vec::new(),
     }
 }
 
@@ -113,6 +171,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limit: usize = arg("limit", "0").parse()?;
     let sidecar_port: u16 = arg("sidecar-port", "59101").parse()?;
     std::fs::create_dir_all(&out_dir)?;
+    // Optional cluster_id -> case name map (--case-names=<tsv>): chunks
+    // whose cluster is known carry a "case_name" DocumentField
+    // (docs/multi-field.md).
+    let case_names: Option<std::sync::Arc<std::collections::HashMap<u64, String>>> =
+        match arg("case-names", "").as_str() {
+            "" => None,
+            path => Some(std::sync::Arc::new(load_case_names(path)?)),
+        };
 
     // --- Load and join chunks x embeddings -------------------------------
     let t0 = Instant::now();
@@ -218,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let block: Vec<(Chunk, Vec<f32>)> = joined[start..end].to_vec();
         let addr = addr.clone();
         let spec = spec.clone();
+        let case_names = case_names.clone();
         ingest_tasks.push(tokio::spawn(async move {
             let n = block.len();
             // Documents first so doc ids and vector slots align 1:1.
@@ -237,6 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             span_start: chunk.span_start,
                             span_end: chunk.span_end,
                         }),
+                        fields: chunk_fields(&case_names, chunk.cluster_id),
                     })
                     .await
                     .unwrap();
@@ -375,6 +443,15 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     // sidecar entirely. Used to build vector-leg experiment clusters
     // (shard-count ladders) straight from the embeddings file.
     let vectors_only = std::env::args().any(|a| a == "--vectors-only");
+    // Optional cluster_id -> case name map (--case-names=<tsv>): chunks
+    // whose cluster is known carry a "case_name" DocumentField, the
+    // second real scoreable field (docs/multi-field.md). Nodes must run
+    // with --bm25-fields=body,case_name.
+    let case_names: Option<std::sync::Arc<std::collections::HashMap<u64, String>>> =
+        match arg("case-names", "").as_str() {
+            "" => None,
+            path => Some(std::sync::Arc::new(load_case_names(path)?)),
+        };
     // Bandwidth-proportional fleets need unequal shards: explicit split
     // points (chunk indexes, ascending, exclusive ends; the last shard
     // runs to the corpus end) override the equal m/n block math.
@@ -493,6 +570,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         // written in the same order, so that equality IS the join.
         let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(256);
         let spec2 = spec.clone();
+        let case_names2 = case_names.clone();
         let cp = chunks_path.clone();
         let ep = embeddings_path.clone();
         let feeder = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -527,6 +605,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                         span_start: chunk.span_start,
                         span_end: chunk.span_end,
                     }),
+                    fields: chunk_fields(&case_names2, chunk.cluster_id),
                 })
                 .map_err(|e| e.to_string())?;
                 sent += 1;
