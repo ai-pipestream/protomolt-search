@@ -253,7 +253,20 @@ are comparable end to end, by construction.
    identity holds on multi-field corpora, and the v5 writer survives
    only as `save_v5`, the oracle for the parity and query-identity
    tests.
-3. Per-field skip runs + pruned fused scorer; contract 2 tests.
+3. Per-field skip runs + pruned fused scorer; contract 2 tests. LANDED:
+   the v6 writer already emits v5-shaped skip runs per field (pulled
+   forward in step 2), so this step is the scorer: `top_k_fused_pruned`
+   generalizes the block-max/MaxScore machinery from terms to (field,
+   term) pairs, each cursor's bounds scaled by `w_f * idf`, every bound
+   sum and candidate score accumulated in the pinned
+   field-id-then-term-index order (bounds dominate the true score in
+   IEEE arithmetic exactly; full evaluations reproduce the exhaustive
+   bits). `tests/fused_pruned.rs` gates contract 2: bitwise
+   pruned-equals-exhaustive over random corpora / weights / floors, the
+   weight-1.0 degenerate identity with `top_k_pruned`, tie survival at
+   the floor and the k-th slot, real block skips under a seeded floor,
+   exhaustive fallbacks (no impacts, negative weight), and distributed
+   equals monolithic on the pruned path, seeded and unseeded.
 4. Wire + WAL + ingest + reshard replay; corpus extraction grows a second
    real field (case name from the cluster metadata) to have something
    honest to score. This step lands as part of the v7 rebuild event:
