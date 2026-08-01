@@ -401,9 +401,9 @@ pub struct FusedDoc {
 ///
 /// Determinism rule: contributions accumulate in field-id order, and
 /// within a field in term-index order — IEEE addition is not
-/// associative, and the fused pruned scorer (build order step 3) must
-/// reproduce these exact bits. With one field at weight 1.0 the result
-/// is bit-identical to [`top_k_exhaustive`] (`1.0 * x == x` exactly).
+/// associative, and [`top_k_fused_pruned`] reproduces these exact
+/// bits. With one field at weight 1.0 the result is bit-identical to
+/// [`top_k_exhaustive`] (`1.0 * x == x` exactly).
 pub fn top_k_fused_exhaustive(fields: &[FieldQuery], k: usize) -> Vec<FusedDoc> {
     type Hits = Vec<(usize, usize, Vec<(u32, u32)>)>;
     let mut scores: std::collections::HashMap<u32, (f64, Hits)> = std::collections::HashMap::new();
@@ -890,19 +890,413 @@ pub fn top_k_pruned_stats(
         .collect()
 }
 
-/// `idf * max over the block frontier of tf_norm(..)` — the term's upper
-/// bound anywhere in the cursor's current block.
+/// `scale * max over the block frontier of tf_norm(..)` — the term's
+/// upper bound anywhere in the cursor's current block. The scale is idf
+/// for a single-field term, `w_f * idf` for a fused (field, term) pair.
 fn block_max(
     cursor: &crate::postings::ImpactCursor,
-    idf: f64,
+    scale: f64,
     params: Bm25Params,
     avgdl: f64,
 ) -> f64 {
-    idf * cursor
-        .block_frontier()
+    scale
+        * cursor
+            .block_frontier()
+            .iter()
+            .map(|&(tf, dl)| tf_norm(params, tf, dl, avgdl))
+            .fold(0.0, f64::max)
+}
+
+/// [`top_k_pruned`] generalized to the fused multi-field query
+/// (`docs/multi-field.md`, build order step 3): block-max top-k over
+/// every (field, term) pair's skip run, bit-identical to
+/// [`top_k_fused_exhaustive`] (with the seed filter applied).
+///
+/// One cursor per scored (field, term) pair, its bounds scaled by
+/// `w_f * idf` — per-field saturation means every single-field bound
+/// argument holds per pair unchanged, and a fused upper bound is the
+/// sum of pair bounds ("floors decompose", `docs/multi-field.md`). The
+/// pinned accumulation order extends across fields: every bound sum
+/// and every candidate score accumulates in field-id-then-term-index
+/// order, so bounds dominate the true score in IEEE arithmetic exactly
+/// (correctly-rounded `+` and `*` by a non-negative scale are
+/// monotone) and full evaluations reproduce the exhaustive scorer's
+/// bits. The skip/heap contract is [`top_k_pruned`]'s verbatim: skips
+/// on `bound <= cutoff`, candidates in doc-id order, strictly-greater
+/// displacement, `score >= floor` keeps ties at a seeded floor.
+///
+/// Falls back to [`top_k_fused_exhaustive`] (floor-filtered) when any
+/// scored pair lacks impacts (heap store, v3/v4 files), when the pair
+/// count exceeds 128 (the membership mask width), or when any field
+/// weight is negative or NaN — the bound algebra needs `w_f >= 0`;
+/// negative weights are not a scoring mode, but the fallback keeps the
+/// function total.
+pub fn top_k_fused_pruned(fields: &[FieldQuery], k: usize, floor: f64) -> Vec<FusedDoc> {
+    let mut prune = PruneStats::default();
+    top_k_fused_pruned_stats(fields, k, floor, &mut prune)
+}
+
+/// [`top_k_fused_pruned`] with skip accounting.
+pub fn top_k_fused_pruned_stats(
+    fields: &[FieldQuery],
+    k: usize,
+    floor: f64,
+    prune: &mut PruneStats,
+) -> Vec<FusedDoc> {
+    // The pinned accumulation order: oi enumerates (field id, term
+    // index) lexicographically.
+    let pair_meta: Vec<(usize, usize)> = fields
         .iter()
-        .map(|&(tf, dl)| tf_norm(params, tf, dl, avgdl))
-        .fold(0.0, f64::max)
+        .enumerate()
+        .flat_map(|(fi, fq)| (0..fq.terms.len()).map(move |ti| (fi, ti)))
+        .collect();
+    let n_pairs = pair_meta.len();
+    if n_pairs > 128 || fields.iter().any(|fq| fq.weight < 0.0 || fq.weight.is_nan()) {
+        return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
+    }
+
+    // One cursor per scored pair. Any missing impact surface falls the
+    // whole query back to the exhaustive scorer.
+    struct PairState<'a> {
+        /// Position in the pinned (field, term) accumulation order.
+        oi: usize,
+        /// `w_f * idf`: the scale on every tf_norm from this pair.
+        widf: f64,
+        /// The pair's field k1/b and avgdl (bounds and contributions
+        /// are per-field functions).
+        params: Bm25Params,
+        avgdl: f64,
+        cursor: crate::postings::ImpactCursor<'a>,
+        /// widf-scaled upper bound of the current level-0 block.
+        block_max: f64,
+        block: u32,
+        /// widf-scaled upper bound of the current level-1 group.
+        l1_max: f64,
+        l1_group: u32,
+        /// widf-scaled upper bound over the whole pair (from level-1
+        /// records; static, so always a valid remainder bound).
+        term_max: f64,
+    }
+    impl PairState<'_> {
+        /// Re-derive bounds after the cursor moved (no-op when it
+        /// stayed inside the current block).
+        fn refresh(&mut self) {
+            if self.cursor.block() == self.block {
+                return;
+            }
+            self.block = self.cursor.block();
+            self.block_max = block_max(&self.cursor, self.widf, self.params, self.avgdl);
+            if self.cursor.l1_group() != self.l1_group {
+                self.l1_group = self.cursor.l1_group();
+                self.l1_max = self.widf
+                    * self
+                        .cursor
+                        .l1_frontier()
+                        .iter()
+                        .map(|&(tf, dl)| tf_norm(self.params, tf, dl, self.avgdl))
+                        .fold(0.0, f64::max);
+            }
+        }
+    }
+    /// Drop exhausted cursors, harvesting their skip counters.
+    fn retain_live(state: &mut Vec<PairState>, skips: &mut (u64, u64)) {
+        state.retain(|ps| {
+            if ps.cursor.exhausted() {
+                skips.0 += ps.cursor.blocks_skipped;
+                skips.1 += ps.cursor.l1_groups_skipped;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let mut state: Vec<PairState> = Vec::new();
+    for (oi, &(fi, ti)) in pair_meta.iter().enumerate() {
+        let fq = &fields[fi];
+        debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
+        if fq.stats.dfs[ti] == 0 {
+            continue;
+        }
+        let Some(cursor) = fq.index.impacts(&fq.terms[ti]) else {
+            return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
+        };
+        let avgdl = fq.stats.avgdl();
+        let widf = fq.weight * idf(fq.stats.doc_count, fq.stats.dfs[ti]);
+        let l1_max = widf
+            * cursor
+                .l1_frontier()
+                .iter()
+                .map(|&(tf, dl)| tf_norm(fq.params, tf, dl, avgdl))
+                .fold(0.0, f64::max);
+        let term_max = widf
+            * cursor
+                .term_frontier()
+                .iter()
+                .map(|&(tf, dl)| tf_norm(fq.params, tf, dl, avgdl))
+                .fold(0.0, f64::max);
+        prune.blocks_total += u64::from(cursor.n_blocks());
+        state.push(PairState {
+            oi,
+            widf,
+            params: fq.params,
+            avgdl,
+            block: cursor.block(),
+            block_max: block_max(&cursor, widf, fq.params, avgdl),
+            l1_group: cursor.l1_group(),
+            l1_max,
+            cursor,
+            term_max,
+        });
+    }
+
+    let mut heap: std::collections::BinaryHeap<HeapEntry> = std::collections::BinaryHeap::new();
+    if k == 0 {
+        return Vec::new();
+    }
+    // Reusable per-candidate accumulation, indexed by oi so the sum
+    // runs in the pinned pair order (see [`top_k_pruned_stats`]; the
+    // loop below is that function pair-generalized, step for step).
+    let mut contrib: Vec<f64> = vec![0.0; n_pairs];
+    let mut touched: Vec<usize> = Vec::new();
+    let mut order: Vec<usize> = Vec::new();
+    let mut nonessential: Vec<bool> = Vec::new();
+    let mut prefix: Vec<usize> = Vec::new();
+    // Per-candidate document length by field id (dl is per field).
+    let mut dls: Vec<u32> = Vec::new();
+    // Skip counts (level-0 blocks, level-1 groups) of retired cursors.
+    let mut finished: (u64, u64) = (0, 0);
+    // Last processed candidate doc id (doc-order invariant witness).
+    let mut last_selected: Option<u32> = None;
+
+    while !state.is_empty() {
+        let heap_full = heap.len() >= k;
+        let kth = if heap_full {
+            heap.peek().expect("full heap").score
+        } else {
+            f64::NEG_INFINITY
+        };
+        // Inert = cannot enter the heap; every bound sum below runs in
+        // pinned pair order (see the contract).
+        let inert = |acc: f64| acc < floor || (heap_full && acc <= kth);
+        let mut static_sum = 0.0;
+        let mut l1_sum = 0.0;
+        let mut block_sum = 0.0;
+        for oi in 0..n_pairs {
+            if let Some(ps) = state.iter().find(|ps| ps.oi == oi) {
+                static_sum += ps.term_max;
+                l1_sum += ps.l1_max;
+                block_sum += ps.block_max;
+            }
+        }
+        // 1. Termination on the static whole-pair bounds.
+        if inert(static_sum) {
+            break;
+        }
+        // 2a. Level-1 skip: whole 4096-posting groups at one test.
+        if inert(l1_sum) {
+            let d = state
+                .iter()
+                .map(|ps| ps.cursor.l1_last_doc())
+                .min()
+                .expect("nonempty state");
+            for ps in state.iter_mut() {
+                ps.cursor.advance_shallow(d.saturating_add(1));
+                ps.refresh();
+            }
+            retain_live(&mut state, &mut finished);
+            continue;
+        }
+        // 2b. Level-0 range skip.
+        if inert(block_sum) {
+            let d = state
+                .iter()
+                .map(|ps| ps.cursor.block_last_doc())
+                .min()
+                .expect("nonempty state");
+            for ps in state.iter_mut() {
+                ps.cursor.advance_shallow(d.saturating_add(1));
+                ps.refresh();
+            }
+            retain_live(&mut state, &mut finished);
+            continue;
+        }
+        // 3. Competitive window [_, window_end]: MaxScore partition
+        // over pairs, exactly the single-field step 3 with ti -> oi.
+        let window_end = state
+            .iter()
+            .map(|ps| ps.cursor.block_last_doc())
+            .min()
+            .expect("nonempty state");
+        order.clear();
+        order.extend(0..state.len());
+        order.sort_by(|&a, &b| {
+            state[a]
+                .block_max
+                .partial_cmp(&state[b].block_max)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        nonessential.clear();
+        nonessential.resize(state.len(), false);
+        prefix.clear();
+        for &j in &order {
+            let mut acc = 0.0;
+            for oi in 0..n_pairs {
+                if let Some(pos) = state.iter().position(|ps| ps.oi == oi) {
+                    if pos == j || prefix.contains(&pos) {
+                        acc += state[pos].block_max;
+                    }
+                }
+            }
+            if inert(acc) {
+                prefix.push(j);
+            } else {
+                break;
+            }
+        }
+        for &j in &prefix {
+            nonessential[j] = true;
+        }
+        // 4. The next candidate is the smallest current doc over the
+        // essential pairs only.
+        let Some(doc) = state
+            .iter()
+            .zip(&nonessential)
+            .filter(|&(_, &ne)| !ne)
+            .map(|(ps, _)| ps.cursor.doc_id())
+            .min()
+        else {
+            unreachable!("block_sum not inert but every pair non-essential");
+        };
+        if doc > window_end {
+            // The shallowest pair is necessarily non-essential (an
+            // essential one would place doc <= window_end); advancing
+            // it past the window end is safe (see the single-field
+            // step 4 argument, which is per cursor and field-blind).
+            for ps in state.iter_mut() {
+                if ps.cursor.block_last_doc() == window_end {
+                    ps.cursor.advance_shallow(window_end.saturating_add(1));
+                    ps.refresh();
+                }
+            }
+            retain_live(&mut state, &mut finished);
+            continue;
+        }
+        // 5. Candidate test with an exact bound: essential pairs their
+        // TRUE contribution when present, non-essential their block
+        // max. Doc-order and soundness arguments are the single-field
+        // step 5's, per cursor and field-blind.
+        if let Some(prev) = last_selected {
+            debug_assert!(
+                doc > prev,
+                "candidate selection out of doc order: {doc} after {prev}"
+            );
+        }
+        last_selected = Some(doc);
+        dls.clear();
+        dls.extend(fields.iter().map(|fq| fq.index.doc_length(doc)));
+        let mut bound = 0.0;
+        for oi in 0..n_pairs {
+            if let Some(pos) = state.iter().position(|ps| ps.oi == oi) {
+                let ps = &state[pos];
+                if nonessential[pos] {
+                    bound += ps.block_max;
+                } else if ps.cursor.doc_id() == doc {
+                    bound +=
+                        ps.widf * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[oi].0], ps.avgdl);
+                }
+            }
+        }
+        if inert(bound) {
+            // Not insertable now, and the floor only rises: drop it,
+            // advancing EVERY cursor past the doc (the single-field
+            // step 5 soundness proof, applied to pairs).
+            for ps in state.iter_mut() {
+                ps.cursor.advance_shallow(doc);
+                if ps.cursor.doc_id() == doc {
+                    ps.cursor.next_posting();
+                }
+                ps.refresh();
+            }
+            retain_live(&mut state, &mut finished);
+            continue;
+        }
+        // 6. Full evaluation: every cursor to the doc, contributions
+        // summed in pinned pair order, insert on the exact contract.
+        touched.clear();
+        let mut mask: u128 = 0;
+        for ps in state.iter_mut() {
+            ps.cursor.advance_shallow(doc);
+            if ps.cursor.doc_id() == doc {
+                contrib[ps.oi] =
+                    ps.widf * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[ps.oi].0], ps.avgdl);
+                touched.push(ps.oi);
+                mask |= 1u128 << ps.oi;
+            }
+        }
+        touched.sort_unstable();
+        let mut score = 0.0;
+        for &oi in &touched {
+            score += contrib[oi];
+        }
+        prune.candidates_evaluated += 1;
+        prune.postings_scored += touched.len() as u64;
+        // Insert on the exact contract: ties at the seed survive,
+        // displacement is strictly-greater.
+        if score >= floor && (!heap_full || score > kth) {
+            if heap_full {
+                heap.pop();
+            }
+            heap.push(HeapEntry {
+                score,
+                doc_id: doc,
+                mask,
+            });
+        }
+        for ps in state.iter_mut() {
+            if ps.cursor.doc_id() == doc {
+                ps.cursor.next_posting();
+                ps.refresh();
+            }
+        }
+        retain_live(&mut state, &mut finished);
+    }
+    prune.blocks_skipped = finished.0 + state.iter().map(|ps| ps.cursor.blocks_skipped).sum::<u64>();
+    prune.l1_groups_skipped =
+        finished.1 + state.iter().map(|ps| ps.cursor.l1_groups_skipped).sum::<u64>();
+
+    let mut out: Vec<HeapEntry> = heap.into_vec();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    out.into_iter()
+        .map(|e| FusedDoc {
+            doc_id: e.doc_id,
+            score: e.score,
+            term_offsets: (0..n_pairs)
+                .filter(|&oi| e.mask >> oi & 1 == 1)
+                .map(|oi| {
+                    let (fi, ti) = pair_meta[oi];
+                    (
+                        fi,
+                        ti,
+                        fields[fi].index.posting_offsets(&fields[fi].terms[ti], e.doc_id),
+                    )
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The seeded-floor contract applied to a fused fallback result: keep
+/// docs with `score >= floor` (ties at the floor survive).
+pub fn filter_fused_to_floor(mut docs: Vec<FusedDoc>, floor: f64) -> Vec<FusedDoc> {
+    if floor.is_finite() {
+        docs.retain(|d| d.score >= floor);
+    }
+    docs
 }
 
 /// The seeded-floor contract applied to a fallback result: keep docs
