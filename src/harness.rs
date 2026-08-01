@@ -77,6 +77,14 @@ pub struct Shard {
 /// Build `n_shards` indexes over contiguous, disjoint partitions of
 /// `corpus`, all seeded with the same calibration — the property that makes
 /// their scores mutually comparable.
+///
+/// Cuts are aligned to the engine's calibration block
+/// ([`turbovec::DEFAULT_BLOCK_SIZE`] rows): per-block calibration fits
+/// each sealed block on exactly its own rows, so distributed ==
+/// monolithic stays BITWISE only when every shard's sealed blocks hold
+/// exactly the rows the monolithic build seals together. Corpora at or
+/// under one block are unaffected (nothing seals; the seed governs
+/// every row), so small-corpus tests keep their naive cuts.
 pub fn build_shards(
     corpus: &[f32],
     dim: usize,
@@ -86,10 +94,24 @@ pub fn build_shards(
     scale: &[f32],
 ) -> Vec<Shard> {
     let n = corpus.len() / dim;
+    let cut = |i: usize| -> usize {
+        if i == 0 {
+            return 0;
+        }
+        if i >= n_shards {
+            return n;
+        }
+        let naive = i * n / n_shards;
+        let block = turbovec::DEFAULT_BLOCK_SIZE;
+        if n <= block {
+            return naive;
+        }
+        ((naive + block / 2) / block * block).min(n)
+    };
     (0..n_shards)
         .map(|i| {
-            let start = i * n / n_shards;
-            let end = (i + 1) * n / n_shards;
+            let start = cut(i);
+            let end = cut(i + 1).max(start);
             let mut index =
                 TurboQuantIndex::new_with_calibration(dim, bit_width, shift, scale).unwrap();
             index.add(&corpus[start * dim..end * dim]);
