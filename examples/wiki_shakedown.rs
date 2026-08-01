@@ -85,6 +85,7 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
                 text,
                 analysis: Some(spec.clone()),
                 lineage: None,
+                fields: Vec::new(),
             })
             .await
             .unwrap();

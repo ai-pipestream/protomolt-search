@@ -59,6 +59,7 @@ async fn add_documents(addr: &str, texts: &[String]) {
                 text,
                 analysis: None,
                 lineage: None,
+                fields: Vec::new(),
             })
             .await
             .unwrap();

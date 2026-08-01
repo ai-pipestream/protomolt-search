@@ -271,6 +271,28 @@ are comparable end to end, by construction.
    real field (case name from the cluster metadata) to have something
    honest to score. This step lands as part of the v7 rebuild event:
    vector v7 re-encode from the raw embeddings, lexical v6 from WAL
-   replay, block-aligned shard cuts (multiples of 8192).
+   replay, block-aligned shard cuts (multiples of 8192). LANDED (the
+   engine wire; the corpus re-ingest itself IS the rebuild event):
+   `DocumentField` on AddDocumentsRequest (the WAL's durable record, so
+   old logs replay body-only and reshard replay is the migration
+   lever), per-field TermStats shares, fused `Bm25FieldLeg` legs on
+   Bm25Query (list order = the pinned accumulation order; shards skip
+   legs naming fields they lack — exact, since their documents hold no
+   postings there), `QueryField` on the client-facing Bm25Search,
+   per-field ingest analysis (body on the streaming session, extras on
+   concurrent unary calls, positional assembly against the shard's
+   `--bm25-fields` table), reshard children deriving or taking the
+   field table, the `compute_legs` hardcoded-k1/b fix (ShardLegs and
+   HybridShard now carry params), the v5/v6 `Bm25Shard::open` resident
+   fix (restarts heap-loaded current-format shards), and
+   `court_ingest --case-names=<tsv>` emitting the case_name field
+   (unstemmed) from cluster metadata. Gates: `tests/multi_field_wire.rs`
+   (fused distributed == monolithic over the wire on both storage
+   shapes, reweight-without-reindex, fused kth-best seed round trip,
+   per-field stats shares, ingest validation, resident-open formats,
+   legs params) and the reshard multi-field gate (children derive both
+   fields, conserve per-field postings, fused ranking survives
+   bitwise). Field-table fingerprints stay 0 until the ingest layer
+   wires real AnalysisSpec hashes; name equality is the current check.
 5. Epoch stats artifact + digests; phase (b) elision behind a flag.
 6. Hybrid floor integration with the streaming vector side.

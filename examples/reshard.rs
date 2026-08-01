@@ -57,6 +57,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // entirely: shard-count and routing experiments only search the
     // vector leg, and children shrink from tens of GB to the .tv files.
     let vectors_only = std::env::args().any(|a| a == "--vectors-only");
+    // Child BM25 field table override (docs/multi-field.md): comma list
+    // starting with "body". Absent = derive from the replayed records.
+    let bm25_fields: Option<Vec<String>> = opt("bm25-fields").map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
 
     // The reshard core is synchronous; the sidecar client is async. Bridge
     // with block_in_place on the multi-thread runtime (same idiom the
@@ -88,14 +97,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
                     reshard::split_logs(
                         &generations, n, &out_dir, slot_base, slot_stride, vectors_only,
-                        &mut analyze,
+                        bm25_fields.as_deref(), &mut analyze,
                     )?
                 }
                 None => {
                     let slot_base = opt("slot-base")
                         .map(|s| s.parse::<u64>())
                         .transpose()?;
-                    reshard::merge(&generations, &out_dir, slot_base, vectors_only, &mut analyze)?
+                    reshard::merge(
+                        &generations, &out_dir, slot_base, vectors_only,
+                        bm25_fields.as_deref(), &mut analyze,
+                    )?
                 }
             }
         }
@@ -106,7 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let n: usize = arg("split", "2").parse()?;
             let slot_base: u64 = arg("slot-base", "0").parse()?;
             let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
-            reshard::split(&gen, n, &out_dir, slot_base, slot_stride, vectors_only, &mut analyze)?
+            reshard::split(
+                &gen, n, &out_dir, slot_base, slot_stride, vectors_only,
+                bm25_fields.as_deref(), &mut analyze,
+            )?
         }
     };
 

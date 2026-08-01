@@ -121,6 +121,7 @@ async fn start_cluster(
                         text,
                         analysis: None,
                         lineage: None,
+                        fields: Vec::new(),
                     })
                     .await
                     .unwrap();

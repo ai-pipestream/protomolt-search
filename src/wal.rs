@@ -708,6 +708,7 @@ mod tests {
                 text: format!("doc {id}"),
                 analysis: None,
                 lineage: None,
+                fields: Vec::new(),
             }],
         })
     }

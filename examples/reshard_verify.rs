@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gen = reshard::resolve_gen(Path::new(&log))?;
     eprintln!("splitting {} {n} ways...", gen.display());
     let t0 = std::time::Instant::now();
-    let output = reshard::split(&gen, n, &out_dir, 0, 25_000_000, false, &mut analyze)?;
+    let output = reshard::split(&gen, n, &out_dir, 0, 25_000_000, false, None, &mut analyze)?;
     eprintln!("split done in {:?}", t0.elapsed());
 
     let parent = TurboQuantIndex::load(Path::new(&parent_path))?;

@@ -264,6 +264,167 @@ impl CoordinatorServiceImpl {
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
                 min_score,
+                fields: Vec::new(),
+            };
+            let mut client = self.node_client(node)?;
+            query_tasks.push(tokio::spawn(async move {
+                client
+                    .bm25_query(request)
+                    .await
+                    .map(|r| (shard as u32, r.into_inner().hits))
+            }));
+        }
+        let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        for task in query_tasks {
+            let (shard, hits) = task
+                .await
+                .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            all.extend(hits.into_iter().map(|h| (shard, h)));
+        }
+        all.sort_by(|(sa, a), (sb, b)| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| sa.cmp(sb))
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        all.truncate(k as usize);
+        Ok(all.into_iter().map(|(_, h)| h).collect())
+    }
+
+    /// Fused multi-field Bm25Search (`docs/multi-field.md`): `text` is
+    /// analyzed once per entry under THAT entry's analysis (term
+    /// identity is per field), ONE TermStats round carries every
+    /// field's terms, and the Bm25Query fan-out sends per-field legs in
+    /// entry order — the pinned accumulation order, identical on every
+    /// shard, so distributed fused scores match the monolith's bits.
+    pub async fn fanout_bm25_fused(
+        &self,
+        text: &str,
+        k: u32,
+        fields: &[crate::pb::QueryField],
+        min_score: f32,
+    ) -> Result<Vec<Bm25Hit>, Status> {
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+        })?;
+        let mut seen: Vec<&str> = Vec::new();
+        for f in fields {
+            if f.field.is_empty() {
+                return Err(Status::invalid_argument("QueryField.field must be named"));
+            }
+            if seen.contains(&f.field.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?} repeats in the query",
+                    f.field
+                )));
+            }
+            if f.weight < 0.0 || f.weight.is_nan() {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?}: weight must be >= 0",
+                    f.field
+                )));
+            }
+            seen.push(&f.field);
+        }
+        // (a) Query analysis per field, each under its own spec.
+        let mut field_terms: Vec<Vec<String>> = Vec::with_capacity(fields.len());
+        for f in fields {
+            let analyzed =
+                crate::analyzer::analyze_document(&addr, text, f.analysis.as_ref()).await?;
+            let mut terms: Vec<String> = Vec::new();
+            for (term, _, _) in analyzed.into_body().terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+            field_terms.push(terms);
+        }
+        if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
+            return Ok(Vec::new());
+        }
+        // (b) One TermStats fan-out with every field's terms; shares
+        // merge elementwise per field, N summed once (it is shared —
+        // a document is a document).
+        let stats_fields: Vec<crate::pb::FieldTerms> = fields
+            .iter()
+            .zip(&field_terms)
+            .map(|(f, terms)| crate::pb::FieldTerms {
+                field: f.field.clone(),
+                terms: terms.clone(),
+            })
+            .collect();
+        let mut share_tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = TermStatsRequest {
+                terms: Vec::new(),
+                fields: stats_fields.clone(),
+            };
+            let mut client = self.node_client(node)?;
+            share_tasks.push(tokio::spawn(async move {
+                client.term_stats(request).await.map(|r| r.into_inner())
+            }));
+        }
+        let mut doc_count = 0u64;
+        let mut totals = vec![0u64; fields.len()];
+        let mut dfs: Vec<Vec<u32>> = field_terms.iter().map(|t| vec![0u32; t.len()]).collect();
+        for task in share_tasks {
+            let share = task
+                .await
+                .map_err(|e| Status::internal(format!("term stats task failed: {e}")))??;
+            if share.field_stats.len() != fields.len() {
+                return Err(Status::internal(format!(
+                    "shard returned {} field stats for {} fields",
+                    share.field_stats.len(),
+                    fields.len()
+                )));
+            }
+            doc_count += share.doc_count;
+            for (fi, fs) in share.field_stats.iter().enumerate() {
+                if fs.doc_frequencies.len() != dfs[fi].len() {
+                    return Err(Status::internal("shard field stats df length mismatch"));
+                }
+                totals[fi] += fs.total_doc_length;
+                for (acc, df) in dfs[fi].iter_mut().zip(&fs.doc_frequencies) {
+                    *acc += df;
+                }
+            }
+        }
+        // (c) Bm25Query fan-out with per-field legs in entry order.
+        // Entry k1/b of 0 pick up the coordinator's configured params,
+        // so tuning reaches this path too.
+        let legs: Vec<crate::pb::Bm25FieldLeg> = fields
+            .iter()
+            .enumerate()
+            .map(|(fi, f)| crate::pb::Bm25FieldLeg {
+                field: f.field.clone(),
+                terms: field_terms[fi].clone(),
+                global_total_doc_length: totals[fi],
+                global_doc_frequencies: dfs[fi].clone(),
+                weight: f.weight,
+                k1: if f.k1 == 0.0 {
+                    self.bm25_params.k1 as f32
+                } else {
+                    f.k1
+                },
+                b: if f.b == 0.0 {
+                    self.bm25_params.b as f32
+                } else {
+                    f.b
+                },
+            })
+            .collect();
+        let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let request = Bm25QueryRequest {
+                terms: Vec::new(),
+                k,
+                global_doc_count: doc_count,
+                global_total_doc_length: 0,
+                global_doc_frequencies: Vec::new(),
+                k1: 0.0,
+                b: 0.0,
+                min_score,
+                fields: legs.clone(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -359,7 +520,10 @@ impl CoordinatorServiceImpl {
             let mut client = self.node_client(node)?;
             share_tasks.push(tokio::spawn(async move {
                 client
-                    .term_stats(TermStatsRequest { terms })
+                    .term_stats(TermStatsRequest {
+                        terms,
+                        fields: Vec::new(),
+                    })
                     .await
                     .map(|r| r.into_inner())
             }));
@@ -403,6 +567,8 @@ impl CoordinatorServiceImpl {
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
                 global_doc_frequencies: global.dfs.clone(),
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -572,6 +738,8 @@ impl CoordinatorServiceImpl {
                 vector_weight: legs.vector_weight,
                 bm25_weight: legs.bm25_weight,
                 rrf_k: legs.rrf_k as f32,
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -1821,9 +1989,13 @@ impl SearchService for CoordinatorServiceImpl {
                 "min_score must be finite (NaN and -inf are not valid floors)",
             ));
         }
-        let hits = self
-            .fanout_bm25_seeded(&req.text, req.k, req.analysis.as_ref(), req.min_score)
-            .await?;
+        let hits = if req.fields.is_empty() {
+            self.fanout_bm25_seeded(&req.text, req.k, req.analysis.as_ref(), req.min_score)
+                .await?
+        } else {
+            self.fanout_bm25_fused(&req.text, req.k, &req.fields, req.min_score)
+                .await?
+        };
         // The merged k-th best: one f32 ULP below the last hit's score
         // when k hits were returned (see `bm25::floor_seed` — a later
         // seed can never exceed the true k-th best), 0 otherwise.

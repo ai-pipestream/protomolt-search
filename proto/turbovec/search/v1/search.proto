@@ -656,6 +656,23 @@ message DocLineage {
   uint32 span_end = 4;
 }
 
+// One additional indexed field of a document (docs/multi-field.md). The
+// body stays the top-level `text` + `analysis` pair; entries here index
+// under their named field with their own analysis. Field values are
+// indexed-only (scoring structures); the stored text remains the body.
+message DocumentField {
+  // Field name; must exist in the shard's field table (--bm25-fields),
+  // must not be "body" (the body is the top-level text), and must not
+  // repeat within one document. Unknown names are INVALID_ARGUMENT.
+  string field = 1;
+  // Raw field text. Non-empty, same cap as the body.
+  string text = 2;
+  // Analysis options for this field (a field's terms share identity
+  // with queries analyzed under the same spec). Absent = sidecar
+  // defaults, same rule as the body.
+  AnalysisSpec analysis = 3;
+}
+
 // One document on the `AddDocuments` stream.
 message AddDocumentsRequest {
   // Raw document text. Non-empty, at most 1 MiB (the sidecar's cap).
@@ -666,6 +683,11 @@ message AddDocumentsRequest {
   // Optional lineage, stored in the doc store and returned by
   // GetDocuments.
   DocLineage lineage = 3;
+  // Additional indexed fields (docs/multi-field.md). Empty = body-only,
+  // exactly the pre-multi-field document. This message is the WAL's
+  // durable record, so old logs replay as body-only automatically and
+  // reshard replay is the field-migration lever.
+  repeated DocumentField fields = 4;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -678,20 +700,47 @@ message AddDocumentsResponse {
   uint64 first_id = 3;
 }
 
+// One field's query terms in a multi-field TermStats request.
+message FieldTerms {
+  // Field name ("body" for field 0).
+  string field = 1;
+  // Query terms under THIS field's analysis (term identity is per
+  // field).
+  repeated string terms = 2;
+}
+
 // Phase (b) of the distributed BM25 flow: stats for these query terms.
 message TermStatsRequest {
-  // Query terms (exact identity: stems when ingest used SOURCE_STEMS).
+  // Query terms against the body field (exact identity: stems when
+  // ingest used SOURCE_STEMS).
   repeated string terms = 1;
+  // Additional per-field term lists (multi-field queries,
+  // docs/multi-field.md). A shard without a named field answers zeros
+  // for it — that IS its share of the global stats.
+  repeated FieldTerms fields = 2;
+}
+
+// One field's share of the global stats (multi-field queries).
+message FieldStats {
+  // Sum of THIS field's document lengths over the shard (avgdl_f
+  // numerator).
+  uint64 total_doc_length = 1;
+  // Document frequency per requested term, parallel to the request
+  // entry's `terms`.
+  repeated uint32 doc_frequencies = 2;
 }
 
 // This shard's share of the global BM25 corpus stats.
 message TermStatsResponse {
-  // Documents in this shard's postings.
+  // Documents in this shard's postings. Shared across fields (a
+  // document is a document; idf's N is corpus-wide).
   uint64 doc_count = 1;
-  // Sum of document lengths (in terms) over the shard.
+  // Sum of BODY document lengths (in terms) over the shard.
   uint64 total_doc_length = 2;
-  // Document frequency per requested term, parallel to `terms`.
+  // Body document frequency per requested term, parallel to `terms`.
   repeated uint32 doc_frequencies = 3;
+  // Per-field shares, parallel to the request's `fields`.
+  repeated FieldStats field_stats = 4;
 }
 
 // Phase (c) of the distributed BM25 flow: score with GLOBAL stats.
@@ -716,8 +765,41 @@ message Bm25QueryRequest {
   // a merged k-th best can seed the shard with it; the shard then
   // returns only hits with score >= min_score (ties at the floor
   // survive) and block-max pruning skips postings that provably cannot
-  // reach it. 0 means unseeded (scores are always positive).
+  // reach it. 0 means unseeded (scores are always positive). For a
+  // fused query (`fields` non-empty) the floor applies to the FUSED
+  // score.
   float min_score = 8;
+  // Fused multi-field query (docs/multi-field.md): when non-empty,
+  // these legs REPLACE the flat single-field query — `terms`,
+  // `global_total_doc_length`, `global_doc_frequencies`, `k1`, and `b`
+  // are ignored; `global_doc_count`, `k`, and `min_score` still apply.
+  // The body scores as the leg named "body". List order is the pinned
+  // accumulation order (IEEE addition is not associative), so the
+  // coordinator MUST send the same leg order to every shard for
+  // bit-identical distributed scoring. A shard skips legs naming fields
+  // it does not have: its documents hold no postings there, so the
+  // fused scores are unchanged — the graceful path for a fleet
+  // mid-migration.
+  repeated Bm25FieldLeg fields = 9;
+}
+
+// One field's leg of a fused multi-field BM25 query.
+message Bm25FieldLeg {
+  // Field name ("body" for field 0).
+  string field = 1;
+  // Query terms under THIS field's analysis.
+  repeated string terms = 2;
+  // Global sum of this field's document lengths (avgdl_f numerator).
+  uint64 global_total_doc_length = 3;
+  // Global document frequency per term, parallel to `terms`.
+  repeated uint32 global_doc_frequencies = 4;
+  // Query-time weight w_f; 0 selects the default (1.0). Negative
+  // weights are INVALID_ARGUMENT.
+  float weight = 5;
+  // This field's BM25 k1; 0 selects the default (1.2).
+  float k1 = 6;
+  // This field's BM25 b; 0 selects the default (0.75).
+  float b = 7;
 }
 
 // A half-open span [start, end) in original-text coordinates.
@@ -734,6 +816,10 @@ message TermOccurrences {
   string term = 1;
   // Every occurrence span in original-text coordinates.
   repeated OffsetSpan offsets = 2;
+  // The field this term matched in. Empty on the single-field path
+  // (the body); fused multi-field hits name the field explicitly
+  // ("body" included).
+  string field = 3;
 }
 
 // One BM25 hit, highlight-ready.
@@ -798,7 +884,32 @@ message Bm25SearchRequest {
   // (e.g. the kth_best of a previous identical query, re-issued after
   // appends) seeds every shard, which then skips postings that provably
   // cannot reach it. 0 means unseeded (scores are always positive).
+  // For a fused query (`fields` non-empty) the floor applies to the
+  // fused score.
   float min_score = 4;
+  // Fused multi-field search (docs/multi-field.md): when non-empty
+  // these entries REPLACE the flat single-field query. `text` is
+  // analyzed once per entry under that entry's analysis and scored
+  // against its field; the fused score is the weighted per-field sum,
+  // accumulated in entry order. `analysis` (field 3) is then ignored.
+  repeated QueryField fields = 5;
+}
+
+// One field of a fused multi-field search.
+message QueryField {
+  // Field to score ("body" for the body field).
+  string field = 1;
+  // Analysis options for THIS field's query terms; MUST match the
+  // options the field was ingested with (term identity is per field).
+  AnalysisSpec analysis = 2;
+  // Query-time weight w_f; 0 selects the default (1.0).
+  float weight = 3;
+  // This field's BM25 k1; 0 selects the coordinator's configured
+  // default.
+  float k1 = 4;
+  // This field's BM25 b; 0 selects the coordinator's configured
+  // default.
+  float b = 5;
 }
 
 // Client-facing distributed BM25 response.
@@ -975,6 +1086,12 @@ message HybridShardRequest {
   float bm25_weight = 9;
   // RRF constant; 0 = default 60.
   float rrf_k = 10;
+  // BM25 k1 for the BM25 leg; 0 selects the default (1.2). The
+  // coordinator forwards its configured params; before this field the
+  // leg always scored with defaults regardless of tuning.
+  float k1 = 11;
+  // BM25 b for the BM25 leg; 0 selects the default (0.75).
+  float b = 12;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -1154,6 +1271,12 @@ message ShardLegsRequest {
   uint64 global_total_doc_length = 6;
   // Global per-term document frequencies for the BM25 leg.
   repeated uint32 global_doc_frequencies = 7;
+  // BM25 k1 for the BM25 leg; 0 selects the default (1.2). The
+  // coordinator forwards its configured params; before this field the
+  // leg always scored with defaults regardless of tuning.
+  float k1 = 8;
+  // BM25 b for the BM25 leg; 0 selects the default (0.75).
+  float b = 9;
 }
 
 // One raw leg hit.

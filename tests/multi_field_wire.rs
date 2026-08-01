@@ -1,0 +1,499 @@
+//! Multi-field wire acceptance (docs/multi-field.md, build order step
+//! 4): ingest through the mock sidecar with extra DocumentFields, then
+//! query fused through the coordinator.
+//!
+//! - Fused distributed == fused monolithic bitwise, heap-store AND
+//!   flushed-resident shapes (resident runs the fused pruned scorer,
+//!   the heap store its exhaustive fallback — the wire twin of the
+//!   pruned-equals-exhaustive gate);
+//! - reweighting reorders with no reindex; hits name their fields;
+//! - the fused kth-best seeds a lossless re-query floor;
+//! - per-field TermStats shares (zeros for fields a shard lacks);
+//! - ingest validation: unknown / duplicate / "body" / empty fields are
+//!   refused before any effect;
+//! - `Bm25Shard::open` maps every reader-supported format resident
+//!   (v5/v6 heap-loaded on restart before this increment);
+//! - ShardLegs k1/b reach the BM25 leg (compute_legs hardcoded
+//!   defaults before this increment).
+
+mod common;
+
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use turbovec_search::coordinator::CoordinatorServiceImpl;
+use turbovec_search::node::{Bm25Shard, NodeConfig};
+use turbovec_search::pb::node_service_client::NodeServiceClient;
+use turbovec_search::pb::{
+    AddDocumentsRequest, Bm25Hit, DocumentField, FieldTerms, FlushRequest, QueryField,
+    ShardLegsRequest, TermStatsRequest,
+};
+
+use common::{mock::start_mock_analysis, start_empty_node};
+
+/// The two-field corpus: (body, optional case name), split over two
+/// shards. "smith" appears in ONE body but several case names, so
+/// name-weighted queries reorder against body-only scoring.
+const CORPUS: [&[(&str, Option<&str>)]; 2] = [
+    &[
+        ("rust search rust fast", Some("Smith v Jones")),
+        ("vector search rust", None),
+        ("smith writes about rust", Some("Acme Corp v Rust Industries")),
+    ],
+    &[
+        ("search engines love rust", Some("Smith v Smith")),
+        ("vector vector vector", None),
+        ("rust", Some("In re Vector Holdings")),
+    ],
+];
+
+const OFFSETS: [u64; 2] = [0, 3];
+
+fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
+    AddDocumentsRequest {
+        text: body.to_string(),
+        analysis: None,
+        lineage: None,
+        fields: name
+            .map(|n| {
+                vec![DocumentField {
+                    field: "case_name".to_string(),
+                    text: n.to_string(),
+                    analysis: None,
+                }]
+            })
+            .unwrap_or_default(),
+    }
+}
+
+async fn add_documents(addr: &str, docs: &[(&str, Option<&str>)]) {
+    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
+    let (tx, rx) = mpsc::channel(8);
+    for (body, name) in docs {
+        tx.send(doc_request(body, *name)).await.unwrap();
+    }
+    drop(tx);
+    let resp = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.added as usize, docs.len());
+}
+
+fn two_field_node(analysis: &str, slot_offset: u64, index_path: Option<std::path::PathBuf>) -> NodeConfig {
+    NodeConfig {
+        slot_offset,
+        analysis_addr: Some(analysis.to_string()),
+        bm25_fields: vec!["body".to_string(), "case_name".to_string()],
+        index_path,
+        ..Default::default()
+    }
+}
+
+/// The fused query: body at weight 1, case_name at `w_name`.
+fn query_fields(w_name: f32) -> Vec<QueryField> {
+    vec![
+        QueryField {
+            field: "body".to_string(),
+            analysis: None,
+            weight: 1.0,
+            k1: 0.0,
+            b: 0.0,
+        },
+        QueryField {
+            field: "case_name".to_string(),
+            analysis: None,
+            weight: w_name,
+            k1: 0.0,
+            b: 0.0,
+        },
+    ]
+}
+
+fn hit_signature(hits: &[Bm25Hit]) -> Vec<(u64, u32)> {
+    hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fused_distributed_equals_monolithic_over_the_wire() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvmfw_dist_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // In-memory shards + monolith: the heap-store shape, whose fused
+    // route takes the exhaustive fallback (no impact surface).
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for (i, docs) in CORPUS.iter().enumerate() {
+        let (addr, handle) = start_empty_node(two_field_node(&analysis, OFFSETS[i], None)).await;
+        add_documents(&addr, docs).await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let (mono_addr, mono) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    let all: Vec<(&str, Option<&str>)> = CORPUS.concat();
+    add_documents(&mono_addr, &all).await;
+
+    let distributed = CoordinatorServiceImpl::new(addrs.clone())
+        .with_bm25(Some(analysis.clone()), Default::default());
+    let monolithic = CoordinatorServiceImpl::new(vec![mono_addr.clone()])
+        .with_bm25(Some(analysis.clone()), Default::default());
+
+    let queries = ["smith", "rust smith", "vector", "holdings rust", "nothing"];
+    let heap_runs: Vec<Vec<Bm25Hit>> = {
+        let mut runs = Vec::new();
+        for text in queries {
+            for k in [3u32, 6] {
+                let got = distributed
+                    .fanout_bm25_fused(text, k, &query_fields(2.0), 0.0)
+                    .await
+                    .unwrap();
+                let want = monolithic
+                    .fanout_bm25_fused(text, k, &query_fields(2.0), 0.0)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    hit_signature(&got),
+                    hit_signature(&want),
+                    "heap shape, query {text:?} k={k}: distributed != monolithic"
+                );
+                runs.push(got);
+            }
+        }
+        runs
+    };
+
+    // Hits name their fields; a case-name term matched under
+    // "case_name", body terms under "body".
+    let smith_hits = &heap_runs[0];
+    assert!(!smith_hits.is_empty());
+    let named: Vec<&str> = smith_hits[0]
+        .terms
+        .iter()
+        .map(|t| t.field.as_str())
+        .collect();
+    assert!(
+        named.contains(&"case_name"),
+        "top smith hit should match the name field, got {named:?}"
+    );
+
+    // Muting = OMITTING the entry (0 means "default 1.0" on the wire,
+    // like every other weight in the proto): a body-only query sees
+    // just doc 2 ("smith writes about rust"); adding the name leg
+    // brings the name-only matches in, and weight changes the order
+    // with no reindex.
+    let body_only = distributed
+        .fanout_bm25_fused("smith", 6, &query_fields(1.0)[..1], 0.0)
+        .await
+        .unwrap();
+    assert_eq!(body_only.len(), 1, "one body mentions smith: {body_only:?}");
+    assert_eq!(body_only[0].doc_id, 2);
+    let weighted = distributed
+        .fanout_bm25_fused("smith", 6, &query_fields(2.0), 0.0)
+        .await
+        .unwrap();
+    assert!(
+        weighted.len() > body_only.len(),
+        "name matches must join the fused list"
+    );
+    // At a heavy name weight the name-matching docs outrank the body
+    // match; at a feather weight the body match leads.
+    let heavy = distributed
+        .fanout_bm25_fused("smith", 6, &query_fields(50.0), 0.0)
+        .await
+        .unwrap();
+    assert_ne!(
+        heavy[0].doc_id,
+        distributed
+            .fanout_bm25_fused("smith", 6, &query_fields(0.01), 0.0)
+            .await
+            .unwrap()[0]
+            .doc_id,
+        "weights must reorder the fused list"
+    );
+
+    // The fused kth-best seeds a lossless re-query.
+    let full = distributed
+        .fanout_bm25_fused("rust smith", 6, &query_fields(2.0), 0.0)
+        .await
+        .unwrap();
+    assert!(full.len() >= 2);
+    let seed = turbovec_search::bm25::floor_seed(full.last().unwrap().score);
+    let seeded = distributed
+        .fanout_bm25_fused("rust smith", 6, &query_fields(2.0), seed)
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_signature(&full),
+        hit_signature(&seeded),
+        "seeding at the fused kth-best must lose nothing"
+    );
+
+    // Per-field TermStats shares on shard 0: case_name df("smith") = 2
+    // ("Smith v Jones", "Acme Corp v Rust Industries" has none — only
+    // the first), body df("smith") = 1; an unknown field answers zeros.
+    let mut c0 = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
+    let stats = c0
+        .term_stats(TermStatsRequest {
+            terms: vec!["smith".into()],
+            fields: vec![
+                FieldTerms {
+                    field: "case_name".into(),
+                    terms: vec!["smith".into(), "jones".into()],
+                },
+                FieldTerms {
+                    field: "docket".into(),
+                    terms: vec!["smith".into()],
+                },
+            ],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stats.doc_frequencies, vec![1], "body df on shard 0");
+    assert_eq!(stats.field_stats.len(), 2);
+    assert_eq!(
+        stats.field_stats[0].doc_frequencies,
+        vec![1, 1],
+        "case_name dfs on shard 0 (mock lowercases nothing; names are ingested verbatim)"
+    );
+    assert!(stats.field_stats[0].total_doc_length > 0);
+    assert_eq!(
+        stats.field_stats[1].doc_frequencies,
+        vec![0],
+        "unknown field answers zeros — that IS its share"
+    );
+    assert_eq!(stats.field_stats[1].total_doc_length, 0);
+
+    // A second, PERSISTED cluster with the same corpus: after Flush the
+    // shards go resident (v6 + impact surface, the fused PRUNED path)
+    // and must reproduce the heap cluster's runs bit for bit — the wire
+    // twin of pruned-equals-exhaustive.
+    let mut r_addrs = Vec::new();
+    let mut r_handles = Vec::new();
+    for (i, docs) in CORPUS.iter().enumerate() {
+        let (addr, handle) = start_empty_node(two_field_node(
+            &analysis,
+            OFFSETS[i],
+            Some(dir.join(format!("shard{i}.tv"))),
+        ))
+        .await;
+        add_documents(&addr, docs).await;
+        let mut c = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        let flushed = c.flush(FlushRequest {}).await.unwrap().into_inner();
+        assert!(flushed.written);
+        r_addrs.push(addr);
+        r_handles.push(handle);
+    }
+    let resident = CoordinatorServiceImpl::new(r_addrs.clone())
+        .with_bm25(Some(analysis.clone()), Default::default());
+    let mut i = 0;
+    for text in queries {
+        for k in [3u32, 6] {
+            let got = resident
+                .fanout_bm25_fused(text, k, &query_fields(2.0), 0.0)
+                .await
+                .unwrap();
+            assert_eq!(
+                hit_signature(&got),
+                hit_signature(&heap_runs[i]),
+                "resident (pruned) shape diverged from heap shape: {text:?} k={k}"
+            );
+            i += 1;
+        }
+    }
+
+    for h in handles.into_iter().chain(r_handles) {
+        h.abort();
+    }
+    mono.abort();
+    mock.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ingest validation fails BEFORE any store or WAL effect: unknown
+/// field names, duplicates, "body", and empty field text are all
+/// INVALID_ARGUMENT, and a valid retry lands on a clean shard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_field_ingest_validation_refuses_bad_fields() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    let client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+
+    let send_one = |req: AddDocumentsRequest| {
+        let mut client = client.clone();
+        async move {
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(req).await.unwrap();
+            drop(tx);
+            client.add_documents(ReceiverStream::new(rx)).await
+        }
+    };
+
+    let bad = |field: &str, text: &str| AddDocumentsRequest {
+        text: "a body".to_string(),
+        analysis: None,
+        lineage: None,
+        fields: vec![DocumentField {
+            field: field.to_string(),
+            text: text.to_string(),
+            analysis: None,
+        }],
+    };
+    for (req, why) in [
+        (bad("docket", "x"), "unknown field"),
+        (bad("body", "x"), "body named as an extra field"),
+        (bad("case_name", ""), "empty field text"),
+        (
+            AddDocumentsRequest {
+                fields: vec![
+                    bad("case_name", "x").fields.remove(0),
+                    bad("case_name", "y").fields.remove(0),
+                ],
+                ..bad("case_name", "x")
+            },
+            "duplicate field",
+        ),
+    ] {
+        let err = send_one(req).await.expect_err(why);
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "{why}: {}",
+            err.message()
+        );
+    }
+
+    // Nothing landed; a valid document still ingests cleanly.
+    let ok = send_one(doc_request("clean body", Some("Good v Name")))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((ok.added, ok.total, ok.first_id), (1, 1, 0));
+
+    node.abort();
+    mock.abort();
+}
+
+/// `Bm25Shard::open` maps every reader-supported format disk-resident.
+/// v5/v6 were missing from its magic list, so a RESTARTED node heap
+/// loaded its whole postings file and lost the impact surface — at real
+/// shard sizes the exact failure the resident reader prevents.
+#[test]
+fn bm25_shard_open_maps_current_formats_resident() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvmfw_open_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut store = turbovec_search::postings::Bm25Store::with_fields(&["body", "case_name"]);
+    for i in 0..40u32 {
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            turbovec_search::postings::AnalyzedDoc::body(
+                vec![("court".to_string(), 1 + i % 3, vec![(0, 5)])],
+                1 + i % 3,
+            ),
+        );
+    }
+
+    let v6 = dir.join("v6.bm25");
+    store.save(&v6).unwrap();
+    assert!(
+        matches!(Bm25Shard::open(&v6).unwrap(), Bm25Shard::Resident(_)),
+        "a v6 file must open disk-resident"
+    );
+
+    // v5 carries exactly one field; build the oracle file from a
+    // single-field store.
+    let mut single = turbovec_search::postings::Bm25Store::new();
+    for i in 0..40u32 {
+        single.add_document(
+            i,
+            format!("doc {i}"),
+            turbovec_search::postings::AnalyzedDoc::body(
+                vec![("court".to_string(), 1 + i % 3, vec![(0, 5)])],
+                1 + i % 3,
+            ),
+        );
+    }
+    let v5 = dir.join("v5.bm25");
+    single.save_v5(&v5).unwrap();
+    assert!(
+        matches!(Bm25Shard::open(&v5).unwrap(), Bm25Shard::Resident(_)),
+        "a v5 file must open disk-resident"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ShardLegs BM25 params reach scoring: non-default k1/b change the
+/// leg's scores. Before this increment `compute_legs` hardcoded the
+/// defaults, so tuning silently never reached the hybrid paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_legs_bm25_params_reach_scoring() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addr, node) = start_empty_node(NodeConfig {
+        analysis_addr: Some(analysis.clone()),
+        ..Default::default()
+    })
+    .await;
+    // Different document lengths so b has something to normalize.
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let (tx, rx) = mpsc::channel(8);
+    for text in [
+        "court",
+        "court appeals court ruling on appeal",
+        "court of appeals for the ninth circuit en banc",
+    ] {
+        tx.send(AddDocumentsRequest {
+            text: text.to_string(),
+            analysis: None,
+            lineage: None,
+            fields: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+    drop(tx);
+    client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap();
+
+    let legs = |k1: f32, b: f32| {
+        let mut client = client.clone();
+        async move {
+            client
+                .shard_legs(ShardLegsRequest {
+                    request_id: String::new(),
+                    k: 3,
+                    vector: Vec::new(),
+                    terms: vec!["court".to_string()],
+                    global_doc_count: 3,
+                    global_total_doc_length: 16,
+                    global_doc_frequencies: vec![3],
+                    k1,
+                    b,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .bm25_hits
+        }
+    };
+    let defaults = legs(0.0, 0.0).await;
+    let tuned = legs(2.5, 0.99).await;
+    assert_eq!(defaults.len(), 3);
+    assert_eq!(tuned.len(), 3);
+    assert!(
+        defaults
+            .iter()
+            .zip(&tuned)
+            .any(|(d, t)| d.score.to_bits() != t.score.to_bits()),
+        "k1/b must reach the BM25 leg's scores"
+    );
+
+    node.abort();
+    mock.abort();
+}
