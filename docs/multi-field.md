@@ -238,10 +238,21 @@ are comparable end to end, by construction.
    dimension; v6 writer/reader with n_fields = 1 proving byte-level parity
    of sections and identical query results against v5. LANDED: `AnalyzedDoc`
    is per-field (`AnalyzedField`), the store is `Vec<FieldStore>` behind the
-   unchanged single-field surface, `save_v6`/`Bm25Reader::open` round-trip
-   the format, and `tests/v6_format.rs` plus the postings section-parity
-   test pin the contract. v5 stays the save default until step 4.
+   unchanged single-field surface, the v6 writer and `Bm25Reader::open`
+   round-trip the format, and `tests/v6_format.rs` plus the postings
+   section-parity test pin the contract.
 2. Multi-field store + reader + exhaustive scorer; contract 3 tests.
+   LANDED, with the writer half of step 4 pulled forward: `with_fields` /
+   `create_with_fields` construction, per-field reader views
+   (`Bm25Store::field` / `Bm25Reader::field`, each its own `Bm25Index`
+   served by the unchanged v5 machinery), the fused weighted-sum scorer
+   `top_k_fused_exhaustive` (accumulation pinned field-id then
+   term-index; contract 3 proven at the store level against per-field
+   merged global stats), the per-field `SpillBuilder`, and v6 IS the
+   format: `save` and `finish` write v6 everywhere, dual-writer byte
+   identity holds on multi-field corpora, and the v5 writer survives
+   only as `save_v5`, the oracle for the parity and query-identity
+   tests.
 3. Per-field skip runs + pruned fused scorer; contract 2 tests.
 4. Wire + WAL + ingest + reshard replay; corpus extraction grows a second
    real field (case name from the cluster metadata) to have something

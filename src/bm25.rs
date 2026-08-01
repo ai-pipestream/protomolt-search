@@ -364,6 +364,84 @@ pub fn top_k_exhaustive(
     docs
 }
 
+/// One field's slice of a fused multi-field query
+/// (`docs/multi-field.md`): the field's index view, its query terms
+/// under the FIELD'S analysis (term identity is per field), its global
+/// per-field stats (shared N, per-field total length and dfs), its
+/// per-field k1/b, and the query-time weight.
+pub struct FieldQuery<'a> {
+    /// The field's index (`Bm25Store::field` / `Bm25Reader::field`).
+    pub index: &'a dyn Bm25Index,
+    /// Query terms analyzed with this field's spec.
+    pub terms: &'a [String],
+    /// Global stats for this field, in `terms` order.
+    pub stats: CorpusStats,
+    /// This field's k1/b.
+    pub params: Bm25Params,
+    /// Query-time weight w_f.
+    pub weight: f64,
+}
+
+/// One document scored by the fused weighted per-field sum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedDoc {
+    /// Local doc id.
+    pub doc_id: u32,
+    /// `sum over fields f of w_f * bm25_f(q, d)`.
+    pub score: f64,
+    /// `(field id, term index within that field's terms, offsets)` for
+    /// the (field, term) pairs present in this doc.
+    pub term_offsets: Vec<(usize, usize, Vec<(u32, u32)>)>,
+}
+
+/// The fused multi-field exhaustive scorer (`docs/multi-field.md`):
+/// weighted per-field sum, each field saturating independently (NOT
+/// true BM25F), so every single-field contract holds per field
+/// unchanged and floors decompose into weighted per-field bounds.
+///
+/// Determinism rule: contributions accumulate in field-id order, and
+/// within a field in term-index order — IEEE addition is not
+/// associative, and the fused pruned scorer (build order step 3) must
+/// reproduce these exact bits. With one field at weight 1.0 the result
+/// is bit-identical to [`top_k_exhaustive`] (`1.0 * x == x` exactly).
+pub fn top_k_fused_exhaustive(fields: &[FieldQuery], k: usize) -> Vec<FusedDoc> {
+    type Hits = Vec<(usize, usize, Vec<(u32, u32)>)>;
+    let mut scores: std::collections::HashMap<u32, (f64, Hits)> = std::collections::HashMap::new();
+    for (fi, fq) in fields.iter().enumerate() {
+        debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
+        let avgdl = fq.stats.avgdl();
+        for (ti, term) in fq.terms.iter().enumerate() {
+            if fq.stats.dfs[ti] == 0 {
+                continue;
+            }
+            let idf = idf(fq.stats.doc_count, fq.stats.dfs[ti]);
+            fq.index.for_each_posting(term, &mut |doc_id, tf, offsets| {
+                let contribution =
+                    fq.weight * idf * tf_norm(fq.params, tf, fq.index.doc_length(doc_id), avgdl);
+                let entry = scores.entry(doc_id).or_default();
+                entry.0 += contribution;
+                entry.1.push((fi, ti, offsets.to_vec()));
+            });
+        }
+    }
+    let mut docs: Vec<FusedDoc> = scores
+        .into_iter()
+        .map(|(doc_id, (score, term_offsets))| FusedDoc {
+            doc_id,
+            score,
+            term_offsets,
+        })
+        .collect();
+    docs.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    docs.truncate(k);
+    docs
+}
+
 /// Skip accounting for [`top_k_pruned_stats`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PruneStats {
@@ -859,7 +937,7 @@ pub fn merge_stats(shares: &[(u64, u64, Vec<u32>)]) -> CorpusStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::postings::{AnalyzedDoc, Bm25Store};
+    use crate::postings::{AnalyzedDoc, AnalyzedField, Bm25Store};
 
     /// Hand-computed BM25 on a 3-doc corpus (N=3, avgdl=3):
     /// doc0 "rust rust search", doc1 "rust vector vector", doc2 "search".
@@ -954,5 +1032,292 @@ mod tests {
             10,
         );
         assert!(hits.is_empty());
+    }
+
+    /// A single body field at weight 1.0 fuses to exactly the
+    /// single-field exhaustive scorer, bit for bit (`1.0 * x == x`).
+    #[test]
+    fn fused_single_field_matches_exhaustive_bitwise() {
+        let mut store = Bm25Store::new();
+        for i in 0..30u32 {
+            let terms = vec![
+                ("rust".to_string(), 1 + i % 3, vec![(i, i + 4)]),
+                (format!("t{}", i % 5), 1, vec![(i + 6, i + 8)]),
+            ];
+            let length = terms.iter().map(|t| t.1).sum();
+            store.add_document(i, format!("doc {i}"), AnalyzedDoc::body(terms, length));
+        }
+        let terms = vec!["rust".to_string(), "t2".to_string()];
+        let stats = CorpusStats {
+            doc_count: store.doc_count(),
+            total_doc_length: store.total_doc_length(),
+            dfs: terms.iter().map(|t| store.df(t)).collect(),
+        };
+        let params = Bm25Params { k1: 0.9, b: 0.4 };
+
+        let want = top_k_exhaustive(&store, &terms, &stats, params, 10);
+        let fused = top_k_fused_exhaustive(
+            &[FieldQuery {
+                index: &store,
+                terms: &terms,
+                stats: stats.clone(),
+                params,
+                weight: 1.0,
+            }],
+            10,
+        );
+        assert_eq!(fused.len(), want.len());
+        for (f, w) in fused.iter().zip(&want) {
+            assert_eq!(f.doc_id, w.doc_id);
+            assert_eq!(f.score.to_bits(), w.score.to_bits(), "doc {}", w.doc_id);
+            let mapped: Vec<(usize, usize, Vec<(u32, u32)>)> = w
+                .term_offsets
+                .iter()
+                .map(|(ti, o)| (0, *ti, o.clone()))
+                .collect();
+            assert_eq!(f.term_offsets, mapped, "doc {}", w.doc_id);
+        }
+    }
+
+    /// Hand-computed fused scores on a two-field corpus, per-field
+    /// params and query-time weights included; the expectation is
+    /// accumulated in the pinned field-id-then-term-index order, so the
+    /// comparison is bitwise. Reweighting reorders without a rebuild.
+    #[test]
+    fn fused_two_fields_hand_computed() {
+        let mut store = Bm25Store::with_fields(&["body", "name"]);
+        // doc0: body "rust rust search", name "smith"
+        store.add_document(
+            0,
+            "a".to_string(),
+            AnalyzedDoc {
+                fields: vec![
+                    AnalyzedField {
+                        terms: vec![("rust".into(), 2, vec![(0, 4)]), ("search".into(), 1, vec![])],
+                        length: 3,
+                    },
+                    AnalyzedField {
+                        terms: vec![("smith".into(), 1, vec![(0, 5)])],
+                        length: 1,
+                    },
+                ],
+            },
+        );
+        // doc1: body "rust vector vector", no name
+        store.add_document(
+            1,
+            "b".to_string(),
+            AnalyzedDoc::body(
+                vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])],
+                3,
+            ),
+        );
+        // doc2: body "search", name "rust smith"
+        store.add_document(
+            2,
+            "c".to_string(),
+            AnalyzedDoc {
+                fields: vec![
+                    AnalyzedField {
+                        terms: vec![("search".into(), 1, vec![])],
+                        length: 1,
+                    },
+                    AnalyzedField {
+                        terms: vec![("rust".into(), 1, vec![(0, 4)]), ("smith".into(), 1, vec![])],
+                        length: 2,
+                    },
+                ],
+            },
+        );
+
+        let body_terms = vec!["rust".to_string()];
+        let name_terms = vec!["rust".to_string(), "smith".to_string()];
+        let body_params = Bm25Params::default();
+        let name_params = Bm25Params { k1: 0.5, b: 0.0 };
+        // N shared; totals and dfs per field.
+        let body_stats = CorpusStats {
+            doc_count: 3,
+            total_doc_length: 7,
+            dfs: vec![2],
+        };
+        let name_stats = CorpusStats {
+            doc_count: 3,
+            total_doc_length: 3,
+            dfs: vec![1, 2],
+        };
+        let fused = |w_name: f64| {
+            top_k_fused_exhaustive(
+                &[
+                    FieldQuery {
+                        index: &store.field(0),
+                        terms: &body_terms,
+                        stats: body_stats.clone(),
+                        params: body_params,
+                        weight: 1.0,
+                    },
+                    FieldQuery {
+                        index: &store.field(1),
+                        terms: &name_terms,
+                        stats: name_stats.clone(),
+                        params: name_params,
+                        weight: w_name,
+                    },
+                ],
+                10,
+            )
+        };
+
+        let hits = fused(2.0);
+        assert_eq!(hits.len(), 3);
+        // Expectations in the pinned accumulation order.
+        let body_avgdl = body_stats.avgdl();
+        let name_avgdl = name_stats.avgdl();
+        // doc2: no body hit; name rust then name smith.
+        let d2 = 2.0 * idf(3, 1) * tf_norm(name_params, 1, 2, name_avgdl)
+            + 2.0 * idf(3, 2) * tf_norm(name_params, 1, 2, name_avgdl);
+        // doc0: body rust, then name smith.
+        let d0 = 1.0 * idf(3, 2) * tf_norm(body_params, 2, 3, body_avgdl)
+            + 2.0 * idf(3, 2) * tf_norm(name_params, 1, 1, name_avgdl);
+        // doc1: body rust only.
+        let d1 = 1.0 * idf(3, 2) * tf_norm(body_params, 1, 3, body_avgdl);
+        assert_eq!(hits[0].doc_id, 2);
+        assert_eq!(hits[0].score.to_bits(), d2.to_bits());
+        assert_eq!(
+            hits[0].term_offsets,
+            vec![(1, 0, vec![(0, 4)]), (1, 1, vec![])]
+        );
+        assert_eq!(hits[1].doc_id, 0);
+        assert_eq!(hits[1].score.to_bits(), d0.to_bits());
+        assert_eq!(hits[2].doc_id, 1);
+        assert_eq!(hits[2].score.to_bits(), d1.to_bits());
+
+        // The name field dominant at w=2.0, near-mute at w=0.1: the
+        // ranking flips with no index change.
+        let hits = fused(0.1);
+        assert_eq!(hits[0].doc_id, 0);
+        assert_eq!(hits[1].doc_id, 1);
+        assert_eq!(hits[2].doc_id, 2);
+    }
+
+    /// Contract 3 of `docs/multi-field.md` at the store level: fused
+    /// multi-field scoring over two shard stores with per-field GLOBAL
+    /// stats, merged by (score desc, global id asc), equals monolithic
+    /// fused scoring of the union corpus bit for bit.
+    #[test]
+    fn fused_distributed_equals_monolithic() {
+        // The document for global id `g`, identical however the corpus
+        // is sharded.
+        fn doc_for(g: u32) -> AnalyzedDoc {
+            let body = vec![
+                ("rust".to_string(), 1 + g % 3, vec![(g, g + 2)]),
+                (format!("t{}", g % 4), 1, vec![(g + 3, g + 5)]),
+            ];
+            let body_len: u32 = body.iter().map(|t| t.1).sum();
+            let mut fields = vec![AnalyzedField {
+                terms: body,
+                length: body_len,
+            }];
+            if g % 3 != 1 {
+                fields.push(AnalyzedField {
+                    terms: vec![
+                        ("smith".to_string(), 1, vec![(0, 5)]),
+                        (format!("n{}", g % 2), 1, vec![]),
+                    ],
+                    length: 2,
+                });
+            }
+            AnalyzedDoc { fields }
+        }
+        fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
+            let mut store = Bm25Store::with_fields(&["body", "name"]);
+            for g in range {
+                store.add_document(g - offset, format!("doc {g}"), doc_for(g));
+            }
+            store
+        }
+        let monolith = build(0..50, 0);
+        let shards = [(build(0..23, 0), 0u32), (build(23..50, 23), 23u32)];
+
+        let body_terms = vec!["rust".to_string(), "t2".to_string()];
+        let name_terms = vec!["smith".to_string(), "n1".to_string()];
+        let body_params = Bm25Params::default();
+        let name_params = Bm25Params { k1: 0.8, b: 0.3 };
+        let weights = [1.0, 1.7];
+
+        // Per-field global stats from per-shard shares (the TermStats
+        // flow): N is the shared any-field count, totals and dfs are
+        // per field.
+        let field_stats = |f: usize, terms: &[String]| {
+            let shares: Vec<(u64, u64, Vec<u32>)> = shards
+                .iter()
+                .map(|(s, _)| {
+                    (
+                        s.doc_count(),
+                        s.field(f).total_doc_length(),
+                        terms.iter().map(|t| s.field(f).df(t)).collect(),
+                    )
+                })
+                .collect();
+            merge_stats(&shares)
+        };
+        let body_stats = field_stats(0, &body_terms);
+        let name_stats = field_stats(1, &name_terms);
+        assert_eq!(body_stats.doc_count, monolith.doc_count());
+        assert_eq!(
+            body_stats.total_doc_length,
+            monolith.field(0).total_doc_length()
+        );
+        assert_eq!(
+            name_stats.total_doc_length,
+            monolith.field(1).total_doc_length()
+        );
+
+        let k = 12;
+        let run = |store: &Bm25Store| {
+            top_k_fused_exhaustive(
+                &[
+                    FieldQuery {
+                        index: &store.field(0),
+                        terms: &body_terms,
+                        stats: body_stats.clone(),
+                        params: body_params,
+                        weight: weights[0],
+                    },
+                    FieldQuery {
+                        index: &store.field(1),
+                        terms: &name_terms,
+                        stats: name_stats.clone(),
+                        params: name_params,
+                        weight: weights[1],
+                    },
+                ],
+                k,
+            )
+        };
+
+        let want = run(&monolith);
+        let mut merged: Vec<FusedDoc> = shards
+            .iter()
+            .flat_map(|(s, offset)| {
+                run(s).into_iter().map(move |mut d| {
+                    d.doc_id += offset;
+                    d
+                })
+            })
+            .collect();
+        merged.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.doc_id.cmp(&b.doc_id))
+        });
+        merged.truncate(k);
+
+        assert_eq!(want.len(), merged.len());
+        for (w, m) in want.iter().zip(&merged) {
+            assert_eq!(w.doc_id, m.doc_id);
+            assert_eq!(w.score.to_bits(), m.score.to_bits(), "doc {}", w.doc_id);
+            assert_eq!(w.term_offsets, m.term_offsets, "doc {}", w.doc_id);
+        }
     }
 }
