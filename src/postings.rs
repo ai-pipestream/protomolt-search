@@ -2375,6 +2375,141 @@ fn validate_v5_directory(
     Ok(())
 }
 
+/// Statistics from one [`transcode_to_v5`] run.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscodeStats {
+    /// Terms transcoded.
+    pub n_terms: u32,
+    /// Document slots carried over.
+    pub n_slots: u32,
+    /// Postings walked.
+    pub postings: u64,
+    /// Source file size in bytes.
+    pub bytes_in: u64,
+    /// Output file size in bytes.
+    pub bytes_out: u64,
+}
+
+/// Rewrite a v3/v4 `.bm25` file as v5 (`TVBM2505`) without re-analysis:
+/// the shared sections (doc_lengths, texts, text_index, lineages) are
+/// byte-copied from the source map, and each term's interleaved v3/v4
+/// postings are re-run into the v5 doc/occurrence/skip runs in one
+/// streaming pass (the v4 occurrence pair encoding IS the v5
+/// occurrence-run encoding, so occurrence bytes are copied, not
+/// decoded). Heap per term is the staged occurrence bytes plus the
+/// skip builder's O(1) state, so a 50 GB shard transcodes in one
+/// sequential read + write.
+///
+/// The output is byte-identical to what [`Bm25Store::save`] would
+/// write for the same corpus (pinned by test), so everything proven of
+/// written-v5 files (dual-writer identity, pruned == exhaustive) holds
+/// of transcoded ones. The source must be v3 or v4; the write is
+/// atomic (tmp + rename) and the source is not modified.
+pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
+    use std::io::Seek;
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+    let reader = Bm25Reader::open(src)?;
+    if reader.v5_runs {
+        return Err(invalid("source is already v5 or v6"));
+    }
+    let map: &[u8] = &reader.map;
+    let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().unwrap());
+    let total_length = u64::from_le_bytes(map[8..16].try_into().unwrap());
+    let texts_off = u64::from_le_bytes(map[16..24].try_into().unwrap());
+    let lineages_off = u64::from_le_bytes(map[24..32].try_into().unwrap());
+    let postings_off = u64::from_le_bytes(map[32..40].try_into().unwrap());
+    let n_slots = u32_at(48);
+    let n_terms = reader.n_terms;
+
+    let tmp = dst.with_extension("bm25tmp");
+    let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
+    w.write_all(MAGIC_V5)?;
+    write_u64(&mut w, total_length)?;
+    write_u64(&mut w, texts_off)?;
+    write_u64(&mut w, lineages_off)?;
+    write_u64(&mut w, postings_off)?;
+    write_u64(&mut w, 0)?; // directory_off, patched after the postings pass
+    write_u32(&mut w, n_slots)?;
+    // Shared sections: identical bytes in v3/v4/v5, at identical
+    // offsets (the header is the same 52 bytes), so the text index's
+    // absolute offsets stay valid verbatim.
+    w.write_all(&map[52..postings_off as usize])?;
+
+    write_u32(&mut w, n_terms)?;
+    let mut directory: Vec<(u64, u64, u64, u32)> = Vec::with_capacity(n_terms as usize);
+    let mut cursor = postings_off + 4;
+    let mut postings_walked = 0u64;
+    for i in 0..n_terms {
+        let (_, term_off, df) = reader.directory_entry(i);
+        // Step over the term's inline header: u32 len, term, u32 count.
+        let term_len = u32_at(term_off as usize) as usize;
+        let mut p = term_off as usize + 4 + term_len + 4;
+        let doc_run_off = cursor;
+        let mut occ_stage: Vec<u8> = Vec::new();
+        let mut skip_l0: Vec<u8> = Vec::new();
+        let mut skip = SkipRunBuilder::new();
+        let mut occ_start = 0u32;
+        for _ in 0..df {
+            let doc_id = u32_at(p);
+            let tf = u32_at(p + 4);
+            let n_offsets = u32_at(p + 8) as usize;
+            write_u32(&mut w, doc_id)?;
+            write_u32(&mut w, tf)?;
+            write_u32(&mut w, occ_start)?;
+            occ_stage.extend_from_slice(&map[p + 12..p + 12 + 8 * n_offsets]);
+            skip.push(tf, reader.doc_length(doc_id), doc_id, &mut skip_l0)?;
+            occ_start = occ_start
+                .checked_add(n_offsets as u32)
+                .ok_or_else(|| invalid("occurrence run exceeds u32 pairs"))?;
+            p += 12 + 8 * n_offsets;
+        }
+        write_u32(&mut w, occ_start)?; // sentinel
+        w.write_all(&occ_stage)?;
+        let (l0_bytes, l1) = skip.finish(&mut skip_l0)?;
+        debug_assert_eq!(l0_bytes, skip_l0.len() as u64);
+        let occ_run_off = doc_run_off + 12 * u64::from(df) + 4;
+        let skip_run_off = occ_run_off + occ_stage.len() as u64;
+        write_skip_run(&mut w, &skip_l0, &l1)?;
+        directory.push((doc_run_off, skip_run_off, occ_run_off, df));
+        cursor = skip_run_off + skip_run_size(l0_bytes, &l1);
+        postings_walked += u64::from(df);
+    }
+    let directory_off = cursor;
+    write_u32(&mut w, n_terms)?;
+    let mut blob_off = 0u64; // relative to the term blob start
+    for (i, &(doc_off, skip_off, occ_off, df)) in directory.iter().enumerate() {
+        let (term, _, _) = reader.directory_entry(i as u32);
+        write_u64(&mut w, doc_off)?;
+        write_u64(&mut w, skip_off)?;
+        write_u64(&mut w, occ_off)?;
+        write_u32(&mut w, df)?;
+        write_u32(&mut w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
+        write_u16(&mut w, term.len() as u16)?;
+        blob_off += term.len() as u64;
+    }
+    for i in 0..n_terms {
+        let (term, _, _) = reader.directory_entry(i);
+        w.write_all(term)?;
+    }
+    w.flush()?;
+    let mut f = w
+        .into_inner()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let bytes_out = f.stream_position()?;
+    f.seek(io::SeekFrom::Start(40))?;
+    f.write_all(&directory_off.to_le_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, dst)?;
+    Ok(TranscodeStats {
+        n_terms,
+        n_slots,
+        postings: postings_walked,
+        bytes_in: map.len() as u64,
+        bytes_out,
+    })
+}
+
 /// Validate the text index: every present entry within the texts
 /// section, absent markers untouched. `entry_base` rebases stored
 /// offsets: the entries are absolute in v3/v4/v5 (base 0) and relative
@@ -2571,6 +2706,23 @@ impl Bm25Reader {
     /// The next local doc id (number of document slots).
     pub fn next_doc_id(&self) -> u32 {
         self.doc_lengths.len() as u32
+    }
+
+    /// Number of terms in the directory.
+    pub fn term_count(&self) -> u32 {
+        self.n_terms
+    }
+
+    /// The `i`th term in directory (sorted) order. Panics when out of
+    /// range; verification tooling only.
+    pub fn term_at(&self, i: u32) -> String {
+        assert!(i < self.n_terms, "term index {i} out of range");
+        let bytes = if self.v5_runs {
+            self.directory_entry_v5(i).0
+        } else {
+            self.directory_entry(i).0
+        };
+        String::from_utf8_lossy(bytes).into_owned()
     }
 
     /// Open a v3/v4/v5/v6 `.bm25` file read-only after full structural
@@ -4213,6 +4365,54 @@ mod tests {
         assert_eq!(loaded.fields[0].total_length, store.fields[0].total_length);
         assert_eq!(loaded.texts, store.texts);
         assert_eq!(loaded.lineages, store.lineages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The transcoder's contract: transcoding the v4 file of a corpus
+    /// produces byte-for-byte the v5 file the direct writer emits, on
+    /// a gappy/lineaged corpus and on one whose hot term spans
+    /// multiple level-1 skip groups (df > 4096).
+    #[test]
+    fn transcode_v4_matches_direct_v5_bytes() {
+        let dir = test_dir("transcode");
+        let hot_store = {
+            let mut store = Bm25Store::new();
+            for i in 0..4300u32 {
+                let tf = 1 + i % 3;
+                let mut terms: DocTerms = vec![("hot".to_string(), tf, vec![(i, i + 2)])];
+                if i % 5 == 0 {
+                    terms.push((format!("t{}", i % 7), 1, Vec::new()));
+                }
+                let length = terms.iter().map(|t| t.1).sum();
+                store.add_document(i * 2, format!("doc {i}"), AnalyzedDoc::body(terms, length));
+            }
+            store
+        };
+        for (tag, store) in [("synthetic", synthetic_store()), ("hot", hot_store)] {
+            let v4_path = dir.join(format!("{tag}.v4.bm25"));
+            {
+                let mut w = io::BufWriter::new(std::fs::File::create(&v4_path).unwrap());
+                store.write_v4_for_bench(&mut w).unwrap();
+                w.flush().unwrap();
+            }
+            let v5_path = dir.join(format!("{tag}.v5.bm25"));
+            let stats = transcode_to_v5(&v4_path, &v5_path).unwrap();
+            assert_eq!(stats.n_slots, store.next_doc_id(), "{tag}: n_slots");
+            let mut direct = Vec::new();
+            store.write_to(&mut direct).unwrap();
+            let transcoded = std::fs::read(&v5_path).unwrap();
+            assert_eq!(transcoded.len(), direct.len(), "{tag}: sizes differ");
+            assert!(
+                transcoded == direct,
+                "{tag}: transcoded v5 is not byte-identical to the direct writer"
+            );
+            // And it serves as v5, block-max surface included.
+            let reader = Bm25Reader::open(&v5_path).unwrap();
+            let probe = if tag == "hot" { "hot" } else { "court" };
+            assert!(reader.has_impacts(probe), "{tag}: no impacts on {probe}");
+            // Transcoding a v5 file is refused.
+            assert!(transcode_to_v5(&v5_path, &dir.join("again.bm25")).is_err());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
