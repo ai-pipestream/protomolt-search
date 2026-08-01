@@ -73,7 +73,7 @@ fn build_bm25(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
         offset = start + token.len() as u32;
     }
     let length = terms.iter().map(|(_, f, _)| f).sum();
-    store.add_document_with_lineage(0, text.to_string(), AnalyzedDoc { terms, length }, None);
+    store.add_document_with_lineage(0, text.to_string(), AnalyzedDoc::body(terms, length), None);
     let path = dir.join("source.tv.bm25");
     store.save(&path).unwrap();
     path

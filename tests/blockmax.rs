@@ -97,7 +97,7 @@ fn random_corpus(
         if constant_dl {
             length = 100;
         }
-        docs.push((id, format!("doc {id}"), AnalyzedDoc { terms, length }));
+        docs.push((id, format!("doc {id}"), AnalyzedDoc::body(terms, length)));
     }
     docs
 }
@@ -208,10 +208,7 @@ fn ties_at_floor_and_kth_slot() {
         store.add_document(
             i,
             format!("doc {i}"),
-            AnalyzedDoc {
-                terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
-                length: 3,
-            },
+            AnalyzedDoc::body(vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])], 3),
         );
     }
     let path = dir.join("a.bm25");
@@ -254,10 +251,7 @@ fn ties_at_floor_and_kth_slot() {
         store.add_document(
             i,
             format!("doc {i}"),
-            AnalyzedDoc {
-                terms: vec![("court".to_string(), tf, vec![(0, 4)])],
-                length: 3,
-            },
+            AnalyzedDoc::body(vec![("court".to_string(), tf, vec![(0, 4)])], 3),
         );
     }
     let path = dir.join("b.bm25");
@@ -312,13 +306,10 @@ fn blocks_actually_skip() {
         store.add_document(
             i,
             format!("doc {i}"),
-            AnalyzedDoc {
-                terms: vec![
+            AnalyzedDoc::body(vec![
                     ("court".to_string(), 1 + (i / 128) % 5, vec![(0, 4)]),
                     (format!("rare{}", i % 97), 1, vec![(0, 4)]),
-                ],
-                length: 100 + i % 50,
-            },
+                ], 100 + i % 50),
         );
     }
     let path = dir.join("s.bm25");
@@ -512,10 +503,7 @@ fn seeded_round_trip_never_loses_boundary_hits() {
         store.add_document(
             i,
             format!("doc {i}"),
-            AnalyzedDoc {
-                terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
-                length: 3,
-            },
+            AnalyzedDoc::body(vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])], 3),
         );
     }
     let path = dir.join("ties.bm25");
@@ -573,7 +561,7 @@ fn pruned_level1_scale_fuzz() {
                     length += tf;
                     terms.push((term, tf, offsets));
                 }
-                AnalyzedDoc { terms, length }
+                AnalyzedDoc::body(terms, length)
             })
             .collect();
         let n_docs = 20_000 + rng.below(24_000);

@@ -73,11 +73,11 @@ header:
     u64 doc_lengths_off_f
     u64 postings_off_f
     u64 directory_off_f
-shared sections (texts, text_index, lineages): byte-identical to v5
+shared sections (texts, text_index, lineages): v5 bytes (index rebased)
 per field f:
   doc_lengths_f (n_slots x u32)
   postings_f    (v5 per-term doc run / occurrence run / skip run)
-  directory_f   (v5 34 B entries + term blob)
+  directory_f   (v5 34 B entries + term blob, run offsets section-relative)
 ```
 
 Lessons from v3/v4 encoded:
@@ -85,6 +85,11 @@ Lessons from v3/v4 encoded:
 - v5's header has no version integer and no spare bytes, and one section
   offset is derived by arithmetic. v6 gets an explicit section table; every
   section is located by an absolute u64 in the header, nothing derived.
+- Section-internal pointers are RELATIVE to their section's start: directory
+  run offsets to the field's postings section, text_index entries to the
+  texts section (v5 stored both absolute, which is why only the other four
+  sections are bit-identical across the two formats). Sections survive
+  relocation, so a future compactor can move a field's group by byte copy.
 - `blob_off` stays u32 but is per-field and blob-relative; per-field blobs
   are strictly smaller than today's single blob, so the v4 lesson holds.
 - Occurrence pair counters stay u32 per (field, term): cap is 4 G pairs per
@@ -231,7 +236,11 @@ are comparable end to end, by construction.
 
 1. Root types: `AnalyzedDoc`, `Posting`, `doc_lengths` grow the field
    dimension; v6 writer/reader with n_fields = 1 proving byte-level parity
-   of sections and identical query results against v5.
+   of sections and identical query results against v5. LANDED: `AnalyzedDoc`
+   is per-field (`AnalyzedField`), the store is `Vec<FieldStore>` behind the
+   unchanged single-field surface, `save_v6`/`Bm25Reader::open` round-trip
+   the format, and `tests/v6_format.rs` plus the postings section-parity
+   test pin the contract. v5 stays the save default until step 4.
 2. Multi-field store + reader + exhaustive scorer; contract 3 tests.
 3. Per-field skip runs + pruned fused scorer; contract 2 tests.
 4. Wire + WAL + ingest + reshard replay; corpus extraction grows a second

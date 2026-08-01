@@ -133,7 +133,7 @@ fn generate(docs: usize, vocab: usize, seed: u64, builder: &mut SpillBuilder) ->
         builder.add_document_with_lineage(
             doc_id,
             String::new(),
-            AnalyzedDoc { terms, length },
+            AnalyzedDoc::body(terms, length),
             None,
         )?;
         if doc_id % 100_000 == 0 {

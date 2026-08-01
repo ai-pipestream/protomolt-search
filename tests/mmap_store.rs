@@ -24,7 +24,7 @@ fn build_store(n_docs: usize, text_len: usize) -> Bm25Store {
         store.add_document_with_lineage(
             i,
             text,
-            AnalyzedDoc { terms, length },
+            AnalyzedDoc::body(terms, length),
             Some(DocLineage {
                 opinion_id: 1000 + u64::from(i),
                 cluster_id: 2000 + u64::from(i % 50),

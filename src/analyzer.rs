@@ -164,10 +164,12 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
     }
 }
 
-/// Folds a response's term vectors into an [`AnalyzedDoc`] (term, tf,
-/// original-text offsets, and document length).
+/// Folds a response's term vectors into a single-field (body)
+/// [`AnalyzedDoc`] (term, tf, original-text offsets, and document
+/// length).
 fn analyzed_from(response: AnalyzeResponse) -> AnalyzedDoc {
-    let mut doc = AnalyzedDoc::default();
+    let mut terms = crate::postings::DocTerms::new();
+    let mut length = 0u32;
     for tv in response.term_vectors {
         if tv.frequency <= 0 {
             continue;
@@ -177,10 +179,10 @@ fn analyzed_from(response: AnalyzeResponse) -> AnalyzedDoc {
             .iter()
             .map(|s| (s.start.max(0) as u32, s.end.max(0) as u32))
             .collect();
-        doc.length += tv.frequency as u32;
-        doc.terms.push((tv.term, tv.frequency as u32, offsets));
+        length += tv.frequency as u32;
+        terms.push((tv.term, tv.frequency as u32, offsets));
     }
-    doc
+    AnalyzedDoc::body(terms, length)
 }
 
 /// Client-side submission buffer of an [`AnalyzeStream`]. Pacing is the

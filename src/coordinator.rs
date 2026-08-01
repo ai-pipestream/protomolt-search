@@ -159,7 +159,7 @@ impl CoordinatorServiceImpl {
         // share identity with indexed terms (stems when SOURCE_STEMS).
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
         let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.terms {
+        for (term, _, _) in analyzed.into_body().terms {
             if !terms.contains(&term) {
                 terms.push(term);
             }
@@ -242,7 +242,7 @@ impl CoordinatorServiceImpl {
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
         let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
         let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.terms {
+        for (term, _, _) in analyzed.into_body().terms {
             if !terms.contains(&term) {
                 terms.push(term);
             }
@@ -869,7 +869,7 @@ impl CoordinatorServiceImpl {
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
         let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
         let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.terms {
+        for (term, _, _) in analyzed.into_body().terms {
             if !terms.contains(&term) {
                 terms.push(term);
             }
@@ -1035,7 +1035,7 @@ impl CoordinatorServiceImpl {
         })?;
         let analyzed = crate::analyzer::analyze_document(&addr, &boost.text, spec).await?;
         let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.terms {
+        for (term, _, _) in analyzed.into_body().terms {
             if !terms.contains(&term) {
                 terms.push(term);
             }

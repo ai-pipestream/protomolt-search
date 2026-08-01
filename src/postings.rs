@@ -40,6 +40,14 @@ const MAGIC_V4: &[u8; 8] = b"TVBM2504";
 /// v5 layout: per-term doc run / occurrence run / skip run (see the
 /// module docs and `docs/block-max.md`); 34 B directory entries.
 const MAGIC_V5: &[u8; 8] = b"TVBM2505";
+/// v6 layout: multi-field (`docs/multi-field.md`). Variable-length
+/// header holding an explicit section table (shared texts/text_index/
+/// lineages offsets plus a field table locating each field's
+/// doc_lengths/postings/directory sections); per-field sections keep
+/// the v5 shape, but section-internal pointers (text_index entries,
+/// directory run offsets) are RELATIVE to their section's start — the
+/// v4 blob lesson generalized, so sections survive relocation.
+const MAGIC_V6: &[u8; 8] = b"TVBM2506";
 
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
@@ -147,31 +155,97 @@ pub struct DocLineage {
     pub span_end: u32,
 }
 
-/// One analyzed document ready to be indexed.
+/// One analyzed field of one document: per-term data plus the field's
+/// length in terms (sum of frequencies, the BM25 length-normalization
+/// input).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AnalyzedDoc {
+pub struct AnalyzedField {
     /// Per-term data; see [`DocTerms`].
     pub terms: DocTerms,
-    /// Document length in terms (sum of frequencies); used by BM25 length
-    /// normalization.
+    /// Field length in terms.
     pub length: u32,
 }
 
-/// The shard's lexical half: postings, corpus stats, and raw texts.
-#[derive(Debug, Default)]
-pub struct Bm25Store {
+/// One analyzed document ready to be indexed: one entry per field,
+/// positionally matching the store's field table. Field 0 is the body
+/// (the stored text). A document may carry fewer entries than the
+/// store has fields; missing trailing fields index as empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnalyzedDoc {
+    /// Per-field analyzed data, indexed by field id.
+    pub fields: Vec<AnalyzedField>,
+}
+
+impl AnalyzedDoc {
+    /// A document with only the body field — every single-field ingest
+    /// path.
+    pub fn body(terms: DocTerms, length: u32) -> Self {
+        Self {
+            fields: vec![AnalyzedField { terms, length }],
+        }
+    }
+
+    /// The body field's analyzed data, consuming the document (empty
+    /// when the document carried no fields).
+    pub fn into_body(self) -> AnalyzedField {
+        self.fields.into_iter().next().unwrap_or_default()
+    }
+}
+
+/// One field's slice of the store: its own postings, per-document
+/// lengths, and running total. Structurally a complete single-field
+/// BM25 index over the shared slot space (`docs/multi-field.md`).
+#[derive(Debug)]
+struct FieldStore {
+    /// Field name from the schema ("body" for field 0).
+    name: String,
+    /// Hash of the field's AnalysisSpec, persisted in the v6 field
+    /// table. 0 until the ingest layer wires real fingerprints.
+    analysis_fingerprint: u64,
     /// term → postings, kept ascending by doc id (append-only).
     postings: HashMap<String, Vec<Posting>>,
     /// Per-document length in terms, indexed by local doc id. Sparse
-    /// slots (ids consumed by the vector side) hold 0.
+    /// slots (ids consumed by the vector side) hold 0. Every field's
+    /// table has the same length (the shared slot count).
     doc_lengths: Vec<u32>,
-    /// Sum of all document lengths (for avgdl).
+    /// Sum of this field's document lengths (for avgdl).
     total_length: u64,
+}
+
+impl FieldStore {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            analysis_fingerprint: 0,
+            postings: HashMap::new(),
+            doc_lengths: Vec::new(),
+            total_length: 0,
+        }
+    }
+}
+
+/// The shard's lexical half: per-field postings and corpus stats over a
+/// shared slot space, plus the raw texts.
+#[derive(Debug)]
+pub struct Bm25Store {
+    /// Per-field indexes; field 0 is the body (the stored text). The
+    /// single-field public surface reads field 0.
+    fields: Vec<FieldStore>,
     /// Raw texts indexed by local doc id; sparse slots hold `None`.
     texts: Vec<Option<String>>,
     /// Per-document lineage, parallel to `texts` (`None` when the
     /// document was ingested without lineage).
     lineages: Vec<Option<DocLineage>>,
+}
+
+impl Default for Bm25Store {
+    fn default() -> Self {
+        Self {
+            fields: vec![FieldStore::new("body")],
+            texts: Vec::new(),
+            lineages: Vec::new(),
+        }
+    }
 }
 
 impl Bm25Store {
@@ -182,27 +256,33 @@ impl Bm25Store {
 
     /// The number of document slots ever allocated (the next local doc id).
     pub fn next_doc_id(&self) -> u32 {
-        self.doc_lengths.len() as u32
+        self.texts.len() as u32
     }
 
-    /// Number of documents with postings.
+    /// Number of documents with postings (in any field).
     pub fn doc_count(&self) -> u64 {
-        self.doc_lengths.iter().filter(|&&l| l > 0).count() as u64
+        (0..self.texts.len())
+            .filter(|&slot| self.fields.iter().any(|f| f.doc_lengths[slot] > 0))
+            .count() as u64
     }
 
-    /// Sum of all document lengths (BM25 avgdl numerator).
+    /// Sum of all body document lengths (BM25 avgdl numerator).
     pub fn total_doc_length(&self) -> u64 {
-        self.total_length
+        self.fields[0].total_length
     }
 
-    /// Postings for `term`, if present.
+    /// Body postings for `term`, if present.
     pub fn postings(&self, term: &str) -> Option<&[Posting]> {
-        self.postings.get(term).map(Vec::as_slice)
+        self.fields[0].postings.get(term).map(Vec::as_slice)
     }
 
-    /// Document length in terms (0 for unknown/sparse slots).
+    /// Body document length in terms (0 for unknown/sparse slots).
     pub fn doc_length(&self, doc_id: u32) -> u32 {
-        self.doc_lengths.get(doc_id as usize).copied().unwrap_or(0)
+        self.fields[0]
+            .doc_lengths
+            .get(doc_id as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The raw text of a document, if stored.
@@ -233,23 +313,31 @@ impl Bm25Store {
         lineage: Option<DocLineage>,
     ) {
         let slot = doc_id as usize;
+        assert!(slot >= self.texts.len(), "doc id {doc_id} already used");
         assert!(
-            slot >= self.doc_lengths.len(),
-            "doc id {doc_id} already used"
+            doc.fields.len() <= self.fields.len(),
+            "document carries {} fields, store has {}",
+            doc.fields.len(),
+            self.fields.len()
         );
-        self.doc_lengths.resize(slot + 1, 0);
+        for field in &mut self.fields {
+            field.doc_lengths.resize(slot + 1, 0);
+        }
         self.texts.resize_with(slot + 1, || None);
         self.lineages.resize_with(slot + 1, || None);
-        self.doc_lengths[slot] = doc.length;
-        self.total_length += u64::from(doc.length);
         self.texts[slot] = Some(text);
         self.lineages[slot] = lineage;
-        for (term, tf, offsets) in doc.terms {
-            self.postings.entry(term).or_default().push(Posting {
-                doc_id,
-                tf,
-                offsets,
-            });
+        for (fi, analyzed) in doc.fields.into_iter().enumerate() {
+            let field = &mut self.fields[fi];
+            field.doc_lengths[slot] = analyzed.length;
+            field.total_length += u64::from(analyzed.length);
+            for (term, tf, offsets) in analyzed.terms {
+                field.postings.entry(term).or_default().push(Posting {
+                    doc_id,
+                    tf,
+                    offsets,
+                });
+            }
         }
     }
 
@@ -271,10 +359,10 @@ impl Bm25Store {
         Self::read_from(&mut &bytes[..])
     }
 
-    /// Sizes of the sections every format version shares (doc_lengths,
-    /// texts, text_index, lineages) plus the sorted term list.
-    fn common_section_sizes(&self) -> (u64, u64, u64, u64, Vec<&String>) {
-        let n_slots = self.doc_lengths.len() as u64;
+    /// Sizes of the shared sections (texts, text_index, lineages),
+    /// identical bytes in every format version modulo text_index
+    /// basing.
+    fn shared_section_sizes(&self) -> (u64, u64, u64) {
         let texts_size: u64 = self
             .texts
             .iter()
@@ -285,21 +373,62 @@ impl Bm25Store {
             .iter()
             .map(|l| if l.is_some() { 25 } else { 1 })
             .sum();
-        let mut terms: Vec<&String> = self.postings.keys().collect();
-        terms.sort();
-        (4 * n_slots, texts_size, 12 * n_slots, lineages_size, terms)
+        (texts_size, 12 * self.texts.len() as u64, lineages_size)
     }
 
-    /// Write the sections between the header and the postings section
-    /// (identical bytes in every format version).
-    fn write_common_sections<W: Write>(&self, w: &mut W, texts_off: u64) -> io::Result<()> {
-        // doc_lengths
-        for &len in &self.doc_lengths {
-            write_u32(w, len)?;
+    /// One field's term list, sorted (the on-disk directory order).
+    fn sorted_terms(field: &FieldStore) -> Vec<&String> {
+        let mut terms: Vec<&String> = field.postings.keys().collect();
+        terms.sort();
+        terms
+    }
+
+    /// Per-term `(occurrence, skip)` run byte sizes of one field — the
+    /// size pass. The skip run's size needs the frontier computation,
+    /// so run the same builder over a sink; the write pass re-runs it
+    /// for real (deterministic, so the sizes agree).
+    fn field_run_sizes(field: &FieldStore, terms: &[&String]) -> io::Result<Vec<(u64, u64)>> {
+        let mut run_sizes: Vec<(u64, u64)> = Vec::with_capacity(terms.len());
+        for term in terms {
+            let postings = &field.postings[*term];
+            let occ_bytes: u64 = postings.iter().map(|p| 8 * p.offsets.len() as u64).sum();
+            let mut skip = SkipRunBuilder::new();
+            let mut sink = io::sink();
+            for p in postings {
+                let dl = field.doc_lengths[p.doc_id as usize];
+                skip.push(p.tf, dl, p.doc_id, &mut sink)?;
+            }
+            let (l0_bytes, l1) = skip.finish(&mut sink)?;
+            run_sizes.push((occ_bytes, skip_run_size(l0_bytes, &l1)));
         }
+        Ok(run_sizes)
+    }
+
+    /// Byte size of one field's postings section (v5 shape).
+    fn field_postings_size(field: &FieldStore, terms: &[&String], run_sizes: &[(u64, u64)]) -> u64 {
+        4 + terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let df = field.postings[*t].len() as u64;
+                12 * df + 4 + run_sizes[i].0 + run_sizes[i].1
+            })
+            .sum::<u64>()
+    }
+
+    /// Byte size of one field's directory section (v5 shape).
+    fn field_directory_size(terms: &[&String]) -> u64 {
+        4 + 34 * terms.len() as u64 + terms.iter().map(|t| t.len() as u64).sum::<u64>()
+    }
+
+    /// Write the shared sections (texts, text_index, lineages).
+    /// `index_base` bases the text_index entries: the absolute texts
+    /// section offset in v3/v4/v5 (absolute entries), 0 in v6
+    /// (section-relative entries).
+    fn write_shared_sections<W: Write>(&self, w: &mut W, index_base: u64) -> io::Result<()> {
         // texts (+ build the on-disk index)
         let mut text_index: Vec<(u64, u32)> = Vec::with_capacity(self.texts.len());
-        let mut cursor = texts_off;
+        let mut cursor = index_base;
         for text in &self.texts {
             match text {
                 Some(t) => {
@@ -339,6 +468,95 @@ impl Bm25Store {
         Ok(())
     }
 
+    /// Write one field's doc_lengths section.
+    fn write_field_doc_lengths<W: Write>(w: &mut W, field: &FieldStore) -> io::Result<()> {
+        for &len in &field.doc_lengths {
+            write_u32(w, len)?;
+        }
+        Ok(())
+    }
+
+    /// Write one field's postings section (u32 n_terms, then per-term
+    /// doc/occurrence/skip runs), returning the directory tuples
+    /// `(doc_run_off, skip_run_off, occ_run_off, df)`. Offsets are
+    /// based at `run_base`: the absolute postings section offset in v5,
+    /// 0 in v6 (section-relative entries).
+    ///
+    /// The doc run streams straight out; the occurrence run and the
+    /// level-0 skip records stage in per-term buffers (the heap store
+    /// already holds every posting, so the stage is never the memory
+    /// ceiling) and are appended after the sentinel.
+    fn write_field_postings<W: Write>(
+        w: &mut W,
+        field: &FieldStore,
+        terms: &[&String],
+        run_sizes: &[(u64, u64)],
+        run_base: u64,
+    ) -> io::Result<Vec<(u64, u64, u64, u32)>> {
+        write_u32(w, terms.len() as u32)?;
+        let mut directory: Vec<(u64, u64, u64, u32)> = Vec::with_capacity(terms.len());
+        let mut cursor = run_base + 4;
+        for (i, term) in terms.iter().enumerate() {
+            let postings = &field.postings[*term];
+            let df = postings.len() as u64;
+            let (occ_bytes, skip_bytes) = run_sizes[i];
+            let doc_run_off = cursor;
+            let occ_run_off = doc_run_off + 12 * df + 4;
+            let skip_run_off = occ_run_off + occ_bytes;
+            directory.push((doc_run_off, skip_run_off, occ_run_off, df as u32));
+            let mut occ_stage: Vec<u8> = Vec::with_capacity(occ_bytes as usize);
+            let mut skip_l0: Vec<u8> = Vec::new();
+            let mut skip = SkipRunBuilder::new();
+            let mut occ_start = 0u32;
+            for p in postings {
+                let dl = field.doc_lengths[p.doc_id as usize];
+                occ_start = push_posting_v5(
+                    w,
+                    &mut occ_stage,
+                    &mut skip,
+                    &mut skip_l0,
+                    p.doc_id,
+                    p.tf,
+                    &p.offsets,
+                    dl,
+                    occ_start,
+                )?;
+            }
+            write_u32(w, occ_start)?; // sentinel
+            w.write_all(&occ_stage)?;
+            let (l0_bytes, l1) = skip.finish(&mut skip_l0)?;
+            debug_assert_eq!(l0_bytes, skip_l0.len() as u64);
+            debug_assert_eq!(skip_bytes, skip_run_size(l0_bytes, &l1));
+            write_skip_run(w, &skip_l0, &l1)?;
+            cursor = skip_run_off + skip_bytes;
+        }
+        Ok(directory)
+    }
+
+    /// Write one field's directory section: fixed-stride 34 B entries
+    /// (binary-searchable), then the term blob.
+    fn write_field_directory<W: Write>(
+        w: &mut W,
+        terms: &[&String],
+        directory: &[(u64, u64, u64, u32)],
+    ) -> io::Result<()> {
+        write_u32(w, terms.len() as u32)?;
+        let mut blob_off = 0u64; // relative to the term blob start
+        for (term, &(doc_off, skip_off, occ_off, df)) in terms.iter().zip(directory.iter()) {
+            write_u64(w, doc_off)?;
+            write_u64(w, skip_off)?;
+            write_u64(w, occ_off)?;
+            write_u32(w, df)?;
+            write_u32(w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
+            write_u16(w, term.len() as u16)?;
+            blob_off += term.len() as u64;
+        }
+        for term in terms {
+            w.write_all(term.as_bytes())?;
+        }
+        Ok(())
+    }
+
     /// The v5 layout (see the module docs and `docs/block-max.md`).
     /// Sections in file order, all offsets precomputed and written into
     /// the fixed header so the reader never walks the file to find them:
@@ -358,104 +576,132 @@ impl Bm25Store {
     ///   u32 blob_off, u16 term_len), then the term blob)
     /// ```
     fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        let header_size = 8 + 8 + 8 * 4 + 4;
-        let (doc_lengths_size, texts_size, text_index_size, lineages_size, terms) =
-            self.common_section_sizes();
-        // Size pass. The skip run's size needs the frontier computation,
-        // so run the same builder over a sink; the write pass below
-        // re-runs it for real (deterministic, so the sizes agree).
-        let mut run_sizes: Vec<(u64, u64)> = Vec::with_capacity(terms.len()); // (occ, skip)
-        for term in &terms {
-            let postings = &self.postings[*term];
-            let occ_bytes: u64 = postings.iter().map(|p| 8 * p.offsets.len() as u64).sum();
-            let mut skip = SkipRunBuilder::new();
-            let mut sink = io::sink();
-            for p in postings {
-                skip.push(p.tf, self.doc_length(p.doc_id), p.doc_id, &mut sink)?;
-            }
-            let (l0_bytes, l1) = skip.finish(&mut sink)?;
-            run_sizes.push((occ_bytes, skip_run_size(l0_bytes, &l1)));
+        if self.fields.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v5 carries exactly one field; multi-field stores write v6",
+            ));
         }
-        let postings_size: u64 = 4 + terms
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let df = self.postings[*t].len() as u64;
-                12 * df + 4 + run_sizes[i].0 + run_sizes[i].1
-            })
-            .sum::<u64>();
+        let field = &self.fields[0];
+        let n_slots = self.texts.len() as u64;
+        let header_size = 8 + 8 + 8 * 4 + 4;
+        let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
+        let terms = Self::sorted_terms(field);
+        let run_sizes = Self::field_run_sizes(field, &terms)?;
+        let postings_size = Self::field_postings_size(field, &terms, &run_sizes);
 
         let doc_lengths_off = header_size as u64;
-        let texts_off = doc_lengths_off + doc_lengths_size;
+        let texts_off = doc_lengths_off + 4 * n_slots;
         let text_index_off = texts_off + texts_size;
         let lineages_off = text_index_off + text_index_size;
         let postings_off = lineages_off + lineages_size;
         let directory_off = postings_off + postings_size;
 
         w.write_all(MAGIC_V5)?;
-        write_u64(w, self.total_length)?;
+        write_u64(w, field.total_length)?;
         write_u64(w, texts_off)?;
         write_u64(w, lineages_off)?;
         write_u64(w, postings_off)?;
         write_u64(w, directory_off)?;
-        write_u32(w, self.doc_lengths.len() as u32)?;
-        self.write_common_sections(w, texts_off)?;
+        write_u32(w, n_slots as u32)?;
+        Self::write_field_doc_lengths(w, field)?;
+        self.write_shared_sections(w, texts_off)?;
+        let directory = Self::write_field_postings(w, field, &terms, &run_sizes, postings_off)?;
+        Self::write_field_directory(w, &terms, &directory)?;
+        Ok(())
+    }
 
-        // postings section: doc run streams straight out; the occurrence
-        // run and the level-0 skip records stage in per-term buffers
-        // (the heap store already holds every posting, so the stage is
-        // never the memory ceiling) and are appended after the sentinel.
-        write_u32(w, terms.len() as u32)?;
-        let mut directory: Vec<(u64, u64, u64, u32)> = Vec::with_capacity(terms.len());
-        let mut cursor = postings_off + 4;
-        for (i, term) in terms.iter().enumerate() {
-            let postings = &self.postings[*term];
-            let df = postings.len() as u64;
-            let (occ_bytes, skip_bytes) = run_sizes[i];
-            let doc_run_off = cursor;
-            let occ_run_off = doc_run_off + 12 * df + 4;
-            let skip_run_off = occ_run_off + occ_bytes;
-            directory.push((doc_run_off, skip_run_off, occ_run_off, df as u32));
-            let mut occ_stage: Vec<u8> = Vec::with_capacity(occ_bytes as usize);
-            let mut skip_l0: Vec<u8> = Vec::new();
-            let mut skip = SkipRunBuilder::new();
-            let mut occ_start = 0u32;
-            for p in postings {
-                occ_start = push_posting_v5(
-                    w,
-                    &mut occ_stage,
-                    &mut skip,
-                    &mut skip_l0,
-                    p.doc_id,
-                    p.tf,
-                    &p.offsets,
-                    self.doc_length(p.doc_id),
-                    occ_start,
-                )?;
-            }
-            write_u32(w, occ_start)?; // sentinel
-            w.write_all(&occ_stage)?;
-            let (l0_bytes, l1) = skip.finish(&mut skip_l0)?;
-            debug_assert_eq!(l0_bytes, skip_l0.len() as u64);
-            debug_assert_eq!(skip_bytes, skip_run_size(l0_bytes, &l1));
-            write_skip_run(w, &skip_l0, &l1)?;
-            cursor = skip_run_off + skip_bytes;
+    /// Persist to `path` in the v6 format (atomically: write tmp,
+    /// rename). See [`Self::write_v6_to`].
+    pub fn save_v6(&self, path: &Path) -> io::Result<()> {
+        let tmp: PathBuf = path.with_extension("bm25tmp");
+        {
+            let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
+            self.write_v6_to(&mut w)?;
+            w.flush()?;
         }
-        // directory: fixed-stride entries (binary-searchable), then the
-        // term blob.
-        write_u32(w, terms.len() as u32)?;
-        let mut blob_off = 0u64; // relative to the term blob start
-        for (term, &(doc_off, skip_off, occ_off, df)) in terms.iter().zip(directory.iter()) {
-            write_u64(w, doc_off)?;
-            write_u64(w, skip_off)?;
-            write_u64(w, occ_off)?;
-            write_u32(w, df)?;
-            write_u32(w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
-            write_u16(w, term.len() as u16)?;
-            blob_off += term.len() as u64;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// The v6 layout (`TVBM2506`, see `docs/multi-field.md`).
+    /// Variable-length header holding an explicit section table, shared
+    /// sections, then one doc_lengths/postings/directory group per
+    /// field in field-id order. Per-field postings and directory
+    /// sections keep the v5 shape, but the directory's run offsets are
+    /// RELATIVE to the field's postings section start, and text_index
+    /// entries are relative to the texts section start (the v4 blob
+    /// lesson generalized: sections survive relocation). Blob offsets
+    /// stay blob-relative. Every section is located by an explicit
+    /// header offset, nothing derived by arithmetic.
+    ///
+    /// ```text
+    /// magic "TVBM2506"
+    /// u32 n_fields | u32 n_slots
+    /// u64 texts_off | u64 text_index_off | u64 lineages_off
+    /// field table, n_fields entries:
+    ///   u16 name_len | name bytes
+    ///   u64 analysis_fingerprint | u64 total_length
+    ///   u64 doc_lengths_off | u64 postings_off | u64 directory_off
+    /// texts | text_index | lineages          <- v5 bytes (index rebased)
+    /// per field: doc_lengths | postings | directory   <- v5-shape sections
+    /// ```
+    pub fn write_v6_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        let n_slots = self.texts.len() as u64;
+        let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
+        let header_size: u64 = 8
+            + 4
+            + 4
+            + 8 * 3
+            + self
+                .fields
+                .iter()
+                .map(|f| 2 + f.name.len() as u64 + 8 * 5)
+                .sum::<u64>();
+        // Size pass per field.
+        let mut field_terms: Vec<Vec<&String>> = Vec::with_capacity(self.fields.len());
+        let mut field_runs: Vec<Vec<(u64, u64)>> = Vec::with_capacity(self.fields.len());
+        for field in &self.fields {
+            let terms = Self::sorted_terms(field);
+            let run_sizes = Self::field_run_sizes(field, &terms)?;
+            field_terms.push(terms);
+            field_runs.push(run_sizes);
         }
-        for term in &terms {
-            w.write_all(term.as_bytes())?;
+        let texts_off = header_size;
+        let text_index_off = texts_off + texts_size;
+        let lineages_off = text_index_off + text_index_size;
+        let mut cursor = lineages_off + lineages_size;
+        // (doc_lengths_off, postings_off, directory_off) per field.
+        let mut section_offs: Vec<(u64, u64, u64)> = Vec::with_capacity(self.fields.len());
+        for (fi, field) in self.fields.iter().enumerate() {
+            let doc_lengths_off = cursor;
+            let postings_off = doc_lengths_off + 4 * n_slots;
+            let directory_off =
+                postings_off + Self::field_postings_size(field, &field_terms[fi], &field_runs[fi]);
+            section_offs.push((doc_lengths_off, postings_off, directory_off));
+            cursor = directory_off + Self::field_directory_size(&field_terms[fi]);
+        }
+
+        w.write_all(MAGIC_V6)?;
+        write_u32(w, self.fields.len() as u32)?;
+        write_u32(w, n_slots as u32)?;
+        write_u64(w, texts_off)?;
+        write_u64(w, text_index_off)?;
+        write_u64(w, lineages_off)?;
+        for (field, &(dl_off, p_off, d_off)) in self.fields.iter().zip(&section_offs) {
+            write_u16(w, field.name.len() as u16)?;
+            w.write_all(field.name.as_bytes())?;
+            write_u64(w, field.analysis_fingerprint)?;
+            write_u64(w, field.total_length)?;
+            write_u64(w, dl_off)?;
+            write_u64(w, p_off)?;
+            write_u64(w, d_off)?;
+        }
+        self.write_shared_sections(w, 0)?;
+        for (fi, field) in self.fields.iter().enumerate() {
+            Self::write_field_doc_lengths(w, field)?;
+            let directory = Self::write_field_postings(w, field, &field_terms[fi], &field_runs[fi], 0)?;
+            Self::write_field_directory(w, &field_terms[fi], &directory)?;
         }
         Ok(())
     }
@@ -482,28 +728,24 @@ impl Bm25Store {
     ///   term blob) — binary-searchable by term
     /// ```
     fn write_v4_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        let n_slots = self.doc_lengths.len() as u64;
+        if self.fields.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v4 carries exactly one field",
+            ));
+        }
+        let field = &self.fields[0];
+        let n_slots = self.texts.len() as u64;
         let header_size = 8 + 8 + 8 * 4 + 4;
         let doc_lengths_size = 4 * n_slots;
-        let texts_size: u64 = self
-            .texts
-            .iter()
-            .map(|t| 4 + t.as_ref().map_or(0, |s| s.len() as u64))
-            .sum();
-        let text_index_size = 12 * n_slots;
-        let lineages_size: u64 = self
-            .lineages
-            .iter()
-            .map(|l| if l.is_some() { 25 } else { 1 })
-            .sum();
-        let mut terms: Vec<&String> = self.postings.keys().collect();
-        terms.sort();
+        let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
+        let terms = Self::sorted_terms(field);
         let postings_size: u64 = 4 + terms
             .iter()
             .map(|t| {
                 4 + t.len() as u64
                     + 4
-                    + self.postings[*t]
+                    + field.postings[*t]
                         .iter()
                         .map(|p| 12 + 8 * p.offsets.len() as u64)
                         .sum::<u64>()
@@ -518,62 +760,21 @@ impl Bm25Store {
         let directory_off = postings_off + postings_size;
 
         w.write_all(MAGIC_V4)?;
-        write_u64(w, self.total_length)?;
+        write_u64(w, field.total_length)?;
         write_u64(w, texts_off)?;
         write_u64(w, lineages_off)?;
         write_u64(w, postings_off)?;
         write_u64(w, directory_off)?;
-        write_u32(w, self.doc_lengths.len() as u32)?;
+        write_u32(w, n_slots as u32)?;
+        Self::write_field_doc_lengths(w, field)?;
+        self.write_shared_sections(w, texts_off)?;
 
-        // doc_lengths
-        for &len in &self.doc_lengths {
-            write_u32(w, len)?;
-        }
-        // texts (+ build the on-disk index)
-        let mut text_index: Vec<(u64, u32)> = Vec::with_capacity(self.texts.len());
-        let mut cursor = texts_off;
-        for text in &self.texts {
-            match text {
-                Some(t) => {
-                    write_u32(w, t.len() as u32)?;
-                    w.write_all(t.as_bytes())?;
-                    text_index.push((cursor + 4, t.len() as u32));
-                    cursor += 4 + t.len() as u64;
-                }
-                None => {
-                    write_u32(w, u32::MAX)?;
-                    text_index.push((0, u32::MAX));
-                    // The absent marker still occupies 4 bytes; skipping
-                    // this advance pointed every later text_index entry 4
-                    // bytes early per gap slot.
-                    cursor += 4;
-                }
-            }
-        }
-        // text_index
-        for &(offset, len) in &text_index {
-            write_u64(w, offset)?;
-            write_u32(w, len)?;
-        }
-        // lineages
-        for lineage in &self.lineages {
-            match lineage {
-                Some(l) => {
-                    w.write_all(&[1u8])?;
-                    write_u64(w, l.opinion_id)?;
-                    write_u64(w, l.cluster_id)?;
-                    write_u32(w, l.span_start)?;
-                    write_u32(w, l.span_end)?;
-                }
-                None => w.write_all(&[0u8])?,
-            }
-        }
         // postings (+ directory entries)
         write_u32(w, terms.len() as u32)?;
         let mut directory: Vec<(u64, u32)> = Vec::with_capacity(terms.len());
         let mut cursor = postings_off + 4;
         for term in &terms {
-            let postings = &self.postings[*term];
+            let postings = &field.postings[*term];
             directory.push((cursor, postings.len() as u32));
             write_str(w, term)?;
             write_u32(w, postings.len() as u32)?;
@@ -606,9 +807,34 @@ impl Bm25Store {
         Ok(())
     }
 
+    /// A single-field ("body") store from already-decoded parts — the
+    /// shape every pre-v6 read path produces.
+    fn from_single_field(
+        postings: HashMap<String, Vec<Posting>>,
+        doc_lengths: Vec<u32>,
+        total_length: u64,
+        texts: Vec<Option<String>>,
+        lineages: Vec<Option<DocLineage>>,
+    ) -> Self {
+        Self {
+            fields: vec![FieldStore {
+                name: "body".to_string(),
+                analysis_fingerprint: 0,
+                postings,
+                doc_lengths,
+                total_length,
+            }],
+            texts,
+            lineages,
+        }
+    }
+
     fn read_from(r: &mut &[u8]) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let magic = take(r, 8)?;
+        if magic == MAGIC_V6 {
+            return Self::read_v6_from(r);
+        }
         if magic == MAGIC_V5 {
             return Self::read_v5_from(r);
         }
@@ -690,13 +916,13 @@ impl Bm25Store {
         if !r.is_empty() {
             return Err(invalid("trailing bytes"));
         }
-        Ok(Self {
+        Ok(Self::from_single_field(
             postings,
             doc_lengths,
             total_length,
             texts,
             lineages,
-        })
+        ))
     }
 }
 
@@ -961,24 +1187,24 @@ impl Bm25Index for Bm25Store {
         self.doc_length(doc_id)
     }
     fn df(&self, term: &str) -> u32 {
-        self.postings.get(term).map_or(0, |p| p.len() as u32)
+        self.fields[0].postings.get(term).map_or(0, |p| p.len() as u32)
     }
     fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
-        if let Some(postings) = self.postings.get(term) {
+        if let Some(postings) = self.fields[0].postings.get(term) {
             for p in postings {
                 f(p.doc_id, p.tf, &p.offsets);
             }
         }
     }
     fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
-        if let Some(postings) = self.postings.get(term) {
+        if let Some(postings) = self.fields[0].postings.get(term) {
             for p in postings {
                 f(p.doc_id, p.tf);
             }
         }
     }
     fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
-        let Some(postings) = self.postings.get(term) else {
+        let Some(postings) = self.fields[0].postings.get(term) else {
             return Vec::new();
         };
         match postings.binary_search_by_key(&doc_id, |p| p.doc_id) {
@@ -1071,23 +1297,28 @@ impl Bm25Store {
             }
             postings.insert(term, plist);
         }
-        Ok(Self {
+        Ok(Self::from_single_field(
             postings,
             doc_lengths,
             total_length,
             texts,
             lineages,
-        })
+        ))
     }
 
-    /// Parse a v5 file back into a heap store (same caller contract as
-    /// [`Self::read_v3_from`]: a disk-resident shard about to receive more
-    /// documents). The skip run is not needed in heap form and is skipped.
-    fn read_v5_from(r: &mut &[u8]) -> io::Result<Self> {
+    /// Decode one v5-shaped postings/directory section pair back into a
+    /// heap postings map (shared by the v5 reload path and every field
+    /// of the v6 reload path). `all` starts at file offset 8 (the magic
+    /// is consumed); `run_base` rebases the directory's run offsets — 0
+    /// for v5 (absolute entries), the field's postings section offset
+    /// for v6 (section-relative entries). The skip run is not needed in
+    /// heap form and is skipped.
+    fn read_v5_shaped_postings(
+        all: &[u8],
+        directory_off: u64,
+        run_base: u64,
+    ) -> io::Result<HashMap<String, Vec<Posting>>> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
-        // `r` starts at file offset 8 (magic consumed); section offsets
-        // are absolute file offsets.
-        let all: &[u8] = r;
         let at = |off: u64, len: u64| -> io::Result<&[u8]> {
             let i = (off as usize)
                 .checked_sub(8)
@@ -1101,6 +1332,56 @@ impl Bm25Store {
         let u64_at = |off: u64| -> io::Result<u64> {
             Ok(u64::from_le_bytes(at(off, 8)?.try_into().expect("8 bytes")))
         };
+        let n_terms = u32_at(directory_off)? as usize;
+        let blob_start = directory_off + 4 + 34 * n_terms as u64;
+        let mut postings = HashMap::with_capacity(n_terms);
+        for i in 0..n_terms {
+            let e = directory_off + 4 + 34 * i as u64;
+            let doc_run_off = u64_at(e)? + run_base;
+            let occ_run_off = u64_at(e + 16)? + run_base;
+            let df = u32_at(e + 24)? as usize;
+            let blob_off = u64::from(u32_at(e + 28)?);
+            let term_len = u64::from(u16::from_le_bytes(
+                at(e + 32, 2)?.try_into().expect("2 bytes"),
+            ));
+            let term = String::from_utf8(at(blob_start + blob_off, term_len)?.to_vec())
+                .map_err(|_| invalid("invalid utf-8 in term"))?;
+            let mut plist = Vec::with_capacity(df);
+            for j in 0..df {
+                let p = doc_run_off + 12 * j as u64;
+                let doc_id = u32_at(p)?;
+                let tf = u32_at(p + 4)?;
+                let occ_start = u64::from(u32_at(p + 8)?);
+                // The next entry's occ_start (or the trailing sentinel
+                // for the last posting) bounds this occurrence slice.
+                let occ_end = u64::from(if j + 1 < df {
+                    u32_at(p + 12 + 8)?
+                } else {
+                    u32_at(doc_run_off + 12 * df as u64)?
+                });
+                let mut offsets = Vec::with_capacity((occ_end - occ_start) as usize);
+                for o in occ_start..occ_end {
+                    offsets.push((u32_at(occ_run_off + 8 * o)?, u32_at(occ_run_off + 8 * o + 4)?));
+                }
+                plist.push(Posting {
+                    doc_id,
+                    tf,
+                    offsets,
+                });
+            }
+            postings.insert(term, plist);
+        }
+        Ok(postings)
+    }
+
+    /// Parse a v5 file back into a heap store (same caller contract as
+    /// [`Self::read_v3_from`]: a disk-resident shard about to receive more
+    /// documents). The skip run is not needed in heap form and is skipped.
+    fn read_v5_from(r: &mut &[u8]) -> io::Result<Self> {
+        let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+        // `r` starts at file offset 8 (magic consumed); section offsets
+        // are absolute file offsets.
+        let all: &[u8] = r;
         let total_length = read_u64(r)?;
         let _texts_off = read_u64(r)?;
         let _lineages_off = read_u64(r)?;
@@ -1143,49 +1424,113 @@ impl Bm25Store {
             }
         }
         // postings: locate each term's runs through the directory.
-        let n_terms = u32_at(directory_off)? as usize;
-        let blob_start = directory_off + 4 + 34 * n_terms as u64;
-        let mut postings = HashMap::with_capacity(n_terms);
-        for i in 0..n_terms {
-            let e = directory_off + 4 + 34 * i as u64;
-            let doc_run_off = u64_at(e)?;
-            let occ_run_off = u64_at(e + 16)?;
-            let df = u32_at(e + 24)? as usize;
-            let blob_off = u64::from(u32_at(e + 28)?);
-            let term_len = u64::from(u16::from_le_bytes(
-                at(e + 32, 2)?.try_into().expect("2 bytes"),
-            ));
-            let term = String::from_utf8(at(blob_start + blob_off, term_len)?.to_vec())
-                .map_err(|_| invalid("invalid utf-8 in term"))?;
-            let mut plist = Vec::with_capacity(df);
-            for j in 0..df {
-                let p = doc_run_off + 12 * j as u64;
-                let doc_id = u32_at(p)?;
-                let tf = u32_at(p + 4)?;
-                let occ_start = u64::from(u32_at(p + 8)?);
-                // The next entry's occ_start (or the trailing sentinel
-                // for the last posting) bounds this occurrence slice.
-                let occ_end = u64::from(if j + 1 < df {
-                    u32_at(p + 12 + 8)?
-                } else {
-                    u32_at(doc_run_off + 12 * df as u64)?
-                });
-                let mut offsets = Vec::with_capacity((occ_end - occ_start) as usize);
-                for o in occ_start..occ_end {
-                    offsets.push((u32_at(occ_run_off + 8 * o)?, u32_at(occ_run_off + 8 * o + 4)?));
-                }
-                plist.push(Posting {
-                    doc_id,
-                    tf,
-                    offsets,
-                });
-            }
-            postings.insert(term, plist);
-        }
-        Ok(Self {
+        let postings = Self::read_v5_shaped_postings(all, directory_off, 0)?;
+        Ok(Self::from_single_field(
             postings,
             doc_lengths,
             total_length,
+            texts,
+            lineages,
+        ))
+    }
+
+    /// Parse a v6 file back into a heap store (same caller contract as
+    /// [`Self::read_v3_from`]). All fields are decoded; shared sections
+    /// once, then one postings map per field.
+    fn read_v6_from(r: &mut &[u8]) -> io::Result<Self> {
+        let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+        // `r` starts at file offset 8 (magic consumed); header offsets
+        // are absolute file offsets.
+        let all: &[u8] = r;
+        let at = |off: u64, len: u64| -> io::Result<&[u8]> {
+            let i = (off as usize)
+                .checked_sub(8)
+                .ok_or_else(|| invalid("bad offset"))?;
+            all.get(i..i + len as usize)
+                .ok_or_else(|| invalid("offset out of range"))
+        };
+        let u32_at = |off: u64| -> io::Result<u32> {
+            Ok(u32::from_le_bytes(at(off, 4)?.try_into().expect("4 bytes")))
+        };
+        let u64_at = |off: u64| -> io::Result<u64> {
+            Ok(u64::from_le_bytes(at(off, 8)?.try_into().expect("8 bytes")))
+        };
+        let n_fields = u32_at(8)? as usize;
+        if n_fields == 0 {
+            return Err(invalid("v6 file with zero fields"));
+        }
+        let n_slots = u32_at(12)? as usize;
+        let texts_off = u64_at(16)?;
+        let lineages_off = u64_at(32)?;
+        // Field table.
+        let mut metas: Vec<(String, u64, u64, u64, u64, u64)> = Vec::with_capacity(n_fields);
+        let mut cursor = 40u64;
+        for _ in 0..n_fields {
+            let name_len = u64::from(u16_at(at(cursor, 2)?));
+            let name = String::from_utf8(at(cursor + 2, name_len)?.to_vec())
+                .map_err(|_| invalid("invalid utf-8 in field name"))?;
+            let base = cursor + 2 + name_len;
+            metas.push((
+                name,
+                u64_at(base)?,      // analysis_fingerprint
+                u64_at(base + 8)?,  // total_length
+                u64_at(base + 16)?, // doc_lengths_off
+                u64_at(base + 24)?, // postings_off
+                u64_at(base + 32)?, // directory_off
+            ));
+            cursor = base + 40;
+        }
+        // Shared sections.
+        let mut texts = Vec::with_capacity(n_slots);
+        let mut tcur = texts_off;
+        for _ in 0..n_slots {
+            let len = u32_at(tcur)?;
+            if len == u32::MAX {
+                texts.push(None);
+                tcur += 4;
+            } else {
+                let bytes = at(tcur + 4, u64::from(len))?;
+                texts.push(Some(
+                    String::from_utf8(bytes.to_vec())
+                        .map_err(|_| invalid("invalid utf-8 in doc text"))?,
+                ));
+                tcur += 4 + u64::from(len);
+            }
+        }
+        let mut lineages = Vec::with_capacity(n_slots);
+        let mut lcur = lineages_off;
+        for _ in 0..n_slots {
+            if at(lcur, 1)?[0] == 0 {
+                lineages.push(None);
+                lcur += 1;
+            } else {
+                lineages.push(Some(DocLineage {
+                    opinion_id: u64_at(lcur + 1)?,
+                    cluster_id: u64_at(lcur + 9)?,
+                    span_start: u32_at(lcur + 17)?,
+                    span_end: u32_at(lcur + 21)?,
+                }));
+                lcur += 25;
+            }
+        }
+        // Per-field sections.
+        let mut fields = Vec::with_capacity(n_fields);
+        for (name, fingerprint, total_length, dl_off, p_off, d_off) in metas {
+            let mut doc_lengths = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots as u64 {
+                doc_lengths.push(u32_at(dl_off + 4 * slot)?);
+            }
+            let postings = Self::read_v5_shaped_postings(all, d_off, p_off)?;
+            fields.push(FieldStore {
+                name,
+                analysis_fingerprint: fingerprint,
+                postings,
+                doc_lengths,
+                total_length,
+            });
+        }
+        Ok(Self {
+            fields,
             texts,
             lineages,
         })
@@ -1299,6 +1644,11 @@ impl SpillBuilder {
         doc: AnalyzedDoc,
         lineage: Option<DocLineage>,
     ) -> io::Result<()> {
+        assert!(
+            doc.fields.len() <= 1,
+            "SpillBuilder is single-field (v4/v5); multi-field builds land with the v6 spill path"
+        );
+        let body = doc.fields.into_iter().next().unwrap_or_default();
         let slot = doc_id as usize;
         assert!(
             slot >= self.doc_lengths.len(),
@@ -1317,13 +1667,13 @@ impl SpillBuilder {
         self.texts.write_all(text.as_bytes())?;
         self.texts_bytes += 4 + text.len() as u64;
         self.text_lens.push(text.len() as u32);
-        self.doc_lengths.push(doc.length);
+        self.doc_lengths.push(body.length);
         self.lineages.push(lineage);
-        self.total_length += u64::from(doc.length);
-        if doc.length > 0 {
+        self.total_length += u64::from(body.length);
+        if body.length > 0 {
             self.doc_count += 1;
         }
-        for (term, tf, offsets) in doc.terms {
+        for (term, tf, offsets) in body.terms {
             self.buf_bytes += term.len() + 24 + 16 * offsets.len();
             self.buf.push((term, doc_id, tf, offsets));
         }
@@ -1814,164 +2164,53 @@ fn validate_structure(map: &[u8], v5: bool, blob_relative: bool) -> io::Result<(
     }
     // Text index: each entry within the texts section (or the absent
     // marker).
-    for slot in 0..n_slots {
-        let e = text_index_off + 12 * slot;
-        let offset = u64_at(e)?;
-        let len = u32_at(e + 8)?;
-        if len != u32::MAX && (offset < texts_off + 4 || offset + u64::from(len) > text_index_off) {
-            return Err(invalid(format!("text index entry {slot} out of the texts section")));
-        }
-    }
+    validate_text_index(map, texts_off, text_index_off, n_slots, 0)?;
     // Lineage walk: variable-stride entries must end exactly at the
     // postings section.
-    let mut cur = lineages_off;
-    for _ in 0..n_slots {
-        let flag = *bytes_at(cur, 1)?
-            .first()
-            .ok_or_else(|| invalid("lineage section overruns postings".into()))?;
-        cur += if flag == 0 { 1 } else { 25 };
+    if lineage_section_end(map, lineages_off, n_slots)? != postings_off {
+        return Err(invalid(
+            "lineage section does not end at the postings section".into(),
+        ));
     }
-    if cur != postings_off {
-        return Err(invalid("lineage section does not end at the postings section".into()));
+    if v5 {
+        return validate_v5_directory(map, postings_off, directory_off, file_len, 0);
     }
-    // Directory: count, fixed-stride entries within the file, then the
-    // term blob (which runs to EOF).
-    let stride: u64 = if v5 { 34 } else { 18 };
+    // v3/v4: 18 B directory entries, interleaved postings records.
     let n_terms = u64::from(u32_at(directory_off)?);
     if u64::from(u32_at(postings_off)?) != n_terms {
         return Err(invalid("postings and directory term counts differ".into()));
     }
-    let blob_start = directory_off + 4 + stride * n_terms;
+    let blob_start = directory_off + 4 + 18 * n_terms;
     if blob_start > file_len {
         return Err(invalid("directory overruns the file".into()));
     }
     let mut prev_term: Vec<u8> = Vec::new();
-    let mut prev_skip_end: u64 = 0;
     for i in 0..n_terms {
-        let e = directory_off + 4 + stride * i;
-        let (term, df) = if v5 {
-            let doc_run_off = u64_at(e)?;
-            let skip_run_off = u64_at(e + 8)?;
-            let occ_run_off = u64_at(e + 16)?;
-            let df = u32_at(e + 24)?;
-            let blob_off = u64::from(u32_at(e + 28)?);
-            let term_len = u64::from(u16_at(bytes_at(e + 32, 2)?));
-            let term = bytes_at(blob_start + blob_off, term_len)?;
-            if term_len == 0 {
-                return Err(invalid(format!("directory entry {i}: empty term")));
-            }
-            // Run offsets: consistent with each other and with the
-            // previous term's region.
-            if doc_run_off < prev_skip_end || doc_run_off < postings_off + 4 {
-                return Err(invalid(format!("directory entry {i}: doc run overlaps previous regions")));
-            }
-            if occ_run_off != doc_run_off + 12 * u64::from(df) + 4 || occ_run_off > skip_run_off {
-                return Err(invalid(format!("directory entry {i}: inconsistent run offsets")));
-            }
-            let skip_end = if i + 1 < n_terms {
-                u64_at(e + stride)?
-            } else {
-                directory_off
-            };
-            if skip_end < skip_run_off + 8 || skip_end > directory_off {
-                return Err(invalid(format!("directory entry {i}: skip run out of the postings section")));
-            }
-            // Occurrence run: length divisible by 8 and equal to the
-            // sentinel occ_start.
-            if (skip_run_off - occ_run_off) % 8 != 0 {
-                return Err(invalid(format!("directory entry {i}: occurrence run not pair-aligned")));
-            }
-            let sentinel = u32_at(doc_run_off + 12 * u64::from(df))?;
-            if u64::from(sentinel) != (skip_run_off - occ_run_off) / 8 {
-                return Err(invalid(format!("directory entry {i}: sentinel occ_start mismatch")));
-            }
-            if df > 0 && u32_at(doc_run_off + 8)? != 0 {
-                return Err(invalid(format!("directory entry {i}: first occ_start is not 0")));
-            }
-            // Skip run: walk level-0 and level-1 records exactly,
-            // cross-checking block last_doc_ids against the doc run.
-            let region = skip_run_off;
-            let region_end = skip_end;
-            let l1_rel = u64_at(region)?;
-            let n_l0 = u64::from(df).div_ceil(BLOCK as u64);
-            let mut cur = region + 8;
-            let mut prev_last = 0u32;
-            let mut l0_record_offs: Vec<u64> = Vec::with_capacity(n_l0 as usize);
-            for b in 0..n_l0 {
-                l0_record_offs.push(cur - region);
-                let last_doc = u32_at(cur)?;
-                let n_pairs = u64::from(bytes_at(cur + 4, 1)?[0]);
-                if n_pairs == 0 || n_pairs > MAX_FRONTIER as u64 {
-                    return Err(invalid(format!("term {i} block {b}: n_pairs {n_pairs} out of range")));
-                }
-                if last_doc < prev_last {
-                    return Err(invalid(format!("term {i} block {b}: last_doc_id goes backwards")));
-                }
-                prev_last = last_doc;
-                // Cross-check the block bound against the doc run.
-                let last_posting = ((b + 1) * BLOCK as u64).min(u64::from(df)) - 1;
-                if u32_at(doc_run_off + 12 * last_posting)? != last_doc {
-                    return Err(invalid(format!("term {i} block {b}: last_doc_id != doc run")));
-                }
-                cur += 5 + 8 * n_pairs;
-                if cur > region_end {
-                    return Err(invalid(format!("term {i}: level-0 records overrun the skip run")));
-                }
-            }
-            if cur != region + l1_rel {
-                return Err(invalid(format!("term {i}: level-1 region offset mismatch")));
-            }
-            let n_l1 = n_l0.div_ceil(LEVEL1_FACTOR as u64);
-            for g in 0..n_l1 {
-                let last_doc = u32_at(cur)?;
-                let l0_off = u64_at(cur + 4)?;
-                let n_pairs = u64::from(bytes_at(cur + 12, 1)?[0]);
-                if n_pairs == 0 || n_pairs > MAX_FRONTIER as u64 {
-                    return Err(invalid(format!("term {i} group {g}: n_pairs out of range")));
-                }
-                let last_block = ((g + 1) * LEVEL1_FACTOR as u64).min(n_l0) - 1;
-                let last_posting = ((last_block + 1) * BLOCK as u64).min(u64::from(df)) - 1;
-                if u32_at(doc_run_off + 12 * last_posting)? != last_doc {
-                    return Err(invalid(format!("term {i} group {g}: last_doc_id != doc run")));
-                }
-                if l0_off != l0_record_offs[(g * LEVEL1_FACTOR as u64) as usize] {
-                    return Err(invalid(format!("term {i} group {g}: l0_off != group start")));
-                }
-                cur += 13 + 8 * n_pairs;
-            }
-            if cur != region_end {
-                return Err(invalid(format!("term {i}: skip run does not end at the next region")));
-            }
-            prev_skip_end = skip_end;
-            (term, df)
+        let e = directory_off + 4 + 18 * i;
+        let postings_entry_off = u64_at(e)?;
+        let df = u32_at(e + 8)?;
+        let stored = u32_at(e + 12)?;
+        let term_len = u64::from(u16_at(bytes_at(e + 16, 2)?));
+        let term = if blob_relative {
+            bytes_at(blob_start + u64::from(stored), term_len)?
         } else {
-            let postings_entry_off = u64_at(e)?;
-            let df = u32_at(e + 8)?;
-            let stored = u32_at(e + 12)?;
-            let term_len = u64::from(u16_at(bytes_at(e + 16, 2)?));
-            let term = if blob_relative {
-                bytes_at(blob_start + u64::from(stored), term_len)?
-            } else {
-                bytes_at(u64::from(stored), term_len)?
-            };
-            if term_len == 0 {
-                return Err(invalid(format!("directory entry {i}: empty term")));
-            }
-            if postings_entry_off < postings_off + 4 || postings_entry_off >= directory_off {
-                return Err(invalid(format!("directory entry {i}: postings offset out of section")));
-            }
-            // The postings entry's inline header must match the
-            // directory entry exactly.
-            let inline_len = u64::from(u32_at(postings_entry_off)?);
-            if inline_len != term_len
-                || bytes_at(postings_entry_off + 4, term_len)? != term
-                || u32_at(postings_entry_off + 4 + term_len)? != df
-            {
-                return Err(invalid(format!("directory entry {i}: postings header mismatch")));
-            }
-            (term, df)
+            bytes_at(u64::from(stored), term_len)?
         };
-        let _ = df;
+        if term_len == 0 {
+            return Err(invalid(format!("directory entry {i}: empty term")));
+        }
+        if postings_entry_off < postings_off + 4 || postings_entry_off >= directory_off {
+            return Err(invalid(format!("directory entry {i}: postings offset out of section")));
+        }
+        // The postings entry's inline header must match the
+        // directory entry exactly.
+        let inline_len = u64::from(u32_at(postings_entry_off)?);
+        if inline_len != term_len
+            || bytes_at(postings_entry_off + 4, term_len)? != term
+            || u32_at(postings_entry_off + 4 + term_len)? != df
+        {
+            return Err(invalid(format!("directory entry {i}: postings header mismatch")));
+        }
         if !prev_term.is_empty() && term <= prev_term.as_slice() {
             return Err(invalid(format!("directory entry {i}: terms not strictly ordered")));
         }
@@ -1980,24 +2219,344 @@ fn validate_structure(map: &[u8], v5: bool, blob_relative: bool) -> io::Result<(
     Ok(())
 }
 
+/// Validate one v5-shaped postings/directory section pair (a v5 file's
+/// only pair, or one field of a v6 file): term counts agree, entries in
+/// bounds and strictly term-ordered, run offsets mutually consistent,
+/// occurrence runs pair-aligned and sentinel-checked, skip runs walked
+/// out exactly with block `last_doc_id`s cross-checked against the doc
+/// run, and the term blob exactly filling the directory section to
+/// `section_end`. `run_base` rebases the directory's run offsets: 0
+/// when entries are absolute (v5), the field's postings section offset
+/// when they are section-relative (v6).
+fn validate_v5_directory(
+    map: &[u8],
+    postings_off: u64,
+    directory_off: u64,
+    section_end: u64,
+    run_base: u64,
+) -> io::Result<()> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let u32_at = |off: u64| -> io::Result<u32> {
+        let b = map
+            .get(off as usize..off as usize + 4)
+            .ok_or_else(|| invalid(format!("read past end at {off}")))?;
+        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    };
+    let u64_at = |off: u64| -> io::Result<u64> {
+        let b = map
+            .get(off as usize..off as usize + 8)
+            .ok_or_else(|| invalid(format!("read past end at {off}")))?;
+        Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+    };
+    let bytes_at = |off: u64, len: u64| -> io::Result<&[u8]> {
+        map.get(off as usize..(off + len) as usize)
+            .ok_or_else(|| invalid(format!("range [{off}, {}) out of file", off + len)))
+    };
+    let n_terms = u64::from(u32_at(directory_off)?);
+    if u64::from(u32_at(postings_off)?) != n_terms {
+        return Err(invalid("postings and directory term counts differ".into()));
+    }
+    let blob_start = directory_off + 4 + 34 * n_terms;
+    if blob_start > section_end {
+        return Err(invalid("directory overruns its section".into()));
+    }
+    let mut prev_term: Vec<u8> = Vec::new();
+    let mut prev_skip_end: u64 = 0;
+    let mut blob_used: u64 = 0;
+    for i in 0..n_terms {
+        let e = directory_off + 4 + 34 * i;
+        let doc_run_off = u64_at(e)? + run_base;
+        let skip_run_off = u64_at(e + 8)? + run_base;
+        let occ_run_off = u64_at(e + 16)? + run_base;
+        let df = u32_at(e + 24)?;
+        let blob_off = u64::from(u32_at(e + 28)?);
+        let term_len = u64::from(u16_at(bytes_at(e + 32, 2)?));
+        if term_len == 0 {
+            return Err(invalid(format!("directory entry {i}: empty term")));
+        }
+        if blob_start + blob_off + term_len > section_end {
+            return Err(invalid(format!("directory entry {i}: term out of the blob section")));
+        }
+        let term = bytes_at(blob_start + blob_off, term_len)?;
+        blob_used += term_len;
+        // Run offsets: consistent with each other and with the
+        // previous term's region.
+        if doc_run_off < prev_skip_end || doc_run_off < postings_off + 4 {
+            return Err(invalid(format!("directory entry {i}: doc run overlaps previous regions")));
+        }
+        if occ_run_off != doc_run_off + 12 * u64::from(df) + 4 || occ_run_off > skip_run_off {
+            return Err(invalid(format!("directory entry {i}: inconsistent run offsets")));
+        }
+        let skip_end = if i + 1 < n_terms {
+            u64_at(e + 34)? + run_base
+        } else {
+            directory_off
+        };
+        if skip_end < skip_run_off + 8 || skip_end > directory_off {
+            return Err(invalid(format!("directory entry {i}: skip run out of the postings section")));
+        }
+        // Occurrence run: length divisible by 8 and equal to the
+        // sentinel occ_start.
+        if (skip_run_off - occ_run_off) % 8 != 0 {
+            return Err(invalid(format!("directory entry {i}: occurrence run not pair-aligned")));
+        }
+        let sentinel = u32_at(doc_run_off + 12 * u64::from(df))?;
+        if u64::from(sentinel) != (skip_run_off - occ_run_off) / 8 {
+            return Err(invalid(format!("directory entry {i}: sentinel occ_start mismatch")));
+        }
+        if df > 0 && u32_at(doc_run_off + 8)? != 0 {
+            return Err(invalid(format!("directory entry {i}: first occ_start is not 0")));
+        }
+        // Skip run: walk level-0 and level-1 records exactly,
+        // cross-checking block last_doc_ids against the doc run.
+        let region = skip_run_off;
+        let region_end = skip_end;
+        let l1_rel = u64_at(region)?;
+        let n_l0 = u64::from(df).div_ceil(BLOCK as u64);
+        let mut cur = region + 8;
+        let mut prev_last = 0u32;
+        let mut l0_record_offs: Vec<u64> = Vec::with_capacity(n_l0 as usize);
+        for b in 0..n_l0 {
+            l0_record_offs.push(cur - region);
+            let last_doc = u32_at(cur)?;
+            let n_pairs = u64::from(bytes_at(cur + 4, 1)?[0]);
+            if n_pairs == 0 || n_pairs > MAX_FRONTIER as u64 {
+                return Err(invalid(format!("term {i} block {b}: n_pairs {n_pairs} out of range")));
+            }
+            if last_doc < prev_last {
+                return Err(invalid(format!("term {i} block {b}: last_doc_id goes backwards")));
+            }
+            prev_last = last_doc;
+            // Cross-check the block bound against the doc run.
+            let last_posting = ((b + 1) * BLOCK as u64).min(u64::from(df)) - 1;
+            if u32_at(doc_run_off + 12 * last_posting)? != last_doc {
+                return Err(invalid(format!("term {i} block {b}: last_doc_id != doc run")));
+            }
+            cur += 5 + 8 * n_pairs;
+            if cur > region_end {
+                return Err(invalid(format!("term {i}: level-0 records overrun the skip run")));
+            }
+        }
+        if cur != region + l1_rel {
+            return Err(invalid(format!("term {i}: level-1 region offset mismatch")));
+        }
+        let n_l1 = n_l0.div_ceil(LEVEL1_FACTOR as u64);
+        for g in 0..n_l1 {
+            let last_doc = u32_at(cur)?;
+            let l0_off = u64_at(cur + 4)?;
+            let n_pairs = u64::from(bytes_at(cur + 12, 1)?[0]);
+            if n_pairs == 0 || n_pairs > MAX_FRONTIER as u64 {
+                return Err(invalid(format!("term {i} group {g}: n_pairs out of range")));
+            }
+            let last_block = ((g + 1) * LEVEL1_FACTOR as u64).min(n_l0) - 1;
+            let last_posting = ((last_block + 1) * BLOCK as u64).min(u64::from(df)) - 1;
+            if u32_at(doc_run_off + 12 * last_posting)? != last_doc {
+                return Err(invalid(format!("term {i} group {g}: last_doc_id != doc run")));
+            }
+            if l0_off != l0_record_offs[(g * LEVEL1_FACTOR as u64) as usize] {
+                return Err(invalid(format!("term {i} group {g}: l0_off != group start")));
+            }
+            cur += 13 + 8 * n_pairs;
+        }
+        if cur != region_end {
+            return Err(invalid(format!("term {i}: skip run does not end at the next region")));
+        }
+        prev_skip_end = skip_end;
+        if !prev_term.is_empty() && term <= prev_term.as_slice() {
+            return Err(invalid(format!("directory entry {i}: terms not strictly ordered")));
+        }
+        prev_term = term.to_vec();
+    }
+    // The term blob exactly fills the directory section (terms are
+    // laid out contiguously in entry order).
+    if blob_start + blob_used != section_end {
+        return Err(invalid("term blob does not fill the directory section".into()));
+    }
+    Ok(())
+}
+
+/// Validate the text index: every present entry within the texts
+/// section, absent markers untouched. `entry_base` rebases stored
+/// offsets: the entries are absolute in v3/v4/v5 (base 0) and relative
+/// to the texts section start in v6 (base `texts_off`).
+fn validate_text_index(
+    map: &[u8],
+    texts_off: u64,
+    text_index_off: u64,
+    n_slots: u64,
+    entry_base: u64,
+) -> io::Result<()> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    for slot in 0..n_slots {
+        let e = (text_index_off + 12 * slot) as usize;
+        let b = map
+            .get(e..e + 12)
+            .ok_or_else(|| invalid(format!("text index entry {slot} past end of file")))?;
+        let offset = u64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+        let len = u32::from_le_bytes(b[8..].try_into().expect("4 bytes"));
+        if len != u32::MAX {
+            let abs = entry_base + offset;
+            if abs < texts_off + 4 || abs + u64::from(len) > text_index_off {
+                return Err(invalid(format!(
+                    "text index entry {slot} out of the texts section"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk the variable-stride lineage section (1 B absent, 25 B present)
+/// and return the offset one past its last entry.
+fn lineage_section_end(map: &[u8], lineages_off: u64, n_slots: u64) -> io::Result<u64> {
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+    let mut cur = lineages_off;
+    for _ in 0..n_slots {
+        let flag = *map
+            .get(cur as usize)
+            .ok_or_else(|| invalid("lineage section overruns the file"))?;
+        cur += if flag == 0 { 1 } else { 25 };
+    }
+    Ok(cur)
+}
+
+/// Full structural validation of a v6 file (`docs/multi-field.md`),
+/// same error-not-panic contract as [`validate_structure`]: the header
+/// and field table, shared-section geometry (contiguous, in order),
+/// the text index and lineage walk, and per field the doc_lengths sum
+/// against the field table's total plus the full v5-shaped directory
+/// and skip-run walk. Field groups must exactly tile the file from the
+/// lineage section's end to EOF.
+fn validate_structure_v6(map: &[u8]) -> io::Result<()> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let file_len = map.len() as u64;
+    let u32_at = |off: u64| -> io::Result<u32> {
+        let b = map
+            .get(off as usize..off as usize + 4)
+            .ok_or_else(|| invalid(format!("read past end at {off}")))?;
+        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    };
+    let u64_at = |off: u64| -> io::Result<u64> {
+        let b = map
+            .get(off as usize..off as usize + 8)
+            .ok_or_else(|| invalid(format!("read past end at {off}")))?;
+        Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+    };
+    let bytes_at = |off: u64, len: u64| -> io::Result<&[u8]> {
+        map.get(off as usize..(off + len) as usize)
+            .ok_or_else(|| invalid(format!("range [{off}, {}) out of file", off + len)))
+    };
+
+    let n_fields = u64::from(u32_at(8)?);
+    if n_fields == 0 {
+        return Err(invalid("v6 file with zero fields".into()));
+    }
+    let n_slots = u64::from(u32_at(12)?);
+    let texts_off = u64_at(16)?;
+    let text_index_off = u64_at(24)?;
+    let lineages_off = u64_at(32)?;
+    // Field table walk: names non-empty and unique, offsets collected.
+    let mut cursor = 40u64;
+    let mut fields: Vec<(u64, u64, u64, u64)> = Vec::new(); // (total, dl, postings, dir)
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for i in 0..n_fields {
+        let name_len = u64::from(u16_at(bytes_at(cursor, 2)?));
+        if name_len == 0 {
+            return Err(invalid(format!("field {i}: empty name")));
+        }
+        let name = bytes_at(cursor + 2, name_len)?.to_vec();
+        if names.contains(&name) {
+            return Err(invalid(format!("field {i}: duplicate name")));
+        }
+        names.push(name);
+        let base = cursor + 2 + name_len;
+        fields.push((
+            u64_at(base + 8)?,  // total_length
+            u64_at(base + 16)?, // doc_lengths_off
+            u64_at(base + 24)?, // postings_off
+            u64_at(base + 32)?, // directory_off
+        ));
+        cursor = base + 40;
+    }
+    let header_end = cursor;
+    // Shared sections: contiguous from the header end, in order.
+    if texts_off != header_end || texts_off > file_len {
+        return Err(invalid("texts section does not start at the header end".into()));
+    }
+    if text_index_off < texts_off
+        || lineages_off != text_index_off + 12 * n_slots
+        || lineages_off > file_len
+    {
+        return Err(invalid("shared section offsets unordered or out of file".into()));
+    }
+    validate_text_index(map, texts_off, text_index_off, n_slots, texts_off)?;
+    let lineage_end = lineage_section_end(map, lineages_off, n_slots)?;
+    // Per-field groups: contiguous from the lineage end, tiling the
+    // file exactly (each group's blob-fill check pins its end to the
+    // next group's start, and the last to EOF).
+    let mut expected_start = lineage_end;
+    for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
+        if dl_off != expected_start {
+            return Err(invalid(format!(
+                "field {i}: doc_lengths section does not start at the previous section's end"
+            )));
+        }
+        if postings_off != dl_off + 4 * n_slots {
+            return Err(invalid(format!(
+                "field {i}: postings section does not follow doc_lengths"
+            )));
+        }
+        let section_end = fields.get(i + 1).map_or(file_len, |f| f.1);
+        if directory_off < postings_off + 4 || directory_off + 4 > section_end {
+            return Err(invalid(format!("field {i}: directory offset out of the group")));
+        }
+        // The field table total must agree with the doc-length table.
+        let mut length_sum = 0u64;
+        for slot in 0..n_slots {
+            length_sum += u64::from(u32_at(dl_off + 4 * slot)?);
+        }
+        if length_sum != total_length {
+            return Err(invalid(format!(
+                "field {i}: total_length != sum of doc lengths"
+            )));
+        }
+        validate_v5_directory(map, postings_off, directory_off, section_end, postings_off)?;
+        expected_start = section_end;
+    }
+    Ok(())
+}
+
 fn u16_at(bytes: &[u8]) -> u16 {
     u16::from_le_bytes(bytes.try_into().expect("2 bytes"))
 }
 
-/// A memory-mapped, disk-resident view of a `.bm25` file (v3, v4, or
-/// v5). Postings and document texts are read from the map on demand; the
-/// only heap state is the per-document length table and a term count.
+/// A memory-mapped, disk-resident view of a `.bm25` file (v3, v4, v5,
+/// or single-field v6). Postings and document texts are read from the
+/// map on demand; the only heap state is the per-document length table
+/// and a term count.
 pub struct Bm25Reader {
     map: memmap2::Mmap,
     doc_lengths: Vec<u32>,
     doc_count: u64,
     total_length: u64,
     lineages_off: u64,
+    /// Start of the on-disk text index (explicit in the v6 header;
+    /// derived as `lineages_off - 12 * n_slots` for v3/v4/v5).
+    text_index_off: u64,
+    /// Base added to text-index entry offsets: 0 for v3/v4/v5
+    /// (absolute entries), the texts section offset for v6 (relative
+    /// entries).
+    text_base: u64,
     directory_off: u64,
     n_terms: u32,
-    /// v5 file: 34 B directory entries and the doc/occurrence/skip run
-    /// layout; v3/v4: 18 B entries and interleaved postings.
-    v5: bool,
+    /// v5-shaped postings (v5 and v6 files): 34 B directory entries
+    /// and the doc/occurrence/skip run layout; v3/v4: 18 B entries and
+    /// interleaved postings.
+    v5_runs: bool,
+    /// Base added to directory run offsets: 0 for v5 (absolute
+    /// entries), the field's postings section offset for v6
+    /// (section-relative entries).
+    run_base: u64,
     /// v4+ directories store blob offsets relative to the blob start;
     /// v3 stored absolute file offsets.
     blob_relative: bool,
@@ -2014,19 +2573,24 @@ impl Bm25Reader {
         self.doc_lengths.len() as u32
     }
 
-    /// Open a v3/v4/v5 `.bm25` file read-only after full structural
-    /// validation (see [`validate_structure`] — malformed files error,
-    /// never panic). Touches only the header, the doc-length table, the
-    /// directory, and the skip runs — no postings or text pages beyond
-    /// those are faulted in until queries ask for them.
+    /// Open a v3/v4/v5/v6 `.bm25` file read-only after full structural
+    /// validation (see [`validate_structure`] / [`validate_structure_v6`]
+    /// — malformed files error, never panic). Touches only the header,
+    /// the doc-length table, the directory, and the skip runs — no
+    /// postings or text pages beyond those are faulted in until queries
+    /// ask for them.
     pub fn open(path: &Path) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let file = std::fs::File::open(path)?;
         let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        if map.len() < 52
-            || (&map[..8] != MAGIC_V5 && &map[..8] != MAGIC_V4 && &map[..8] != MAGIC_V3)
-        {
-            return Err(invalid("not a v3/v4/v5 .bm25 file"));
+        if map.len() < 52 {
+            return Err(invalid("not a v3/v4/v5/v6 .bm25 file"));
+        }
+        if &map[..8] == MAGIC_V6 {
+            return Self::open_v6(map);
+        }
+        if &map[..8] != MAGIC_V5 && &map[..8] != MAGIC_V4 && &map[..8] != MAGIC_V3 {
+            return Err(invalid("not a v3/v4/v5/v6 .bm25 file"));
         }
         let v5 = &map[..8] == MAGIC_V5;
         let blob_relative = &map[..8] != MAGIC_V3;
@@ -2061,10 +2625,64 @@ impl Bm25Reader {
             doc_count,
             total_length,
             lineages_off,
+            text_index_off: lineages_off - 12 * n_slots as u64,
+            text_base: 0,
             directory_off,
             n_terms,
-            v5,
+            v5_runs: v5,
+            run_base: 0,
             blob_relative,
+            lineage_index: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Open a validated v6 map. Single-field files only for now: the
+    /// reader's query surface has no field parameter yet, so a
+    /// multi-field file cannot be served faithfully (increment 2 of
+    /// `docs/multi-field.md` lifts this). The one field's sections are
+    /// v5-shaped, so the entire v5 read machinery applies with run
+    /// offsets rebased by the field's postings section offset.
+    fn open_v6(map: memmap2::Mmap) -> io::Result<Self> {
+        let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+        validate_structure_v6(&map)?;
+        let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().unwrap());
+        let u64_at = |off: usize| u64::from_le_bytes(map[off..off + 8].try_into().unwrap());
+        let n_fields = u32_at(8);
+        if n_fields != 1 {
+            return Err(invalid(
+                "multi-field v6 files are not readable yet (docs/multi-field.md increment 2)",
+            ));
+        }
+        let n_slots = u32_at(12) as usize;
+        let texts_off = u64_at(16);
+        let text_index_off = u64_at(24);
+        let lineages_off = u64_at(32);
+        // Field 0's table entry (validation checked the walk).
+        let name_len = u16::from_le_bytes(map[40..42].try_into().unwrap()) as usize;
+        let base = 42 + name_len;
+        let total_length = u64_at(base + 8);
+        let doc_lengths_off = u64_at(base + 16) as usize;
+        let postings_off = u64_at(base + 24);
+        let directory_off = u64_at(base + 32);
+        let mut doc_lengths = Vec::with_capacity(n_slots);
+        for slot in 0..n_slots {
+            doc_lengths.push(u32_at(doc_lengths_off + 4 * slot));
+        }
+        let doc_count = doc_lengths.iter().filter(|&&l| l > 0).count() as u64;
+        let n_terms = u32_at(directory_off as usize);
+        Ok(Self {
+            map,
+            doc_lengths,
+            doc_count,
+            total_length,
+            lineages_off,
+            text_index_off,
+            text_base: texts_off,
+            directory_off,
+            n_terms,
+            v5_runs: true,
+            run_base: postings_off,
+            blob_relative: true,
             lineage_index: std::sync::OnceLock::new(),
         })
     }
@@ -2085,13 +2703,19 @@ impl Bm25Reader {
         (&self.map[blob_off..blob_off + len], postings_off, df)
     }
 
-    /// The 34 B v5 directory entry: `(term bytes, doc_run_off,
-    /// skip_run_off, occ_run_off, df)`.
+    /// The 34 B v5-shaped directory entry: `(term bytes, doc_run_off,
+    /// skip_run_off, occ_run_off, df)`. Run offsets are rebased by
+    /// `run_base` (0 on v5 files, where entries are absolute; the
+    /// field's postings section offset on v6, where they are
+    /// section-relative), so callers always see absolute offsets.
     fn directory_entry_v5(&self, i: u32) -> (&[u8], u64, u64, u64, u32) {
         let e = self.directory_off as usize + 4 + 34 * i as usize;
-        let doc_run_off = u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap());
-        let skip_run_off = u64::from_le_bytes(self.map[e + 8..e + 16].try_into().unwrap());
-        let occ_run_off = u64::from_le_bytes(self.map[e + 16..e + 24].try_into().unwrap());
+        let doc_run_off =
+            u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap()) + self.run_base;
+        let skip_run_off =
+            u64::from_le_bytes(self.map[e + 8..e + 16].try_into().unwrap()) + self.run_base;
+        let occ_run_off =
+            u64::from_le_bytes(self.map[e + 16..e + 24].try_into().unwrap()) + self.run_base;
         let df = u32::from_le_bytes(self.map[e + 24..e + 28].try_into().unwrap());
         let stored = u32::from_le_bytes(self.map[e + 28..e + 32].try_into().unwrap()) as usize;
         let len = u16::from_le_bytes(self.map[e + 32..e + 34].try_into().unwrap()) as usize;
@@ -2556,14 +3180,14 @@ impl Bm25Index for Bm25Reader {
         self.doc_lengths.get(doc_id as usize).copied().unwrap_or(0)
     }
     fn df(&self, term: &str) -> u32 {
-        if self.v5 {
+        if self.v5_runs {
             self.directory_lookup_v5(term).map_or(0, |(_, _, _, df)| df)
         } else {
             self.directory_lookup(term).map_or(0, |(_, df)| df)
         }
     }
     fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
-        if self.v5 {
+        if self.v5_runs {
             let Some((doc_run_off, _, occ_run_off, df)) = self.directory_lookup_v5(term) else {
                 return;
             };
@@ -2582,7 +3206,7 @@ impl Bm25Index for Bm25Reader {
         }
     }
     fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
-        if self.v5 {
+        if self.v5_runs {
             let Some((doc_run_off, _, _, df)) = self.directory_lookup_v5(term) else {
                 return;
             };
@@ -2594,7 +3218,7 @@ impl Bm25Index for Bm25Reader {
         }
     }
     fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
-        if self.v5 {
+        if self.v5_runs {
             let Some((doc_run_off, _, occ_run_off, df)) = self.directory_lookup_v5(term) else {
                 return Vec::new();
             };
@@ -2650,7 +3274,7 @@ impl Bm25Index for Bm25Reader {
         }
     }
     fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
-        if !self.v5 {
+        if !self.v5_runs {
             return None;
         }
         let (doc_run_off, skip_run_off, occ_run_off, df) = self.directory_lookup_v5(term)?;
@@ -2663,19 +3287,17 @@ impl Bm25Index for Bm25Reader {
         ))
     }
     fn has_impacts(&self, term: &str) -> bool {
-        self.v5 && self.directory_lookup_v5(term).is_some()
+        self.v5_runs && self.directory_lookup_v5(term).is_some()
     }
     fn text(&self, doc_id: u32) -> Option<String> {
         let slot = doc_id as usize;
         if slot >= self.doc_lengths.len() {
             return None;
         }
-        // The on-disk text index sits between the texts and lineages
-        // sections: lineages_off - 12 * n_slots, 12-byte entries.
-        let n_slots = self.doc_lengths.len() as u64;
-        let index_start = self.lineages_off - 12 * n_slots;
-        let e = (index_start + 12 * doc_id as u64) as usize;
-        let offset = u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap());
+        // The on-disk text index: 12-byte entries; offsets absolute in
+        // v3/v4/v5, texts-section-relative in v6 (text_base rebases).
+        let e = (self.text_index_off + 12 * doc_id as u64) as usize;
+        let offset = u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap()) + self.text_base;
         let len = u32::from_le_bytes(self.map[e + 8..e + 12].try_into().unwrap());
         if len == u32::MAX {
             return None;
@@ -2752,7 +3374,7 @@ mod tests {
                 span_start: i,
                 span_end: i + 100,
             });
-            docs.push((id, format!("document {i} body text"), AnalyzedDoc { terms, length }, lineage));
+            docs.push((id, format!("document {i} body text"), AnalyzedDoc::body(terms, length), lineage));
         }
         docs
     }
@@ -2843,23 +3465,23 @@ mod tests {
     }
 
     fn doc_a() -> AnalyzedDoc {
-        AnalyzedDoc {
-            terms: vec![
+        AnalyzedDoc::body(
+            vec![
                 ("rust".to_string(), 2, vec![(0, 4), (10, 14)]),
                 ("search".to_string(), 1, vec![(5, 11)]),
             ],
-            length: 3,
-        }
+            3,
+        )
     }
 
     fn doc_b() -> AnalyzedDoc {
-        AnalyzedDoc {
-            terms: vec![
+        AnalyzedDoc::body(
+            vec![
                 ("rust".to_string(), 1, vec![(0, 4)]),
                 ("vector".to_string(), 2, vec![(5, 11), (12, 18)]),
             ],
-            length: 3,
-        }
+            3,
+        )
     }
 
     #[test]
@@ -2894,10 +3516,7 @@ mod tests {
         store.add_document(
             2,
             "hello world".to_string(),
-            AnalyzedDoc {
-                terms: vec![("hello".to_string(), 1, vec![(0, 5)])],
-                length: 2,
-            },
+            AnalyzedDoc::body(vec![("hello".to_string(), 1, vec![(0, 5)])], 2),
         );
         assert_eq!(store.next_doc_id(), 3);
         assert_eq!(store.doc_count(), 1);
@@ -2919,10 +3538,10 @@ mod tests {
         store.save(&path).unwrap();
 
         let loaded = Bm25Store::load(&path).unwrap();
-        assert_eq!(loaded.doc_lengths, store.doc_lengths);
-        assert_eq!(loaded.total_length, store.total_length);
+        assert_eq!(loaded.fields[0].doc_lengths, store.fields[0].doc_lengths);
+        assert_eq!(loaded.fields[0].total_length, store.fields[0].total_length);
         assert_eq!(loaded.texts, store.texts);
-        assert_eq!(loaded.postings, store.postings);
+        assert_eq!(loaded.fields[0].postings, store.fields[0].postings);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2948,28 +3567,19 @@ mod tests {
         store.add_document_with_lineage(
             2,
             "a".to_string(),
-            AnalyzedDoc {
-                terms: vec![("rust".into(), 1, vec![(0, 4)])],
-                length: 1,
-            },
+            AnalyzedDoc::body(vec![("rust".into(), 1, vec![(0, 4)])], 1),
             Some(lineage(2)),
         );
         store.add_document_with_lineage(
             3,
             "b".to_string(),
-            AnalyzedDoc {
-                terms: vec![("rust".into(), 2, vec![(0, 4), (6, 10)])],
-                length: 2,
-            },
+            AnalyzedDoc::body(vec![("rust".into(), 2, vec![(0, 4), (6, 10)])], 2),
             None,
         );
         store.add_document_with_lineage(
             7,
             "c".to_string(),
-            AnalyzedDoc {
-                terms: vec![("search".into(), 1, vec![(0, 6)])],
-                length: 1,
-            },
+            AnalyzedDoc::body(vec![("search".into(), 1, vec![(0, 6)])], 1),
             Some(lineage(7)),
         );
         store.save(&path).unwrap();
@@ -2998,10 +3608,7 @@ mod tests {
             store.add_document(
                 i * 2, // gaps: even ids only
                 format!("doc {i}"),
-                AnalyzedDoc {
-                    terms: vec![("court".to_string(), 1, vec![(i, i + 3)])],
-                    length: 5,
-                },
+                AnalyzedDoc::body(vec![("court".to_string(), 1, vec![(i, i + 3)])], 5),
             );
         }
         {
@@ -3010,7 +3617,7 @@ mod tests {
             w.flush().unwrap();
         }
         let reader = Bm25Reader::open(&path).unwrap();
-        assert!(!reader.v5, "expected the v4 path");
+        assert!(!reader.v5_runs, "expected the v4 path");
         // First posting of the list (early exit after one record).
         assert_eq!(reader.posting_offsets("court", 0), vec![(0, 3)]);
         // Middle and last.
@@ -3092,7 +3699,7 @@ mod tests {
                 length += tf;
                 terms.push((term, tf, offsets));
             }
-            docs.push((id, format!("doc {id}"), AnalyzedDoc { terms, length }));
+            docs.push((id, format!("doc {id}"), AnalyzedDoc::body(terms, length)));
         }
         docs
     }
@@ -3175,8 +3782,8 @@ mod tests {
 
         // And the heap reload path (shard append) parses v5.
         let loaded = Bm25Store::load(&path).unwrap();
-        assert_eq!(loaded.postings, store.postings);
-        assert_eq!(loaded.doc_lengths, store.doc_lengths);
+        assert_eq!(loaded.fields[0].postings, store.fields[0].postings);
+        assert_eq!(loaded.fields[0].doc_lengths, store.fields[0].doc_lengths);
         assert_eq!(loaded.texts, store.texts);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3353,10 +3960,7 @@ mod tests {
             stair.add_document(
                 i,
                 format!("doc {i}"),
-                AnalyzedDoc {
-                    terms: vec![("stair".to_string(), 1 + i % 150, vec![(i, i + 2)])],
-                    length: 100 + i,
-                },
+                AnalyzedDoc::body(vec![("stair".to_string(), 1 + i % 150, vec![(i, i + 2)])], 100 + i),
             );
         }
         let path = dir.join("stair.bm25");
@@ -3385,14 +3989,11 @@ mod tests {
             store.add_document(
                 i,
                 format!("doc {i}"),
-                AnalyzedDoc {
-                    terms: vec![(
+                AnalyzedDoc::body(vec![(
                         "court".to_string(),
                         tf,
                         (0..tf).map(|o| (o * 10 + i, o * 10 + i + 4)).collect(),
-                    )],
-                    length: tf,
-                },
+                    )], tf),
             );
         }
         store.save(&path).unwrap();
@@ -3438,6 +4039,236 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- v6 (TVBM2506) tests -------------------------------------------
+
+    fn synthetic_store() -> Bm25Store {
+        let mut store = Bm25Store::new();
+        for (id, text, doc, lineage) in synthetic_corpus() {
+            store.add_document_with_lineage(id, text, doc, lineage);
+        }
+        store
+    }
+
+    /// The increment-1 parity contract (`docs/multi-field.md` build
+    /// order step 1): a single-field v6 file carries the SAME section
+    /// bytes as the v5 file of the same corpus. doc_lengths, texts,
+    /// lineages, and postings are byte-identical; text_index entries
+    /// and directory run offsets differ only by their documented
+    /// rebasing (v6 stores them section-relative).
+    #[test]
+    fn v6_single_field_sections_match_v5() {
+        let store = synthetic_store();
+        let mut v5 = Vec::new();
+        store.write_to(&mut v5).unwrap();
+        let mut v6 = Vec::new();
+        store.write_v6_to(&mut v6).unwrap();
+
+        let u32le = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64le = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+
+        // v5 geometry from its fixed header.
+        let v5_texts_off = u64le(&v5, 16) as usize;
+        let v5_lineages_off = u64le(&v5, 24) as usize;
+        let v5_postings_off = u64le(&v5, 32) as usize;
+        let v5_directory_off = u64le(&v5, 40) as usize;
+        let n_slots = u32le(&v5, 48) as usize;
+        let v5_text_index_off = v5_lineages_off - 12 * n_slots;
+
+        // v6 geometry from its section table.
+        assert_eq!(&v6[..8], b"TVBM2506");
+        assert_eq!(u32le(&v6, 8), 1, "n_fields");
+        assert_eq!(u32le(&v6, 12) as usize, n_slots, "n_slots");
+        let t_off = u64le(&v6, 16) as usize;
+        let ti_off = u64le(&v6, 24) as usize;
+        let l_off = u64le(&v6, 32) as usize;
+        let name_len = u16::from_le_bytes(v6[40..42].try_into().unwrap()) as usize;
+        assert_eq!(&v6[42..42 + name_len], b"body");
+        let fe = 42 + name_len;
+        assert_eq!(u64le(&v6, fe), 0, "analysis fingerprint placeholder");
+        assert_eq!(u64le(&v6, fe + 8), u64le(&v5, 8), "total_length");
+        let dl_off = u64le(&v6, fe + 16) as usize;
+        let p_off = u64le(&v6, fe + 24) as usize;
+        let d_off = u64le(&v6, fe + 32) as usize;
+
+        // Byte-identical sections.
+        assert_eq!(
+            &v6[dl_off..dl_off + 4 * n_slots],
+            &v5[52..v5_texts_off],
+            "doc_lengths section"
+        );
+        assert_eq!(
+            &v6[t_off..ti_off],
+            &v5[v5_texts_off..v5_text_index_off],
+            "texts section"
+        );
+        assert_eq!(
+            &v6[l_off..dl_off],
+            &v5[v5_lineages_off..v5_postings_off],
+            "lineages section"
+        );
+        assert_eq!(
+            &v6[p_off..d_off],
+            &v5[v5_postings_off..v5_directory_off],
+            "postings section"
+        );
+
+        // text_index: identical entries after the documented rebase.
+        for slot in 0..n_slots {
+            let a = v5_text_index_off + 12 * slot;
+            let b = ti_off + 12 * slot;
+            assert_eq!(u32le(&v5, a + 8), u32le(&v6, b + 8), "text len, slot {slot}");
+            if u32le(&v5, a + 8) != u32::MAX {
+                assert_eq!(
+                    u64le(&v5, a) - v5_texts_off as u64,
+                    u64le(&v6, b),
+                    "text offset, slot {slot}"
+                );
+            } else {
+                assert_eq!(u64le(&v6, b), 0, "absent marker, slot {slot}");
+            }
+        }
+
+        // directory: identical entries after the documented rebase,
+        // identical term blob, both files fully tiled.
+        let n_terms = u32le(&v5, v5_directory_off) as usize;
+        assert_eq!(u32le(&v6, d_off) as usize, n_terms, "n_terms");
+        for i in 0..n_terms {
+            let a = v5_directory_off + 4 + 34 * i;
+            let b = d_off + 4 + 34 * i;
+            for run in 0..3 {
+                assert_eq!(
+                    u64le(&v5, a + 8 * run) - v5_postings_off as u64,
+                    u64le(&v6, b + 8 * run),
+                    "run offset {run}, term {i}"
+                );
+            }
+            assert_eq!(&v5[a + 24..a + 34], &v6[b + 24..b + 34], "df/blob/len, term {i}");
+        }
+        let blob_a = v5_directory_off + 4 + 34 * n_terms;
+        let blob_b = d_off + 4 + 34 * n_terms;
+        assert_eq!(v5.len() - blob_a, v6.len() - blob_b, "blob sizes");
+        assert_eq!(&v5[blob_a..], &v6[blob_b..], "term blob");
+    }
+
+    /// v6 round trip: the reader serves exactly what the heap store
+    /// holds through every trait method, the block-max surface is
+    /// present, and `Bm25Store::load` (the shard append path)
+    /// reproduces the store exactly.
+    #[test]
+    fn v6_round_trip_matches_heap_store() {
+        let dir = test_dir("v6rt");
+        let path = dir.join("shard.bm25");
+        let store = synthetic_store();
+        store.save_v6(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+
+        assert_eq!(Bm25Index::doc_count(&reader), store.doc_count());
+        assert_eq!(reader.total_doc_length(), store.total_doc_length());
+        assert_eq!(reader.next_doc_id(), store.next_doc_id());
+        for term in ["court", "plaintiff", "rust", "search", "vector", "quant", "missing"] {
+            assert_eq!(reader.df(term), store.df(term), "df({term})");
+            let mut got = Vec::new();
+            reader.for_each_posting(term, &mut |d, tf, o| got.push((d, tf, o.to_vec())));
+            let want: Vec<(u32, u32, Vec<(u32, u32)>)> = store
+                .postings(term)
+                .map(|ps| ps.iter().map(|p| (p.doc_id, p.tf, p.offsets.clone())).collect())
+                .unwrap_or_default();
+            assert_eq!(got, want, "for_each_posting({term})");
+            let mut got_tf = Vec::new();
+            reader.for_each_doc_tf(term, &mut |d, tf| got_tf.push((d, tf)));
+            let want_tf: Vec<(u32, u32)> = want.iter().map(|(d, tf, _)| (*d, *tf)).collect();
+            assert_eq!(got_tf, want_tf, "for_each_doc_tf({term})");
+            for (d, _, offs) in &want {
+                assert_eq!(
+                    &reader.posting_offsets(term, *d),
+                    offs,
+                    "posting_offsets({term}, {d})"
+                );
+            }
+            assert_eq!(
+                reader.has_impacts(term),
+                store.df(term) > 0,
+                "has_impacts({term})"
+            );
+        }
+        for slot in 0..store.next_doc_id() {
+            assert_eq!(reader.doc_length(slot), store.doc_length(slot), "doc_length({slot})");
+            assert_eq!(
+                Bm25Index::text(&reader, slot),
+                store.text(slot).map(str::to_string),
+                "text({slot})"
+            );
+            assert_eq!(
+                Bm25Index::lineage(&reader, slot),
+                store.lineage(slot),
+                "lineage({slot})"
+            );
+        }
+        // Heap reload (the shard append path) parses v6.
+        let loaded = Bm25Store::load(&path).unwrap();
+        assert_eq!(loaded.fields[0].name, "body");
+        assert_eq!(loaded.fields[0].postings, store.fields[0].postings);
+        assert_eq!(loaded.fields[0].doc_lengths, store.fields[0].doc_lengths);
+        assert_eq!(loaded.fields[0].total_length, store.fields[0].total_length);
+        assert_eq!(loaded.texts, store.texts);
+        assert_eq!(loaded.lineages, store.lineages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v6 validation rejects malformed headers and section geometry
+    /// with errors, never panics.
+    #[test]
+    fn v6_open_rejects_malformed_files() {
+        let dir = test_dir("v6bad");
+        let path = dir.join("shard.bm25");
+        let store = synthetic_store();
+        store.save_v6(&path).unwrap();
+        let good = std::fs::read(&path).unwrap();
+        assert!(Bm25Reader::open(&path).is_ok());
+
+        let bad_path = dir.join("bad.bm25");
+        let expect_err = |mutate: &dyn Fn(&mut Vec<u8>), what: &str| {
+            let mut bytes = good.clone();
+            mutate(&mut bytes);
+            std::fs::write(&bad_path, &bytes).unwrap();
+            assert!(Bm25Reader::open(&bad_path).is_err(), "{what} was accepted");
+        };
+        expect_err(&|b| b[8..12].copy_from_slice(&0u32.to_le_bytes()), "zero fields");
+        expect_err(
+            &|b| {
+                let v = u64::from_le_bytes(b[16..24].try_into().unwrap()) + 1;
+                b[16..24].copy_from_slice(&v.to_le_bytes());
+            },
+            "texts section not at the header end",
+        );
+        expect_err(
+            &|b| {
+                let v = u64::from_le_bytes(b[32..40].try_into().unwrap()) + 1;
+                b[32..40].copy_from_slice(&v.to_le_bytes());
+            },
+            "lineages offset off the text index end",
+        );
+        expect_err(
+            &|b| {
+                // Field total_length no longer matches the doc lengths.
+                let name_len = u16::from_le_bytes(b[40..42].try_into().unwrap()) as usize;
+                let fe = 42 + name_len + 8;
+                let v = u64::from_le_bytes(b[fe..fe + 8].try_into().unwrap()) + 1;
+                b[fe..fe + 8].copy_from_slice(&v.to_le_bytes());
+            },
+            "field total_length mismatch",
+        );
+        expect_err(
+            &|b| {
+                let n = b.len();
+                b.truncate(n - 3);
+            },
+            "truncated term blob",
+        );
+        expect_err(&|b| b.truncate(30), "truncated header");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -3468,7 +4299,7 @@ mod malformed_tests {
             store.add_document_with_lineage(
                 id,
                 format!("d{i}"),
-                AnalyzedDoc { terms, length },
+                AnalyzedDoc::body(terms, length),
                 lineage,
             );
         }
@@ -3501,7 +4332,7 @@ mod malformed_tests {
             store.add_document_with_lineage(
                 id,
                 format!("d{i}"),
-                AnalyzedDoc { terms, length },
+                AnalyzedDoc::body(terms, length),
                 lineage,
             );
         }
@@ -3617,4 +4448,5 @@ mod malformed_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }

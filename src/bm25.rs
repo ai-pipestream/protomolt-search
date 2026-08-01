@@ -870,26 +870,17 @@ mod tests {
         store.add_document(
             0,
             "a".to_string(),
-            AnalyzedDoc {
-                terms: vec![("rust".into(), 2, vec![]), ("search".into(), 1, vec![])],
-                length: 3,
-            },
+            AnalyzedDoc::body(vec![("rust".into(), 2, vec![]), ("search".into(), 1, vec![])], 3),
         );
         store.add_document(
             1,
             "b".to_string(),
-            AnalyzedDoc {
-                terms: vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])],
-                length: 3,
-            },
+            AnalyzedDoc::body(vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])], 3),
         );
         store.add_document(
             2,
             "c".to_string(),
-            AnalyzedDoc {
-                terms: vec![("search".into(), 1, vec![])],
-                length: 3,
-            },
+            AnalyzedDoc::body(vec![("search".into(), 1, vec![])], 3),
         );
 
         let params = Bm25Params::default();
