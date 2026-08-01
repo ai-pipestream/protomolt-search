@@ -5,12 +5,41 @@
 //! sampled term streams plus document metadata are compared against
 //! the source before declaring success.
 //!
+//! Everything here is O(1) heap in the shard size: posting streams are
+//! compared as running digests, never collected — a uniformly sampled
+//! term set WILL include hot terms whose streams are gigabytes, and
+//! collecting those alongside a 50 GB mmap is an OOM on real machines.
+//!
 //! Usage: bm25_transcode <src.bm25> <dst.bm25> [sample_terms]
 
 use std::path::Path;
 use std::time::Instant;
 
 use turbovec_search::postings::{transcode_to_v5, Bm25Index, Bm25Reader};
+
+/// FNV-1a over a posting stream: order-sensitive digest of every
+/// (doc_id, tf, offsets) triple, O(1) memory however long the stream.
+fn stream_digest(reader: &Bm25Reader, term: &str) -> (u64, u64) {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut step = |v: u32| {
+        for b in v.to_le_bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    let mut count = 0u64;
+    reader.for_each_posting(term, &mut |d, tf, offsets| {
+        step(d);
+        step(tf);
+        step(offsets.len() as u32);
+        for &(s, e) in offsets {
+            step(s);
+            step(e);
+        }
+        count += 1;
+    });
+    (hash, count)
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -56,8 +85,9 @@ fn main() {
     );
     assert_eq!(a.term_count(), b.term_count(), "term counts differ");
 
-    // Sampled term streams: identical (doc, tf, offsets) sequences, and
-    // the output must expose the block-max surface.
+    // Sampled term streams: identical (doc, tf, offsets) digests, and
+    // the output must expose the block-max surface. Digests, not
+    // collected Vecs — hot terms stream gigabytes.
     let t = Instant::now();
     let n = a.term_count() as u64;
     let step = (n / samples.max(1)).max(1);
@@ -69,12 +99,11 @@ fn main() {
         assert_eq!(term, b.term_at(i as u32), "term order diverged at {i}");
         assert_eq!(a.df(&term), b.df(&term), "df({term})");
         assert!(b.has_impacts(&term), "no impacts on {term}");
-        let mut want = Vec::new();
-        a.for_each_posting(&term, &mut |d, tf, o| want.push((d, tf, o.to_vec())));
-        let mut got = Vec::new();
-        b.for_each_posting(&term, &mut |d, tf, o| got.push((d, tf, o.to_vec())));
-        assert_eq!(got, want, "posting stream differs for {term}");
-        postings += want.len() as u64;
+        let (want_hash, want_n) = stream_digest(&a, &term);
+        let (got_hash, got_n) = stream_digest(&b, &term);
+        assert_eq!(got_n, want_n, "posting count differs for {term}");
+        assert_eq!(got_hash, want_hash, "posting stream differs for {term}");
+        postings += want_n;
         checked += 1;
         i += step;
     }

@@ -2602,12 +2602,14 @@ pub struct TranscodeStats {
 /// Rewrite a v3/v4 `.bm25` file as v5 (`TVBM2505`) without re-analysis:
 /// the shared sections (doc_lengths, texts, text_index, lineages) are
 /// byte-copied from the source map, and each term's interleaved v3/v4
-/// postings are re-run into the v5 doc/occurrence/skip runs in one
-/// streaming pass (the v4 occurrence pair encoding IS the v5
-/// occurrence-run encoding, so occurrence bytes are copied, not
-/// decoded). Heap per term is the staged occurrence bytes plus the
-/// skip builder's O(1) state, so a 50 GB shard transcodes in one
-/// sequential read + write.
+/// postings are re-run into the v5 doc/occurrence/skip runs in two
+/// map walks (doc run + skip state first, then the occurrence bytes,
+/// which ARE the v5 occurrence-run encoding, copied map to file, never
+/// staged). Heap per term is the skip builder's state plus its level-0
+/// record bytes (~70 B per 128 postings, single-digit MB even for a
+/// df-in-the-millions term), NOT the occurrence data — a hot term in a
+/// 50 GB shard carries gigabytes of occurrence pairs, and staging
+/// those was an OOM on real shards.
 ///
 /// The output is byte-identical to what [`Bm25Store::save_v5`] would
 /// write for the same corpus (pinned by test), so everything proven of
@@ -2653,12 +2655,15 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
         let (_, term_off, df) = reader.directory_entry(field0, i);
         // Step over the term's inline header: u32 len, term, u32 count.
         let term_len = u32_at(term_off as usize) as usize;
-        let mut p = term_off as usize + 4 + term_len + 4;
+        let postings_start = term_off as usize + 4 + term_len + 4;
         let doc_run_off = cursor;
-        let mut occ_stage: Vec<u8> = Vec::new();
+        // Pass 1: the doc run (doc_id, tf, occ_start) plus skip-run
+        // state, straight off the map.
         let mut skip_l0: Vec<u8> = Vec::new();
         let mut skip = SkipRunBuilder::new();
         let mut occ_start = 0u32;
+        let mut occ_bytes = 0u64;
+        let mut p = postings_start;
         for _ in 0..df {
             let doc_id = u32_at(p);
             let tf = u32_at(p + 4);
@@ -2666,19 +2671,28 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
             write_u32(&mut w, doc_id)?;
             write_u32(&mut w, tf)?;
             write_u32(&mut w, occ_start)?;
-            occ_stage.extend_from_slice(&map[p + 12..p + 12 + 8 * n_offsets]);
             skip.push(tf, reader.doc_length(doc_id), doc_id, &mut skip_l0)?;
             occ_start = occ_start
                 .checked_add(n_offsets as u32)
                 .ok_or_else(|| invalid("occurrence run exceeds u32 pairs"))?;
+            occ_bytes += 8 * n_offsets as u64;
             p += 12 + 8 * n_offsets;
         }
         write_u32(&mut w, occ_start)?; // sentinel
-        w.write_all(&occ_stage)?;
+        // Pass 2: occurrence bytes, copied map to file per posting —
+        // no staging, so the term's occurrence volume never touches
+        // the heap. The re-walk revisits pages just read; the doc-run
+        // fields it steps over are cheaper than staging gigabytes.
+        let mut p = postings_start;
+        for _ in 0..df {
+            let n_offsets = u32_at(p + 8) as usize;
+            w.write_all(&map[p + 12..p + 12 + 8 * n_offsets])?;
+            p += 12 + 8 * n_offsets;
+        }
         let (l0_bytes, l1) = skip.finish(&mut skip_l0)?;
         debug_assert_eq!(l0_bytes, skip_l0.len() as u64);
         let occ_run_off = doc_run_off + 12 * u64::from(df) + 4;
-        let skip_run_off = occ_run_off + occ_stage.len() as u64;
+        let skip_run_off = occ_run_off + occ_bytes;
         write_skip_run(&mut w, &skip_l0, &l1)?;
         directory.push((doc_run_off, skip_run_off, occ_run_off, df));
         cursor = skip_run_off + skip_run_size(l0_bytes, &l1);
