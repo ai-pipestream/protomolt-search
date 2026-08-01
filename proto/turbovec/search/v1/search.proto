@@ -179,6 +179,17 @@ service NodeService {
   // supplied global stats.
   rpc Bm25Rescore(Bm25RescoreRequest) returns (Bm25RescoreResponse);
 
+  // Candidate-scoped VECTOR scoring: the vector twin of Bm25Rescore.
+  // Scores just `candidate_ids` against this shard's index through a
+  // masked scan; the kernel short-circuits fully-masked SIMD blocks, so
+  // the cost scales with the allowlist, not the shard. Ids outside this
+  // shard's range (or beyond its live slots) are ignored. Scores are
+  // bitwise identical to the same slots' scores in a full or streaming
+  // search — one kernel, one calibration — which is what lets
+  // FUSION_MODE_DECOMPOSED use this as phase 0: rescore the BM25 leg's
+  // top docs to seed the fused floor before the vector streams open.
+  rpc VectorRescore(VectorRescoreRequest) returns (VectorRescoreResponse);
+
   // Runs the shard's LOCAL half of a hybrid query: the chunked vector
   // scan and the BM25 scoring (with the supplied global stats), fused
   // with RRF on the node — level one of the settled two-level fusion. The
@@ -433,6 +444,19 @@ message StartStreamSearch {
   // reordering cost nothing (the gRPC stream stays the reliable lane).
   // 0 disables the UDP lane for this stream.
   uint64 floor_token = 4;
+  // Document-mode streaming: when true, every batch record carries the
+  // emitted slot's PARENT (20-byte records, see StreamSearchBatch) —
+  // the doc-store lineage opinion_id, or a high-bit-tagged global id
+  // for slots without lineage. The scan itself is unchanged; what
+  // changes is the floor's MEANING: the coordinator relays k-th best
+  // PARENT scores (a parent's score is its best chunk's score), which
+  // are >= plain chunk floors, so pruning only strengthens and the
+  // lossless invariant holds — a chunk below the floor can neither
+  // beat its own parent's best nor introduce a new top-k parent.
+  // Chunks of one parent may live on several shards; every shard's
+  // qualifying chunks flow to the coordinator, which aggregates by
+  // parent id — document collapse without Lucene-style colocation.
+  bool collapse_parents = 5;
 }
 
 // Abandon request for a streaming scan.
@@ -461,6 +485,9 @@ message StreamSearchResponse {
 // Record stride: 12 bytes, little-endian, `hits.len() % 12 == 0`:
 //   u64 global vector id (shard slot offset + local slot)
 //   f32 score
+// When the stream's `StartStreamSearch.collapse_parents` is true the
+// stride is 20 bytes (`hits.len() % 20 == 0`) with a third field:
+//   u64 parent id (lineage opinion_id, or high-bit-tagged global id)
 // Records are score-descending within a batch. Empty batches are never
 // sent.
 message StreamSearchBatch {
@@ -620,6 +647,31 @@ message SearchResponse {
   // id. Fewer than k entries when the whole corpus holds fewer than k
   // vectors.
   repeated ScoredHit hits = 2;
+  // Document-mode only (`collapse_parents` on a coordinator running the
+  // streaming path): one group per returned parent, parallel to `hits`
+  // (hits[i] is groups[i]'s best chunk). Each group holds EVERY chunk
+  // of that parent scoring at or above `chunk_floor`, across all
+  // shards — the cross-shard chunk retrieval that collapse-only Search
+  // does not do. Empty on every other path.
+  repeated ParentGroup groups = 3;
+  // Document-mode only: the completeness bound on `groups` — one f32
+  // ULP below the k-th best parent score when k distinct parents were
+  // found, -inf otherwise (fewer than k parents exist, so no floor ever
+  // rose and every chunk of every parent is present). Score-defined and
+  // layout-invariant: the same corpus in any shard layout yields the
+  // same groups.
+  float chunk_floor = 4;
+}
+
+// One parent document's chunks in a document-mode search response.
+message ParentGroup {
+  // The parent (lineage opinion_id, or a high-bit-tagged global id for
+  // chunks ingested without lineage).
+  uint64 parent_id = 1;
+  // Every emitted chunk of this parent scoring at or above
+  // `SearchResponse.chunk_floor`: score descending, ties by vector id.
+  // chunks[0] is the parent's best chunk, the representative in `hits`.
+  repeated ScoredHit chunks = 2;
 }
 
 // Passthrough for the analysis sidecar's pipeline options (vendored proto
@@ -969,6 +1021,40 @@ enum FusionMode {
   // compresses every gap to the fixed distance between adjacent ranks.
   // Requires globally comparable scores per leg, same as GLOBAL_RANK.
   FUSION_MODE_SCORE_BLEND = 4;
+
+  // EXACT fused top-k over the raw weighted sum
+  //
+  //   fused(d) = vector_weight * v(d) + bm25_weight * b(d)
+  //
+  // with no leg truncation: unlike SCORE_BLEND (whose blend runs over
+  // the union of two leg_k-deep lists, missing docs mediocre in both
+  // legs but strong fused), every doc in the corpus is accounted for.
+  // Requires both weights > 0 and globally comparable raw scores per
+  // leg (shared calibration, global stats).
+  //
+  // Execution is BM25-first with decomposed floors over the streaming
+  // vector path (docs/multi-field.md "Hybrid streaming interplay"):
+  //   1. the BM25 leg runs to depth leg_k (milliseconds; postings over
+  //      a few terms). Its top score b_1 is the EXACT global maximum
+  //      b(d), the bound every decomposed floor divides through.
+  //   2. VectorRescore pins v(d) for the leg's top k docs — k true
+  //      fused scores, whose k-th best s_0 is a lower bound on the
+  //      final fused k-th best. Every vector stream then opens with
+  //      initial_floor = (s_0 - bm25_weight * b_1) / vector_weight:
+  //      any doc scoring below that satisfies fused(d) < s_0 whatever
+  //      its b(d), so pruning it is lossless. (A BM25-only bound can
+  //      never floor the vector scan — the top lexical doc could sit
+  //      at any vector score — which is why phase 2 exists.)
+  //   3. as emissions accumulate, the coordinator's k-th best known
+  //      fused lower bound rises and re-decomposed floors chase it.
+  //   4. close-out: emitted docs outside the BM25 leg's list get their
+  //      b(d) pinned by Bm25Rescore (candidate-scoped) unless even
+  //      b = the leg's boundary score cannot lift them to the k-th
+  //      best; docs never emitted were certified fused < s by their
+  //      floor. Exact by construction, every certificate checked.
+  // leg_k is a cost knob here, not a correctness knob: deeper legs
+  // pin more b(d) up front and shrink the close-out rescore.
+  FUSION_MODE_DECOMPOSED = 5;
 }
 
 // SCORE_BLEND only: how each leg's retained scores are rescaled before
@@ -1026,7 +1112,9 @@ message HybridLegOptions {
   // How deep each leg is fetched before fusion. 0 = default
   // max(k, rrf_k): the RRF constant should never exceed a leg's depth, or
   // deep-ranked docs could not contribute their 1/(rrf_k + rank) share.
-  // Values below k are clamped to k.
+  // Values below k are clamped to k. For DECOMPOSED this is the BM25
+  // leg's depth — a cost knob, never a correctness knob (see
+  // FUSION_MODE_DECOMPOSED).
   uint32 leg_k = 1;
   // Weight of the vector leg: its RRF weight under GLOBAL_RANK and
   // TWO_LEVEL, its blend weight under SCORE_BLEND. ABSENT = default
@@ -1219,8 +1307,9 @@ message HybridShardDebug {
 message HybridHit {
   // Global doc id.
   uint64 doc_id = 1;
-  // Coordinator-level fused RRF score (this doc appears on exactly one
-  // shard, so this is 1/(rrf_k + shard-list rank)).
+  // The coordinator-level fused score: RRF for GLOBAL_RANK/TWO_LEVEL,
+  // the normalized combination for SCORE_BLEND, and the raw weighted
+  // sum vector_weight * v + bm25_weight * b for DECOMPOSED.
   float fused_score = 2;
   // Shard that owns the doc.
   uint32 shard = 3;
@@ -1356,6 +1445,22 @@ message Bm25RescoreRequest {
 message Bm25RescoreResponse {
   // One hit per candidate that scored above zero.
   repeated Bm25Hit hits = 1;
+}
+
+// Candidate-scoped vector scoring (see NodeService.VectorRescore).
+message VectorRescoreRequest {
+  // The query vector (shard dim).
+  repeated float vector = 1;
+  // Global candidate doc ids to score. Ids outside this shard's range,
+  // or beyond its live slots, are ignored.
+  repeated uint64 candidate_ids = 2;
+}
+
+// Scores for the requested candidates present on this shard, score
+// descending. A shard with no index answers empty (it holds none of
+// the candidates).
+message VectorRescoreResponse {
+  repeated RawLegHit hits = 1;
 }
 
 // One cascade hit: the two leg scores as SEPARATE fields (no fused

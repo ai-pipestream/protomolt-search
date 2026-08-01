@@ -205,6 +205,18 @@ side's streaming scan (`search_streaming` on the fork) runs floored from
 near the start. Both floors tighten monotonically as fused results
 accumulate; both sides certify exactness with their done frames.
 
+One subtlety the landed implementation had to face: a BM25-only bound can
+never floor the vector scan, because the top lexical doc could sit at any
+vector score — the decomposed floor `(s - w_b * B_max(q)) / w_v` is only
+non-vacuous once `s` incorporates real vector knowledge. So the landed
+FUSION_MODE_DECOMPOSED inserts a phase between the legs: `VectorRescore`
+(the vector twin of `Bm25Rescore`, a masked candidate-scoped scan whose
+scores are bitwise the streaming scan's) pins v(d) for the BM25 leg's top
+k docs, and their true fused scores are the first floor. `B_max(q)` is the
+leg's own top score `b_1` — exact, no artifact needed — until the epoch
+stats artifact supplies per-(field,term) corners for a coordinator-side
+bound with no shard touched.
+
 ## Schema binding (protomolt)
 
 The field table is compiled from a registered descriptor at shard create:
@@ -295,4 +307,30 @@ are comparable end to end, by construction.
    bitwise). Field-table fingerprints stay 0 until the ingest layer
    wires real AnalysisSpec hashes; name equality is the current check.
 5. Epoch stats artifact + digests; phase (b) elision behind a flag.
-6. Hybrid floor integration with the streaming vector side.
+6. Hybrid floor integration with the streaming vector side. LANDED as
+   FUSION_MODE_DECOMPOSED: the exact fused weighted-sum top-k
+   `w_v * v(d) + w_b * b(d)` with no leg truncation, executed
+   BM25-first — leg to depth leg_k (its top score IS the exact
+   `B_max(q)` for floor purposes), `VectorRescore` pins v(d) for the
+   leg's top k docs (see the interplay note above for why a BM25-only
+   bound cannot floor the vector scan), every vector stream opens with
+   the decomposed floor, re-decomposed raises chase the k-th best
+   known fused lower bound mid-scan, and a candidate-scoped
+   `Bm25Rescore` close-out pins b(d) for emitted docs the leg did not
+   cover (docs an unfilled leg proves absent score exactly 0). The
+   same increment landed document-mode streaming (the second search
+   mode): `StartStreamSearch.collapse_parents` tags every emission
+   with its parent (20-byte records), the coordinator owns the whole
+   parent aggregation — floors are k-th best PARENT scores, the
+   response carries per-parent chunk groups filtered to the final
+   floor (cross-shard chunk retrieval, no colocation) — and the
+   sign-agnostic floor seed fix (vector scores are signed; clamping a
+   negative k-th best to zero was a latent recall bug on the plain
+   streaming path). Gates: `tests/decomposed.rs` (bitwise equality
+   with the exhaustive fused oracle across weightings, leg depths,
+   and the min_vector_score gate; rescore-equals-scan bitwise;
+   degenerate empty leg; weight validation) and
+   `tests/stream_collapse.rs` (representatives equal the bidi
+   collapse path, groups exactly the chunks at or above the returned
+   floor, straddler parents retrieve from both shards, self-parent
+   fallback).
