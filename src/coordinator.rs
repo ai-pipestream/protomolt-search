@@ -842,11 +842,23 @@ impl CoordinatorServiceImpl {
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
-                    for hit in batch.hits {
+                    // Packed 12-byte LE records: u64 global id, f32
+                    // score (see StreamSearchBatch).
+                    if batch.hits.len() % 12 != 0 {
+                        return Err(Status::internal(format!(
+                            "shard {shard} sent a misaligned batch of {} bytes",
+                            batch.hits.len()
+                        )));
+                    }
+                    for rec in batch.hits.chunks_exact(12) {
                         let entry = StreamHeapEntry(MergedHit {
-                            vector_id: hit.vector_id,
+                            vector_id: u64::from_le_bytes(
+                                rec[..8].try_into().expect("8-byte id"),
+                            ),
                             shard: shard as u32,
-                            score: hit.score,
+                            score: f32::from_le_bytes(
+                                rec[8..12].try_into().expect("4-byte score"),
+                            ),
                         });
                         if heap.len() < k as usize {
                             heap.push(entry);

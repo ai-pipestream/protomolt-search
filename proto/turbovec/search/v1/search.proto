@@ -442,11 +442,21 @@ message StreamSearchResponse {
 }
 
 // Every candidate of one calibration block scoring at or above the
-// floor in effect when the block was scored. Scores descending within
-// the batch; ids are global (`parent_id` unused, 0). Empty batches are
-// never sent.
+// floor in effect when the block was scored, as PACKED fixed-stride
+// records rather than per-hit messages: streaming volume concentrates
+// in the pre-floor blocks, and a single byte blob is one pack pass on
+// the node (fused into the slot-to-global-id rebase it does anyway)
+// and one stride walk at the coordinator — no per-hit protobuf
+// encode/decode, no per-hit allocation, and 12 bytes per record on
+// the wire instead of ~18.
+//
+// Record stride: 12 bytes, little-endian, `hits.len() % 12 == 0`:
+//   u64 global vector id (shard slot offset + local slot)
+//   f32 score
+// Records are score-descending within a batch. Empty batches are never
+// sent.
 message StreamSearchBatch {
-  repeated ScoredHit hits = 1;
+  bytes hits = 1;
 }
 
 // What the scan did; terminal message of a `StreamSearch` stream.

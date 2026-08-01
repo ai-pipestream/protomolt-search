@@ -2026,21 +2026,23 @@ impl NodeService for NodeServiceImpl {
                     let mut raises = 0u64;
                     let summary = index
                         .try_search_streaming(&start.vector, options, |batch| {
-                            // Real emissions only carry live slots; a
-                            // negative would be an engine contract break,
-                            // dropped rather than wrapped into a bogus
-                            // global id.
-                            let hits: Vec<ScoredHit> = batch
-                                .slots
-                                .iter()
-                                .zip(batch.scores)
-                                .filter(|&(&slot, _)| slot >= 0)
-                                .map(|(&slot, &score)| ScoredHit {
-                                    vector_id: slot_offset + slot as u64,
-                                    score,
-                                    parent_id: 0,
-                                })
-                                .collect();
+                            // Pack the batch as 12-byte LE records
+                            // (u64 global id, f32 score), fused into the
+                            // slot-to-global-id rebase — one pass, no
+                            // per-hit messages. Real emissions only
+                            // carry live slots; a negative would be an
+                            // engine contract break, dropped rather
+                            // than wrapped into a bogus global id.
+                            let mut hits: Vec<u8> = Vec::with_capacity(12 * batch.slots.len());
+                            for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
+                                if slot < 0 {
+                                    continue;
+                                }
+                                hits.extend_from_slice(
+                                    &(slot_offset + slot as u64).to_le_bytes(),
+                                );
+                                hits.extend_from_slice(&score.to_le_bytes());
+                            }
                             let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
                                 payload: Some(stream_search_response::Payload::Batch(
                                     StreamSearchBatch { hits },
