@@ -178,12 +178,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             )
             .with_bm25(bm25_store)
             .with_generation(generation);
+            // The UDP floor lane shares the gRPC listener's host:port.
+            node.spawn_floor_listener(addr);
             node_services.push(node.clone());
             eprintln!("NodeService listening on {addr}");
             let max = cfg.max_message_bytes;
             let mut shutdown = shutdown_rx.clone();
             handles.push(tokio::spawn(
                 Server::builder()
+                .initial_stream_window_size(turbovec_search::H2_STREAM_WINDOW)
+                .initial_connection_window_size(turbovec_search::H2_CONN_WINDOW)
                     .add_service(NodeServiceImpl::into_server(node, max))
                     .serve_with_incoming_shutdown(
                         harness::nodelay_incoming(listener),
@@ -211,7 +215,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 shard_deadline: to_duration(cfg.shard_deadline_ms),
                 hedge_delay: to_duration(cfg.hedge_delay_ms),
             })
-            .with_replicas(cfg.replica_addrs.clone());
+            .with_replicas(cfg.replica_addrs.clone())
+            .with_stream_search(cfg.stream_search);
         if let Some(map) = &cfg.shard_map {
             eprintln!(
                 "shard map generation {} ({} shards)",
@@ -227,6 +232,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         let mut shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(
             Server::builder()
+                .initial_stream_window_size(turbovec_search::H2_STREAM_WINDOW)
+                .initial_connection_window_size(turbovec_search::H2_CONN_WINDOW)
                 .add_service(CoordinatorServiceImpl::into_server(coordinator, max))
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;

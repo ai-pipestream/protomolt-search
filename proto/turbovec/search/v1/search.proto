@@ -38,6 +38,18 @@ service NodeService {
   // chunks.
   rpc SearchShard(stream SearchShardRequest) returns (stream SearchShardResponse);
 
+  // Streaming scan: the shard emits EVERY candidate at or above the live
+  // floor as the scan passes each calibration block, holds no top-k, and
+  // never sees k. The client (the coordinator) owns k: it merges all
+  // shards' emissions into the only heap in the system, raises the floor
+  // as its global k-th best tightens, and may abandon the scan with
+  // `StopStreamSearch`. The terminal `StreamSearchSummary` with
+  // `completed = true` is the exactness certificate: every live slot
+  // scoring at or above the floor in effect when its block was scored
+  // was emitted. Without a floor this emits the whole shard; the relayed
+  // floor is the mechanism, not an optimization.
+  rpc StreamSearch(stream StreamSearchRequest) returns (stream StreamSearchResponse);
+
   // Exposes the shard's TQ+ calibration (per-coordinate shift/scale) plus
   // basic shape metadata. Scores are only comparable across shards whose
   // indexes were built with byte-identical calibration, so callers can use
@@ -385,6 +397,90 @@ message ScoredHit {
   // (lineage opinion_id, or a high-bit-tagged global id for slots
   // without lineage). 0 outside collapse mode.
   uint64 parent_id = 3;
+}
+
+// One message on the client-to-shard leg of `StreamSearch`.
+message StreamSearchRequest {
+  oneof payload {
+    // Opens the scan. Exactly one per stream, first message.
+    StartStreamSearch start = 1;
+    // Raises the shard's emission floor. Applied from the next
+    // calibration block; floors only rise (lower values are ignored).
+    FloorUpdate floor_update = 2;
+    // Abandons the scan: emissions stop, the terminal summary arrives
+    // with `completed = false`, and the stream closes.
+    StopStreamSearch stop = 3;
+  }
+}
+
+// Opens a streaming scan. There is no k: the shard emits everything at
+// or above the floor and the client keeps what it wants.
+message StartStreamSearch {
+  // Coordinator-assigned id tying this scan to one logical query.
+  // Opaque to the node; echoed in logs only.
+  string request_id = 1;
+  // The query vector. Length must equal the shard index dimension.
+  repeated float vector = 2;
+  // Starting emission floor: a known lower bound on the global k-th
+  // best (for example a finished BM25 leg's decomposed floor). Absent
+  // means no floor, which emits the entire shard.
+  optional float initial_floor = 3;
+  // Token identifying this stream on the node's UDP floor lane (the
+  // same host:port as the gRPC listener, UDP namespace). 12-byte
+  // little-endian datagrams of u64 token + f32 floor fold into this
+  // stream's floor exactly like FloorUpdate messages: an unreliable
+  // fast copy of the same monotone hint, so loss, duplication, and
+  // reordering cost nothing (the gRPC stream stays the reliable lane).
+  // 0 disables the UDP lane for this stream.
+  uint64 floor_token = 4;
+}
+
+// Abandon request for a streaming scan.
+message StopStreamSearch {}
+
+// One message on the shard-to-client leg of `StreamSearch`.
+message StreamSearchResponse {
+  oneof payload {
+    // Candidates from one calibration block.
+    StreamSearchBatch batch = 1;
+    // Terminal message: exactly one per stream; the server closes the
+    // stream after it.
+    StreamSearchSummary summary = 2;
+  }
+}
+
+// Every candidate of one calibration block scoring at or above the
+// floor in effect when the block was scored, as PACKED fixed-stride
+// records rather than per-hit messages: streaming volume concentrates
+// in the pre-floor blocks, and a single byte blob is one pack pass on
+// the node (fused into the slot-to-global-id rebase it does anyway)
+// and one stride walk at the coordinator — no per-hit protobuf
+// encode/decode, no per-hit allocation, and 12 bytes per record on
+// the wire instead of ~18.
+//
+// Record stride: 12 bytes, little-endian, `hits.len() % 12 == 0`:
+//   u64 global vector id (shard slot offset + local slot)
+//   f32 score
+// Records are score-descending within a batch. Empty batches are never
+// sent.
+message StreamSearchBatch {
+  bytes hits = 1;
+}
+
+// What the scan did; terminal message of a `StreamSearch` stream.
+message StreamSearchSummary {
+  // True when every block was scanned to the end: for this query, every
+  // live slot scoring at or above the floor in effect when its block
+  // was scored was emitted — the exactness certificate a merging
+  // coordinator waits for. False only after `StopStreamSearch` (or a
+  // broken client connection).
+  bool completed = 1;
+  // Candidates emitted across all batches.
+  uint64 emitted = 2;
+  // Calibration blocks scored.
+  uint64 blocks_scanned = 3;
+  // Floor raises that took effect between blocks.
+  uint64 floor_raises_applied = 4;
 }
 
 // Empty: the node reports whatever its loaded index holds.

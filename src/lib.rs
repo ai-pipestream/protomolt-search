@@ -47,3 +47,14 @@ pub mod wal;
 /// several MB. Search responses are tiny by comparison (k=10000 hits is
 /// ~160 KiB).
 pub const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// HTTP/2 flow-control windows, applied to every server and client
+/// channel this crate builds. The defaults (64 KiB stream window) sit
+/// BELOW one full pre-floor stream batch (12 B x 8192-row calibration
+/// block = 96 KiB), so every burst stalled on window-update round
+/// trips — pure chattiness. Sized to the batch geometry: the stream
+/// window carries ~20 full-block batches without a round trip, the
+/// connection window two such streams.
+pub const H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+/// See [`H2_STREAM_WINDOW`].
+pub const H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;

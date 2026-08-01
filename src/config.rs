@@ -147,6 +147,11 @@ pub struct Config {
     /// Coordinator: optional replica address per shard, aligned with
     /// `node_addrs` (from the shard map's `replica` fields).
     pub replica_addrs: Vec<Option<String>>,
+    /// Coordinator: serve plain vector Search over the streaming
+    /// protocol (shards emit above the relayed floor; the coordinator
+    /// holds the only top-k). Identical results, different pruning
+    /// locus. Off by default.
+    pub stream_search: bool,
     /// gRPC message size cap applied to clients and servers.
     pub max_message_bytes: usize,
     /// Issue one demo search against the coordinator at startup.
@@ -193,6 +198,7 @@ struct FileConfig {
     hedge_delay_ms: Option<u64>,
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
+    stream_search: Option<bool>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
     analysis_addr: Option<String>,
@@ -600,6 +606,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         None => file.save_on_shutdown.unwrap_or(true),
     };
 
+    let stream_search = flag_present(args, "stream-search")
+        || std::env::var("TURBOVEC_STREAM_SEARCH")
+            .map(|s| parse_env_bool(&s))
+            .unwrap_or(false)
+        || file.stream_search.unwrap_or(false);
+
     let analysis_addr = opt(
         args,
         "analysis-addr",
@@ -649,6 +661,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         replica_addrs,
         max_message_bytes,
         demo_query,
+        stream_search,
         query_dim,
         bit_width,
         save_on_shutdown,

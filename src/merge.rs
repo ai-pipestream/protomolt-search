@@ -17,7 +17,7 @@ pub struct MergedHit {
 /// Total order over hits: score descending, then shard ascending, then
 /// vector id ascending. Scores are finite by construction (turbovec rejects
 /// non-finite input), so `total_cmp` never sees NaN here.
-fn cmp_hits(a: &MergedHit, b: &MergedHit) -> Ordering {
+pub(crate) fn cmp_hits(a: &MergedHit, b: &MergedHit) -> Ordering {
     b.score
         .total_cmp(&a.score)
         .then_with(|| a.shard.cmp(&b.shard))

@@ -203,12 +203,14 @@ async fn start_node_inner(
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
+    let node = NodeServiceImpl::new(index, config);
+    // The UDP floor lane shares the gRPC listener's host:port.
+    node.spawn_floor_listener(addr);
     let handle = tokio::spawn(
         Server::builder()
-            .add_service(NodeServiceImpl::into_server(
-                NodeServiceImpl::new(index, config),
-                MAX_MESSAGE_BYTES,
-            ))
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW)
+            .add_service(NodeServiceImpl::into_server(node, MAX_MESSAGE_BYTES))
             .serve_with_incoming(nodelay_incoming(listener)),
     );
     (format!("http://{addr}"), handle)
@@ -222,6 +224,8 @@ pub async fn start_coordinator(
     let addr: SocketAddr = listener.local_addr().unwrap();
     let handle = tokio::spawn(
         Server::builder()
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW)
             .add_service(CoordinatorServiceImpl::into_server(
                 CoordinatorServiceImpl::new(node_addrs),
                 MAX_MESSAGE_BYTES,
@@ -471,6 +475,8 @@ pub mod mock_analysis {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(
             Server::builder()
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW)
                 .add_service(
                     AnalysisServiceServer::new(MockAnalysis)
                         .max_decoding_message_size(MAX_MESSAGE_BYTES)
