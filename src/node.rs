@@ -14,6 +14,7 @@
 //! duration of their chunked scan, so a search never observes a
 //! half-applied batch.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -462,6 +463,47 @@ pub struct NodeServiceImpl {
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
     scan_jobs: Arc<std::sync::OnceLock<mpsc::Sender<ScanJob>>>,
+    /// UDP floor lane registry: stream token -> that stream's floor
+    /// cell (f32 bits, monotone max). Fed by [`Self::spawn_floor_listener`],
+    /// read by the streaming scan between blocks.
+    floor_cells: Arc<std::sync::Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>>,
+}
+
+/// Raise a floor cell (f32 bits) to `floor` if that is higher. Monotone
+/// under any interleaving of the gRPC and UDP lanes; NaN is ignored.
+fn raise_floor_cell(cell: &std::sync::atomic::AtomicU32, floor: f32) {
+    if floor.is_nan() {
+        return;
+    }
+    let _ = cell.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |cur| (floor > f32::from_bits(cur)).then(|| floor.to_bits()),
+    );
+}
+
+/// Fold one UDP floor datagram into its stream's cell. 12 bytes,
+/// little-endian: u64 stream token, f32 floor. Anything else — short or
+/// long datagrams, unknown tokens, NaN or non-raising floors — is
+/// dropped: this lane is an unreliable fast copy of a monotone hint,
+/// and the gRPC stream remains the reliable one.
+fn apply_floor_datagram(
+    cells: &std::sync::Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>,
+    datagram: &[u8],
+) {
+    if datagram.len() != 12 {
+        return;
+    }
+    let token = u64::from_le_bytes(datagram[..8].try_into().expect("8 bytes"));
+    let floor = f32::from_le_bytes(datagram[8..12].try_into().expect("4 bytes"));
+    let cell = cells
+        .lock()
+        .expect("floor registry poisoned")
+        .get(&token)
+        .cloned();
+    if let Some(cell) = cell {
+        raise_floor_cell(&cell, floor);
+    }
 }
 
 /// Kernel batch width: turbovec's multi-query scan scores up to four
@@ -623,7 +665,35 @@ impl NodeServiceImpl {
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
+            floor_cells: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Bind the UDP floor lane on `addr` — the same host:port as the
+    /// gRPC listener, UDP namespace — and fold incoming datagrams into
+    /// the matching stream's floor cell (see [`apply_floor_datagram`]).
+    /// A failed bind only loses the fast lane: floors still travel on
+    /// every stream's reliable gRPC leg.
+    pub fn spawn_floor_listener(&self, addr: std::net::SocketAddr) {
+        let cells = Arc::clone(&self.floor_cells);
+        tokio::spawn(async move {
+            let socket = match tokio::net::UdpSocket::bind(addr).await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    eprintln!(
+                        "floor UDP bind {addr}: {e}; floors ride the gRPC streams only"
+                    );
+                    return;
+                }
+            };
+            let mut buf = [0u8; 64];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((n, _peer)) => apply_floor_datagram(&cells, &buf[..n]),
+                    Err(_) => continue,
+                }
+            }
+        });
     }
 
     /// The shared scan queue, spawning the scheduler on first use (RPC
@@ -1927,6 +1997,7 @@ impl NodeService for NodeServiceImpl {
         let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
         let state = self.state.clone();
         let slot_offset = self.config.slot_offset;
+        let floor_cells = Arc::clone(&self.floor_cells);
 
         tokio::spawn(async move {
             // Protocol: the first message must be Start.
@@ -1954,27 +2025,30 @@ impl NodeService for NodeServiceImpl {
                 return;
             }
 
-            // Floor raises and Stop fold into cells the blocking scan
-            // polls after each emitted block — the same pump shape as
-            // search_shard's (monotone maxes, everything else ignored).
-            let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
+            // Floor raises fold into one shared cell the blocking scan
+            // polls after each emitted block. Two lanes feed it: the
+            // stream's own FloorUpdate messages (reliable) and, when
+            // the Start carried a token, the node's UDP floor listener
+            // (fast, lossy, same monotone fold).
+            let floor_cell = Arc::new(std::sync::atomic::AtomicU32::new(
+                f32::NEG_INFINITY.to_bits(),
+            ));
+            let udp_token = (start.floor_token != 0).then_some(start.floor_token);
+            if let Some(token) = udp_token {
+                floor_cells
+                    .lock()
+                    .expect("floor registry poisoned")
+                    .insert(token, Arc::clone(&floor_cell));
+            }
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_pump = Arc::clone(&stop);
+            let pump_cell = Arc::clone(&floor_cell);
             tokio::spawn(async move {
                 loop {
                     match inbound.message().await {
                         Ok(Some(StreamSearchRequest {
                             payload: Some(stream_search_request::Payload::FloorUpdate(u)),
-                        })) => {
-                            floor_tx.send_if_modified(|cur| {
-                                if !u.floor.is_nan() && u.floor > *cur {
-                                    *cur = u.floor;
-                                    true
-                                } else {
-                                    false
-                                }
-                            });
-                        }
+                        })) => raise_floor_cell(&pump_cell, u.floor),
                         Ok(Some(StreamSearchRequest {
                             payload: Some(stream_search_request::Payload::Stop(_)),
                         })) => {
@@ -1992,6 +2066,7 @@ impl NodeService for NodeServiceImpl {
             });
 
             let scan_tx = tx.clone();
+            let scan_cell = Arc::clone(&floor_cell);
             let scan =
                 tokio::task::spawn_blocking(move || -> Result<StreamSearchSummary, Status> {
                     let guard = state.read().expect("shard state lock poisoned");
@@ -2053,7 +2128,9 @@ impl NodeService for NodeServiceImpl {
                             if sent.is_err() || stop.load(std::sync::atomic::Ordering::Acquire) {
                                 return turbovec::StreamControl::Stop;
                             }
-                            let f = *floor_rx.borrow();
+                            let f = f32::from_bits(
+                                scan_cell.load(std::sync::atomic::Ordering::Acquire),
+                            );
                             if f > floor_now {
                                 floor_now = f;
                                 raises += 1;
@@ -2070,7 +2147,14 @@ impl NodeService for NodeServiceImpl {
                         floor_raises_applied: raises,
                     })
                 });
-            match scan.await {
+            let outcome = scan.await;
+            if let Some(token) = udp_token {
+                floor_cells
+                    .lock()
+                    .expect("floor registry poisoned")
+                    .remove(&token);
+            }
+            match outcome {
                 Ok(Ok(summary)) => {
                     let _ = tx
                         .send(Ok(StreamSearchResponse {
@@ -2538,5 +2622,56 @@ impl NodeService for NodeServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
         .map(Response::new)
+    }
+}
+
+#[cfg(test)]
+mod floor_lane_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn cell_of(cells: &std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>>, token: u64) -> f32 {
+        f32::from_bits(
+            cells.lock().unwrap()[&token].load(Ordering::Acquire),
+        )
+    }
+
+    fn datagram(token: u64, floor: f32) -> Vec<u8> {
+        let mut d = Vec::with_capacity(12);
+        d.extend_from_slice(&token.to_le_bytes());
+        d.extend_from_slice(&floor.to_le_bytes());
+        d
+    }
+
+    /// The UDP fold: raises apply, non-raises and garbage never do, and
+    /// no input shape can panic the listener.
+    #[test]
+    fn floor_datagrams_fold_monotonically_and_ignore_garbage() {
+        let cells: std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>> =
+            std::sync::Mutex::new(HashMap::new());
+        cells.lock().unwrap().insert(
+            7,
+            Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())),
+        );
+
+        apply_floor_datagram(&cells, &datagram(7, 0.25));
+        assert_eq!(cell_of(&cells, 7), 0.25);
+        // Lower, equal, and NaN floors are ignored.
+        apply_floor_datagram(&cells, &datagram(7, 0.10));
+        apply_floor_datagram(&cells, &datagram(7, 0.25));
+        apply_floor_datagram(&cells, &datagram(7, f32::NAN));
+        assert_eq!(cell_of(&cells, 7), 0.25);
+        // Duplicated and reordered raises: max wins regardless.
+        apply_floor_datagram(&cells, &datagram(7, 0.75));
+        apply_floor_datagram(&cells, &datagram(7, 0.50));
+        apply_floor_datagram(&cells, &datagram(7, 0.75));
+        assert_eq!(cell_of(&cells, 7), 0.75);
+        // Unknown tokens, short, long, and empty datagrams: dropped.
+        apply_floor_datagram(&cells, &datagram(8, 9.0));
+        apply_floor_datagram(&cells, &datagram(7, 9.0)[..11].to_vec());
+        apply_floor_datagram(&cells, &[0u8; 13]);
+        apply_floor_datagram(&cells, &[]);
+        assert_eq!(cell_of(&cells, 7), 0.75);
+        assert_eq!(cells.lock().unwrap().len(), 1);
     }
 }

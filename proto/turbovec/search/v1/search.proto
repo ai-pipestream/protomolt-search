@@ -425,6 +425,14 @@ message StartStreamSearch {
   // best (for example a finished BM25 leg's decomposed floor). Absent
   // means no floor, which emits the entire shard.
   optional float initial_floor = 3;
+  // Token identifying this stream on the node's UDP floor lane (the
+  // same host:port as the gRPC listener, UDP namespace). 12-byte
+  // little-endian datagrams of u64 token + f32 floor fold into this
+  // stream's floor exactly like FloorUpdate messages: an unreliable
+  // fast copy of the same monotone hint, so loss, duplication, and
+  // reordering cost nothing (the gRPC stream stays the reliable lane).
+  // 0 disables the UDP lane for this stream.
+  uint64 floor_token = 4;
 }
 
 // Abandon request for a streaming scan.

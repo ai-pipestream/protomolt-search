@@ -70,6 +70,26 @@ pub struct CoordinatorServiceImpl {
     stream_search: bool,
     /// One reusable channel per address, created on first use.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
+    /// Lazily bound UDP socket for the floor fast lane (`None` when the
+    /// bind failed; floors then ride the gRPC streams alone).
+    floor_socket: Arc<std::sync::OnceLock<Option<std::net::UdpSocket>>>,
+    /// Resolved UDP floor target per node address (`None` =
+    /// unresolvable), cached on first use. IPv4 preferred.
+    floor_targets: Arc<Mutex<HashMap<String, Option<std::net::SocketAddr>>>>,
+}
+
+/// A process-unique, well-mixed stream token for the UDP floor lane
+/// (0 is reserved for "no UDP"). Tokens route datagrams to in-flight
+/// streams on a trusted network; they are unique, not secret.
+fn floor_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let raw = (u64::from(std::process::id()) << 32) ^ NEXT.fetch_add(1, AtomicOrdering::Relaxed);
+    // splitmix64 finalizer.
+    let mut z = raw.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    z.max(1)
 }
 
 impl CoordinatorServiceImpl {
@@ -84,7 +104,47 @@ impl CoordinatorServiceImpl {
             limits: FanoutLimits::default(),
             stream_search: false,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            floor_socket: Arc::new(std::sync::OnceLock::new()),
+            floor_targets: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The UDP floor socket, bound once (nonblocking: a full local
+    /// buffer drops the datagram, which a monotone hint tolerates).
+    fn floor_socket(&self) -> Option<&std::net::UdpSocket> {
+        self.floor_socket
+            .get_or_init(|| {
+                std::net::UdpSocket::bind(("0.0.0.0", 0)).ok().map(|s| {
+                    let _ = s.set_nonblocking(true);
+                    s
+                })
+            })
+            .as_ref()
+    }
+
+    /// The UDP floor target for a node address: the same host:port as
+    /// its gRPC listener, in the UDP namespace. Resolved once and
+    /// cached; IPv4 preferred (the fleet pins IPv4).
+    fn floor_target(&self, addr: &str) -> Option<std::net::SocketAddr> {
+        let mut cache = self
+            .floor_targets
+            .lock()
+            .expect("floor target cache poisoned");
+        if let Some(target) = cache.get(addr) {
+            return *target;
+        }
+        let stripped = addr
+            .strip_prefix("http://")
+            .or_else(|| addr.strip_prefix("https://"))
+            .unwrap_or(addr);
+        let resolved = std::net::ToSocketAddrs::to_socket_addrs(stripped)
+            .ok()
+            .and_then(|addrs| {
+                let all: Vec<std::net::SocketAddr> = addrs.collect();
+                all.iter().find(|a| a.is_ipv4()).copied().or(all.first().copied())
+            });
+        cache.insert(addr.to_string(), resolved);
+        resolved
     }
 
     /// Serve plain vector `Search` over the streaming protocol: shards
@@ -129,7 +189,12 @@ impl CoordinatorServiceImpl {
         }
         let endpoint = Endpoint::from_shared(addr.to_string())
             .map_err(|e| Status::unavailable(format!("invalid node address {addr}: {e}")))?
-            .tcp_nodelay(true);
+            .tcp_nodelay(true)
+            // The client end is the RECEIVER of stream batches, so these
+            // windows are what let a shard's pre-floor burst flow without
+            // window-update round trips (see H2_STREAM_WINDOW).
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW);
         let ch = endpoint.connect_lazy();
         cache.insert(addr.to_string(), ch.clone());
         Ok(ch)
@@ -759,13 +824,19 @@ impl CoordinatorServiceImpl {
         }
 
         // One StreamSearch per shard: Start flows through a held
-        // sender that later carries floor raises.
+        // sender that later carries floor raises. Each stream also gets
+        // a UDP token so raises reach the shard on the fast lossy lane
+        // as well as the reliable stream.
         let (merged_tx, mut merged_rx) =
             mpsc::channel::<(usize, Result<Option<StreamSearchResponse>, Status>)>(4 * n_nodes);
         let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
             Vec::with_capacity(n_nodes);
+        let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
         for shard in 0..n_nodes {
             let mut client = self.node_client(&self.node_addrs[shard])?;
+            let lane = self
+                .floor_target(&self.node_addrs[shard])
+                .map(|target| (floor_token(), target));
             let (req_tx, req_rx) = mpsc::channel::<StreamSearchRequest>(64);
             req_tx
                 .try_send(StreamSearchRequest {
@@ -773,10 +844,12 @@ impl CoordinatorServiceImpl {
                         request_id: request_id.to_string(),
                         vector: vector.to_vec(),
                         initial_floor,
+                        floor_token: lane.map_or(0, |(token, _)| token),
                     })),
                 })
                 .expect("fresh channel accepts the Start message");
             floor_txs.push(Some(req_tx));
+            udp_lanes.push(lane);
             let merged_tx = merged_tx.clone();
             tokio::spawn(async move {
                 let mut inbound = match client
@@ -883,11 +956,27 @@ impl CoordinatorServiceImpl {
                                     FloorUpdate { floor },
                                 )),
                             };
-                            for tx in floor_txs.iter().flatten() {
+                            // UDP first (the fast lossy copy), then the
+                            // reliable stream. Both are monotone
+                            // max-folds shard-side, so double delivery
+                            // and loss are equally free.
+                            let socket = self.floor_socket();
+                            for (si, tx) in floor_txs.iter().enumerate() {
+                                if tx.is_none() {
+                                    continue;
+                                }
+                                if let (Some(socket), Some((token, target))) =
+                                    (socket, udp_lanes[si])
+                                {
+                                    let mut dgram = [0u8; 12];
+                                    dgram[..8].copy_from_slice(&token.to_le_bytes());
+                                    dgram[8..].copy_from_slice(&floor.to_le_bytes());
+                                    let _ = socket.send_to(&dgram, target);
+                                }
                                 // Raises are monotone and disposable: a
                                 // full channel just means the next raise
                                 // supersedes this one.
-                                let _ = tx.try_send(update.clone());
+                                let _ = tx.as_ref().expect("checked above").try_send(update.clone());
                             }
                         }
                     }
