@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 
 use crate::bm25::{self, Bm25Params, CorpusStats};
 use crate::fusion::{self, Leg};
-use crate::merge::{merge_topk, FloorTracker};
+use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
 use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
@@ -24,8 +24,10 @@ use crate::pb::{
     HybridSearchRequest, HybridShardDebug,
     HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
     SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
-    ShardLegsRequest, ShardScanStats, StartShardSearch, TermStatsRequest,
+    ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
 };
+use crate::pb::{stream_search_request, stream_search_response};
 
 /// Process-unique request id counter for coordinator-assigned ids.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -63,6 +65,9 @@ pub struct CoordinatorServiceImpl {
     bm25_params: Bm25Params,
     /// Per-shard deadline and hedging controls.
     limits: FanoutLimits,
+    /// Serve `SearchService.Search` over the streaming protocol
+    /// (`fanout_stream_search`) instead of the per-shard top-k fan-out.
+    stream_search: bool,
     /// One reusable channel per address, created on first use.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
 }
@@ -77,8 +82,18 @@ impl CoordinatorServiceImpl {
             analysis_addr: None,
             bm25_params: Bm25Params::default(),
             limits: FanoutLimits::default(),
+            stream_search: false,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Serve plain vector `Search` over the streaming protocol: shards
+    /// emit above the relayed floor and this coordinator holds the only
+    /// top-k. Results are identical to the default fan-out; the modes
+    /// differ in where pruning happens, not in what they return.
+    pub fn with_stream_search(mut self, on: bool) -> Self {
+        self.stream_search = on;
+        self
     }
 
     /// Configure the BM25 path: analysis sidecar for query analysis and
@@ -698,6 +713,203 @@ impl CoordinatorServiceImpl {
             shard_wall_ms,
             hedges_fired: hedges.load(AtomicOrdering::Relaxed),
             hedge_wins: hedge_wins.load(AtomicOrdering::Relaxed),
+        })
+    }
+
+    /// [`Self::fanout_search`] over the streaming protocol
+    /// (`NodeService.StreamSearch`): shards hold no top-k and emit
+    /// every candidate at or above the live floor; the heap here — the
+    /// only one in the system — defines k. Whenever its k-th best
+    /// tightens, `floor_seed(kth)` (one f32 ULP below, so boundary ties
+    /// survive) is pushed to every open stream.
+    ///
+    /// Exactness: this path never sends Stop, every shard's terminal
+    /// summary must certify `completed = true`, every emission scored
+    /// at or above the floor in effect when its block was scanned, and
+    /// every pushed floor is a lower bound on the global k-th best —
+    /// so nothing that belongs in the top-k was withheld. Results are
+    /// identical to [`Self::fanout_search`] (same scores, same
+    /// `merge_topk` total order).
+    ///
+    /// `initial_floor` seeds every shard's starting floor — the hybrid
+    /// seam, where a finished BM25 leg's decomposed floor prunes the
+    /// vector scan from the first block.
+    pub async fn fanout_stream_search(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        initial_floor: Option<f32>,
+    ) -> Result<StreamFanoutResult, Status> {
+        let n_nodes = self.node_addrs.len();
+        if n_nodes == 0 {
+            return Err(Status::failed_precondition("no shard nodes configured"));
+        }
+        if initial_floor.is_some_and(f32::is_nan) {
+            return Err(Status::invalid_argument("initial_floor must not be NaN"));
+        }
+        // Without k the heap never fills, no floor ever rises, and
+        // every shard would emit itself entirely for nothing.
+        if k == 0 {
+            return Ok(StreamFanoutResult {
+                hits: Vec::new(),
+                summaries: Vec::new(),
+                floors_sent: 0,
+            });
+        }
+
+        // One StreamSearch per shard: Start flows through a held
+        // sender that later carries floor raises.
+        let (merged_tx, mut merged_rx) =
+            mpsc::channel::<(usize, Result<Option<StreamSearchResponse>, Status>)>(4 * n_nodes);
+        let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
+            Vec::with_capacity(n_nodes);
+        for shard in 0..n_nodes {
+            let mut client = self.node_client(&self.node_addrs[shard])?;
+            let (req_tx, req_rx) = mpsc::channel::<StreamSearchRequest>(64);
+            req_tx
+                .try_send(StreamSearchRequest {
+                    payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+                        request_id: request_id.to_string(),
+                        vector: vector.to_vec(),
+                        initial_floor,
+                    })),
+                })
+                .expect("fresh channel accepts the Start message");
+            floor_txs.push(Some(req_tx));
+            let merged_tx = merged_tx.clone();
+            tokio::spawn(async move {
+                let mut inbound = match client
+                    .stream_search(Request::new(ReceiverStream::new(req_rx)))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(e) => {
+                        let _ = merged_tx.send((shard, Err(e))).await;
+                        return;
+                    }
+                };
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(msg)) => {
+                            if merged_tx.send((shard, Ok(Some(msg)))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = merged_tx.send((shard, Ok(None))).await;
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = merged_tx.send((shard, Err(e))).await;
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        drop(merged_tx);
+
+        // The global top-k: a max-heap whose top is the WORST survivor
+        // under the merge's total order, so peek() is the k-th best.
+        let mut heap: std::collections::BinaryHeap<StreamHeapEntry> =
+            std::collections::BinaryHeap::with_capacity(k as usize + 1);
+        let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
+        let mut remaining = n_nodes;
+        let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
+        let mut floors_sent = 0u64;
+        while remaining > 0 {
+            let Some((shard, item)) = merged_rx.recv().await else {
+                return Err(Status::internal("stream fan-out ended without all shards"));
+            };
+            let msg = match item {
+                Ok(Some(msg)) => msg,
+                // Stream closed without a summary: the shard broke the
+                // protocol (its Ok(None) must follow the summary we
+                // already counted, in which case remaining was already
+                // decremented and we never see the close here).
+                Ok(None) => {
+                    if summaries[shard].is_none() {
+                        return Err(Status::internal(format!(
+                            "shard {shard} closed its stream without a summary"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!("shard {shard} failed: {e}")));
+                }
+            };
+            match msg.payload {
+                Some(stream_search_response::Payload::Batch(batch)) => {
+                    for hit in batch.hits {
+                        let entry = StreamHeapEntry(MergedHit {
+                            vector_id: hit.vector_id,
+                            shard: shard as u32,
+                            score: hit.score,
+                        });
+                        if heap.len() < k as usize {
+                            heap.push(entry);
+                        } else if cmp_hits(&entry.0, &heap.peek().expect("heap is full").0)
+                            == std::cmp::Ordering::Less
+                        {
+                            heap.pop();
+                            heap.push(entry);
+                        }
+                    }
+                    // Full heap: its worst survivor bounds the global
+                    // k-th best from below; seed one ULP down so shard
+                    // ties at the boundary keep flowing.
+                    if heap.len() == k as usize {
+                        let kth = heap.peek().expect("heap is full").0.score;
+                        let floor = bm25::floor_seed(kth);
+                        if floor > last_floor {
+                            last_floor = floor;
+                            floors_sent += 1;
+                            let update = StreamSearchRequest {
+                                payload: Some(stream_search_request::Payload::FloorUpdate(
+                                    FloorUpdate { floor },
+                                )),
+                            };
+                            for tx in floor_txs.iter().flatten() {
+                                // Raises are monotone and disposable: a
+                                // full channel just means the next raise
+                                // supersedes this one.
+                                let _ = tx.try_send(update.clone());
+                            }
+                        }
+                    }
+                }
+                Some(stream_search_response::Payload::Summary(summary)) => {
+                    if !summary.completed {
+                        return Err(Status::internal(format!(
+                            "shard {shard} stopped before completing its scan"
+                        )));
+                    }
+                    summaries[shard] = Some(summary);
+                    floor_txs[shard] = None;
+                    remaining -= 1;
+                }
+                None => {}
+            }
+        }
+
+        let mut all: Vec<MergedHit> = heap.into_iter().map(|e| e.0).collect();
+        all.sort_by(cmp_hits);
+        Ok(StreamFanoutResult {
+            hits: all
+                .into_iter()
+                .map(|h| ScoredHit {
+                    vector_id: h.vector_id,
+                    score: h.score,
+                    parent_id: 0,
+                })
+                .collect(),
+            summaries: summaries
+                .into_iter()
+                .map(|s| s.expect("all summaries arrived"))
+                .collect(),
+            floors_sent,
         })
     }
 
@@ -1418,6 +1630,40 @@ pub struct FanoutResult {
     pub hedge_wins: u64,
 }
 
+/// Result of [`CoordinatorServiceImpl::fanout_stream_search`].
+pub struct StreamFanoutResult {
+    /// Merged global top-k, in the same total order as
+    /// [`FanoutResult::hits`].
+    pub hits: Vec<ScoredHit>,
+    /// Per-shard terminal summaries, shard order; every one certified
+    /// `completed`.
+    pub summaries: Vec<StreamSearchSummary>,
+    /// Floor raises this coordinator broadcast.
+    pub floors_sent: u64,
+}
+
+/// Heap wrapper whose `Ord` IS the merge's total order ([`cmp_hits`]:
+/// better entries compare Less), so a max-heap's peek is the worst
+/// survivor — the running k-th best.
+struct StreamHeapEntry(MergedHit);
+
+impl PartialEq for StreamHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        cmp_hits(&self.0, &other.0) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for StreamHeapEntry {}
+impl PartialOrd for StreamHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for StreamHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_hits(&self.0, &other.0)
+    }
+}
+
 #[tonic::async_trait]
 impl SearchService for CoordinatorServiceImpl {
     async fn search(
@@ -1446,6 +1692,14 @@ impl SearchService for CoordinatorServiceImpl {
         let result = if req.collapse_parents {
             self.fanout_search_collapse(&request_id, &req.vector, req.k)
                 .await?
+        } else if self.stream_search {
+            let streamed = self
+                .fanout_stream_search(&request_id, &req.vector, req.k, None)
+                .await?;
+            return Ok(Response::new(SearchResponse {
+                request_id,
+                hits: streamed.hits,
+            }));
         } else {
             self.fanout_search(&request_id, &req.vector, req.k, false)
                 .await?

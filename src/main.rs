@@ -211,7 +211,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 shard_deadline: to_duration(cfg.shard_deadline_ms),
                 hedge_delay: to_duration(cfg.hedge_delay_ms),
             })
-            .with_replicas(cfg.replica_addrs.clone());
+            .with_replicas(cfg.replica_addrs.clone())
+            .with_stream_search(cfg.stream_search);
         if let Some(map) = &cfg.shard_map {
             eprintln!(
                 "shard map generation {} ({} shards)",

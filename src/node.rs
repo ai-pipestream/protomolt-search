@@ -30,7 +30,8 @@ use crate::chunked::{chunked_topk_collapsed,
 use crate::fusion::{self, Leg};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
-    search_shard_request, search_shard_response, snapshot_chunk, AddDocumentsRequest,
+    search_shard_request, search_shard_response, snapshot_chunk, stream_search_request,
+    stream_search_response, AddDocumentsRequest,
     AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest,
     Bm25QueryResponse, Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest,
     FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
@@ -39,7 +40,9 @@ use crate::pb::{
     InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone,
     SearchShardRequest, SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse,
     ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest,
-    StartShardSearch, StoredDocument, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
+    TermStatsResponse,
 };
 use crate::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker};
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
@@ -1605,6 +1608,7 @@ impl NodeServiceImpl {
 #[tonic::async_trait]
 impl NodeService for NodeServiceImpl {
     type SearchShardStream = ReceiverStream<Result<SearchShardResponse, Status>>;
+    type StreamSearchStream = ReceiverStream<Result<StreamSearchResponse, Status>>;
 
     async fn search_shard(
         &self,
@@ -1913,6 +1917,177 @@ impl NodeService for NodeServiceImpl {
                 .ingest_busy
                 .load(std::sync::atomic::Ordering::Acquire),
         }))
+    }
+
+    async fn stream_search(
+        &self,
+        request: Request<Streaming<StreamSearchRequest>>,
+    ) -> Result<Response<Self::StreamSearchStream>, Status> {
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
+        let state = self.state.clone();
+        let slot_offset = self.config.slot_offset;
+
+        tokio::spawn(async move {
+            // Protocol: the first message must be Start.
+            let start = match inbound.message().await {
+                Ok(Some(StreamSearchRequest {
+                    payload: Some(stream_search_request::Payload::Start(start)),
+                })) => start,
+                Ok(_) => {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument(
+                            "first StreamSearchRequest must be StartStreamSearch",
+                        )))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            if start.initial_floor.is_some_and(f32::is_nan) {
+                let _ = tx
+                    .send(Err(Status::invalid_argument("initial_floor must not be NaN")))
+                    .await;
+                return;
+            }
+
+            // Floor raises and Stop fold into cells the blocking scan
+            // polls after each emitted block — the same pump shape as
+            // search_shard's (monotone maxes, everything else ignored).
+            let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_pump = Arc::clone(&stop);
+            tokio::spawn(async move {
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(StreamSearchRequest {
+                            payload: Some(stream_search_request::Payload::FloorUpdate(u)),
+                        })) => {
+                            floor_tx.send_if_modified(|cur| {
+                                if !u.floor.is_nan() && u.floor > *cur {
+                                    *cur = u.floor;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        }
+                        Ok(Some(StreamSearchRequest {
+                            payload: Some(stream_search_request::Payload::Stop(_)),
+                        })) => {
+                            stop_pump.store(true, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
+                        // Duplicate Start or empty payload: ignore.
+                        Ok(Some(_)) => {}
+                        // Client closed or the stream broke: no more
+                        // raises can arrive; the scan finishes (or hits
+                        // the dead response channel) on its own.
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            });
+
+            let scan_tx = tx.clone();
+            let scan =
+                tokio::task::spawn_blocking(move || -> Result<StreamSearchSummary, Status> {
+                    let guard = state.read().expect("shard state lock poisoned");
+                    let index = guard.index.as_ref().ok_or_else(|| {
+                        Status::failed_precondition(
+                            "shard has no index yet (set calibration or add vectors)",
+                        )
+                    })?;
+                    let dim = index
+                        .dim_opt()
+                        .ok_or_else(|| Status::failed_precondition("index has no vectors"))?;
+                    if start.vector.len() != dim {
+                        return Err(Status::invalid_argument(format!(
+                            "query vector has dim {}, index expects {dim}",
+                            start.vector.len()
+                        )));
+                    }
+                    if let Some((_, coord, value)) =
+                        turbovec::first_invalid_coord(&start.vector, dim)
+                    {
+                        return Err(Status::invalid_argument(format!(
+                            "query coordinate {coord} is invalid: {value}"
+                        )));
+                    }
+
+                    let mut options = turbovec::SearchOptions::new();
+                    let mut floor_now = f32::NEG_INFINITY;
+                    if let Some(f) = start.initial_floor {
+                        options = options.with_initial_threshold(f);
+                        floor_now = f;
+                    }
+                    let mut raises = 0u64;
+                    let summary = index
+                        .try_search_streaming(&start.vector, options, |batch| {
+                            // Real emissions only carry live slots; a
+                            // negative would be an engine contract break,
+                            // dropped rather than wrapped into a bogus
+                            // global id.
+                            let hits: Vec<ScoredHit> = batch
+                                .slots
+                                .iter()
+                                .zip(batch.scores)
+                                .filter(|&(&slot, _)| slot >= 0)
+                                .map(|(&slot, &score)| ScoredHit {
+                                    vector_id: slot_offset + slot as u64,
+                                    score,
+                                    parent_id: 0,
+                                })
+                                .collect();
+                            let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
+                                payload: Some(stream_search_response::Payload::Batch(
+                                    StreamSearchBatch { hits },
+                                )),
+                            }));
+                            // A dead response channel means the client is
+                            // gone: stop scanning, nobody is listening.
+                            if sent.is_err() || stop.load(std::sync::atomic::Ordering::Acquire) {
+                                return turbovec::StreamControl::Stop;
+                            }
+                            let f = *floor_rx.borrow();
+                            if f > floor_now {
+                                floor_now = f;
+                                raises += 1;
+                                turbovec::StreamControl::RaiseFloor(f)
+                            } else {
+                                turbovec::StreamControl::Continue
+                            }
+                        })
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                    Ok(StreamSearchSummary {
+                        completed: summary.completed,
+                        emitted: summary.emitted as u64,
+                        blocks_scanned: summary.blocks_scanned as u64,
+                        floor_raises_applied: raises,
+                    })
+                });
+            match scan.await {
+                Ok(Ok(summary)) => {
+                    let _ = tx
+                        .send(Ok(StreamSearchResponse {
+                            payload: Some(stream_search_response::Payload::Summary(summary)),
+                        }))
+                        .await;
+                }
+                Ok(Err(status)) => {
+                    let _ = tx.send(Err(status)).await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("stream scan panicked: {e}"))))
+                        .await;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn get_calibration(
