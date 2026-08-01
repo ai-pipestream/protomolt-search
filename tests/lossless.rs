@@ -15,7 +15,12 @@ mod common;
 use common::{monolithic_topk, unit_vectors, Cluster, BIT_WIDTH, DIM};
 use turbovec_search::coordinator::CoordinatorServiceImpl;
 
-const N: usize = 20_000;
+// Three whole calibration blocks (3 x turbovec::DEFAULT_BLOCK_SIZE).
+// Under per-block calibration a sealed block refits on exactly its own
+// rows, so distributed == monolithic stays BITWISE only when every
+// shard is whole sealed blocks: a tail shard's open block would ride
+// the seed while the monolithic's tail rides its last seal's fit.
+const N: usize = 24_576;
 const K: u32 = 10;
 const QUERIES: usize = 8;
 
@@ -74,8 +79,9 @@ async fn distributed_matches_monolithic_without_floor_sharing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_matches_monolithic_at_k_1000() {
     const BIG_K: u32 = 1_000;
-    // 3 shards x 8000 vectors; 8 blocks/chunk → ~31 chunks per shard.
-    let cluster = Cluster::start(24_000, 8, true).await;
+    // 3 shards x 8192 vectors (whole calibration blocks); 8 blocks/chunk
+    // → ~32 chunks per shard.
+    let cluster = Cluster::start(N, 8, true).await;
     let coordinator = CoordinatorServiceImpl::new(cluster.node_addrs.clone());
 
     for qi in 0..2u64 {
@@ -150,7 +156,12 @@ async fn get_calibration_reports_seeded_values() {
     use turbovec_search::pb::node_service_client::NodeServiceClient;
     use turbovec_search::pb::GetCalibrationRequest;
 
-    let cluster = Cluster::start(N, 8, true).await;
+    // Sub-block shards: before any block seals, every shard's reported
+    // calibration IS the seed, so cross-shard equality is exactly the
+    // seeding contract. Once blocks seal, per-block calibration makes
+    // each shard report its latest seal's fit and shard-level equality
+    // stops being a property the engine has.
+    let cluster = Cluster::start(3_000, 8, true).await;
     let mut reference: Option<(Vec<f32>, Vec<f32>)> = None;
     for addr in &cluster.node_addrs {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();

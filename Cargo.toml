@@ -6,7 +6,7 @@ license = "MIT"
 description = "Distributed top-k search over turbovec shard indexes with collaborative mid-query floor sharing"
 
 [dependencies]
-turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream" }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-streaming" }
 tonic = "0.12"
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
