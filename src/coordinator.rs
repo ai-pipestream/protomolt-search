@@ -24,8 +24,9 @@ use crate::pb::{
     HybridSearchRequest, HybridShardDebug,
     HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
     SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
-    ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
+    ParentGroup, ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch,
+    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
+    VectorRescoreRequest,
 };
 use crate::pb::{stream_search_request, stream_search_response};
 
@@ -497,6 +498,10 @@ impl CoordinatorServiceImpl {
                 self.fanout_hybrid_two_level(request_id, vector, k, &terms, &global, legs, debug)
                     .await?
             }
+            FusionMode::Decomposed => {
+                self.fanout_hybrid_decomposed(request_id, vector, k, &terms, &global, legs, debug)
+                    .await?
+            }
             _ => {
                 self.fanout_hybrid_global_rank(vector, k, &terms, &global, legs, debug)
                     .await?
@@ -837,6 +842,394 @@ impl CoordinatorServiceImpl {
         Ok((hits, dbg))
     }
 
+    /// FUSION_MODE_DECOMPOSED: the EXACT fused weighted-sum top-k
+    ///
+    ///   fused(d) = w_v * v(d) + w_b * b(d)
+    ///
+    /// executed BM25-first with decomposed floors over the streaming
+    /// vector path (the proto's FusionMode comment walks the phases;
+    /// docs/multi-field.md "Hybrid streaming interplay" has the floor
+    /// algebra). The result set is the vector index: b(d) joins on the
+    /// shared positional id space, exactly 0 for docs no query term
+    /// matches.
+    ///
+    /// The exactness ledger, kept by construction:
+    /// - the BM25 leg is the exact global top-leg_k, so its top score
+    ///   `b_1` is the exact global maximum of b(d), and its boundary
+    ///   score bounds b(d) for every doc outside the shard lists;
+    /// - every vector floor F pushed here satisfies: v(d) < F implies
+    ///   fused(d) < s_lb <= the final k-th best fused score, so a doc
+    ///   the floor suppressed can never belong to the top-k, and ties
+    ///   AT the floor survive shard-side (emission is score >= floor);
+    /// - every candidate ends with EXACT leg scores: v from the stream
+    ///   or from `VectorRescore` (bitwise identical — one kernel, one
+    ///   calibration), b from the leg, from `Bm25Rescore`, or exactly
+    ///   0 when the unfilled leg proves no further doc matches.
+    async fn fanout_hybrid_decomposed(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        terms: &[String],
+        global: &CorpusStats,
+        legs: HybridLegs,
+        debug: bool,
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        let n_nodes = self.node_addrs.len();
+        if n_nodes == 0 {
+            return Err(Status::failed_precondition("no shard nodes configured"));
+        }
+        let w_v = f64::from(legs.vector_weight);
+        let w_b = f64::from(legs.bm25_weight);
+        let fused_of = |v: f32, b: f32| w_v * f64::from(v) + w_b * f64::from(b);
+        let min_v = (legs.min_vector_score > 0.0).then_some(legs.min_vector_score);
+        let t_legs = std::time::Instant::now();
+
+        // Phase 1: the BM25 leg, exact global top-leg_k. Every score
+        // any shard returned is exact for its doc, so all of them pin
+        // b(d) — the merge only decides b_1, the boundary, and ranks.
+        let mut bm25_of: HashMap<u64, (f32, u32)> = HashMap::new();
+        let mut leg_counts: HashMap<u32, u32> = HashMap::new();
+        let mut merged: Vec<(u64, f32, u32)> = Vec::new();
+        if !terms.is_empty() {
+            let mut leg_tasks = Vec::with_capacity(n_nodes);
+            for (shard, node) in self.node_addrs.iter().enumerate() {
+                let request = Bm25QueryRequest {
+                    terms: terms.to_vec(),
+                    k: legs.leg_k,
+                    global_doc_count: global.doc_count,
+                    global_total_doc_length: global.total_doc_length,
+                    global_doc_frequencies: global.dfs.clone(),
+                    k1: self.bm25_params.k1 as f32,
+                    b: self.bm25_params.b as f32,
+                    min_score: 0.0,
+                    fields: Vec::new(),
+                };
+                let mut client = self.node_client(node)?;
+                leg_tasks.push(tokio::spawn(async move {
+                    client
+                        .bm25_query(request)
+                        .await
+                        .map(|r| (shard as u32, r.into_inner().hits))
+                }));
+            }
+            for task in leg_tasks {
+                let (shard, hits) = task
+                    .await
+                    .map_err(|e| Status::internal(format!("bm25 leg task failed: {e}")))??;
+                leg_counts.insert(shard, hits.len() as u32);
+                for h in &hits {
+                    bm25_of.insert(h.doc_id, (h.score, shard));
+                    merged.push((h.doc_id, h.score, shard));
+                }
+            }
+            merged.sort_by(|a, b| {
+                b.1.total_cmp(&a.1)
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            merged.truncate(legs.leg_k as usize);
+        }
+        let b_1 = merged.first().map_or(0.0f32, |&(_, s, _)| s);
+        let wb_b1 = w_b * f64::from(b_1);
+        // The leg filled: docs outside every shard list score at most
+        // the boundary. It did not: every matching doc is in some list,
+        // so an absent doc scores exactly 0.
+        let filled = merged.len() == legs.leg_k as usize && !merged.is_empty();
+        let b_out: f64 = if filled {
+            f64::from(merged.last().expect("filled leg is non-empty").1)
+        } else {
+            0.0
+        };
+        let bm25_rank: HashMap<u64, u32> = merged
+            .iter()
+            .enumerate()
+            .map(|(i, &(doc, _, _))| (doc, i as u32 + 1))
+            .collect();
+
+        // Phase 2: pin v(d) for the leg's top k docs. Their true fused
+        // scores are the first k-th-best lower bound — the seed a
+        // BM25-only bound can never provide (the top lexical doc could
+        // sit at any vector score, so no shard-wide vector floor
+        // follows from the leg alone).
+        let mut seed_ids: HashMap<u32, Vec<u64>> = HashMap::new();
+        for &(doc, _, shard) in merged.iter().take(k as usize) {
+            seed_ids.entry(shard).or_default().push(doc);
+        }
+        let v_of = self.fanout_vector_rescore(vector, seed_ids).await?;
+
+        // Known fused LOWER bounds, tracked as a k-sized min-heap: its
+        // root is s_lb, the k-th best known bound, and every pushed
+        // floor decomposes from it. A doc outside the leg contributes
+        // w_v * v alone (b >= 0), still a valid lower bound.
+        let mut flb_heap: std::collections::BinaryHeap<std::cmp::Reverse<F64Ord>> =
+            std::collections::BinaryHeap::with_capacity(k as usize + 1);
+        let push_flb = |heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<F64Ord>>,
+                            value: f64| {
+            if heap.len() < k as usize {
+                heap.push(std::cmp::Reverse(F64Ord(value)));
+            } else if heap.peek().is_some_and(|r| value > r.0 .0) {
+                heap.pop();
+                heap.push(std::cmp::Reverse(F64Ord(value)));
+            }
+        };
+        // Candidates: doc -> (v, owning shard). Seeded with the phase-2
+        // rescores so a seed doc is a candidate even if the floor it
+        // funded later suppresses its own emission.
+        let mut v_seen: HashMap<u64, (f32, u32)> = HashMap::new();
+        for (&doc, &v) in &v_of {
+            let (b, shard) = bm25_of[&doc];
+            v_seen.insert(doc, (v, shard));
+            if min_v.is_none_or(|m| v >= m) {
+                push_flb(&mut flb_heap, fused_of(v, b));
+            }
+        }
+        let mut s_lb = (flb_heap.len() == k as usize)
+            .then(|| flb_heap.peek().expect("full heap").0 .0);
+        let decomposed = s_lb.map(|s| decomposed_floor(s, wb_b1, w_v));
+        // min_vector_score is a result-set gate, so it doubles as a
+        // free starting floor: suppressed docs are excluded docs.
+        let initial_floor = match (decomposed, min_v) {
+            (Some(f), Some(m)) => Some(f.max(m)),
+            (Some(f), None) => Some(f),
+            (None, Some(m)) => Some(m),
+            (None, None) => None,
+        };
+
+        // Phase 3: the streaming vector scan, floored from the first
+        // block, with re-decomposed floors chasing the rising k-th
+        // best known bound.
+        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false)?;
+        let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
+        let mut remaining = n_nodes;
+        let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
+        while remaining > 0 {
+            let (shard, msg) = match fanout.next_message(&summaries).await? {
+                Some(pair) => pair,
+                None => continue,
+            };
+            match msg.payload {
+                Some(stream_search_response::Payload::Batch(batch)) => {
+                    if batch.hits.len() % 12 != 0 {
+                        return Err(Status::internal(format!(
+                            "shard {shard} sent a misaligned batch of {} bytes",
+                            batch.hits.len()
+                        )));
+                    }
+                    for rec in batch.hits.chunks_exact(12) {
+                        let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
+                        let v = f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score"));
+                        // A re-emitted phase-2 seed carries the identical
+                        // score (one kernel); keep the first sighting.
+                        if v_seen.contains_key(&doc) {
+                            continue;
+                        }
+                        v_seen.insert(doc, (v, shard as u32));
+                        if min_v.is_some_and(|m| v < m) {
+                            continue;
+                        }
+                        let b = bm25_of.get(&doc).map_or(0.0f32, |&(s, _)| s);
+                        push_flb(&mut flb_heap, fused_of(v, b));
+                    }
+                    if flb_heap.len() == k as usize {
+                        let m = flb_heap.peek().expect("full heap").0 .0;
+                        if s_lb.is_none_or(|s| m > s) {
+                            s_lb = Some(m);
+                            let floor = decomposed_floor(m, wb_b1, w_v);
+                            if floor > last_floor {
+                                last_floor = floor;
+                                self.push_stream_floor(&fanout, floor);
+                            }
+                        }
+                    }
+                }
+                Some(stream_search_response::Payload::Summary(summary)) => {
+                    if !summary.completed {
+                        return Err(Status::internal(format!(
+                            "shard {shard} stopped before completing its scan"
+                        )));
+                    }
+                    summaries[shard] = Some(summary);
+                    fanout.floor_txs[shard] = None;
+                    remaining -= 1;
+                }
+                None => {}
+            }
+        }
+        let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
+
+        // Close-out. Candidates with a leg score (or proven-zero b)
+        // have exact fused scores already; the rest hold b in
+        // [0, b_out] and need Bm25Rescore — unless even b_out cannot
+        // lift them to the k-th best exact fused score known so far.
+        let t_fusion = std::time::Instant::now();
+        let mut exact: Vec<(u64, u32, f32, f32)> = Vec::new(); // (doc, shard, v, b)
+        let mut unknown: Vec<(u64, u32, f32)> = Vec::new(); // (doc, shard, v)
+        for (&doc, &(v, shard)) in &v_seen {
+            if min_v.is_some_and(|m| v < m) {
+                continue;
+            }
+            match bm25_of.get(&doc) {
+                Some(&(b, _)) => exact.push((doc, shard, v, b)),
+                None if !filled => exact.push((doc, shard, v, 0.0)),
+                None => unknown.push((doc, shard, v)),
+            }
+        }
+        let kth_known: f64 = {
+            let mut fused: Vec<f64> = exact.iter().map(|&(_, _, v, b)| fused_of(v, b)).collect();
+            if fused.len() >= k as usize {
+                let idx = k as usize - 1;
+                *fused
+                    .select_nth_unstable_by(idx, |a, b| b.total_cmp(a))
+                    .1
+            } else {
+                f64::NEG_INFINITY
+            }
+        };
+        let mut rescore_ids: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut rescore_docs: Vec<(u64, u32, f32)> = Vec::new();
+        for (doc, shard, v) in unknown {
+            // Conservative upper bound: round the two products and the
+            // sum up by a magnitude-relative slack that dwarfs the f64
+            // rounding error, so a doc dropped here provably cannot
+            // reach the k-th best.
+            let ub = w_v * f64::from(v) + w_b * b_out;
+            let mag = ub.abs() + (w_v * f64::from(v)).abs() + w_b * b_out;
+            let ub_safe = ub + mag * SLACK_REL + f64::MIN_POSITIVE;
+            if ub_safe >= kth_known {
+                rescore_ids.entry(shard).or_default().push(doc);
+                rescore_docs.push((doc, shard, v));
+            }
+        }
+        let rescored_b = self.fanout_bm25_rescore_scores(terms, global, rescore_ids).await?;
+        for (doc, shard, v) in rescore_docs {
+            // Absent from the rescore response = no query term matches
+            // the doc: b is exactly 0.
+            let b = rescored_b.get(&doc).copied().unwrap_or(0.0);
+            exact.push((doc, shard, v, b));
+        }
+
+        let mut ranked: Vec<(u64, u32, f32, f32, f64)> = exact
+            .into_iter()
+            .map(|(doc, shard, v, b)| (doc, shard, v, b, fused_of(v, b)))
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.4.total_cmp(&a.4)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(k as usize);
+        let hits: Vec<HybridHit> = ranked
+            .into_iter()
+            .map(|(doc, shard, v, b, fused)| HybridHit {
+                doc_id: doc,
+                fused_score: fused as f32,
+                shard,
+                vector_rank: None,
+                vector_score: v,
+                bm25_rank: bm25_rank.get(&doc).copied(),
+                bm25_score: b,
+                boost_score: 0.0,
+            })
+            .collect();
+        let dbg = debug.then(|| {
+            let shards: Vec<HybridShardDebug> = summaries
+                .iter()
+                .enumerate()
+                .map(|(shard, summary)| HybridShardDebug {
+                    shard: shard as u32,
+                    rpc_ms: 0.0,
+                    vector_hits: summary
+                        .as_ref()
+                        .map_or(0, |s| u32::try_from(s.emitted).unwrap_or(u32::MAX)),
+                    bm25_hits: leg_counts.get(&(shard as u32)).copied().unwrap_or(0),
+                    scan: None,
+                })
+                .collect();
+            HybridDebug {
+                fusion_mode: FusionMode::Decomposed as i32,
+                leg_k: legs.leg_k,
+                terms: Vec::new(),
+                analysis_ms: 0.0,
+                stats_ms: 0.0,
+                legs_ms,
+                fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
+                total_ms: 0.0,
+                shards,
+                boost_ms: 0.0,
+                boost_terms: Vec::new(),
+            }
+        });
+        Ok((hits, dbg))
+    }
+
+    /// Candidate-scoped vector scoring fan-out: `VectorRescore` on
+    /// every shard that owns candidates, merged into doc -> score.
+    async fn fanout_vector_rescore(
+        &self,
+        vector: &[f32],
+        by_shard: HashMap<u32, Vec<u64>>,
+    ) -> Result<HashMap<u64, f32>, Status> {
+        let mut tasks = Vec::with_capacity(by_shard.len());
+        for (shard, ids) in by_shard {
+            let request = VectorRescoreRequest {
+                vector: vector.to_vec(),
+                candidate_ids: ids,
+            };
+            let mut client = self.node_client(&self.node_addrs[shard as usize])?;
+            tasks.push(tokio::spawn(async move {
+                client.vector_rescore(request).await.map(|r| r.into_inner().hits)
+            }));
+        }
+        let mut scores = HashMap::new();
+        for task in tasks {
+            let hits = task
+                .await
+                .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
+            for hit in hits {
+                scores.insert(hit.doc_id, hit.score);
+            }
+        }
+        Ok(scores)
+    }
+
+    /// Candidate-scoped BM25 fan-out (the cascade phase-2 seam),
+    /// reduced to doc -> score. Docs absent from the response match no
+    /// query term and score exactly 0.
+    async fn fanout_bm25_rescore_scores(
+        &self,
+        terms: &[String],
+        global: &CorpusStats,
+        by_shard: HashMap<u32, Vec<u64>>,
+    ) -> Result<HashMap<u64, f32>, Status> {
+        let mut tasks = Vec::with_capacity(by_shard.len());
+        for (shard, ids) in by_shard {
+            let request = Bm25RescoreRequest {
+                terms: terms.to_vec(),
+                global_doc_count: global.doc_count,
+                global_total_doc_length: global.total_doc_length,
+                global_doc_frequencies: global.dfs.clone(),
+                candidate_ids: ids,
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
+            };
+            let mut client = self.node_client(&self.node_addrs[shard as usize])?;
+            tasks.push(tokio::spawn(async move {
+                client.bm25_rescore(request).await.map(|r| r.into_inner().hits)
+            }));
+        }
+        let mut scores = HashMap::new();
+        for task in tasks {
+            let hits = task
+                .await
+                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??;
+            for hit in hits {
+                scores.insert(hit.doc_id, hit.score);
+            }
+        }
+        Ok(scores)
+    }
+
     /// Build the tonic server for this service with explicit message size
     /// limits (see [`crate::MAX_MESSAGE_BYTES`]).
     pub fn into_server(self, max_message_bytes: usize) -> SearchServiceServer<Self> {
@@ -949,6 +1342,106 @@ impl CoordinatorServiceImpl {
         })
     }
 
+    /// Open one `StreamSearch` per shard: Start flows through a held
+    /// sender that later carries floor raises. Each stream also gets a
+    /// UDP token so raises reach the shard on the fast lossy lane as
+    /// well as the reliable stream.
+    fn open_stream_fanout(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        initial_floor: Option<f32>,
+        collapse_parents: bool,
+    ) -> Result<StreamFanout, Status> {
+        let n_nodes = self.node_addrs.len();
+        let (merged_tx, merged_rx) =
+            mpsc::channel::<(usize, Result<Option<StreamSearchResponse>, Status>)>(4 * n_nodes);
+        let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
+            Vec::with_capacity(n_nodes);
+        let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
+        for shard in 0..n_nodes {
+            let mut client = self.node_client(&self.node_addrs[shard])?;
+            let lane = self
+                .floor_target(&self.node_addrs[shard])
+                .map(|target| (floor_token(), target));
+            let (req_tx, req_rx) = mpsc::channel::<StreamSearchRequest>(64);
+            req_tx
+                .try_send(StreamSearchRequest {
+                    payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+                        request_id: request_id.to_string(),
+                        vector: vector.to_vec(),
+                        initial_floor,
+                        floor_token: lane.map_or(0, |(token, _)| token),
+                        collapse_parents,
+                    })),
+                })
+                .expect("fresh channel accepts the Start message");
+            floor_txs.push(Some(req_tx));
+            udp_lanes.push(lane);
+            let merged_tx = merged_tx.clone();
+            tokio::spawn(async move {
+                let mut inbound = match client
+                    .stream_search(Request::new(ReceiverStream::new(req_rx)))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(e) => {
+                        let _ = merged_tx.send((shard, Err(e))).await;
+                        return;
+                    }
+                };
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(msg)) => {
+                            if merged_tx.send((shard, Ok(Some(msg)))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = merged_tx.send((shard, Ok(None))).await;
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = merged_tx.send((shard, Err(e))).await;
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        Ok(StreamFanout {
+            merged_rx,
+            floor_txs,
+            udp_lanes,
+        })
+    }
+
+    /// Push a floor raise to every still-open stream of `fanout`: UDP
+    /// first (the fast lossy copy), then the reliable stream. Both are
+    /// monotone max-folds shard-side, so double delivery and loss are
+    /// equally free; a full stream channel just means the next raise
+    /// supersedes this one.
+    fn push_stream_floor(&self, fanout: &StreamFanout, floor: f32) {
+        let update = StreamSearchRequest {
+            payload: Some(stream_search_request::Payload::FloorUpdate(FloorUpdate {
+                floor,
+            })),
+        };
+        let socket = self.floor_socket();
+        for (si, tx) in fanout.floor_txs.iter().enumerate() {
+            let Some(tx) = tx.as_ref() else {
+                continue;
+            };
+            if let (Some(socket), Some((token, target))) = (socket, fanout.udp_lanes[si]) {
+                let mut dgram = [0u8; 12];
+                dgram[..8].copy_from_slice(&token.to_le_bytes());
+                dgram[8..].copy_from_slice(&floor.to_le_bytes());
+                let _ = socket.send_to(&dgram, target);
+            }
+            let _ = tx.try_send(update.clone());
+        }
+    }
+
     /// [`Self::fanout_search`] over the streaming protocol
     /// (`NodeService.StreamSearch`): shards hold no top-k and emit
     /// every candidate at or above the live floor; the heap here — the
@@ -991,65 +1484,8 @@ impl CoordinatorServiceImpl {
             });
         }
 
-        // One StreamSearch per shard: Start flows through a held
-        // sender that later carries floor raises. Each stream also gets
-        // a UDP token so raises reach the shard on the fast lossy lane
-        // as well as the reliable stream.
-        let (merged_tx, mut merged_rx) =
-            mpsc::channel::<(usize, Result<Option<StreamSearchResponse>, Status>)>(4 * n_nodes);
-        let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
-            Vec::with_capacity(n_nodes);
-        let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
-        for shard in 0..n_nodes {
-            let mut client = self.node_client(&self.node_addrs[shard])?;
-            let lane = self
-                .floor_target(&self.node_addrs[shard])
-                .map(|target| (floor_token(), target));
-            let (req_tx, req_rx) = mpsc::channel::<StreamSearchRequest>(64);
-            req_tx
-                .try_send(StreamSearchRequest {
-                    payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
-                        request_id: request_id.to_string(),
-                        vector: vector.to_vec(),
-                        initial_floor,
-                        floor_token: lane.map_or(0, |(token, _)| token),
-                    })),
-                })
-                .expect("fresh channel accepts the Start message");
-            floor_txs.push(Some(req_tx));
-            udp_lanes.push(lane);
-            let merged_tx = merged_tx.clone();
-            tokio::spawn(async move {
-                let mut inbound = match client
-                    .stream_search(Request::new(ReceiverStream::new(req_rx)))
-                    .await
-                {
-                    Ok(response) => response.into_inner(),
-                    Err(e) => {
-                        let _ = merged_tx.send((shard, Err(e))).await;
-                        return;
-                    }
-                };
-                loop {
-                    match inbound.message().await {
-                        Ok(Some(msg)) => {
-                            if merged_tx.send((shard, Ok(Some(msg)))).await.is_err() {
-                                return;
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = merged_tx.send((shard, Ok(None))).await;
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = merged_tx.send((shard, Err(e))).await;
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-        drop(merged_tx);
+        let mut fanout =
+            self.open_stream_fanout(request_id, vector, initial_floor, false)?;
 
         // The global top-k: a max-heap whose top is the WORST survivor
         // under the merge's total order, so peek() is the k-th best.
@@ -1060,26 +1496,9 @@ impl CoordinatorServiceImpl {
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
         let mut floors_sent = 0u64;
         while remaining > 0 {
-            let Some((shard, item)) = merged_rx.recv().await else {
-                return Err(Status::internal("stream fan-out ended without all shards"));
-            };
-            let msg = match item {
-                Ok(Some(msg)) => msg,
-                // Stream closed without a summary: the shard broke the
-                // protocol (its Ok(None) must follow the summary we
-                // already counted, in which case remaining was already
-                // decremented and we never see the close here).
-                Ok(None) => {
-                    if summaries[shard].is_none() {
-                        return Err(Status::internal(format!(
-                            "shard {shard} closed its stream without a summary"
-                        )));
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    return Err(Status::internal(format!("shard {shard} failed: {e}")));
-                }
+            let (shard, msg) = match fanout.next_message(&summaries).await? {
+                Some(pair) => pair,
+                None => continue,
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
@@ -1112,40 +1531,18 @@ impl CoordinatorServiceImpl {
                     }
                     // Full heap: its worst survivor bounds the global
                     // k-th best from below; seed one ULP down so shard
-                    // ties at the boundary keep flowing.
+                    // ties at the boundary keep flowing. next_down, not
+                    // bm25::floor_seed: vector scores are SIGNED (dot
+                    // products), and clamping a negative k-th best to 0
+                    // would push a floor ABOVE it — a recall bug on any
+                    // corpus whose top-k dips below zero.
                     if heap.len() == k as usize {
                         let kth = heap.peek().expect("heap is full").0.score;
-                        let floor = bm25::floor_seed(kth);
+                        let floor = kth.next_down();
                         if floor > last_floor {
                             last_floor = floor;
                             floors_sent += 1;
-                            let update = StreamSearchRequest {
-                                payload: Some(stream_search_request::Payload::FloorUpdate(
-                                    FloorUpdate { floor },
-                                )),
-                            };
-                            // UDP first (the fast lossy copy), then the
-                            // reliable stream. Both are monotone
-                            // max-folds shard-side, so double delivery
-                            // and loss are equally free.
-                            let socket = self.floor_socket();
-                            for (si, tx) in floor_txs.iter().enumerate() {
-                                if tx.is_none() {
-                                    continue;
-                                }
-                                if let (Some(socket), Some((token, target))) =
-                                    (socket, udp_lanes[si])
-                                {
-                                    let mut dgram = [0u8; 12];
-                                    dgram[..8].copy_from_slice(&token.to_le_bytes());
-                                    dgram[8..].copy_from_slice(&floor.to_le_bytes());
-                                    let _ = socket.send_to(&dgram, target);
-                                }
-                                // Raises are monotone and disposable: a
-                                // full channel just means the next raise
-                                // supersedes this one.
-                                let _ = tx.as_ref().expect("checked above").try_send(update.clone());
-                            }
+                            self.push_stream_floor(&fanout, floor);
                         }
                     }
                 }
@@ -1156,7 +1553,7 @@ impl CoordinatorServiceImpl {
                         )));
                     }
                     summaries[shard] = Some(summary);
-                    floor_txs[shard] = None;
+                    fanout.floor_txs[shard] = None;
                     remaining -= 1;
                 }
                 None => {}
@@ -1174,6 +1571,185 @@ impl CoordinatorServiceImpl {
                     parent_id: 0,
                 })
                 .collect(),
+            summaries: summaries
+                .into_iter()
+                .map(|s| s.expect("all summaries arrived"))
+                .collect(),
+            floors_sent,
+        })
+    }
+
+    /// Document-mode streaming: [`Self::fanout_stream_search`] with
+    /// `k` meaning k distinct PARENT documents. Shards emit chunks
+    /// tagged with their parents (lineage `opinion_id`, or tagged
+    /// self-parents); the coordinator owns the whole document
+    /// aggregation — a parent's score is its best chunk's, the floor
+    /// is one ULP below the k-th best parent score, and each returned
+    /// parent carries EVERY chunk at or above the final floor,
+    /// whichever shards held them. No colocation: an opinion whose
+    /// chunks straddle a shard cut aggregates here exactly like one
+    /// whose chunks share a shard.
+    ///
+    /// Lossless: a chunk below the parent floor can neither beat its
+    /// own parent's best nor introduce a new top-k parent, and every
+    /// chunk scoring at or above the FINAL floor cleared every earlier
+    /// (lower) floor, so filtering the retained chunks to the final
+    /// floor makes the groups exact and layout-invariant.
+    pub async fn fanout_stream_search_collapse(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+    ) -> Result<CollapseStreamResult, Status> {
+        struct ParentAgg {
+            best_score: f32,
+            best_id: u64,
+            chunks: Vec<(u64, f32)>,
+        }
+        let n_nodes = self.node_addrs.len();
+        if n_nodes == 0 {
+            return Err(Status::failed_precondition("no shard nodes configured"));
+        }
+        if k == 0 {
+            return Ok(CollapseStreamResult {
+                hits: Vec::new(),
+                groups: Vec::new(),
+                chunk_floor: f32::NEG_INFINITY,
+                summaries: Vec::new(),
+                floors_sent: 0,
+            });
+        }
+        let mut fanout = self.open_stream_fanout(request_id, vector, None, true)?;
+        let mut parents: HashMap<u64, ParentAgg> = HashMap::new();
+        let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
+        let mut remaining = n_nodes;
+        // The k-th best parent score, recomputed lazily: only a batch
+        // that raised some parent's best (or added a parent) can move
+        // it, and floors derive from nothing else.
+        let mut kth = f32::NEG_INFINITY;
+        let mut last_floor = f32::NEG_INFINITY;
+        let mut floors_sent = 0u64;
+        while remaining > 0 {
+            let (shard, msg) = match fanout.next_message(&summaries).await? {
+                Some(pair) => pair,
+                None => continue,
+            };
+            match msg.payload {
+                Some(stream_search_response::Payload::Batch(batch)) => {
+                    // Packed 20-byte LE records: u64 global id, f32
+                    // score, u64 parent (see StreamSearchBatch).
+                    if batch.hits.len() % 20 != 0 {
+                        return Err(Status::internal(format!(
+                            "shard {shard} sent a misaligned collapse batch of {} bytes",
+                            batch.hits.len()
+                        )));
+                    }
+                    let mut dirty = false;
+                    for rec in batch.hits.chunks_exact(20) {
+                        let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
+                        let score =
+                            f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score"));
+                        let parent =
+                            u64::from_le_bytes(rec[12..20].try_into().expect("8-byte parent"));
+                        let agg = parents.entry(parent).or_insert_with(|| {
+                            dirty = true;
+                            ParentAgg {
+                                best_score: f32::NEG_INFINITY,
+                                best_id: u64::MAX,
+                                chunks: Vec::new(),
+                            }
+                        });
+                        agg.chunks.push((doc, score));
+                        if score > agg.best_score
+                            || (score == agg.best_score && doc < agg.best_id)
+                        {
+                            if score > agg.best_score && score > kth {
+                                dirty = true;
+                            }
+                            agg.best_score = score;
+                            agg.best_id = doc;
+                        }
+                    }
+                    if dirty && parents.len() >= k as usize {
+                        let mut bests: Vec<f32> =
+                            parents.values().map(|a| a.best_score).collect();
+                        let idx = k as usize - 1;
+                        let new_kth =
+                            *bests.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1;
+                        if new_kth > kth {
+                            kth = new_kth;
+                            // next_down, not bm25::floor_seed: parent
+                            // scores are signed vector scores.
+                            let floor = kth.next_down();
+                            if floor > last_floor {
+                                last_floor = floor;
+                                floors_sent += 1;
+                                self.push_stream_floor(&fanout, floor);
+                            }
+                        }
+                    }
+                }
+                Some(stream_search_response::Payload::Summary(summary)) => {
+                    if !summary.completed {
+                        return Err(Status::internal(format!(
+                            "shard {shard} stopped before completing its scan"
+                        )));
+                    }
+                    summaries[shard] = Some(summary);
+                    fanout.floor_txs[shard] = None;
+                    remaining -= 1;
+                }
+                None => {}
+            }
+        }
+
+        // Rank parents (best desc, best chunk id asc — the collapse
+        // fan-out's order), keep k, and filter each kept parent's
+        // chunks to the final floor for a deterministic group: every
+        // chunk at or above it was emitted, every chunk below it is
+        // dropped whether or not it happened to arrive.
+        let mut ranked: Vec<(u64, ParentAgg)> = parents.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.best_score
+                .total_cmp(&a.1.best_score)
+                .then_with(|| a.1.best_id.cmp(&b.1.best_id))
+        });
+        let chunk_floor = if ranked.len() >= k as usize {
+            ranked[k as usize - 1].1.best_score.next_down()
+        } else {
+            f32::NEG_INFINITY
+        };
+        ranked.truncate(k as usize);
+        let mut hits = Vec::with_capacity(ranked.len());
+        let mut groups = Vec::with_capacity(ranked.len());
+        for (parent, agg) in ranked {
+            hits.push(ScoredHit {
+                vector_id: agg.best_id,
+                score: agg.best_score,
+                parent_id: parent,
+            });
+            let mut chunks: Vec<(u64, f32)> = agg
+                .chunks
+                .into_iter()
+                .filter(|&(_, score)| score >= chunk_floor)
+                .collect();
+            chunks.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            groups.push(ParentGroup {
+                parent_id: parent,
+                chunks: chunks
+                    .into_iter()
+                    .map(|(doc, score)| ScoredHit {
+                        vector_id: doc,
+                        score,
+                        parent_id: parent,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(CollapseStreamResult {
+            hits,
+            groups,
+            chunk_floor,
             summaries: summaries
                 .into_iter()
                 .map(|s| s.expect("all summaries arrived"))
@@ -1659,6 +2235,80 @@ impl CoordinatorServiceImpl {
     }
 }
 
+/// Total-order f64 wrapper for heap keys.
+#[derive(PartialEq)]
+struct F64Ord(f64);
+impl Eq for F64Ord {}
+impl PartialOrd for F64Ord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for F64Ord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Magnitude-relative slack for the decomposed-floor bounds: 2^-40 of
+/// the participating magnitudes, about four thousand times the worst
+/// accumulated f64 rounding error of the three operations involved and
+/// one part in 10^12 of the scores — provably conservative, immeasurably
+/// loose.
+const SLACK_REL: f64 = 1.0 / (1u64 << 40) as f64;
+
+/// The decomposed vector floor for a fused lower bound `s_lb`:
+/// mathematically (s_lb - w_b * b_1) / w_v, rounded DOWN past every
+/// f64 rounding error and the f32 cast, so that v(d) < result implies
+/// w_v * v(d) + w_b * b(d) < s_lb for every doc (b(d) <= b_1 by the
+/// exactness of the BM25 leg). `wb_b1` arrives premultiplied.
+fn decomposed_floor(s_lb: f64, wb_b1: f64, w_v: f64) -> f32 {
+    let t = (s_lb - wb_b1) / w_v;
+    let mag = t.abs() + (s_lb.abs() + wb_b1.abs()) / w_v;
+    let safe = t - mag * SLACK_REL - f64::MIN_POSITIVE;
+    (safe as f32).next_down()
+}
+
+/// One open `StreamSearch` fan-out: a merged inbound lane plus the
+/// per-shard floor lanes (reliable stream sender + optional UDP token).
+/// Shared by every streaming consumer — plain top-k, document mode,
+/// and the decomposed hybrid — which differ only in what they do with
+/// the batches and which floor they derive.
+struct StreamFanout {
+    merged_rx: mpsc::Receiver<(usize, Result<Option<StreamSearchResponse>, Status>)>,
+    floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>>,
+    udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>>,
+}
+
+impl StreamFanout {
+    /// The next inbound message: `Ok(Some((shard, msg)))` for a payload,
+    /// `Ok(None)` for a clean post-summary stream close (callers just
+    /// continue), and an error for a shard failure or a close without a
+    /// summary (a protocol break — the summary is the exactness
+    /// certificate, so a stream that vanishes without one aborts the
+    /// query).
+    async fn next_message(
+        &mut self,
+        summaries: &[Option<StreamSearchSummary>],
+    ) -> Result<Option<(usize, StreamSearchResponse)>, Status> {
+        let Some((shard, item)) = self.merged_rx.recv().await else {
+            return Err(Status::internal("stream fan-out ended without all shards"));
+        };
+        match item {
+            Ok(Some(msg)) => Ok(Some((shard, msg))),
+            Ok(None) => {
+                if summaries[shard].is_none() {
+                    return Err(Status::internal(format!(
+                        "shard {shard} closed its stream without a summary"
+                    )));
+                }
+                Ok(None)
+            }
+            Err(e) => Err(Status::internal(format!("shard {shard} failed: {e}"))),
+        }
+    }
+}
+
 /// Everything one shard-stream attempt needs, cheap to clone per attempt
 /// (a hedged retry is just a second attempt with the same context).
 #[derive(Clone)]
@@ -1900,6 +2550,24 @@ pub struct FanoutResult {
 }
 
 /// Result of [`CoordinatorServiceImpl::fanout_stream_search`].
+/// What a document-mode streaming fan-out returns (see
+/// [`CoordinatorServiceImpl::fanout_stream_search_collapse`]).
+pub struct CollapseStreamResult {
+    /// The top-k parents' representatives: each parent's best chunk,
+    /// score descending, ties by chunk id; `parent_id` set.
+    pub hits: Vec<ScoredHit>,
+    /// One group per entry of `hits`, same order: every chunk of that
+    /// parent scoring at or above `chunk_floor`.
+    pub groups: Vec<ParentGroup>,
+    /// One ULP below the k-th best parent score, or -inf when fewer
+    /// than k parents exist.
+    pub chunk_floor: f32,
+    /// Every shard's terminal summary (all certified `completed`).
+    pub summaries: Vec<StreamSearchSummary>,
+    /// Parent-floor raises pushed to the fleet.
+    pub floors_sent: u64,
+}
+
 pub struct StreamFanoutResult {
     /// Merged global top-k, in the same total order as
     /// [`FanoutResult::hits`].
@@ -1959,6 +2627,22 @@ impl SearchService for CoordinatorServiceImpl {
         };
 
         let result = if req.collapse_parents {
+            // Document mode on a streaming coordinator: parents
+            // aggregate here from tagged chunk emissions, and the
+            // response carries the per-parent chunk groups. The bidi
+            // path collapses shard-side and returns representatives
+            // only.
+            if self.stream_search {
+                let doc = self
+                    .fanout_stream_search_collapse(&request_id, &req.vector, req.k)
+                    .await?;
+                return Ok(Response::new(SearchResponse {
+                    request_id,
+                    hits: doc.hits,
+                    groups: doc.groups,
+                    chunk_floor: doc.chunk_floor,
+                }));
+            }
             self.fanout_search_collapse(&request_id, &req.vector, req.k)
                 .await?
         } else if self.stream_search {
@@ -1968,6 +2652,8 @@ impl SearchService for CoordinatorServiceImpl {
             return Ok(Response::new(SearchResponse {
                 request_id,
                 hits: streamed.hits,
+                groups: Vec::new(),
+                chunk_floor: 0.0,
             }));
         } else {
             self.fanout_search(&request_id, &req.vector, req.k, false)
@@ -1976,6 +2662,8 @@ impl SearchService for CoordinatorServiceImpl {
         Ok(Response::new(SearchResponse {
             request_id,
             hits: result.hits,
+            groups: Vec::new(),
+            chunk_floor: 0.0,
         }))
     }
 
@@ -2062,6 +2750,18 @@ impl SearchService for CoordinatorServiceImpl {
             return Err(Status::invalid_argument(
                 "TWO_LEVEL cannot disable a leg (its node wire format cannot distinguish \
                  0 from unset); use GLOBAL_RANK or SCORE_BLEND",
+            ));
+        }
+        // The decomposed floor algebra divides by vector_weight and
+        // scales bounds by bm25_weight; both must be strictly positive
+        // (a single-leg query belongs to GLOBAL_RANK or SCORE_BLEND).
+        if options.fusion_mode() == FusionMode::Decomposed
+            && !(vector_weight > 0.0 && vector_weight.is_finite()
+                && bm25_weight > 0.0
+                && bm25_weight.is_finite())
+        {
+            return Err(Status::invalid_argument(
+                "DECOMPOSED requires finite leg weights > 0 for both legs",
             ));
         }
         if options.min_vector_score.is_nan() {

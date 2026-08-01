@@ -43,7 +43,7 @@ use crate::pb::{
     ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest,
     StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
     StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
-    TermStatsResponse,
+    TermStatsResponse, VectorRescoreRequest, VectorRescoreResponse,
 };
 use crate::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker};
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
@@ -2381,6 +2381,20 @@ impl NodeService for NodeServiceImpl {
             let scan_cell = Arc::clone(&floor_cell);
             let scan =
                 tokio::task::spawn_blocking(move || -> Result<StreamSearchSummary, Status> {
+                    // Document mode: resolve each emitted slot's parent.
+                    // parent_map takes its own locks (read to build,
+                    // write to cache), so it runs before the scan's read
+                    // guard is taken, exactly as in the bidi collapse
+                    // path.
+                    let parents = if start.collapse_parents {
+                        let n = {
+                            let guard = state.read().expect("shard state lock poisoned");
+                            guard.index.as_ref().map_or(0, |index| index.len())
+                        };
+                        Some(Self::parent_map(&state, slot_offset, n))
+                    } else {
+                        None
+                    };
                     let guard = state.read().expect("shard state lock poisoned");
                     let index = guard.index.as_ref().ok_or_else(|| {
                         Status::failed_precondition(
@@ -2403,6 +2417,13 @@ impl NodeService for NodeServiceImpl {
                             "query coordinate {coord} is invalid: {value}"
                         )));
                     }
+                    if let Some(p) = parents.as_ref() {
+                        if p.len() != index.len() {
+                            return Err(Status::aborted(
+                                "shard grew between setup and scan; retry",
+                            ));
+                        }
+                    }
 
                     let mut options = turbovec::SearchOptions::new();
                     let mut floor_now = f32::NEG_INFINITY;
@@ -2411,16 +2432,19 @@ impl NodeService for NodeServiceImpl {
                         floor_now = f;
                     }
                     let mut raises = 0u64;
+                    let stride = if parents.is_some() { 20 } else { 12 };
                     let summary = index
                         .try_search_streaming(&start.vector, options, |batch| {
-                            // Pack the batch as 12-byte LE records
-                            // (u64 global id, f32 score), fused into the
+                            // Pack the batch as fixed-stride LE records
+                            // (u64 global id, f32 score, and in document
+                            // mode the slot's u64 parent), fused into the
                             // slot-to-global-id rebase — one pass, no
                             // per-hit messages. Real emissions only
                             // carry live slots; a negative would be an
                             // engine contract break, dropped rather
                             // than wrapped into a bogus global id.
-                            let mut hits: Vec<u8> = Vec::with_capacity(12 * batch.slots.len());
+                            let mut hits: Vec<u8> =
+                                Vec::with_capacity(stride * batch.slots.len());
                             for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
                                 if slot < 0 {
                                     continue;
@@ -2429,6 +2453,9 @@ impl NodeService for NodeServiceImpl {
                                     &(slot_offset + slot as u64).to_le_bytes(),
                                 );
                                 hits.extend_from_slice(&score.to_le_bytes());
+                                if let Some(p) = parents.as_deref() {
+                                    hits.extend_from_slice(&p[slot as usize].to_le_bytes());
+                                }
                             }
                             let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
                                 payload: Some(stream_search_response::Payload::Batch(
@@ -2878,6 +2905,73 @@ impl NodeService for NodeServiceImpl {
             None => Vec::new(),
         };
         Ok(Response::new(Bm25RescoreResponse { hits }))
+    }
+
+    async fn vector_rescore(
+        &self,
+        request: Request<VectorRescoreRequest>,
+    ) -> Result<Response<VectorRescoreResponse>, Status> {
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let state = self.state.clone();
+        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
+            let guard = state.read().expect("shard state lock poisoned");
+            // A shard with no index holds none of the candidates.
+            let Some(index) = guard.index.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let Some(dim) = index.dim_opt() else {
+                return Ok(Vec::new());
+            };
+            if req.vector.len() != dim {
+                return Err(Status::invalid_argument(format!(
+                    "query vector has dim {}, index expects {dim}",
+                    req.vector.len()
+                )));
+            }
+            if let Some((_, coord, value)) = turbovec::first_invalid_coord(&req.vector, dim) {
+                return Err(Status::invalid_argument(format!(
+                    "query coordinate {coord} is invalid: {value}"
+                )));
+            }
+            // Route global ids into this shard's live slots; the mask
+            // names slots, so it is sized to slot_capacity (== len on
+            // these append-only shards, but the mask contract is
+            // capacity). The kernel short-circuits fully-masked SIMD
+            // blocks, so a tiny allowlist costs a mask walk, not a scan.
+            let n = index.len();
+            let mut mask = vec![false; index.slot_capacity()];
+            let mut allowed = 0usize;
+            for &id in &req.candidate_ids {
+                if id >= offset && id - offset < n as u64 {
+                    let slot = (id - offset) as usize;
+                    if !mask[slot] {
+                        mask[slot] = true;
+                        allowed += 1;
+                    }
+                }
+            }
+            if allowed == 0 {
+                return Ok(Vec::new());
+            }
+            let results = index
+                .try_search_with_mask(&req.vector, allowed, Some(&mask))
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let hits = results
+                .indices_for_query(0)
+                .iter()
+                .zip(results.scores_for_query(0))
+                .filter(|&(&slot, _)| slot >= 0)
+                .map(|(&slot, &score)| RawLegHit {
+                    doc_id: offset + slot as u64,
+                    score,
+                })
+                .collect();
+            Ok(hits)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
+        Ok(Response::new(VectorRescoreResponse { hits }))
     }
 
     async fn get_documents(
