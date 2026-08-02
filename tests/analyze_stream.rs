@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
-use turbovec_search::analyzer::{analyze_batch, analyze_document, AnalyzeStream};
+use turbovec_search::analyzer::{
+    analyze_batch, analyze_batch_streams, analyze_document, AnalyzeStream,
+};
 use turbovec_search::harness::mock_analysis::MockAnalysis;
 use turbovec_search::harness::nodelay_incoming;
 use turbovec_search::node::NodeConfig;
@@ -204,5 +206,72 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
         status.message()
     );
     node.abort();
+    server.abort();
+}
+
+/// The stream count is a throughput knob and nothing else.
+///
+/// Analysis is a pure function of (text, spec), and results are keyed by
+/// the caller's sequence, so splitting a batch over N streams changes
+/// only who waits. Pinned because a knob that quietly perturbed term
+/// identity would corrupt an index rather than merely slow one down, and
+/// the corruption would surface as bad rankings months later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_count_does_not_change_a_single_result() {
+    let (addr, server) = start_mock_analysis().await;
+    // More documents than streams, and (below) more streams than
+    // documents: both sides of the clamp.
+    let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS.iter().map(|t| (*t, None)).collect();
+    let baseline = analyze_batch_streams(&addr, &docs, 1).await.unwrap();
+    for streams in [2, 3, 4, 7, 16] {
+        let split = analyze_batch_streams(&addr, &docs, streams).await.unwrap();
+        assert_eq!(
+            split, baseline,
+            "{streams} streams changed the analysis of an unchanged batch"
+        );
+    }
+    // 0 is clamped to 1 rather than analyzing nothing.
+    assert_eq!(analyze_batch_streams(&addr, &docs, 0).await.unwrap(), baseline);
+    server.abort();
+}
+
+/// Mixed specs must stay grouped, and the split must respect the groups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_streams_keep_each_spec_with_its_own_documents() {
+    let (addr, server) = start_mock_analysis().await;
+    let stemmed = AnalysisSpec {
+        tokenizer: 1,
+        stemmer: 2,
+        term_vector_mode: 1,
+        term_vector_source: 2,
+        normalizer_rungs: Vec::new(),
+    };
+    // Interleaved specs, so a naive split would cross a group boundary.
+    let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (*t, if i % 2 == 0 { Some(&stemmed) } else { None }))
+        .collect();
+    let baseline = analyze_batch_streams(&addr, &docs, 1).await.unwrap();
+    for streams in [2, 5] {
+        assert_eq!(
+            analyze_batch_streams(&addr, &docs, streams).await.unwrap(),
+            baseline,
+            "{streams} streams crossed a spec boundary"
+        );
+    }
+    // And the two specs really do produce different terms, or the check
+    // above would pass on an accident.
+    let plain = analyze_document(&addr, TEXTS[0], None).await.unwrap();
+    let stem = analyze_document(&addr, TEXTS[0], Some(&stemmed)).await.unwrap();
+    assert_ne!(plain, stem, "the fixture's two specs must actually differ");
+    server.abort();
+}
+
+/// An empty batch opens no streams and returns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_batch_is_not_an_error() {
+    let (addr, server) = start_mock_analysis().await;
+    assert!(analyze_batch_streams(&addr, &[], 8).await.unwrap().is_empty());
     server.abort();
 }

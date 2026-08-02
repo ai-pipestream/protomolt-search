@@ -68,16 +68,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The reshard core is synchronous; the sidecar client is async. Bridge
     // with block_in_place on the multi-thread runtime (same idiom the
-    // court examples use for sync work under tokio). Each batch rides one
-    // AnalyzeStream, paced by the sidecar's flow control (a sidecar
-    // predating the RPC is refused outright, not quietly downgraded to
-    // per-document unary calls that would die deep into the replay).
+    // court examples use for sync work under tokio). Each batch rides
+    // `--analysis-streams` AnalyzeStreams, paced by the sidecar's flow
+    // control (a sidecar predating the RPC is refused outright, not
+    // quietly downgraded to per-document unary calls that would die deep
+    // into the replay).
+    //
+    // One stream is a pipeline, not a parallel: analysis is the ceiling
+    // on this replay, so raising the count lets the sidecar work on
+    // several documents at once. It cannot change the result -- results
+    // are keyed by sequence and analysis is a pure function of (text,
+    // spec) -- so it is safe to tune against a live sidecar.
+    let streams: usize = arg("analysis-streams", "1").parse()?;
     let addr = analysis_addr.clone();
     let handle = tokio::runtime::Handle::current();
     let mut analyze =
         move |docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
-            tokio::task::block_in_place(|| handle.block_on(analyzer::analyze_batch(&addr, docs)))
-                .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
+            tokio::task::block_in_place(|| {
+                handle.block_on(analyzer::analyze_batch_streams(&addr, docs, streams))
+            })
+            .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
         };
 
     let output = match opt("logs") {

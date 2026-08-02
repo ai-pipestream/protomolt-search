@@ -225,8 +225,8 @@ pub struct AnalyzeStream {
 
 impl AnalyzeStream {
     /// Opens a stream and sends its options message. UNIMPLEMENTED means
-    /// the sidecar predates the RPC: fall back to unary
-    /// [`analyze_document`] calls.
+    /// the sidecar predates the RPC and must be rebuilt; there is no
+    /// unary fallback (see [`analyze_batch`] for why it was removed).
     ///
     /// The await resolves on call ACCEPTANCE, not on any result: the
     /// sidecar sends response headers eagerly (its
@@ -257,6 +257,54 @@ impl AnalyzeStream {
         self.submit
             .clone()
             .expect("finished stream has no submitter")
+    }
+
+    /// Submit `indices` (as sequences) through this one stream and
+    /// collect every result, racing submission against consumption so a
+    /// full local buffer never stalls the drain.
+    ///
+    /// Extracted so the multi-stream path runs the SAME loop N times
+    /// rather than a second implementation of it: the pacing here is
+    /// subtle (the await in `submit` is the backpressure), and two
+    /// versions of it would drift.
+    async fn run_to_completion(
+        mut self,
+        items: &[(u64, &str)],
+    ) -> Result<Vec<(u64, AnalyzedDoc)>, Status> {
+        let mut out = Vec::with_capacity(items.len());
+        let submit = self.submitter();
+        let (mut submitted, mut received) = (0usize, 0usize);
+        let take = |item: Option<(u64, Result<AnalyzedDoc, Status>)>,
+                        out: &mut Vec<(u64, AnalyzedDoc)>|
+         -> Result<(), Status> {
+            let Some((sequence, result)) = item else {
+                return Err(Status::internal(
+                    "analysis stream completed with documents unanswered",
+                ));
+            };
+            out.push((sequence, result?));
+            Ok(())
+        };
+        while submitted < items.len() {
+            let (sequence, text) = items[submitted];
+            tokio::select! {
+                sent = submit.submit(sequence, text) => {
+                    sent?;
+                    submitted += 1;
+                }
+                result = self.next() => {
+                    take(result?, &mut out)?;
+                    received += 1;
+                }
+            }
+        }
+        drop(submit);
+        self.finish();
+        while received < items.len() {
+            take(self.next().await?, &mut out)?;
+            received += 1;
+        }
+        Ok(out)
     }
 
     /// Half-close the submission side. Once every [`submitter`] clone
@@ -291,34 +339,49 @@ impl AnalyzeStream {
     }
 }
 
-/// Analyze a batch through one [`AnalyzeStream`] per distinct spec
-/// (almost always exactly one), returning results in input order. Falls
-/// back to concurrent unary calls against a sidecar that predates the
-/// RPC. Any per-document failure fails the whole batch, the contract the
-/// reshard replay tools rely on.
+/// Analyze a batch through [`AnalyzeStream`], returning results in INPUT
+/// order. Any per-document failure fails the whole batch, the contract
+/// the reshard replay tools rely on.
+///
+/// One stream per distinct spec (almost always exactly one). For more
+/// than one stream per spec see [`analyze_batch_streams`].
 pub async fn analyze_batch(
     addr: &str,
     docs: &[(&str, Option<&AnalysisSpec>)],
 ) -> Result<Vec<AnalyzedDoc>, Status> {
+    analyze_batch_streams(addr, docs, 1).await
+}
+
+/// [`analyze_batch`] over `streams` concurrent AnalyzeStreams per spec.
+///
+/// One stream is a pipeline, not a parallel: the sidecar paces it with
+/// its own flow control, so a single stream can leave analysis workers
+/// idle while it waits on the wire. Since analysis is the ceiling on
+/// bulk ingest (shard parallelism is not), opening several lets the
+/// sidecar work on several documents at once. The right number is a
+/// property of the sidecar's worker pool, not of this client, which is
+/// why it is a parameter rather than a constant.
+///
+/// Results are keyed by the caller's sequence and land in their input
+/// slots, so the OUTPUT IS BYTE-IDENTICAL whatever `streams` is set to.
+/// Analysis is a pure function of (text, spec); splitting the work
+/// changes only who waits. That is pinned by test, because a throughput
+/// knob that quietly perturbed term identity would corrupt an index
+/// rather than slow one down.
+///
+/// `streams` is clamped to at least 1 and to the number of documents in
+/// a group; more streams than documents would open connections that
+/// immediately close.
+pub async fn analyze_batch_streams(
+    addr: &str,
+    docs: &[(&str, Option<&AnalysisSpec>)],
+    streams: usize,
+) -> Result<Vec<AnalyzedDoc>, Status> {
     let mut out: Vec<Option<AnalyzedDoc>> = Vec::new();
     out.resize_with(docs.len(), || None);
-    let receive = |item: Option<(u64, Result<AnalyzedDoc, Status>)>,
-                   out: &mut Vec<Option<AnalyzedDoc>>|
-     -> Result<(), Status> {
-        let Some((sequence, result)) = item else {
-            return Err(Status::internal(
-                "analysis stream completed with documents unanswered",
-            ));
-        };
-        let slot = out
-            .get_mut(sequence as usize)
-            .ok_or_else(|| Status::internal(format!("unknown result sequence {sequence}")))?;
-        *slot = Some(result?);
-        Ok(())
-    };
     // Group indices by spec, preserving first-seen order; the global doc
     // index is the sequence, so results land in their input slots no
-    // matter which group answered.
+    // matter which group or which stream answered.
     let mut groups: Vec<(Option<&AnalysisSpec>, Vec<usize>)> = Vec::new();
     for (i, (_, spec)) in docs.iter().enumerate() {
         match groups.iter_mut().find(|(s, _)| *s == *spec) {
@@ -327,48 +390,101 @@ pub async fn analyze_batch(
         }
     }
     for (spec, indices) in groups {
-        let mut session = match AnalyzeStream::open(addr, spec).await {
-            Ok(session) => session,
-            // No quiet downgrade to per-document unary calls. This is a
-            // BULK path (reshard and WAL replay), and the unary transport
-            // opens one h2 stream per document: a sidecar predating
-            // AnalyzeStream GOAWAYs after ~70 of them, so the "fallback"
-            // does not degrade gracefully, it fails obscurely thousands of
-            // documents later. Name the version skew here instead.
-            Err(status) if status.code() == tonic::Code::Unimplemented => {
-                return Err(Status::failed_precondition(format!(
-                    "analysis sidecar at {addr} does not implement AnalyzeStream; \
-                     it predates the RPC and must be rebuilt (./gradlew installDist \
-                     in grpc-opennlp-analysis)"
-                )));
-            }
-            Err(status) => return Err(status),
-        };
-        let submit = session.submitter();
-        let mut submitted = 0usize;
-        let mut received = 0usize;
-        while submitted < indices.len() {
-            let i = indices[submitted];
-            tokio::select! {
-                sent = submit.submit(i as u64, docs[i].0) => {
-                    sent?;
-                    submitted += 1;
-                }
-                result = session.next() => {
-                    receive(result?, &mut out)?;
-                    received += 1;
-                }
-            }
+        let want = streams.max(1).min(indices.len());
+        if want == 0 {
+            continue;
         }
-        drop(submit);
-        session.finish();
-        while received < indices.len() {
-            receive(session.next().await?, &mut out)?;
-            received += 1;
+        // Contiguous chunks, not round-robin: consecutive documents in a
+        // bulk replay tend to be similar in size, so contiguity keeps the
+        // per-stream loads even without knowing anything about them.
+        let per = indices.len().div_ceil(want);
+        let chunks: Vec<Vec<(u64, &str)>> = indices
+            .chunks(per)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&i| (i as u64, docs[i].0))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let mut sessions = Vec::with_capacity(chunks.len());
+        for _ in 0..chunks.len() {
+            sessions.push(open_stream(addr, spec).await?);
+        }
+        // Drive every stream from this one task: the work being
+        // overlapped is the sidecar's, and these futures only wait on
+        // I/O. No spawn, so nothing has to be cloned to satisfy 'static.
+        let mut running: Vec<_> = sessions
+            .into_iter()
+            .zip(&chunks)
+            .map(|(session, chunk)| Box::pin(session.run_to_completion(chunk)))
+            .collect();
+        for done in join_all(&mut running).await {
+            for (sequence, doc) in done? {
+                let slot = out.get_mut(sequence as usize).ok_or_else(|| {
+                    Status::internal(format!("unknown result sequence {sequence}"))
+                })?;
+                *slot = Some(doc);
+            }
         }
     }
     Ok(out
         .into_iter()
         .map(|slot| slot.expect("every input index received exactly one result"))
         .collect())
+}
+
+/// Open one stream, naming a version skew rather than degrading.
+///
+/// No quiet downgrade to per-document unary calls. That fallback existed
+/// and cost real debugging time: this is a BULK path (reshard and WAL
+/// replay), and the unary transport opens one h2 stream per document, so
+/// a sidecar predating AnalyzeStream GOAWAYs after ~70 of them. The
+/// "fallback" did not degrade gracefully, it failed obscurely thousands
+/// of documents later.
+async fn open_stream(addr: &str, spec: Option<&AnalysisSpec>) -> Result<AnalyzeStream, Status> {
+    match AnalyzeStream::open(addr, spec).await {
+        Ok(session) => Ok(session),
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            Err(Status::failed_precondition(format!(
+                "analysis sidecar at {addr} does not implement AnalyzeStream; \
+                 it predates the RPC and must be rebuilt (./gradlew installDist \
+                 in grpc-opennlp-analysis)"
+            )))
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Await every future to completion, returning results in input order.
+///
+/// Hand-rolled because the crate does not depend on `futures`, and this
+/// is the whole of what it would be used for: poll each in turn, yield
+/// when none is ready. The waker is shared, so a wake from any one
+/// re-polls all of them, which is correct if slightly eager for the
+/// handful of streams this ever holds.
+async fn join_all<F: std::future::Future>(futures: &mut [std::pin::Pin<Box<F>>]) -> Vec<F::Output> {
+    let mut done: Vec<Option<F::Output>> = (0..futures.len()).map(|_| None).collect();
+    let mut remaining = futures.len();
+    std::future::poll_fn(|cx| {
+        for (slot, future) in done.iter_mut().zip(futures.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(cx) {
+                *slot = Some(value);
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    done.into_iter()
+        .map(|slot| slot.expect("poll_fn returned only when every future completed"))
+        .collect()
 }
