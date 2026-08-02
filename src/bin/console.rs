@@ -328,11 +328,21 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         "harmonic" => ScoreCombination::Harmonic,
         other => return Err(format!("unknown combination {other:?}")),
     };
-    // Analysis spec: must match how the corpus was ingested (term
-    // identity above all). Empty selects the sidecar defaults.
-    let pick = |v: &str, options: &[(&str, i32)]| -> Result<i32, String> {
+    // Analysis spec: must match how the corpus was ingested, because term
+    // identity is the whole contract. "default" therefore means THE
+    // CORPUS SPEC, never "let the sidecar pick".
+    //
+    // Sending no spec used to look harmless and was not: the sidecar
+    // resolves an absent spec to its own defaults (token-sourced,
+    // unstemmed), so every query term arrived as a raw token, missed a
+    // corpus of Porter stems, and scored df = 0. BM25 then returned
+    // nothing while the page still rendered a ranked list, because the
+    // vector leg answered normally. A lexical leg that silently matches
+    // nothing is indistinguishable from one that legitimately found
+    // nothing, which is exactly the failure this default prevents.
+    let pick = |v: &str, options: &[(&str, i32)], corpus_default: i32| -> Result<i32, String> {
         if v.is_empty() || v == "default" {
-            return Ok(0);
+            return Ok(corpus_default);
         }
         options
             .iter()
@@ -340,17 +350,15 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
             .map(|&(_, n)| n)
             .ok_or_else(|| format!("unknown value {v:?}"))
     };
-    let tokenizer = pick(&req.tokenizer, &[("whitespace", 1), ("simple", 2)])?;
-    let stemmer = pick(&req.stemmer, &[("none", 1), ("porter", 2)])?;
-    let term_source = pick(&req.term_source, &[("tokens", 1), ("stems", 2)])?;
-    let analysis = (tokenizer != 0 || stemmer != 0 || term_source != 0).then(|| {
-        turbovec_search::pb::AnalysisSpec {
-            tokenizer,
-            stemmer,
-            term_vector_mode: 0,
-            term_vector_source: term_source,
-            normalizer_rungs: Vec::new(),
-        }
+    let tokenizer = pick(&req.tokenizer, &[("whitespace", 1), ("simple", 2)], 1)?;
+    let stemmer = pick(&req.stemmer, &[("none", 1), ("porter", 2)], 2)?;
+    let term_source = pick(&req.term_source, &[("tokens", 1), ("stems", 2)], 2)?;
+    let analysis = Some(turbovec_search::pb::AnalysisSpec {
+        tokenizer,
+        stemmer,
+        term_vector_mode: 0,
+        term_vector_source: term_source,
+        normalizer_rungs: Vec::new(),
     });
 
     let boost = (!req.boost_text.is_empty()).then(|| BoostRescore {

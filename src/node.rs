@@ -1362,7 +1362,7 @@ impl NodeServiceImpl {
                     .zip(&leg_of_view)
                     .map(|(view, &li)| {
                         let leg = &req.fields[li];
-                        bm25::FieldQuery {
+                        Ok(bm25::FieldQuery {
                             index: view.as_ref(),
                             terms: &leg.terms,
                             stats: bm25::CorpusStats {
@@ -1370,15 +1370,15 @@ impl NodeServiceImpl {
                                 total_doc_length: leg.global_total_doc_length,
                                 dfs: leg.global_doc_frequencies.clone(),
                             },
-                            params: params_from(leg.k1, leg.b),
+                            params: params_from(leg.k1, leg.b)?,
                             weight: if leg.weight == 0.0 {
                                 1.0
                             } else {
                                 f64::from(leg.weight)
                             },
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, Status>>()?;
                 let floor = if req.min_score == 0.0 {
                     f64::NEG_INFINITY
                 } else {
@@ -1542,7 +1542,7 @@ impl NodeServiceImpl {
             req.global_doc_count,
             req.global_total_doc_length,
             &req.global_doc_frequencies,
-            params_from(req.k1, req.b),
+            params_from(req.k1, req.b)?,
             k,
         )?;
 
@@ -1577,8 +1577,27 @@ impl NodeServiceImpl {
 }
 
 /// Request-carried BM25 params: 0 selects the default (proto3 "absent").
-fn params_from(k1: f32, b: f32) -> Bm25Params {
-    Bm25Params {
+///
+/// Values are RANGE CHECKED, not just defaulted. `b` outside [0, 1]
+/// breaks the monotonicity precondition the block-max bounds rest on
+/// (see `postings::SkipRun`), so a bound can fall below a real score and
+/// the pruned scorer silently drops hits the exhaustive one keeps. A NaN
+/// is worse: BM25's `partial_cmp(..).unwrap_or(Equal)` degrades to
+/// insertion order, which makes the ranking depend on shard layout. Both
+/// arrive straight off the wire, so both are refused here rather than
+/// discovered as an unreproducible ranking difference.
+fn params_from(k1: f32, b: f32) -> Result<Bm25Params, Status> {
+    if !k1.is_finite() || k1 < 0.0 {
+        return Err(Status::invalid_argument(format!(
+            "bm25 k1 must be finite and >= 0, got {k1}"
+        )));
+    }
+    if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+        return Err(Status::invalid_argument(format!(
+            "bm25 b must be finite and within [0, 1], got {b}"
+        )));
+    }
+    Ok(Bm25Params {
         k1: if k1 == 0.0 {
             bm25::DEFAULT_K1
         } else {
@@ -1589,7 +1608,7 @@ fn params_from(k1: f32, b: f32) -> Bm25Params {
         } else {
             f64::from(b)
         },
-    }
+    })
 }
 
 /// Request weights default to 1.0 (0 means "unset" in the proto);
@@ -2725,7 +2744,7 @@ impl NodeService for NodeServiceImpl {
         if !req.fields.is_empty() {
             return self.bm25_query_fused(&req).map(Response::new);
         }
-        let params = params_from(req.k1, req.b);
+        let params = params_from(req.k1, req.b)?;
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
             total_doc_length: req.global_total_doc_length,
@@ -2994,7 +3013,7 @@ impl NodeService for NodeServiceImpl {
                 req.global_doc_count,
                 req.global_total_doc_length,
                 &req.global_doc_frequencies,
-                params_from(req.k1, req.b),
+                params_from(req.k1, req.b)?,
                 req.k as usize,
             )?;
             Ok(ShardLegsResponse {
