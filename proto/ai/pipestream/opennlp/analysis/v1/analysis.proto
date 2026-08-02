@@ -383,6 +383,18 @@ message TermVectorOptions {
 
     // Group by stem (the BM25 mode; the stem defines identity, rungs ignored).
     SOURCE_STEMS = 2;
+
+    // Group by the stem of the NORMALIZED token: the rung chain runs first,
+    // then the stemmer, and the resulting stem is the identity.
+    //
+    // SOURCE_STEMS alone is a trap for any corpus that is not already lower
+    // case. Stemmers are written for folded input, so "COURT" survives
+    // unchanged while "court" stems to "court", and the two become distinct
+    // terms; a query typed in lower case then misses every capitalized
+    // occurrence. SOURCE_TOKENS is not the answer either, because it folds
+    // but never stems ("court" and "courts" stay apart). This is the mode
+    // that composes them, and it is what a BM25 index over prose wants.
+    SOURCE_NORMALIZED_STEMS = 3;
   }
 
   // Whether term vectors are computed.
