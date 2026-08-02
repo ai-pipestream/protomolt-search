@@ -27,6 +27,11 @@ use crate::pb::{
     StartShardSearch, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
     StreamSearchSummary, TermStatsRequest, VectorRescoreRequest,
 };
+use crate::pb::{
+    search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
+    VariantSearchRequest, VariantSearchResponse,
+};
+use crate::rankdiff;
 use crate::pb::{stream_search_request, stream_search_response};
 
 /// Process-unique request id counter for coordinator-assigned ids.
@@ -370,6 +375,11 @@ impl CoordinatorServiceImpl {
         let mut doc_count = 0u64;
         let mut totals = vec![0u64; fields.len()];
         let mut dfs: Vec<Vec<u32>> = field_terms.iter().map(|t| vec![0u32; t.len()]).collect();
+        // Which fields any shard actually has. A field no shard knows is
+        // a typo, not a query: scoring it as "contributes nothing" would
+        // silently return the ranking of the REMAINING fields, so a
+        // misspelled arm of an A/B reads as "no difference".
+        let mut known_somewhere = vec![false; fields.len()];
         for task in share_tasks {
             let share = task
                 .await
@@ -387,10 +397,31 @@ impl CoordinatorServiceImpl {
                     return Err(Status::internal("shard field stats df length mismatch"));
                 }
                 totals[fi] += fs.total_doc_length;
+                known_somewhere[fi] |= fs.known;
                 for (acc, df) in dfs[fi].iter_mut().zip(&fs.doc_frequencies) {
                     *acc += df;
                 }
             }
+        }
+        // A partially-known field is tolerated: that is a real
+        // heterogeneous fleet, and the shards that have it still
+        // contribute. A field NO shard has is refused.
+        let unknown: Vec<&str> = fields
+            .iter()
+            .zip(&known_somewhere)
+            .filter(|(_, known)| !**known)
+            .map(|(f, _)| f.field.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "no shard indexes {}: scoring an unknown field would silently return the \
+                 remaining fields' ranking. Check the spelling, or the nodes' --bm25-fields.",
+                unknown
+                    .iter()
+                    .map(|f| format!("{f:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
         // (c) Bm25Query fan-out with per-field legs in entry order.
         // Entry k1/b of 0 pick up the coordinator's configured params,
@@ -2237,6 +2268,111 @@ impl CoordinatorServiceImpl {
         }
         results
     }
+
+    /// Run one A/B arm through the ordinary handler for its kind.
+    ///
+    /// This dispatches to `bm25_search`/`hybrid_search` rather than
+    /// reimplementing them: the comparison is only trustworthy if each
+    /// arm executes the path it would execute in production, and a
+    /// parallel scoring path written for the A/B would drift from the
+    /// served one until the diff was measuring the drift.
+    async fn run_variant(
+        &self,
+        query: &search_variant::Query,
+        k: u32,
+    ) -> Result<Vec<RankedHit>, Status> {
+        match query {
+            search_variant::Query::Bm25(req) => {
+                // `k` is the request's shared depth; an arm's own k is
+                // ignored so the rankings stay comparable.
+                let mut req = req.clone();
+                req.k = k;
+                let resp = SearchService::bm25_search(self, Request::new(req))
+                    .await?
+                    .into_inner();
+                Ok(resp
+                    .hits
+                    .into_iter()
+                    .map(|h| RankedHit {
+                        doc_id: h.doc_id,
+                        score: h.score,
+                    })
+                    .collect())
+            }
+            search_variant::Query::Hybrid(req) => {
+                let mut req = req.clone();
+                req.k = k;
+                // The profile block is per-arm noise here and the caller
+                // asked for a comparison, not a trace.
+                req.debug = false;
+                let resp = SearchService::hybrid_search(self, Request::new(req))
+                    .await?
+                    .into_inner();
+                // CASCADE reports in `cascade_hits` and leaves `hits`
+                // empty; the other modes do the reverse. Both are a
+                // ranking, which is all a diff needs.
+                if resp.hits.is_empty() {
+                    Ok(resp
+                        .cascade_hits
+                        .into_iter()
+                        .map(|h| RankedHit {
+                            doc_id: h.doc_id,
+                            score: h.bm25_score,
+                        })
+                        .collect())
+                } else {
+                    Ok(resp
+                        .hits
+                        .into_iter()
+                        .map(|h| RankedHit {
+                            doc_id: h.doc_id,
+                            score: h.fused_score,
+                        })
+                        .collect())
+                }
+            }
+        }
+    }
+}
+
+/// Diff one arm against the reference arm.
+///
+/// Split out from the handler so the measure wiring is testable without a
+/// cluster: everything below the fan-out is a pure function of two
+/// rankings.
+fn diff_against(
+    reference: &VariantResult,
+    variant: &VariantResult,
+    k: usize,
+    rbo_p: f64,
+) -> RankingDiff {
+    let ref_ids: Vec<u64> = reference.hits.iter().map(|h| h.doc_id).collect();
+    let var_ids: Vec<u64> = variant.hits.iter().map(|h| h.doc_id).collect();
+    let depth = k.min(ref_ids.len()).min(var_ids.len());
+    let overlap_fraction = rankdiff::overlap_at_k(&ref_ids, &var_ids, k);
+    // The reference's own scores are the yardstick for both sides, so
+    // regret never compares a BM25 score with a fused one.
+    let scored: Vec<(u64, f32)> = reference
+        .hits
+        .iter()
+        .map(|h| (h.doc_id, h.score))
+        .collect();
+    let regret = rankdiff::score_regret(&scored, &var_ids, k);
+    RankingDiff {
+        reference: reference.label.clone(),
+        variant: variant.label.clone(),
+        depth: depth as u32,
+        // Recovered from the fraction rather than recounted, so the two
+        // can never disagree.
+        overlap: (overlap_fraction * depth as f64).round() as u32,
+        overlap_fraction: overlap_fraction as f32,
+        kendall_tau: rankdiff::kendall_tau(&ref_ids, &var_ids) as f32,
+        rbo: rankdiff::rbo(&ref_ids, &var_ids, rbo_p) as f32,
+        score_regret: regret.mean as f32,
+        regret_counted: regret.counted as u32,
+        regret_unscored: regret.unscored as u32,
+        top1_flipped: rankdiff::top1_flipped(&ref_ids, &var_ids),
+    }
 }
 
 /// Total-order f64 wrapper for heap keys.
@@ -2915,5 +3051,148 @@ impl SearchService for CoordinatorServiceImpl {
         }
         let results = self.fanout_calibration(&req).await;
         Ok(Response::new(BroadcastCalibrationResponse { results }))
+    }
+
+    async fn variant_search(
+        &self,
+        request: Request<VariantSearchRequest>,
+    ) -> Result<Response<VariantSearchResponse>, Status> {
+        let req = request.into_inner();
+        if req.variants.len() < 2 {
+            return Err(Status::invalid_argument(format!(
+                "variant search compares configurations: at least 2 variants required, got {}",
+                req.variants.len()
+            )));
+        }
+        if req.k == 0 {
+            return Err(Status::invalid_argument("k must be positive"));
+        }
+        // Labels carry the whole result: a blank or duplicated one makes
+        // the diffs unreadable, so reject rather than disambiguate.
+        let mut seen: Vec<&str> = Vec::with_capacity(req.variants.len());
+        for (i, v) in req.variants.iter().enumerate() {
+            if v.label.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "variant {i} has an empty label; every arm must be named"
+                )));
+            }
+            if seen.contains(&v.label.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate variant label {:?}: labels identify arms in the diffs",
+                    v.label
+                )));
+            }
+            seen.push(&v.label);
+            if v.query.is_none() {
+                return Err(Status::invalid_argument(format!(
+                    "variant {:?} has no query set (expected bm25 or hybrid)",
+                    v.label
+                )));
+            }
+        }
+        // RBO's persistence is a probability; 1.0 would never terminate
+        // its weighting and is as much an error as 2.0.
+        let rbo_p = if req.rbo_p == 0.0 {
+            0.9
+        } else {
+            f64::from(req.rbo_p)
+        };
+        if !(rbo_p.is_finite() && rbo_p > 0.0 && rbo_p < 1.0) {
+            return Err(Status::invalid_argument(format!(
+                "rbo_p must be in (0, 1); got {}",
+                req.rbo_p
+            )));
+        }
+        if req.interleave && req.variants.len() != 2 {
+            return Err(Status::invalid_argument(format!(
+                "interleaving is a two-way method (team draft); got {} variants. \
+                 Compare more arms with diffs, or interleave them pairwise.",
+                req.variants.len()
+            )));
+        }
+        let request_id = if req.request_id.is_empty() {
+            format!(
+                "req-{}-{}",
+                std::process::id(),
+                REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+            )
+        } else {
+            req.request_id.clone()
+        };
+
+        // Sequential, not concurrent. Running the arms together would
+        // make each one's `elapsed_ms` a measure of how hard the other
+        // arms were hitting the same shards, and per-arm cost is part of
+        // what an A/B is asked to report.
+        let mut results = Vec::with_capacity(req.variants.len());
+        for variant in &req.variants {
+            let query = variant
+                .query
+                .as_ref()
+                .expect("query presence checked above");
+            let started = std::time::Instant::now();
+            let hits = self.run_variant(query, req.k).await.map_err(|e| {
+                // Name the arm: with several in flight, an unadorned
+                // status leaves the caller guessing which one failed.
+                Status::new(
+                    e.code(),
+                    format!("variant {:?}: {}", variant.label, e.message()),
+                )
+            })?;
+            results.push(VariantResult {
+                label: variant.label.clone(),
+                hits,
+                elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
+            });
+        }
+
+        let diffs: Vec<RankingDiff> = results[1..]
+            .iter()
+            .map(|v| diff_against(&results[0], v, req.k as usize, rbo_p))
+            .collect();
+
+        let interleaving = req.interleave.then(|| {
+            let a: Vec<u64> = results[0].hits.iter().map(|h| h.doc_id).collect();
+            let b: Vec<u64> = results[1].hits.iter().map(|h| h.doc_id).collect();
+            // A seed derived from the query text keeps a re-run of the
+            // same query byte-identical while still varying across
+            // queries, so determinism does not become a first-position
+            // bias for one arm.
+            let seed = if req.interleave_seed == 0 {
+                crate::interleave::seed_for(variant_text(&req.variants[0]))
+            } else {
+                req.interleave_seed
+            };
+            let merged = crate::interleave::team_draft(&a, &b, req.k as usize, seed);
+            Interleaving {
+                doc_ids: merged.ids,
+                teams: merged
+                    .team
+                    .into_iter()
+                    .map(|t| match t {
+                        crate::interleave::Team::A => InterleaveTeam::A as i32,
+                        crate::interleave::Team::B => InterleaveTeam::B as i32,
+                    })
+                    .collect(),
+                seed,
+            }
+        });
+
+        Ok(Response::new(VariantSearchResponse {
+            request_id,
+            results,
+            diffs,
+            interleaving,
+        }))
+    }
+}
+
+/// The query text of an arm, whatever kind it is — the stable thing to
+/// seed an interleaving from.
+fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
+    match &variant.query {
+        Some(search_variant::Query::Bm25(r)) => &r.text,
+        Some(search_variant::Query::Hybrid(r)) => &r.text,
+        None => "",
     }
 }

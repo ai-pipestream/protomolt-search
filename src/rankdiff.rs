@@ -190,8 +190,9 @@ pub fn score_regret(reference: &[(u64, f32)], variant: &[u64], k: usize) -> Scor
 /// The result of [`score_regret`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoreRegret {
-    /// Mean score given up per compared rank. Negative means the variant
-    /// surfaced documents the reference scored higher.
+    /// Mean score given up per compared rank, >= 0 for a reference in
+    /// descending score order. A negative value means the reference was
+    /// not sorted, which is a caller error rather than a finding.
     pub mean: f64,
     /// Ranks where both sides had a reference score.
     pub counted: usize,

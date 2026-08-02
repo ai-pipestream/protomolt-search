@@ -501,3 +501,57 @@ async fn shard_legs_bm25_params_reach_scoring() {
     node.abort();
     mock.abort();
 }
+
+/// An unknown field must be refused, and a partially-known one must not.
+///
+/// Shards skip a leg naming a field they lack, which is right for a
+/// heterogeneous fleet and catastrophic for a typo: the fused score of
+/// the REMAINING fields comes back as if it answered the question asked.
+/// The distinction the engine can actually make is fleet-wide — no shard
+/// has it (a typo) versus some shard has it (a real rollout) — so that is
+/// where the refusal lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_field_no_shard_indexes_is_refused_not_silently_skipped() {
+    let (analysis, mock) = start_mock_analysis().await;
+
+    // Shard 0 has case_name; shard 1 is body-only. Together they are the
+    // mid-rollout fleet the skip exists for.
+    let (a, node_a) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    add_documents(&a, CORPUS[0]).await;
+    let (b, node_b) = start_empty_node(NodeConfig {
+        slot_offset: OFFSETS[1],
+        analysis_addr: Some(analysis.clone()),
+        bm25_fields: vec!["body".to_string()],
+        ..Default::default()
+    })
+    .await;
+    add_documents(&b, &CORPUS[1].iter().map(|(t, _)| (*t, None)).collect::<Vec<_>>()).await;
+
+    let coord = CoordinatorServiceImpl::new(vec![a, b])
+        .with_bm25(Some(analysis.clone()), Default::default());
+
+    // Partially known: shard 0 answers, shard 1 skips, query succeeds.
+    let partial = coord
+        .fanout_bm25_fused("smith rust", 5, &query_fields(2.0), 0.0)
+        .await
+        .expect("a field some shard indexes is a real query");
+    assert!(!partial.is_empty());
+
+    // Known nowhere: refused, and the message says what to check.
+    let mut typo = query_fields(2.0);
+    typo[1].field = "case_nmae".to_string();
+    let err = coord
+        .fanout_bm25_fused("smith rust", 5, &typo, 0.0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("case_nmae") && err.message().contains("no shard indexes"),
+        "the refusal must name the field: {}",
+        err.message()
+    );
+
+    node_a.abort();
+    node_b.abort();
+    mock.abort();
+}

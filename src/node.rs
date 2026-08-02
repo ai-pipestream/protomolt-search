@@ -1329,8 +1329,11 @@ impl NodeServiceImpl {
     /// missing or `--block-max=false`; results identical), and the
     /// floor applies to the FUSED score. A leg naming a field this
     /// shard lacks is skipped: its documents hold no postings there, so
-    /// every fused score is unchanged — the graceful path for a fleet
-    /// mid-migration.
+    /// every fused score is unchanged — the graceful path for a
+    /// heterogeneous fleet. That is safe only because the coordinator
+    /// refuses a field NO shard knows (see `fanout_bm25_fused` and
+    /// `FieldStats.known`); skipping alone would turn a misspelled field
+    /// into a silently different ranking.
     fn bm25_query_fused(&self, req: &Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
         for leg in &req.fields {
             if leg.terms.len() != leg.global_doc_frequencies.len() {
@@ -2697,11 +2700,13 @@ impl NodeService for NodeServiceImpl {
                             crate::pb::FieldStats {
                                 total_doc_length: view.total_doc_length(),
                                 doc_frequencies: ft.terms.iter().map(|t| view.df(t)).collect(),
+                                known: true,
                             }
                         }
                         None => crate::pb::FieldStats {
                             total_doc_length: 0,
                             doc_frequencies: vec![0; ft.terms.len()],
+                            known: false,
                         },
                     })
                     .collect();
@@ -2716,11 +2721,14 @@ impl NodeService for NodeServiceImpl {
                 0,
                 0,
                 req.terms.iter().map(|_| 0).collect(),
+                // No postings at all: this shard knows no field, which is
+                // a different statement from "the field does not exist".
                 req.fields
                     .iter()
                     .map(|ft| crate::pb::FieldStats {
                         total_doc_length: 0,
                         doc_frequencies: vec![0; ft.terms.len()],
+                        known: false,
                     })
                     .collect(),
             ),

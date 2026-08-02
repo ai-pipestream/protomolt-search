@@ -170,6 +170,23 @@ FIELDS=body,body_norm,case_name BODY_COLUMNS=body_norm:1:2:3 \
 chain before the stemmer. Query one field, then the other, over the same
 documents.
 
+Then ask the engine for the comparison rather than assembling it
+yourself. `SearchService.VariantSearch` takes N labelled arms, each a
+complete ordinary request, runs them one after another over the same
+corpus, and returns each ranking plus the diffs against the first arm:
+overlap, Kendall tau-b over the union, truncated RBO, and score regret in
+the reference's own units. Read tau and regret together — a big tau
+change at zero regret is the near-duplicate shuffle, while real regret
+means the arm reached for worse documents. Set `interleave` with exactly
+two arms to also get a team-draft merge of the two, ready to serve, with
+per-position attribution so a selection credits one arm.
+
+This is only worth serving from the engine because search here is
+bitwise deterministic and layout-invariant: two arms of one query differ
+only by the arm, so a single query is already an observation rather than
+a sample. Where recall varies run to run, the same diff would mostly be
+measuring the index's own noise.
+
 The catch is honest: a body column is most of the postings, so each one
 roughly adds the whole `.bm25` again. Run this on a slice (`SHARDS=2`
 over a 1M-chunk corpus is minutes of ingest), then let the winner ride

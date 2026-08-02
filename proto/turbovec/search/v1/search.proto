@@ -253,6 +253,26 @@ service SearchService {
   // health. Never fails on an unreachable node — that is a reported
   // outcome, not an error.
   rpc ClusterHealth(ClusterHealthRequest) returns (ClusterHealthResponse);
+
+  // Runs two or more query configurations over the SAME corpus in one
+  // request and reports how far apart their rankings are: the A/B
+  // primitive, served by the engine rather than reassembled by every
+  // client.
+  //
+  // The engine is the right place for this because the comparison is
+  // only meaningful if the runs are otherwise identical. Search is
+  // bitwise deterministic and layout-invariant here (tests/score_layout),
+  // so two variants of one query differ ONLY by the variant — there is no
+  // recall noise to average out, and a one-query diff is already a real
+  // observation rather than a sample. An approximate engine cannot make
+  // that claim, which is why A/B there means traffic splitting and weeks
+  // of accumulation.
+  //
+  // Each variant is a COMPLETE ordinary request (Bm25Search or
+  // HybridSearch) and runs the ordinary code path, so the thing measured
+  // is the thing served. A variant-only scoring path would eventually
+  // drift from production and the A/B would then be measuring the drift.
+  rpc VariantSearch(VariantSearchRequest) returns (VariantSearchResponse);
 }
 
 message HealthRequest {}
@@ -780,6 +800,17 @@ message FieldStats {
   // Document frequency per requested term, parallel to the request
   // entry's `terms`.
   repeated uint32 doc_frequencies = 2;
+  // Whether this shard's field table contains the named field at all.
+  //
+  // The zeros above cannot answer that on their own: an empty shard, a
+  // shard whose documents simply never filled the field, and a shard
+  // that has never heard of the field are indistinguishable in them.
+  // The difference matters because one of those is a typo in the query,
+  // and scoring a misspelled field as "contributes nothing" returns a
+  // confidently wrong ranking instead of an error. The coordinator
+  // refuses a field NO shard knows, and tolerates one that only some
+  // know (a genuinely heterogeneous fleet).
+  bool known = 3;
 }
 
 // This shard's share of the global BM25 corpus stats.
@@ -1483,4 +1514,169 @@ message CascadeHit {
   // base_weight * bm25_score + boost_weight * boost_score, and `rank`
   // reflects the final order).
   float boost_score = 6;
+}
+
+// One labelled query configuration to evaluate.
+//
+// A variant carries a whole request rather than a set of overrides so
+// that anything the engine can be asked is something the engine can A/B,
+// including comparisons across kinds: BM25-only against hybrid answers
+// "is the vector leg earning its latency", which an overrides-shaped
+// message could not express.
+message SearchVariant {
+  // Caller's name for this configuration ("control", "normalized-stems").
+  // Echoed on every result and diff; must be non-empty and unique within
+  // the request, because the diffs are unreadable if two arms share a
+  // name.
+  string label = 1;
+  // The query to run. Its own `k` and `request_id` are ignored: depth is
+  // shared across the request so the rankings are comparable, and the
+  // request id is assigned once for the whole comparison.
+  oneof query {
+    Bm25SearchRequest bm25 = 2;
+    HybridSearchRequest hybrid = 3;
+  }
+}
+
+// Evaluate several query configurations over one corpus.
+message VariantSearchRequest {
+  // Optional caller id; assigned when empty and echoed back.
+  string request_id = 1;
+  // The configurations to compare, in order. At least two. The FIRST is
+  // the reference for every diff (conventionally the incumbent), which is
+  // what makes score_regret's asymmetry well defined.
+  repeated SearchVariant variants = 2;
+  // Depth for every variant and for the diffs. Applied to all arms, since
+  // rankings truncated at different depths are not comparable.
+  uint32 k = 3;
+  // RBO persistence: the probability a reader continues to the next rank,
+  // so 0.9 weights roughly the first ten results. 0 selects 0.9.
+  float rbo_p = 4;
+  // When true, also return the two variants' results merged by team-draft
+  // interleaving, ready to serve to a user whose selection then credits
+  // one arm. Requires EXACTLY two variants: team draft is a two-way
+  // method, and an "interleaving" of three arms would be a different
+  // algorithm wearing the same name.
+  bool interleave = 5;
+  // Seed for the interleaving's tie-breaking coin. 0 derives a stable
+  // seed from the first variant's query text, which keeps a re-run of the
+  // same query reproducible while still varying across queries. Set it
+  // explicitly only to replay a specific past interleaving.
+  uint64 interleave_seed = 6;
+}
+
+// One variant's ranking.
+message VariantResult {
+  // The variant's label, echoed.
+  string label = 1;
+  // The top-k, best first. Ids and scores only: this message exists to be
+  // compared, and per-term occurrences would multiply the response by the
+  // number of arms. Re-issue the winning variant as an ordinary request
+  // for the full hit detail.
+  repeated RankedHit hits = 2;
+  // Wall time of this variant's fan-out, measured at the coordinator.
+  // Variants run one after another, not concurrently, so this is the
+  // configuration's own cost rather than its share of a contended fleet.
+  float elapsed_ms = 3;
+}
+
+// A ranked result reduced to what a comparison needs.
+message RankedHit {
+  // Global doc id.
+  uint64 doc_id = 1;
+  // The variant's own score for it: fused score for a hybrid variant, the
+  // (possibly multi-field) BM25 score for a BM25 variant. Comparable
+  // WITHIN a variant, and across variants only when they score the same
+  // way — which is why the diffs below lean on rank, and why score_regret
+  // reads its scores from the reference alone.
+  float score = 2;
+}
+
+// How far one variant's ranking sits from the reference's.
+//
+// These measure disagreement, not quality. Nothing here says which arm is
+// better; that needs labels, or the interleaving's selections.
+message RankingDiff {
+  // Label of the reference arm (the request's first variant).
+  string reference = 1;
+  // Label of the arm being compared to it.
+  string variant = 2;
+  // Ranks compared: min(k, both list lengths).
+  uint32 depth = 3;
+  // Documents present in both top-`depth` sets.
+  uint32 overlap = 4;
+  // `overlap` as a fraction of `depth`; 1.0 means the same set in any
+  // order.
+  float overlap_fraction = 5;
+  // Kendall tau-b over the UNION of both rankings: +1 identical order, -1
+  // reversed, 0 no association. Documents one arm omitted are ranked past
+  // the end of its list rather than dropped, so omission counts as the
+  // disagreement it is.
+  float kendall_tau = 6;
+  // Truncated rank-biased overlap at the request's `rbo_p`: like overlap
+  // but top-weighted, so a swap at rank 1 costs far more than one at rank
+  // 50. Truncated means it assumes nothing about the unseen tail and is
+  // therefore a LOWER bound.
+  float rbo = 7;
+  // Mean reference score given up per compared rank: at each rank, the
+  // reference's score there minus the reference's score of whatever this
+  // variant put there. Both sides are measured by the reference's
+  // yardstick, so only the selection differs.
+  //
+  // This measures the SET and not the order — any reordering of the same
+  // documents cancels to exactly 0. Read it WITH kendall_tau: a large tau
+  // change at zero regret is the near-duplicate shuffle signature, while
+  // real regret means the variant reached for worse documents.
+  float score_regret = 8;
+  // Ranks where both the reference and the variant's document had a
+  // reference score, so the regret term above is a mean over these.
+  uint32 regret_counted = 9;
+  // Variant documents the reference never scored. Not averaged in: they
+  // may be better or worse and this measure cannot tell, so they are
+  // reported instead of being silently absorbed into the mean. A high
+  // count means the arms have diverged past what regret can judge.
+  uint32 regret_unscored = 10;
+  // Whether the two arms disagree about the single best result — the
+  // difference a user is most likely to notice, and easily invisible in
+  // an aggregate.
+  bool top1_flipped = 11;
+}
+
+// Which arm contributed an interleaved result.
+enum InterleaveTeam {
+  // Unused zero value.
+  INTERLEAVE_TEAM_UNSPECIFIED = 0;
+  // The request's first variant.
+  INTERLEAVE_TEAM_A = 1;
+  // The request's second variant.
+  INTERLEAVE_TEAM_B = 2;
+}
+
+// Two variants merged into the one list a user sees.
+//
+// Team-draft interleaving alternates which arm contributes the next
+// result, so both get equal exposure within a single query and a
+// selection is evidence about the ranking rather than about the position.
+// A document both arms returned is contributed once and credits neither
+// beyond that: results the arms agree on carry no information, and
+// counting them would drown the disagreements that discriminate.
+message Interleaving {
+  // The merged list, in display order.
+  repeated uint64 doc_ids = 1;
+  // Contributing arm per position; parallel to `doc_ids`.
+  repeated InterleaveTeam teams = 2;
+  // The seed actually used, so the exact merge can be replayed.
+  uint64 seed = 3;
+}
+
+// The comparison.
+message VariantSearchResponse {
+  // Echoes the request id (or the assigned one).
+  string request_id = 1;
+  // One entry per variant, in request order.
+  repeated VariantResult results = 2;
+  // Every variant after the first, diffed against the first.
+  repeated RankingDiff diffs = 3;
+  // Present only when the request asked to interleave.
+  Interleaving interleaving = 4;
 }
