@@ -129,6 +129,19 @@ pub struct Config {
     /// (v5 files). `false` forces the exhaustive scorer — the A/B
     /// baseline; results are identical either way.
     pub block_max: bool,
+    /// Serve a shard whose BM25 bulk build was interrupted: a
+    /// `.bm25.build` spill directory with no `.bm25` beside it.
+    ///
+    /// Off by default. `Flush` removes the spill directory on success,
+    /// so that pair cannot occur on a shard that finished, and serving it
+    /// is the bad kind of quiet: the node comes up healthy, answers
+    /// vector queries normally, and contributes NOTHING to every lexical
+    /// query, so a fleet ranks against a corpus short one shard's share
+    /// with nothing anywhere saying so.
+    ///
+    /// A shard with neither file is NOT affected — that is what a
+    /// vector-only deployment looks like, and it is a real one.
+    pub allow_missing_bm25: bool,
     /// Coalesce concurrent vector scans into batched kernel calls (up to
     /// four queries per pass over the packed codes). `false` runs one
     /// scan per RPC — the A/B baseline; results are identical either way.
@@ -196,6 +209,7 @@ struct FileConfig {
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
     block_max: Option<bool>,
+    allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
     floor_delta: Option<f32>,
@@ -499,6 +513,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         Some(s) => parse_env_bool(&s),
         None => file.block_max.unwrap_or(true),
     };
+    let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
+        || match opt(args, "allow-missing-bm25", "TURBOVEC_ALLOW_MISSING_BM25", None) {
+            Some(s) => parse_env_bool(&s),
+            None => file.allow_missing_bm25.unwrap_or(false),
+        };
     let coalesce = match opt(args, "coalesce", "TURBOVEC_COALESCE", None) {
         Some(s) => parse_env_bool(&s),
         None => file.coalesce.unwrap_or(true),
@@ -689,6 +708,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         chunk_blocks,
         share_floors,
         block_max,
+        allow_missing_bm25,
         coalesce,
         scan_parallel,
         floor_delta,
@@ -715,6 +735,31 @@ mod tests {
 
     fn args(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allow_missing_bm25_is_off_unless_asked_for() {
+        // The default has to be the strict one: a shard silently serving
+        // no postings is the failure this exists to catch, and a default
+        // of "permit" would mean the check never fires where it matters.
+        let base = [
+            "--role=node",
+            "--demo-vectors=10",
+            "--node-listen=127.0.0.1:9001",
+        ];
+        assert!(!parse(&args(&base)).unwrap().allow_missing_bm25);
+        let mut bare = base.to_vec();
+        bare.push("--allow-missing-bm25");
+        assert!(
+            parse(&args(&bare)).unwrap().allow_missing_bm25,
+            "the bare flag must work; an operator will not write =true"
+        );
+        let mut valued = base.to_vec();
+        valued.push("--allow-missing-bm25=true");
+        assert!(parse(&args(&valued)).unwrap().allow_missing_bm25);
+        let mut off = base.to_vec();
+        off.push("--allow-missing-bm25=false");
+        assert!(!parse(&args(&off)).unwrap().allow_missing_bm25);
     }
 
     #[test]

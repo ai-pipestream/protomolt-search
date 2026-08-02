@@ -256,6 +256,18 @@ pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Where a bulk BM25 build spills while it runs: `<bm25 path>.build`.
+///
+/// A successful `Flush` removes it, so finding one beside a MISSING
+/// `.bm25` is unambiguous evidence of an interrupted build — as opposed
+/// to a shard that simply has no postings, which is what a vector-only
+/// deployment legitimately looks like.
+pub fn bm25_build_dir(bm25_path: &std::path::Path) -> PathBuf {
+    let mut p = bm25_path.as_os_str().to_owned();
+    p.push(".build");
+    PathBuf::from(p)
+}
+
 /// Snapshot generation layout, next to the shard's configured index path:
 /// `<index path>.snap/` is the active generation holding the installed
 /// image as `index.tv` + `index.tv.bm25`. Because BOTH files live inside
@@ -775,10 +787,7 @@ impl NodeServiceImpl {
         let names: Vec<&str> = self.config.bm25_fields.iter().map(String::as_str).collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
-                let bm25_path = storage_paths(p, generation).1;
-                let mut dir = bm25_path.as_os_str().to_owned();
-                dir.push(".build");
-                let dir = PathBuf::from(dir);
+                let dir = bm25_build_dir(&storage_paths(p, generation).1);
                 SpillBuilder::create_with_fields(&dir, &names)
                     .map(Bm25Shard::Spilling)
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))

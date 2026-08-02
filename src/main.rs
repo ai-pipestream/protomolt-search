@@ -140,7 +140,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             let listener = TcpListener::bind(shard.listen).await?;
             let addr: SocketAddr = listener.local_addr()?;
-            let bm25_store = shard.index_path.as_ref().and_then(|p| {
+            let mut bm25_store = None;
+            if let Some(p) = shard.index_path.as_ref() {
                 let bm25_path = match &generation {
                     Some(dir) => turbovec_search::node::generation_bm25(dir),
                     None => turbovec_search::node::bm25_sidecar_path(p),
@@ -151,14 +152,40 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                         shard.listen,
                         bm25_path.display()
                     );
-                    Some(
+                    bm25_store = Some(
                         turbovec_search::node::Bm25Shard::open(&bm25_path)
                             .unwrap_or_else(|e| panic!("load {}: {e}", bm25_path.display())),
+                    );
+                } else if turbovec_search::node::bm25_build_dir(&bm25_path).exists()
+                    && !cfg.allow_missing_bm25
+                {
+                    // A spill directory with no .bm25 beside it means a
+                    // bulk build was interrupted: Flush removes the
+                    // directory on success, so this state cannot be
+                    // reached by a shard that finished. Serving it anyway
+                    // is the bad kind of quiet -- the node reports
+                    // healthy, answers vector queries normally, and
+                    // contributes nothing to every lexical query, so the
+                    // fleet ranks against a corpus short one shard's
+                    // share with nothing anywhere saying so.
+                    //
+                    // A shard with no build directory and no .bm25 is NOT
+                    // refused: that is exactly what a vector-only
+                    // deployment looks like, and it is a real one.
+                    return Err(format!(
+                        "shard @{}: BM25 build directory {} exists but {} does not. \
+                         A bulk build was interrupted; this shard would answer lexical \
+                         queries with silence, which is indistinguishable from a corpus \
+                         that genuinely lacks those terms. Re-run the ingest for this \
+                         shard, or pass --allow-missing-bm25 to serve it vector-only \
+                         on purpose.",
+                        shard.listen,
+                        turbovec_search::node::bm25_build_dir(&bm25_path).display(),
+                        bm25_path.display()
                     )
-                } else {
-                    None
+                    .into());
                 }
-            });
+            }
             let node = NodeServiceImpl::new(
                 index,
                 NodeConfig {
