@@ -113,6 +113,62 @@ pub fn analyzer_by_name(name: &str) -> Result<Option<AnalysisSpec>, String> {
 /// Every name [`analyzer_by_name`] accepts.
 pub const ANALYZER_NAMES: &[&str] = &["ingest", "folded", "cased", "server"];
 
+/// Stable 64-bit identity of an [`AnalysisSpec`]: the term-identity
+/// contract reduced to one number a shard can persist and a query can be
+/// checked against.
+///
+/// Field name equality is NOT this check. A column named `body_norm`
+/// built under one analyzer and queried under another matches on name,
+/// scores different terms, and returns a confident wrong ranking with no
+/// error anywhere. That failure has cost this project twice, and the
+/// coming rebuild multiplies the surface by adding a second body column
+/// whose whole purpose is to differ from the first.
+///
+/// Hand-rolled FNV-1a for the same reason [`crate::reshard::fnv1a64`] is:
+/// this value is written into a FILE FORMAT, so it must never change.
+/// `DefaultHasher` is explicitly not stable across Rust releases and
+/// would silently invalidate every shard on a toolchain bump.
+///
+/// `None` is 0, meaning UNKNOWN rather than "the default analyzer": an
+/// absent spec is resolved against the sidecar's own defaults, which
+/// this side cannot see and must not guess at. 0 never enforces, so a
+/// shard written before fingerprints existed keeps answering.
+pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
+    fn eat(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let Some(spec) = spec else { return 0 };
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    // Domain tag. If AnalysisSpec ever grows a field, bumping this
+    // invalidates old fingerprints LOUDLY (every shard mismatches and
+    // says so) instead of letting two different specs share a number.
+    eat(&mut hash, b"turbovec.analysis.v1");
+    for value in [
+        spec.tokenizer,
+        spec.stemmer,
+        spec.term_vector_mode,
+        spec.term_vector_source,
+    ] {
+        eat(&mut hash, &value.to_le_bytes());
+    }
+    // Char filter ORDER is semantic (it is a chain applied in sequence),
+    // so it is hashed in order and never sorted. The count goes in
+    // first so [1, 2] and [12] cannot collide.
+    eat(&mut hash, &(spec.char_filters.len() as u32).to_le_bytes());
+    for filter in &spec.char_filters {
+        eat(&mut hash, &filter.to_le_bytes());
+    }
+    // 0 is reserved for "unknown"; a real spec must never claim it.
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
 /// `AnalysisOptions.Tokenizer.TOKENIZER_WHITESPACE`.
 pub const TOKENIZER_WHITESPACE: i32 = 1;
 /// `AnalysisOptions.Stemmer.STEMMER_NONE`.
@@ -657,5 +713,101 @@ mod tests {
         for name in ANALYZER_NAMES {
             assert!(err.contains(name), "error should list {name}: {err}");
         }
+    }
+
+    /// The fingerprint must separate the two analyzers an A/B compares,
+    /// and must survive a round trip through the file format unchanged.
+    #[test]
+    fn the_fingerprint_separates_the_analyzers_it_exists_to_separate() {
+        let folded = analysis_fingerprint(Some(&body_spec()));
+        let cased = analysis_fingerprint(Some(&cased_body_spec()));
+        assert_ne!(folded, cased);
+        assert_ne!(folded, 0);
+        assert_ne!(cased, 0);
+        // Stable: same spec, same number, every call.
+        assert_eq!(folded, analysis_fingerprint(Some(&body_spec())));
+    }
+
+    /// An absent spec is UNKNOWN, not "the default analyzer". The
+    /// sidecar resolves an absent spec against its own defaults, which
+    /// this side cannot see, so claiming a number here would assert
+    /// something we do not know.
+    #[test]
+    fn an_absent_spec_is_unknown_not_a_default() {
+        assert_eq!(analysis_fingerprint(None), 0);
+    }
+
+    /// Char filter ORDER is semantic, and the count is hashed so a
+    /// two-filter chain cannot collide with a one-filter chain whose
+    /// value happens to concatenate.
+    #[test]
+    fn char_filter_order_and_arity_both_change_the_fingerprint() {
+        let base = body_spec();
+        let mut reordered = base.clone();
+        reordered.char_filters.reverse();
+        assert_ne!(
+            analysis_fingerprint(Some(&base)),
+            analysis_fingerprint(Some(&reordered)),
+            "a reordered filter chain is a different analyzer"
+        );
+        let mut dropped = base.clone();
+        dropped.char_filters.pop();
+        assert_ne!(
+            analysis_fingerprint(Some(&base)),
+            analysis_fingerprint(Some(&dropped))
+        );
+        let mut one = base.clone();
+        one.char_filters = vec![12];
+        let mut two = base.clone();
+        two.char_filters = vec![1, 2];
+        assert_ne!(
+            analysis_fingerprint(Some(&one)),
+            analysis_fingerprint(Some(&two)),
+            "[12] must not collide with [1, 2]"
+        );
+    }
+
+    /// Every scalar of the spec participates. A field that did not would
+    /// be a hole in the contract exactly where someone would eventually
+    /// vary it.
+    #[test]
+    fn every_field_of_the_spec_changes_the_fingerprint() {
+        let base = body_spec();
+        let fp = analysis_fingerprint(Some(&base));
+        for (name, mutate) in [
+            (
+                "tokenizer",
+                (|s: &mut AnalysisSpec| s.tokenizer += 1) as fn(&mut AnalysisSpec),
+            ),
+            ("stemmer", |s: &mut AnalysisSpec| s.stemmer += 1),
+            ("term_vector_mode", |s: &mut AnalysisSpec| {
+                s.term_vector_mode += 1
+            }),
+            ("term_vector_source", |s: &mut AnalysisSpec| {
+                s.term_vector_source += 1
+            }),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                fp,
+                analysis_fingerprint(Some(&changed)),
+                "changing {name} must change the fingerprint"
+            );
+        }
+    }
+
+    /// The value is written into a FILE FORMAT, so it is pinned to a
+    /// literal. A change here silently invalidates every shard on disk,
+    /// so it must be a deliberate edit to this test and not a drive-by
+    /// refactor of the hash.
+    #[test]
+    fn the_corpus_fingerprint_is_pinned() {
+        assert_eq!(
+            analysis_fingerprint(Some(&body_spec())),
+            0x38b3_6014_eb6d_63eb,
+            "the corpus analyzer fingerprint changed; every v7 shard on disk \
+             carries the old value and would now refuse every query"
+        );
     }
 }

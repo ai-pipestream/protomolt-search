@@ -79,6 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             weight: 1.0,
             k1: 1.2,
             b: 0.75,
+            // 0, and deliberately: --terms are typed in already
+            // analyzed, so this probe does not KNOW which analyzer
+            // produced them and must not claim one. Declaring a spec it
+            // did not use would refuse valid probes against a column
+            // built any other way.
+            analysis_fingerprint: 0,
         }],
     };
 

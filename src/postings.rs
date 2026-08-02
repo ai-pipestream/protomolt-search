@@ -285,6 +285,39 @@ impl Bm25Store {
         &self.fields[f].name
     }
 
+    /// Record field `f`'s analyzer fingerprint, or refuse if it
+    /// contradicts what the field already holds.
+    ///
+    /// A fingerprint is written once, by the first document that carries
+    /// one, and is immutable after. A LATER document analyzed differently
+    /// into the same column is exactly the drift this exists to catch:
+    /// the two halves of the column would hold different term identities
+    /// and every score over it would silently mix them. 0 means the
+    /// caller does not know its own spec, which neither sets nor checks.
+    pub fn set_analysis_fingerprint(&mut self, f: usize, fingerprint: u64) -> Result<(), String> {
+        if fingerprint == 0 {
+            return Ok(());
+        }
+        let field = &mut self.fields[f];
+        match field.analysis_fingerprint {
+            0 => {
+                field.analysis_fingerprint = fingerprint;
+                Ok(())
+            }
+            held if held == fingerprint => Ok(()),
+            held => Err(format!(
+                "field {:?} was built with analyzer fingerprint {held:#x} but this \
+                 document carries {fingerprint:#x}; one column holds one term identity",
+                field.name
+            )),
+        }
+    }
+
+    /// Field `f`'s analyzer fingerprint (0 = unknown).
+    pub fn analysis_fingerprint(&self, f: usize) -> u64 {
+        self.fields[f].analysis_fingerprint
+    }
+
     /// The index of the field named `name`, if the table has it.
     pub fn field_index(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|f| f.name == name)
@@ -1782,6 +1815,39 @@ impl SpillBuilder {
         &self.fields[f].name
     }
 
+    /// Record field `f`'s analyzer fingerprint, or refuse if it
+    /// contradicts what the field already holds.
+    ///
+    /// A fingerprint is written once, by the first document that carries
+    /// one, and is immutable after. A LATER document analyzed differently
+    /// into the same column is exactly the drift this exists to catch:
+    /// the two halves of the column would hold different term identities
+    /// and every score over it would silently mix them. 0 means the
+    /// caller does not know its own spec, which neither sets nor checks.
+    pub fn set_analysis_fingerprint(&mut self, f: usize, fingerprint: u64) -> Result<(), String> {
+        if fingerprint == 0 {
+            return Ok(());
+        }
+        let field = &mut self.fields[f];
+        match field.analysis_fingerprint {
+            0 => {
+                field.analysis_fingerprint = fingerprint;
+                Ok(())
+            }
+            held if held == fingerprint => Ok(()),
+            held => Err(format!(
+                "field {:?} was built with analyzer fingerprint {held:#x} but this \
+                 document carries {fingerprint:#x}; one column holds one term identity",
+                field.name
+            )),
+        }
+    }
+
+    /// Field `f`'s analyzer fingerprint (0 = unknown).
+    pub fn analysis_fingerprint(&self, f: usize) -> u64 {
+        self.fields[f].analysis_fingerprint
+    }
+
     /// Sum of all body document lengths (BM25 avgdl numerator).
     pub fn total_doc_length(&self) -> u64 {
         self.fields[0].total_length
@@ -2975,6 +3041,10 @@ fn u16_at(bytes: &[u8]) -> u16 {
 /// per field-table entry.
 struct FieldSlice {
     name: String,
+    /// Hash of the field's AnalysisSpec, read back from the v6 field
+    /// table. 0 for a shard written before fingerprints, which never
+    /// enforces.
+    analysis_fingerprint: u64,
     doc_lengths: Vec<u32>,
     total_length: u64,
     directory_off: u64,
@@ -3034,6 +3104,12 @@ impl Bm25Reader {
     /// The name of field `f`. Panics when out of range.
     pub fn field_name(&self, f: usize) -> &str {
         &self.fields[f].name
+    }
+
+    /// Field `f`'s analyzer fingerprint (0 = unknown, which never
+    /// enforces).
+    pub fn analysis_fingerprint(&self, f: usize) -> u64 {
+        self.fields[f].analysis_fingerprint
     }
 
     /// The index of the field named `name`, if the table has it.
@@ -3120,6 +3196,8 @@ impl Bm25Reader {
             map,
             fields: vec![FieldSlice {
                 name: "body".to_string(),
+                // v3/v4/v5 carry no field table, so no fingerprint.
+                analysis_fingerprint: 0,
                 doc_lengths,
                 total_length,
                 directory_off,
@@ -3158,6 +3236,7 @@ impl Bm25Reader {
             let name =
                 String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
             let base = cursor + 2 + name_len;
+            let analysis_fingerprint = u64_at(base);
             let total_length = u64_at(base + 8);
             let doc_lengths_off = u64_at(base + 16) as usize;
             let postings_off = u64_at(base + 24);
@@ -3169,6 +3248,7 @@ impl Bm25Reader {
             let n_terms = u32_at(directory_off as usize);
             fields.push(FieldSlice {
                 name,
+                analysis_fingerprint,
                 doc_lengths,
                 total_length,
                 directory_off,

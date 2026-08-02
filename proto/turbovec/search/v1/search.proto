@@ -893,6 +893,15 @@ message Bm25FieldLeg {
   float k1 = 6;
   // This field's BM25 b; 0 selects the default (0.75).
   float b = 7;
+  // Fingerprint of the analyzer that produced `terms`
+  // (turbovec_search::analyzer::analysis_fingerprint). The shard REFUSES
+  // the query when this disagrees with the analyzer its column was built
+  // under, because the two would score different term identities against
+  // one idf and report a confident wrong ranking rather than an error.
+  // 0 means the caller does not know its own analyzer and disables the
+  // check; a shard whose column predates fingerprints is 0 on its side
+  // and also does not enforce.
+  uint64 analysis_fingerprint = 8;
 }
 
 // A half-open span [start, end) in original-text coordinates.

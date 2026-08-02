@@ -213,6 +213,27 @@ impl Bm25Shard {
         }
     }
 
+    /// Field `f`'s analyzer fingerprint in the active table (0 =
+    /// unknown, which never enforces).
+    fn analysis_fingerprint(&self, f: usize) -> u64 {
+        match self {
+            Bm25Shard::Building(s) => s.analysis_fingerprint(f),
+            Bm25Shard::Spilling(s) => s.analysis_fingerprint(f),
+            Bm25Shard::Resident(r) => r.analysis_fingerprint(f),
+        }
+    }
+
+    /// Record field `f`'s analyzer fingerprint, refusing a contradiction.
+    /// A disk-resident shard is not being written to, so it has nothing
+    /// to record.
+    fn set_analysis_fingerprint(&mut self, f: usize, fingerprint: u64) -> Result<(), String> {
+        match self {
+            Bm25Shard::Building(s) => s.set_analysis_fingerprint(f, fingerprint),
+            Bm25Shard::Spilling(s) => s.set_analysis_fingerprint(f, fingerprint),
+            Bm25Shard::Resident(_) => Ok(()),
+        }
+    }
+
     /// The table index of the field named `name`, if present. `None`
     /// while bulk-building (no searchable surface to resolve against).
     fn field_index(&self, name: &str) -> Option<usize> {
@@ -1396,6 +1417,23 @@ impl NodeServiceImpl {
                 let mut leg_of_view: Vec<usize> = Vec::new();
                 for (li, leg) in req.fields.iter().enumerate() {
                     if let Some(fi) = store.field_index(&leg.field) {
+                        // Term identity is a contract, and the field
+                        // name does not carry it. A column built folded
+                        // and queried cased matches on name, scores
+                        // different terms, and returns a ranking that
+                        // looks perfectly reasonable. Refuse instead.
+                        let held = store.analysis_fingerprint(fi);
+                        if held != 0
+                            && leg.analysis_fingerprint != 0
+                            && held != leg.analysis_fingerprint
+                        {
+                            return Err(Status::failed_precondition(format!(
+                                "field {:?} was built with analyzer fingerprint {held:#x} but the \
+                                 query's terms were analyzed under {:#x}; the two score different \
+                                 term identities",
+                                leg.field, leg.analysis_fingerprint
+                            )));
+                        }
                         views.push(store.field_view(fi).expect("searchable, checked above"));
                         leg_of_view.push(li);
                     }
@@ -2034,6 +2072,33 @@ impl NodeServiceImpl {
                         want.unwrap_or("<missing>")
                     )));
                 }
+            }
+        }
+        // Record which analyzer produced each column, and refuse a
+        // document that contradicts one already recorded. Field NAME
+        // agreement (just above) does not catch this: two documents can
+        // agree on the name `body_norm` and disagree on what a term IS,
+        // and nothing downstream would notice. Half a column folded and
+        // half not scores both halves against one idf.
+        {
+            let shard = guard.bm25.as_mut().expect("builder just ensured");
+            let body = crate::analyzer::analysis_fingerprint(doc.analysis.as_ref());
+            shard
+                .set_analysis_fingerprint(0, body)
+                .map_err(Status::failed_precondition)?;
+            for field in &doc.fields {
+                let Some(fi) = self
+                    .config
+                    .bm25_fields
+                    .iter()
+                    .position(|n| *n == field.field)
+                else {
+                    continue; // already refused upstream
+                };
+                let fingerprint = crate::analyzer::analysis_fingerprint(field.analysis.as_ref());
+                shard
+                    .set_analysis_fingerprint(fi, fingerprint)
+                    .map_err(Status::failed_precondition)?;
             }
         }
         let global_id = self.config.slot_offset + u64::from(doc_id);

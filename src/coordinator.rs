@@ -453,6 +453,12 @@ impl CoordinatorServiceImpl {
                 } else {
                     f.b
                 },
+                // Declare which analyzer produced these terms so the
+                // shard can refuse a column built under a different one.
+                // The terms were analyzed under f.analysis just above,
+                // so this is the fingerprint OF THE SPEC ACTUALLY USED,
+                // not of what the caller meant.
+                analysis_fingerprint: crate::analyzer::analysis_fingerprint(f.analysis.as_ref()),
             })
             .collect();
         if trace {

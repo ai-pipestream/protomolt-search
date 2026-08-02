@@ -804,3 +804,97 @@ async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
     node.abort();
     mock.abort();
 }
+
+/// A column built under one analyzer and queried under another is
+/// REFUSED, not silently scored.
+///
+/// This is the guard that did not exist when the v7 corpus was built
+/// under SOURCE_STEMS. Field NAME agreement was the only check, and a
+/// name matches whatever the terms underneath it mean, so the mismatch
+/// produced a confident wrong ranking with no error anywhere. The
+/// rebuild adds a second body column whose entire purpose is to be
+/// analyzed differently from the first, which turns a latent hazard into
+/// a live one: the two columns will differ by exactly the thing the name
+/// does not carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
+    use turbovec_search::analyzer::{analysis_fingerprint, body_spec, cased_body_spec};
+    use turbovec_search::pb::{Bm25FieldLeg, Bm25QueryRequest};
+
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+
+    // Ingest the body under the FOLDED analyzer, which is what the
+    // shard then records for field 0.
+    let folded = body_spec();
+    let (tx, rx) = mpsc::channel(8);
+    for (body, name) in CORPUS[0] {
+        let mut doc = doc_request(body, *name);
+        doc.analysis = Some(folded.clone());
+        tx.send(doc).await.unwrap();
+    }
+    drop(tx);
+    let added = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(added.added, 3);
+
+    let leg = |fingerprint: u64| Bm25QueryRequest {
+        terms: Vec::new(),
+        k: 5,
+        global_doc_count: 3,
+        global_total_doc_length: 12,
+        global_doc_frequencies: Vec::new(),
+        k1: 0.0,
+        b: 0.0,
+        min_score: 0.0,
+        fields: vec![Bm25FieldLeg {
+            field: "body".to_string(),
+            terms: vec!["rust".to_string()],
+            global_total_doc_length: 12,
+            global_doc_frequencies: vec![3],
+            weight: 1.0,
+            k1: 1.2,
+            b: 0.75,
+            analysis_fingerprint: fingerprint,
+        }],
+    };
+
+    // The analyzer it was built with: answered.
+    let ok = client
+        .bm25_query(leg(analysis_fingerprint(Some(&folded))))
+        .await
+        .expect("the ingest analyzer must be accepted")
+        .into_inner();
+    assert!(!ok.hits.is_empty(), "matching analyzer should return hits");
+
+    // The OTHER analyzer of the A/B: refused, and the error names both
+    // fingerprints so the mismatch is diagnosable rather than merely
+    // reported.
+    let err = client
+        .bm25_query(leg(analysis_fingerprint(Some(&cased_body_spec()))))
+        .await
+        .expect_err("a mismatched analyzer must be refused, not scored");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(
+        err.message().contains("term identities"),
+        "error should explain WHY: {}",
+        err.message()
+    );
+
+    // 0 means "I do not know my own analyzer", which disables the check
+    // rather than failing closed: probes and tools that hand-type terms
+    // must keep working, and a shard predating fingerprints reads 0 too.
+    let unknown = client
+        .bm25_query(leg(0))
+        .await
+        .expect("an undeclared analyzer must not be refused")
+        .into_inner();
+    assert!(!unknown.hits.is_empty());
+
+    node.abort();
+    mock.abort();
+}
