@@ -656,7 +656,9 @@ message SearchRequest {
   // Optional caller id for log correlation; the coordinator assigns one
   // when empty and echoes it back.
   string request_id = 1;
-  // Number of global top hits to return.
+  // Number of global top hits to return. Optional: 0 (proto3 unset)
+  // selects the coordinator's configured `max_k` (default 10000, its
+  // stop bound); a value above `max_k` is refused, never clamped.
   uint32 k = 2;
   // The query vector. Length must equal the shard dimension.
   repeated float vector = 3;
@@ -976,7 +978,8 @@ message GetDocumentsResponse {
 message Bm25SearchRequest {
   // Query text, analyzed with `analysis` before scoring.
   string text = 1;
-  // Number of global top hits to return.
+  // Number of global top hits to return. Optional: 0 selects the
+  // coordinator's `max_k`; above it is refused (see SearchRequest.k).
   uint32 k = 2;
   // Analysis options for the query. MUST match the options documents were
   // ingested with (term identity source above all).
@@ -1297,7 +1300,8 @@ message HybridSearchRequest {
   string text = 2;
   // Vector leg query.
   repeated float vector = 3;
-  // Number of global fused hits to return.
+  // Number of global fused hits to return. Optional: 0 selects the
+  // coordinator's `max_k`; above it is refused (see SearchRequest.k).
   uint32 k = 4;
   // Analysis options for the BM25 leg query.
   AnalysisSpec analysis = 5;
@@ -1569,7 +1573,9 @@ message VariantSearchRequest {
   // what makes score_regret's asymmetry well defined.
   repeated SearchVariant variants = 2;
   // Depth for every variant and for the diffs. Applied to all arms, since
-  // rankings truncated at different depths are not comparable.
+  // rankings truncated at different depths are not comparable. Optional:
+  // 0 selects the coordinator's `max_k`; above it is refused (see
+  // SearchRequest.k). An arm's own `k` is always overridden by this one.
   uint32 k = 3;
   // RBO persistence: the probability a reader continues to the next rank,
   // so 0.9 weights roughly the first ten results. 0 selects 0.9.

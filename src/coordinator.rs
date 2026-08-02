@@ -37,6 +37,11 @@ use crate::rankdiff;
 /// Process-unique request id counter for coordinator-assigned ids.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Default hard cap on any client-facing `k` (`--max-k` overrides).
+/// Bounds the coordinator's heap and keeps the shared floor rising: an
+/// unbounded k would hold the floor at -inf and stream every shard dry.
+pub const DEFAULT_MAX_K: u32 = 10_000;
+
 /// Per-shard timing controls for the fan-out (all off by default).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FanoutLimits {
@@ -73,6 +78,10 @@ pub struct CoordinatorServiceImpl {
     /// Serve `SearchService.Search` over the streaming protocol
     /// (`fanout_stream_search`) instead of the per-shard top-k fan-out.
     stream_search: bool,
+    /// Hard upper bound on any client-facing `k`. A request above it is
+    /// refused (never clamped), and a request that omits `k` (proto3 0)
+    /// runs at exactly this depth — the coordinator's stop bound.
+    max_k: u32,
     /// One reusable channel per address, created on first use.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
     /// Lazily bound UDP socket for the floor fast lane (`None` when the
@@ -108,6 +117,7 @@ impl CoordinatorServiceImpl {
             bm25_params: Bm25Params::default(),
             limits: FanoutLimits::default(),
             stream_search: false,
+            max_k: DEFAULT_MAX_K,
             channels: Arc::new(Mutex::new(HashMap::new())),
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -162,6 +172,32 @@ impl CoordinatorServiceImpl {
     pub fn with_stream_search(mut self, on: bool) -> Self {
         self.stream_search = on;
         self
+    }
+
+    /// Set the hard cap on client-facing `k` (also the depth a request
+    /// omitting `k` runs at). Zero is rejected at config parse time, so
+    /// this takes the already-validated value.
+    pub fn with_max_k(mut self, max_k: u32) -> Self {
+        self.max_k = max_k;
+        self
+    }
+
+    /// Resolve a request's `k` against the configured cap. Proto3 makes
+    /// an omitted field 0, so 0 selects `max_k` (the documented sentinel
+    /// idiom here, like `rbo_p`); anything above the cap is refused with
+    /// both numbers named rather than silently clamped.
+    fn resolve_k(&self, requested: u32) -> Result<u32, Status> {
+        if requested == 0 {
+            return Ok(self.max_k);
+        }
+        if requested > self.max_k {
+            return Err(Status::invalid_argument(format!(
+                "k={requested} exceeds this coordinator's max_k={}; \
+                 lower k or raise --max-k",
+                self.max_k
+            )));
+        }
+        Ok(requested)
     }
 
     /// Configure the BM25 path: analysis sidecar for query analysis and
@@ -2837,6 +2873,7 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
+        let k = self.resolve_k(req.k)?;
         if req.vector.is_empty() {
             return Err(Status::invalid_argument("empty query vector"));
         }
@@ -2863,7 +2900,7 @@ impl SearchService for CoordinatorServiceImpl {
             // only.
             if self.stream_search {
                 let doc = self
-                    .fanout_stream_search_collapse(&request_id, &req.vector, req.k)
+                    .fanout_stream_search_collapse(&request_id, &req.vector, k)
                     .await?;
                 return Ok(Response::new(SearchResponse {
                     request_id,
@@ -2872,11 +2909,11 @@ impl SearchService for CoordinatorServiceImpl {
                     chunk_floor: doc.chunk_floor,
                 }));
             }
-            self.fanout_search_collapse(&request_id, &req.vector, req.k)
+            self.fanout_search_collapse(&request_id, &req.vector, k)
                 .await?
         } else if self.stream_search {
             let streamed = self
-                .fanout_stream_search(&request_id, &req.vector, req.k, None)
+                .fanout_stream_search(&request_id, &req.vector, k, None)
                 .await?;
             return Ok(Response::new(SearchResponse {
                 request_id,
@@ -2885,7 +2922,7 @@ impl SearchService for CoordinatorServiceImpl {
                 chunk_floor: 0.0,
             }));
         } else {
-            self.fanout_search(&request_id, &req.vector, req.k, false)
+            self.fanout_search(&request_id, &req.vector, k, false)
                 .await?
         };
         Ok(Response::new(SearchResponse {
@@ -2901,13 +2938,14 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
         let req = request.into_inner();
+        let k = self.resolve_k(req.k)?;
         if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
             return Err(Status::invalid_argument(
                 "min_score must be finite (NaN and -inf are not valid floors)",
             ));
         }
         let hits = if req.fields.is_empty() {
-            self.fanout_bm25_seeded(&req.text, req.k, req.analysis.as_ref(), req.min_score)
+            self.fanout_bm25_seeded(&req.text, k, req.analysis.as_ref(), req.min_score)
                 .await?
         } else {
             // `analysis` is documented as ignored once `fields` is set,
@@ -2925,13 +2963,13 @@ impl SearchService for CoordinatorServiceImpl {
                      `fields` to use the single-field route.",
                 ));
             }
-            self.fanout_bm25_fused(&req.text, req.k, &req.fields, req.min_score)
+            self.fanout_bm25_fused(&req.text, k, &req.fields, req.min_score)
                 .await?
         };
         // The merged k-th best: one f32 ULP below the last hit's score
         // when k hits were returned (see `bm25::floor_seed` — a later
         // seed can never exceed the true k-th best), 0 otherwise.
-        let kth_best = if hits.len() == req.k as usize {
+        let kth_best = if hits.len() == k as usize {
             hits.last()
                 .map(|h| crate::bm25::floor_seed(h.score))
                 .unwrap_or(0.0)
@@ -2946,6 +2984,7 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
         let req = request.into_inner();
+        let k = self.resolve_k(req.k)?;
         if req.text.is_empty() {
             return Err(Status::invalid_argument(
                 "hybrid search requires query text",
@@ -3023,9 +3062,9 @@ impl SearchService for CoordinatorServiceImpl {
         }
         let legs = HybridLegs {
             leg_k: if options.leg_k == 0 {
-                req.k.max(rrf_k as u32)
+                k.max(rrf_k as u32)
             } else {
-                options.leg_k.max(req.k)
+                options.leg_k.max(k)
             },
             vector_weight,
             bm25_weight,
@@ -3050,7 +3089,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &request_id,
                         &req.text,
                         &req.vector,
-                        req.k,
+                        k,
                         req.analysis.as_ref(),
                         legs.min_vector_score,
                         req.debug,
@@ -3064,7 +3103,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &request_id,
                         &req.text,
                         &req.vector,
-                        req.k,
+                        k,
                         req.analysis.as_ref(),
                         legs,
                         req.debug,
@@ -3180,9 +3219,8 @@ impl SearchService for CoordinatorServiceImpl {
                 req.variants.len()
             )));
         }
-        if req.k == 0 {
-            return Err(Status::invalid_argument("k must be positive"));
-        }
+        // 0 = unset selects max_k, like every other client-facing k.
+        let k = self.resolve_k(req.k)?;
         // Labels carry the whole result: a blank or duplicated one makes
         // the diffs unreadable, so reject rather than disambiguate.
         let mut seen: Vec<&str> = Vec::with_capacity(req.variants.len());
@@ -3247,7 +3285,7 @@ impl SearchService for CoordinatorServiceImpl {
                 .as_ref()
                 .expect("query presence checked above");
             let started = std::time::Instant::now();
-            let hits = self.run_variant(query, req.k).await.map_err(|e| {
+            let hits = self.run_variant(query, k).await.map_err(|e| {
                 // Name the arm: with several in flight, an unadorned
                 // status leaves the caller guessing which one failed.
                 Status::new(
@@ -3264,7 +3302,7 @@ impl SearchService for CoordinatorServiceImpl {
 
         let diffs: Vec<RankingDiff> = results[1..]
             .iter()
-            .map(|v| diff_against(&results[0], v, req.k as usize, rbo_p))
+            .map(|v| diff_against(&results[0], v, k as usize, rbo_p))
             .collect();
 
         let interleaving = req.interleave.then(|| {
@@ -3279,7 +3317,7 @@ impl SearchService for CoordinatorServiceImpl {
             } else {
                 req.interleave_seed
             };
-            let merged = crate::interleave::team_draft(&a, &b, req.k as usize, seed);
+            let merged = crate::interleave::team_draft(&a, &b, k as usize, seed);
             Interleaving {
                 doc_ids: merged.ids,
                 teams: merged

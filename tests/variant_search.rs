@@ -418,9 +418,12 @@ async fn unreadable_requests_are_refused() {
             "no query set",
         ),
         (
-            "k must select something",
-            request(vec![body_only("rust"), with_case_name("x", "rust", 2.0)], 0),
-            "k must be positive",
+            "k above the coordinator's cap is refused, not clamped",
+            request(
+                vec![body_only("rust"), with_case_name("x", "rust", 2.0)],
+                10_001,
+            ),
+            "exceeds this coordinator's max_k",
         ),
         (
             "rbo persistence is a probability",
@@ -466,5 +469,82 @@ async fn a_failing_arm_is_named_in_the_error() {
         err.message().contains("challenger"),
         "the failing arm must be named: {}",
         err.message()
+    );
+}
+
+/// `k` is optional on every client-facing request: 0 (proto3 unset)
+/// selects the coordinator's `max_k` stop bound, a value within the cap
+/// is honored, and a value above it is refused with both numbers named
+/// rather than silently clamped. The cap is what keeps a coordinator
+/// from being asked to hold an unbounded heap while the shared floor
+/// never rises.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
+    let (coord, _nodes, _mock) = cluster().await;
+    let bm25 = |k: u32| Bm25SearchRequest {
+        text: "rust".to_string(),
+        k,
+        analysis: None,
+        min_score: 0.0,
+        fields: Vec::new(),
+    };
+
+    // Omitted k runs at the default cap: deep enough to find every
+    // matching document in this corpus.
+    let all = coord
+        .bm25_search(tonic::Request::new(bm25(0)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        all.hits.len(),
+        5,
+        "omitted k must run at max_k and surface every match"
+    );
+
+    // A coordinator capped at 2: omitted k stops there...
+    let capped = coord.clone().with_max_k(2);
+    let two = capped
+        .bm25_search(tonic::Request::new(bm25(0)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(two.hits.len(), 2, "omitted k must stop at the configured cap");
+
+    // ...an explicit k within the cap is honored...
+    let one = capped
+        .bm25_search(tonic::Request::new(bm25(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(one.hits.len(), 1);
+
+    // ...and one above it is refused, naming both numbers so the caller
+    // knows what to lower (or which flag to raise).
+    let err = capped
+        .bm25_search(tonic::Request::new(bm25(3)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("k=3") && err.message().contains("max_k=2"),
+        "refusal must name both sides: {}",
+        err.message()
+    );
+
+    // VariantSearch rides the same resolution: omitting k no longer
+    // refuses, it compares at the cap.
+    let resp = coord
+        .variant_search(tonic::Request::new(request(
+            vec![body_only("rust"), with_case_name("boost", "rust", 2.0)],
+            0,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.results.len(), 2);
+    assert!(
+        resp.results.iter().all(|r| !r.hits.is_empty()),
+        "both arms must run at the defaulted depth"
     );
 }

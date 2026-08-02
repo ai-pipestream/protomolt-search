@@ -171,6 +171,10 @@ pub struct Config {
     /// holds the only top-k). Identical results, different pruning
     /// locus. Off by default.
     pub stream_search: bool,
+    /// Coordinator: hard cap on any client-facing `k`. Requests above it
+    /// are refused (never clamped); a request omitting `k` runs at this
+    /// depth. Must be at least 1.
+    pub max_k: u32,
     /// gRPC message size cap applied to clients and servers.
     pub max_message_bytes: usize,
     /// Issue one demo search against the coordinator at startup.
@@ -226,6 +230,7 @@ struct FileConfig {
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
     stream_search: Option<bool>,
+    max_k: Option<u32>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
     analysis_addr: Option<String>,
@@ -681,6 +686,26 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
 
+    let max_k = opt(
+        args,
+        "max-k",
+        "TURBOVEC_MAX_K",
+        file.max_k.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u32>()
+            .map_err(|e| format!("invalid max k: {e}"))
+            .and_then(|v| {
+                if v == 0 {
+                    Err("max k must be at least 1 (0 would refuse every query)".to_string())
+                } else {
+                    Ok(v)
+                }
+            })
+    })
+    .transpose()?
+    .unwrap_or(crate::coordinator::DEFAULT_MAX_K);
+
     let analysis_addr = opt(
         args,
         "analysis-addr",
@@ -757,6 +782,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         max_message_bytes,
         demo_query,
         stream_search,
+        max_k,
         query_dim,
         bit_width,
         save_on_shutdown,
