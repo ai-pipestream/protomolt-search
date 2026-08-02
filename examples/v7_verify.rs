@@ -128,7 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 probe.targets.iter().filter(|t| !t.is_replica).count()
             };
             if want > 0 && up == want {
-                println!("  ready   {up}/{want} shards after {:.0}s", started.elapsed().as_secs_f64());
+                println!(
+                    "  ready   {up}/{want} shards after {:.0}s",
+                    started.elapsed().as_secs_f64()
+                );
                 if ready_only {
                     return Ok(());
                 }
@@ -599,49 +602,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         }
     });
-    r.check("variant search: interleaving is balanced and duplicate-free", {
-        match &variants.interleaving {
-            Some(il) => {
-                let mut ids = il.doc_ids.clone();
-                ids.sort_unstable();
-                ids.dedup();
-                let a = il.teams.iter().filter(|t| **t == 1).count();
-                let b = il.teams.len() - a;
-                if ids.len() != il.doc_ids.len() {
-                    Err("a document appears twice".to_string())
-                } else if a.abs_diff(b) > 1 {
-                    Err(format!("lopsided exposure: {a} vs {b}"))
-                } else {
-                    Ok(format!("{} results, {a}/{b} split, seed {}", il.doc_ids.len(), il.seed))
-                }
-            }
-            None => Err("interleaving was requested but absent".to_string()),
-        }
-    });
-    r.check("variant search: an unindexed field is refused, not scored as 0", {
-        let mut bogus = name_field(1.0);
-        bogus.field = "case_nmae".to_string();
-        match client
-            .variant_search(VariantSearchRequest {
-                request_id: String::new(),
-                variants: vec![
-                    ab_arm("body-only", vec![body_field()]),
-                    ab_arm("typo", vec![body_field(), bogus]),
-                ],
-                k,
-                rbo_p: 0.0,
-                interleave: false,
-                interleave_seed: 0,
-            })
-            .await
+    r.check(
+        "variant search: interleaving is balanced and duplicate-free",
         {
-            Ok(_) => Err("a field no shard indexes was silently scored".to_string()),
-            Err(e) if e.message().contains("no shard indexes") => {
-                Ok("refused, naming the field".to_string())
+            match &variants.interleaving {
+                Some(il) => {
+                    let mut ids = il.doc_ids.clone();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let a = il.teams.iter().filter(|t| **t == 1).count();
+                    let b = il.teams.len() - a;
+                    if ids.len() != il.doc_ids.len() {
+                        Err("a document appears twice".to_string())
+                    } else if a.abs_diff(b) > 1 {
+                        Err(format!("lopsided exposure: {a} vs {b}"))
+                    } else {
+                        Ok(format!(
+                            "{} results, {a}/{b} split, seed {}",
+                            il.doc_ids.len(),
+                            il.seed
+                        ))
+                    }
+                }
+                None => Err("interleaving was requested but absent".to_string()),
             }
-            Err(e) => Err(format!("refused for the wrong reason: {}", e.message())),
-        }
-    });
+        },
+    );
+    r.check(
+        "variant search: an unindexed field is refused, not scored as 0",
+        {
+            let mut bogus = name_field(1.0);
+            bogus.field = "case_nmae".to_string();
+            match client
+                .variant_search(VariantSearchRequest {
+                    request_id: String::new(),
+                    variants: vec![
+                        ab_arm("body-only", vec![body_field()]),
+                        ab_arm("typo", vec![body_field(), bogus]),
+                    ],
+                    k,
+                    rbo_p: 0.0,
+                    interleave: false,
+                    interleave_seed: 0,
+                })
+                .await
+            {
+                Ok(_) => Err("a field no shard indexes was silently scored".to_string()),
+                Err(e) if e.message().contains("no shard indexes") => {
+                    Ok("refused, naming the field".to_string())
+                }
+                Err(e) => Err(format!("refused for the wrong reason: {}", e.message())),
+            }
+        },
+    );
 
     println!("\n{} passed, {} failed", r.passed, r.failed);
     if r.failed > 0 {

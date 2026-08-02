@@ -625,7 +625,7 @@ struct ScanJob {
     external: Box<dyn FnMut() -> Option<f32> + Send>,
     /// Receives this query's k-th-best raises (the caller bakes in the
     /// share gate and delta filter).
-    publish: Box<dyn FnMut(f32) + Send>,
+    publish: Box<dyn FnMut(f32) -> bool + Send>,
     done: tokio::sync::oneshot::Sender<Result<(Vec<ChunkHit>, ScanStats), Status>>,
 }
 
@@ -690,7 +690,7 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
     let dim = index.dim_opt();
     let mut specs: Vec<(Vec<f32>, usize, bool)> = Vec::with_capacity(batch.len());
     let mut externals: Vec<Box<dyn FnMut() -> Option<f32> + Send>> = Vec::new();
-    let mut publishers: Vec<Box<dyn FnMut(f32) + Send>> = Vec::new();
+    let mut publishers: Vec<Box<dyn FnMut(f32) -> bool + Send>> = Vec::new();
     let mut dones = Vec::new();
     for job in batch {
         if Some(job.vector.len()) != dim {
@@ -1523,7 +1523,7 @@ impl NodeServiceImpl {
                     k,
                     self.config.chunk_blocks,
                     &mut || None,
-                    &mut |_| {},
+                    &mut |_| false,
                     false,
                 );
                 vector_leg = hits
@@ -2092,25 +2092,29 @@ impl NodeService for NodeServiceImpl {
             let mut last_published = f32::NEG_INFINITY;
             let mut offers = 0u32;
             let mut last_at: Option<std::time::Instant> = None;
-            let publish_floor = move |floor: f32| {
+            // Returns whether the floor actually went on the wire, so
+            // the scan can report offers and publishes apart. Reporting
+            // only offers is how the warmup and debounce knobs came to
+            // look like no-ops.
+            let publish_floor = move |floor: f32| -> bool {
                 if !share {
-                    return;
+                    return false;
                 }
                 // Skip the opening chunks: their floors are the weakest
                 // and cost a broadcast to every shard apiece.
                 offers += 1;
                 if offers <= warmup {
-                    return;
+                    return false;
                 }
                 if floor <= last_published + floor_delta {
-                    return;
+                    return false;
                 }
                 // Debounce. Suppressing a floor loses nothing: they are
                 // monotone, so the next one published is at least as
                 // high as the one dropped.
                 if let (Some(interval), Some(at)) = (min_interval, last_at) {
                     if at.elapsed() < interval {
-                        return;
+                        return false;
                     }
                 }
                 last_published = floor;
@@ -2120,6 +2124,7 @@ impl NodeService for NodeServiceImpl {
                         floor,
                     })),
                 }));
+                true
             };
             let external_floor = move || {
                 if share {
@@ -2195,6 +2200,7 @@ impl NodeService for NodeServiceImpl {
                                 candidates_collected: stats.candidates_collected,
                                 floors_published: stats.floors_published,
                                 floor_updates_applied: stats.floor_updates_applied,
+                                floors_offered: stats.floors_offered,
                             }),
                         };
                         let _ = tx
@@ -2301,6 +2307,7 @@ impl NodeService for NodeServiceImpl {
                             candidates_collected: stats.candidates_collected,
                             floors_published: stats.floors_published,
                             floor_updates_applied: stats.floor_updates_applied,
+                            floors_offered: stats.floors_offered,
                         }),
                     };
                     let _ = tx

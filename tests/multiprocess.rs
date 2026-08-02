@@ -309,9 +309,8 @@ async fn an_interrupted_bm25_build_refuses_to_serve() {
         node.terminate();
     }
     assert!(index.exists(), "the shard should have saved its vectors");
-    let build = turbovec_search::node::bm25_build_dir(
-        &turbovec_search::node::bm25_sidecar_path(&index),
-    );
+    let build =
+        turbovec_search::node::bm25_build_dir(&turbovec_search::node::bm25_sidecar_path(&index));
     std::fs::create_dir_all(&build).unwrap();
 
     // Refused: the process exits rather than serving a half-built shard.

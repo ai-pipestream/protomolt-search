@@ -275,7 +275,7 @@ impl AnalyzeStream {
         let submit = self.submitter();
         let (mut submitted, mut received) = (0usize, 0usize);
         let take = |item: Option<(u64, Result<AnalyzedDoc, Status>)>,
-                        out: &mut Vec<(u64, AnalyzedDoc)>|
+                    out: &mut Vec<(u64, AnalyzedDoc)>|
          -> Result<(), Status> {
             let Some((sequence, result)) = item else {
                 return Err(Status::internal(

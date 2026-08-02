@@ -341,7 +341,11 @@ mod tests {
         // the empty list, so every pair ties, the denominator goes to
         // zero, and the old code called that perfect agreement.
         let full = [10u64, 20, 30];
-        assert_eq!(kendall_tau(&[], &full), 0.0, "nothing agrees with everything");
+        assert_eq!(
+            kendall_tau(&[], &full),
+            0.0,
+            "nothing agrees with everything"
+        );
         assert_eq!(kendall_tau(&full, &[]), 0.0, "and it is symmetric");
         // The one-result case has no pair to compare at all.
         assert_eq!(kendall_tau(&[], &[10u64]), 0.0);

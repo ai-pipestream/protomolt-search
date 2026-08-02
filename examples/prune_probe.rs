@@ -22,9 +22,7 @@
 
 use std::time::Instant;
 
-use turbovec_search::bm25::{
-    self, Bm25Params, CorpusStats, FieldQuery, PruneStats,
-};
+use turbovec_search::bm25::{self, Bm25Params, CorpusStats, FieldQuery, PruneStats};
 use turbovec_search::postings::{Bm25Index, Bm25Reader};
 
 fn arg(key: &str, default: &str) -> String {
@@ -67,7 +65,11 @@ fn show(
         } else {
             String::new()
         };
-        println!("{:<10}   {:>2}. {doc:<12} {score:.6}  dl {dl:>6}{snippet}", "", i + 1);
+        println!(
+            "{:<10}   {:>2}. {doc:<12} {score:.6}  dl {dl:>6}{snippet}",
+            "",
+            i + 1
+        );
     }
     if !top.is_empty() {
         println!(

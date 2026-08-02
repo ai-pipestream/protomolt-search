@@ -522,7 +522,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         None => file.block_max.unwrap_or(true),
     };
     let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
-        || match opt(args, "allow-missing-bm25", "TURBOVEC_ALLOW_MISSING_BM25", None) {
+        || match opt(
+            args,
+            "allow-missing-bm25",
+            "TURBOVEC_ALLOW_MISSING_BM25",
+            None,
+        ) {
             Some(s) => parse_env_bool(&s),
             None => file.allow_missing_bm25.unwrap_or(false),
         };

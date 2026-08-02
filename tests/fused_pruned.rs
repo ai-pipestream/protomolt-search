@@ -1067,13 +1067,13 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
     );
 
     // A seeded floor must still hold the filtered-oracle contract.
-    let seeded = bm25::top_k_fused_pruned(
-        &q!(reader.field(0), reader.field(1)),
-        10,
-        oracle[9].score,
-    );
+    let seeded =
+        bm25::top_k_fused_pruned(&q!(reader.field(0), reader.field(1)), 10, oracle[9].score);
     assert_eq!(
-        sig(&bm25::filter_fused_to_floor(oracle.clone(), oracle[9].score)),
+        sig(&bm25::filter_fused_to_floor(
+            oracle.clone(),
+            oracle[9].score
+        )),
         sig(&seeded),
         "a seeded floor must not change the surviving fused hits"
     );

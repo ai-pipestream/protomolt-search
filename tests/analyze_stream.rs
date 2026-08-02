@@ -231,7 +231,10 @@ async fn stream_count_does_not_change_a_single_result() {
         );
     }
     // 0 is clamped to 1 rather than analyzing nothing.
-    assert_eq!(analyze_batch_streams(&addr, &docs, 0).await.unwrap(), baseline);
+    assert_eq!(
+        analyze_batch_streams(&addr, &docs, 0).await.unwrap(),
+        baseline
+    );
     server.abort();
 }
 
@@ -263,7 +266,9 @@ async fn multiple_streams_keep_each_spec_with_its_own_documents() {
     // And the two specs really do produce different terms, or the check
     // above would pass on an accident.
     let plain = analyze_document(&addr, TEXTS[0], None).await.unwrap();
-    let stem = analyze_document(&addr, TEXTS[0], Some(&stemmed)).await.unwrap();
+    let stem = analyze_document(&addr, TEXTS[0], Some(&stemmed))
+        .await
+        .unwrap();
     assert_ne!(plain, stem, "the fixture's two specs must actually differ");
     server.abort();
 }
@@ -272,6 +277,9 @@ async fn multiple_streams_keep_each_spec_with_its_own_documents() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_batch_is_not_an_error() {
     let (addr, server) = start_mock_analysis().await;
-    assert!(analyze_batch_streams(&addr, &[], 8).await.unwrap().is_empty());
+    assert!(analyze_batch_streams(&addr, &[], 8)
+        .await
+        .unwrap()
+        .is_empty());
     server.abort();
 }

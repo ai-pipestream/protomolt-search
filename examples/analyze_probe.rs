@@ -75,7 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--embed") {
         match analyzer::embed_text(&addr, &text).await {
             Ok(v) => {
-                let norm = v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt();
+                let norm = v
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>()
+                    .sqrt();
                 println!("embedding: dim {}, L2 norm {norm:.4}", v.len());
                 if v.iter().any(|x| !x.is_finite()) {
                     println!("  WARNING: embedding has non-finite coordinates");

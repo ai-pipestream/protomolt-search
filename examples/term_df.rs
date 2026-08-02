@@ -103,7 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("field {field:?}, {doc_count} documents across {} shards", nodes.len());
+    println!(
+        "field {field:?}, {doc_count} documents across {} shards",
+        nodes.len()
+    );
     println!("  {:<16} {:>14} {:>8}   cost", "term", "df", "% corpus");
     let mut order: Vec<usize> = (0..terms.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(dfs[i]));
@@ -123,7 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("  {:<16} {:>14} {:>7.1}%   {note}", terms[i], dfs[i], pct);
     }
-    println!("  {:<16} {:>14}  postings the scorer must consider", "TOTAL", total);
+    println!(
+        "  {:<16} {:>14}  postings the scorer must consider",
+        "TOTAL", total
+    );
 
     let avg = |len: u64| len as f64 / doc_count.max(1) as f64;
     println!("\n  stat surface        total_doc_length        avgdl   used by");

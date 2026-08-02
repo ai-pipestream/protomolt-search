@@ -525,7 +525,14 @@ async fn a_field_no_shard_indexes_is_refused_not_silently_skipped() {
         ..Default::default()
     })
     .await;
-    add_documents(&b, &CORPUS[1].iter().map(|(t, _)| (*t, None)).collect::<Vec<_>>()).await;
+    add_documents(
+        &b,
+        &CORPUS[1]
+            .iter()
+            .map(|(t, _)| (*t, None))
+            .collect::<Vec<_>>(),
+    )
+    .await;
 
     let coord = CoordinatorServiceImpl::new(vec![a, b])
         .with_bm25(Some(analysis.clone()), Default::default());

@@ -71,7 +71,10 @@ fn report(label: &str, hits: &[(u64, f32)], fetched: &[(u64, Option<String>)]) {
     println!("\n[{label}]");
     let (mut total, mut counted, mut missing) = (0usize, 0usize, 0usize);
     for (i, (id, score)) in hits.iter().enumerate() {
-        let text = fetched.iter().find(|(f, _)| f == id).and_then(|(_, t)| t.as_deref());
+        let text = fetched
+            .iter()
+            .find(|(f, _)| f == id)
+            .and_then(|(_, t)| t.as_deref());
         match text {
             Some(t) => {
                 let words = t.split_whitespace().count();
@@ -99,7 +102,10 @@ fn report(label: &str, hits: &[(u64, f32)], fetched: &[(u64, Option<String>)]) {
     if missing > 0 {
         // Said out loud and kept out of the mean: a length claim made
         // from a third of the hits is not a length claim.
-        println!("      {missing} of {} hits had NO stored text -- excluded above", hits.len());
+        println!(
+            "      {missing} of {} hits had NO stored text -- excluded above",
+            hits.len()
+        );
     }
 }
 
@@ -209,7 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_inner();
         // Cascade reports in `cascade_hits`, the rest in `hits`.
         let hits: Vec<(u64, f32)> = if r.hits.is_empty() {
-            r.cascade_hits.iter().map(|h| (h.doc_id, h.bm25_score)).collect()
+            r.cascade_hits
+                .iter()
+                .map(|h| (h.doc_id, h.bm25_score))
+                .collect()
         } else {
             r.hits.iter().map(|h| (h.doc_id, h.fused_score)).collect()
         };

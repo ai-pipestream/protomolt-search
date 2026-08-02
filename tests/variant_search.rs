@@ -189,7 +189,11 @@ async fn an_arm_compared_with_itself_agrees_on_every_measure() {
         .into_inner();
 
     assert_eq!(resp.results.len(), 2);
-    assert_eq!(resp.diffs.len(), 1, "n arms produce n-1 diffs against the first");
+    assert_eq!(
+        resp.diffs.len(),
+        1,
+        "n arms produce n-1 diffs against the first"
+    );
     let d = &resp.diffs[0];
     assert_eq!(d.reference, "body-only");
     assert_eq!(d.variant, "twin");
@@ -293,9 +297,16 @@ async fn interleaving_merges_both_arms_and_names_their_contributions() {
         .into_inner();
 
     let il = resp.interleaving.expect("interleaving was requested");
-    assert_eq!(il.doc_ids.len(), il.teams.len(), "attribution is per position");
+    assert_eq!(
+        il.doc_ids.len(),
+        il.teams.len(),
+        "attribution is per position"
+    );
     assert!(!il.doc_ids.is_empty());
-    assert_ne!(il.seed, 0, "a derived seed is reported so it can be replayed");
+    assert_ne!(
+        il.seed, 0,
+        "a derived seed is reported so it can be replayed"
+    );
     let mut sorted = il.doc_ids.clone();
     sorted.sort_unstable();
     sorted.dedup();
@@ -310,7 +321,11 @@ async fn interleaving_merges_both_arms_and_names_their_contributions() {
         .all(|t| *t == InterleaveTeam::A as i32 || *t == InterleaveTeam::B as i32));
     // Exposure is balanced within one result: that is what makes a
     // selection evidence about the ranking and not about the slot.
-    let a = il.teams.iter().filter(|t| **t == InterleaveTeam::A as i32).count();
+    let a = il
+        .teams
+        .iter()
+        .filter(|t| **t == InterleaveTeam::A as i32)
+        .count();
     let b = il.teams.len() - a;
     assert!(a.abs_diff(b) <= 1, "lopsided exposure: {a} vs {b}");
 }
@@ -410,8 +425,7 @@ async fn unreadable_requests_are_refused() {
         (
             "rbo persistence is a probability",
             {
-                let mut r =
-                    request(vec![body_only("rust"), with_case_name("x", "rust", 2.0)], 5);
+                let mut r = request(vec![body_only("rust"), with_case_name("x", "rust", 2.0)], 5);
                 r.rbo_p = 1.0;
                 r
             },

@@ -542,7 +542,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        println!("\nper-arm cost over {} queries (server-side, arms run sequentially):", queries.len());
+        println!(
+            "\nper-arm cost over {} queries (server-side, arms run sequentially):",
+            queries.len()
+        );
         for (i, a) in arms.iter().enumerate() {
             obs[i].report(&a.label, &a.scale, queries.len());
         }

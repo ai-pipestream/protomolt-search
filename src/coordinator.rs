@@ -31,8 +31,8 @@ use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
     VariantSearchRequest, VariantSearchResponse,
 };
-use crate::rankdiff;
 use crate::pb::{stream_search_request, stream_search_response};
+use crate::rankdiff;
 
 /// Process-unique request id counter for coordinator-assigned ids.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -460,8 +460,13 @@ impl CoordinatorServiceImpl {
                 eprintln!(
                     "bm25-fused leg: field={:?} terms={:?} dfs={:?} total_len={} w={} k1={} b={} \
                      | req k={k} N={doc_count} min_score={min_score}",
-                    l.field, l.terms, l.global_doc_frequencies, l.global_total_doc_length,
-                    l.weight, l.k1, l.b
+                    l.field,
+                    l.terms,
+                    l.global_doc_frequencies,
+                    l.global_total_doc_length,
+                    l.weight,
+                    l.k1,
+                    l.b
                 );
             }
         }
@@ -2400,11 +2405,7 @@ fn diff_against(
     let overlap_fraction = rankdiff::overlap_at_k(&ref_ids, &var_ids, k);
     // The reference's own scores are the yardstick for both sides, so
     // regret never compares a BM25 score with a fused one.
-    let scored: Vec<(u64, f32)> = reference
-        .hits
-        .iter()
-        .map(|h| (h.doc_id, h.score))
-        .collect();
+    let scored: Vec<(u64, f32)> = reference.hits.iter().map(|h| (h.doc_id, h.score)).collect();
     let regret = rankdiff::score_regret(&scored, &var_ids, k);
     RankingDiff {
         reference: reference.label.clone(),

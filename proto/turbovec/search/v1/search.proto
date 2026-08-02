@@ -410,10 +410,17 @@ message ShardScanStats {
   uint32 chunk_calls = 1;
   // Real candidates collected across all chunks (sentinel padding excluded).
   uint64 candidates_collected = 2;
-  // How many floor values the node published to the coordinator.
+  // How many floor values the node actually PUT ON THE WIRE. This is
+  // what --floor-warmup-chunks and --floor-min-interval-ms move, and it
+  // is strictly <= floors_offered.
   uint64 floors_published = 3;
   // How many chunks ran with a coordinator-pushed floor in effect.
   uint64 floor_updates_applied = 4;
+  // How many chunks OFFERED a floor: one per chunk whose heap held k.
+  // The scan's own behaviour, independent of what the node does with
+  // them. This field used to be missing and `floors_published` counted
+  // offers, so the broadcast knobs measured as having no effect.
+  uint64 floors_offered = 5;
 }
 
 // One scored vector. Ids are global across the cluster (see
