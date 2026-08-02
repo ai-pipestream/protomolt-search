@@ -51,13 +51,7 @@ const VECTOR_BATCH: usize = 512;
 /// WHITESPACE tokenizer, PORTER stemmer, MODE_FULL, SOURCE_STEMS — query
 /// and ingest share term identity through the stems.
 fn analysis_spec() -> AnalysisSpec {
-    AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_rungs: vec![],
-    }
+    turbovec_search::analyzer::body_spec()
 }
 
 fn arg(key: &str, default: &str) -> String {

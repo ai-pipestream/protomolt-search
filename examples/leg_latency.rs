@@ -38,13 +38,7 @@ fn arg(key: &str, default: &str) -> String {
 /// terms will not match the index and the timing would be of a query
 /// that finds nothing.
 fn body_spec() -> AnalysisSpec {
-    AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_rungs: vec![],
-    }
+    turbovec_search::analyzer::body_spec()
 }
 
 fn pct(sorted: &[f64], p: usize) -> f64 {

@@ -31,13 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docs: usize = arg("docs", "3").parse()?;
     let with_field = std::env::args().any(|a| a == "--with-field");
 
-    let spec = AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_rungs: vec![],
-    };
+    let spec = turbovec_search::analyzer::body_spec();
     // Real chunk texts when asked: the synthetic sentence below exercises
     // neither long documents nor the corpus's own byte content.
     let chunks_path = arg("chunks", "");

@@ -28,13 +28,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn body_spec() -> AnalysisSpec {
-    AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_rungs: vec![],
-    }
+    turbovec_search::analyzer::body_spec()
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]

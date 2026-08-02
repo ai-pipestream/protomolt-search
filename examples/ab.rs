@@ -76,13 +76,7 @@ fn args_all(key: &str) -> Vec<String> {
 
 /// The body field's ingest analysis, for `--analysis=ingest`.
 fn body_spec() -> AnalysisSpec {
-    AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_rungs: vec![],
-    }
+    turbovec_search::analyzer::body_spec()
 }
 
 /// The unit an arm's scores are expressed in.

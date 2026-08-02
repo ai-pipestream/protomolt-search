@@ -19,7 +19,7 @@ use std::path::Path;
 
 use turbovec_search::court;
 use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{AnalysisSpec, Bm25SearchRequest, SearchRequest};
+use turbovec_search::pb::{Bm25SearchRequest, SearchRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -84,13 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bm25_search(Bm25SearchRequest {
             text: "court".into(),
             k: 5,
-            analysis: Some(AnalysisSpec {
-                tokenizer: 1,
-                stemmer: 2,
-                term_vector_mode: 1,
-                term_vector_source: 2,
-                normalizer_rungs: vec![],
-            }),
+            analysis: Some(turbovec_search::analyzer::body_spec()),
             min_score: 0.0,
             fields: Vec::new(),
         })

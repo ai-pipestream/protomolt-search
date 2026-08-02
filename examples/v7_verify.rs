@@ -29,15 +29,9 @@ fn arg(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// The body field's ingest analysis: whitespace tokens, Porter stems.
+/// The body field's ingest analysis.
 fn body_spec() -> AnalysisSpec {
-    AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_rungs: vec![],
-    }
+    turbovec_search::analyzer::body_spec()
 }
 
 /// The case_name field's ingest analysis: UNSTEMMED, tokens as identity.

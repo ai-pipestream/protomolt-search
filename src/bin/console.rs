@@ -384,15 +384,28 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
             .map(|&(_, n)| n)
             .ok_or_else(|| format!("unknown value {v:?}"))
     };
-    let tokenizer = pick(&req.tokenizer, &[("whitespace", 1), ("simple", 2)], 1)?;
-    let stemmer = pick(&req.stemmer, &[("none", 1), ("porter", 2)], 2)?;
-    let term_source = pick(&req.term_source, &[("tokens", 1), ("stems", 2)], 2)?;
+    // Every default here comes from the one corpus spec rather than a
+    // literal repeated at this call site. An override is a deliberate
+    // A/B; a default that drifts from the index is a silent mismatch
+    // that scores different terms instead of failing.
+    let corpus = turbovec_search::analyzer::body_spec();
+    let tokenizer = pick(
+        &req.tokenizer,
+        &[("whitespace", 1), ("simple", 2)],
+        corpus.tokenizer,
+    )?;
+    let stemmer = pick(&req.stemmer, &[("none", 1), ("porter", 2)], corpus.stemmer)?;
+    let term_source = pick(
+        &req.term_source,
+        &[("tokens", 1), ("stems", 2), ("normalized_stems", 3)],
+        corpus.term_vector_source,
+    )?;
     let analysis = Some(turbovec_search::pb::AnalysisSpec {
         tokenizer,
         stemmer,
         term_vector_mode: 0,
         term_vector_source: term_source,
-        normalizer_rungs: Vec::new(),
+        normalizer_rungs: corpus.normalizer_rungs.clone(),
     });
 
     let boost = (!req.boost_text.is_empty()).then(|| BoostRescore {

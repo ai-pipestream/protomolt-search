@@ -24,6 +24,66 @@ use crate::postings::AnalyzedDoc;
 /// Matches the sidecar's default text size cap.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
+/// The analysis a body-text corpus is built with, and the ONLY spec that
+/// may be used to query one.
+///
+/// Term identity is decided entirely inside the sidecar, so an index and
+/// a query that disagree about this struct do not fail — they silently
+/// score different terms. That has now cost this project twice: once
+/// when a query went out unstemmed against a stemmed index, and once
+/// when the v7 corpus was built under `SOURCE_STEMS` (below). Both times
+/// the spec was written out by hand at the call site, and there were
+/// thirteen such copies. There is now one, and callers take it from
+/// here.
+///
+/// `SOURCE_NORMALIZED_STEMS` (3), not `SOURCE_STEMS` (2). The sidecar's
+/// own proto calls SOURCE_STEMS "a trap for any corpus that is not
+/// already lower case", and it is: stemmers operate on the surface form
+/// and do not fold case, so capitalization survives into term identity.
+/// Measured on the 86.6M-chunk court corpus built that way, `court`,
+/// `Court` and `COURT` were three separate terms with df 36,113,172 /
+/// 22,353,022 / 2,165,891 — a lowercase query reached 60% of them and
+/// scored the term as far rarer than it is. Proper nouns fared worst
+/// (`Dragon` df 4,571 vs `dragon` 508), so a search for "dungeons and
+/// dragons" returned dragon-toy copyright suits and prison dungeons
+/// while every Dungeons & Dragons opinion sat under the capitalized
+/// terms, unreachable.
+///
+/// The rungs run before the stemmer under source 3. STRIP_INVISIBLE and
+/// WHITESPACE are the sidecar's own defaults; FULL_CASE_FOLD is the one
+/// that does the work here.
+pub fn body_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        tokenizer: TOKENIZER_WHITESPACE,
+        stemmer: STEMMER_PORTER,
+        term_vector_mode: TERM_VECTOR_MODE_FULL,
+        term_vector_source: SOURCE_NORMALIZED_STEMS,
+        normalizer_rungs: vec![RUNG_STRIP_INVISIBLE, RUNG_WHITESPACE, RUNG_FULL_CASE_FOLD],
+    }
+}
+
+/// `AnalysisOptions.Tokenizer.TOKENIZER_WHITESPACE`.
+pub const TOKENIZER_WHITESPACE: i32 = 1;
+/// `AnalysisOptions.Stemmer.STEMMER_NONE`.
+pub const STEMMER_NONE: i32 = 1;
+/// `AnalysisOptions.Stemmer.STEMMER_PORTER`.
+pub const STEMMER_PORTER: i32 = 2;
+/// `TermVectorOptions.Mode.MODE_FULL` (occurrence offsets included).
+pub const TERM_VECTOR_MODE_FULL: i32 = 1;
+/// `TermVectorOptions.Source.SOURCE_TOKENS` (rungs define identity).
+pub const SOURCE_TOKENS: i32 = 1;
+/// `TermVectorOptions.Source.SOURCE_STEMS` (rungs IGNORED; see
+/// [`body_spec`] for why this is the wrong choice for prose).
+pub const SOURCE_STEMS: i32 = 2;
+/// `TermVectorOptions.Source.SOURCE_NORMALIZED_STEMS` (rungs, then stem).
+pub const SOURCE_NORMALIZED_STEMS: i32 = 3;
+/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_STRIP_INVISIBLE`.
+pub const RUNG_STRIP_INVISIBLE: i32 = 1;
+/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_WHITESPACE`.
+pub const RUNG_WHITESPACE: i32 = 2;
+/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_FULL_CASE_FOLD`.
+pub const RUNG_FULL_CASE_FOLD: i32 = 6;
+
 /// Shared h2 channel to a sidecar address. tonic channels multiplex
 /// concurrent calls over one connection and are cheap to clone; opening
 /// a fresh TCP+h2 connection per Analyze (the previous behavior) buried
