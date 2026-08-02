@@ -62,7 +62,7 @@ service AnalysisService {
 
   // GetCapabilities reports which features this server instance can actually
   // serve right now (embeddings on/off and model directory, POS/NER model
-  // availability, available stemmers and normalizer rungs, OpenNLP version).
+  // availability, available stemmers and normalizer steps, OpenNLP version).
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
 }
 
@@ -93,9 +93,11 @@ message AnalyzeRequest {
 // a single request share one document, so every returned layer refers to the
 // same original text coordinates.
 message AnalysisOptions {
-  // Model-free tokenizers. TOKENIZER_UNSPECIFIED selects the server default
-  // (TOKENIZER_WHITESPACE). Both tokenizers need no language model and produce
-  // tokens with original-text offsets.
+  // Tokenizers. TOKENIZER_UNSPECIFIED selects the server default
+  // (TOKENIZER_WHITESPACE). WHITESPACE, SIMPLE, and UAX29 are model-free;
+  // LATTICE and SENTENCEPIECE need a server-configured dictionary/model and
+  // fall back to whitespace tokenization (with a warning) when it is missing.
+  // All produce tokens with original-text offsets.
   enum Tokenizer {
     // Unused zero value; resolves to the server default tokenizer.
     TOKENIZER_UNSPECIFIED = 0;
@@ -106,6 +108,24 @@ message AnalysisOptions {
     // Character-class tokenizer: splits letters, digits, and punctuation into
     // separate tokens.
     TOKENIZER_SIMPLE = 2;
+
+    // Unicode UAX #29 word segmentation: drops punctuation, keeps
+    // abbreviation periods ("U.S." stays one token), handles CJK and emoji
+    // correctly. Model-free.
+    TOKENIZER_UAX29 = 3;
+
+    // Lattice tokenizer over a MeCab dictionary, for CJK text. Requires the
+    // server to be configured with a dictionary directory
+    // (OPENNLP_LATTICE_DIC_DIR); when none is configured the request still
+    // succeeds with whitespace tokenization and a warning is returned.
+    TOKENIZER_LATTICE = 4;
+
+    // SentencePiece subword tokenizer, for OOV handling. Requires the server
+    // to be configured with a model file (OPENNLP_SENTENCEPIECE_MODEL); when
+    // none is configured the request still succeeds with whitespace
+    // tokenization and a warning is returned. Pieces without original-text
+    // coverage (control symbols, byte-fallback fill) are dropped.
+    TOKENIZER_SENTENCEPIECE = 5;
   }
 
   // Model-free stemmers. STEMMER_UNSPECIFIED behaves as STEMMER_NONE. Every
@@ -114,7 +134,7 @@ message AnalysisOptions {
   // dictionary (OPENNLP_HUNSPELL_AFF + OPENNLP_HUNSPELL_DIC).
   //
   // Stemmers operate on the token surface form as-is: they do not lowercase
-  // and they do not fold case or accents. Fold first (normalizer rungs with
+  // and they do not fold case or accents. Fold first (normalizer steps with
   // term_vectors, or client-side) if case-insensitive stems are needed.
   enum Stemmer {
     // Unused zero value; behaves as STEMMER_NONE.
@@ -295,6 +315,78 @@ message AnalysisOptions {
   // and a warning is returned. When served, the response carries one lemma per
   // token, parallel to tokens.
   bool lemmatize = 9;
+
+  // Whether to score text noise: OCR damage, gibberish, base64-ish blobs.
+  // Model-free structural scoring; embedded assets (data URIs and the like)
+  // are detected first and excluded from scoring. The response carries one
+  // NoiseSpan per finding, so an indexer can skip or downweight a garbage
+  // chunk instead of indexing it.
+  bool noise = 10;
+
+  // Whether to flag text artifacts: replacement characters, control
+  // characters, mojibake, unpaired surrogates, zero-width characters, and the
+  // like. Model-free. Detection only FLAGS spans with a type — it never
+  // modifies the text; repair decisions belong to the consumer.
+  bool artifacts = 11;
+
+  // Glossary matching. Absent means disabled.
+  GlossaryOptions glossary = 12;
+
+  // Whether to extract PII: email addresses, phone numbers, IBANs, and card
+  // numbers. Model-free (cursor scanners plus validators); always available.
+  bool pii = 13;
+
+  // Whether to run coreference resolution: deterministic sieve-based mention
+  // chaining, model-free, but it consumes the POS and entity layers, so it
+  // requires the server to be configured with POS and NER models. Requesting
+  // coref implies pos_tags and ner. When either model is missing the request
+  // still succeeds, coref_mentions stays empty, and a warning is returned.
+  bool coref = 14;
+
+  // Whether to run dependency parsing. Requires the server to be configured
+  // with a dependency-parsing model (OPENNLP_DEPPARSE_MODEL) and a POS model.
+  // Requesting dependency_parse implies pos_tags. When a model is missing the
+  // request still succeeds, dependencies stays empty, and a warning is
+  // returned.
+  bool dependency_parse = 15;
+
+  // Relation extraction over dependency paths. Absent means disabled.
+  // Consumes the entity and dependency layers, so it requires NER and
+  // dependency-parsing models and implies dependency_parse (which implies
+  // pos_tags). When a model is missing the request still succeeds, relations
+  // stays empty, and a warning is returned.
+  RelationOptions relations = 16;
+
+  // Whether to geocode location entities against the bundled Natural Earth
+  // gazetteer. Model-free data, but it consumes the entity layer, so it
+  // requires the server to be configured with an NER model and implies ner.
+  // When no NER model is configured the request still succeeds, locations and
+  // regions stay empty, and a warning is returned.
+  bool geo = 17;
+}
+
+// GlossaryOptions controls multi-word phrase matching: an Aho-Corasick
+// automaton over the supplied entries, matched against the raw text with
+// word-boundary checks, leftmost-longest overlap resolution. Deterministic,
+// model-free, and cheap — the practical answer to "Dungeons & Dragons should
+// be one unit", which no stock NER model would ever tag.
+message GlossaryOptions {
+  // One glossary entry: a stable concept id and its surface form.
+  message Entry {
+    // Stable concept/product code. Aliases are multiple entries sharing one
+    // id.
+    string id = 1;
+
+    // The surface form to match; multiword phrases are fine.
+    string term = 2;
+  }
+
+  // The glossary to match. Must not be empty when glossary is set; an empty
+  // glossary fails with INVALID_ARGUMENT.
+  repeated Entry entries = 1;
+
+  // Whether matching ignores case (per code point, locale-independent).
+  bool ignore_case = 2;
 }
 
 // TermVectorOptions controls per-term frequency and occurrence extraction.
@@ -317,58 +409,101 @@ message TermVectorOptions {
     MODE_SCORING_ONLY = 2;
   }
 
-  // One rung of the aligned text-normalizer chain. Rungs apply in the fixed
-  // pipeline order of the OpenNLP normalizer builder, not in request order.
-  // Every rung is offset-aware: normalization never breaks original-text
-  // offsets.
-  enum NormalizerRung {
+  // One step of the text-normalizer chain. Steps apply in the fixed pipeline
+  // order of the OpenNLP normalizer builder, not in request order.
+  // Normalization never breaks original-text offsets: steps that can report a
+  // character alignment compose into the aligned whole-document chain; steps
+  // backed by java.text.Normalizer, JDK case mapping, or regexes (NFKC, NFC,
+  // CONFUSABLE_SKELETON, ACCENT_FOLD, CASE_FOLD, URL, NUMBER, SOCIAL_MEDIA,
+  // SHRINK) cannot, and are applied per token instead — occurrence spans are
+  // the token spans either way, so both paths return original-text offsets.
+  enum NormalizerStep {
     // Unused zero value; ignored when present.
-    NORMALIZER_RUNG_UNSPECIFIED = 0;
+    NORMALIZER_STEP_UNSPECIFIED = 0;
 
     // Removes invisible characters (zero-width spaces, soft hyphens, …).
-    NORMALIZER_RUNG_STRIP_INVISIBLE = 1;
+    NORMALIZER_STEP_STRIP_INVISIBLE = 1;
 
     // Collapses runs of whitespace to a single space.
-    NORMALIZER_RUNG_WHITESPACE = 2;
+    NORMALIZER_STEP_WHITESPACE = 2;
 
     // Normalizes the Unicode dash zoo to ASCII '-'.
-    NORMALIZER_RUNG_DASHES = 3;
+    NORMALIZER_STEP_DASHES = 3;
 
     // Normalizes the Unicode quote zoo to ASCII quotes.
-    NORMALIZER_RUNG_QUOTES = 4;
+    NORMALIZER_STEP_QUOTES = 4;
 
     // Normalizes Unicode digit variants to ASCII digits.
-    NORMALIZER_RUNG_DIGITS = 5;
+    NORMALIZER_STEP_DIGITS = 5;
 
     // Unicode full case folding ("Groß" -> "gross"), locale-independent.
-    NORMALIZER_RUNG_FULL_CASE_FOLD = 6;
+    NORMALIZER_STEP_FULL_CASE_FOLD = 6;
 
     // Collapses ellipsis characters ("…") to "...".
-    NORMALIZER_RUNG_ELLIPSIS = 7;
+    NORMALIZER_STEP_ELLIPSIS = 7;
 
     // Normalizes Unicode bullet characters to '*'.
-    NORMALIZER_RUNG_BULLETS = 8;
+    NORMALIZER_STEP_BULLETS = 8;
 
     // Converts emoji to their emoticon text equivalents.
-    NORMALIZER_RUNG_EMOJI_TO_EMOTICON = 9;
+    NORMALIZER_STEP_EMOJI_TO_EMOTICON = 9;
 
     // Converts emoticons to their emoji equivalents.
-    NORMALIZER_RUNG_EMOTICON_TO_EMOJI = 10;
+    NORMALIZER_STEP_EMOTICON_TO_EMOJI = 10;
 
     // Expands German umlauts and sharp-s to ASCII digraphs
     // ("ä" -> "ae", "ö" -> "oe", "ü" -> "ue", "ß" -> "ss").
-    NORMALIZER_RUNG_GERMAN_UMLAUT = 11;
+    NORMALIZER_STEP_GERMAN_UMLAUT = 11;
+
+    // Unicode NFKC compatibility normalization: folds ligatures, full-width
+    // forms, and compatibility characters to their canonical equivalents.
+    NORMALIZER_STEP_NFKC = 12;
+
+    // Unicode NFC canonical composition.
+    NORMALIZER_STEP_NFC = 13;
+
+    // Unicode confusable skeleton folding (UTS #39): maps look-alike
+    // characters (Cyrillic/Greek homoglyphs, …) to their prototype, so a
+    // spoofed or OCR-damaged word collapses onto its Latin twin.
+    NORMALIZER_STEP_CONFUSABLE_SKELETON = 14;
+
+    // Strips accents and diacritics ("café" -> "cafe"), separate from case
+    // folding. Maps stroke and ligature letters ("ø" -> "o", "æ" -> "ae",
+    // "ß" -> "ss").
+    NORMALIZER_STEP_ACCENT_FOLD = 15;
+
+    // Simple case folding (locale-independent lowercase), distinct from
+    // NORMALIZER_STEP_FULL_CASE_FOLD: "ß" stays "ß" here.
+    NORMALIZER_STEP_CASE_FOLD = 16;
+
+    // Collapses horizontal whitespace runs to a single space but preserves
+    // line structure: any run containing a line break collapses to one "\n".
+    NORMALIZER_STEP_LINE_BREAK_PRESERVING_WHITESPACE = 17;
+
+    // Replaces URLs and mail addresses with a single space.
+    NORMALIZER_STEP_URL = 18;
+
+    // Replaces runs of ASCII digits with a single space.
+    NORMALIZER_STEP_NUMBER = 19;
+
+    // Replaces social-media artifacts (hashtags, @handles, RT markers) with a
+    // single space.
+    NORMALIZER_STEP_SOCIAL_MEDIA = 20;
+
+    // Collapses whitespace runs and shrinks repeated-character runs to two
+    // ("Helllllloooooo" -> "Helloo"), then trims.
+    NORMALIZER_STEP_SHRINK = 21;
   }
 
   // Which layer supplies term identity. This choice decides what a "term" is:
   //
   // TOKENS: terms are token surface forms after the aligned normalizer chain;
-  // the rungs define identity (so "Groß"/"GROSS" can collapse under
+  // the steps define identity (so "Groß"/"GROSS" can collapse under
   // FULL_CASE_FOLD). The stems layer is not involved.
   //
   // STEMS: the stem IS the term identity. Occurrences of different surface
   // forms group under their common stem ("running"/"runs" -> "run"). The
-  // normalizer rungs are IGNORED for identity in this mode (stems are
+  // normalizer steps are IGNORED for identity in this mode (stems are
   // computed from the raw token surface forms); the term vector annotator is
   // bypassed and grouping happens service-side, one entry per distinct stem,
   // with the occurrence spans of every token carrying that stem, in original
@@ -378,13 +513,13 @@ message TermVectorOptions {
     // Unused zero value; resolves to SOURCE_TOKENS.
     SOURCE_UNSPECIFIED = 0;
 
-    // Group by normalized token text (the default; rungs define identity).
+    // Group by normalized token text (the default; steps define identity).
     SOURCE_TOKENS = 1;
 
-    // Group by stem (the BM25 mode; the stem defines identity, rungs ignored).
+    // Group by stem (the BM25 mode; the stem defines identity, steps ignored).
     SOURCE_STEMS = 2;
 
-    // Group by the stem of the NORMALIZED token: the rung chain runs first,
+    // Group by the stem of the NORMALIZED token: the step chain runs first,
     // then the stemmer, and the resulting stem is the identity.
     //
     // SOURCE_STEMS alone is a trap for any corpus that is not already lower
@@ -403,11 +538,11 @@ message TermVectorOptions {
   // Recording mode. Defaults to MODE_FULL.
   Mode mode = 2;
 
-  // Normalizer rungs for term identity. When empty and enabled, the server
+  // Normalizer steps for term identity. When empty and enabled, the server
   // default applies: STRIP_INVISIBLE + WHITESPACE + FULL_CASE_FOLD, which is
   // the chain BM25 consumers usually want. Ignored when source is
   // SOURCE_STEMS: the stem alone defines identity there.
-  repeated NormalizerRung rungs = 3;
+  repeated NormalizerStep steps = 3;
 
   // Term identity source. Defaults to SOURCE_TOKENS.
   Source source = 4;
@@ -489,6 +624,158 @@ message ChunkEmbedding {
   repeated float vector = 3;
 }
 
+// A noise finding: a span of likely-damaged text with a severity and a score.
+message NoiseSpan {
+  // Original-text span of the finding.
+  Span span = 1;
+
+  // Severity bucket: "misspelled", "damaged", "gibberish", or "binaryish"
+  // (mild to worst). An open string; new severities may appear.
+  string severity = 2;
+
+  // Noise score in (0, 1]; higher is noisier.
+  double score = 3;
+}
+
+// A flagged text artifact. Detection never modifies the text: the consumer
+// decides whether to mask, drop, or repair the flagged span.
+message TextArtifact {
+  // Original-text span of the artifact.
+  Span span = 1;
+
+  // Artifact type: "replacement", "control", "noncharacter",
+  // "unpaired-surrogate", "private-use", "bidi-control", "zero-width", or
+  // "mojibake". An open string; new types may appear.
+  string type = 2;
+}
+
+// A glossary match: a span where a glossary entry's term was found.
+message GlossaryMatch {
+  // Original-text span of the match.
+  Span span = 1;
+
+  // The matched entry's concept id.
+  string id = 2;
+
+  // The registered term that matched (the span's covered text may differ in
+  // case when ignore_case was set).
+  string term = 3;
+}
+
+// RelationOptions controls relation extraction: rule patterns matched over
+// dependency paths between entity mentions.
+message RelationOptions {
+  // One relation pattern: a dependency-path rule with a type label.
+  message Pattern {
+    // Relation type label attached to matches.
+    string type = 1;
+
+    // Whitespace-separated dependency steps: '<' walks up toward the head,
+    // '>' walks down toward dependents; the pivot is the lowest common
+    // ancestor. Example: "<nsubj >obj".
+    string path = 2;
+
+    // Optional lowercased pivot-token form restricting where the path
+    // applies.
+    string trigger = 3;
+  }
+
+  // The patterns to match. Must not be empty when relations is set; an empty
+  // pattern list fails with INVALID_ARGUMENT.
+  repeated Pattern patterns = 1;
+}
+
+// A PII mention.
+message PiiMention {
+  // Original-text span of the mention.
+  Span span = 1;
+
+  // PII type: "email", "phone", "iban", or "card". An open string; new types
+  // may appear.
+  string type = 2;
+
+  // Formatting-stripped form (email lowercased; IBAN separators removed;
+  // phone/card digits only, phone keeps a leading '+').
+  string normalized = 3;
+}
+
+// A coreference mention: one member of a mention chain.
+message CorefMention {
+  // Original-text span of the mention.
+  Span span = 1;
+
+  // Chain (cluster) id, numbered by first mention. Singletons included.
+  int32 chain = 2;
+
+  // Mention kind: "entity" or "pronoun".
+  string kind = 3;
+
+  // Index into the entities layer this mention resolves to, or -1 for
+  // pronouns.
+  int32 entity = 4;
+}
+
+// One dependency arc. Arcs are one per token, in token order.
+message DependencyArc {
+  // Original-text span of the dependent token.
+  Span span = 1;
+
+  // Token index of the head, or -1 for the root.
+  int32 head = 2;
+
+  // Token index of the dependent.
+  int32 dependent = 3;
+
+  // Dependency relation label, for example "nsubj".
+  string relation = 4;
+}
+
+// A relation mention linking two entities.
+message RelationMention {
+  // Original-text span covering both entity mentions.
+  Span span = 1;
+
+  // The pattern's relation type.
+  string type = 2;
+
+  // Index into the entities layer: the subject.
+  int32 subject = 3;
+
+  // Index into the entities layer: the object.
+  int32 object = 4;
+}
+
+// A geocoded location entity.
+message GeoLocation {
+  // Original-text span of the location mention.
+  Span span = 1;
+
+  // Gazetteer name of the resolved place.
+  string name = 2;
+
+  // ISO country code of the resolved place.
+  string country_code = 3;
+
+  // Resolved coordinates.
+  double latitude = 4;
+
+  // Resolved coordinates.
+  double longitude = 5;
+
+  // Resolution confidence in [0, 1].
+  double confidence = 6;
+}
+
+// A document-level region vote: the share of location evidence pointing at a
+// country.
+message RegionVote {
+  // ISO country code.
+  string country_code = 1;
+
+  // Share of the document's location evidence voting for this country.
+  double share = 2;
+}
+
 // AnalyzeResponse carries every requested layer. Layers that were not
 // requested (or that were requested but unavailable — see warnings) are empty.
 message AnalyzeResponse {
@@ -528,6 +815,41 @@ message AnalyzeResponse {
   // dictionaries work. Words missing from the dictionary come back as "O",
   // the OpenNLP convention.
   repeated string lemmas = 8;
+
+  // Noise findings, in text order. Empty unless noise was requested.
+  repeated NoiseSpan noise = 9;
+
+  // Flagged text artifacts, in text order. Empty unless artifacts was
+  // requested.
+  repeated TextArtifact artifacts = 10;
+
+  // Glossary matches, in text order, non-overlapping (leftmost-longest).
+  // Empty unless a glossary was supplied.
+  repeated GlossaryMatch glossary_matches = 11;
+
+  // PII mentions, in text order. Empty unless pii was requested.
+  repeated PiiMention pii = 12;
+
+  // Coreference mentions. Empty unless coref was requested AND the server has
+  // POS and NER models configured.
+  repeated CorefMention coref_mentions = 13;
+
+  // Dependency arcs, one per token, in token order. Empty unless
+  // dependency_parse was requested AND the server has a dependency-parsing
+  // model configured.
+  repeated DependencyArc dependencies = 14;
+
+  // Relation mentions. Empty unless relation patterns were supplied AND the
+  // server has NER and dependency-parsing models configured.
+  repeated RelationMention relations = 15;
+
+  // Geocoded location entities. Empty unless geo was requested AND the server
+  // has an NER model configured.
+  repeated GeoLocation locations = 16;
+
+  // Document-level region votes, ranked by share. Empty unless geo was
+  // requested AND the server has an NER model configured.
+  repeated RegionVote regions = 17;
 }
 
 // One message of the AnalyzeStream request direction. The first message of a
@@ -616,9 +938,9 @@ message GetCapabilitiesResponse {
   // the zero value).
   repeated string stemmers = 8;
 
-  // Normalizer rung names this build supports (the NormalizerRung enum values
+  // Normalizer step names this build supports (the NormalizerStep enum values
   // minus the zero value).
-  repeated string normalizer_rungs = 9;
+  repeated string normalizer_steps = 9;
 
   // Tokenizer option names this build supports (the Tokenizer enum values
   // minus the zero value).
@@ -635,4 +957,16 @@ message GetCapabilitiesResponse {
   // Whether a lemmatizer dictionary is configured and lemmatize requests are
   // served.
   bool lemmatizer_available = 13;
+
+  // Whether a MeCab dictionary is configured and TOKENIZER_LATTICE requests
+  // are served without whitespace fallback.
+  bool lattice_available = 14;
+
+  // Whether a SentencePiece model is configured and TOKENIZER_SENTENCEPIECE
+  // requests are served without whitespace fallback.
+  bool sentencepiece_available = 15;
+
+  // Whether a dependency-parsing model is configured and dependency_parse
+  // requests are served.
+  bool dependency_parse_available = 16;
 }

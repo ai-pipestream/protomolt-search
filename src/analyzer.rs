@@ -327,8 +327,10 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
         term_vectors: Some(TermVectorOptions {
             enabled: true,
             mode,
-            // the sidecar still spells this field `rungs`
-            rungs: char_filters,
+            // The sidecar calls these normalizer STEPS; Lucene (and so
+            // this side) calls the stage a char filter. Same field
+            // number, same values, different vocabulary.
+            steps: char_filters,
             source,
         }),
         ..Default::default()

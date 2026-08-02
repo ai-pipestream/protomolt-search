@@ -362,6 +362,11 @@ pub mod mock_analysis {
             embeddings: Vec::new(),
             warnings: Vec::new(),
             lemmas: Vec::new(),
+            // The sidecar's tier-1 surface (noise, artifacts, glossary,
+            // pii, coref, dependencies, relations, geo). The mock models
+            // term identity only, so it returns none of it rather than
+            // inventing plausible-looking annotations.
+            ..Default::default()
         })
     }
 
