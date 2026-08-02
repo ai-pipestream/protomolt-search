@@ -56,7 +56,7 @@ fn analysis_spec() -> AnalysisSpec {
         stemmer: 2,
         term_vector_mode: 1,
         term_vector_source: 2,
-        normalizer_rungs: vec![],
+        normalizer_steps: vec![],
     }
 }
 

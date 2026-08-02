@@ -141,11 +141,11 @@ pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
 /// are always requested (FULL mode with occurrence offsets unless the spec
 /// overrides), everything else defaults.
 fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
-    let (mode, source, rungs, tokenizer, stemmer) = match spec {
+    let (mode, source, steps, tokenizer, stemmer) = match spec {
         Some(s) => (
             s.term_vector_mode,
             s.term_vector_source,
-            s.normalizer_rungs.clone(),
+            s.normalizer_steps.clone(),
             s.tokenizer,
             s.stemmer,
         ),
@@ -157,7 +157,7 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
         term_vectors: Some(TermVectorOptions {
             enabled: true,
             mode,
-            rungs,
+            steps,
             source,
         }),
         ..Default::default()

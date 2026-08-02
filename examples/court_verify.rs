@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stemmer: 2,
                 term_vector_mode: 1,
                 term_vector_source: 2,
-                normalizer_rungs: vec![],
+                normalizer_steps: vec![],
             }),
             min_score: 0.0,
             fields: Vec::new(),

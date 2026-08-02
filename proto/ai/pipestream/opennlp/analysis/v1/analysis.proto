@@ -62,7 +62,7 @@ service AnalysisService {
 
   // GetCapabilities reports which features this server instance can actually
   // serve right now (embeddings on/off and model directory, POS/NER model
-  // availability, available stemmers and normalizer rungs, OpenNLP version).
+  // availability, available stemmers and normalizer steps, OpenNLP version).
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
 }
 
@@ -134,7 +134,7 @@ message AnalysisOptions {
   // dictionary (OPENNLP_HUNSPELL_AFF + OPENNLP_HUNSPELL_DIC).
   //
   // Stemmers operate on the token surface form as-is: they do not lowercase
-  // and they do not fold case or accents. Fold first (normalizer rungs with
+  // and they do not fold case or accents. Fold first (normalizer steps with
   // term_vectors, or client-side) if case-insensitive stems are needed.
   enum Stemmer {
     // Unused zero value; behaves as STEMMER_NONE.
@@ -409,101 +409,101 @@ message TermVectorOptions {
     MODE_SCORING_ONLY = 2;
   }
 
-  // One rung of the text-normalizer chain. Rungs apply in the fixed pipeline
+  // One step of the text-normalizer chain. Steps apply in the fixed pipeline
   // order of the OpenNLP normalizer builder, not in request order.
-  // Normalization never breaks original-text offsets: rungs that can report a
-  // character alignment compose into the aligned whole-document chain; rungs
+  // Normalization never breaks original-text offsets: steps that can report a
+  // character alignment compose into the aligned whole-document chain; steps
   // backed by java.text.Normalizer, JDK case mapping, or regexes (NFKC, NFC,
   // CONFUSABLE_SKELETON, ACCENT_FOLD, CASE_FOLD, URL, NUMBER, SOCIAL_MEDIA,
   // SHRINK) cannot, and are applied per token instead — occurrence spans are
   // the token spans either way, so both paths return original-text offsets.
-  enum NormalizerRung {
+  enum NormalizerStep {
     // Unused zero value; ignored when present.
-    NORMALIZER_RUNG_UNSPECIFIED = 0;
+    NORMALIZER_STEP_UNSPECIFIED = 0;
 
     // Removes invisible characters (zero-width spaces, soft hyphens, …).
-    NORMALIZER_RUNG_STRIP_INVISIBLE = 1;
+    NORMALIZER_STEP_STRIP_INVISIBLE = 1;
 
     // Collapses runs of whitespace to a single space.
-    NORMALIZER_RUNG_WHITESPACE = 2;
+    NORMALIZER_STEP_WHITESPACE = 2;
 
     // Normalizes the Unicode dash zoo to ASCII '-'.
-    NORMALIZER_RUNG_DASHES = 3;
+    NORMALIZER_STEP_DASHES = 3;
 
     // Normalizes the Unicode quote zoo to ASCII quotes.
-    NORMALIZER_RUNG_QUOTES = 4;
+    NORMALIZER_STEP_QUOTES = 4;
 
     // Normalizes Unicode digit variants to ASCII digits.
-    NORMALIZER_RUNG_DIGITS = 5;
+    NORMALIZER_STEP_DIGITS = 5;
 
     // Unicode full case folding ("Groß" -> "gross"), locale-independent.
-    NORMALIZER_RUNG_FULL_CASE_FOLD = 6;
+    NORMALIZER_STEP_FULL_CASE_FOLD = 6;
 
     // Collapses ellipsis characters ("…") to "...".
-    NORMALIZER_RUNG_ELLIPSIS = 7;
+    NORMALIZER_STEP_ELLIPSIS = 7;
 
     // Normalizes Unicode bullet characters to '*'.
-    NORMALIZER_RUNG_BULLETS = 8;
+    NORMALIZER_STEP_BULLETS = 8;
 
     // Converts emoji to their emoticon text equivalents.
-    NORMALIZER_RUNG_EMOJI_TO_EMOTICON = 9;
+    NORMALIZER_STEP_EMOJI_TO_EMOTICON = 9;
 
     // Converts emoticons to their emoji equivalents.
-    NORMALIZER_RUNG_EMOTICON_TO_EMOJI = 10;
+    NORMALIZER_STEP_EMOTICON_TO_EMOJI = 10;
 
     // Expands German umlauts and sharp-s to ASCII digraphs
     // ("ä" -> "ae", "ö" -> "oe", "ü" -> "ue", "ß" -> "ss").
-    NORMALIZER_RUNG_GERMAN_UMLAUT = 11;
+    NORMALIZER_STEP_GERMAN_UMLAUT = 11;
 
     // Unicode NFKC compatibility normalization: folds ligatures, full-width
     // forms, and compatibility characters to their canonical equivalents.
-    NORMALIZER_RUNG_NFKC = 12;
+    NORMALIZER_STEP_NFKC = 12;
 
     // Unicode NFC canonical composition.
-    NORMALIZER_RUNG_NFC = 13;
+    NORMALIZER_STEP_NFC = 13;
 
     // Unicode confusable skeleton folding (UTS #39): maps look-alike
     // characters (Cyrillic/Greek homoglyphs, …) to their prototype, so a
     // spoofed or OCR-damaged word collapses onto its Latin twin.
-    NORMALIZER_RUNG_CONFUSABLE_SKELETON = 14;
+    NORMALIZER_STEP_CONFUSABLE_SKELETON = 14;
 
     // Strips accents and diacritics ("café" -> "cafe"), separate from case
     // folding. Maps stroke and ligature letters ("ø" -> "o", "æ" -> "ae",
     // "ß" -> "ss").
-    NORMALIZER_RUNG_ACCENT_FOLD = 15;
+    NORMALIZER_STEP_ACCENT_FOLD = 15;
 
     // Simple case folding (locale-independent lowercase), distinct from
-    // NORMALIZER_RUNG_FULL_CASE_FOLD: "ß" stays "ß" here.
-    NORMALIZER_RUNG_CASE_FOLD = 16;
+    // NORMALIZER_STEP_FULL_CASE_FOLD: "ß" stays "ß" here.
+    NORMALIZER_STEP_CASE_FOLD = 16;
 
     // Collapses horizontal whitespace runs to a single space but preserves
     // line structure: any run containing a line break collapses to one "\n".
-    NORMALIZER_RUNG_LINE_BREAK_PRESERVING_WHITESPACE = 17;
+    NORMALIZER_STEP_LINE_BREAK_PRESERVING_WHITESPACE = 17;
 
     // Replaces URLs and mail addresses with a single space.
-    NORMALIZER_RUNG_URL = 18;
+    NORMALIZER_STEP_URL = 18;
 
     // Replaces runs of ASCII digits with a single space.
-    NORMALIZER_RUNG_NUMBER = 19;
+    NORMALIZER_STEP_NUMBER = 19;
 
     // Replaces social-media artifacts (hashtags, @handles, RT markers) with a
     // single space.
-    NORMALIZER_RUNG_SOCIAL_MEDIA = 20;
+    NORMALIZER_STEP_SOCIAL_MEDIA = 20;
 
     // Collapses whitespace runs and shrinks repeated-character runs to two
     // ("Helllllloooooo" -> "Helloo"), then trims.
-    NORMALIZER_RUNG_SHRINK = 21;
+    NORMALIZER_STEP_SHRINK = 21;
   }
 
   // Which layer supplies term identity. This choice decides what a "term" is:
   //
   // TOKENS: terms are token surface forms after the aligned normalizer chain;
-  // the rungs define identity (so "Groß"/"GROSS" can collapse under
+  // the steps define identity (so "Groß"/"GROSS" can collapse under
   // FULL_CASE_FOLD). The stems layer is not involved.
   //
   // STEMS: the stem IS the term identity. Occurrences of different surface
   // forms group under their common stem ("running"/"runs" -> "run"). The
-  // normalizer rungs are IGNORED for identity in this mode (stems are
+  // normalizer steps are IGNORED for identity in this mode (stems are
   // computed from the raw token surface forms); the term vector annotator is
   // bypassed and grouping happens service-side, one entry per distinct stem,
   // with the occurrence spans of every token carrying that stem, in original
@@ -513,13 +513,13 @@ message TermVectorOptions {
     // Unused zero value; resolves to SOURCE_TOKENS.
     SOURCE_UNSPECIFIED = 0;
 
-    // Group by normalized token text (the default; rungs define identity).
+    // Group by normalized token text (the default; steps define identity).
     SOURCE_TOKENS = 1;
 
-    // Group by stem (the BM25 mode; the stem defines identity, rungs ignored).
+    // Group by stem (the BM25 mode; the stem defines identity, steps ignored).
     SOURCE_STEMS = 2;
 
-    // Group by the stem of the NORMALIZED token: the rung chain runs first,
+    // Group by the stem of the NORMALIZED token: the step chain runs first,
     // then the stemmer, and the resulting stem is the identity.
     //
     // SOURCE_STEMS alone is a trap for any corpus that is not already lower
@@ -538,11 +538,11 @@ message TermVectorOptions {
   // Recording mode. Defaults to MODE_FULL.
   Mode mode = 2;
 
-  // Normalizer rungs for term identity. When empty and enabled, the server
+  // Normalizer steps for term identity. When empty and enabled, the server
   // default applies: STRIP_INVISIBLE + WHITESPACE + FULL_CASE_FOLD, which is
   // the chain BM25 consumers usually want. Ignored when source is
   // SOURCE_STEMS: the stem alone defines identity there.
-  repeated NormalizerRung rungs = 3;
+  repeated NormalizerStep steps = 3;
 
   // Term identity source. Defaults to SOURCE_TOKENS.
   Source source = 4;
@@ -938,9 +938,9 @@ message GetCapabilitiesResponse {
   // the zero value).
   repeated string stemmers = 8;
 
-  // Normalizer rung names this build supports (the NormalizerRung enum values
+  // Normalizer step names this build supports (the NormalizerStep enum values
   // minus the zero value).
-  repeated string normalizer_rungs = 9;
+  repeated string normalizer_steps = 9;
 
   // Tokenizer option names this build supports (the Tokenizer enum values
   // minus the zero value).

@@ -46,7 +46,7 @@ fn analysis_spec() -> AnalysisSpec {
         stemmer: 2,
         term_vector_mode: 1,
         term_vector_source: 2,
-        normalizer_rungs: vec![],
+        normalizer_steps: vec![],
     }
 }
 
@@ -59,7 +59,7 @@ fn case_name_spec() -> AnalysisSpec {
         stemmer: 1,
         term_vector_mode: 1,
         term_vector_source: 1,
-        normalizer_rungs: vec![],
+        normalizer_steps: vec![],
     }
 }
 

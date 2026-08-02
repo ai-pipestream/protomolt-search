@@ -349,7 +349,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
             stemmer,
             term_vector_mode: 0,
             term_vector_source: term_source,
-            normalizer_rungs: Vec::new(),
+            normalizer_steps: Vec::new(),
         }
     });
 

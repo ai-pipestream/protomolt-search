@@ -362,6 +362,15 @@ pub mod mock_analysis {
                 embeddings: Vec::new(),
                 warnings: Vec::new(),
                 lemmas: Vec::new(),
+                noise: Vec::new(),
+                artifacts: Vec::new(),
+                glossary_matches: Vec::new(),
+                pii: Vec::new(),
+                coref_mentions: Vec::new(),
+                dependencies: Vec::new(),
+                relations: Vec::new(),
+                locations: Vec::new(),
+                regions: Vec::new(),
             })
     }
 
