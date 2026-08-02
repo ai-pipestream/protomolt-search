@@ -30,6 +30,7 @@ fn opts() -> AnalysisOptions {
         sentence_detection: true,
         ner: true,
         pos_tags: true,
+        geo: true,
         term_vectors: Some(TermVectorOptions {
             enabled: true,
             mode: spec.term_vector_mode,
@@ -54,7 +55,20 @@ fn fingerprint(r: &turbovec_search::pb::analysis::AnalyzeResponse) -> String {
         .collect();
     ents.sort();
     let pos: Vec<&str> = r.tokens.iter().map(|t| t.pos.as_str()).collect();
-    format!("E[{}] P[{}]", ents.join(","), pos.join(" "))
+    // Geocoding resolves a name to a place, so the resolved identity and
+    // its coordinates are what a race would corrupt, not just the count.
+    let mut geo: Vec<String> = r
+        .locations
+        .iter()
+        .map(|l| format!("{}@{:.5},{:.5}", l.name, l.latitude, l.longitude))
+        .collect();
+    geo.sort();
+    format!(
+        "E[{}] P[{}] G[{}]",
+        ents.join(","),
+        pos.join(" "),
+        geo.join(",")
+    )
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -92,8 +106,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_inner();
         expected.push(fingerprint(&r));
     }
-    let entities: usize = expected.iter().filter(|f| !f.starts_with("E[]")).count();
-    println!("reference done: {} docs, {} with at least one entity", expected.len(), entities);
+    // Report coverage per layer. A layer that produced nothing on every
+    // document makes its share of this comparison vacuous: it would
+    // "agree" no matter how badly it raced.
+    let entities = expected.iter().filter(|f| !f.contains("E[]")).count();
+    let pos = expected.iter().filter(|f| !f.contains("P[]")).count();
+    let geo = expected.iter().filter(|f| !f.contains("G[]")).count();
+    println!(
+        "reference done: {} docs; with entities {entities}, with POS {pos}, with locations {geo}",
+        expected.len()
+    );
+    for (layer, n) in [("entities", entities), ("POS", pos), ("locations", geo)] {
+        if n == 0 {
+            println!("  WARNING: {layer} empty on every document; this run does not test that layer");
+        }
+    }
 
     // Candidate: all at once.
     let cc = AnalysisServiceClient::connect(candidate).await?;
