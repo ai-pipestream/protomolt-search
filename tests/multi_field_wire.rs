@@ -596,7 +596,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
         stemmer: 2,
         term_vector_mode: 1,
         term_vector_source: 2,
-        normalizer_rungs: vec![],
+        char_filters: vec![],
     };
 
     // Per-field: the supported way to say it, and it must still work.
@@ -655,7 +655,8 @@ impl turbovec_search::pb::analysis::analysis_service_server::AnalysisService for
     async fn analyze(
         &self,
         request: tonic::Request<turbovec_search::pb::analysis::AnalyzeRequest>,
-    ) -> Result<tonic::Response<turbovec_search::pb::analysis::AnalyzeResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<turbovec_search::pb::analysis::AnalyzeResponse>, tonic::Status>
+    {
         self.unary
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         turbovec_search::pb::analysis::analysis_service_server::AnalysisService::analyze(

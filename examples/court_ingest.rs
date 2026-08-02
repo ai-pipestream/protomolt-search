@@ -51,7 +51,7 @@ fn case_name_spec() -> AnalysisSpec {
         stemmer: 1,
         term_vector_mode: 1,
         term_vector_source: 1,
-        normalizer_rungs: vec![],
+        char_filters: vec![],
     }
 }
 
@@ -133,7 +133,7 @@ fn parse_body_columns(spec: &str) -> Result<Vec<BodyColumn>, String> {
                 stemmer: num(2, "stemmer")?,
                 term_vector_mode: 1,
                 term_vector_source: num(3, "source")?,
-                normalizer_rungs: Vec::new(),
+                char_filters: Vec::new(),
             },
         });
     }

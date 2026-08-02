@@ -49,7 +49,7 @@ pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// while every Dungeons & Dragons opinion sat under the capitalized
 /// terms, unreachable.
 ///
-/// The rungs run before the stemmer under source 3. STRIP_INVISIBLE and
+/// The char filters run before the stemmer under source 3. STRIP_INVISIBLE and
 /// WHITESPACE are the sidecar's own defaults; FULL_CASE_FOLD is the one
 /// that does the work here.
 pub fn body_spec() -> AnalysisSpec {
@@ -58,9 +58,60 @@ pub fn body_spec() -> AnalysisSpec {
         stemmer: STEMMER_PORTER,
         term_vector_mode: TERM_VECTOR_MODE_FULL,
         term_vector_source: SOURCE_NORMALIZED_STEMS,
-        normalizer_rungs: vec![RUNG_STRIP_INVISIBLE, RUNG_WHITESPACE, RUNG_FULL_CASE_FOLD],
+        char_filters: vec![
+            CHAR_FILTER_STRIP_INVISIBLE,
+            CHAR_FILTER_WHITESPACE,
+            CHAR_FILTER_FULL_CASE_FOLD,
+        ],
     }
 }
+
+/// The cased twin of [`body_spec`]: identical tokenizer and stemmer,
+/// but term identity taken from the stem of the SURFACE form, so
+/// capitalization survives into the term.
+///
+/// This is not a mistake repeated; it is the other arm of the
+/// experiment. Folding is right for recall (`court` should find
+/// `Court`), and wrong for the signal that made "Dungeons and Dragons"
+/// findable at all: on this corpus the capitalized form dominates for
+/// proper nouns, and folding destroys the distinction. Which wins is a
+/// question about THIS corpus, so it is measured rather than assumed,
+/// which is what a second column is for.
+pub fn cased_body_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        term_vector_source: SOURCE_STEMS,
+        // SOURCE_STEMS ignores char filters outright, so leaving them
+        // populated here would be a lie about what the column contains.
+        char_filters: Vec::new(),
+        ..body_spec()
+    }
+}
+
+/// The analyzers callers may name, for CLIs and config: one vocabulary
+/// instead of enum triples at every call site.
+///
+/// `Ok(None)` means "send no spec", which leaves the sidecar to apply
+/// its own defaults. That is a real choice and not the same as any named
+/// analyzer, because the sidecar's default does not stem.
+pub fn analyzer_by_name(name: &str) -> Result<Option<AnalysisSpec>, String> {
+    Ok(match name {
+        // `ingest` is the corpus's own analyzer, whatever that currently
+        // is; the alias exists so callers can say "match the index"
+        // without knowing which one that is today.
+        "ingest" | "folded" => Some(body_spec()),
+        "cased" => Some(cased_body_spec()),
+        "server" => None,
+        other => {
+            return Err(format!(
+                "unknown analyzer {other:?}; expected one of {}",
+                ANALYZER_NAMES.join(", ")
+            ))
+        }
+    })
+}
+
+/// Every name [`analyzer_by_name`] accepts.
+pub const ANALYZER_NAMES: &[&str] = &["ingest", "folded", "cased", "server"];
 
 /// `AnalysisOptions.Tokenizer.TOKENIZER_WHITESPACE`.
 pub const TOKENIZER_WHITESPACE: i32 = 1;
@@ -70,19 +121,22 @@ pub const STEMMER_NONE: i32 = 1;
 pub const STEMMER_PORTER: i32 = 2;
 /// `TermVectorOptions.Mode.MODE_FULL` (occurrence offsets included).
 pub const TERM_VECTOR_MODE_FULL: i32 = 1;
-/// `TermVectorOptions.Source.SOURCE_TOKENS` (rungs define identity).
+/// `TermVectorOptions.Source.SOURCE_TOKENS` (char filters define identity).
 pub const SOURCE_TOKENS: i32 = 1;
-/// `TermVectorOptions.Source.SOURCE_STEMS` (rungs IGNORED; see
+/// `TermVectorOptions.Source.SOURCE_STEMS` (char filters IGNORED; see
 /// [`body_spec`] for why this is the wrong choice for prose).
 pub const SOURCE_STEMS: i32 = 2;
-/// `TermVectorOptions.Source.SOURCE_NORMALIZED_STEMS` (rungs, then stem).
+/// `TermVectorOptions.Source.SOURCE_NORMALIZED_STEMS` (char filters, then stem).
 pub const SOURCE_NORMALIZED_STEMS: i32 = 3;
+/// Strip invisible controls. Sidecar wire value
 /// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_STRIP_INVISIBLE`.
-pub const RUNG_STRIP_INVISIBLE: i32 = 1;
+pub const CHAR_FILTER_STRIP_INVISIBLE: i32 = 1;
+/// Collapse whitespace. Sidecar wire value
 /// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_WHITESPACE`.
-pub const RUNG_WHITESPACE: i32 = 2;
+pub const CHAR_FILTER_WHITESPACE: i32 = 2;
+/// Full Unicode case fold. Sidecar wire value
 /// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_FULL_CASE_FOLD`.
-pub const RUNG_FULL_CASE_FOLD: i32 = 6;
+pub const CHAR_FILTER_FULL_CASE_FOLD: i32 = 6;
 
 /// Shared h2 channel to a sidecar address. tonic channels multiplex
 /// concurrent calls over one connection and are cheap to clone; opening
@@ -201,11 +255,11 @@ pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
 /// are always requested (FULL mode with occurrence offsets unless the spec
 /// overrides), everything else defaults.
 fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
-    let (mode, source, rungs, tokenizer, stemmer) = match spec {
+    let (mode, source, char_filters, tokenizer, stemmer) = match spec {
         Some(s) => (
             s.term_vector_mode,
             s.term_vector_source,
-            s.normalizer_rungs.clone(),
+            s.char_filters.clone(),
             s.tokenizer,
             s.stemmer,
         ),
@@ -217,7 +271,8 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
         term_vectors: Some(TermVectorOptions {
             enabled: true,
             mode,
-            rungs,
+            // the sidecar still spells this field `rungs`
+            rungs: char_filters,
             source,
         }),
         ..Default::default()
@@ -547,4 +602,60 @@ async fn join_all<F: std::future::Future>(futures: &mut [std::pin::Pin<Box<F>>])
     done.into_iter()
         .map(|slot| slot.expect("poll_fn returned only when every future completed"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two named body analyzers must differ in TERM IDENTITY, not
+    /// merely in name. If they ever resolved to the same spec the A/B
+    /// they exist for would compare a column with itself and report
+    /// "no difference", which is the most expensive possible way to be
+    /// wrong: it looks like an answer.
+    #[test]
+    fn folded_and_cased_are_actually_different_analyzers() {
+        let folded = analyzer_by_name("folded").expect("known name").unwrap();
+        let cased = analyzer_by_name("cased").expect("known name").unwrap();
+        assert_ne!(folded.term_vector_source, cased.term_vector_source);
+        assert_eq!(folded.term_vector_source, SOURCE_NORMALIZED_STEMS);
+        assert_eq!(cased.term_vector_source, SOURCE_STEMS);
+        // Same tokenizer and stemmer: the comparison isolates case
+        // folding, so anything else differing would confound it.
+        assert_eq!(folded.tokenizer, cased.tokenizer);
+        assert_eq!(folded.stemmer, cased.stemmer);
+        // SOURCE_STEMS ignores char filters, so carrying them on the
+        // cased spec would misdescribe what the column holds.
+        assert!(cased.char_filters.is_empty());
+        assert!(folded.char_filters.contains(&CHAR_FILTER_FULL_CASE_FOLD));
+    }
+
+    /// `ingest` tracks the corpus spec rather than restating it, so the
+    /// alias cannot rot when `body_spec` changes.
+    #[test]
+    fn ingest_is_the_corpus_analyzer() {
+        assert_eq!(analyzer_by_name("ingest").unwrap(), Some(body_spec()));
+        assert_eq!(analyzer_by_name("folded").unwrap(), Some(body_spec()));
+    }
+
+    /// `server` is a real choice (leave the spec unset), not a missing
+    /// answer, and it is NOT the same as any named analyzer: the
+    /// sidecar's default does not stem.
+    #[test]
+    fn server_means_no_spec() {
+        assert_eq!(analyzer_by_name("server").unwrap(), None);
+    }
+
+    /// An unknown name is refused and NAMES the alternatives. A silent
+    /// fallback to the default here would query a stemmed index with an
+    /// unstemmed spec and report the ranking of whatever fragment
+    /// happened to match.
+    #[test]
+    fn an_unknown_analyzer_is_refused_and_lists_the_known_ones() {
+        let err = analyzer_by_name("porter").expect_err("not a known name");
+        assert!(err.contains("porter"), "{err}");
+        for name in ANALYZER_NAMES {
+            assert!(err.contains(name), "error should list {name}: {err}");
+        }
+    }
 }

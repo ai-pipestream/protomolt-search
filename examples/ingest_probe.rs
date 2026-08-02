@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             stemmer: 1,
                             term_vector_mode: 1,
                             term_vector_source: 1,
-                            normalizer_rungs: vec![],
+                            char_filters: vec![],
                         }),
                     }]
                 } else {

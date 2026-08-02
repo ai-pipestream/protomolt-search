@@ -1724,7 +1724,10 @@ struct FieldStreams {
     /// Holding the SUBMITTER here rather than the session is what lets
     /// [`finish`](Self::finish) half-close every stream by dropping them;
     /// each session itself is owned by its driver task.
-    sessions: Vec<(Option<crate::pb::AnalysisSpec>, crate::analyzer::AnalyzeSubmit)>,
+    sessions: Vec<(
+        Option<crate::pb::AnalysisSpec>,
+        crate::analyzer::AnalyzeSubmit,
+    )>,
     events: tokio::sync::mpsc::Receiver<FieldEvent>,
     /// Cloned into each driver as it is spawned. Taking it in `finish` is
     /// what makes `recv` observe `None` once every driver has exited.

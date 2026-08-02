@@ -626,7 +626,7 @@ async fn stems_source_groups_surface_forms() {
         stemmer: 2, // any real stemmer value; mock stems regardless
         term_vector_mode: 0,
         term_vector_source: 2, // SOURCE_STEMS
-        normalizer_rungs: vec![],
+        char_filters: vec![],
     };
     add_documents(
         &addr,

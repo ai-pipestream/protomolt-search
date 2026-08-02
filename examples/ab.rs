@@ -4,7 +4,7 @@
 //!
 //! An arm is written as `label=field[:weight][+field[:weight]...]`, so
 //! the A/B that motivated this — one body column against another indexed
-//! under a different analysis — is a one-liner:
+//! under a different analyzer — is a one-liner:
 //!
 //! ```text
 //! ab --coord=127.0.0.1:59291 --query="supreme court certiorari" \
@@ -35,16 +35,25 @@
 //!    --arm=two-level=hybrid@fusion=two_level --queries=...
 //! ```
 //!
-//! Every arm is queried with the BODY FIELD'S INGEST ANALYSIS by
+//! Every arm is queried with the BODY FIELD'S INGEST ANALYZER by
 //! default, because term identity is fixed at ingest: the analysis
 //! sidecar's own default does not stem, so querying this index with it
 //! matches only the tokens that happen to equal their own stem and
-//! silently reports the ranking of that fragment. `--analysis=server`
+//! silently reports the ranking of that fragment. `--analyzer=server`
 //! leaves the spec unset for callers that want the sidecar default.
 //!
-//! An arm comparing two COLUMNS indexed under DIFFERENT analyses cannot
-//! be expressed by either: each column needs its own spec, and this flag
-//! sets one for all of them.
+//! A field may name its OWN analyzer with `/name`, which is what an
+//! arm comparing two columns indexed under different analyzers needs —
+//! the comparison this tool exists for, and the one `--analyzer` alone
+//! cannot express, since it sets one analyzer for every field:
+//!
+//! ```text
+//! ab --arm=folded=body_norm/folded --arm=cased=body_cased/cased \
+//!    --queries=... --interleave
+//! ```
+//!
+//! Named analyzers come from `analyzer::analyzer_by_name`, so the CLI
+//! and the ingest side cannot drift apart into two vocabularies.
 
 use std::time::Instant;
 
@@ -72,11 +81,6 @@ fn args_all(key: &str) -> Vec<String> {
     std::env::args()
         .filter_map(|a| a.strip_prefix(&prefix).map(str::to_string))
         .collect()
-}
-
-/// The body field's ingest analysis, for `--analysis=ingest`.
-fn body_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
 }
 
 /// The unit an arm's scores are expressed in.
@@ -161,7 +165,11 @@ impl Arm {
                     .fields
                     .iter()
                     .map(|f| QueryField {
-                        analysis: analysis.cloned(),
+                        // A field's OWN analyzer wins; `--analyzer` is
+                        // only the fallback for fields that named none.
+                        // Overwriting here (the previous behavior) is
+                        // what made a two-column comparison inexpressible.
+                        analysis: f.analysis.clone().or_else(|| analysis.cloned()),
                         ..f.clone()
                     })
                     .collect(),
@@ -293,21 +301,45 @@ fn parse_arm(spec: &str) -> Result<Arm, String> {
         });
     }
     let mut query_fields = Vec::new();
+    let mut idents = Vec::new();
     for part in fields.split('+') {
-        let (name, weight) = match part.split_once(':') {
+        // `/analyzer` binds to the field, so it is split off before the
+        // `:weight` suffix.
+        let (field_spec, analyzer) = match part.split_once('/') {
+            Some((f, a)) => (f, Some(a)),
+            None => (part, None),
+        };
+        let (name, weight) = match field_spec.split_once(':') {
             Some((n, w)) => (
                 n,
                 w.parse::<f32>()
                     .map_err(|e| format!("arm {label}: weight {w:?}: {e}"))?,
             ),
-            None => (part, 1.0),
+            None => (field_spec, 1.0),
         };
         if name.is_empty() {
             return Err(format!("arm {label}: empty field name"));
         }
+        let analysis = match analyzer {
+            Some(a) => analyzer::analyzer_by_name(a)
+                .map_err(|e| format!("arm {label}: field {name:?}: {e}"))?,
+            None => None,
+        };
+        // Two columns under different analyzers hold DIFFERENT TERMS, so
+        // their idf and their scores come out of different scoring
+        // spaces. Naming the analyzer in the identity is what stops
+        // `score_regret` subtracting across them.
+        idents.push(format!(
+            "{}:{}:{}:{}:{}",
+            name,
+            weight,
+            k1,
+            b,
+            analyzer.unwrap_or("-")
+        ));
         query_fields.push(QueryField {
             field: name.to_string(),
-            analysis: None,
+            analysis,
             weight,
             k1,
             b,
@@ -316,11 +348,7 @@ fn parse_arm(spec: &str) -> Result<Arm, String> {
     // The scale identity includes k1/b: the same field at two different
     // b values is two different scoring functions, and their scores are
     // no more subtractable than BM25 and RRF are.
-    let ident = query_fields
-        .iter()
-        .map(|f| format!("{}:{}:{}:{}", f.field, f.weight, f.k1, f.b))
-        .collect::<Vec<_>>()
-        .join("+");
+    let ident = idents.join("+");
     Ok(Arm {
         label: label.to_string(),
         fields: query_fields,
@@ -455,11 +483,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // identity is fixed at ingest: querying a stemmed index with the
     // sidecar's unstemmed default silently drops most of the query and
     // reports whatever the surviving tokens matched.
-    let analysis = match arg("analysis", "ingest").as_str() {
-        "server" => None,
-        "ingest" => Some(body_spec()),
-        other => {
-            eprintln!("--analysis={other:?}: expected `server` or `ingest`");
+    // The default fallback for fields that did not name their own.
+    let analysis = match analyzer::analyzer_by_name(&arg("analyzer", "ingest")) {
+        Ok(spec) => spec,
+        Err(e) => {
+            eprintln!("--analyzer: {e}");
             std::process::exit(2);
         }
     };

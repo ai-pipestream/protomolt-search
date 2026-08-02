@@ -716,9 +716,12 @@ message AnalysisSpec {
   // TermVectorOptions.Source value (1 = TOKENS, 2 = STEMS). Ingest and
   // query MUST use the same source or term identities will not match.
   int32 term_vector_source = 4;
-  // TermVectorOptions.NormalizerRung values for term identity (ignored
-  // when source is STEMS).
-  repeated int32 normalizer_rungs = 5;
+  // Character filters applied before tokenization, in order, defining
+  // term identity (IGNORED when source is STEMS). "Char filter" is
+  // Lucene's name for this stage and OpenNLP implements them as
+  // CharSequenceNormalizer; the sidecar's wire enum still spells them
+  // TermVectorOptions.NormalizerRung, whose values these are.
+  repeated int32 char_filters = 5;
 }
 
 // Lineage for one ingested document: where it came from in the source

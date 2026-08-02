@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stemmer: arg("stemmer", "2").parse()?,
         term_vector_mode: arg("mode", "1").parse()?,
         term_vector_source: arg("source", "2").parse()?,
-        normalizer_rungs: match arg("rungs", "").as_str() {
+        char_filters: match arg("rungs", "").as_str() {
             "" => Vec::new(),
             r => r
                 .split(',')
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spec.stemmer,
         spec.term_vector_mode,
         spec.term_vector_source,
-        spec.normalizer_rungs
+        spec.char_filters
     );
     println!("text: {text:?}");
     let doc = analyzer::analyze_document(&addr, &text, Some(&spec)).await?;

@@ -247,7 +247,7 @@ async fn multiple_streams_keep_each_spec_with_its_own_documents() {
         stemmer: 2,
         term_vector_mode: 1,
         term_vector_source: 2,
-        normalizer_rungs: Vec::new(),
+        char_filters: Vec::new(),
     };
     // Interleaved specs, so a naive split would cross a group boundary.
     let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS

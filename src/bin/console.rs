@@ -405,7 +405,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         stemmer,
         term_vector_mode: 0,
         term_vector_source: term_source,
-        normalizer_rungs: corpus.normalizer_rungs.clone(),
+        char_filters: corpus.char_filters.clone(),
     });
 
     let boost = (!req.boost_text.is_empty()).then(|| BoostRescore {
