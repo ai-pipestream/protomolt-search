@@ -371,6 +371,7 @@ pub mod mock_analysis {
                 relations: Vec::new(),
                 locations: Vec::new(),
                 regions: Vec::new(),
+                cased_term_vectors: Vec::new(),
             })
     }
 

@@ -159,6 +159,7 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
             mode,
             steps,
             source,
+            dual_cased: false,
         }),
         ..Default::default()
     }

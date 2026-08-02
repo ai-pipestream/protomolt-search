@@ -310,10 +310,18 @@ message AnalysisOptions {
   EmbeddingOptions embeddings = 8;
 
   // Whether to run dictionary lemmatization. Requires the server to be
-  // configured with a lemmatizer dictionary (OPENNLP_LEMMATIZER_DICT); when no
-  // dictionary is configured the request still succeeds, lemmas stays empty,
-  // and a warning is returned. When served, the response carries one lemma per
-  // token, parallel to tokens.
+  // configured with a lemmatizer backend: a WordNet database directory
+  // (OPENNLP_WORDNET_DIR, the Morphy lemmatizer, takes precedence) or a flat
+  // lemmatizer dictionary (OPENNLP_LEMMATIZER_DICT); when neither is
+  // configured the request still succeeds, lemmas stays empty, and a warning
+  // is returned. When served, the response carries one lemma per token,
+  // parallel to tokens.
+  //
+  // Lookup keys on (token, POS tag); the WordNet backend adapts UD tags
+  // (PROPN lemmatizes as a noun) and falls back to an all-POS lookup when no
+  // POS model produced tags, while the flat dictionary looks up with the
+  // neutral empty tag. Words missing from the lexicon come back as "O", the
+  // OpenNLP convention.
   bool lemmatize = 9;
 
   // Whether to score text noise: OCR damage, gibberish, base64-ish blobs.
@@ -415,8 +423,9 @@ message TermVectorOptions {
   // character alignment compose into the aligned whole-document chain; steps
   // backed by java.text.Normalizer, JDK case mapping, or regexes (NFKC, NFC,
   // CONFUSABLE_SKELETON, ACCENT_FOLD, CASE_FOLD, URL, NUMBER, SOCIAL_MEDIA,
-  // SHRINK) cannot, and are applied per token instead — occurrence spans are
-  // the token spans either way, so both paths return original-text offsets.
+  // SHRINK), whole-token rewrites (SYMBOL_JOINER), and spell correction
+  // (SPELLCHECK) are applied per token instead — occurrence spans are the
+  // token spans either way, so both paths return original-text offsets.
   enum NormalizerStep {
     // Unused zero value; ignored when present.
     NORMALIZER_STEP_UNSPECIFIED = 0;
@@ -493,6 +502,23 @@ message TermVectorOptions {
     // Collapses whitespace runs and shrinks repeated-character runs to two
     // ("Helllllloooooo" -> "Helloo"), then trims.
     NORMALIZER_STEP_SHRINK = 21;
+
+    // Spells out a whole-token symbol joiner ("&" -> "and"), so a document
+    // writing "Dungeons & Dragons" and a query writing "dungeons and dragons"
+    // agree on term identity. Only a token consisting of exactly the symbol
+    // is rewritten; symbols embedded in a larger token ("R&D", "AT&T") are
+    // left alone.
+    NORMALIZER_STEP_SYMBOL_JOINER = 22;
+
+    // SymSpell spell correction of each token ("dargons" -> "dragons"),
+    // aimed at OCR-damaged corpora. Requires the server to be configured
+    // with a spell-check model (OPENNLP_SPELLCHECK_MODEL); when none is
+    // configured the request still succeeds with the step skipped and a
+    // warning is returned. Correction re-applies the token's casing pattern
+    // and skips numbers, URLs, and short tokens. Handle deliberately: it
+    // changes term identity, so it belongs in a parallel column's spec,
+    // never silently in the body's.
+    NORMALIZER_STEP_SPELLCHECK = 23;
   }
 
   // Which layer supplies term identity. This choice decides what a "term" is:
@@ -546,6 +572,25 @@ message TermVectorOptions {
 
   // Term identity source. Defaults to SOURCE_TOKENS.
   Source source = 4;
+
+  // Whether to ALSO emit the cased term identity in one pass. When true, the
+  // response carries cased_term_vectors alongside term_vectors: both are
+  // computed from the same tokenization in the same analysis pass, so their
+  // occurrence spans coincide exactly.
+  //
+  // The two identities differ only in case folding: term_vectors runs the
+  // step chain as requested, cased_term_vectors runs the SAME chain minus the
+  // case-folding steps (FULL_CASE_FOLD, CASE_FOLD). With SOURCE_NORMALIZED_STEMS
+  // that means "COURT court Court Dungeons dungeons running runs" yields a
+  // folded stream of 3 terms ({court, dungeon, run}) and a cased stream of 6
+  // ({COURT, Court, court, Dungeon, dungeon, run}) from one call — the folded
+  // form for recall, the cased form for the proper-noun asymmetry, without
+  // analyzing the text twice.
+  //
+  // Meaningless with SOURCE_STEMS (that source ignores the step chain, so
+  // there is no folded form to contrast with); requesting the combination
+  // fails with INVALID_ARGUMENT. Model-free and always available.
+  bool dual_cased = 5;
 }
 
 // EmbeddingOptions controls dense vector extraction. The embedding backend is
@@ -809,11 +854,12 @@ message AnalyzeResponse {
   repeated string warnings = 7;
 
   // One lemma per token, exactly parallel to tokens. Empty unless lemmatize
-  // was requested AND the server has a lemmatizer dictionary configured.
-  // Lookup keys are (lowercased token, POS tag); when no POS model produced
-  // tags, every token looks up with the neutral empty tag, so tag-agnostic
-  // dictionaries work. Words missing from the dictionary come back as "O",
-  // the OpenNLP convention.
+  // was requested AND the server has a lemmatizer backend configured
+  // (OPENNLP_WORDNET_DIR or OPENNLP_LEMMATIZER_DICT). Lookup keys on (token,
+  // POS tag); when no POS model produced tags, the backend's tagless path
+  // applies (neutral tag for the flat dictionary, all-POS fallback for
+  // WordNet). Words missing from the lexicon come back as "O", the OpenNLP
+  // convention.
   repeated string lemmas = 8;
 
   // Noise findings, in text order. Empty unless noise was requested.
@@ -850,6 +896,13 @@ message AnalyzeResponse {
   // Document-level region votes, ranked by share. Empty unless geo was
   // requested AND the server has an NER model configured.
   repeated RegionVote regions = 17;
+
+  // The cased term identity, in first-occurrence order, computed in the same
+  // pass as term_vectors: the same step chain minus the case-folding steps,
+  // then (for stem sources) the same stemmer. Occurrence spans coincide with
+  // term_vectors span-for-span. Empty unless term_vectors.dual_cased was
+  // requested.
+  repeated TermVector cased_term_vectors = 18;
 }
 
 // One message of the AnalyzeStream request direction. The first message of a
@@ -911,7 +964,7 @@ message GetCapabilitiesRequest {}
 
 // GetCapabilitiesResponse reports what this server instance can actually serve.
 message GetCapabilitiesResponse {
-  // Version of the wrapped OpenNLP build, for example "3.x-preview-SNAPSHOT".
+  // Version of the wrapped OpenNLP build, for example "0.0.0-preview-SNAPSHOT".
   string opennlp_version = 1;
 
   // Version of this service.
@@ -969,4 +1022,13 @@ message GetCapabilitiesResponse {
   // Whether a dependency-parsing model is configured and dependency_parse
   // requests are served.
   bool dependency_parse_available = 16;
+
+  // Whether term_vectors.dual_cased requests are served. Model-free, so this
+  // is always true; it exists so a client compiled against an older contract
+  // can tell the feature exists on this server.
+  bool dual_term_identity_available = 17;
+
+  // Whether a SymSpell spell-check model is configured and
+  // NORMALIZER_STEP_SPELLCHECK requests are served without skipping the step.
+  bool spellcheck_available = 18;
 }
