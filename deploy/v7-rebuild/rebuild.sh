@@ -75,6 +75,7 @@ export JAVA_OPTS=${JAVA_OPTS:--Xmx4g}
 EMBEDDINGS_DIR=${EMBEDDINGS_DIR:-/work/court-corpus/models/minilm-l6-v2-static}
 BIN=${BIN:-$REPO/target/release/turbovec-search}
 INGEST=${INGEST:-$REPO/target/release/examples/court_ingest}
+PROBE=${PROBE:-$REPO/target/release/examples/analyze_probe}
 
 RUN="$OUT/run"
 LOGS="$OUT/logs"
@@ -269,10 +270,35 @@ start_node() {
 
 stage_sidecar() { sidecar_up; }
 
+# Analysis and embedding are separate capabilities of the same process,
+# and a sidecar can hold one without the other: an open port proves
+# neither. Probe embedding specifically, because that is the half ingest
+# never exercises (vectors come from the file), so a sidecar that cannot
+# embed serves a whole rebuild without complaint and then fails the first
+# hybrid query.
+sidecar_can_embed() {
+  "$PROBE" --addr="http://127.0.0.1:$SIDECAR_PORT" --text=probe --embed >/dev/null 2>&1
+}
+
 sidecar_up() {
   if port_open "$SIDECAR_PORT"; then
-    say "analysis sidecar already listening on :$SIDECAR_PORT"
-    return
+    if [[ ! -x $PROBE ]] || sidecar_can_embed; then
+      say "analysis sidecar already listening on :$SIDECAR_PORT"
+      return
+    fi
+    # Most likely its jars were replaced under it: a running JVM loads
+    # classes lazily, so a rebuild mid-session leaves the process serving
+    # everything it had already touched and unable to load anything it
+    # had not. Ingest keeps working; embedding, which ingest never calls,
+    # does not.
+    say "sidecar on :$SIDECAR_PORT answers but CANNOT EMBED; restarting it"
+    if [[ -f $RUN/sidecar.pid ]]; then
+      kill "$(cat "$RUN/sidecar.pid")" 2>/dev/null || true
+      rm -f "$RUN/sidecar.pid"
+    fi
+    for _ in $(seq 1 30); do port_open "$SIDECAR_PORT" || break; sleep 1; done
+    port_open "$SIDECAR_PORT" &&
+      die "sidecar on :$SIDECAR_PORT will not stop; kill it and re-run"
   fi
   [[ -x $SIDECAR_BIN ]] || die "no analysis sidecar binary at $SIDECAR_BIN"
   [[ -d $EMBEDDINGS_DIR ]] || die "no embedding model at EMBEDDINGS_DIR=$EMBEDDINGS_DIR"

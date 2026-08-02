@@ -127,7 +127,7 @@ WAVE=2 puts the peak at 839 GB for the full corpus; WAVE=4 at 1006 GB.
 of wedging the filesystem hours in. Total work is unchanged by WAVE — the
 shared analysis sidecar is the throughput ceiling, not shard parallelism.
 
-## Three things that will bite you
+## Four things that will bite you
 
 **A stale analysis sidecar.** If the sidecar predates the `AnalyzeStream`
 RPC, the node silently falls back to one unary call per document; its gRPC
@@ -151,6 +151,24 @@ bind; the permanent fix is
 Ingest takes vectors from the embeddings file, so a sidecar started
 without `OPENNLP_EMBEDDINGS_DIR` builds a perfectly good index and then
 cannot embed a single query. `rebuild.sh` always sets it.
+
+**Do not rebuild the sidecar's jars while it is running.** This one was
+self-inflicted mid-rebuild and is worth the warning. A JVM loads classes
+lazily, so `./gradlew installDist` against a live sidecar leaves the
+process serving everything it had already touched and unable to load
+anything it had not. Ingest kept working for hours across six shards
+because the analysis path's classes were all resident; embedding, which
+ingest never calls, died with
+`ClassNotFoundException: EmbeddingOptions$1` — a *classpath* error, even
+though `OPENNLP_EMBEDDINGS_DIR` was correctly set and the jar on disk was
+perfectly good. The failure is invisible until the first query, which is
+after the rebuild has finished.
+
+An open port therefore does not mean a working sidecar: analysis and
+embedding are separate capabilities of one process, and ingest exercises
+only the first. `sidecar_up` now probes embedding specifically
+(`analyze_probe --embed`) and restarts a sidecar that answers but cannot
+embed, rather than adopting it because the port was listening.
 
 ## A/B-ing an analysis change without a second rebuild
 

@@ -65,5 +65,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (term, tf) in &terms {
         println!("  {term:<24} tf={tf}");
     }
+
+    // Embedding is a SEPARATE capability of the same sidecar, and the one
+    // that fails silently at deploy time: a sidecar started without
+    // OPENNLP_EMBEDDINGS_DIR analyzes perfectly, builds a perfectly good
+    // index, and then cannot embed a single query. Checking it here means
+    // finding out before the cluster is serving rather than from the
+    // first hybrid search.
+    if std::env::args().any(|a| a == "--embed") {
+        match analyzer::embed_text(&addr, &text).await {
+            Ok(v) => {
+                let norm = v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt();
+                println!("embedding: dim {}, L2 norm {norm:.4}", v.len());
+                if v.iter().any(|x| !x.is_finite()) {
+                    println!("  WARNING: embedding has non-finite coordinates");
+                }
+            }
+            Err(e) => {
+                println!("embedding: FAILED -- {e}");
+                println!("  the sidecar analyzes but cannot embed; check OPENNLP_EMBEDDINGS_DIR");
+                std::process::exit(1);
+            }
+        }
+    }
     Ok(())
 }
