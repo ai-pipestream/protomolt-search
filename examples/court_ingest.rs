@@ -90,20 +90,88 @@ fn load_case_names(path: &str) -> Result<std::collections::HashMap<u64, String>,
     Ok(map)
 }
 
-/// The extra-field entries for one chunk: a case_name DocumentField
-/// when the cluster map knows the chunk's cluster.
+/// One extra column over the SAME body text, under its own analysis:
+/// the A/B unit.
+///
+/// Comparing two analysis chains normally costs two indexes and two
+/// ingests, which at corpus scale is hours and hundreds of GB. Multi-field
+/// BM25 already gives every field its own postings over one shared slot
+/// space, so the same text indexed twice under different specs is two
+/// columns of ONE index, and the comparison becomes a query-time choice of
+/// which field to score. Both columns see byte-identical input and
+/// identical ids, which is exactly the control a text-scrub or
+/// re-chunk experiment cannot offer.
+///
+/// Cost is the honest catch: a body column is most of the postings, so
+/// each one roughly adds the whole `.bm25` again. Slices, not corpora.
+struct BodyColumn {
+    field: String,
+    spec: AnalysisSpec,
+}
+
+/// Parses `--body-columns=name:tokenizer:stemmer:source,...` (numeric
+/// sidecar enum values, matching AnalysisSpec's passthrough), each an
+/// extra copy of the body under that spec. The stored body itself is
+/// always field 0 and is NOT named here.
+fn parse_body_columns(spec: &str) -> Result<Vec<BodyColumn>, String> {
+    let mut out = Vec::new();
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.len() != 4 {
+            return Err(format!(
+                "--body-columns entry {entry:?}: expected name:tokenizer:stemmer:source"
+            ));
+        }
+        let num = |i: usize, what: &str| -> Result<i32, String> {
+            parts[i]
+                .parse()
+                .map_err(|e| format!("--body-columns entry {entry:?}: {what}: {e}"))
+        };
+        let field = parts[0].to_string();
+        if field == "body" {
+            return Err("--body-columns cannot redefine \"body\": it is field 0, \
+                        ingested under --analysis"
+                .to_string());
+        }
+        out.push(BodyColumn {
+            field,
+            spec: AnalysisSpec {
+                tokenizer: num(1, "tokenizer")?,
+                stemmer: num(2, "stemmer")?,
+                term_vector_mode: 1,
+                term_vector_source: num(3, "source")?,
+                normalizer_rungs: Vec::new(),
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// The extra-field entries for one chunk: every A/B body column over the
+/// chunk's own text, then a case_name DocumentField when the cluster map
+/// knows the chunk's cluster.
 fn chunk_fields(
     case_names: &Option<std::sync::Arc<std::collections::HashMap<u64, String>>>,
     cluster_id: u64,
+    body_columns: &[BodyColumn],
+    text: &str,
 ) -> Vec<DocumentField> {
-    match case_names.as_ref().and_then(|m| m.get(&cluster_id)) {
-        Some(name) => vec![DocumentField {
+    let mut fields: Vec<DocumentField> = body_columns
+        .iter()
+        .map(|c| DocumentField {
+            field: c.field.clone(),
+            text: text.to_string(),
+            analysis: Some(c.spec.clone()),
+        })
+        .collect();
+    if let Some(name) = case_names.as_ref().and_then(|m| m.get(&cluster_id)) {
+        fields.push(DocumentField {
             field: "case_name".to_string(),
             text: name.clone(),
             analysis: Some(case_name_spec()),
-        }],
-        None => Vec::new(),
+        });
     }
+    fields
 }
 
 /// Sequential reader over an embeddings-file block starting at record
@@ -235,6 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "" => None,
             path => Some(std::sync::Arc::new(load_case_names(path)?)),
         };
+    let body_columns = std::sync::Arc::new(parse_body_columns(&arg("body-columns", ""))?);
 
     // --- Load and join chunks x embeddings -------------------------------
     let t0 = Instant::now();
@@ -341,6 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = addr.clone();
         let spec = spec.clone();
         let case_names = case_names.clone();
+        let body_columns = body_columns.clone();
         ingest_tasks.push(tokio::spawn(async move {
             let n = block.len();
             // Documents first so doc ids and vector slots align 1:1.
@@ -360,7 +430,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             span_start: chunk.span_start,
                             span_end: chunk.span_end,
                         }),
-                        fields: chunk_fields(&case_names, chunk.cluster_id),
+                        fields: chunk_fields(
+                            &case_names,
+                            chunk.cluster_id,
+                            &body_columns,
+                            &chunk.text,
+                        ),
                     })
                     .await
                     .unwrap();
@@ -509,6 +584,9 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
             "" => None,
             path => Some(std::sync::Arc::new(load_case_names(path)?)),
         };
+    // Extra A/B columns over the same body text (--body-columns). Nodes
+    // must carry these names in --bm25-fields, in this order, after body.
+    let body_columns = std::sync::Arc::new(parse_body_columns(&arg("body-columns", ""))?);
     // Bandwidth-proportional fleets need unequal shards: explicit split
     // points (chunk indexes, ascending, exclusive ends; the last shard
     // runs to the corpus end) override the equal m/n block math.
@@ -650,6 +728,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
             let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(256);
             let spec2 = spec.clone();
             let case_names2 = case_names.clone();
+            let body_columns2 = body_columns.clone();
             let cp = chunks_path.clone();
             let ep = embeddings_path.clone();
             let feeder = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -675,6 +754,10 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                             chunk.opinion_id, chunk.ordinal, key.0, key.1
                         ));
                     }
+                    // The extra columns index the same bytes, so build
+                    // them before the body text moves into the request.
+                    let fields =
+                        chunk_fields(&case_names2, chunk.cluster_id, &body_columns2, &chunk.text);
                     tx.blocking_send(AddDocumentsRequest {
                         text: chunk.text,
                         analysis: Some(spec2.clone()),
@@ -684,7 +767,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                             span_start: chunk.span_start,
                             span_end: chunk.span_end,
                         }),
-                        fields: chunk_fields(&case_names2, chunk.cluster_id),
+                        fields,
                     })
                     .map_err(|e| e.to_string())?;
                     sent += 1;

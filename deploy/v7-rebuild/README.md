@@ -145,6 +145,44 @@ Ingest takes vectors from the embeddings file, so a sidecar started
 without `OPENNLP_EMBEDDINGS_DIR` builds a perfectly good index and then
 cannot embed a single query. `rebuild.sh` always sets it.
 
+## A/B-ing an analysis change without a second rebuild
+
+Any change to term identity (tokenizer, stemmer, normalizer, term source)
+invalidates the BM25 index, and a second full rebuild peaks at ~840 GB
+against a 674 GB finished set: you cannot hold both. That makes "just try
+it and compare" prohibitively expensive at corpus scale.
+
+Multi-field BM25 dissolves this. Every field gets its own postings over
+one shared slot space, so the same body text can be indexed twice under
+different analysis as two COLUMNS of one index, and the comparison
+becomes a query-time choice of which field to score. Both columns see
+byte-identical input and identical ids, which is a cleaner control than
+two separate ingests could give.
+
+```bash
+OUT=/work/court-corpus/ab-slice SHARDS=2 \
+FIELDS=body,body_norm,case_name BODY_COLUMNS=body_norm:1:2:3 \
+  ./rebuild.sh up calibrate ingest down serve
+```
+
+`body` keeps the corpus spec (whitespace, porter, SOURCE_STEMS) and
+`body_norm` takes SOURCE_NORMALIZED_STEMS, which runs the normalizer rung
+chain before the stemmer. Query one field, then the other, over the same
+documents.
+
+The catch is honest: a body column is most of the postings, so each one
+roughly adds the whole `.bm25` again. Run this on a slice (`SHARDS=2`
+over a 1M-chunk corpus is minutes of ingest), then let the winner ride
+the full rebuild alone.
+
+Why this matters for THIS corpus: under `SOURCE_STEMS` the Porter stemmer
+only transforms lower-case input, so `COURT` is indexed as its literal
+surface form while `court` stems normally. A caption reading "SUPREME
+COURT OF THE UNITED STATES" and the query "supreme court certiorari
+united states" share exactly one term. `SOURCE_NORMALIZED_STEMS` folds
+first and they share all five. That is a term-identity claim, not a
+relevance claim, which is exactly what the A/B is for.
+
 ## Rollback
 
 The previous shard set is on the NAS at

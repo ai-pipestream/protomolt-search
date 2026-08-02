@@ -27,7 +27,7 @@
 #   OUT, CHUNKS, EMB, CASE_NAMES, SHARDS, DIM, BLOCK, CHUNK_BLOCKS,
 #   FIELDS, PORT_BASE, COORD_PORT, SIDECAR_PORT, SIDECAR_BIN,
 #   OFFSET_STRIDE, EMBEDDINGS_DIR, BIN, INGEST,
-#   WAVE (shards ingesting at once), DISK_MARGIN_GB
+#   WAVE (shards ingesting at once), DISK_MARGIN_GB, BODY_COLUMNS
 #
 set -euo pipefail
 
@@ -42,6 +42,18 @@ DIM=${DIM:-256}
 BLOCK=${BLOCK:-8192}
 CHUNK_BLOCKS=${CHUNK_BLOCKS:-8192}
 FIELDS=${FIELDS:-body,case_name}
+# A/B columns: extra copies of the body text under different analysis,
+# as extra BM25 fields over the SAME slot space, so comparing two
+# analysis chains is a query-time choice of field rather than a second
+# index. Format: name:tokenizer:stemmer:source,... (numeric sidecar enum
+# values). Every name listed here must also appear in FIELDS, after
+# "body" and before "case_name". A body column costs roughly another
+# whole .bm25, so this is for slices, not for the full corpus.
+#
+#   FIELDS=body,body_norm,case_name BODY_COLUMNS=body_norm:1:2:3
+#
+# (source 3 = SOURCE_NORMALIZED_STEMS: rungs run, then the stemmer.)
+BODY_COLUMNS=${BODY_COLUMNS:-}
 PORT_BASE=${PORT_BASE:-59300}
 COORD_PORT=${COORD_PORT:-59291}
 SIDECAR_PORT=${SIDECAR_PORT:-59202}
@@ -306,6 +318,7 @@ stage_ingest() {
       "$INGEST" --nodes="$NODE_LIST" \
         --chunks="$CHUNKS" --embeddings="$EMB" \
         --case-names="$CASE_NAMES" \
+        ${BODY_COLUMNS:+--body-columns="$BODY_COLUMNS"} \
         --chunk-count="$M" \
         --split-points="$SPLITS" \
         --calibration="$OUT/calibration.json" \
