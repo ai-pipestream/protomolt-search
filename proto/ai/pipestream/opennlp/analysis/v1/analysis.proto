@@ -505,9 +505,11 @@ message TermVectorOptions {
 
     // Spells out a whole-token symbol joiner ("&" -> "and"), so a document
     // writing "Dungeons & Dragons" and a query writing "dungeons and dragons"
-    // agree on term identity. Only a token consisting of exactly the symbol
-    // is rewritten; symbols embedded in a larger token ("R&D", "AT&T") are
-    // left alone.
+    // agree on term identity. The table covers the standalone joiners
+    // (&, +, @), unit and legal reference marks (%, section sign, pilcrow,
+    // degree), and IP marks (copyright, registered, trademark). Only a token
+    // consisting of exactly the symbol is rewritten; symbols embedded in a
+    // larger token ("R&D", "AT&T", "TSR®") are left alone.
     NORMALIZER_STEP_SYMBOL_JOINER = 22;
 
     // SymSpell spell correction of each token ("dargons" -> "dragons"),
