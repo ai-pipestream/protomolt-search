@@ -282,9 +282,17 @@ are comparable end to end, by construction.
 4. Wire + WAL + ingest + reshard replay; corpus extraction grows a second
    real field (case name from the cluster metadata) to have something
    honest to score. This step lands as part of the v7 rebuild event:
-   vector v7 re-encode from the raw embeddings, lexical v6 from WAL
-   replay, block-aligned shard cuts (multiples of 8192). LANDED (the
-   engine wire; the corpus re-ingest itself IS the rebuild event):
+   vector v7 re-encode from the raw embeddings, lexical v6, block-aligned
+   shard cuts (multiples of 8192). NOTE on the replay path: an existing
+   WAL cannot carry this step's payload, because its records predate
+   `DocumentField` and replay body-only by construction — a WAL replay
+   would rebuild the corpus with `case_name` missing. The rebuild
+   therefore re-ingests from the chunk texts, which is the same work
+   (replay re-analyzes every document anyway) and picks the field up
+   natively; WAL replay stays the migration lever for shape changes that
+   do not add a field. See `deploy/v7-rebuild/` for the runbook and the
+   measured disk model. LANDED (the engine wire; the corpus re-ingest
+   itself IS the rebuild event):
    `DocumentField` on AddDocumentsRequest (the WAL's durable record, so
    old logs replay body-only and reshard replay is the migration
    lever), per-field TermStats shares, fused `Bm25FieldLeg` legs on

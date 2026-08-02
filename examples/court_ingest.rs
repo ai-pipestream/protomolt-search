@@ -153,6 +153,63 @@ impl EmbBlock {
     }
 }
 
+/// A fitted TQ+ seed calibration, shared between the drivers of one
+/// rebuild (`--calibration=<path>`). Fitting streams the whole
+/// embeddings file, so N parallel drivers would otherwise read it N
+/// times to arrive at the same numbers.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CalibrationFile {
+    dim: usize,
+    bit_width: usize,
+    shift: Vec<f32>,
+    scale: Vec<f32>,
+}
+
+/// Load `path` when it exists, else fit from the embeddings file's
+/// stride sample and write it (temp file + rename, so a concurrent
+/// reader never sees a partial fit).
+fn load_or_fit_calibration(
+    path: &str,
+    embeddings_path: &str,
+    dim: usize,
+) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+    if !path.is_empty() && std::path::Path::new(path).exists() {
+        let text = std::fs::read_to_string(path)?;
+        let file: CalibrationFile = serde_json::from_str(&text)?;
+        if file.dim != dim {
+            return Err(format!("{path}: calibration dim {} != corpus dim {dim}", file.dim).into());
+        }
+        eprintln!("calibration loaded from {path}");
+        return Ok((file.shift, file.scale));
+    }
+    let (_, reader) = court::EmbeddingReader::open(std::path::Path::new(embeddings_path))?;
+    let mut sample: Vec<f32> = Vec::new();
+    for (i, record) in reader.enumerate() {
+        let record = record?;
+        if i % 300 == 0 {
+            sample.extend_from_slice(&record.vector);
+        }
+    }
+    let (shift, scale) = harness::fit_calibration(dim, 4, &sample);
+    eprintln!(
+        "calibration fitted on {} sample vectors",
+        sample.len() / dim
+    );
+    if !path.is_empty() {
+        let text = serde_json::to_string(&CalibrationFile {
+            dim,
+            bit_width: 4,
+            shift: shift.clone(),
+            scale: scale.clone(),
+        })?;
+        let tmp = format!("{path}.tmp{}", std::process::id());
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)?;
+        eprintln!("calibration written to {path}");
+    }
+    Ok((shift, scale))
+}
+
 /// Remote-shard mode: stream the chunks and embeddings files shard by
 /// shard into already-running nodes (`--nodes`), instead of building the
 /// join in memory. Nothing is buffered beyond the channel window, so the
@@ -478,10 +535,26 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     // integrity check (chunk count == embedding count). Vectors-only
     // ingest reads the count straight off the fixed-stride embeddings
     // file instead of walking the chunks file.
-    let m = if vectors_only {
+    // `--chunk-count=<m>` skips the counting walk, which reads the whole
+    // chunks file (a rebuild's N parallel drivers would each pay it to
+    // learn the same number). Correctness does not rest on the walk: the
+    // doc feeder asserts (opinion_id, ordinal) equality at EVERY position
+    // against the embeddings file, and each shard asserts it sent exactly
+    // its share, so a wrong count cannot silently mis-join — it fails the
+    // ingest. The plan stage prints the count to pass here.
+    let declared_count: usize = arg("chunk-count", "0").parse()?;
+    let m = if vectors_only || declared_count > 0 {
         let (dim_probe, _) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
         let rec = 12 + dim_probe as u64 * 4;
-        ((std::fs::metadata(&embeddings_path)?.len() - 12) / rec) as usize
+        let from_file = ((std::fs::metadata(&embeddings_path)?.len() - 12) / rec) as usize;
+        if declared_count > 0 && declared_count != from_file {
+            return Err(format!(
+                "--chunk-count={declared_count} disagrees with the embeddings file's \
+                 {from_file} records"
+            )
+            .into());
+        }
+        from_file
     } else {
         let mut m = 0usize;
         for chunk in court::read_chunks(std::path::Path::new(&chunks_path))? {
@@ -518,21 +591,22 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
          this driver handles shards {first_shard}..{end_shard}"
     );
 
-    // Calibration: stride sample streamed from the embeddings file.
-    let (dim, reader) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
+    // Calibration: stride sample streamed from the embeddings file, or
+    // the shared fit at --calibration=<path>. With per-block (v7)
+    // calibration this is only the SEED every block starts from — a
+    // sealed 8192-row block refits on its own rows — so it survives as
+    // the open block's fit and as the precondition AddVectors checks.
+    let (dim, _) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
     let dim = dim as usize;
-    let mut sample: Vec<f32> = Vec::new();
-    for (i, record) in reader.enumerate() {
-        let record = record?;
-        if i % 300 == 0 {
-            sample.extend_from_slice(&record.vector);
-        }
+    let calibration_path = arg("calibration", "");
+    let (shift, scale) = load_or_fit_calibration(&calibration_path, &embeddings_path, dim)?;
+    // `--fit-only` stops here: one driver fits and publishes the file,
+    // then the per-shard drivers all load it instead of re-streaming the
+    // embeddings file once each.
+    if std::env::args().any(|a| a == "--fit-only") {
+        eprintln!("--fit-only: calibration ready, no shards touched");
+        return Ok(());
     }
-    let (shift, scale) = harness::fit_calibration(dim, 4, &sample);
-    eprintln!(
-        "calibration fitted on {} sample vectors",
-        sample.len() / dim
-    );
 
     // Broadcast only to this driver's range: nodes outside it may already
     // hold vectors (another driver's shards), where SetCalibration is a
