@@ -974,7 +974,10 @@ message Bm25SearchRequest {
   // these entries REPLACE the flat single-field query. `text` is
   // analyzed once per entry under that entry's analysis and scored
   // against its field; the fused score is the weighted per-field sum,
-  // accumulated in entry order. `analysis` (field 3) is then ignored.
+  // accumulated in entry order. Setting `analysis` (field 3) as well is
+  // REFUSED rather than ignored: a caller that set it meant it, and
+  // quietly dropping it runs the query under the sidecar's default
+  // analysis, whose terms need not exist in the index at all.
   repeated QueryField fields = 5;
 }
 

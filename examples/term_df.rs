@@ -69,12 +69,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut dfs = vec![0u64; terms.len()];
+    let mut legacy_dfs = vec![0u64; terms.len()];
     let mut doc_count = 0u64;
+    // Both stat surfaces in one round: the legacy body totals that
+    // `fanout_bm25_seeded` scores with, and the per-field shares that
+    // `fanout_bm25_fused` scores with. They feed the SAME idf and avgdl
+    // for the body field, so any disagreement means the two query paths
+    // are scoring the same corpus differently.
+    let mut total_len = 0u64;
+    let mut field_len = 0u64;
     for node in &nodes {
         let mut client = NodeServiceClient::connect(node.clone()).await?;
         let r = client
             .term_stats(TermStatsRequest {
-                terms: Vec::new(),
+                terms: terms.clone(),
                 fields: vec![FieldTerms {
                     field: field.clone(),
                     terms: terms.clone(),
@@ -83,7 +91,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?
             .into_inner();
         doc_count += r.doc_count;
+        total_len += r.total_doc_length;
+        for (acc, df) in legacy_dfs.iter_mut().zip(&r.doc_frequencies) {
+            *acc += u64::from(*df);
+        }
         if let Some(fs) = r.field_stats.first() {
+            field_len += fs.total_doc_length;
             for (acc, df) in dfs.iter_mut().zip(&fs.doc_frequencies) {
                 *acc += u64::from(*df);
             }
@@ -91,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("field {field:?}, {doc_count} documents across {} shards", nodes.len());
-    println!("  {:<16} {:>14} {:>8}   {}", "term", "df", "% corpus", "cost");
+    println!("  {:<16} {:>14} {:>8}   cost", "term", "df", "% corpus");
     let mut order: Vec<usize> = (0..terms.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(dfs[i]));
     let mut total = 0u64;
@@ -111,5 +124,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {:<16} {:>14} {:>7.1}%   {note}", terms[i], dfs[i], pct);
     }
     println!("  {:<16} {:>14}  postings the scorer must consider", "TOTAL", total);
+
+    let avg = |len: u64| len as f64 / doc_count.max(1) as f64;
+    println!("\n  stat surface        total_doc_length        avgdl   used by");
+    println!(
+        "  legacy body         {total_len:>16} {:>12.2}   Bm25Search with no fields (seeded)",
+        avg(total_len)
+    );
+    println!(
+        "  field {field:<14}{field_len:>16} {:>12.2}   Bm25Search with fields (fused), hybrid",
+        avg(field_len)
+    );
+    if total_len != field_len || legacy_dfs != dfs {
+        // Same field, same corpus: the two surfaces must agree, or the
+        // two query paths are scoring different corpora and every
+        // comparison between them is meaningless.
+        println!(
+            "\n  MISMATCH: the two paths do not agree about {field:?}.\n  \
+             df legacy {legacy_dfs:?}\n  df field  {dfs:?}"
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }

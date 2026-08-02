@@ -18,15 +18,41 @@
 //! ab --arm=body-only=body --arm=caption=body+case_name:3 --query="smith"
 //! ```
 //!
-//! Analysis is left unset, so every field is queried with the
-//! coordinator's configured spec. That is the correct default here: term
-//! identity is per field and was fixed at ingest, so an arm comparing two
-//! COLUMNS is already comparing two analyses.
+//! An arm may carry `@key=value` options after its fields. `@k1=` and
+//! `@b=` override the BM25 parameters, which is how a length
+//! normalization sweep is run without reindexing anything:
+//!
+//! ```text
+//! ab --arm=default=body --arm=flat=body@b=0.3 --queries=...
+//! ```
+//!
+//! The literal field name `hybrid` selects the hybrid path instead of the
+//! lexical one, where `@fusion=` picks the strategy. This needs a query
+//! vector, so `--analysis-addr` must point at the embedding sidecar:
+//!
+//! ```text
+//! ab --arm=cascade=hybrid@fusion=cascade \
+//!    --arm=two-level=hybrid@fusion=two_level --queries=...
+//! ```
+//!
+//! Every arm is queried with the BODY FIELD'S INGEST ANALYSIS by
+//! default, because term identity is fixed at ingest: the analysis
+//! sidecar's own default does not stem, so querying this index with it
+//! matches only the tokens that happen to equal their own stem and
+//! silently reports the ranking of that fragment. `--analysis=server`
+//! leaves the spec unset for callers that want the sidecar default.
+//!
+//! An arm comparing two COLUMNS indexed under DIFFERENT analyses cannot
+//! be expressed by either: each column needs its own spec, and this flag
+//! sets one for all of them.
 
+use std::time::Instant;
+
+use turbovec_search::analyzer;
 use turbovec_search::pb::search_service_client::SearchServiceClient;
 use turbovec_search::pb::{
-    search_variant, Bm25SearchRequest, InterleaveTeam, QueryField, SearchVariant,
-    VariantSearchRequest,
+    search_variant, AnalysisSpec, Bm25SearchRequest, FusionMode, HybridLegOptions,
+    HybridSearchRequest, InterleaveTeam, QueryField, SearchVariant, VariantSearchRequest,
 };
 
 fn arg(key: &str, default: &str) -> String {
@@ -48,13 +74,229 @@ fn args_all(key: &str) -> Vec<String> {
         .collect()
 }
 
-/// `label=field[:weight][+field[:weight]...]`
-fn parse_arm(spec: &str, text: &str) -> Result<SearchVariant, String> {
-    let (label, fields) = spec
+/// The body field's ingest analysis, for `--analysis=ingest`.
+fn body_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        tokenizer: 1,
+        stemmer: 2,
+        term_vector_mode: 1,
+        term_vector_source: 2,
+        normalizer_rungs: vec![],
+    }
+}
+
+/// The unit an arm's scores are expressed in.
+///
+/// `score_regret` subtracts one arm's score from another's, which is a
+/// number only when both came out of the same scoring function. Raw BM25,
+/// an RRF rank sum, a normalized blend and a weighted fused sum are four
+/// different units; differencing across them yields a value that formats
+/// perfectly and means nothing. Arms carry their unit so the report can
+/// refuse the subtraction instead of printing that value.
+#[derive(PartialEq, Clone, Debug)]
+enum Scale {
+    /// Raw BM25 over the given normalized field spec.
+    Bm25(String),
+    /// Reciprocal rank fusion (GLOBAL_RANK, TWO_LEVEL).
+    Rrf,
+    /// Normalized-and-combined leg scores (SCORE_BLEND).
+    Blend,
+    /// Raw weighted sum of the legs (DECOMPOSED).
+    FusedSum,
+    /// Cascade reports the reranked BM25 score of a vector-gated pool.
+    /// Not [`Scale::Bm25`]: the same document can be absent here for
+    /// want of vector recall, so the two are the same unit over
+    /// different populations, and only a same-mode pair is safe.
+    CascadeBm25,
+}
+
+impl std::fmt::Display for Scale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Scale::Bm25(spec) => write!(f, "bm25({spec})"),
+            Scale::Rrf => write!(f, "rrf"),
+            Scale::Blend => write!(f, "blend"),
+            Scale::FusedSum => write!(f, "fused-sum"),
+            Scale::CascadeBm25 => write!(f, "cascade-bm25"),
+        }
+    }
+}
+
+/// One configuration under test: everything except the query text, which
+/// changes per query while the arm does not.
+struct Arm {
+    label: String,
+    /// Lexical arm: the fields to score. Empty means the default
+    /// single-field route (`fanout_bm25_seeded`) rather than the fused
+    /// multi-field one — a different code path over the same body
+    /// postings, which is worth being able to name as an arm.
+    fields: Vec<QueryField>,
+    /// Hybrid arm: the leg options. `None` for a lexical arm.
+    legs: Option<HybridLegOptions>,
+    /// Seeded lexical floor, forwarded to every shard. 0 = unseeded.
+    min_score: f32,
+    scale: Scale,
+}
+
+impl Arm {
+    fn is_hybrid(&self) -> bool {
+        self.legs.is_some()
+    }
+
+    fn build(&self, text: &str, vector: &[f32], analysis: Option<&AnalysisSpec>) -> SearchVariant {
+        let query = match &self.legs {
+            Some(legs) => search_variant::Query::Hybrid(HybridSearchRequest {
+                request_id: String::new(),
+                text: text.to_string(),
+                vector: vector.to_vec(),
+                k: 0, // the request's shared k wins
+                analysis: analysis.cloned(),
+                legs: Some(*legs),
+                debug: false,
+                boost: None,
+            }),
+            None => search_variant::Query::Bm25(Bm25SearchRequest {
+                text: text.to_string(),
+                k: 0,
+                // Request-level analysis reaches the single-field route
+                // only; a fused request carries the spec PER FIELD, and
+                // setting both is refused. Put it where it is read.
+                analysis: self.fields.is_empty().then(|| analysis.cloned()).flatten(),
+                min_score: self.min_score,
+                fields: self
+                    .fields
+                    .iter()
+                    .map(|f| QueryField {
+                        analysis: analysis.cloned(),
+                        ..f.clone()
+                    })
+                    .collect(),
+            }),
+        };
+        SearchVariant {
+            label: self.label.clone(),
+            query: Some(query),
+        }
+    }
+}
+
+fn parse_fusion(v: &str) -> Result<(FusionMode, Scale), String> {
+    Ok(match v.replace('-', "_").as_str() {
+        "cascade" => (FusionMode::Cascade, Scale::CascadeBm25),
+        "global_rank" | "global" => (FusionMode::GlobalRank, Scale::Rrf),
+        "two_level" => (FusionMode::TwoLevel, Scale::Rrf),
+        "score_blend" | "blend" => (FusionMode::ScoreBlend, Scale::Blend),
+        "decomposed" => (FusionMode::Decomposed, Scale::FusedSum),
+        other => {
+            return Err(format!(
+                "unknown fusion mode {other:?}; expected one of \
+                 cascade, global_rank, two_level, score_blend, decomposed"
+            ))
+        }
+    })
+}
+
+/// `label=field[:weight][+field[:weight]...][@key=value...]`, or
+/// `label=hybrid[@key=value...]`.
+fn parse_arm(spec: &str) -> Result<Arm, String> {
+    let (label, rest) = spec
         .split_once('=')
         .ok_or_else(|| format!("arm {spec:?}: expected label=field[+field...]"))?;
     if label.is_empty() {
         return Err(format!("arm {spec:?}: empty label"));
+    }
+    let mut parts = rest.split('@');
+    let fields = parts.next().unwrap_or_default();
+    let mut opts: Vec<(String, String)> = Vec::new();
+    for o in parts {
+        let (k, v) = o
+            .split_once('=')
+            .ok_or_else(|| format!("arm {label}: option {o:?}: expected key=value"))?;
+        opts.push((k.to_string(), v.to_string()));
+    }
+    let num = |k: &str, v: &str| -> Result<f32, String> {
+        v.parse::<f32>()
+            .map_err(|e| format!("arm {label}: {k}={v:?}: {e}"))
+    };
+
+    if fields == "hybrid" {
+        let mut legs = HybridLegOptions::default();
+        // Absent fusion resolves to CASCADE at the server. Requiring it
+        // keeps the arm's label honest about what actually ran: the
+        // whole point of this comparison is which mode is which.
+        let mut scale = None;
+        for (k, v) in &opts {
+            match k.as_str() {
+                "fusion" => {
+                    let (mode, s) = parse_fusion(v).map_err(|e| format!("arm {label}: {e}"))?;
+                    legs.fusion_mode = mode as i32;
+                    scale = Some(s);
+                }
+                "leg_k" => {
+                    legs.leg_k = v
+                        .parse()
+                        .map_err(|e| format!("arm {label}: leg_k={v:?}: {e}"))?
+                }
+                "vw" => legs.vector_weight = Some(num(k, v)?),
+                "bw" => legs.bm25_weight = Some(num(k, v)?),
+                // Silently ignoring a misplaced knob would report a
+                // comparison of two identical arms as "no difference".
+                "k1" | "b" | "min_score" => {
+                    return Err(format!(
+                        "arm {label}: @{k} is a lexical parameter and the hybrid \
+                         request has nowhere to put it. Sweep {k} on a lexical arm."
+                    ))
+                }
+                other => return Err(format!("arm {label}: unknown option {other:?}")),
+            }
+        }
+        let scale = scale.ok_or_else(|| {
+            format!("arm {label}: hybrid arms need @fusion=<mode>; an unset mode resolves to cascade at the server, which makes the arm's label a guess")
+        })?;
+        return Ok(Arm {
+            label: label.to_string(),
+            fields: Vec::new(),
+            legs: Some(legs),
+            min_score: 0.0,
+            scale,
+        });
+    }
+
+    let (mut k1, mut b) = (0.0f32, 0.0f32);
+    let mut min_score = 0.0f32;
+    for (k, v) in &opts {
+        match k.as_str() {
+            "k1" => k1 = num(k, v)?,
+            "b" => b = num(k, v)?,
+            "min_score" => min_score = num(k, v)?,
+            "fusion" | "leg_k" | "vw" | "bw" => {
+                return Err(format!(
+                    "arm {label}: @{k} is a hybrid option, but this arm scores \
+                     fields directly. Write the field list as `hybrid` to use \
+                     the fused path."
+                ))
+            }
+            other => return Err(format!("arm {label}: unknown option {other:?}")),
+        }
+    }
+    // The reserved spelling `default` sends NO field list, which is what
+    // routes a query to `fanout_bm25_seeded`. Naming it as an arm is the
+    // only way to A/B the deployed single-field route against the fused
+    // multi-field one on the same postings.
+    if fields == "default" {
+        if k1 != 0.0 || b != 0.0 {
+            return Err(format!(
+                "arm {label}: @k1/@b are per-field parameters and the `default` route \
+                 sends no field list. Write the field name instead."
+            ));
+        }
+        return Ok(Arm {
+            label: label.to_string(),
+            fields: Vec::new(),
+            legs: None,
+            min_score,
+            scale: Scale::Bm25("default-route".to_string()),
+        });
     }
     let mut query_fields = Vec::new();
     for part in fields.split('+') {
@@ -73,19 +315,24 @@ fn parse_arm(spec: &str, text: &str) -> Result<SearchVariant, String> {
             field: name.to_string(),
             analysis: None,
             weight,
-            k1: 0.0,
-            b: 0.0,
+            k1,
+            b,
         });
     }
-    Ok(SearchVariant {
+    // The scale identity includes k1/b: the same field at two different
+    // b values is two different scoring functions, and their scores are
+    // no more subtractable than BM25 and RRF are.
+    let ident = query_fields
+        .iter()
+        .map(|f| format!("{}:{}:{}:{}", f.field, f.weight, f.k1, f.b))
+        .collect::<Vec<_>>()
+        .join("+");
+    Ok(Arm {
         label: label.to_string(),
-        query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
-            text: text.to_string(),
-            k: 0, // the request's shared k wins
-            analysis: None,
-            min_score: 0.0,
-            fields: query_fields,
-        })),
+        fields: query_fields,
+        legs: None,
+        min_score,
+        scale: Scale::Bm25(ident),
     })
 }
 
@@ -96,6 +343,47 @@ fn parse_arm(spec: &str, text: &str) -> Result<SearchVariant, String> {
 /// analysis chains needs the aggregate, and the SPREAD matters as much as
 /// the mean -- a chain that helps half the queries and hurts the other
 /// half averages to "no change" and is not that.
+/// Per-arm cost, which is half of what a mode comparison is asked.
+///
+/// `elapsed_ms` comes from the server, where the arms run sequentially,
+/// so it is the arm's own time rather than a measure of how hard the
+/// other arms were hitting the same shards.
+#[derive(Default)]
+struct ArmObs {
+    ms: Vec<f64>,
+    hits: usize,
+    empty: usize,
+}
+
+impl ArmObs {
+    fn report(&self, label: &str, scale: &Scale, queries: usize) {
+        let mut ms = self.ms.clone();
+        ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+        let p = |q: usize| -> f64 {
+            if ms.is_empty() {
+                return f64::NAN;
+            }
+            ms[(ms.len() * q / 100).min(ms.len() - 1)]
+        };
+        println!(
+            "  {label:<14} p50 {:7.1}  p90 {:7.1}  p99 {:7.1}  max {:7.1}   {:.1} hits/query  [{scale}]",
+            p(50),
+            p(90),
+            p(99),
+            ms.last().copied().unwrap_or(f64::NAN),
+            self.hits as f64 / queries.max(1) as f64,
+        );
+        if self.empty > 0 {
+            // An arm that matches nothing is fast for the wrong reason.
+            println!(
+                "  {:<14} {} of {queries} queries returned NO HITS -- those timings are \
+                 the cost of finding nothing",
+                "", self.empty
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct Totals {
     queries: usize,
@@ -144,12 +432,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let specs = args_all("arm");
     if specs.len() < 2 {
         eprintln!(
-            "need at least two --arm=label=field[+field:weight] (got {})\n\
-             example: --arm=control=body --arm=folded=body_norm",
+            "need at least two --arm=label=field[+field:weight][@k=v] (got {})\n\
+             example: --arm=control=body --arm=folded=body_norm\n\
+             example: --arm=cascade=hybrid@fusion=cascade --arm=gr=hybrid@fusion=global_rank",
             specs.len()
         );
         std::process::exit(2);
     }
+    let arms: Vec<Arm> = specs
+        .iter()
+        .map(|s| parse_arm(s))
+        .collect::<Result<_, String>>()?;
     let queries: Vec<String> = match arg("queries", "").as_str() {
         "" => vec![arg("query", "supreme court certiorari")],
         path => std::fs::read_to_string(path)?
@@ -163,7 +456,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("no queries");
         std::process::exit(2);
     }
+
+    // Default to the ingest spec, NOT the sidecar's default. Term
+    // identity is fixed at ingest: querying a stemmed index with the
+    // sidecar's unstemmed default silently drops most of the query and
+    // reports whatever the surviving tokens matched.
+    let analysis = match arg("analysis", "ingest").as_str() {
+        "server" => None,
+        "ingest" => Some(body_spec()),
+        other => {
+            eprintln!("--analysis={other:?}: expected `server` or `ingest`");
+            std::process::exit(2);
+        }
+    };
+    // Only pay for the sidecar when an arm actually needs a vector, so a
+    // purely lexical A/B still runs with no embedder in reach.
+    let needs_vector = arms.iter().any(Arm::is_hybrid);
+    let analysis_addr = arg("analysis-addr", "http://127.0.0.1:59202");
+    let mut embed_ms: Vec<f64> = Vec::new();
+
     let mut client = SearchServiceClient::connect(format!("http://{coord}")).await?;
+    let mut obs: Vec<ArmObs> = arms.iter().map(|_| ArmObs::default()).collect();
 
     // Query-set mode: per-query one-liners, then the aggregate.
     if queries.len() > 1 {
@@ -173,10 +486,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "query", "overlap", "tau-b", "rbo", "top1"
         );
         for q in &queries {
-            let variants: Vec<SearchVariant> = specs
+            let vector = if needs_vector {
+                let t = Instant::now();
+                let v = analyzer::embed_text(&analysis_addr, q).await?;
+                embed_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                v
+            } else {
+                Vec::new()
+            };
+            let variants: Vec<SearchVariant> = arms
                 .iter()
-                .map(|s| parse_arm(s, q))
-                .collect::<Result<_, _>>()?;
+                .map(|a| a.build(q, &vector, analysis.as_ref()))
+                .collect();
             let resp = client
                 .variant_search(VariantSearchRequest {
                     request_id: String::new(),
@@ -188,6 +509,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
                 .into_inner();
+            for (i, r) in resp.results.iter().enumerate() {
+                obs[i].ms.push(f64::from(r.elapsed_ms));
+                obs[i].hits += r.hits.len();
+                if r.hits.is_empty() {
+                    obs[i].empty += 1;
+                }
+            }
             for d in &resp.diffs {
                 if totals.iter().all(|(l, _)| *l != d.variant) {
                     totals.push((d.variant.clone(), Totals::default()));
@@ -214,6 +542,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        println!("\nper-arm cost over {} queries (server-side, arms run sequentially):", queries.len());
+        for (i, a) in arms.iter().enumerate() {
+            obs[i].report(&a.label, &a.scale, queries.len());
+        }
+        if !embed_ms.is_empty() {
+            embed_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+            println!(
+                "  {:<14} p50 {:7.1}  (once per query, shared by every hybrid arm, \
+                 excluded above)",
+                "embed",
+                embed_ms[embed_ms.len() / 2]
+            );
+        }
+
         println!("\nover {} queries:", queries.len());
         for (label, t) in &totals {
             let n = t.queries.max(1) as f64;
@@ -223,12 +565,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t.tau / n,
                 t.rbo / n
             );
+            // Same rule as the single-query table: regret only speaks
+            // when both arms scored the same way.
+            let same_scale = arms
+                .iter()
+                .find(|a| a.label == *label)
+                .is_some_and(|a| a.scale == arms[0].scale);
+            let regret_note = if same_scale {
+                format!("{} diverged past what regret can judge", t.diverged)
+            } else {
+                "regret N/A: this arm scores in a different unit than the reference".to_string()
+            };
             println!(
-                "  {:<width$} top-1 changed on {} of {}; {} diverged past what regret can judge",
+                "  {:<width$} top-1 changed on {} of {}; {regret_note}",
                 "",
                 t.flips,
                 t.queries,
-                t.diverged,
                 width = label.len() + 2
             );
             if t.incomparable > 0 {
@@ -261,10 +613,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let query = &queries[0];
-    let variants: Vec<SearchVariant> = specs
+    let vector = if needs_vector {
+        analyzer::embed_text(&analysis_addr, query).await?
+    } else {
+        Vec::new()
+    };
+    let variants: Vec<SearchVariant> = arms
         .iter()
-        .map(|s| parse_arm(s, query))
-        .collect::<Result<_, _>>()?;
+        .map(|a| a.build(query, &vector, analysis.as_ref()))
+        .collect();
     let resp = client
         .variant_search(VariantSearchRequest {
             request_id: String::new(),
@@ -287,7 +644,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[{}]  NO HITS -- this arm matched no document", r.label);
             continue;
         }
-        println!("[{}]  {} hits  {:.1} ms", r.label, r.hits.len(), r.elapsed_ms);
+        let scale = arms
+            .iter()
+            .find(|a| a.label == r.label)
+            .map(|a| a.scale.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "[{}]  {} hits  {:.1} ms  scores in {scale}",
+            r.label,
+            r.hits.len(),
+            r.elapsed_ms
+        );
         for (i, h) in r.hits.iter().enumerate() {
             println!("  {:>3}. {:<14} {:.6}", i + 1, h.doc_id, h.score);
         }
@@ -309,17 +676,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             continue;
         }
+        // Regret differences two arms' scores, which is only a quantity
+        // when both arms produced them the same way. Across scales the
+        // subtraction is unit-mixing, so print the reason rather than
+        // the number.
+        let variant_scale = arms
+            .iter()
+            .find(|a| a.label == d.variant)
+            .map(|a| a.scale.clone())
+            .expect("every diff names an arm we sent");
+        let comparable_scale = variant_scale == arms[0].scale;
+        let regret = if comparable_scale {
+            format!("{:8.4}", d.score_regret)
+        } else {
+            format!("{:>8}", "SCALE")
+        };
         println!(
-            "{:<20} {:>6} {:>7.0}% {:>8.3} {:>10.4} {:>8.4} {:>6}",
+            "{:<20} {:>6} {:>7.0}% {:>8.3} {:>10.4} {regret} {:>6}",
             d.variant,
             d.depth,
             d.overlap_fraction * 100.0,
             d.kendall_tau,
             d.rbo,
-            d.score_regret,
             if d.top1_flipped { "FLIP" } else { "same" },
         );
-        if d.regret_unscored > 0 {
+        if !comparable_scale {
+            println!(
+                "{:<20} arms score in different units ({} vs {variant_scale}); regret \
+                 would be a subtraction across scales. Read tau/rbo/overlap.",
+                "", arms[0].scale
+            );
+        }
+        if comparable_scale && d.regret_unscored > 0 {
             // Not folded into the mean: these are documents the reference
             // never scored, so regret genuinely cannot judge them. Their
             // presence also breaks the cancellation that makes regret's

@@ -1034,10 +1034,17 @@ pub fn top_k_fused_pruned_stats(
     for (oi, &(fi, ti)) in pair_meta.iter().enumerate() {
         let fq = &fields[fi];
         debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
-        if fq.stats.dfs[ti] == 0 {
+        // A (field, term) pair absent from THIS shard contributes 0 to
+        // every document here, so it is skipped rather than scored.
+        // `fq.stats.dfs` is the GLOBAL df, which is non-zero for a term
+        // that merely lives on another shard; checking it alone sends
+        // every such query down the exhaustive path.
+        if fq.stats.dfs[ti] == 0 || fq.index.df(&fq.terms[ti]) == 0 {
             continue;
         }
         let Some(cursor) = fq.index.impacts(&fq.terms[ti]) else {
+            // Present here but no impact surface: a genuine format
+            // limitation, and the only case that still forfeits pruning.
             return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
         };
         let avgdl = fq.stats.avgdl();

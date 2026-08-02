@@ -312,6 +312,12 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
+        // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
+        // route and the single-field route reach the same node scorer,
+        // so when they disagree by orders of magnitude the question is
+        // which phase, and that cannot be answered from outside.
+        let trace = std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
+        let t0 = std::time::Instant::now();
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
@@ -347,6 +353,7 @@ impl CoordinatorServiceImpl {
             }
             field_terms.push(terms);
         }
+        let t_analyzed = t0.elapsed();
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
             return Ok(Vec::new());
         }
@@ -423,6 +430,7 @@ impl CoordinatorServiceImpl {
                     .join(", ")
             )));
         }
+        let t_stats = t0.elapsed();
         // (c) Bm25Query fan-out with per-field legs in entry order.
         // Entry k1/b of 0 pick up the coordinator's configured params,
         // so tuning reaches this path too.
@@ -447,6 +455,16 @@ impl CoordinatorServiceImpl {
                 },
             })
             .collect();
+        if trace {
+            for l in &legs {
+                eprintln!(
+                    "bm25-fused leg: field={:?} terms={:?} dfs={:?} total_len={} w={} k1={} b={} \
+                     | req k={k} N={doc_count} min_score={min_score}",
+                    l.field, l.terms, l.global_doc_frequencies, l.global_total_doc_length,
+                    l.weight, l.k1, l.b
+                );
+            }
+        }
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
@@ -462,18 +480,35 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
-                client
-                    .bm25_query(request)
-                    .await
-                    .map(|r| (shard as u32, r.into_inner().hits))
+                let started = std::time::Instant::now();
+                client.bm25_query(request).await.map(|r| {
+                    (
+                        shard as u32,
+                        r.into_inner().hits,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    )
+                })
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut per_shard: Vec<(u32, f64)> = Vec::new();
         for task in query_tasks {
-            let (shard, hits) = task
+            let (shard, hits, ms) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            per_shard.push((shard, ms));
             all.extend(hits.into_iter().map(|h| (shard, h)));
+        }
+        let t_query = t0.elapsed();
+        if trace {
+            eprintln!(
+                "bm25-fused per-shard ms: {}",
+                per_shard
+                    .iter()
+                    .map(|(s, ms)| format!("{s}:{ms:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
         all.sort_by(|(sa, a), (sb, b)| {
             b.score
@@ -482,6 +517,19 @@ impl CoordinatorServiceImpl {
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         all.truncate(k as usize);
+        if trace {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "bm25-fused: analyze {:.1} ms, term-stats {:.1} ms, query fan-out {:.1} ms, \
+                 merge {:.1} ms  ({} fields, {} terms)",
+                ms(t_analyzed),
+                ms(t_stats - t_analyzed),
+                ms(t_query - t_stats),
+                ms(t0.elapsed() - t_query),
+                fields.len(),
+                field_terms.iter().map(Vec::len).sum::<usize>(),
+            );
+        }
         Ok(all.into_iter().map(|(_, h)| h).collect())
     }
 
@@ -2819,6 +2867,21 @@ impl SearchService for CoordinatorServiceImpl {
             self.fanout_bm25_seeded(&req.text, req.k, req.analysis.as_ref(), req.min_score)
                 .await?
         } else {
+            // `analysis` is documented as ignored once `fields` is set,
+            // because term identity is per field. Ignoring it QUIETLY is
+            // the trap: the caller believes it asked for the ingest
+            // analysis, every field falls back to the sidecar default,
+            // and the query runs against terms that do not exist in the
+            // index. That returns a confident ranking over whichever
+            // tokens happened to survive, so it does not look like a
+            // failure -- it looks like bad relevance.
+            if req.analysis.is_some() {
+                return Err(Status::invalid_argument(
+                    "Bm25SearchRequest.analysis is ignored when `fields` is set (term identity \
+                     is per field). Move the spec onto each QueryField.analysis, or drop \
+                     `fields` to use the single-field route.",
+                ));
+            }
             self.fanout_bm25_fused(&req.text, req.k, &req.fields, req.min_score)
                 .await?
         };

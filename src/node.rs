@@ -1436,7 +1436,15 @@ impl NodeServiceImpl {
                         fq.terms
                             .iter()
                             .enumerate()
-                            .all(|(ti, t)| fq.stats.dfs[ti] == 0 || fq.index.has_impacts(t))
+                            // Local absence is not a missing impact
+                            // surface: see top_k_fused_pruned_stats.
+                            // Global df alone would forfeit pruning on
+                            // every shard lacking a rare term.
+                            .all(|(ti, t)| {
+                                fq.stats.dfs[ti] == 0
+                                    || fq.index.df(t) == 0
+                                    || fq.index.has_impacts(t)
+                            })
                     });
                 let docs = if prunable {
                     bm25::top_k_fused_pruned(&queries, req.k as usize, floor)

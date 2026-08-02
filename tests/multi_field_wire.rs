@@ -555,3 +555,82 @@ async fn a_field_no_shard_indexes_is_refused_not_silently_skipped() {
     node_b.abort();
     mock.abort();
 }
+
+/// A request-level `analysis` alongside `fields` is refused, not dropped.
+///
+/// The proto says `analysis` is ignored once `fields` is set, because
+/// term identity is per field. Ignoring it QUIETLY is what makes it
+/// dangerous: every field then falls back to the analysis sidecar's
+/// default, which need not be the spec the field was ingested with. The
+/// query runs against terms that are not in the index, matches only the
+/// tokens that happen to survive both analyses, and returns a confident
+/// ranking of that fragment -- which reads as bad relevance, never as a
+/// failure.
+///
+/// Found on the live fleet: an A/B tool set the spec at the request
+/// level, the fused route analyzed with the sidecar default (no
+/// stemming), and the query went out as "court, established" instead of
+/// "court, establish". The unstemmed term existed in ONE document of
+/// 86.6M, which then also dragged seven of eight shards onto the
+/// exhaustive scorer.
+#[tokio::test]
+async fn request_level_analysis_with_fields_is_refused_not_ignored() {
+    use turbovec_search::pb::search_service_server::SearchService;
+    use turbovec_search::pb::{AnalysisSpec, Bm25SearchRequest};
+
+    let (analysis, mock) = start_mock_analysis().await;
+    let (a, node_a) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    add_documents(&a, CORPUS[0]).await;
+    let coord =
+        CoordinatorServiceImpl::new(vec![a]).with_bm25(Some(analysis.clone()), Default::default());
+
+    let spec = AnalysisSpec {
+        tokenizer: 1,
+        stemmer: 2,
+        term_vector_mode: 1,
+        term_vector_source: 2,
+        normalizer_rungs: vec![],
+    };
+
+    // Per-field: the supported way to say it, and it must still work.
+    let mut per_field = query_fields(2.0);
+    for f in &mut per_field {
+        f.analysis = Some(spec.clone());
+    }
+    SearchService::bm25_search(
+        &coord,
+        tonic::Request::new(Bm25SearchRequest {
+            text: "smith rust".to_string(),
+            k: 5,
+            analysis: None,
+            min_score: 0.0,
+            fields: per_field,
+        }),
+    )
+    .await
+    .expect("per-field analysis is how a fused query carries its spec");
+
+    // Request-level alongside fields: refused, and the message says
+    // where the spec belongs.
+    let err = SearchService::bm25_search(
+        &coord,
+        tonic::Request::new(Bm25SearchRequest {
+            text: "smith rust".to_string(),
+            k: 5,
+            analysis: Some(spec),
+            min_score: 0.0,
+            fields: query_fields(2.0),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("QueryField.analysis"),
+        "the refusal must say where to put the spec: {}",
+        err.message()
+    );
+
+    node_a.abort();
+    mock.abort();
+}
