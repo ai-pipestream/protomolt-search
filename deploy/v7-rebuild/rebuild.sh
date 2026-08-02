@@ -361,9 +361,20 @@ stage_down() {
 
 stage_serve() {
   mkdir -p "$RUN" "$LOGS"
+  # Check the whole set BEFORE starting anything. A missing .bm25 is the
+  # one that matters: the node comes up healthy on vectors alone and puts
+  # a silent hole in every lexical query, so catching it here beats
+  # discovering it from a ranking. (The binary refuses an interrupted
+  # build too; this also catches a .bm25 that was never started.)
+  local missing=()
+  for ((i = 0; i < SHARDS; i++)); do
+    [[ -f $OUT/shard-$i.tv ]] || missing+=("shard-$i.tv")
+    [[ -f $OUT/shard-$i.tv.bm25 ]] || missing+=("shard-$i.tv.bm25")
+    [[ -d $OUT/shard-$i.tv.bm25.build ]] && missing+=("shard-$i: build unfinished")
+  done
+  ((${#missing[@]} == 0)) || die "not ready to serve: ${missing[*]}"
   sidecar_up
   for ((i = 0; i < SHARDS; i++)); do
-    [[ -f $OUT/shard-$i.tv ]] || die "no index at $OUT/shard-$i.tv"
     start_node "$i"
   done
   say "serving $SHARDS shards on $NODE_LIST (mmaps page in on first query)"
