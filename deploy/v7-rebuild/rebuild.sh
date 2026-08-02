@@ -76,6 +76,7 @@ EMBEDDINGS_DIR=${EMBEDDINGS_DIR:-/work/court-corpus/models/minilm-l6-v2-static}
 BIN=${BIN:-$REPO/target/release/turbovec-search}
 INGEST=${INGEST:-$REPO/target/release/examples/court_ingest}
 PROBE=${PROBE:-$REPO/target/release/examples/analyze_probe}
+VERIFY=${VERIFY:-$REPO/target/release/examples/v7_verify}
 
 RUN="$OUT/run"
 LOGS="$OUT/logs"
@@ -414,6 +415,18 @@ stage_serve() {
   echo $! >"$RUN/coordinator.pid"
   wait_port "$COORD_PORT" coordinator
   say "coordinator on :$COORD_PORT"
+  # An open port is not readiness: a node binds before it opens its
+  # .bm25, and opening 50 GB of postings reads every document length.
+  # Report when the fleet can actually answer, so the next stage does not
+  # measure a cluster that is still loading.
+  say "waiting for all $SHARDS shards to answer health (they are still opening their postings)"
+  local waited
+  for waited in $(seq 1 300); do
+    "$VERIFY" --coord="127.0.0.1:$COORD_PORT" --shards="$SHARDS" \
+      --ready-only --wait-ready=2 >/dev/null 2>&1 && break
+    sleep 2
+  done
+  say "fleet ready on :$COORD_PORT"
 }
 
 stage_stop() {

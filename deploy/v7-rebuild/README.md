@@ -76,8 +76,28 @@ Then the acceptance matrix:
 ```bash
 cargo run --release --example v7_verify -- \
   --coord=127.0.0.1:59291 --analysis-addr=http://127.0.0.1:59202 \
-  --shards=8 --offset-stride=21659648
+  --shards=8 --offset-stride=21659648 --wait-ready=600
 ```
+
+`serve` now waits for this itself, so the flag mainly matters when
+running the matrix by hand. Measured on the finished corpus: `serve`
+used to return in seconds and the fleet was genuinely ready 2m41s later.
+
+To be precise about what that window was: a node does not start its gRPC
+server until after the store opens, so connections sit unanswered in the
+kernel backlog and probes time out. Queries were SLOW, not wrong -- no
+partial BM25 result was ever served. The bug was the false ready signal,
+not the data.
+
+`--wait-ready` is not optional in practice on a cold fleet. A node binds
+its listener BEFORE it opens its `.bm25`, and opening a 50 GB postings
+file reads every document length to count documents. The kernel accepts
+connections into the backlog throughout, so `serve` reports the port open
+minutes before the node can answer anything: run the matrix immediately
+and health reports 0 of 8 while vector search passes, because the 1.4 GB
+`.tv` finished loading and the 52 GB `.bm25` did not. The flag polls
+ClusterHealth until every shard actually answers, and on timeout says so
+and runs anyway rather than passing quietly.
 
 ## Why the cuts are block-aligned
 
