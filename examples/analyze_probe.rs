@@ -28,26 +28,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "text",
         "COURT court Court COURTS courts Appellant APPELLANT appellant",
     );
-    let spec = AnalysisSpec {
-        tokenizer: arg("tokenizer", "1").parse()?,
-        stemmer: arg("stemmer", "2").parse()?,
-        term_vector_mode: arg("mode", "1").parse()?,
-        term_vector_source: arg("source", "2").parse()?,
-        char_filters: match arg("rungs", "").as_str() {
-            "" => Vec::new(),
-            r => r
-                .split(',')
-                .map(|s| s.trim().parse())
-                .collect::<Result<_, _>>()?,
-        },
+    // `--analyzer=<name>` probes a REAL analyzer from the one place they
+    // are defined, rather than a hand-typed reconstruction of it. The
+    // difference matters: this tool exists to answer "what does the
+    // index actually contain", and a probe that retypes the spec can
+    // agree with itself while disagreeing with the corpus.
+    let named = arg("analyzer", "");
+    let spec = if named.is_empty() {
+        AnalysisSpec {
+            tokenizer: arg("tokenizer", "1").parse()?,
+            stemmer: arg("stemmer", "2").parse()?,
+            term_vector_mode: arg("mode", "1").parse()?,
+            term_vector_source: arg("source", "2").parse()?,
+            char_filters: match arg("char-filters", &arg("rungs", "")).as_str() {
+                "" => Vec::new(),
+                r => r
+                    .split(',')
+                    .map(|s| s.trim().parse())
+                    .collect::<Result<_, _>>()?,
+            },
+        }
+    } else {
+        match analyzer::analyzer_by_name(&named)? {
+            Some(spec) => spec,
+            None => {
+                return Err(format!(
+                    "analyzer {named:?} means \"whatever the sidecar defaults to\", \
+                     which has no spec to print; probe it with explicit flags"
+                )
+                .into())
+            }
+        }
     };
     println!(
-        "spec: tokenizer={} stemmer={} mode={} source={} rungs={:?}",
+        "spec: {}tokenizer={} stemmer={} mode={} source={} char_filters={:?}",
+        if named.is_empty() {
+            String::new()
+        } else {
+            format!("[{named}] ")
+        },
         spec.tokenizer,
         spec.stemmer,
         spec.term_vector_mode,
         spec.term_vector_source,
         spec.char_filters
+    );
+    println!(
+        "fingerprint: 0x{:016x}",
+        analyzer::analysis_fingerprint(Some(&spec))
     );
     println!("text: {text:?}");
     let doc = analyzer::analyze_document(&addr, &text, Some(&spec)).await?;

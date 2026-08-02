@@ -229,9 +229,53 @@ second version of some derived part without disturbing the first.
 
 The search cluster's relationship to it is simple: the index keeps what
 ranking needs, the repo service keeps everything else, and results carry
-enough lineage to fetch the rest on demand. TODO: the integration is
-planned but not wired, the proto shape is expected to change, and which
-annotation data lands here versus in index columns is undecided.
+enough lineage to fetch the rest on demand. That gives two document
+shapes on purpose. A search hit is lean: identity, score, the chunk
+text, and lineage. The full record, with every annotation layer the
+sidecar produced, is fetched from the repo service by that lineage. The
+lean shape is what ranking and paging need; the full shape is what
+someone analyzing the corpus needs, and making them the same object
+would put analysis payloads on the query path.
+
+### 8.1 Capturing NLP output
+
+The sidecar produces sixteen annotation layers and the index consumes
+two of them: term vectors and embeddings. The rest (sentences, POS,
+entities, lemmas, coreference, dependencies, relations, geography,
+noise, artifacts, PII, glossary matches) are computed only if asked for
+and otherwise never exist. Holding them in the repo service is the
+decided direction, since they are retrievable rather than rankable.
+
+The cost question is when to ask. Analysis is by far the most expensive
+part of a corpus build, so capturing annotations during the rebuild that
+is already happening is much cheaper than a second pass over the corpus
+later. But the layers are not equally priced. Measured against the live
+sidecar on real chunks, relative to a term-vectors-only pass:
+
+- near free, within measurement noise: sentence detection, noise,
+  artifacts, and lemmatization
+- roughly seven to eight times the baseline pass: POS tagging, named
+  entity recognition, and geography (the latter two also require the
+  sentence layer and refuse without it)
+- roughly fourteen times: coreference resolution
+
+So the cheap layers can ride the rebuild without changing its shape,
+while the expensive ones are their own decision and probably their own
+pass. TODO: which set the rebuild actually enables.
+
+Two constraints on the design, both learned rather than assumed. First,
+annotations must be keyed by stable document identity (source document
+and chunk ordinal), never by the index's document id, which is a
+storage position that changes whenever the corpus is resharded. Second,
+a failed annotation write must not fail the index build, but it also
+must not vanish: coverage belongs in the ledger so that "which chunks
+lack annotations" is a question with an answer.
+
+TODO: the integration is planned but not wired, the proto shape is
+expected to change, and the bulk-analytics access pattern (counting
+across the corpus rather than fetching one document) is unsolved. A
+per-document object store answers the second question well and the
+first one badly.
 
 ## 9. Protocols, briefly
 
