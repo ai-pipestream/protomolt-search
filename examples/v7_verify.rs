@@ -17,8 +17,9 @@
 use turbovec_search::analyzer;
 use turbovec_search::pb::search_service_client::SearchServiceClient;
 use turbovec_search::pb::{
-    AnalysisSpec, Bm25SearchRequest, ClusterHealthRequest, FusionMode, HybridLegOptions,
-    HybridSearchRequest, QueryField, SearchRequest,
+    search_variant, AnalysisSpec, Bm25SearchRequest, ClusterHealthRequest, FusionMode,
+    HybridLegOptions, HybridSearchRequest, QueryField, SearchRequest, SearchVariant,
+    VariantSearchRequest,
 };
 
 fn arg(key: &str, default: &str) -> String {
@@ -467,6 +468,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok("bitwise identical".to_string())
         } else {
             Err("results differ".to_string())
+        }
+    });
+
+    // The A/B surface, against the real corpus: two arms over the same
+    // 86M documents, one scoring body alone and one fusing the caption.
+    // Weighting a field must move the ranking, and an arm named for a
+    // field nothing indexes must be refused rather than silently scored
+    // as the remaining fields.
+    let ab_arm = |label: &str, fields: Vec<QueryField>| SearchVariant {
+        label: label.to_string(),
+        query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            text: query.clone(),
+            k: 0,
+            analysis: None,
+            min_score: 0.0,
+            fields,
+        })),
+    };
+    let body_field = || QueryField {
+        field: "body".to_string(),
+        analysis: Some(body_spec()),
+        weight: 1.0,
+        k1: 0.0,
+        b: 0.0,
+    };
+    let name_field = |w: f32| QueryField {
+        field: "case_name".to_string(),
+        analysis: Some(case_name_spec()),
+        weight: w,
+        k1: 0.0,
+        b: 0.0,
+    };
+    let variants = client
+        .variant_search(VariantSearchRequest {
+            request_id: String::new(),
+            variants: vec![
+                ab_arm("body-only", vec![body_field()]),
+                ab_arm("caption-boosted", vec![body_field(), name_field(4.0)]),
+            ],
+            k,
+            rbo_p: 0.0,
+            interleave: true,
+            interleave_seed: 0,
+        })
+        .await?
+        .into_inner();
+    r.check("variant search: two arms, one diff, both ranked", {
+        let d = variants.diffs.first();
+        match d {
+            Some(d) if variants.results.len() == 2 && d.reference == "body-only" => Ok(format!(
+                "overlap {:.0}%, tau {:.3}, rbo {:.3}, regret {:.4}{}",
+                d.overlap_fraction * 100.0,
+                d.kendall_tau,
+                d.rbo,
+                d.score_regret,
+                if d.top1_flipped { ", top1 FLIPPED" } else { "" }
+            )),
+            _ => Err(format!(
+                "expected 2 results and 1 diff, got {} and {}",
+                variants.results.len(),
+                variants.diffs.len()
+            )),
+        }
+    });
+    r.check("variant search: interleaving is balanced and duplicate-free", {
+        match &variants.interleaving {
+            Some(il) => {
+                let mut ids = il.doc_ids.clone();
+                ids.sort_unstable();
+                ids.dedup();
+                let a = il.teams.iter().filter(|t| **t == 1).count();
+                let b = il.teams.len() - a;
+                if ids.len() != il.doc_ids.len() {
+                    Err("a document appears twice".to_string())
+                } else if a.abs_diff(b) > 1 {
+                    Err(format!("lopsided exposure: {a} vs {b}"))
+                } else {
+                    Ok(format!("{} results, {a}/{b} split, seed {}", il.doc_ids.len(), il.seed))
+                }
+            }
+            None => Err("interleaving was requested but absent".to_string()),
+        }
+    });
+    r.check("variant search: an unindexed field is refused, not scored as 0", {
+        let mut bogus = name_field(1.0);
+        bogus.field = "case_nmae".to_string();
+        match client
+            .variant_search(VariantSearchRequest {
+                request_id: String::new(),
+                variants: vec![
+                    ab_arm("body-only", vec![body_field()]),
+                    ab_arm("typo", vec![body_field(), bogus]),
+                ],
+                k,
+                rbo_p: 0.0,
+                interleave: false,
+                interleave_seed: 0,
+            })
+            .await
+        {
+            Ok(_) => Err("a field no shard indexes was silently scored".to_string()),
+            Err(e) if e.message().contains("no shard indexes") => {
+                Ok("refused, naming the field".to_string())
+            }
+            Err(e) => Err(format!("refused for the wrong reason: {}", e.message())),
         }
     });
 

@@ -148,6 +148,16 @@ stats. `CorpusStats` becomes per-field:
 `TermStats` is keyed by (field, term); `merge_stats` stays an elementwise sum.
 The four request protos that carry globals grow the field dimension.
 
+A shard that lacks a named field answers zeros for it, and `FieldStats`
+also says `known: false` outright. The flag is what makes the zeros
+readable: an empty shard, a shard whose documents never filled the field,
+and a shard that has never heard of the field all produce identical
+numbers, and one of those is a typo. Shards still SKIP a leg naming a
+field they lack, which is right for a heterogeneous fleet, but the
+coordinator refuses a field NO shard knows — otherwise a misspelled field
+returns the remaining fields' ranking with no error, and an A/B arm with
+a typo reads as "makes no difference".
+
 Folded-in fix: the hybrid leg path (`compute_legs`) hardcodes default k1/b
 today; `ShardLegsRequest` and `HybridShardRequest` gain k1/b (per field in
 v6) so tuning reaches every path, not just Bm25Search.

@@ -64,6 +64,13 @@ WAVE=2 ./rebuild.sh down       # nodes flush on SIGTERM
 WAVE=2 ./rebuild.sh serve      # nodes on the built shards + coordinator
 ```
 
+`serve` will refuse to start a shard that still has a `.bm25.build`
+directory with no `.bm25` beside it, because `Flush` removes that
+directory on success and the pair can only mean an interrupted build. A
+shard like that would come up healthy and answer every lexical query
+with silence, putting a one-eighth hole in every BM25 result with
+nothing anywhere saying so. If you meant it, `--allow-missing-bm25`.
+
 Then the acceptance matrix:
 
 ```bash
