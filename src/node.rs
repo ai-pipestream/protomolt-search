@@ -1931,60 +1931,6 @@ impl NodeServiceImpl {
         Ok(())
     }
 
-    /// The pre-stream transport, kept for sidecars that predate
-    /// AnalyzeStream: up to ANALYZE_PIPELINE unary sidecar calls run
-    /// ahead of the apply point.
-    async fn ingest_unary(
-        &self,
-        first: AddDocumentsRequest,
-        inbound: &mut Streaming<AddDocumentsRequest>,
-        addr: &str,
-        added: &mut u64,
-        first_id: &mut u64,
-    ) -> Result<(), Status> {
-        const ANALYZE_PIPELINE: usize = 8;
-        let spawn_analysis =
-            |doc: &AddDocumentsRequest| -> Result<
-                tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
-                Status,
-            > {
-                let extras = self.spawn_field_analyses(doc)?;
-                let addr = addr.to_string();
-                let text = doc.text.clone();
-                let spec = doc.analysis.clone();
-                Ok(tokio::spawn(async move {
-                    let body =
-                        crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await?;
-                    join_fields(body, extras).await
-                }))
-            };
-        let mut in_flight: std::collections::VecDeque<(
-            AddDocumentsRequest,
-            tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
-        )> = std::collections::VecDeque::new();
-        let handle = spawn_analysis(&first)?;
-        in_flight.push_back((first, handle));
-        let mut inbound_open = true;
-        loop {
-            while inbound_open && in_flight.len() < ANALYZE_PIPELINE {
-                match inbound.message().await? {
-                    Some(doc) => {
-                        let handle = spawn_analysis(&doc)?;
-                        in_flight.push_back((doc, handle));
-                    }
-                    None => inbound_open = false,
-                }
-            }
-            let Some((doc, handle)) = in_flight.pop_front() else {
-                break;
-            };
-            let analyzed = handle
-                .await
-                .map_err(|e| Status::internal(format!("analysis task failed: {e}")))??;
-            self.apply_analyzed_document(doc, analyzed, added, first_id)?;
-        }
-        Ok(())
-    }
 }
 
 #[tonic::async_trait]
@@ -2652,12 +2598,19 @@ impl NodeService for NodeServiceImpl {
         let mut inbound = request.into_inner();
         let mut added = 0u64;
         let mut first_id = 0u64;
-        // Analysis dominates bulk ingest. The preferred transport is one
-        // AnalyzeStream for the whole call, paced by the sidecar's own
-        // flow control; a sidecar that predates the RPC (UNIMPLEMENTED
-        // on open) gets the previous pipelined-unary path. Either way,
-        // documents are applied strictly in arrival order — ids and WAL
-        // order stay deterministic.
+        // Analysis dominates bulk ingest, and the only supported transport
+        // is one AnalyzeStream for the whole call, paced by the sidecar's
+        // own flow control. Documents are applied strictly in arrival
+        // order, so ids and WAL order stay deterministic.
+        //
+        // A sidecar without AnalyzeStream is REFUSED rather than served on
+        // the old per-document unary path. That fallback existed and cost
+        // real debugging time: a stale sidecar silently took it, then its
+        // gRPC server GOAWAYed the connection after ~70 streams, and the
+        // bulk driver died seconds into a multi-hour job with an opaque
+        // "h2 protocol error" while this node logged nothing and stayed
+        // healthy. Degrading quietly turned a one-line version mismatch
+        // into an h2 forensics exercise; failing here names it instead.
         if let Some(first) = inbound.message().await? {
             match crate::analyzer::AnalyzeStream::open(&addr, first.analysis.as_ref()).await {
                 Ok(session) => {
@@ -2672,8 +2625,12 @@ impl NodeService for NodeServiceImpl {
                     .await?;
                 }
                 Err(status) if status.code() == tonic::Code::Unimplemented => {
-                    self.ingest_unary(first, &mut inbound, &addr, &mut added, &mut first_id)
-                        .await?;
+                    return Err(Status::failed_precondition(format!(
+                        "analysis sidecar at {addr} does not implement AnalyzeStream; \
+                         it predates the RPC and must be rebuilt (./gradlew installDist \
+                         in grpc-opennlp-analysis). Refusing to ingest on the removed \
+                         unary path."
+                    )));
                 }
                 Err(status) => return Err(status),
             }

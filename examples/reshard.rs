@@ -70,8 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The reshard core is synchronous; the sidecar client is async. Bridge
     // with block_in_place on the multi-thread runtime (same idiom the
     // court examples use for sync work under tokio). Each batch rides one
-    // AnalyzeStream, paced by the sidecar's flow control (older sidecars
-    // fall back to concurrent unary calls inside analyze_batch).
+    // AnalyzeStream, paced by the sidecar's flow control (a sidecar
+    // predating the RPC is refused outright, not quietly downgraded to
+    // per-document unary calls that would die deep into the replay).
     let addr = analysis_addr.clone();
     let handle = tokio::runtime::Handle::current();
     let mut analyze = move |docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {

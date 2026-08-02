@@ -329,8 +329,18 @@ pub async fn analyze_batch(
     for (spec, indices) in groups {
         let mut session = match AnalyzeStream::open(addr, spec).await {
             Ok(session) => session,
+            // No quiet downgrade to per-document unary calls. This is a
+            // BULK path (reshard and WAL replay), and the unary transport
+            // opens one h2 stream per document: a sidecar predating
+            // AnalyzeStream GOAWAYs after ~70 of them, so the "fallback"
+            // does not degrade gracefully, it fails obscurely thousands of
+            // documents later. Name the version skew here instead.
             Err(status) if status.code() == tonic::Code::Unimplemented => {
-                return analyze_batch_unary(addr, docs).await;
+                return Err(Status::failed_precondition(format!(
+                    "analysis sidecar at {addr} does not implement AnalyzeStream; \
+                     it predates the RPC and must be rebuilt (./gradlew installDist \
+                     in grpc-opennlp-analysis)"
+                )));
             }
             Err(status) => return Err(status),
         };
@@ -361,29 +371,4 @@ pub async fn analyze_batch(
         .into_iter()
         .map(|slot| slot.expect("every input index received exactly one result"))
         .collect())
-}
-
-/// The pre-stream behavior of the replay tools: one unary call per
-/// document, fanned out concurrently over the shared channel.
-async fn analyze_batch_unary(
-    addr: &str,
-    docs: &[(&str, Option<&AnalysisSpec>)],
-) -> Result<Vec<AnalyzedDoc>, Status> {
-    let tasks: Vec<_> = docs
-        .iter()
-        .map(|(text, spec)| {
-            let addr = addr.to_string();
-            let text = text.to_string();
-            let spec = spec.cloned();
-            tokio::spawn(async move { analyze_document(&addr, &text, spec.as_ref()).await })
-        })
-        .collect();
-    let mut out = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        out.push(
-            task.await
-                .map_err(|e| Status::internal(format!("analysis task failed: {e}")))??,
-        );
-    }
-    Ok(out)
 }

@@ -1,7 +1,12 @@
 //! AnalyzeStream client acceptance: order restoration against a mock that
 //! DELIBERATELY answers out of order, per-document error isolation, and
-//! the unary fallback (batch and ingest) against a sidecar that predates
-//! the RPC.
+//! the LOUD REFUSAL (batch and ingest) of a sidecar that predates the RPC.
+//!
+//! There used to be a quiet downgrade to per-document unary calls here.
+//! It cost real debugging time: a stale sidecar took it silently, its
+//! server GOAWAYed after ~70 streams, and a multi-hour bulk job died with
+//! an opaque h2 error while the node logged nothing. Both paths now name
+//! the version skew instead, and these tests pin that.
 
 mod common;
 
@@ -152,20 +157,23 @@ async fn start_no_stream_mock() -> (
 }
 
 #[tokio::test]
-async fn batch_falls_back_to_unary_on_unimplemented() {
+async fn batch_refuses_a_sidecar_without_analyze_stream() {
     let (addr, server) = start_no_stream_mock().await;
     let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS.iter().map(|t| (*t, None)).collect();
-    let batch = analyze_batch(&addr, &docs).await.unwrap();
-    assert_eq!(batch.len(), TEXTS.len());
-    for (i, text) in TEXTS.iter().enumerate() {
-        let unary = analyze_document(&addr, text, None).await.unwrap();
-        assert_eq!(batch[i], unary, "fallback document {i} differs");
-    }
+    let status = analyze_batch(&addr, &docs)
+        .await
+        .expect_err("a sidecar without AnalyzeStream must be refused, not silently downgraded");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("AnalyzeStream"),
+        "the refusal must name the missing RPC so the fix is obvious: {}",
+        status.message()
+    );
     server.abort();
 }
 
 #[tokio::test]
-async fn ingest_falls_back_to_unary_on_unimplemented() {
+async fn ingest_refuses_a_sidecar_without_analyze_stream() {
     let (analysis, server) = start_no_stream_mock().await;
     let (addr, node) = start_empty_node(NodeConfig {
         analysis_addr: Some(analysis),
@@ -185,13 +193,16 @@ async fn ingest_falls_back_to_unary_on_unimplemented() {
         .unwrap();
     }
     drop(tx);
-    let response = client
+    let status = client
         .add_documents(ReceiverStream::new(rx))
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(response.added, TEXTS.len() as u64);
-    assert_eq!(response.total, TEXTS.len() as u64);
+        .expect_err("ingest against a pre-AnalyzeStream sidecar must fail loudly");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("AnalyzeStream"),
+        "the refusal must name the missing RPC: {}",
+        status.message()
+    );
     node.abort();
     server.abort();
 }
