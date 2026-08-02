@@ -1549,7 +1549,12 @@ impl NodeServiceImpl {
                     && terms
                         .iter()
                         .enumerate()
-                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.has_impacts(t));
+                        // Local absence is not a missing impact surface:
+                        // see top_k_pruned. Global df alone would forfeit
+                        // pruning on every shard lacking a rare term.
+                        .all(|(ti, t)| {
+                            stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
+                        });
                 let docs = if prunable {
                     bm25::top_k_pruned(index, terms, &stats, params, k, f64::NEG_INFINITY)
                 } else {
@@ -2847,7 +2852,12 @@ impl NodeService for NodeServiceImpl {
                         .terms
                         .iter()
                         .enumerate()
-                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.has_impacts(t));
+                        // Local absence is not a missing impact surface:
+                        // see top_k_pruned. Global df alone would forfeit
+                        // pruning on every shard lacking a rare term.
+                        .all(|(ti, t)| {
+                            stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
+                        });
                 let docs = if prunable {
                     bm25::top_k_pruned(index, &req.terms, &stats, params, req.k as usize, floor)
                 } else {

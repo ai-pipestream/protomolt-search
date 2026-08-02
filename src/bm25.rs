@@ -607,10 +607,22 @@ pub fn top_k_pruned_stats(
         return filter_to_floor(top_k(store, terms, stats, params, k), floor);
     }
     for (ti, term) in terms.iter().enumerate() {
-        if stats.dfs[ti] == 0 {
+        // A term absent from THIS shard contributes 0 to every document
+        // here, so it is skipped rather than scored. `stats.dfs` is the
+        // GLOBAL df, which is non-zero for a term that merely lives on
+        // another shard: checking only that sent every such query down
+        // the exhaustive path below, because a locally-absent term has no
+        // impact surface to open. On a sharded corpus that is the common
+        // case for exactly the rare, discriminative terms worth pruning
+        // with -- measured at 2710 ms vs 9 ms for "of 12b6" on the 86.6M
+        // corpus, where 7 of 8 shards lacked the rare term and each one
+        // then walked all 83.7M postings of "of" exhaustively.
+        if stats.dfs[ti] == 0 || store.df(term) == 0 {
             continue;
         }
         let Some(cursor) = store.impacts(term) else {
+            // Present here but no impact surface: a genuine format
+            // limitation, and the only case that still forfeits pruning.
             return filter_to_floor(top_k(store, terms, stats, params, k), floor);
         };
         let idf = idf(stats.doc_count, stats.dfs[ti]);

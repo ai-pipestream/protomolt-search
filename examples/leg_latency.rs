@@ -73,6 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let analysis_addr = arg("analysis-addr", "http://127.0.0.1:59202");
     let k: u32 = arg("k", "10").parse()?;
     let repeats: usize = arg("repeats", "1").parse()?;
+    // Seeded floor for the BM25 leg. Lets a caller test whether a query's
+    // cost is floor-bootstrap bound: MaxScore cannot demote a term until
+    // the floor exceeds that term's max contribution, and the floor only
+    // rises as documents are found in doc-id order.
+    let min_score: f32 = arg("min-score", "0").parse()?;
     let queries: Vec<String> = match arg("queries", "").as_str() {
         "" => vec![arg("query", "qualified immunity clearly established right")],
         path => std::fs::read_to_string(path)?
@@ -120,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     text: q.clone(),
                     k,
                     analysis: Some(body_spec()),
-                    min_score: 0.0,
+                    min_score,
                     fields: Vec::new(),
                 })
                 .await?

@@ -623,3 +623,109 @@ fn pruned_level1_scale_fuzz() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A term that lives on ANOTHER shard must not forfeit pruning here.
+///
+/// `CorpusStats.dfs` is the GLOBAL df the coordinator computed, so a rare
+/// term is non-zero there even on the shards that do not contain it.
+/// Those shards have no impact surface to open for it, and the scorer
+/// used to read that as "this index lacks impacts" and drop the WHOLE
+/// query to the exhaustive path -- walking every posting of the common
+/// terms it could otherwise have skipped.
+///
+/// On a sharded corpus this fires for exactly the rare, discriminative
+/// terms that make pruning worth having. Measured on the live 86.6M-chunk
+/// fleet before the fix: "of 12b6" took 2710 ms where "of" alone took 9,
+/// because 7 of 8 shards lacked the rare term and each then walked all
+/// 83.7M postings of "of".
+#[test]
+fn a_term_absent_from_this_shard_does_not_disable_pruning() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bm_absent_term");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // This shard holds only "court". "12b6" exists elsewhere in the
+    // cluster, so its GLOBAL df is non-zero while its local df is 0.
+    let mut store = Bm25Store::new();
+    for i in 0..2000u32 {
+        let tf = if i % 97 == 0 { 5 } else { 1 };
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            AnalyzedDoc::body(vec![("court".to_string(), tf, vec![(0, 5)])], 4),
+        );
+    }
+    let path = dir.join("absent.bm25");
+    store.save(&path).unwrap();
+    let reader = Bm25Reader::open(&path).unwrap();
+
+    let params = Bm25Params::default();
+    let terms = vec!["court".to_string(), "12b6".to_string()];
+    let stats = CorpusStats {
+        doc_count: store.doc_count(),
+        total_doc_length: store.total_doc_length(),
+        // Global dfs: the rare term is present in the CLUSTER.
+        dfs: vec![2000, 10],
+    };
+
+    let oracle = bm25::top_k_exhaustive(&store, &terms, &stats, params, 10);
+    let mut prune = PruneStats::default();
+    let got = bm25::top_k_pruned_stats(
+        &reader,
+        &terms,
+        &stats,
+        params,
+        10,
+        f64::NEG_INFINITY,
+        &mut prune,
+    );
+
+    // Correctness first: skipping a locally-absent term is only valid
+    // because it contributes 0 to every document here.
+    assert_eq!(
+        sig(&oracle),
+        sig(&got),
+        "skipping a locally-absent term must not change a single score"
+    );
+
+    // And the point of the fix: pruning actually ran. The exhaustive
+    // fallback reports no blocks at all, so a non-zero total proves the
+    // pruned path was taken rather than silently bypassed.
+    assert!(
+        prune.blocks_total > 0,
+        "the query fell back to exhaustive despite every PRESENT term having impacts"
+    );
+    // blocks_skipped is deliberately NOT asserted. How much this fixture
+    // skips depends on its score distribution, not on the fix: the bug
+    // was that the pruned scorer was never ENTERED, and blocks_total
+    // proves entry (the exhaustive fallback walks no blocks and reports
+    // none). Other gates in this file cover skip effectiveness.
+    let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, oracle[9].score);
+    assert_eq!(
+        sig(&bm25::filter_to_floor(oracle.clone(), oracle[9].score)),
+        sig(&seeded),
+        "a seeded floor must not change the surviving hits"
+    );
+
+    // The single-term query is the control: it always pruned, and adding
+    // a term this shard does not hold must not make things worse.
+    let mut solo = PruneStats::default();
+    let _ = bm25::top_k_pruned_stats(
+        &reader,
+        &["court".to_string()],
+        &CorpusStats {
+            doc_count: store.doc_count(),
+            total_doc_length: store.total_doc_length(),
+            dfs: vec![2000],
+        },
+        params,
+        10,
+        f64::NEG_INFINITY,
+        &mut solo,
+    );
+    assert_eq!(
+        prune.blocks_total, solo.blocks_total,
+        "a locally-absent term should add no blocks to walk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
