@@ -721,8 +721,8 @@ message AnalysisSpec {
   // Character filters applied before tokenization, in order, defining
   // term identity (IGNORED when source is STEMS). "Char filter" is
   // Lucene's name for this stage and OpenNLP implements them as
-  // CharSequenceNormalizer; the sidecar's wire enum still spells them
-  // TermVectorOptions.NormalizerRung, whose values these are.
+  // CharSequenceNormalizer; the sidecar's wire enum spells them
+  // TermVectorOptions.NormalizerStep, whose values these are.
   repeated int32 char_filters = 5;
 }
 
