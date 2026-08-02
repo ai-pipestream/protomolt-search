@@ -21,17 +21,26 @@ use crate::pb::{
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, ClusterHealthRequest,
     ClusterHealthResponse, FloorUpdate, FusionMode, HealthRequest, HybridDebug, HybridHit,
-    HybridSearchRequest, HybridShardDebug,
-    HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
-    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
-    ParentGroup, ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch,
-    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
-    VectorRescoreRequest,
+    HybridSearchRequest, HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup,
+    ScoredHit, SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats,
+    StartShardSearch, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermStatsRequest, VectorRescoreRequest,
+};
+use crate::pb::{
+    search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
+    VariantSearchRequest, VariantSearchResponse,
 };
 use crate::pb::{stream_search_request, stream_search_response};
+use crate::rankdiff;
 
 /// Process-unique request id counter for coordinator-assigned ids.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Default hard cap on any client-facing `k` (`--max-k` overrides).
+/// Bounds the coordinator's heap and keeps the shared floor rising: an
+/// unbounded k would hold the floor at -inf and stream every shard dry.
+pub const DEFAULT_MAX_K: u32 = 10_000;
 
 /// Per-shard timing controls for the fan-out (all off by default).
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,6 +78,10 @@ pub struct CoordinatorServiceImpl {
     /// Serve `SearchService.Search` over the streaming protocol
     /// (`fanout_stream_search`) instead of the per-shard top-k fan-out.
     stream_search: bool,
+    /// Hard upper bound on any client-facing `k`. A request above it is
+    /// refused (never clamped), and a request that omits `k` (proto3 0)
+    /// runs at exactly this depth — the coordinator's stop bound.
+    max_k: u32,
     /// One reusable channel per address, created on first use.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
     /// Lazily bound UDP socket for the floor fast lane (`None` when the
@@ -104,6 +117,7 @@ impl CoordinatorServiceImpl {
             bm25_params: Bm25Params::default(),
             limits: FanoutLimits::default(),
             stream_search: false,
+            max_k: DEFAULT_MAX_K,
             channels: Arc::new(Mutex::new(HashMap::new())),
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -142,7 +156,10 @@ impl CoordinatorServiceImpl {
             .ok()
             .and_then(|addrs| {
                 let all: Vec<std::net::SocketAddr> = addrs.collect();
-                all.iter().find(|a| a.is_ipv4()).copied().or(all.first().copied())
+                all.iter()
+                    .find(|a| a.is_ipv4())
+                    .copied()
+                    .or(all.first().copied())
             });
         cache.insert(addr.to_string(), resolved);
         resolved
@@ -155,6 +172,32 @@ impl CoordinatorServiceImpl {
     pub fn with_stream_search(mut self, on: bool) -> Self {
         self.stream_search = on;
         self
+    }
+
+    /// Set the hard cap on client-facing `k` (also the depth a request
+    /// omitting `k` runs at). Zero is rejected at config parse time, so
+    /// this takes the already-validated value.
+    pub fn with_max_k(mut self, max_k: u32) -> Self {
+        self.max_k = max_k;
+        self
+    }
+
+    /// Resolve a request's `k` against the configured cap. Proto3 makes
+    /// an omitted field 0, so 0 selects `max_k` (the documented sentinel
+    /// idiom here, like `rbo_p`); anything above the cap is refused with
+    /// both numbers named rather than silently clamped.
+    fn resolve_k(&self, requested: u32) -> Result<u32, Status> {
+        if requested == 0 {
+            return Ok(self.max_k);
+        }
+        if requested > self.max_k {
+            return Err(Status::invalid_argument(format!(
+                "k={requested} exceeds this coordinator's max_k={}; \
+                 lower k or raise --max-k",
+                self.max_k
+            )));
+        }
+        Ok(requested)
     }
 
     /// Configure the BM25 path: analysis sidecar for query analysis and
@@ -305,6 +348,12 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
+        // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
+        // route and the single-field route reach the same node scorer,
+        // so when they disagree by orders of magnitude the question is
+        // which phase, and that cannot be answered from outside.
+        let trace = std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
+        let t0 = std::time::Instant::now();
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
@@ -340,6 +389,7 @@ impl CoordinatorServiceImpl {
             }
             field_terms.push(terms);
         }
+        let t_analyzed = t0.elapsed();
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
             return Ok(Vec::new());
         }
@@ -368,6 +418,11 @@ impl CoordinatorServiceImpl {
         let mut doc_count = 0u64;
         let mut totals = vec![0u64; fields.len()];
         let mut dfs: Vec<Vec<u32>> = field_terms.iter().map(|t| vec![0u32; t.len()]).collect();
+        // Which fields any shard actually has. A field no shard knows is
+        // a typo, not a query: scoring it as "contributes nothing" would
+        // silently return the ranking of the REMAINING fields, so a
+        // misspelled arm of an A/B reads as "no difference".
+        let mut known_somewhere = vec![false; fields.len()];
         for task in share_tasks {
             let share = task
                 .await
@@ -385,11 +440,33 @@ impl CoordinatorServiceImpl {
                     return Err(Status::internal("shard field stats df length mismatch"));
                 }
                 totals[fi] += fs.total_doc_length;
+                known_somewhere[fi] |= fs.known;
                 for (acc, df) in dfs[fi].iter_mut().zip(&fs.doc_frequencies) {
                     *acc += df;
                 }
             }
         }
+        // A partially-known field is tolerated: that is a real
+        // heterogeneous fleet, and the shards that have it still
+        // contribute. A field NO shard has is refused.
+        let unknown: Vec<&str> = fields
+            .iter()
+            .zip(&known_somewhere)
+            .filter(|(_, known)| !**known)
+            .map(|(f, _)| f.field.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "no shard indexes {}: scoring an unknown field would silently return the \
+                 remaining fields' ranking. Check the spelling, or the nodes' --bm25-fields.",
+                unknown
+                    .iter()
+                    .map(|f| format!("{f:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let t_stats = t0.elapsed();
         // (c) Bm25Query fan-out with per-field legs in entry order.
         // Entry k1/b of 0 pick up the coordinator's configured params,
         // so tuning reaches this path too.
@@ -412,8 +489,29 @@ impl CoordinatorServiceImpl {
                 } else {
                     f.b
                 },
+                // Declare which analyzer produced these terms so the
+                // shard can refuse a column built under a different one.
+                // The terms were analyzed under f.analysis just above,
+                // so this is the fingerprint OF THE SPEC ACTUALLY USED,
+                // not of what the caller meant.
+                analysis_fingerprint: crate::analyzer::analysis_fingerprint(f.analysis.as_ref()),
             })
             .collect();
+        if trace {
+            for l in &legs {
+                eprintln!(
+                    "bm25-fused leg: field={:?} terms={:?} dfs={:?} total_len={} w={} k1={} b={} \
+                     | req k={k} N={doc_count} min_score={min_score}",
+                    l.field,
+                    l.terms,
+                    l.global_doc_frequencies,
+                    l.global_total_doc_length,
+                    l.weight,
+                    l.k1,
+                    l.b
+                );
+            }
+        }
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
@@ -429,18 +527,35 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
-                client
-                    .bm25_query(request)
-                    .await
-                    .map(|r| (shard as u32, r.into_inner().hits))
+                let started = std::time::Instant::now();
+                client.bm25_query(request).await.map(|r| {
+                    (
+                        shard as u32,
+                        r.into_inner().hits,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    )
+                })
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut per_shard: Vec<(u32, f64)> = Vec::new();
         for task in query_tasks {
-            let (shard, hits) = task
+            let (shard, hits, ms) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            per_shard.push((shard, ms));
             all.extend(hits.into_iter().map(|h| (shard, h)));
+        }
+        let t_query = t0.elapsed();
+        if trace {
+            eprintln!(
+                "bm25-fused per-shard ms: {}",
+                per_shard
+                    .iter()
+                    .map(|(s, ms)| format!("{s}:{ms:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
         all.sort_by(|(sa, a), (sb, b)| {
             b.score
@@ -449,6 +564,19 @@ impl CoordinatorServiceImpl {
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         all.truncate(k as usize);
+        if trace {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "bm25-fused: analyze {:.1} ms, term-stats {:.1} ms, query fan-out {:.1} ms, \
+                 merge {:.1} ms  ({} fields, {} terms)",
+                ms(t_analyzed),
+                ms(t_stats - t_analyzed),
+                ms(t_query - t_stats),
+                ms(t0.elapsed() - t_query),
+                fields.len(),
+                field_terms.iter().map(Vec::len).sum::<usize>(),
+            );
+        }
         Ok(all.into_iter().map(|(_, h)| h).collect())
     }
 
@@ -562,26 +690,30 @@ impl CoordinatorServiceImpl {
         debug: bool,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let t_legs = std::time::Instant::now();
+        let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = ShardLegsRequest {
                 request_id: String::new(),
                 k: legs.leg_k,
-                vector: vector.to_vec(),
-                terms: terms.to_vec(),
+                vector: leg_vector.clone(),
+                terms: leg_terms.clone(),
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
-                global_doc_frequencies: global.dfs.clone(),
+                global_doc_frequencies: leg_dfs.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
-                client
-                    .shard_legs(request)
-                    .await
-                    .map(|r| (shard as u32, t0.elapsed().as_secs_f32() * 1e3, r.into_inner()))
+                client.shard_legs(request).await.map(|r| {
+                    (
+                        shard as u32,
+                        t0.elapsed().as_secs_f32() * 1e3,
+                        r.into_inner(),
+                    )
+                })
             }));
         }
         let mut vector_shards = Vec::with_capacity(shard_tasks.len());
@@ -730,16 +862,17 @@ impl CoordinatorServiceImpl {
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let t_legs = std::time::Instant::now();
         // Level one: per-shard local fusion.
+        let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = HybridShardRequest {
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
-                vector: vector.to_vec(),
-                terms: terms.to_vec(),
+                vector: leg_vector.clone(),
+                terms: leg_terms.clone(),
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
-                global_doc_frequencies: global.dfs.clone(),
+                global_doc_frequencies: leg_dfs.clone(),
                 vector_weight: legs.vector_weight,
                 bm25_weight: legs.bm25_weight,
                 rrf_k: legs.rrf_k as f32,
@@ -749,10 +882,13 @@ impl CoordinatorServiceImpl {
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
-                client
-                    .hybrid_shard(request)
-                    .await
-                    .map(|r| (shard as u32, t0.elapsed().as_secs_f32() * 1e3, r.into_inner().hits))
+                client.hybrid_shard(request).await.map(|r| {
+                    (
+                        shard as u32,
+                        t0.elapsed().as_secs_f32() * 1e3,
+                        r.into_inner().hits,
+                    )
+                })
             }));
         }
         let mut shard_lists: Vec<(u32, Vec<crate::pb::HybridLegHit>)> = Vec::new();
@@ -764,9 +900,7 @@ impl CoordinatorServiceImpl {
             // Vector-score floor: drop non-qualifying docs from the
             // shard's fused list before level-two fusion.
             if legs.min_vector_score > 0.0 {
-                hits.retain(|h| {
-                    h.vector_rank.is_some() && h.vector_score >= legs.min_vector_score
-                });
+                hits.retain(|h| h.vector_rank.is_some() && h.vector_score >= legs.min_vector_score);
             }
             if debug {
                 // A two-level shard returns one FUSED list; per-leg
@@ -965,7 +1099,7 @@ impl CoordinatorServiceImpl {
         let mut flb_heap: std::collections::BinaryHeap<std::cmp::Reverse<F64Ord>> =
             std::collections::BinaryHeap::with_capacity(k as usize + 1);
         let push_flb = |heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<F64Ord>>,
-                            value: f64| {
+                        value: f64| {
             if heap.len() < k as usize {
                 heap.push(std::cmp::Reverse(F64Ord(value)));
             } else if heap.peek().is_some_and(|r| value > r.0 .0) {
@@ -984,8 +1118,8 @@ impl CoordinatorServiceImpl {
                 push_flb(&mut flb_heap, fused_of(v, b));
             }
         }
-        let mut s_lb = (flb_heap.len() == k as usize)
-            .then(|| flb_heap.peek().expect("full heap").0 .0);
+        let mut s_lb =
+            (flb_heap.len() == k as usize).then(|| flb_heap.peek().expect("full heap").0 .0);
         let decomposed = s_lb.map(|s| decomposed_floor(s, wb_b1, w_v));
         // min_vector_score is a result-set gate, so it doubles as a
         // free starting floor: suppressed docs are excluded docs.
@@ -1079,9 +1213,7 @@ impl CoordinatorServiceImpl {
             let mut fused: Vec<f64> = exact.iter().map(|&(_, _, v, b)| fused_of(v, b)).collect();
             if fused.len() >= k as usize {
                 let idx = k as usize - 1;
-                *fused
-                    .select_nth_unstable_by(idx, |a, b| b.total_cmp(a))
-                    .1
+                *fused.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1
             } else {
                 f64::NEG_INFINITY
             }
@@ -1101,7 +1233,9 @@ impl CoordinatorServiceImpl {
                 rescore_docs.push((doc, shard, v));
             }
         }
-        let rescored_b = self.fanout_bm25_rescore_scores(terms, global, rescore_ids).await?;
+        let rescored_b = self
+            .fanout_bm25_rescore_scores(terms, global, rescore_ids)
+            .await?;
         for (doc, shard, v) in rescore_docs {
             // Absent from the rescore response = no query term matches
             // the doc: b is exactly 0.
@@ -1178,7 +1312,10 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
             tasks.push(tokio::spawn(async move {
-                client.vector_rescore(request).await.map(|r| r.into_inner().hits)
+                client
+                    .vector_rescore(request)
+                    .await
+                    .map(|r| r.into_inner().hits)
             }));
         }
         let mut scores = HashMap::new();
@@ -1215,7 +1352,10 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
             tasks.push(tokio::spawn(async move {
-                client.bm25_rescore(request).await.map(|r| r.into_inner().hits)
+                client
+                    .bm25_rescore(request)
+                    .await
+                    .map(|r| r.into_inner().hits)
             }));
         }
         let mut scores = HashMap::new();
@@ -1484,8 +1624,7 @@ impl CoordinatorServiceImpl {
             });
         }
 
-        let mut fanout =
-            self.open_stream_fanout(request_id, vector, initial_floor, false)?;
+        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false)?;
 
         // The global top-k: a max-heap whose top is the WORST survivor
         // under the merge's total order, so peek() is the k-th best.
@@ -1512,13 +1651,9 @@ impl CoordinatorServiceImpl {
                     }
                     for rec in batch.hits.chunks_exact(12) {
                         let entry = StreamHeapEntry(MergedHit {
-                            vector_id: u64::from_le_bytes(
-                                rec[..8].try_into().expect("8-byte id"),
-                            ),
+                            vector_id: u64::from_le_bytes(rec[..8].try_into().expect("8-byte id")),
                             shard: shard as u32,
-                            score: f32::from_le_bytes(
-                                rec[8..12].try_into().expect("4-byte score"),
-                            ),
+                            score: f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score")),
                         });
                         if heap.len() < k as usize {
                             heap.push(entry);
@@ -1660,8 +1795,7 @@ impl CoordinatorServiceImpl {
                             }
                         });
                         agg.chunks.push((doc, score));
-                        if score > agg.best_score
-                            || (score == agg.best_score && doc < agg.best_id)
+                        if score > agg.best_score || (score == agg.best_score && doc < agg.best_id)
                         {
                             if score > agg.best_score && score > kth {
                                 dirty = true;
@@ -1671,11 +1805,9 @@ impl CoordinatorServiceImpl {
                         }
                     }
                     if dirty && parents.len() >= k as usize {
-                        let mut bests: Vec<f32> =
-                            parents.values().map(|a| a.best_score).collect();
+                        let mut bests: Vec<f32> = parents.values().map(|a| a.best_score).collect();
                         let idx = k as usize - 1;
-                        let new_kth =
-                            *bests.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1;
+                        let new_kth = *bests.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1;
                         if new_kth > kth {
                             kth = new_kth;
                             // next_down, not bm25::floor_seed: parent
@@ -1821,10 +1953,7 @@ impl CoordinatorServiceImpl {
                 Some((shard, wall_ms, Ok(done))) => {
                     shard_hits.push((
                         shard,
-                        done.hits
-                            .iter()
-                            .map(|h| (h.vector_id, h.score))
-                            .collect(),
+                        done.hits.iter().map(|h| (h.vector_id, h.score)).collect(),
                     ));
                     for hit in done.hits {
                         let entry = best.entry(hit.parent_id).or_insert_with(|| hit.clone());
@@ -2128,7 +2257,10 @@ impl CoordinatorServiceImpl {
                 };
                 let mut client = self.node_client(node)?;
                 rescore_tasks.push(tokio::spawn(async move {
-                    client.bm25_rescore(request).await.map(|r| r.into_inner().hits)
+                    client
+                        .bm25_rescore(request)
+                        .await
+                        .map(|r| r.into_inner().hits)
                 }));
             }
             for task in rescore_tasks {
@@ -2232,6 +2364,107 @@ impl CoordinatorServiceImpl {
             }
         }
         results
+    }
+
+    /// Run one A/B arm through the ordinary handler for its kind.
+    ///
+    /// This dispatches to `bm25_search`/`hybrid_search` rather than
+    /// reimplementing them: the comparison is only trustworthy if each
+    /// arm executes the path it would execute in production, and a
+    /// parallel scoring path written for the A/B would drift from the
+    /// served one until the diff was measuring the drift.
+    async fn run_variant(
+        &self,
+        query: &search_variant::Query,
+        k: u32,
+    ) -> Result<Vec<RankedHit>, Status> {
+        match query {
+            search_variant::Query::Bm25(req) => {
+                // `k` is the request's shared depth; an arm's own k is
+                // ignored so the rankings stay comparable.
+                let mut req = req.clone();
+                req.k = k;
+                let resp = SearchService::bm25_search(self, Request::new(req))
+                    .await?
+                    .into_inner();
+                Ok(resp
+                    .hits
+                    .into_iter()
+                    .map(|h| RankedHit {
+                        doc_id: h.doc_id,
+                        score: h.score,
+                    })
+                    .collect())
+            }
+            search_variant::Query::Hybrid(req) => {
+                let mut req = req.clone();
+                req.k = k;
+                // The profile block is per-arm noise here and the caller
+                // asked for a comparison, not a trace.
+                req.debug = false;
+                let resp = SearchService::hybrid_search(self, Request::new(req))
+                    .await?
+                    .into_inner();
+                // CASCADE reports in `cascade_hits` and leaves `hits`
+                // empty; the other modes do the reverse. Both are a
+                // ranking, which is all a diff needs.
+                if resp.hits.is_empty() {
+                    Ok(resp
+                        .cascade_hits
+                        .into_iter()
+                        .map(|h| RankedHit {
+                            doc_id: h.doc_id,
+                            score: h.bm25_score,
+                        })
+                        .collect())
+                } else {
+                    Ok(resp
+                        .hits
+                        .into_iter()
+                        .map(|h| RankedHit {
+                            doc_id: h.doc_id,
+                            score: h.fused_score,
+                        })
+                        .collect())
+                }
+            }
+        }
+    }
+}
+
+/// Diff one arm against the reference arm.
+///
+/// Split out from the handler so the measure wiring is testable without a
+/// cluster: everything below the fan-out is a pure function of two
+/// rankings.
+fn diff_against(
+    reference: &VariantResult,
+    variant: &VariantResult,
+    k: usize,
+    rbo_p: f64,
+) -> RankingDiff {
+    let ref_ids: Vec<u64> = reference.hits.iter().map(|h| h.doc_id).collect();
+    let var_ids: Vec<u64> = variant.hits.iter().map(|h| h.doc_id).collect();
+    let depth = k.min(ref_ids.len()).min(var_ids.len());
+    let overlap_fraction = rankdiff::overlap_at_k(&ref_ids, &var_ids, k);
+    // The reference's own scores are the yardstick for both sides, so
+    // regret never compares a BM25 score with a fused one.
+    let scored: Vec<(u64, f32)> = reference.hits.iter().map(|h| (h.doc_id, h.score)).collect();
+    let regret = rankdiff::score_regret(&scored, &var_ids, k);
+    RankingDiff {
+        reference: reference.label.clone(),
+        variant: variant.label.clone(),
+        depth: depth as u32,
+        // Recovered from the fraction rather than recounted, so the two
+        // can never disagree.
+        overlap: (overlap_fraction * depth as f64).round() as u32,
+        overlap_fraction: overlap_fraction as f32,
+        kendall_tau: rankdiff::kendall_tau(&ref_ids, &var_ids) as f32,
+        rbo: rankdiff::rbo(&ref_ids, &var_ids, rbo_p) as f32,
+        score_regret: regret.mean as f32,
+        regret_counted: regret.counted as u32,
+        regret_unscored: regret.unscored as u32,
+        top1_flipped: rankdiff::top1_flipped(&ref_ids, &var_ids),
     }
 }
 
@@ -2486,14 +2719,12 @@ async fn run_shard_with_hedge(
         }
     };
     match limits.shard_deadline {
-        Some(deadline) => tokio::time::timeout(deadline, attempt)
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded(format!(
-                    "shard {shard} exceeded its {}ms deadline",
-                    deadline.as_millis()
-                ))
-            })?,
+        Some(deadline) => tokio::time::timeout(deadline, attempt).await.map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "shard {shard} exceeded its {}ms deadline",
+                deadline.as_millis()
+            ))
+        })?,
         None => attempt.await,
     }
 }
@@ -2524,6 +2755,40 @@ pub struct HybridLegs {
     pub combination: fusion::Combination,
     /// Vector-score floor on the result set (see the proto); 0 = off.
     pub min_vector_score: f32,
+}
+
+/// The per-leg payload to put on the wire, blanked for a leg this query
+/// has disabled.
+///
+/// A weight of exactly 0 disables a leg (see `HybridLegs`) and both
+/// fusion functions honor it — but they do so AFTER the shard has
+/// already scanned. A shard has no weight field to read; it gates the
+/// vector scan on a non-empty `vector` and the BM25 scan on non-empty
+/// `terms`, so sending a payload for a disabled leg buys a full scan
+/// whose result is then discarded. Measured on the 86.6M-chunk fleet: a
+/// `vector_weight: 0` query still paid ~320 ms of vector scan out of
+/// ~340 ms total, so "bm25-only" cost 20x what the lexical leg costs
+/// alone.
+///
+/// `dfs` travels with `terms` because `shard_legs` and `hybrid_shard`
+/// both reject a request whose lengths disagree.
+fn leg_payloads(
+    vector: &[f32],
+    terms: &[String],
+    global: &CorpusStats,
+    legs: HybridLegs,
+) -> (Vec<f32>, Vec<String>, Vec<u32>) {
+    let vector = if legs.vector_weight == 0.0 {
+        Vec::new()
+    } else {
+        vector.to_vec()
+    };
+    let (terms, dfs) = if legs.bm25_weight == 0.0 {
+        (Vec::new(), Vec::new())
+    } else {
+        (terms.to_vec(), global.dfs.clone())
+    };
+    (vector, terms, dfs)
 }
 
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
@@ -2608,6 +2873,7 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
+        let k = self.resolve_k(req.k)?;
         if req.vector.is_empty() {
             return Err(Status::invalid_argument("empty query vector"));
         }
@@ -2634,7 +2900,7 @@ impl SearchService for CoordinatorServiceImpl {
             // only.
             if self.stream_search {
                 let doc = self
-                    .fanout_stream_search_collapse(&request_id, &req.vector, req.k)
+                    .fanout_stream_search_collapse(&request_id, &req.vector, k)
                     .await?;
                 return Ok(Response::new(SearchResponse {
                     request_id,
@@ -2643,11 +2909,11 @@ impl SearchService for CoordinatorServiceImpl {
                     chunk_floor: doc.chunk_floor,
                 }));
             }
-            self.fanout_search_collapse(&request_id, &req.vector, req.k)
+            self.fanout_search_collapse(&request_id, &req.vector, k)
                 .await?
         } else if self.stream_search {
             let streamed = self
-                .fanout_stream_search(&request_id, &req.vector, req.k, None)
+                .fanout_stream_search(&request_id, &req.vector, k, None)
                 .await?;
             return Ok(Response::new(SearchResponse {
                 request_id,
@@ -2656,7 +2922,7 @@ impl SearchService for CoordinatorServiceImpl {
                 chunk_floor: 0.0,
             }));
         } else {
-            self.fanout_search(&request_id, &req.vector, req.k, false)
+            self.fanout_search(&request_id, &req.vector, k, false)
                 .await?
         };
         Ok(Response::new(SearchResponse {
@@ -2672,24 +2938,39 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
         let req = request.into_inner();
+        let k = self.resolve_k(req.k)?;
         if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
             return Err(Status::invalid_argument(
                 "min_score must be finite (NaN and -inf are not valid floors)",
             ));
         }
         let hits = if req.fields.is_empty() {
-            self.fanout_bm25_seeded(&req.text, req.k, req.analysis.as_ref(), req.min_score)
+            self.fanout_bm25_seeded(&req.text, k, req.analysis.as_ref(), req.min_score)
                 .await?
         } else {
-            self.fanout_bm25_fused(&req.text, req.k, &req.fields, req.min_score)
+            // `analysis` is documented as ignored once `fields` is set,
+            // because term identity is per field. Ignoring it QUIETLY is
+            // the trap: the caller believes it asked for the ingest
+            // analysis, every field falls back to the sidecar default,
+            // and the query runs against terms that do not exist in the
+            // index. That returns a confident ranking over whichever
+            // tokens happened to survive, so it does not look like a
+            // failure -- it looks like bad relevance.
+            if req.analysis.is_some() {
+                return Err(Status::invalid_argument(
+                    "Bm25SearchRequest.analysis is ignored when `fields` is set (term identity \
+                     is per field). Move the spec onto each QueryField.analysis, or drop \
+                     `fields` to use the single-field route.",
+                ));
+            }
+            self.fanout_bm25_fused(&req.text, k, &req.fields, req.min_score)
                 .await?
         };
         // The merged k-th best: one f32 ULP below the last hit's score
         // when k hits were returned (see `bm25::floor_seed` — a later
         // seed can never exceed the true k-th best), 0 otherwise.
-        let kth_best = if hits.len() == req.k as usize {
-            hits
-                .last()
+        let kth_best = if hits.len() == k as usize {
+            hits.last()
                 .map(|h| crate::bm25::floor_seed(h.score))
                 .unwrap_or(0.0)
         } else {
@@ -2703,6 +2984,7 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
         let req = request.into_inner();
+        let k = self.resolve_k(req.k)?;
         if req.text.is_empty() {
             return Err(Status::invalid_argument(
                 "hybrid search requires query text",
@@ -2756,7 +3038,8 @@ impl SearchService for CoordinatorServiceImpl {
         // scales bounds by bm25_weight; both must be strictly positive
         // (a single-leg query belongs to GLOBAL_RANK or SCORE_BLEND).
         if options.fusion_mode() == FusionMode::Decomposed
-            && !(vector_weight > 0.0 && vector_weight.is_finite()
+            && !(vector_weight > 0.0
+                && vector_weight.is_finite()
                 && bm25_weight > 0.0
                 && bm25_weight.is_finite())
         {
@@ -2767,11 +3050,21 @@ impl SearchService for CoordinatorServiceImpl {
         if options.min_vector_score.is_nan() {
             return Err(Status::invalid_argument("min_vector_score must not be NaN"));
         }
+        // A floor on the vector leg's score cannot be met by a query that
+        // does not run the vector leg. Fusion would drop every hit and
+        // return an empty result set, which reads as "nothing matched"
+        // rather than "you asked for two contradictory things".
+        if options.min_vector_score > 0.0 && vector_weight == 0.0 {
+            return Err(Status::invalid_argument(
+                "min_vector_score is set but the vector leg is disabled (vector_weight 0); \
+                 no hit can carry a qualifying vector score",
+            ));
+        }
         let legs = HybridLegs {
             leg_k: if options.leg_k == 0 {
-                req.k.max(rrf_k as u32)
+                k.max(rrf_k as u32)
             } else {
-                options.leg_k.max(req.k)
+                options.leg_k.max(k)
             },
             vector_weight,
             bm25_weight,
@@ -2796,7 +3089,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &request_id,
                         &req.text,
                         &req.vector,
-                        req.k,
+                        k,
                         req.analysis.as_ref(),
                         legs.min_vector_score,
                         req.debug,
@@ -2810,7 +3103,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &request_id,
                         &req.text,
                         &req.vector,
-                        req.k,
+                        k,
                         req.analysis.as_ref(),
                         legs,
                         req.debug,
@@ -2895,9 +3188,7 @@ impl SearchService for CoordinatorServiceImpl {
         for task in tasks {
             match task.await {
                 Ok(target) => targets.push(target),
-                Err(e) => {
-                    return Err(Status::internal(format!("health probe task failed: {e}")))
-                }
+                Err(e) => return Err(Status::internal(format!("health probe task failed: {e}"))),
             }
         }
         Ok(Response::new(ClusterHealthResponse { targets }))
@@ -2915,5 +3206,147 @@ impl SearchService for CoordinatorServiceImpl {
         }
         let results = self.fanout_calibration(&req).await;
         Ok(Response::new(BroadcastCalibrationResponse { results }))
+    }
+
+    async fn variant_search(
+        &self,
+        request: Request<VariantSearchRequest>,
+    ) -> Result<Response<VariantSearchResponse>, Status> {
+        let req = request.into_inner();
+        if req.variants.len() < 2 {
+            return Err(Status::invalid_argument(format!(
+                "variant search compares configurations: at least 2 variants required, got {}",
+                req.variants.len()
+            )));
+        }
+        // 0 = unset selects max_k, like every other client-facing k.
+        let k = self.resolve_k(req.k)?;
+        // Labels carry the whole result: a blank or duplicated one makes
+        // the diffs unreadable, so reject rather than disambiguate.
+        let mut seen: Vec<&str> = Vec::with_capacity(req.variants.len());
+        for (i, v) in req.variants.iter().enumerate() {
+            if v.label.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "variant {i} has an empty label; every arm must be named"
+                )));
+            }
+            if seen.contains(&v.label.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate variant label {:?}: labels identify arms in the diffs",
+                    v.label
+                )));
+            }
+            seen.push(&v.label);
+            if v.query.is_none() {
+                return Err(Status::invalid_argument(format!(
+                    "variant {:?} has no query set (expected bm25 or hybrid)",
+                    v.label
+                )));
+            }
+        }
+        // RBO's persistence is a probability; 1.0 would never terminate
+        // its weighting and is as much an error as 2.0.
+        let rbo_p = if req.rbo_p == 0.0 {
+            0.9
+        } else {
+            f64::from(req.rbo_p)
+        };
+        if !(rbo_p.is_finite() && rbo_p > 0.0 && rbo_p < 1.0) {
+            return Err(Status::invalid_argument(format!(
+                "rbo_p must be in (0, 1); got {}",
+                req.rbo_p
+            )));
+        }
+        if req.interleave && req.variants.len() != 2 {
+            return Err(Status::invalid_argument(format!(
+                "interleaving is a two-way method (team draft); got {} variants. \
+                 Compare more arms with diffs, or interleave them pairwise.",
+                req.variants.len()
+            )));
+        }
+        let request_id = if req.request_id.is_empty() {
+            format!(
+                "req-{}-{}",
+                std::process::id(),
+                REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+            )
+        } else {
+            req.request_id.clone()
+        };
+
+        // Sequential, not concurrent. Running the arms together would
+        // make each one's `elapsed_ms` a measure of how hard the other
+        // arms were hitting the same shards, and per-arm cost is part of
+        // what an A/B is asked to report.
+        let mut results = Vec::with_capacity(req.variants.len());
+        for variant in &req.variants {
+            let query = variant
+                .query
+                .as_ref()
+                .expect("query presence checked above");
+            let started = std::time::Instant::now();
+            let hits = self.run_variant(query, k).await.map_err(|e| {
+                // Name the arm: with several in flight, an unadorned
+                // status leaves the caller guessing which one failed.
+                Status::new(
+                    e.code(),
+                    format!("variant {:?}: {}", variant.label, e.message()),
+                )
+            })?;
+            results.push(VariantResult {
+                label: variant.label.clone(),
+                hits,
+                elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
+            });
+        }
+
+        let diffs: Vec<RankingDiff> = results[1..]
+            .iter()
+            .map(|v| diff_against(&results[0], v, k as usize, rbo_p))
+            .collect();
+
+        let interleaving = req.interleave.then(|| {
+            let a: Vec<u64> = results[0].hits.iter().map(|h| h.doc_id).collect();
+            let b: Vec<u64> = results[1].hits.iter().map(|h| h.doc_id).collect();
+            // A seed derived from the query text keeps a re-run of the
+            // same query byte-identical while still varying across
+            // queries, so determinism does not become a first-position
+            // bias for one arm.
+            let seed = if req.interleave_seed == 0 {
+                crate::interleave::seed_for(variant_text(&req.variants[0]))
+            } else {
+                req.interleave_seed
+            };
+            let merged = crate::interleave::team_draft(&a, &b, k as usize, seed);
+            Interleaving {
+                doc_ids: merged.ids,
+                teams: merged
+                    .team
+                    .into_iter()
+                    .map(|t| match t {
+                        crate::interleave::Team::A => InterleaveTeam::A as i32,
+                        crate::interleave::Team::B => InterleaveTeam::B as i32,
+                    })
+                    .collect(),
+                seed,
+            }
+        });
+
+        Ok(Response::new(VariantSearchResponse {
+            request_id,
+            results,
+            diffs,
+            interleaving,
+        }))
+    }
+}
+
+/// The query text of an arm, whatever kind it is — the stable thing to
+/// seed an interleaving from.
+fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
+    match &variant.query {
+        Some(search_variant::Query::Bm25(r)) => &r.text,
+        Some(search_variant::Query::Hybrid(r)) => &r.text,
+        None => "",
     }
 }

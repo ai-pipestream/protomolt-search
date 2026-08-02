@@ -24,6 +24,176 @@ use crate::postings::AnalyzedDoc;
 /// Matches the sidecar's default text size cap.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
+/// The analysis a body-text corpus is built with, and the ONLY spec that
+/// may be used to query one.
+///
+/// Term identity is decided entirely inside the sidecar, so an index and
+/// a query that disagree about this struct do not fail — they silently
+/// score different terms. That has now cost this project twice: once
+/// when a query went out unstemmed against a stemmed index, and once
+/// when the v7 corpus was built under `SOURCE_STEMS` (below). Both times
+/// the spec was written out by hand at the call site, and there were
+/// thirteen such copies. There is now one, and callers take it from
+/// here.
+///
+/// `SOURCE_NORMALIZED_STEMS` (3), not `SOURCE_STEMS` (2). The sidecar's
+/// own proto calls SOURCE_STEMS "a trap for any corpus that is not
+/// already lower case", and it is: stemmers operate on the surface form
+/// and do not fold case, so capitalization survives into term identity.
+/// Measured on the 86.6M-chunk court corpus built that way, `court`,
+/// `Court` and `COURT` were three separate terms with df 36,113,172 /
+/// 22,353,022 / 2,165,891 — a lowercase query reached 60% of them and
+/// scored the term as far rarer than it is. Proper nouns fared worst
+/// (`Dragon` df 4,571 vs `dragon` 508), so a search for "dungeons and
+/// dragons" returned dragon-toy copyright suits and prison dungeons
+/// while every Dungeons & Dragons opinion sat under the capitalized
+/// terms, unreachable.
+///
+/// The char filters run before the stemmer under source 3. STRIP_INVISIBLE and
+/// WHITESPACE are the sidecar's own defaults; FULL_CASE_FOLD is the one
+/// that does the work here.
+pub fn body_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        tokenizer: TOKENIZER_WHITESPACE,
+        stemmer: STEMMER_PORTER,
+        term_vector_mode: TERM_VECTOR_MODE_FULL,
+        term_vector_source: SOURCE_NORMALIZED_STEMS,
+        char_filters: vec![
+            CHAR_FILTER_STRIP_INVISIBLE,
+            CHAR_FILTER_WHITESPACE,
+            CHAR_FILTER_FULL_CASE_FOLD,
+        ],
+    }
+}
+
+/// The cased twin of [`body_spec`]: identical tokenizer and stemmer,
+/// but term identity taken from the stem of the SURFACE form, so
+/// capitalization survives into the term.
+///
+/// This is not a mistake repeated; it is the other arm of the
+/// experiment. Folding is right for recall (`court` should find
+/// `Court`), and wrong for the signal that made "Dungeons and Dragons"
+/// findable at all: on this corpus the capitalized form dominates for
+/// proper nouns, and folding destroys the distinction. Which wins is a
+/// question about THIS corpus, so it is measured rather than assumed,
+/// which is what a second column is for.
+pub fn cased_body_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        term_vector_source: SOURCE_STEMS,
+        // SOURCE_STEMS ignores char filters outright, so leaving them
+        // populated here would be a lie about what the column contains.
+        char_filters: Vec::new(),
+        ..body_spec()
+    }
+}
+
+/// The analyzers callers may name, for CLIs and config: one vocabulary
+/// instead of enum triples at every call site.
+///
+/// `Ok(None)` means "send no spec", which leaves the sidecar to apply
+/// its own defaults. That is a real choice and not the same as any named
+/// analyzer, because the sidecar's default does not stem.
+pub fn analyzer_by_name(name: &str) -> Result<Option<AnalysisSpec>, String> {
+    Ok(match name {
+        // `ingest` is the corpus's own analyzer, whatever that currently
+        // is; the alias exists so callers can say "match the index"
+        // without knowing which one that is today.
+        "ingest" | "folded" => Some(body_spec()),
+        "cased" => Some(cased_body_spec()),
+        "server" => None,
+        other => {
+            return Err(format!(
+                "unknown analyzer {other:?}; expected one of {}",
+                ANALYZER_NAMES.join(", ")
+            ))
+        }
+    })
+}
+
+/// Every name [`analyzer_by_name`] accepts.
+pub const ANALYZER_NAMES: &[&str] = &["ingest", "folded", "cased", "server"];
+
+/// Stable 64-bit identity of an [`AnalysisSpec`]: the term-identity
+/// contract reduced to one number a shard can persist and a query can be
+/// checked against.
+///
+/// Field name equality is NOT this check. A column named `body_norm`
+/// built under one analyzer and queried under another matches on name,
+/// scores different terms, and returns a confident wrong ranking with no
+/// error anywhere. That failure has cost this project twice, and the
+/// coming rebuild multiplies the surface by adding a second body column
+/// whose whole purpose is to differ from the first.
+///
+/// Hand-rolled FNV-1a for the same reason [`crate::reshard::fnv1a64`] is:
+/// this value is written into a FILE FORMAT, so it must never change.
+/// `DefaultHasher` is explicitly not stable across Rust releases and
+/// would silently invalidate every shard on a toolchain bump.
+///
+/// `None` is 0, meaning UNKNOWN rather than "the default analyzer": an
+/// absent spec is resolved against the sidecar's own defaults, which
+/// this side cannot see and must not guess at. 0 never enforces, so a
+/// shard written before fingerprints existed keeps answering.
+pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
+    fn eat(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let Some(spec) = spec else { return 0 };
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    // Domain tag. If AnalysisSpec ever grows a field, bumping this
+    // invalidates old fingerprints LOUDLY (every shard mismatches and
+    // says so) instead of letting two different specs share a number.
+    eat(&mut hash, b"turbovec.analysis.v1");
+    for value in [
+        spec.tokenizer,
+        spec.stemmer,
+        spec.term_vector_mode,
+        spec.term_vector_source,
+    ] {
+        eat(&mut hash, &value.to_le_bytes());
+    }
+    // Char filter ORDER is semantic (it is a chain applied in sequence),
+    // so it is hashed in order and never sorted. The count goes in
+    // first so [1, 2] and [12] cannot collide.
+    eat(&mut hash, &(spec.char_filters.len() as u32).to_le_bytes());
+    for filter in &spec.char_filters {
+        eat(&mut hash, &filter.to_le_bytes());
+    }
+    // 0 is reserved for "unknown"; a real spec must never claim it.
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+/// `AnalysisOptions.Tokenizer.TOKENIZER_WHITESPACE`.
+pub const TOKENIZER_WHITESPACE: i32 = 1;
+/// `AnalysisOptions.Stemmer.STEMMER_NONE`.
+pub const STEMMER_NONE: i32 = 1;
+/// `AnalysisOptions.Stemmer.STEMMER_PORTER`.
+pub const STEMMER_PORTER: i32 = 2;
+/// `TermVectorOptions.Mode.MODE_FULL` (occurrence offsets included).
+pub const TERM_VECTOR_MODE_FULL: i32 = 1;
+/// `TermVectorOptions.Source.SOURCE_TOKENS` (char filters define identity).
+pub const SOURCE_TOKENS: i32 = 1;
+/// `TermVectorOptions.Source.SOURCE_STEMS` (char filters IGNORED; see
+/// [`body_spec`] for why this is the wrong choice for prose).
+pub const SOURCE_STEMS: i32 = 2;
+/// `TermVectorOptions.Source.SOURCE_NORMALIZED_STEMS` (char filters, then stem).
+pub const SOURCE_NORMALIZED_STEMS: i32 = 3;
+/// Strip invisible controls. Sidecar wire value
+/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_STRIP_INVISIBLE`.
+pub const CHAR_FILTER_STRIP_INVISIBLE: i32 = 1;
+/// Collapse whitespace. Sidecar wire value
+/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_WHITESPACE`.
+pub const CHAR_FILTER_WHITESPACE: i32 = 2;
+/// Full Unicode case fold. Sidecar wire value
+/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_FULL_CASE_FOLD`.
+pub const CHAR_FILTER_FULL_CASE_FOLD: i32 = 6;
+
 /// Shared h2 channel to a sidecar address. tonic channels multiplex
 /// concurrent calls over one connection and are cheap to clone; opening
 /// a fresh TCP+h2 connection per Analyze (the previous behavior) buried
@@ -141,11 +311,11 @@ pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
 /// are always requested (FULL mode with occurrence offsets unless the spec
 /// overrides), everything else defaults.
 fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
-    let (mode, source, steps, tokenizer, stemmer) = match spec {
+    let (mode, source, char_filters, tokenizer, stemmer) = match spec {
         Some(s) => (
             s.term_vector_mode,
             s.term_vector_source,
-            s.normalizer_steps.clone(),
+            s.char_filters.clone(),
             s.tokenizer,
             s.stemmer,
         ),
@@ -157,9 +327,11 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
         term_vectors: Some(TermVectorOptions {
             enabled: true,
             mode,
-            steps,
+            // The sidecar calls these normalizer STEPS; Lucene (and so
+            // this side) calls the stage a char filter. Same field
+            // number, same values, different vocabulary.
+            steps: char_filters,
             source,
-            dual_cased: false,
         }),
         ..Default::default()
     }
@@ -226,8 +398,8 @@ pub struct AnalyzeStream {
 
 impl AnalyzeStream {
     /// Opens a stream and sends its options message. UNIMPLEMENTED means
-    /// the sidecar predates the RPC: fall back to unary
-    /// [`analyze_document`] calls.
+    /// the sidecar predates the RPC and must be rebuilt; there is no
+    /// unary fallback (see [`analyze_batch`] for why it was removed).
     ///
     /// The await resolves on call ACCEPTANCE, not on any result: the
     /// sidecar sends response headers eagerly (its
@@ -258,6 +430,54 @@ impl AnalyzeStream {
         self.submit
             .clone()
             .expect("finished stream has no submitter")
+    }
+
+    /// Submit `indices` (as sequences) through this one stream and
+    /// collect every result, racing submission against consumption so a
+    /// full local buffer never stalls the drain.
+    ///
+    /// Extracted so the multi-stream path runs the SAME loop N times
+    /// rather than a second implementation of it: the pacing here is
+    /// subtle (the await in `submit` is the backpressure), and two
+    /// versions of it would drift.
+    async fn run_to_completion(
+        mut self,
+        items: &[(u64, &str)],
+    ) -> Result<Vec<(u64, AnalyzedDoc)>, Status> {
+        let mut out = Vec::with_capacity(items.len());
+        let submit = self.submitter();
+        let (mut submitted, mut received) = (0usize, 0usize);
+        let take = |item: Option<(u64, Result<AnalyzedDoc, Status>)>,
+                    out: &mut Vec<(u64, AnalyzedDoc)>|
+         -> Result<(), Status> {
+            let Some((sequence, result)) = item else {
+                return Err(Status::internal(
+                    "analysis stream completed with documents unanswered",
+                ));
+            };
+            out.push((sequence, result?));
+            Ok(())
+        };
+        while submitted < items.len() {
+            let (sequence, text) = items[submitted];
+            tokio::select! {
+                sent = submit.submit(sequence, text) => {
+                    sent?;
+                    submitted += 1;
+                }
+                result = self.next() => {
+                    take(result?, &mut out)?;
+                    received += 1;
+                }
+            }
+        }
+        drop(submit);
+        self.finish();
+        while received < items.len() {
+            take(self.next().await?, &mut out)?;
+            received += 1;
+        }
+        Ok(out)
     }
 
     /// Half-close the submission side. Once every [`submitter`] clone
@@ -292,34 +512,49 @@ impl AnalyzeStream {
     }
 }
 
-/// Analyze a batch through one [`AnalyzeStream`] per distinct spec
-/// (almost always exactly one), returning results in input order. Falls
-/// back to concurrent unary calls against a sidecar that predates the
-/// RPC. Any per-document failure fails the whole batch, the contract the
-/// reshard replay tools rely on.
+/// Analyze a batch through [`AnalyzeStream`], returning results in INPUT
+/// order. Any per-document failure fails the whole batch, the contract
+/// the reshard replay tools rely on.
+///
+/// One stream per distinct spec (almost always exactly one). For more
+/// than one stream per spec see [`analyze_batch_streams`].
 pub async fn analyze_batch(
     addr: &str,
     docs: &[(&str, Option<&AnalysisSpec>)],
 ) -> Result<Vec<AnalyzedDoc>, Status> {
+    analyze_batch_streams(addr, docs, 1).await
+}
+
+/// [`analyze_batch`] over `streams` concurrent AnalyzeStreams per spec.
+///
+/// One stream is a pipeline, not a parallel: the sidecar paces it with
+/// its own flow control, so a single stream can leave analysis workers
+/// idle while it waits on the wire. Since analysis is the ceiling on
+/// bulk ingest (shard parallelism is not), opening several lets the
+/// sidecar work on several documents at once. The right number is a
+/// property of the sidecar's worker pool, not of this client, which is
+/// why it is a parameter rather than a constant.
+///
+/// Results are keyed by the caller's sequence and land in their input
+/// slots, so the OUTPUT IS BYTE-IDENTICAL whatever `streams` is set to.
+/// Analysis is a pure function of (text, spec); splitting the work
+/// changes only who waits. That is pinned by test, because a throughput
+/// knob that quietly perturbed term identity would corrupt an index
+/// rather than slow one down.
+///
+/// `streams` is clamped to at least 1 and to the number of documents in
+/// a group; more streams than documents would open connections that
+/// immediately close.
+pub async fn analyze_batch_streams(
+    addr: &str,
+    docs: &[(&str, Option<&AnalysisSpec>)],
+    streams: usize,
+) -> Result<Vec<AnalyzedDoc>, Status> {
     let mut out: Vec<Option<AnalyzedDoc>> = Vec::new();
     out.resize_with(docs.len(), || None);
-    let receive = |item: Option<(u64, Result<AnalyzedDoc, Status>)>,
-                       out: &mut Vec<Option<AnalyzedDoc>>|
-     -> Result<(), Status> {
-        let Some((sequence, result)) = item else {
-            return Err(Status::internal(
-                "analysis stream completed with documents unanswered",
-            ));
-        };
-        let slot = out
-            .get_mut(sequence as usize)
-            .ok_or_else(|| Status::internal(format!("unknown result sequence {sequence}")))?;
-        *slot = Some(result?);
-        Ok(())
-    };
     // Group indices by spec, preserving first-seen order; the global doc
     // index is the sequence, so results land in their input slots no
-    // matter which group answered.
+    // matter which group or which stream answered.
     let mut groups: Vec<(Option<&AnalysisSpec>, Vec<usize>)> = Vec::new();
     for (i, (_, spec)) in docs.iter().enumerate() {
         match groups.iter_mut().find(|(s, _)| *s == *spec) {
@@ -328,34 +563,43 @@ pub async fn analyze_batch(
         }
     }
     for (spec, indices) in groups {
-        let mut session = match AnalyzeStream::open(addr, spec).await {
-            Ok(session) => session,
-            Err(status) if status.code() == tonic::Code::Unimplemented => {
-                return analyze_batch_unary(addr, docs).await;
-            }
-            Err(status) => return Err(status),
-        };
-        let submit = session.submitter();
-        let mut submitted = 0usize;
-        let mut received = 0usize;
-        while submitted < indices.len() {
-            let i = indices[submitted];
-            tokio::select! {
-                sent = submit.submit(i as u64, docs[i].0) => {
-                    sent?;
-                    submitted += 1;
-                }
-                result = session.next() => {
-                    receive(result?, &mut out)?;
-                    received += 1;
-                }
-            }
+        let want = streams.max(1).min(indices.len());
+        if want == 0 {
+            continue;
         }
-        drop(submit);
-        session.finish();
-        while received < indices.len() {
-            receive(session.next().await?, &mut out)?;
-            received += 1;
+        // Contiguous chunks, not round-robin: consecutive documents in a
+        // bulk replay tend to be similar in size, so contiguity keeps the
+        // per-stream loads even without knowing anything about them.
+        let per = indices.len().div_ceil(want);
+        let chunks: Vec<Vec<(u64, &str)>> = indices
+            .chunks(per)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&i| (i as u64, docs[i].0))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let mut sessions = Vec::with_capacity(chunks.len());
+        for _ in 0..chunks.len() {
+            sessions.push(open_stream(addr, spec).await?);
+        }
+        // Drive every stream from this one task: the work being
+        // overlapped is the sidecar's, and these futures only wait on
+        // I/O. No spawn, so nothing has to be cloned to satisfy 'static.
+        let mut running: Vec<_> = sessions
+            .into_iter()
+            .zip(&chunks)
+            .map(|(session, chunk)| Box::pin(session.run_to_completion(chunk)))
+            .collect();
+        for done in join_all(&mut running).await {
+            for (sequence, doc) in done? {
+                let slot = out.get_mut(sequence as usize).ok_or_else(|| {
+                    Status::internal(format!("unknown result sequence {sequence}"))
+                })?;
+                *slot = Some(doc);
+            }
         }
     }
     Ok(out
@@ -364,27 +608,208 @@ pub async fn analyze_batch(
         .collect())
 }
 
-/// The pre-stream behavior of the replay tools: one unary call per
-/// document, fanned out concurrently over the shared channel.
-async fn analyze_batch_unary(
-    addr: &str,
-    docs: &[(&str, Option<&AnalysisSpec>)],
-) -> Result<Vec<AnalyzedDoc>, Status> {
-    let tasks: Vec<_> = docs
-        .iter()
-        .map(|(text, spec)| {
-            let addr = addr.to_string();
-            let text = text.to_string();
-            let spec = spec.cloned();
-            tokio::spawn(async move { analyze_document(&addr, &text, spec.as_ref()).await })
-        })
-        .collect();
-    let mut out = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        out.push(
-            task.await
-                .map_err(|e| Status::internal(format!("analysis task failed: {e}")))??,
+/// Open one stream, naming a version skew rather than degrading.
+///
+/// No quiet downgrade to per-document unary calls. That fallback existed
+/// and cost real debugging time: this is a BULK path (reshard and WAL
+/// replay), and the unary transport opens one h2 stream per document, so
+/// a sidecar predating AnalyzeStream GOAWAYs after ~70 of them. The
+/// "fallback" did not degrade gracefully, it failed obscurely thousands
+/// of documents later.
+async fn open_stream(addr: &str, spec: Option<&AnalysisSpec>) -> Result<AnalyzeStream, Status> {
+    match AnalyzeStream::open(addr, spec).await {
+        Ok(session) => Ok(session),
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            Err(Status::failed_precondition(format!(
+                "analysis sidecar at {addr} does not implement AnalyzeStream; \
+                 it predates the RPC and must be rebuilt (./gradlew installDist \
+                 in grpc-opennlp-analysis)"
+            )))
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Await every future to completion, returning results in input order.
+///
+/// Hand-rolled because the crate does not depend on `futures`, and this
+/// is the whole of what it would be used for: poll each in turn, yield
+/// when none is ready. The waker is shared, so a wake from any one
+/// re-polls all of them, which is correct if slightly eager for the
+/// handful of streams this ever holds.
+async fn join_all<F: std::future::Future>(futures: &mut [std::pin::Pin<Box<F>>]) -> Vec<F::Output> {
+    let mut done: Vec<Option<F::Output>> = (0..futures.len()).map(|_| None).collect();
+    let mut remaining = futures.len();
+    std::future::poll_fn(|cx| {
+        for (slot, future) in done.iter_mut().zip(futures.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(cx) {
+                *slot = Some(value);
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    done.into_iter()
+        .map(|slot| slot.expect("poll_fn returned only when every future completed"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two named body analyzers must differ in TERM IDENTITY, not
+    /// merely in name. If they ever resolved to the same spec the A/B
+    /// they exist for would compare a column with itself and report
+    /// "no difference", which is the most expensive possible way to be
+    /// wrong: it looks like an answer.
+    #[test]
+    fn folded_and_cased_are_actually_different_analyzers() {
+        let folded = analyzer_by_name("folded").expect("known name").unwrap();
+        let cased = analyzer_by_name("cased").expect("known name").unwrap();
+        assert_ne!(folded.term_vector_source, cased.term_vector_source);
+        assert_eq!(folded.term_vector_source, SOURCE_NORMALIZED_STEMS);
+        assert_eq!(cased.term_vector_source, SOURCE_STEMS);
+        // Same tokenizer and stemmer: the comparison isolates case
+        // folding, so anything else differing would confound it.
+        assert_eq!(folded.tokenizer, cased.tokenizer);
+        assert_eq!(folded.stemmer, cased.stemmer);
+        // SOURCE_STEMS ignores char filters, so carrying them on the
+        // cased spec would misdescribe what the column holds.
+        assert!(cased.char_filters.is_empty());
+        assert!(folded.char_filters.contains(&CHAR_FILTER_FULL_CASE_FOLD));
+    }
+
+    /// `ingest` tracks the corpus spec rather than restating it, so the
+    /// alias cannot rot when `body_spec` changes.
+    #[test]
+    fn ingest_is_the_corpus_analyzer() {
+        assert_eq!(analyzer_by_name("ingest").unwrap(), Some(body_spec()));
+        assert_eq!(analyzer_by_name("folded").unwrap(), Some(body_spec()));
+    }
+
+    /// `server` is a real choice (leave the spec unset), not a missing
+    /// answer, and it is NOT the same as any named analyzer: the
+    /// sidecar's default does not stem.
+    #[test]
+    fn server_means_no_spec() {
+        assert_eq!(analyzer_by_name("server").unwrap(), None);
+    }
+
+    /// An unknown name is refused and NAMES the alternatives. A silent
+    /// fallback to the default here would query a stemmed index with an
+    /// unstemmed spec and report the ranking of whatever fragment
+    /// happened to match.
+    #[test]
+    fn an_unknown_analyzer_is_refused_and_lists_the_known_ones() {
+        let err = analyzer_by_name("porter").expect_err("not a known name");
+        assert!(err.contains("porter"), "{err}");
+        for name in ANALYZER_NAMES {
+            assert!(err.contains(name), "error should list {name}: {err}");
+        }
+    }
+
+    /// The fingerprint must separate the two analyzers an A/B compares,
+    /// and must survive a round trip through the file format unchanged.
+    #[test]
+    fn the_fingerprint_separates_the_analyzers_it_exists_to_separate() {
+        let folded = analysis_fingerprint(Some(&body_spec()));
+        let cased = analysis_fingerprint(Some(&cased_body_spec()));
+        assert_ne!(folded, cased);
+        assert_ne!(folded, 0);
+        assert_ne!(cased, 0);
+        // Stable: same spec, same number, every call.
+        assert_eq!(folded, analysis_fingerprint(Some(&body_spec())));
+    }
+
+    /// An absent spec is UNKNOWN, not "the default analyzer". The
+    /// sidecar resolves an absent spec against its own defaults, which
+    /// this side cannot see, so claiming a number here would assert
+    /// something we do not know.
+    #[test]
+    fn an_absent_spec_is_unknown_not_a_default() {
+        assert_eq!(analysis_fingerprint(None), 0);
+    }
+
+    /// Char filter ORDER is semantic, and the count is hashed so a
+    /// two-filter chain cannot collide with a one-filter chain whose
+    /// value happens to concatenate.
+    #[test]
+    fn char_filter_order_and_arity_both_change_the_fingerprint() {
+        let base = body_spec();
+        let mut reordered = base.clone();
+        reordered.char_filters.reverse();
+        assert_ne!(
+            analysis_fingerprint(Some(&base)),
+            analysis_fingerprint(Some(&reordered)),
+            "a reordered filter chain is a different analyzer"
+        );
+        let mut dropped = base.clone();
+        dropped.char_filters.pop();
+        assert_ne!(
+            analysis_fingerprint(Some(&base)),
+            analysis_fingerprint(Some(&dropped))
+        );
+        let mut one = base.clone();
+        one.char_filters = vec![12];
+        let mut two = base.clone();
+        two.char_filters = vec![1, 2];
+        assert_ne!(
+            analysis_fingerprint(Some(&one)),
+            analysis_fingerprint(Some(&two)),
+            "[12] must not collide with [1, 2]"
         );
     }
-    Ok(out)
+
+    /// Every scalar of the spec participates. A field that did not would
+    /// be a hole in the contract exactly where someone would eventually
+    /// vary it.
+    #[test]
+    fn every_field_of_the_spec_changes_the_fingerprint() {
+        let base = body_spec();
+        let fp = analysis_fingerprint(Some(&base));
+        for (name, mutate) in [
+            (
+                "tokenizer",
+                (|s: &mut AnalysisSpec| s.tokenizer += 1) as fn(&mut AnalysisSpec),
+            ),
+            ("stemmer", |s: &mut AnalysisSpec| s.stemmer += 1),
+            ("term_vector_mode", |s: &mut AnalysisSpec| {
+                s.term_vector_mode += 1
+            }),
+            ("term_vector_source", |s: &mut AnalysisSpec| {
+                s.term_vector_source += 1
+            }),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                fp,
+                analysis_fingerprint(Some(&changed)),
+                "changing {name} must change the fingerprint"
+            );
+        }
+    }
+
+    /// The value is written into a FILE FORMAT, so it is pinned to a
+    /// literal. A change here silently invalidates every shard on disk,
+    /// so it must be a deliberate edit to this test and not a drive-by
+    /// refactor of the hash.
+    #[test]
+    fn the_corpus_fingerprint_is_pinned() {
+        assert_eq!(
+            analysis_fingerprint(Some(&body_spec())),
+            0x38b3_6014_eb6d_63eb,
+            "the corpus analyzer fingerprint changed; every v7 shard on disk \
+             carries the old value and would now refuse every query"
+        );
+    }
 }

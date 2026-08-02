@@ -25,8 +25,7 @@ use turbovec_search::node::NodeConfig;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastCalibrationRequest, DocLineage,
-    DocumentField,
-    FlushRequest, GetDocumentsRequest,
+    DocumentField, FlushRequest, GetDocumentsRequest,
 };
 
 const SIDECAR_BIN: &str =
@@ -40,14 +39,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn analysis_spec() -> AnalysisSpec {
-    // WHITESPACE tokenizer, PORTER stemmer, MODE_FULL, SOURCE_STEMS.
-    AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_steps: vec![],
-    }
+    turbovec_search::analyzer::body_spec()
 }
 
 /// The case_name field's analysis (docs/multi-field.md): names stay
@@ -59,7 +51,7 @@ fn case_name_spec() -> AnalysisSpec {
         stemmer: 1,
         term_vector_mode: 1,
         term_vector_source: 1,
-        normalizer_steps: vec![],
+        char_filters: vec![],
     }
 }
 
@@ -91,20 +83,88 @@ fn load_case_names(path: &str) -> Result<std::collections::HashMap<u64, String>,
     Ok(map)
 }
 
-/// The extra-field entries for one chunk: a case_name DocumentField
-/// when the cluster map knows the chunk's cluster.
+/// One extra column over the SAME body text, under its own analysis:
+/// the A/B unit.
+///
+/// Comparing two analysis chains normally costs two indexes and two
+/// ingests, which at corpus scale is hours and hundreds of GB. Multi-field
+/// BM25 already gives every field its own postings over one shared slot
+/// space, so the same text indexed twice under different specs is two
+/// columns of ONE index, and the comparison becomes a query-time choice of
+/// which field to score. Both columns see byte-identical input and
+/// identical ids, which is exactly the control a text-scrub or
+/// re-chunk experiment cannot offer.
+///
+/// Cost is the honest catch: a body column is most of the postings, so
+/// each one roughly adds the whole `.bm25` again. Slices, not corpora.
+struct BodyColumn {
+    field: String,
+    spec: AnalysisSpec,
+}
+
+/// Parses `--body-columns=name:tokenizer:stemmer:source,...` (numeric
+/// sidecar enum values, matching AnalysisSpec's passthrough), each an
+/// extra copy of the body under that spec. The stored body itself is
+/// always field 0 and is NOT named here.
+fn parse_body_columns(spec: &str) -> Result<Vec<BodyColumn>, String> {
+    let mut out = Vec::new();
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.len() != 4 {
+            return Err(format!(
+                "--body-columns entry {entry:?}: expected name:tokenizer:stemmer:source"
+            ));
+        }
+        let num = |i: usize, what: &str| -> Result<i32, String> {
+            parts[i]
+                .parse()
+                .map_err(|e| format!("--body-columns entry {entry:?}: {what}: {e}"))
+        };
+        let field = parts[0].to_string();
+        if field == "body" {
+            return Err("--body-columns cannot redefine \"body\": it is field 0, \
+                        ingested under --analysis"
+                .to_string());
+        }
+        out.push(BodyColumn {
+            field,
+            spec: AnalysisSpec {
+                tokenizer: num(1, "tokenizer")?,
+                stemmer: num(2, "stemmer")?,
+                term_vector_mode: 1,
+                term_vector_source: num(3, "source")?,
+                char_filters: Vec::new(),
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// The extra-field entries for one chunk: every A/B body column over the
+/// chunk's own text, then a case_name DocumentField when the cluster map
+/// knows the chunk's cluster.
 fn chunk_fields(
     case_names: &Option<std::sync::Arc<std::collections::HashMap<u64, String>>>,
     cluster_id: u64,
+    body_columns: &[BodyColumn],
+    text: &str,
 ) -> Vec<DocumentField> {
-    match case_names.as_ref().and_then(|m| m.get(&cluster_id)) {
-        Some(name) => vec![DocumentField {
+    let mut fields: Vec<DocumentField> = body_columns
+        .iter()
+        .map(|c| DocumentField {
+            field: c.field.clone(),
+            text: text.to_string(),
+            analysis: Some(c.spec.clone()),
+        })
+        .collect();
+    if let Some(name) = case_names.as_ref().and_then(|m| m.get(&cluster_id)) {
+        fields.push(DocumentField {
             field: "case_name".to_string(),
             text: name.clone(),
             analysis: Some(case_name_spec()),
-        }],
-        None => Vec::new(),
+        });
     }
+    fields
 }
 
 /// Sequential reader over an embeddings-file block starting at record
@@ -153,6 +213,63 @@ impl EmbBlock {
     }
 }
 
+/// A fitted TQ+ seed calibration, shared between the drivers of one
+/// rebuild (`--calibration=<path>`). Fitting streams the whole
+/// embeddings file, so N parallel drivers would otherwise read it N
+/// times to arrive at the same numbers.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CalibrationFile {
+    dim: usize,
+    bit_width: usize,
+    shift: Vec<f32>,
+    scale: Vec<f32>,
+}
+
+/// Load `path` when it exists, else fit from the embeddings file's
+/// stride sample and write it (temp file + rename, so a concurrent
+/// reader never sees a partial fit).
+fn load_or_fit_calibration(
+    path: &str,
+    embeddings_path: &str,
+    dim: usize,
+) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+    if !path.is_empty() && std::path::Path::new(path).exists() {
+        let text = std::fs::read_to_string(path)?;
+        let file: CalibrationFile = serde_json::from_str(&text)?;
+        if file.dim != dim {
+            return Err(format!("{path}: calibration dim {} != corpus dim {dim}", file.dim).into());
+        }
+        eprintln!("calibration loaded from {path}");
+        return Ok((file.shift, file.scale));
+    }
+    let (_, reader) = court::EmbeddingReader::open(std::path::Path::new(embeddings_path))?;
+    let mut sample: Vec<f32> = Vec::new();
+    for (i, record) in reader.enumerate() {
+        let record = record?;
+        if i % 300 == 0 {
+            sample.extend_from_slice(&record.vector);
+        }
+    }
+    let (shift, scale) = harness::fit_calibration(dim, 4, &sample);
+    eprintln!(
+        "calibration fitted on {} sample vectors",
+        sample.len() / dim
+    );
+    if !path.is_empty() {
+        let text = serde_json::to_string(&CalibrationFile {
+            dim,
+            bit_width: 4,
+            shift: shift.clone(),
+            scale: scale.clone(),
+        })?;
+        let tmp = format!("{path}.tmp{}", std::process::id());
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)?;
+        eprintln!("calibration written to {path}");
+    }
+    Ok((shift, scale))
+}
+
 /// Remote-shard mode: stream the chunks and embeddings files shard by
 /// shard into already-running nodes (`--nodes`), instead of building the
 /// join in memory. Nothing is buffered beyond the channel window, so the
@@ -179,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "" => None,
             path => Some(std::sync::Arc::new(load_case_names(path)?)),
         };
+    let body_columns = std::sync::Arc::new(parse_body_columns(&arg("body-columns", ""))?);
 
     // --- Load and join chunks x embeddings -------------------------------
     let t0 = Instant::now();
@@ -285,6 +403,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = addr.clone();
         let spec = spec.clone();
         let case_names = case_names.clone();
+        let body_columns = body_columns.clone();
         ingest_tasks.push(tokio::spawn(async move {
             let n = block.len();
             // Documents first so doc ids and vector slots align 1:1.
@@ -304,7 +423,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             span_start: chunk.span_start,
                             span_end: chunk.span_end,
                         }),
-                        fields: chunk_fields(&case_names, chunk.cluster_id),
+                        fields: chunk_fields(
+                            &case_names,
+                            chunk.cluster_id,
+                            &body_columns,
+                            &chunk.text,
+                        ),
                     })
                     .await
                     .unwrap();
@@ -371,7 +495,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let hits = coordinator
             .fanout_cascade("court", &chunk.text, vector, 5, Some(&spec), 0.0, false)
-            .await?.0;
+            .await?
+            .0;
         for hit in &hits {
             println!(
                 "  #{} doc {:>7} (shard {}) vector {:.4}  bm25 {:.4}",
@@ -452,6 +577,9 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
             "" => None,
             path => Some(std::sync::Arc::new(load_case_names(path)?)),
         };
+    // Extra A/B columns over the same body text (--body-columns). Nodes
+    // must carry these names in --bm25-fields, in this order, after body.
+    let body_columns = std::sync::Arc::new(parse_body_columns(&arg("body-columns", ""))?);
     // Bandwidth-proportional fleets need unequal shards: explicit split
     // points (chunk indexes, ascending, exclusive ends; the last shard
     // runs to the corpus end) override the equal m/n block math.
@@ -478,10 +606,26 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     // integrity check (chunk count == embedding count). Vectors-only
     // ingest reads the count straight off the fixed-stride embeddings
     // file instead of walking the chunks file.
-    let m = if vectors_only {
+    // `--chunk-count=<m>` skips the counting walk, which reads the whole
+    // chunks file (a rebuild's N parallel drivers would each pay it to
+    // learn the same number). Correctness does not rest on the walk: the
+    // doc feeder asserts (opinion_id, ordinal) equality at EVERY position
+    // against the embeddings file, and each shard asserts it sent exactly
+    // its share, so a wrong count cannot silently mis-join — it fails the
+    // ingest. The plan stage prints the count to pass here.
+    let declared_count: usize = arg("chunk-count", "0").parse()?;
+    let m = if vectors_only || declared_count > 0 {
         let (dim_probe, _) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
         let rec = 12 + dim_probe as u64 * 4;
-        ((std::fs::metadata(&embeddings_path)?.len() - 12) / rec) as usize
+        let from_file = ((std::fs::metadata(&embeddings_path)?.len() - 12) / rec) as usize;
+        if declared_count > 0 && declared_count != from_file {
+            return Err(format!(
+                "--chunk-count={declared_count} disagrees with the embeddings file's \
+                 {from_file} records"
+            )
+            .into());
+        }
+        from_file
     } else {
         let mut m = 0usize;
         for chunk in court::read_chunks(std::path::Path::new(&chunks_path))? {
@@ -518,21 +662,22 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
          this driver handles shards {first_shard}..{end_shard}"
     );
 
-    // Calibration: stride sample streamed from the embeddings file.
-    let (dim, reader) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
+    // Calibration: stride sample streamed from the embeddings file, or
+    // the shared fit at --calibration=<path>. With per-block (v7)
+    // calibration this is only the SEED every block starts from — a
+    // sealed 8192-row block refits on its own rows — so it survives as
+    // the open block's fit and as the precondition AddVectors checks.
+    let (dim, _) = court::EmbeddingReader::open(std::path::Path::new(&embeddings_path))?;
     let dim = dim as usize;
-    let mut sample: Vec<f32> = Vec::new();
-    for (i, record) in reader.enumerate() {
-        let record = record?;
-        if i % 300 == 0 {
-            sample.extend_from_slice(&record.vector);
-        }
+    let calibration_path = arg("calibration", "");
+    let (shift, scale) = load_or_fit_calibration(&calibration_path, &embeddings_path, dim)?;
+    // `--fit-only` stops here: one driver fits and publishes the file,
+    // then the per-shard drivers all load it instead of re-streaming the
+    // embeddings file once each.
+    if std::env::args().any(|a| a == "--fit-only") {
+        eprintln!("--fit-only: calibration ready, no shards touched");
+        return Ok(());
     }
-    let (shift, scale) = harness::fit_calibration(dim, 4, &sample);
-    eprintln!(
-        "calibration fitted on {} sample vectors",
-        sample.len() / dim
-    );
 
     // Broadcast only to this driver's range: nodes outside it may already
     // hold vectors (another driver's shards), where SetCalibration is a
@@ -556,7 +701,12 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("calibration broadcast to {} shards OK", results.len());
 
     let spec = analysis_spec();
-    for (shard, addr) in node_addrs.iter().enumerate().take(end_shard).skip(first_shard) {
+    for (shard, addr) in node_addrs
+        .iter()
+        .enumerate()
+        .take(end_shard)
+        .skip(first_shard)
+    {
         let t0 = Instant::now();
         let (start, end) = bounds[shard];
 
@@ -564,63 +714,68 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         let mut client = NodeServiceClient::connect(addr.clone()).await?;
 
         if !vectors_only {
-        // Documents first (ids 0..), then vectors (slots align). The doc
-        // feeder walks the chunks file and the embeddings block in lock
-        // step, asserting key equality at every position — both files were
-        // written in the same order, so that equality IS the join.
-        let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(256);
-        let spec2 = spec.clone();
-        let case_names2 = case_names.clone();
-        let cp = chunks_path.clone();
-        let ep = embeddings_path.clone();
-        let feeder = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            use std::io::BufRead;
-            let mut emb = EmbBlock::open(&ep, start as u64, dim).map_err(|e| e.to_string())?;
-            let file = std::fs::File::open(&cp).map_err(|e| e.to_string())?;
-            let mut sent = 0usize;
-            for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
-                if i < start {
-                    line.map_err(|e| e.to_string())?;
-                    continue;
-                }
-                if i >= end {
-                    break;
-                }
-                let line = line.map_err(|e| e.to_string())?;
-                let chunk: Chunk = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-                let key = emb.next_key_skip_vector().map_err(|e| e.to_string())?;
-                if key != (chunk.opinion_id, chunk.ordinal) {
-                    return Err(format!(
-                        "chunk/embedding order mismatch at shard {shard} position {i}: \
+            // Documents first (ids 0..), then vectors (slots align). The doc
+            // feeder walks the chunks file and the embeddings block in lock
+            // step, asserting key equality at every position — both files were
+            // written in the same order, so that equality IS the join.
+            let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(256);
+            let spec2 = spec.clone();
+            let case_names2 = case_names.clone();
+            let body_columns2 = body_columns.clone();
+            let cp = chunks_path.clone();
+            let ep = embeddings_path.clone();
+            let feeder = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                use std::io::BufRead;
+                let mut emb = EmbBlock::open(&ep, start as u64, dim).map_err(|e| e.to_string())?;
+                let file = std::fs::File::open(&cp).map_err(|e| e.to_string())?;
+                let mut sent = 0usize;
+                for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
+                    if i < start {
+                        line.map_err(|e| e.to_string())?;
+                        continue;
+                    }
+                    if i >= end {
+                        break;
+                    }
+                    let line = line.map_err(|e| e.to_string())?;
+                    let chunk: Chunk = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+                    let key = emb.next_key_skip_vector().map_err(|e| e.to_string())?;
+                    if key != (chunk.opinion_id, chunk.ordinal) {
+                        return Err(format!(
+                            "chunk/embedding order mismatch at shard {shard} position {i}: \
                          chunk ({}, {}), embedding ({}, {})",
-                        chunk.opinion_id, chunk.ordinal, key.0, key.1
-                    ));
+                            chunk.opinion_id, chunk.ordinal, key.0, key.1
+                        ));
+                    }
+                    // The extra columns index the same bytes, so build
+                    // them before the body text moves into the request.
+                    let fields =
+                        chunk_fields(&case_names2, chunk.cluster_id, &body_columns2, &chunk.text);
+                    tx.blocking_send(AddDocumentsRequest {
+                        text: chunk.text,
+                        analysis: Some(spec2.clone()),
+                        lineage: Some(DocLineage {
+                            opinion_id: chunk.opinion_id,
+                            cluster_id: chunk.cluster_id,
+                            span_start: chunk.span_start,
+                            span_end: chunk.span_end,
+                        }),
+                        fields,
+                    })
+                    .map_err(|e| e.to_string())?;
+                    sent += 1;
                 }
-                tx.blocking_send(AddDocumentsRequest {
-                    text: chunk.text,
-                    analysis: Some(spec2.clone()),
-                    lineage: Some(DocLineage {
-                        opinion_id: chunk.opinion_id,
-                        cluster_id: chunk.cluster_id,
-                        span_start: chunk.span_start,
-                        span_end: chunk.span_end,
-                    }),
-                    fields: chunk_fields(&case_names2, chunk.cluster_id),
-                })
-                .map_err(|e| e.to_string())?;
-                sent += 1;
-            }
-            if sent != n {
-                return Err(format!("shard {shard}: sent {sent} of {n} docs"));
-            }
-            Ok(())
-        });
-        let docs = client
-            .add_documents(ReceiverStream::new(rx))
-            .await?
-            .into_inner();
-        feeder.await??;
-        assert_eq!(docs.added as usize, n);
+                if sent != n {
+                    return Err(format!("shard {shard}: sent {sent} of {n} docs"));
+                }
+                Ok(())
+            });
+            let docs = client
+                .add_documents(ReceiverStream::new(rx))
+                .await?
+                .into_inner();
+            feeder.await??;
+            assert_eq!(docs.added as usize, n);
         }
 
         // Vectors: a direct seek into the fixed-stride embeddings file;

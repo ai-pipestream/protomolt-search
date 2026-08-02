@@ -51,7 +51,11 @@ const CRC_TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[i] = c;
@@ -438,7 +442,10 @@ pub fn truncate_records_at_or_above(gen_dir: &Path, cutoff_id: u64) -> io::Resul
             }
         }
         if let Some(offset) = cut_at {
-            OpenOptions::new().write(true).open(&path)?.set_len(offset)?;
+            OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(offset)?;
         }
     }
     Ok(dropped)
@@ -585,7 +592,10 @@ impl WalWriter {
                 true
             }
             Err(e) => {
-                eprintln!("wal: manifest rewrite in {} failed: {e}", self.dir.display());
+                eprintln!(
+                    "wal: manifest rewrite in {} failed: {e}",
+                    self.dir.display()
+                );
                 false
             }
         }
@@ -755,7 +765,9 @@ mod tests {
             writer.append(add_op(id)).unwrap();
         }
         writer.append(doc_op(3)).unwrap();
-        writer.append(wal_record::Op::Flush(FlushMarker {})).unwrap();
+        writer
+            .append(wal_record::Op::Flush(FlushMarker {}))
+            .unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -783,10 +795,7 @@ mod tests {
         // The flush marker is in markers.wal, seq 1.
         let markers = read_all(&markers_path(&gen)).unwrap();
         assert_eq!(markers.len(), 1);
-        assert!(matches!(
-            markers[0].op,
-            Some(wal_record::Op::Flush(_))
-        ));
+        assert!(matches!(markers[0].op, Some(wal_record::Op::Flush(_))));
 
         // Resume: sequences continue, manifest is adopted (and locked).
         let m = read_manifest(&gen).unwrap();
@@ -802,7 +811,10 @@ mod tests {
             .count()
             // The document (id 3) rides its bucket too.
             + usize::from(bucket_of(3, 4) as u32 == bucket);
-        assert_eq!(records.last().unwrap().seq, bucket_records_before as u64 + 1);
+        assert_eq!(
+            records.last().unwrap().seq,
+            bucket_records_before as u64 + 1
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -832,9 +844,7 @@ mod tests {
         // The torn bucket loses its tail frame but scans cleanly to the
         // valid prefix; resume continues its sequence.
         let scan = scan_records(&torn).unwrap();
-        let intact: Vec<u64> = (0..20u64)
-            .filter(|&id| bucket_of(id, 4) == 0)
-            .collect();
+        let intact: Vec<u64> = (0..20u64).filter(|&id| bucket_of(id, 4) == 0).collect();
         assert!(scan.last_seq <= intact.len() as u64);
         let m = read_manifest(&gen).unwrap();
         let mut writer = WalWriter::resume(&gen, m).unwrap();
@@ -919,7 +929,9 @@ mod tests {
             writer.append(add_op(id)).unwrap();
         }
         writer.append(doc_op(20)).unwrap();
-        writer.append(wal_record::Op::Flush(FlushMarker {})).unwrap();
+        writer
+            .append(wal_record::Op::Flush(FlushMarker {}))
+            .unwrap();
         writer.flush().unwrap();
         drop(writer);
 

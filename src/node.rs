@@ -25,27 +25,29 @@ use tonic::{Request, Response, Status, Streaming};
 use turbovec::TurboQuantIndex;
 
 use crate::bm25::{self, Bm25Params};
-use crate::chunked::{chunked_topk_collapsed, 
-    chunked_topk, chunked_topk_batch, BatchQuery, ChunkHit, ScanStats, DEFAULT_CHUNK_BLOCKS,
+use crate::chunked::{
+    chunked_topk, chunked_topk_batch, chunked_topk_collapsed, BatchQuery, ChunkHit, ScanStats,
+    DEFAULT_CHUNK_BLOCKS,
 };
 use crate::fusion::{self, Leg};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
+use crate::pb::wal::{
+    wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker,
+};
 use crate::pb::{
     search_shard_request, search_shard_response, snapshot_chunk, stream_search_request,
-    stream_search_response, AddDocumentsRequest,
-    AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest,
-    Bm25QueryResponse, Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest,
-    FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
-    GetDocumentsResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
-    HybridShardResponse,
-    InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone,
-    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse,
-    ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest,
-    StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
-    TermStatsResponse, VectorRescoreRequest, VectorRescoreResponse,
+    stream_search_response, AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest,
+    AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse, Bm25RescoreRequest,
+    Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest,
+    GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse, HealthRequest,
+    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, InstallSnapshotResponse,
+    OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse,
+    SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse,
+    ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch, StoredDocument,
+    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
+    TermOccurrences, TermStatsRequest, TermStatsResponse, VectorRescoreRequest,
+    VectorRescoreResponse,
 };
-use crate::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker};
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
 use crate::wal::{self, WalWriter};
 
@@ -71,6 +73,30 @@ pub struct NodeConfig {
     /// behavior); a small positive delta trades a sliver of pruning
     /// reactivity for far fewer floor messages on real networks.
     pub floor_delta: f32,
+    /// Publish opportunities to SKIP before the first floor goes out.
+    ///
+    /// The scanner offers a floor after every chunk in which its heap is
+    /// full, so on a large shard that is one message per chunk for the
+    /// whole scan. The earliest floors are also the weakest: they prune
+    /// least, yet each one costs a coordinator broadcast to EVERY shard.
+    /// Skipping the first few trades a little early pruning for a large
+    /// cut in messages. 0 keeps the historical behavior.
+    ///
+    /// Measured on the 86.6M-chunk corpus: 42 chunks per shard, so 42
+    /// publishes per shard per query, 336 across the fleet. Note that a
+    /// CANDIDATE-count warmup does not bite at this granularity -- the
+    /// first chunk alone collects ~6,000 candidates, so the heap is full
+    /// almost immediately; chunks are the unit that actually gates.
+    pub floor_warmup_chunks: u32,
+    /// Minimum wall time between two published floors, in milliseconds.
+    ///
+    /// Independent of `floor_delta`, which gates on score movement: a
+    /// scan can raise its floor meaningfully many times in quick
+    /// succession and still not be worth that many broadcasts. 0 disables
+    /// the debounce. Floors are monotone, so a suppressed one is never
+    /// lost information -- the next publish carries a floor at least as
+    /// high.
+    pub floor_min_interval_ms: u64,
     /// Bit width used when `AddVectors` constructs an index from scratch
     /// (no loaded index, no seeded calibration).
     pub bit_width: usize,
@@ -111,6 +137,8 @@ impl Default for NodeConfig {
             share_floors: true,
             block_max: true,
             floor_delta: 0.0,
+            floor_warmup_chunks: 0,
+            floor_min_interval_ms: 0,
             bit_width: 4,
             index_path: None,
             analysis_addr: None,
@@ -185,6 +213,27 @@ impl Bm25Shard {
         }
     }
 
+    /// Field `f`'s analyzer fingerprint in the active table (0 =
+    /// unknown, which never enforces).
+    fn analysis_fingerprint(&self, f: usize) -> u64 {
+        match self {
+            Bm25Shard::Building(s) => s.analysis_fingerprint(f),
+            Bm25Shard::Spilling(s) => s.analysis_fingerprint(f),
+            Bm25Shard::Resident(r) => r.analysis_fingerprint(f),
+        }
+    }
+
+    /// Record field `f`'s analyzer fingerprint, refusing a contradiction.
+    /// A disk-resident shard is not being written to, so it has nothing
+    /// to record.
+    fn set_analysis_fingerprint(&mut self, f: usize, fingerprint: u64) -> Result<(), String> {
+        match self {
+            Bm25Shard::Building(s) => s.set_analysis_fingerprint(f, fingerprint),
+            Bm25Shard::Spilling(s) => s.set_analysis_fingerprint(f, fingerprint),
+            Bm25Shard::Resident(_) => Ok(()),
+        }
+    }
+
     /// The table index of the field named `name`, if present. `None`
     /// while bulk-building (no searchable surface to resolve against).
     fn field_index(&self, name: &str) -> Option<usize> {
@@ -215,7 +264,10 @@ impl Bm25Shard {
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let mut magic = [0u8; 8];
         std::fs::File::open(path)?.read_exact(&mut magic)?;
-        if matches!(&magic, b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506") {
+        if matches!(
+            &magic,
+            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506"
+        ) {
             Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
         } else {
             Ok(Bm25Shard::Building(Bm25Store::load(path)?))
@@ -248,6 +300,18 @@ struct ShardState {
 pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".bm25");
+    PathBuf::from(p)
+}
+
+/// Where a bulk BM25 build spills while it runs: `<bm25 path>.build`.
+///
+/// A successful `Flush` removes it, so finding one beside a MISSING
+/// `.bm25` is unambiguous evidence of an interrupted build — as opposed
+/// to a shard that simply has no postings, which is what a vector-only
+/// deployment legitimately looks like.
+pub fn bm25_build_dir(bm25_path: &std::path::Path) -> PathBuf {
+    let mut p = bm25_path.as_os_str().to_owned();
+    p.push(".build");
     PathBuf::from(p)
 }
 
@@ -582,7 +646,7 @@ struct ScanJob {
     external: Box<dyn FnMut() -> Option<f32> + Send>,
     /// Receives this query's k-th-best raises (the caller bakes in the
     /// share gate and delta filter).
-    publish: Box<dyn FnMut(f32) + Send>,
+    publish: Box<dyn FnMut(f32) -> bool + Send>,
     done: tokio::sync::oneshot::Sender<Result<(Vec<ChunkHit>, ScanStats), Status>>,
 }
 
@@ -628,11 +692,7 @@ async fn scan_scheduler(
 
 /// Run one batched scan under the shard read lock and deliver every job's
 /// result. Blocking-pool context.
-fn run_scan_batch(
-    state: &std::sync::RwLock<ShardState>,
-    chunk_blocks: usize,
-    batch: Vec<ScanJob>,
-) {
+fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, batch: Vec<ScanJob>) {
     let guard = state.read().expect("shard state lock poisoned");
     let index = match guard.index.as_ref() {
         Some(index) => index,
@@ -651,7 +711,7 @@ fn run_scan_batch(
     let dim = index.dim_opt();
     let mut specs: Vec<(Vec<f32>, usize, bool)> = Vec::with_capacity(batch.len());
     let mut externals: Vec<Box<dyn FnMut() -> Option<f32> + Send>> = Vec::new();
-    let mut publishers: Vec<Box<dyn FnMut(f32) + Send>> = Vec::new();
+    let mut publishers: Vec<Box<dyn FnMut(f32) -> bool + Send>> = Vec::new();
     let mut dones = Vec::new();
     for job in batch {
         if Some(job.vector.len()) != dim {
@@ -728,9 +788,7 @@ impl NodeServiceImpl {
             let socket = match tokio::net::UdpSocket::bind(addr).await {
                 Ok(socket) => socket,
                 Err(e) => {
-                    eprintln!(
-                        "floor UDP bind {addr}: {e}; floors ride the gRPC streams only"
-                    );
+                    eprintln!("floor UDP bind {addr}: {e}; floors ride the gRPC streams only");
                     return;
                 }
             };
@@ -776,10 +834,7 @@ impl NodeServiceImpl {
         let names: Vec<&str> = self.config.bm25_fields.iter().map(String::as_str).collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
-                let bm25_path = storage_paths(p, generation).1;
-                let mut dir = bm25_path.as_os_str().to_owned();
-                dir.push(".build");
-                let dir = PathBuf::from(dir);
+                let dir = bm25_build_dir(&storage_paths(p, generation).1);
                 SpillBuilder::create_with_fields(&dir, &names)
                     .map(Bm25Shard::Spilling)
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
@@ -813,7 +868,10 @@ impl NodeServiceImpl {
     /// (startup found one via [`recover_generation`]): Flush and the
     /// AddDocuments reload path then read/write inside it.
     pub fn with_generation(self, dir: Option<PathBuf>) -> Self {
-        self.state.write().expect("shard state lock poisoned").generation = dir;
+        self.state
+            .write()
+            .expect("shard state lock poisoned")
+            .generation = dir;
         self
     }
 
@@ -865,10 +923,7 @@ impl NodeServiceImpl {
             }
             Arc::new(parents)
         };
-        state
-            .write()
-            .expect("shard state lock poisoned")
-            .parents = Some(Arc::clone(&built));
+        state.write().expect("shard state lock poisoned").parents = Some(Arc::clone(&built));
         built
     }
 
@@ -1057,7 +1112,11 @@ impl NodeServiceImpl {
     /// tear. Replacing an existing generation renames it aside first; the
     /// crash window between the two renames is covered by
     /// [`recover_generation`] at startup.
-    fn apply_snapshot(&self, tmp_dir: &Path, with_bm25: bool) -> Result<InstallSnapshotResponse, Status> {
+    fn apply_snapshot(
+        &self,
+        tmp_dir: &Path,
+        with_bm25: bool,
+    ) -> Result<InstallSnapshotResponse, Status> {
         let path = self
             .config
             .index_path
@@ -1114,7 +1173,10 @@ impl NodeServiceImpl {
 
         guard.bm25 = if with_bm25 {
             Some(Bm25Shard::open(&generation_bm25(&snap)).map_err(|e| {
-                Status::internal(format!("open installed {}: {e}", generation_bm25(&snap).display()))
+                Status::internal(format!(
+                    "open installed {}: {e}",
+                    generation_bm25(&snap).display()
+                ))
             })?)
         } else {
             // Wholesale replacement: an image without a sidecar replaces
@@ -1265,7 +1327,10 @@ impl NodeServiceImpl {
                     guard.index.as_mut().expect("just constructed")
                 }
             };
-            (self.config.slot_offset + index.len() as u64, index.bit_width())
+            (
+                self.config.slot_offset + index.len() as u64,
+                index.bit_width(),
+            )
         };
         // Apply first, log after, under this one lock. A failed apply
         // must never reach the log: its assigned ids would be reused by
@@ -1320,8 +1385,11 @@ impl NodeServiceImpl {
     /// missing or `--block-max=false`; results identical), and the
     /// floor applies to the FUSED score. A leg naming a field this
     /// shard lacks is skipped: its documents hold no postings there, so
-    /// every fused score is unchanged — the graceful path for a fleet
-    /// mid-migration.
+    /// every fused score is unchanged — the graceful path for a
+    /// heterogeneous fleet. That is safe only because the coordinator
+    /// refuses a field NO shard knows (see `fanout_bm25_fused` and
+    /// `FieldStats.known`); skipping alone would turn a misspelled field
+    /// into a silently different ranking.
     fn bm25_query_fused(&self, req: &Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
         for leg in &req.fields {
             if leg.terms.len() != leg.global_doc_frequencies.len() {
@@ -1349,6 +1417,23 @@ impl NodeServiceImpl {
                 let mut leg_of_view: Vec<usize> = Vec::new();
                 for (li, leg) in req.fields.iter().enumerate() {
                     if let Some(fi) = store.field_index(&leg.field) {
+                        // Term identity is a contract, and the field
+                        // name does not carry it. A column built folded
+                        // and queried cased matches on name, scores
+                        // different terms, and returns a ranking that
+                        // looks perfectly reasonable. Refuse instead.
+                        let held = store.analysis_fingerprint(fi);
+                        if held != 0
+                            && leg.analysis_fingerprint != 0
+                            && held != leg.analysis_fingerprint
+                        {
+                            return Err(Status::failed_precondition(format!(
+                                "field {:?} was built with analyzer fingerprint {held:#x} but the \
+                                 query's terms were analyzed under {:#x}; the two score different \
+                                 term identities",
+                                leg.field, leg.analysis_fingerprint
+                            )));
+                        }
                         views.push(store.field_view(fi).expect("searchable, checked above"));
                         leg_of_view.push(li);
                     }
@@ -1362,7 +1447,7 @@ impl NodeServiceImpl {
                     .zip(&leg_of_view)
                     .map(|(view, &li)| {
                         let leg = &req.fields[li];
-                        bm25::FieldQuery {
+                        Ok(bm25::FieldQuery {
                             index: view.as_ref(),
                             terms: &leg.terms,
                             stats: bm25::CorpusStats {
@@ -1370,15 +1455,15 @@ impl NodeServiceImpl {
                                 total_doc_length: leg.global_total_doc_length,
                                 dfs: leg.global_doc_frequencies.clone(),
                             },
-                            params: params_from(leg.k1, leg.b),
+                            params: params_from(leg.k1, leg.b)?,
                             weight: if leg.weight == 0.0 {
                                 1.0
                             } else {
                                 f64::from(leg.weight)
                             },
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, Status>>()?;
                 let floor = if req.min_score == 0.0 {
                     f64::NEG_INFINITY
                 } else {
@@ -1389,7 +1474,15 @@ impl NodeServiceImpl {
                         fq.terms
                             .iter()
                             .enumerate()
-                            .all(|(ti, t)| fq.stats.dfs[ti] == 0 || fq.index.has_impacts(t))
+                            // Local absence is not a missing impact
+                            // surface: see top_k_fused_pruned_stats.
+                            // Global df alone would forfeit pruning on
+                            // every shard lacking a rare term.
+                            .all(|(ti, t)| {
+                                fq.stats.dfs[ti] == 0
+                                    || fq.index.df(t) == 0
+                                    || fq.index.has_impacts(t)
+                            })
                     });
                 let docs = if prunable {
                     bm25::top_k_fused_pruned(&queries, req.k as usize, floor)
@@ -1426,7 +1519,9 @@ impl NodeServiceImpl {
         // Same seed rule as the flat path: one f32 ULP below the k-th
         // fused score when the heap filled, 0 otherwise.
         let kth_best = if hits.len() == req.k as usize {
-            hits.last().map(|h| bm25::floor_seed(h.score)).unwrap_or(0.0)
+            hits.last()
+                .map(|h| bm25::floor_seed(h.score))
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -1466,7 +1561,7 @@ impl NodeServiceImpl {
                     k,
                     self.config.chunk_blocks,
                     &mut || None,
-                    &mut |_| {},
+                    &mut |_| false,
                     false,
                 );
                 vector_leg = hits
@@ -1500,7 +1595,12 @@ impl NodeServiceImpl {
                     && terms
                         .iter()
                         .enumerate()
-                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.has_impacts(t));
+                        // Local absence is not a missing impact surface:
+                        // see top_k_pruned. Global df alone would forfeit
+                        // pruning on every shard lacking a rare term.
+                        .all(|(ti, t)| {
+                            stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
+                        });
                 let docs = if prunable {
                     bm25::top_k_pruned(index, terms, &stats, params, k, f64::NEG_INFINITY)
                 } else {
@@ -1542,7 +1642,7 @@ impl NodeServiceImpl {
             req.global_doc_count,
             req.global_total_doc_length,
             &req.global_doc_frequencies,
-            params_from(req.k1, req.b),
+            params_from(req.k1, req.b)?,
             k,
         )?;
 
@@ -1577,8 +1677,27 @@ impl NodeServiceImpl {
 }
 
 /// Request-carried BM25 params: 0 selects the default (proto3 "absent").
-fn params_from(k1: f32, b: f32) -> Bm25Params {
-    Bm25Params {
+///
+/// Values are RANGE CHECKED, not just defaulted. `b` outside [0, 1]
+/// breaks the monotonicity precondition the block-max bounds rest on
+/// (see `postings::SkipRun`), so a bound can fall below a real score and
+/// the pruned scorer silently drops hits the exhaustive one keeps. A NaN
+/// is worse: BM25's `partial_cmp(..).unwrap_or(Equal)` degrades to
+/// insertion order, which makes the ranking depend on shard layout. Both
+/// arrive straight off the wire, so both are refused here rather than
+/// discovered as an unreproducible ranking difference.
+fn params_from(k1: f32, b: f32) -> Result<Bm25Params, Status> {
+    if !k1.is_finite() || k1 < 0.0 {
+        return Err(Status::invalid_argument(format!(
+            "bm25 k1 must be finite and >= 0, got {k1}"
+        )));
+    }
+    if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+        return Err(Status::invalid_argument(format!(
+            "bm25 b must be finite and within [0, 1], got {b}"
+        )));
+    }
+    Ok(Bm25Params {
         k1: if k1 == 0.0 {
             bm25::DEFAULT_K1
         } else {
@@ -1589,7 +1708,7 @@ fn params_from(k1: f32, b: f32) -> Bm25Params {
         } else {
             f64::from(b)
         },
-    }
+    })
 }
 
 /// Request weights default to 1.0 (0 means "unset" in the proto);
@@ -1604,20 +1723,203 @@ fn weight_or_default(value: f32, name: &str) -> Result<f64, Status> {
     Ok(f64::from(value))
 }
 
-/// Spawned per-field analysis tasks for one document's extra fields:
-/// `(field table index, task)` pairs (`docs/multi-field.md`).
-type FieldAnalyses = Vec<(
-    usize,
-    tokio::task::JoinHandle<Result<crate::postings::AnalyzedField, Status>>,
-)>;
+/// Documents held for ordered apply; bounds this side's memory the way
+/// ANALYZE_PIPELINE bounded the unary path.
+const MAX_PENDING: usize = 32;
 
-/// Await one document's extra-field analyses and assemble the
-/// positional [`crate::postings::AnalyzedDoc`]: body at field 0, extras
-/// at their table indexes, gaps empty. Body-only documents pass through
-/// untouched (the exact pre-multi-field shape).
-async fn join_fields(
+/// One event from the extra-field analysis streams.
+enum FieldEvent {
+    /// A field finished: the submission sequence it was tagged with, and
+    /// either its analysis or that ONE field's own failure.
+    Result(u64, Result<crate::postings::AnalyzedField, Status>),
+    /// The stream itself failed, so every field riding it is lost. Kept
+    /// distinct from a per-field error because a dead stream cannot be
+    /// attributed to a sequence, and silently dropping it would hang the
+    /// apply wavefront on a field that is never coming.
+    StreamFailed(Status),
+}
+
+/// Persistent per-spec [`crate::analyzer::AnalyzeStream`] sessions for
+/// documents' extra fields.
+///
+/// Extra fields used to ride concurrent UNARY `Analyze` calls, one h2
+/// stream per field per document. The asymmetry with the body (which has
+/// always streamed) was deliberate: field texts were captions and titles,
+/// small next to the body, so a dedicated stream bought nothing. That
+/// stops being true with multi-field body columns. A rebuild of 86.6M
+/// chunks carrying `case_name` plus two A/B body columns is ~260M unary
+/// calls against the sidecar, which the rebuild README names as the
+/// ingest throughput ceiling, not shard parallelism. The sidecar's
+/// listener has died under rapid-fire unary traffic before, which is why
+/// `analyzer::shared_channel` exists at all.
+///
+/// Fields on ONE document deliberately carry DIFFERENT specs (that is
+/// what a body column IS), so this holds one session per distinct spec,
+/// opened on first use and reused for the rest of the call.
+struct FieldStreams {
+    addr: String,
+    /// Submission handles, one per distinct spec in first-seen order.
+    /// Holding the SUBMITTER here rather than the session is what lets
+    /// [`finish`](Self::finish) half-close every stream by dropping them;
+    /// each session itself is owned by its driver task.
+    sessions: Vec<(
+        Option<crate::pb::AnalysisSpec>,
+        crate::analyzer::AnalyzeSubmit,
+    )>,
+    events: tokio::sync::mpsc::Receiver<FieldEvent>,
+    /// Cloned into each driver as it is spawned. Taking it in `finish` is
+    /// what makes `recv` observe `None` once every driver has exited.
+    emit: Option<tokio::sync::mpsc::Sender<FieldEvent>>,
+    /// Monotonic across every session: the sequence is this side's
+    /// routing key, and results are matched by it alone.
+    next_sequence: u64,
+    /// Submitted minus delivered. `recv` must not be selected on when
+    /// this is zero, or it parks on a channel nothing will feed.
+    outstanding: usize,
+}
+
+impl FieldStreams {
+    fn new(addr: &str) -> Self {
+        // Deep enough that drivers rarely block on a full channel while
+        // the apply wavefront is busy; every item is one analyzed field.
+        let (emit, events) = tokio::sync::mpsc::channel(MAX_PENDING * 4);
+        Self {
+            addr: addr.to_string(),
+            sessions: Vec::new(),
+            events,
+            emit: Some(emit),
+            next_sequence: 0,
+            outstanding: 0,
+        }
+    }
+
+    /// Queue one field's text on the session for its spec, opening that
+    /// session if this is the spec's first field. Returns the sequence
+    /// the result will carry.
+    async fn submit(
+        &mut self,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        text: &str,
+    ) -> Result<u64, Status> {
+        let index = match self.sessions.iter().position(|(s, _)| s.as_ref() == spec) {
+            Some(index) => index,
+            None => {
+                let mut session = crate::analyzer::AnalyzeStream::open(&self.addr, spec)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == tonic::Code::Unimplemented {
+                            Status::failed_precondition(format!(
+                                "analysis sidecar at {} does not implement AnalyzeStream; \
+                                 it predates the RPC and must be rebuilt (./gradlew installDist \
+                                 in grpc-opennlp-analysis). Refusing to analyze fields on the \
+                                 removed unary path.",
+                                self.addr
+                            ))
+                        } else {
+                            status
+                        }
+                    })?;
+                let submit = session.submitter();
+                // Hand the driver a session that holds NO submitter of
+                // its own, so the clone kept here is the only one alive
+                // and dropping it in `finish` really does half-close the
+                // stream. `open` leaves a submitter inside the session;
+                // leaving it there means the sidecar never sees the
+                // half-close, and a held response never flushes.
+                session.finish();
+                let emit = self
+                    .emit
+                    .clone()
+                    .ok_or_else(|| Status::internal("field streams already finished"))?;
+                tokio::spawn(drive_field_stream(session, emit));
+                self.sessions.push((spec.cloned(), submit));
+                self.sessions.len() - 1
+            }
+        };
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.sessions[index].1.submit(sequence, text).await?;
+        self.outstanding += 1;
+        Ok(sequence)
+    }
+
+    /// True when a field result is still owed, and therefore when `recv`
+    /// is safe to select on.
+    fn pending(&self) -> bool {
+        self.outstanding > 0
+    }
+
+    /// The next field event. `None` once every driver has exited, which
+    /// only happens after [`finish`](Self::finish) drops the last sender.
+    async fn recv(&mut self) -> Option<FieldEvent> {
+        let event = self.events.recv().await;
+        if matches!(event, Some(FieldEvent::Result(..))) {
+            self.outstanding -= 1;
+        }
+        event
+    }
+
+    /// Half-close every stream so the sidecar drains what is in flight.
+    /// Idempotent, and required before awaiting the final results: a
+    /// sidecar may hold a response until more work arrives (the test mock
+    /// deliberately does), so the last field of a call only lands once
+    /// its stream is closing.
+    fn finish(&mut self) {
+        self.sessions.clear();
+        self.emit = None;
+    }
+}
+
+/// Pump one field session's results into the shared event channel.
+///
+/// Runs as its own task so the main ingest loop never has to poll N
+/// streams by hand, and so a session whose results the sidecar is holding
+/// cannot stall submission on a different session.
+async fn drive_field_stream(
+    mut session: crate::analyzer::AnalyzeStream,
+    emit: tokio::sync::mpsc::Sender<FieldEvent>,
+) {
+    loop {
+        let event = match session.next().await {
+            Ok(Some((sequence, result))) => FieldEvent::Result(
+                sequence,
+                result.map(crate::postings::AnalyzedDoc::into_body),
+            ),
+            Ok(None) => return,
+            Err(status) => FieldEvent::StreamFailed(status),
+        };
+        let failed = matches!(event, FieldEvent::StreamFailed(_));
+        // A closed receiver means the ingest call is already unwinding.
+        if emit.send(event).await.is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// One document held between submission and apply: the request itself,
+/// plus its extra fields filling in as their results arrive.
+struct PendingDoc {
+    doc: AddDocumentsRequest,
+    /// `(field table index, analysis)`, in submission order. `None` until
+    /// that field's result lands.
+    extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
+    /// Extras still unfilled. The document is ready to apply when this is
+    /// zero AND its body result has arrived.
+    outstanding: usize,
+}
+
+/// Assemble one document's positional [`crate::postings::AnalyzedDoc`]:
+/// body at field 0, extras at their table indexes, gaps empty. Body-only
+/// documents pass through untouched (the exact pre-multi-field shape).
+///
+/// Nothing is awaited here. The apply wavefront only reaches a document
+/// once every one of its fields has already landed, which is what keeps
+/// a sidecar that holds a response (the test mock deliberately does, and
+/// the streaming contract permits it) from stalling the whole ingest on
+/// one field.
+fn join_fields(
     body: crate::postings::AnalyzedDoc,
-    extras: FieldAnalyses,
+    extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
 ) -> Result<crate::postings::AnalyzedDoc, Status> {
     if extras.is_empty() {
         return Ok(body);
@@ -1625,10 +1927,13 @@ async fn join_fields(
     let n = extras.iter().map(|&(fi, _)| fi + 1).max().unwrap_or(1);
     let mut fields = vec![crate::postings::AnalyzedField::default(); n];
     fields[0] = body.into_body();
-    for (fi, handle) in extras {
-        fields[fi] = handle
-            .await
-            .map_err(|e| Status::internal(format!("field analysis task failed: {e}")))??;
+    for (fi, analyzed) in extras {
+        fields[fi] = analyzed.ok_or_else(|| {
+            Status::internal(format!(
+                "field {fi} applied before its analysis arrived; the apply \
+                 wavefront must not advance past an unfilled field"
+            ))
+        })?;
     }
     Ok(crate::postings::AnalyzedDoc { fields })
 }
@@ -1636,20 +1941,29 @@ async fn join_fields(
 /// Bulk-ingest internals: the two analysis transports and the shared
 /// per-document apply step.
 impl NodeServiceImpl {
-    /// Validate a document's extra fields against the shard's
-    /// configured field table and start their sidecar analyses
-    /// (concurrent unary calls — field texts are captions and titles,
-    /// small next to the body, so a dedicated stream buys nothing).
-    /// Validation failures surface BEFORE any store or WAL effect.
-    fn spawn_field_analyses(&self, doc: &AddDocumentsRequest) -> Result<FieldAnalyses, Status> {
+    /// Validate a document's extra fields against the shard's configured
+    /// field table and queue their analyses on the per-spec field
+    /// streams. Validation failures surface BEFORE any store or WAL
+    /// effect, and before anything is submitted.
+    ///
+    /// Every field's sequence is recorded in `route` so its result can be
+    /// steered back to `(document sequence, slot in that document's
+    /// extras)`; the sequence is the only key the wire carries.
+    async fn submit_field_analyses(
+        &self,
+        doc: &AddDocumentsRequest,
+        sequence: u64,
+        streams: &mut FieldStreams,
+        route: &mut std::collections::HashMap<u64, (u64, usize)>,
+    ) -> Result<Vec<(usize, Option<crate::postings::AnalyzedField>)>, Status> {
         if doc.fields.is_empty() {
             return Ok(Vec::new());
         }
-        let addr = self.config.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
-        })?;
-        let mut handles = FieldAnalyses::new();
+        // Validate the whole document first: a partially submitted
+        // document would leave orphan sequences in flight that nothing
+        // ever routes.
         let mut seen: Vec<&str> = Vec::new();
+        let mut accepted: Vec<usize> = Vec::with_capacity(doc.fields.len());
         for field in &doc.fields {
             if field.field == "body" {
                 return Err(Status::invalid_argument(
@@ -1680,19 +1994,15 @@ impl NodeServiceImpl {
                     field.field
                 )));
             }
-            let addr = addr.clone();
-            let text = field.text.clone();
-            let spec = field.analysis.clone();
-            handles.push((
-                fi,
-                tokio::spawn(async move {
-                    crate::analyzer::analyze_document(&addr, &text, spec.as_ref())
-                        .await
-                        .map(crate::postings::AnalyzedDoc::into_body)
-                }),
-            ));
+            accepted.push(fi);
         }
-        Ok(handles)
+        let mut extras = Vec::with_capacity(accepted.len());
+        for (slot, (field, fi)) in doc.fields.iter().zip(accepted).enumerate() {
+            let tag = streams.submit(field.analysis.as_ref(), &field.text).await?;
+            route.insert(tag, (sequence, slot));
+            extras.push((fi, None));
+        }
+        Ok(extras)
     }
 
     /// Apply one analyzed document: id assignment, store insert, WAL
@@ -1764,6 +2074,33 @@ impl NodeServiceImpl {
                 }
             }
         }
+        // Record which analyzer produced each column, and refuse a
+        // document that contradicts one already recorded. Field NAME
+        // agreement (just above) does not catch this: two documents can
+        // agree on the name `body_norm` and disagree on what a term IS,
+        // and nothing downstream would notice. Half a column folded and
+        // half not scores both halves against one idf.
+        {
+            let shard = guard.bm25.as_mut().expect("builder just ensured");
+            let body = crate::analyzer::analysis_fingerprint(doc.analysis.as_ref());
+            shard
+                .set_analysis_fingerprint(0, body)
+                .map_err(Status::failed_precondition)?;
+            for field in &doc.fields {
+                let Some(fi) = self
+                    .config
+                    .bm25_fields
+                    .iter()
+                    .position(|n| *n == field.field)
+                else {
+                    continue; // already refused upstream
+                };
+                let fingerprint = crate::analyzer::analysis_fingerprint(field.analysis.as_ref());
+                shard
+                    .set_analysis_fingerprint(fi, fingerprint)
+                    .map_err(Status::failed_precondition)?;
+            }
+        }
         let global_id = self.config.slot_offset + u64::from(doc_id);
         if *added == 0 {
             *first_id = global_id;
@@ -1814,9 +2151,6 @@ impl NodeServiceImpl {
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
-        // Documents held for ordered apply; bounds this side's memory the
-        // way ANALYZE_PIPELINE bounded the unary path.
-        const MAX_PENDING: usize = 32;
         fn store_result(
             results: &mut std::collections::HashMap<u64, crate::postings::AnalyzedDoc>,
             item: Option<(u64, Result<crate::postings::AnalyzedDoc, Status>)>,
@@ -1834,81 +2168,136 @@ impl NodeServiceImpl {
                 )),
             }
         }
+        /// Steer one field result into its document's slot. The route
+        /// table is the only thing that knows which document a sequence
+        /// belonged to, so an unknown sequence is a wire-level bug, not a
+        /// recoverable condition.
+        fn store_field(
+            pending: &mut std::collections::BTreeMap<u64, PendingDoc>,
+            route: &mut std::collections::HashMap<u64, (u64, usize)>,
+            event: Option<FieldEvent>,
+        ) -> Result<(), Status> {
+            match event {
+                Some(FieldEvent::Result(tag, result)) => {
+                    let (sequence, slot) = route.remove(&tag).ok_or_else(|| {
+                        Status::internal(format!("field result {tag} matches no submitted field"))
+                    })?;
+                    // One field failing fails the ingest call, exactly as
+                    // a failed unary field analysis did.
+                    let analyzed = result?;
+                    let doc = pending.get_mut(&sequence).ok_or_else(|| {
+                        Status::internal(format!(
+                            "field result for document {sequence}, which is no longer pending"
+                        ))
+                    })?;
+                    if doc.extras[slot].1.replace(analyzed).is_none() {
+                        doc.outstanding -= 1;
+                    }
+                    Ok(())
+                }
+                Some(FieldEvent::StreamFailed(status)) => Err(status),
+                None => Err(Status::internal(
+                    "field analysis streams ended with fields in flight",
+                )),
+            }
+        }
         enum Step {
             Doc(AddDocumentsRequest),
             InboundClosed,
             Result(Option<(u64, Result<crate::postings::AnalyzedDoc, Status>)>),
+            Field(Option<FieldEvent>),
         }
         let mut spec = first.analysis.clone();
         let mut submit = Some(session.submitter());
-        // Each pending document carries its spawned extra-field
-        // analyses; the session covers the BODY only (extra fields ride
-        // concurrent unary calls, joined at apply time).
-        let mut pending: std::collections::BTreeMap<u64, (AddDocumentsRequest, FieldAnalyses)> =
+        // The body session covers the BODY only; extra fields ride their
+        // own per-spec sessions, and a document applies once its body and
+        // every one of its fields have landed.
+        let mut fields = FieldStreams::new(addr);
+        let mut route: std::collections::HashMap<u64, (u64, usize)> =
+            std::collections::HashMap::new();
+        let mut pending: std::collections::BTreeMap<u64, PendingDoc> =
             std::collections::BTreeMap::new();
         let mut results: std::collections::HashMap<u64, crate::postings::AnalyzedDoc> =
             std::collections::HashMap::new();
-        let first_extras = self.spawn_field_analyses(&first)?;
+        let first_extras = self
+            .submit_field_analyses(&first, 0, &mut fields, &mut route)
+            .await?;
         submit
             .as_ref()
             .expect("submitter set above")
             .submit(0, &first.text)
             .await?;
-        pending.insert(0, (first, first_extras));
+        pending.insert(
+            0,
+            PendingDoc {
+                doc: first,
+                outstanding: first_extras.len(),
+                extras: first_extras,
+            },
+        );
         let mut next_seq = 1u64;
         let mut next_apply = 0u64;
         let mut inbound_open = true;
         loop {
-            while let Some(analyzed) = results.remove(&next_apply) {
-                let (doc, extras) = pending
-                    .remove(&next_apply)
-                    .expect("every result has a pending document");
-                let analyzed = join_fields(analyzed, extras).await?;
-                self.apply_analyzed_document(doc, analyzed, added, first_id)?;
-                next_apply += 1;
-            }
+            self.advance_apply(&mut pending, &mut results, &mut next_apply, added, first_id)?;
             if pending.is_empty() && !inbound_open {
                 break;
             }
-            let step = if inbound_open && pending.len() < MAX_PENDING {
-                tokio::select! {
-                    message = inbound.message() => match message? {
+            // Guards, so a stream that owes nothing is never polled. The
+            // body session owes exactly the pending documents whose body
+            // result has not landed; once it is finished and drained it
+            // yields `None` forever, which `store_result` would rightly
+            // read as truncation.
+            let want_body = pending.len() > results.len();
+            let want_field = fields.pending();
+            // At least one arm is always live: if a document is still
+            // pending after `advance_apply`, the one at the wavefront is
+            // owed either its body or a field.
+            let step = tokio::select! {
+                message = inbound.message(),
+                    if inbound_open && pending.len() < MAX_PENDING => match message? {
                         Some(doc) => Step::Doc(doc),
                         None => Step::InboundClosed,
                     },
-                    result = session.next() => Step::Result(result?),
-                }
-            } else {
-                Step::Result(session.next().await?)
+                result = session.next(), if want_body => Step::Result(result?),
+                event = fields.recv(), if want_field => Step::Field(event),
             };
             match step {
                 Step::Doc(doc) => {
-                    // Extra-field analyses start on arrival (validated
-                    // now, so a bad field fails before the body enters
-                    // the session).
-                    let extras = self.spawn_field_analyses(&doc)?;
+                    // Extra-field analyses are queued on arrival
+                    // (validated now, so a bad field fails before the
+                    // body enters the session).
+                    let extras = self
+                        .submit_field_analyses(&doc, next_seq, &mut fields, &mut route)
+                        .await?;
                     if doc.analysis != spec {
-                        // A mid-stream BODY spec change (rare): drain
-                        // the current session completely so ordering
-                        // holds, then open a new one for the new spec.
-                        // Dropping the submitter clone is what lets the
-                        // old session half-close and drain.
+                        // A mid-stream BODY spec change (rare): collect
+                        // what the current session still owes so nothing
+                        // is lost when it is replaced, then open a new
+                        // one. Dropping the submitter clone is what lets
+                        // the old session half-close and drain.
+                        //
+                        // Only the BODY session is being replaced. Field
+                        // sessions are per-spec and outlive this, and
+                        // draining them here would DEADLOCK: a sidecar
+                        // may hold a result until more work arrives on
+                        // that stream (the test mock deliberately does),
+                        // and no more field work is coming until the new
+                        // body session is open.
                         drop(submit.take());
                         session.finish();
-                        while !pending.is_empty() {
+                        while pending.len() > results.len() {
                             store_result(&mut results, session.next().await?)?;
-                            while let Some(analyzed) = results.remove(&next_apply) {
-                                let (done, done_extras) = pending
-                                    .remove(&next_apply)
-                                    .expect("every result has a pending document");
-                                let analyzed = join_fields(analyzed, done_extras).await?;
-                                self.apply_analyzed_document(done, analyzed, added, first_id)?;
-                                next_apply += 1;
-                            }
                         }
-                        session =
-                            crate::analyzer::AnalyzeStream::open(addr, doc.analysis.as_ref())
-                                .await?;
+                        self.advance_apply(
+                            &mut pending,
+                            &mut results,
+                            &mut next_apply,
+                            added,
+                            first_id,
+                        )?;
+                        session = crate::analyzer::AnalyzeStream::open(addr, doc.analysis.as_ref())
+                            .await?;
                         spec = doc.analysis.clone();
                         submit = Some(session.submitter());
                     }
@@ -1917,73 +2306,56 @@ impl NodeServiceImpl {
                         .expect("stream open while inbound open")
                         .submit(next_seq, &doc.text)
                         .await?;
-                    pending.insert(next_seq, (doc, extras));
+                    pending.insert(
+                        next_seq,
+                        PendingDoc {
+                            doc,
+                            outstanding: extras.len(),
+                            extras,
+                        },
+                    );
                     next_seq += 1;
                 }
                 Step::InboundClosed => {
                     inbound_open = false;
                     submit = None;
                     session.finish();
+                    // Half-close the field streams too. A sidecar may
+                    // hold a result until more work arrives, so the last
+                    // field of the call only lands once its stream is
+                    // closing.
+                    fields.finish();
                 }
                 Step::Result(item) => store_result(&mut results, item)?,
+                Step::Field(event) => store_field(&mut pending, &mut route, event)?,
             }
         }
         Ok(())
     }
 
-    /// The pre-stream transport, kept for sidecars that predate
-    /// AnalyzeStream: up to ANALYZE_PIPELINE unary sidecar calls run
-    /// ahead of the apply point.
-    async fn ingest_unary(
+    /// Advance the apply wavefront over every consecutive sequence whose
+    /// body AND every extra field have landed, keeping application in
+    /// arrival order.
+    fn advance_apply(
         &self,
-        first: AddDocumentsRequest,
-        inbound: &mut Streaming<AddDocumentsRequest>,
-        addr: &str,
+        pending: &mut std::collections::BTreeMap<u64, PendingDoc>,
+        results: &mut std::collections::HashMap<u64, crate::postings::AnalyzedDoc>,
+        next_apply: &mut u64,
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
-        const ANALYZE_PIPELINE: usize = 8;
-        let spawn_analysis =
-            |doc: &AddDocumentsRequest| -> Result<
-                tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
-                Status,
-            > {
-                let extras = self.spawn_field_analyses(doc)?;
-                let addr = addr.to_string();
-                let text = doc.text.clone();
-                let spec = doc.analysis.clone();
-                Ok(tokio::spawn(async move {
-                    let body =
-                        crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await?;
-                    join_fields(body, extras).await
-                }))
-            };
-        let mut in_flight: std::collections::VecDeque<(
-            AddDocumentsRequest,
-            tokio::task::JoinHandle<Result<crate::postings::AnalyzedDoc, Status>>,
-        )> = std::collections::VecDeque::new();
-        let handle = spawn_analysis(&first)?;
-        in_flight.push_back((first, handle));
-        let mut inbound_open = true;
         loop {
-            while inbound_open && in_flight.len() < ANALYZE_PIPELINE {
-                match inbound.message().await? {
-                    Some(doc) => {
-                        let handle = spawn_analysis(&doc)?;
-                        in_flight.push_back((doc, handle));
-                    }
-                    None => inbound_open = false,
-                }
+            let ready = results.contains_key(next_apply)
+                && pending.get(next_apply).is_some_and(|p| p.outstanding == 0);
+            if !ready {
+                return Ok(());
             }
-            let Some((doc, handle)) = in_flight.pop_front() else {
-                break;
-            };
-            let analyzed = handle
-                .await
-                .map_err(|e| Status::internal(format!("analysis task failed: {e}")))??;
-            self.apply_analyzed_document(doc, analyzed, added, first_id)?;
+            let analyzed = results.remove(next_apply).expect("readiness just checked");
+            let held = pending.remove(next_apply).expect("readiness just checked");
+            let analyzed = join_fields(analyzed, held.extras)?;
+            self.apply_analyzed_document(held.doc, analyzed, added, first_id)?;
+            *next_apply += 1;
         }
-        Ok(())
     }
 }
 
@@ -2061,16 +2433,45 @@ impl NodeService for NodeServiceImpl {
             // disposable (they are monotone, so the next chunk's publish
             // supersedes any dropped one). The terminal Done is sent
             // with `.await` below and cannot be dropped.
+            let warmup = config.floor_warmup_chunks;
+            let min_interval = (config.floor_min_interval_ms > 0)
+                .then(|| std::time::Duration::from_millis(config.floor_min_interval_ms));
             let mut last_published = f32::NEG_INFINITY;
-            let publish_floor = move |floor: f32| {
-                if share && floor > last_published + floor_delta {
-                    last_published = floor;
-                    let _ = scan_tx.try_send(Ok(SearchShardResponse {
-                        payload: Some(search_shard_response::Payload::FloorUpdate(
-                            FloorUpdate { floor },
-                        )),
-                    }));
+            let mut offers = 0u32;
+            let mut last_at: Option<std::time::Instant> = None;
+            // Returns whether the floor actually went on the wire, so
+            // the scan can report offers and publishes apart. Reporting
+            // only offers is how the warmup and debounce knobs came to
+            // look like no-ops.
+            let publish_floor = move |floor: f32| -> bool {
+                if !share {
+                    return false;
                 }
+                // Skip the opening chunks: their floors are the weakest
+                // and cost a broadcast to every shard apiece.
+                offers += 1;
+                if offers <= warmup {
+                    return false;
+                }
+                if floor <= last_published + floor_delta {
+                    return false;
+                }
+                // Debounce. Suppressing a floor loses nothing: they are
+                // monotone, so the next one published is at least as
+                // high as the one dropped.
+                if let (Some(interval), Some(at)) = (min_interval, last_at) {
+                    if at.elapsed() < interval {
+                        return false;
+                    }
+                }
+                last_published = floor;
+                last_at = Some(std::time::Instant::now());
+                let _ = scan_tx.try_send(Ok(SearchShardResponse {
+                    payload: Some(search_shard_response::Payload::FloorUpdate(FloorUpdate {
+                        floor,
+                    })),
+                }));
+                true
             };
             let external_floor = move || {
                 if share {
@@ -2114,9 +2515,7 @@ impl NodeService for NodeServiceImpl {
                         Status::failed_precondition("shard index disappeared mid-setup")
                     })?;
                     if index.len() != parents.len() {
-                        return Err(Status::aborted(
-                            "shard grew between setup and scan; retry",
-                        ));
+                        return Err(Status::aborted("shard grew between setup and scan; retry"));
                     }
                     Ok(chunked_topk_collapsed(
                         index,
@@ -2148,6 +2547,7 @@ impl NodeService for NodeServiceImpl {
                                 candidates_collected: stats.candidates_collected,
                                 floors_published: stats.floors_published,
                                 floor_updates_applied: stats.floor_updates_applied,
+                                floors_offered: stats.floors_offered,
                             }),
                         };
                         let _ = tx
@@ -2254,6 +2654,7 @@ impl NodeService for NodeServiceImpl {
                             candidates_collected: stats.candidates_collected,
                             floors_published: stats.floors_published,
                             floor_updates_applied: stats.floor_updates_applied,
+                            floors_offered: stats.floors_offered,
                         }),
                     };
                     let _ = tx
@@ -2295,9 +2696,7 @@ impl NodeService for NodeServiceImpl {
             slot_offset: self.config.slot_offset,
             bm25_docs,
             bm25_building,
-            ingest_active: self
-                .ingest_busy
-                .load(std::sync::atomic::Ordering::Acquire),
+            ingest_active: self.ingest_busy.load(std::sync::atomic::Ordering::Acquire),
         }))
     }
 
@@ -2332,7 +2731,9 @@ impl NodeService for NodeServiceImpl {
             };
             if start.initial_floor.is_some_and(f32::is_nan) {
                 let _ = tx
-                    .send(Err(Status::invalid_argument("initial_floor must not be NaN")))
+                    .send(Err(Status::invalid_argument(
+                        "initial_floor must not be NaN",
+                    )))
                     .await;
                 return;
             }
@@ -2443,15 +2844,12 @@ impl NodeService for NodeServiceImpl {
                             // carry live slots; a negative would be an
                             // engine contract break, dropped rather
                             // than wrapped into a bogus global id.
-                            let mut hits: Vec<u8> =
-                                Vec::with_capacity(stride * batch.slots.len());
+                            let mut hits: Vec<u8> = Vec::with_capacity(stride * batch.slots.len());
                             for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
                                 if slot < 0 {
                                     continue;
                                 }
-                                hits.extend_from_slice(
-                                    &(slot_offset + slot as u64).to_le_bytes(),
-                                );
+                                hits.extend_from_slice(&(slot_offset + slot as u64).to_le_bytes());
                                 hits.extend_from_slice(&score.to_le_bytes());
                                 if let Some(p) = parents.as_deref() {
                                     hits.extend_from_slice(&p[slot as usize].to_le_bytes());
@@ -2652,12 +3050,19 @@ impl NodeService for NodeServiceImpl {
         let mut inbound = request.into_inner();
         let mut added = 0u64;
         let mut first_id = 0u64;
-        // Analysis dominates bulk ingest. The preferred transport is one
-        // AnalyzeStream for the whole call, paced by the sidecar's own
-        // flow control; a sidecar that predates the RPC (UNIMPLEMENTED
-        // on open) gets the previous pipelined-unary path. Either way,
-        // documents are applied strictly in arrival order — ids and WAL
-        // order stay deterministic.
+        // Analysis dominates bulk ingest, and the only supported transport
+        // is one AnalyzeStream for the whole call, paced by the sidecar's
+        // own flow control. Documents are applied strictly in arrival
+        // order, so ids and WAL order stay deterministic.
+        //
+        // A sidecar without AnalyzeStream is REFUSED rather than served on
+        // the old per-document unary path. That fallback existed and cost
+        // real debugging time: a stale sidecar silently took it, then its
+        // gRPC server GOAWAYed the connection after ~70 streams, and the
+        // bulk driver died seconds into a multi-hour job with an opaque
+        // "h2 protocol error" while this node logged nothing and stayed
+        // healthy. Degrading quietly turned a one-line version mismatch
+        // into an h2 forensics exercise; failing here names it instead.
         if let Some(first) = inbound.message().await? {
             match crate::analyzer::AnalyzeStream::open(&addr, first.analysis.as_ref()).await {
                 Ok(session) => {
@@ -2672,8 +3077,12 @@ impl NodeService for NodeServiceImpl {
                     .await?;
                 }
                 Err(status) if status.code() == tonic::Code::Unimplemented => {
-                    self.ingest_unary(first, &mut inbound, &addr, &mut added, &mut first_id)
-                        .await?;
+                    return Err(Status::failed_precondition(format!(
+                        "analysis sidecar at {addr} does not implement AnalyzeStream; \
+                         it predates the RPC and must be rebuilt (./gradlew installDist \
+                         in grpc-opennlp-analysis). Refusing to ingest on the removed \
+                         unary path."
+                    )));
                 }
                 Err(status) => return Err(status),
             }
@@ -2717,11 +3126,13 @@ impl NodeService for NodeServiceImpl {
                             crate::pb::FieldStats {
                                 total_doc_length: view.total_doc_length(),
                                 doc_frequencies: ft.terms.iter().map(|t| view.df(t)).collect(),
+                                known: true,
                             }
                         }
                         None => crate::pb::FieldStats {
                             total_doc_length: 0,
                             doc_frequencies: vec![0; ft.terms.len()],
+                            known: false,
                         },
                     })
                     .collect();
@@ -2736,11 +3147,14 @@ impl NodeService for NodeServiceImpl {
                 0,
                 0,
                 req.terms.iter().map(|_| 0).collect(),
+                // No postings at all: this shard knows no field, which is
+                // a different statement from "the field does not exist".
                 req.fields
                     .iter()
                     .map(|ft| crate::pb::FieldStats {
                         total_doc_length: 0,
                         doc_frequencies: vec![0; ft.terms.len()],
+                        known: false,
                     })
                     .collect(),
             ),
@@ -2768,7 +3182,7 @@ impl NodeService for NodeServiceImpl {
         if !req.fields.is_empty() {
             return self.bm25_query_fused(&req).map(Response::new);
         }
-        let params = params_from(req.k1, req.b);
+        let params = params_from(req.k1, req.b)?;
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
             total_doc_length: req.global_total_doc_length,
@@ -2800,7 +3214,12 @@ impl NodeService for NodeServiceImpl {
                         .terms
                         .iter()
                         .enumerate()
-                        .all(|(ti, t)| stats.dfs[ti] == 0 || index.has_impacts(t));
+                        // Local absence is not a missing impact surface:
+                        // see top_k_pruned. Global df alone would forfeit
+                        // pruning on every shard lacking a rare term.
+                        .all(|(ti, t)| {
+                            stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
+                        });
                 let docs = if prunable {
                     bm25::top_k_pruned(index, &req.terms, &stats, params, req.k as usize, floor)
                 } else {
@@ -2834,7 +3253,9 @@ impl NodeService for NodeServiceImpl {
         // when the heap filled (so a later f32 seed never exceeds the
         // true k-th best — ties at the floor survive), 0 otherwise.
         let kth_best = if hits.len() == req.k as usize {
-            hits.last().map(|h| bm25::floor_seed(h.score)).unwrap_or(0.0)
+            hits.last()
+                .map(|h| bm25::floor_seed(h.score))
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -3037,7 +3458,7 @@ impl NodeService for NodeServiceImpl {
                 req.global_doc_count,
                 req.global_total_doc_length,
                 &req.global_doc_frequencies,
-                params_from(req.k1, req.b),
+                params_from(req.k1, req.b)?,
                 req.k as usize,
             )?;
             Ok(ShardLegsResponse {
@@ -3069,9 +3490,7 @@ mod floor_lane_tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn cell_of(cells: &std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>>, token: u64) -> f32 {
-        f32::from_bits(
-            cells.lock().unwrap()[&token].load(Ordering::Acquire),
-        )
+        f32::from_bits(cells.lock().unwrap()[&token].load(Ordering::Acquire))
     }
 
     fn datagram(token: u64, floor: f32) -> Vec<u8> {
@@ -3087,10 +3506,10 @@ mod floor_lane_tests {
     fn floor_datagrams_fold_monotonically_and_ignore_garbage() {
         let cells: std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>> =
             std::sync::Mutex::new(HashMap::new());
-        cells.lock().unwrap().insert(
-            7,
-            Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())),
-        );
+        cells
+            .lock()
+            .unwrap()
+            .insert(7, Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())));
 
         apply_floor_datagram(&cells, &datagram(7, 0.25));
         assert_eq!(cell_of(&cells, 7), 0.25);

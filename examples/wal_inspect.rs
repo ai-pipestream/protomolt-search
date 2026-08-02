@@ -25,8 +25,7 @@ use turbovec_search::wal::{self, RecordReader};
 
 fn opt(key: &str) -> Option<String> {
     let prefix = format!("--{key}=");
-    std::env::args()
-        .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+    std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
 }
 
 fn flag(key: &str) -> bool {
@@ -39,8 +38,7 @@ fn inspect_file(path: &Path, records: bool) -> Result<(u64, u64), String> {
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .len();
-    let mut reader =
-        RecordReader::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut reader = RecordReader::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut count = 0u64;
     let mut first_seq = 0u64;
     let mut last_seq = 0u64;
@@ -96,8 +94,7 @@ fn inspect_file(path: &Path, records: bool) -> Result<(u64, u64), String> {
 }
 
 fn inspect_gen(gen: &Path, records: bool) -> Result<(), String> {
-    let manifest =
-        wal::read_manifest(gen).map_err(|e| format!("{}: {e}", gen.display()))?;
+    let manifest = wal::read_manifest(gen).map_err(|e| format!("{}: {e}", gen.display()))?;
     let calibrated = !manifest.calibration_shift.is_empty();
     println!("{}", gen.display());
     println!(
@@ -108,7 +105,11 @@ fn inspect_gen(gen: &Path, records: bool) -> Result<(), String> {
         manifest.slot_offset,
         manifest.generation,
         manifest.bucket_count,
-        if calibrated { "locked" } else { "NONE (unseeded; not reshardable)" },
+        if calibrated {
+            "locked"
+        } else {
+            "NONE (unseeded; not reshardable)"
+        },
         manifest.format_version,
     );
     if manifest.preexisting_vectors > 0 || manifest.preexisting_documents > 0 {
@@ -151,9 +152,16 @@ fn main() -> Result<(), String> {
     let mut gens: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&target).map_err(|e| format!("{}: {e}", target.display()))? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         if name.ends_with(".broken") {
-            println!("{}: retired as broken (append failure); not a usable log", path.display());
+            println!(
+                "{}: retired as broken (append failure); not a usable log",
+                path.display()
+            );
         } else if name.starts_with("gen-") && path.is_dir() {
             gens.push(path);
         }

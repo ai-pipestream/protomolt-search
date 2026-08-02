@@ -181,8 +181,11 @@ pub fn blend_fuse(
             Normalization::ZScore => {
                 let n = retained.len() as f64;
                 let mean = retained.iter().map(|&(_, s)| s).sum::<f64>() / n;
-                let variance =
-                    retained.iter().map(|&(_, s)| (s - mean).powi(2)).sum::<f64>() / n;
+                let variance = retained
+                    .iter()
+                    .map(|&(_, s)| (s - mean).powi(2))
+                    .sum::<f64>()
+                    / n;
                 let sigma = variance.sqrt();
                 if sigma > 0.0 {
                     Box::new(move |s| (s - mean) / sigma)
@@ -217,11 +220,7 @@ pub fn blend_fuse(
         }
     }
 
-    let total_weight: f64 = legs
-        .iter()
-        .map(|l| l.weight)
-        .filter(|&w| w != 0.0)
-        .sum();
+    let total_weight: f64 = legs.iter().map(|l| l.weight).filter(|&w| w != 0.0).sum();
     let mut hits: Vec<FusedHit> = acc
         .into_values()
         .map(|(mut hit, norms)| {
@@ -622,9 +621,8 @@ mod tests {
             Combination::Geometric,
             10,
         );
-        let by_id = |hits: &[FusedHit], id: u64| {
-            hits.iter().find(|h| h.doc_id == id).unwrap().fused_score
-        };
+        let by_id =
+            |hits: &[FusedHit], id: u64| hits.iter().find(|h| h.doc_id == id).unwrap().fused_score;
         assert!((by_id(&geo, 1) - 1.0).abs() < 1e-12);
         assert!((by_id(&geo, 2) - 0.5f64.sqrt()).abs() < 1e-12);
         assert_eq!(by_id(&geo, 3), 0.0);
@@ -647,7 +645,10 @@ mod tests {
         // RETAINED set: min 7, max 9 -> doc 1: 1.0, doc 2: 0.5, boundary
         // docs 0.0. The dropped doc appears nowhere.
         let fused = blend_fuse(
-            &[leg(&[(1, 9.0), (2, 8.0), (3, 7.0), (4, 7.0), (5, 1.0)], 1.0)],
+            &[leg(
+                &[(1, 9.0), (2, 8.0), (3, 7.0), (4, 7.0), (5, 1.0)],
+                1.0,
+            )],
             3,
             Normalization::MinMax,
             Combination::Arithmetic,

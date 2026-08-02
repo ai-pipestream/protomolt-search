@@ -88,7 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "console on http://{listen} -> coordinator {} ({} node(s) for doc text, analysis {})",
         ctx.coordinator,
         ctx.nodes.len(),
-        ctx.analysis.as_deref().unwrap_or("NONE: embedding disabled")
+        ctx.analysis
+            .as_deref()
+            .unwrap_or("NONE: embedding disabled")
     );
     loop {
         let (stream, _) = listener.accept().await?;
@@ -141,20 +143,40 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) -> std::io::Result<()
     }
 
     match (method.as_str(), path.as_str()) {
-        ("GET", "/") => respond(&mut stream, 200, "text/html; charset=utf-8", CONSOLE_HTML.as_bytes()).await,
+        ("GET", "/") => {
+            respond(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                CONSOLE_HTML.as_bytes(),
+            )
+            .await
+        }
         ("GET", "/api/health") => {
             let out = match health(&ctx).await {
                 Ok(v) => (200, v),
                 Err(e) => (502, json!({ "error": e })),
             };
-            respond(&mut stream, out.0, "application/json", out.1.to_string().as_bytes()).await
+            respond(
+                &mut stream,
+                out.0,
+                "application/json",
+                out.1.to_string().as_bytes(),
+            )
+            .await
         }
         ("POST", "/api/search") => {
             let out = match search(&ctx, &body).await {
                 Ok(v) => (200, v),
                 Err(e) => (400, json!({ "error": e })),
             };
-            respond(&mut stream, out.0, "application/json", out.1.to_string().as_bytes()).await
+            respond(
+                &mut stream,
+                out.0,
+                "application/json",
+                out.1.to_string().as_bytes(),
+            )
+            .await
         }
         _ => respond(&mut stream, 404, "text/plain", b"not found").await,
     }
@@ -188,19 +210,19 @@ async fn respond(
 }
 
 fn search_client(addr: &str) -> Result<SearchServiceClient<Channel>, String> {
-    Ok(SearchServiceClient::new(
-        analyzer::shared_channel(addr).map_err(|e| e.to_string())?,
+    Ok(
+        SearchServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
+            .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES),
     )
-    .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES))
 }
 
 fn node_client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
-    Ok(NodeServiceClient::new(
-        analyzer::shared_channel(addr).map_err(|e| e.to_string())?,
+    Ok(
+        NodeServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
+            .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES),
     )
-    .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES))
 }
 
 async fn health(ctx: &Ctx) -> Result<Value, String> {
@@ -265,7 +287,7 @@ impl Default for SearchBody {
             text: String::new(),
             vector: None,
             k: 10,
-            mode: "cascade".to_string(),
+            mode: "global_rank".to_string(),
             leg_k: 0,
             rrf_k: 0.0,
             vector_weight: 0.0,
@@ -309,9 +331,21 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
     };
     let embed_ms = t_embed.elapsed().as_secs_f32() * 1e3;
 
+    // GLOBAL_RANK by default, not CASCADE. Cascade generates candidates
+    // from the vector leg and only RERANKS that pool by BM25, so the
+    // lexical leg cannot introduce a document. Measured over 36 queries
+    // on the 86.6M-chunk corpus: cascade retained 0% of the pure-lexical
+    // top-10 on every one of them, where global_rank retained 41%. On a
+    // short query the vector leg's own top hits are section headings
+    // whose text IS the query ("QUALIFIED IMMUNITY", "B. Qualified
+    // Immunity"), and cascade hands all of them straight through --
+    // mean length of its top 6 was 3 words against global_rank's 130.
+    // Global rank is also the faster of the two here (p50 380 vs 428 ms,
+    // p99 579 vs 686) and is the mode documented as reproducing the
+    // monolithic result exactly.
     let fusion_mode = match req.mode.as_str() {
-        "cascade" | "" => FusionMode::Cascade,
-        "global_rank" => FusionMode::GlobalRank,
+        "global_rank" | "" => FusionMode::GlobalRank,
+        "cascade" => FusionMode::Cascade,
         "score_blend" => FusionMode::ScoreBlend,
         "two_level" => FusionMode::TwoLevel,
         other => return Err(format!("unknown mode {other:?}")),
@@ -328,11 +362,21 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         "harmonic" => ScoreCombination::Harmonic,
         other => return Err(format!("unknown combination {other:?}")),
     };
-    // Analysis spec: must match how the corpus was ingested (term
-    // identity above all). Empty selects the sidecar defaults.
-    let pick = |v: &str, options: &[(&str, i32)]| -> Result<i32, String> {
+    // Analysis spec: must match how the corpus was ingested, because term
+    // identity is the whole contract. "default" therefore means THE
+    // CORPUS SPEC, never "let the sidecar pick".
+    //
+    // Sending no spec used to look harmless and was not: the sidecar
+    // resolves an absent spec to its own defaults (token-sourced,
+    // unstemmed), so every query term arrived as a raw token, missed a
+    // corpus of Porter stems, and scored df = 0. BM25 then returned
+    // nothing while the page still rendered a ranked list, because the
+    // vector leg answered normally. A lexical leg that silently matches
+    // nothing is indistinguishable from one that legitimately found
+    // nothing, which is exactly the failure this default prevents.
+    let pick = |v: &str, options: &[(&str, i32)], corpus_default: i32| -> Result<i32, String> {
         if v.is_empty() || v == "default" {
-            return Ok(0);
+            return Ok(corpus_default);
         }
         options
             .iter()
@@ -340,17 +384,28 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
             .map(|&(_, n)| n)
             .ok_or_else(|| format!("unknown value {v:?}"))
     };
-    let tokenizer = pick(&req.tokenizer, &[("whitespace", 1), ("simple", 2)])?;
-    let stemmer = pick(&req.stemmer, &[("none", 1), ("porter", 2)])?;
-    let term_source = pick(&req.term_source, &[("tokens", 1), ("stems", 2)])?;
-    let analysis = (tokenizer != 0 || stemmer != 0 || term_source != 0).then(|| {
-        turbovec_search::pb::AnalysisSpec {
-            tokenizer,
-            stemmer,
-            term_vector_mode: 0,
-            term_vector_source: term_source,
-            normalizer_steps: Vec::new(),
-        }
+    // Every default here comes from the one corpus spec rather than a
+    // literal repeated at this call site. An override is a deliberate
+    // A/B; a default that drifts from the index is a silent mismatch
+    // that scores different terms instead of failing.
+    let corpus = turbovec_search::analyzer::body_spec();
+    let tokenizer = pick(
+        &req.tokenizer,
+        &[("whitespace", 1), ("simple", 2)],
+        corpus.tokenizer,
+    )?;
+    let stemmer = pick(&req.stemmer, &[("none", 1), ("porter", 2)], corpus.stemmer)?;
+    let term_source = pick(
+        &req.term_source,
+        &[("tokens", 1), ("stems", 2), ("normalized_stems", 3)],
+        corpus.term_vector_source,
+    )?;
+    let analysis = Some(turbovec_search::pb::AnalysisSpec {
+        tokenizer,
+        stemmer,
+        term_vector_mode: 0,
+        term_vector_source: term_source,
+        char_filters: corpus.char_filters.clone(),
     });
 
     let boost = (!req.boost_text.is_empty()).then(|| BoostRescore {

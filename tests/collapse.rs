@@ -188,7 +188,11 @@ async fn collapse_returns_distinct_parents_and_matches_reference() {
     parents.dedup();
     assert_eq!(parents.len(), first.hits.len(), "no duplicate parents");
     for h in &first.hits {
-        assert_eq!(h.parent_id, opinion_of(h.vector_id), "chunk belongs to parent");
+        assert_eq!(
+            h.parent_id,
+            opinion_of(h.vector_id),
+            "chunk belongs to parent"
+        );
     }
 
     // The straddler: search deep enough that opinion 102 must be present,

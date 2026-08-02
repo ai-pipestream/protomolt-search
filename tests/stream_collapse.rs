@@ -237,7 +237,10 @@ async fn document_mode_matches_bidi_collapse_and_retrieves_chunk_groups() {
         );
         // The representative is the group's best chunk.
         let best = &group.chunks[0];
-        assert_eq!((best.vector_id, best.score.to_bits()), (hit.vector_id, hit.score.to_bits()));
+        assert_eq!(
+            (best.vector_id, best.score.to_bits()),
+            (hit.vector_id, hit.score.to_bits())
+        );
         for c in &group.chunks {
             assert_eq!(c.parent_id, group.parent_id);
         }
@@ -284,7 +287,11 @@ async fn straddler_group_retrieves_chunks_from_both_shards() {
     );
     // And exactly once each.
     assert_eq!(
-        streamed.groups.iter().filter(|g| g.parent_id == 102).count(),
+        streamed
+            .groups
+            .iter()
+            .filter(|g| g.parent_id == 102)
+            .count(),
         1
     );
     fx.shutdown().await;

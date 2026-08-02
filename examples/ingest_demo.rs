@@ -19,7 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::search_service_client::SearchServiceClient;
 use turbovec_search::pb::{
-    AddDocumentsRequest, AnalysisSpec, Bm25SearchRequest, GetDocumentsRequest, TermStatsRequest,
+    AddDocumentsRequest, Bm25SearchRequest, GetDocumentsRequest, TermStatsRequest,
 };
 
 const DOCS: [&str; 4] = [
@@ -46,13 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // WHITESPACE tokenizer, PORTER stemmer, MODE_FULL, SOURCE_STEMS.
-    let spec = AnalysisSpec {
-        tokenizer: 1,
-        stemmer: 2,
-        term_vector_mode: 1,
-        term_vector_source: 2,
-        normalizer_steps: vec![],
-    };
+    let spec = turbovec_search::analyzer::body_spec();
 
     let mut node_client = NodeServiceClient::connect(node).await?;
 

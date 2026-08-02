@@ -97,9 +97,8 @@ fn dot(vec_bytes: &[u8], q: &[f32]) -> f32 {
     let (mut a0, mut a1, mut a2, mut a3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut d = 0;
     while d + 4 <= DIM {
-        let f = |i: usize| {
-            f32::from_le_bytes(vec_bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"))
-        };
+        let f =
+            |i: usize| f32::from_le_bytes(vec_bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
         a0 += f(d) * q[d];
         a1 += f(d + 1) * q[d + 1];
         a2 += f(d + 2) * q[d + 2];
@@ -152,8 +151,8 @@ fn exact_pools(path: &str, queries: &[Vec<f32>], k: usize) -> Vec<Vec<(u64, f32)
             {
                 scope.spawn(move || {
                     for row in 0..rows {
-                        let vec_bytes = &data
-                            [row * record_bytes + RECORD_HEADER..(row + 1) * record_bytes];
+                        let vec_bytes =
+                            &data[row * record_bytes + RECORD_HEADER..(row + 1) * record_bytes];
                         let gid = base_row + row as u64;
                         for (heap, q) in heap_chunk.iter_mut().zip(query_chunk) {
                             let score = dot(vec_bytes, q);
@@ -170,10 +169,7 @@ fn exact_pools(path: &str, queries: &[Vec<f32>], k: usize) -> Vec<Vec<(u64, f32)
         });
         base_row += rows as u64;
         if base_row % (BLOCK_ROWS as u64 * 64) == 0 {
-            eprintln!(
-                "  exact scan: {base_row} rows in {:?}",
-                t0.elapsed()
-            );
+            eprintln!("  exact scan: {base_row} rows in {:?}", t0.elapsed());
         }
         if rows < BLOCK_ROWS {
             break;
@@ -297,7 +293,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut counts = Vec::new();
     for node in &nodes {
         let mut client = NodeServiceClient::connect(node.clone()).await?;
-        counts.push(client.health(HealthRequest {}).await?.into_inner().num_vectors);
+        counts.push(
+            client
+                .health(HealthRequest {})
+                .await?
+                .into_inner()
+                .num_vectors,
+        );
     }
     let total_docs: u64 = counts.iter().sum();
     let mut starts = vec![0u64; counts.len()];
@@ -363,7 +365,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for q in &queries {
         m2v_queries.push(analyzer::embed_text(&analysis, q).await?);
     }
-    eprintln!("model2vec embedded {} queries in {:?}", queries.len(), t.elapsed());
+    eprintln!(
+        "model2vec embedded {} queries in {:?}",
+        queries.len(),
+        t.elapsed()
+    );
 
     let t = Instant::now();
     let quant_pools: Vec<Vec<u64>> = {
@@ -389,7 +395,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .expect("search")
                         .into_inner()
                         .hits;
-                    (qi, hits.into_iter().map(|h| h.vector_id).collect::<Vec<u64>>())
+                    (
+                        qi,
+                        hits.into_iter().map(|h| h.vector_id).collect::<Vec<u64>>(),
+                    )
                 });
                 next += 1;
             }
@@ -436,7 +445,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES);
         for ids in doc_ids.chunks(2000) {
             let found = client
-                .get_documents(GetDocumentsRequest { doc_ids: ids.to_vec() })
+                .get_documents(GetDocumentsRequest {
+                    doc_ids: ids.to_vec(),
+                })
                 .await?
                 .into_inner();
             let batch: Vec<(u64, String)> = found
@@ -446,11 +457,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             tei_embed_batch(&tei_channel, &tei, batch, concurrency, &mut tei_of).await?;
             if tei_of.len() % 500_000 < 2000 {
-                eprintln!("  TEI: {}/{total_wanted} in {:?}", tei_of.len(), t.elapsed());
+                eprintln!(
+                    "  TEI: {}/{total_wanted} in {:?}",
+                    tei_of.len(),
+                    t.elapsed()
+                );
             }
         }
     }
-    eprintln!("TEI embedded {}/{total_wanted} texts in {:?}", tei_of.len(), t.elapsed());
+    eprintln!(
+        "TEI embedded {}/{total_wanted} texts in {:?}",
+        tei_of.len(),
+        t.elapsed()
+    );
 
     let mut tei_queries = Vec::new();
     for q in &queries {
@@ -461,8 +480,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Falloff sweep over pool prefixes and the dense k grid.
     let k_grid: Vec<usize> = vec![
-        1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000, 1500,
-        2000, 3000, 5000, 7000, 10000, 15000, 20000,
+        1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000, 1500, 2000,
+        3000, 5000, 7000, 10000, 15000, 20000,
     ];
     let pool_grid: Vec<usize> = vec![1000, 2000, 5000, 10000, 20000]
         .into_iter()
@@ -472,8 +491,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the lossless pool serves, in TEI cosine points. Regret ~0 with low
     // id agreement means the disagreements are interchangeable ties;
     // material regret is real quantization loss.
-    let mut csv =
-        String::from("pool_k,k,mean_recall,min_recall,max_recall,p10_recall,mean_regret,p90_regret\n");
+    let mut csv = String::from(
+        "pool_k,k,mean_recall,min_recall,max_recall,p10_recall,mean_regret,p90_regret\n",
+    );
 
     let tei_sort = |pool: &[u64], qi: usize| -> Vec<(u64, f64)> {
         let mut scored: Vec<(u64, f64)> = pool
@@ -494,8 +514,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &pk in &pool_grid {
         let per_query: Vec<(Vec<(u64, f64)>, Vec<(u64, f64)>)> = (0..queries.len())
             .map(|qi| {
-                let quant_members: HashSet<u64> = quant_pools[qi]
-                    [..pk.min(quant_pools[qi].len())]
+                let quant_members: HashSet<u64> = quant_pools[qi][..pk.min(quant_pools[qi].len())]
                     .iter()
                     .copied()
                     .collect();
@@ -533,9 +552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Per-rank served-score gap, lossless minus quantized.
                 let n = kq.min(ke);
                 if n > 0 {
-                    regrets.push(
-                        (0..n).map(|i| e[i].1 - q[i].1).sum::<f64>() / n as f64,
-                    );
+                    regrets.push((0..n).map(|i| e[i].1 - q[i].1).sum::<f64>() / n as f64);
                 }
             }
             recalls.sort_by(f64::total_cmp);

@@ -607,10 +607,22 @@ pub fn top_k_pruned_stats(
         return filter_to_floor(top_k(store, terms, stats, params, k), floor);
     }
     for (ti, term) in terms.iter().enumerate() {
-        if stats.dfs[ti] == 0 {
+        // A term absent from THIS shard contributes 0 to every document
+        // here, so it is skipped rather than scored. `stats.dfs` is the
+        // GLOBAL df, which is non-zero for a term that merely lives on
+        // another shard: checking only that sent every such query down
+        // the exhaustive path below, because a locally-absent term has no
+        // impact surface to open. On a sharded corpus that is the common
+        // case for exactly the rare, discriminative terms worth pruning
+        // with -- measured at 2710 ms vs 9 ms for "of 12b6" on the 86.6M
+        // corpus, where 7 of 8 shards lacked the rare term and each one
+        // then walked all 83.7M postings of "of" exhaustively.
+        if stats.dfs[ti] == 0 || store.df(term) == 0 {
             continue;
         }
         let Some(cursor) = store.impacts(term) else {
+            // Present here but no impact surface: a genuine format
+            // limitation, and the only case that still forfeits pruning.
             return filter_to_floor(top_k(store, terms, stats, params, k), floor);
         };
         let idf = idf(stats.doc_count, stats.dfs[ti]);
@@ -867,9 +879,13 @@ pub fn top_k_pruned_stats(
         }
         retain_live(&mut state, &mut finished);
     }
-    prune.blocks_skipped = finished.0 + state.iter().map(|ts| ts.cursor.blocks_skipped).sum::<u64>();
-    prune.l1_groups_skipped =
-        finished.1 + state.iter().map(|ts| ts.cursor.l1_groups_skipped).sum::<u64>();
+    prune.blocks_skipped =
+        finished.0 + state.iter().map(|ts| ts.cursor.blocks_skipped).sum::<u64>();
+    prune.l1_groups_skipped = finished.1
+        + state
+            .iter()
+            .map(|ts| ts.cursor.l1_groups_skipped)
+            .sum::<u64>();
 
     let mut out: Vec<HeapEntry> = heap.into_vec();
     out.sort_by(|a, b| {
@@ -951,7 +967,11 @@ pub fn top_k_fused_pruned_stats(
         .flat_map(|(fi, fq)| (0..fq.terms.len()).map(move |ti| (fi, ti)))
         .collect();
     let n_pairs = pair_meta.len();
-    if n_pairs > 128 || fields.iter().any(|fq| fq.weight < 0.0 || fq.weight.is_nan()) {
+    if n_pairs > 128
+        || fields
+            .iter()
+            .any(|fq| fq.weight < 0.0 || fq.weight.is_nan())
+    {
         return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
     }
 
@@ -1014,10 +1034,17 @@ pub fn top_k_fused_pruned_stats(
     for (oi, &(fi, ti)) in pair_meta.iter().enumerate() {
         let fq = &fields[fi];
         debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
-        if fq.stats.dfs[ti] == 0 {
+        // A (field, term) pair absent from THIS shard contributes 0 to
+        // every document here, so it is skipped rather than scored.
+        // `fq.stats.dfs` is the GLOBAL df, which is non-zero for a term
+        // that merely lives on another shard; checking it alone sends
+        // every such query down the exhaustive path.
+        if fq.stats.dfs[ti] == 0 || fq.index.df(&fq.terms[ti]) == 0 {
             continue;
         }
         let Some(cursor) = fq.index.impacts(&fq.terms[ti]) else {
+            // Present here but no impact surface: a genuine format
+            // limitation, and the only case that still forfeits pruning.
             return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
         };
         let avgdl = fq.stats.avgdl();
@@ -1201,8 +1228,8 @@ pub fn top_k_fused_pruned_stats(
                 if nonessential[pos] {
                     bound += ps.block_max;
                 } else if ps.cursor.doc_id() == doc {
-                    bound +=
-                        ps.widf * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[oi].0], ps.avgdl);
+                    bound += ps.widf
+                        * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[oi].0], ps.avgdl);
                 }
             }
         }
@@ -1260,9 +1287,13 @@ pub fn top_k_fused_pruned_stats(
         }
         retain_live(&mut state, &mut finished);
     }
-    prune.blocks_skipped = finished.0 + state.iter().map(|ps| ps.cursor.blocks_skipped).sum::<u64>();
-    prune.l1_groups_skipped =
-        finished.1 + state.iter().map(|ps| ps.cursor.l1_groups_skipped).sum::<u64>();
+    prune.blocks_skipped =
+        finished.0 + state.iter().map(|ps| ps.cursor.blocks_skipped).sum::<u64>();
+    prune.l1_groups_skipped = finished.1
+        + state
+            .iter()
+            .map(|ps| ps.cursor.l1_groups_skipped)
+            .sum::<u64>();
 
     let mut out: Vec<HeapEntry> = heap.into_vec();
     out.sort_by(|a, b| {
@@ -1282,7 +1313,9 @@ pub fn top_k_fused_pruned_stats(
                     (
                         fi,
                         ti,
-                        fields[fi].index.posting_offsets(&fields[fi].terms[ti], e.doc_id),
+                        fields[fi]
+                            .index
+                            .posting_offsets(&fields[fi].terms[ti], e.doc_id),
                     )
                 })
                 .collect(),
@@ -1342,12 +1375,18 @@ mod tests {
         store.add_document(
             0,
             "a".to_string(),
-            AnalyzedDoc::body(vec![("rust".into(), 2, vec![]), ("search".into(), 1, vec![])], 3),
+            AnalyzedDoc::body(
+                vec![("rust".into(), 2, vec![]), ("search".into(), 1, vec![])],
+                3,
+            ),
         );
         store.add_document(
             1,
             "b".to_string(),
-            AnalyzedDoc::body(vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])], 3),
+            AnalyzedDoc::body(
+                vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])],
+                3,
+            ),
         );
         store.add_document(
             2,
@@ -1487,7 +1526,10 @@ mod tests {
             AnalyzedDoc {
                 fields: vec![
                     AnalyzedField {
-                        terms: vec![("rust".into(), 2, vec![(0, 4)]), ("search".into(), 1, vec![])],
+                        terms: vec![
+                            ("rust".into(), 2, vec![(0, 4)]),
+                            ("search".into(), 1, vec![]),
+                        ],
                         length: 3,
                     },
                     AnalyzedField {
@@ -1517,7 +1559,10 @@ mod tests {
                         length: 1,
                     },
                     AnalyzedField {
-                        terms: vec![("rust".into(), 1, vec![(0, 4)]), ("smith".into(), 1, vec![])],
+                        terms: vec![
+                            ("rust".into(), 1, vec![(0, 4)]),
+                            ("smith".into(), 1, vec![]),
+                        ],
                         length: 2,
                     },
                 ],

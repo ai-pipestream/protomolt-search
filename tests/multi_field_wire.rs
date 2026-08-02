@@ -37,7 +37,10 @@ const CORPUS: [&[(&str, Option<&str>)]; 2] = [
     &[
         ("rust search rust fast", Some("Smith v Jones")),
         ("vector search rust", None),
-        ("smith writes about rust", Some("Acme Corp v Rust Industries")),
+        (
+            "smith writes about rust",
+            Some("Acme Corp v Rust Industries"),
+        ),
     ],
     &[
         ("search engines love rust", Some("Smith v Smith")),
@@ -80,7 +83,11 @@ async fn add_documents(addr: &str, docs: &[(&str, Option<&str>)]) {
     assert_eq!(resp.added as usize, docs.len());
 }
 
-fn two_field_node(analysis: &str, slot_offset: u64, index_path: Option<std::path::PathBuf>) -> NodeConfig {
+fn two_field_node(
+    analysis: &str,
+    slot_offset: u64,
+    index_path: Option<std::path::PathBuf>,
+) -> NodeConfig {
     NodeConfig {
         slot_offset,
         analysis_addr: Some(analysis.to_string()),
@@ -456,10 +463,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
         .unwrap();
     }
     drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap();
+    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
 
     let legs = |k1: f32, b: f32| {
         let mut client = client.clone();
@@ -493,6 +497,403 @@ async fn shard_legs_bm25_params_reach_scoring() {
             .any(|(d, t)| d.score.to_bits() != t.score.to_bits()),
         "k1/b must reach the BM25 leg's scores"
     );
+
+    node.abort();
+    mock.abort();
+}
+
+/// An unknown field must be refused, and a partially-known one must not.
+///
+/// Shards skip a leg naming a field they lack, which is right for a
+/// heterogeneous fleet and catastrophic for a typo: the fused score of
+/// the REMAINING fields comes back as if it answered the question asked.
+/// The distinction the engine can actually make is fleet-wide — no shard
+/// has it (a typo) versus some shard has it (a real rollout) — so that is
+/// where the refusal lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_field_no_shard_indexes_is_refused_not_silently_skipped() {
+    let (analysis, mock) = start_mock_analysis().await;
+
+    // Shard 0 has case_name; shard 1 is body-only. Together they are the
+    // mid-rollout fleet the skip exists for.
+    let (a, node_a) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    add_documents(&a, CORPUS[0]).await;
+    let (b, node_b) = start_empty_node(NodeConfig {
+        slot_offset: OFFSETS[1],
+        analysis_addr: Some(analysis.clone()),
+        bm25_fields: vec!["body".to_string()],
+        ..Default::default()
+    })
+    .await;
+    add_documents(
+        &b,
+        &CORPUS[1]
+            .iter()
+            .map(|(t, _)| (*t, None))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+
+    let coord = CoordinatorServiceImpl::new(vec![a, b])
+        .with_bm25(Some(analysis.clone()), Default::default());
+
+    // Partially known: shard 0 answers, shard 1 skips, query succeeds.
+    let partial = coord
+        .fanout_bm25_fused("smith rust", 5, &query_fields(2.0), 0.0)
+        .await
+        .expect("a field some shard indexes is a real query");
+    assert!(!partial.is_empty());
+
+    // Known nowhere: refused, and the message says what to check.
+    let mut typo = query_fields(2.0);
+    typo[1].field = "case_nmae".to_string();
+    let err = coord
+        .fanout_bm25_fused("smith rust", 5, &typo, 0.0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("case_nmae") && err.message().contains("no shard indexes"),
+        "the refusal must name the field: {}",
+        err.message()
+    );
+
+    node_a.abort();
+    node_b.abort();
+    mock.abort();
+}
+
+/// A request-level `analysis` alongside `fields` is refused, not dropped.
+///
+/// The proto says `analysis` is ignored once `fields` is set, because
+/// term identity is per field. Ignoring it QUIETLY is what makes it
+/// dangerous: every field then falls back to the analysis sidecar's
+/// default, which need not be the spec the field was ingested with. The
+/// query runs against terms that are not in the index, matches only the
+/// tokens that happen to survive both analyses, and returns a confident
+/// ranking of that fragment -- which reads as bad relevance, never as a
+/// failure.
+///
+/// Found on the live fleet: an A/B tool set the spec at the request
+/// level, the fused route analyzed with the sidecar default (no
+/// stemming), and the query went out as "court, established" instead of
+/// "court, establish". The unstemmed term existed in ONE document of
+/// 86.6M, which then also dragged seven of eight shards onto the
+/// exhaustive scorer.
+#[tokio::test]
+async fn request_level_analysis_with_fields_is_refused_not_ignored() {
+    use turbovec_search::pb::search_service_server::SearchService;
+    use turbovec_search::pb::{AnalysisSpec, Bm25SearchRequest};
+
+    let (analysis, mock) = start_mock_analysis().await;
+    let (a, node_a) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    add_documents(&a, CORPUS[0]).await;
+    let coord =
+        CoordinatorServiceImpl::new(vec![a]).with_bm25(Some(analysis.clone()), Default::default());
+
+    let spec = AnalysisSpec {
+        tokenizer: 1,
+        stemmer: 2,
+        term_vector_mode: 1,
+        term_vector_source: 2,
+        char_filters: vec![],
+    };
+
+    // Per-field: the supported way to say it, and it must still work.
+    let mut per_field = query_fields(2.0);
+    for f in &mut per_field {
+        f.analysis = Some(spec.clone());
+    }
+    SearchService::bm25_search(
+        &coord,
+        tonic::Request::new(Bm25SearchRequest {
+            text: "smith rust".to_string(),
+            k: 5,
+            analysis: None,
+            min_score: 0.0,
+            fields: per_field,
+        }),
+    )
+    .await
+    .expect("per-field analysis is how a fused query carries its spec");
+
+    // Request-level alongside fields: refused, and the message says
+    // where the spec belongs.
+    let err = SearchService::bm25_search(
+        &coord,
+        tonic::Request::new(Bm25SearchRequest {
+            text: "smith rust".to_string(),
+            k: 5,
+            analysis: Some(spec),
+            min_score: 0.0,
+            fields: query_fields(2.0),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("QueryField.analysis"),
+        "the refusal must say where to put the spec: {}",
+        err.message()
+    );
+
+    node_a.abort();
+    mock.abort();
+}
+
+/// A sidecar that records every UNARY `Analyze` it is asked for, and
+/// otherwise behaves exactly like the shared mock.
+struct CountingMock {
+    inner: turbovec_search::harness::mock_analysis::MockAnalysis,
+    unary: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl turbovec_search::pb::analysis::analysis_service_server::AnalysisService for CountingMock {
+    async fn analyze(
+        &self,
+        request: tonic::Request<turbovec_search::pb::analysis::AnalyzeRequest>,
+    ) -> Result<tonic::Response<turbovec_search::pb::analysis::AnalyzeResponse>, tonic::Status>
+    {
+        self.unary
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::analyze(
+            &self.inner,
+            request,
+        )
+        .await
+    }
+
+    type AnalyzeStreamStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<
+                        turbovec_search::pb::analysis::AnalyzeStreamResponse,
+                        tonic::Status,
+                    >,
+                > + Send,
+        >,
+    >;
+
+    async fn analyze_stream(
+        &self,
+        request: tonic::Request<
+            tonic::Streaming<turbovec_search::pb::analysis::AnalyzeStreamRequest>,
+        >,
+    ) -> Result<tonic::Response<Self::AnalyzeStreamStream>, tonic::Status> {
+        self.streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::analyze_stream(
+            &self.inner,
+            request,
+        )
+        .await
+    }
+
+    async fn get_capabilities(
+        &self,
+        request: tonic::Request<turbovec_search::pb::analysis::GetCapabilitiesRequest>,
+    ) -> Result<
+        tonic::Response<turbovec_search::pb::analysis::GetCapabilitiesResponse>,
+        tonic::Status,
+    > {
+        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::get_capabilities(
+            &self.inner,
+            request,
+        )
+        .await
+    }
+}
+
+/// Extra fields ride AnalyzeStream, not one unary `Analyze` per field.
+///
+/// The body has always streamed; extra fields used to spawn a unary call
+/// each, which at rebuild scale (86.6M chunks x several body columns) is
+/// hundreds of millions of h2 streams against the sidecar the rebuild
+/// README names as the ingest throughput ceiling. This pins the
+/// transport, because nothing else would notice it regressing: the unary
+/// path produced byte-identical postings, just far more slowly.
+///
+/// Ingests 6 two-field documents in ONE call and asserts the sidecar saw
+/// ZERO unary calls, a BOUNDED number of streams (one for the body spec
+/// plus one per distinct field spec, NOT one per document), and the same
+/// per-field term identity the unary path produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
+    let unary = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let streams = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let analysis = format!("http://{}", listener.local_addr().unwrap());
+    let mock = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                turbovec_search::pb::analysis::analysis_service_server::AnalysisServiceServer::new(
+                    CountingMock {
+                        inner: turbovec_search::harness::mock_analysis::MockAnalysis,
+                        unary: unary.clone(),
+                        streams: streams.clone(),
+                    },
+                ),
+            )
+            .serve_with_incoming(turbovec_search::harness::nodelay_incoming(listener)),
+    );
+
+    let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+
+    // Every document in CORPUS[0] and CORPUS[1], in one ingest call: six
+    // documents, four of which carry a case_name.
+    let docs: Vec<AddDocumentsRequest> = CORPUS
+        .iter()
+        .flat_map(|shard| shard.iter())
+        .map(|&(body, name)| doc_request(body, name))
+        .collect();
+    let named = docs.iter().filter(|d| !d.fields.is_empty()).count();
+    assert_eq!(named, 4, "fixture: four documents carry a case_name");
+
+    let (tx, rx) = mpsc::channel(16);
+    for doc in docs {
+        tx.send(doc).await.unwrap();
+    }
+    drop(tx);
+    let added = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((added.added, added.total), (6, 6));
+
+    assert_eq!(
+        unary.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "extra fields must not fall back to unary Analyze; that is the whole point"
+    );
+    // Body spec + field spec, both None here, so two sessions: one for
+    // the body and one shared by every field. The bound that matters is
+    // that it does NOT scale with document or field count.
+    let opened = streams.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        opened <= 2,
+        "expected one stream per distinct spec (<=2), saw {opened}; \
+         streams must not scale with the {named} analyzed fields"
+    );
+
+    // Term identity is unchanged: case_name df("smith") = 3 across the
+    // whole corpus ("Smith v Jones", "Smith v Smith", and "smith" in no
+    // other name), body df("smith") = 1.
+    let stats = client
+        .term_stats(TermStatsRequest {
+            terms: vec!["smith".into()],
+            fields: vec![FieldTerms {
+                field: "case_name".into(),
+                terms: vec!["smith".into(), "vector".into()],
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stats.doc_frequencies, vec![1], "body df(smith)");
+    assert_eq!(
+        stats.field_stats[0].doc_frequencies,
+        vec![2, 1],
+        "case_name df(smith), df(vector) — the unary path's exact values"
+    );
+
+    node.abort();
+    mock.abort();
+}
+
+/// A column built under one analyzer and queried under another is
+/// REFUSED, not silently scored.
+///
+/// This is the guard that did not exist when the v7 corpus was built
+/// under SOURCE_STEMS. Field NAME agreement was the only check, and a
+/// name matches whatever the terms underneath it mean, so the mismatch
+/// produced a confident wrong ranking with no error anywhere. The
+/// rebuild adds a second body column whose entire purpose is to be
+/// analyzed differently from the first, which turns a latent hazard into
+/// a live one: the two columns will differ by exactly the thing the name
+/// does not carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
+    use turbovec_search::analyzer::{analysis_fingerprint, body_spec, cased_body_spec};
+    use turbovec_search::pb::{Bm25FieldLeg, Bm25QueryRequest};
+
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+
+    // Ingest the body under the FOLDED analyzer, which is what the
+    // shard then records for field 0.
+    let folded = body_spec();
+    let (tx, rx) = mpsc::channel(8);
+    for (body, name) in CORPUS[0] {
+        let mut doc = doc_request(body, *name);
+        doc.analysis = Some(folded.clone());
+        tx.send(doc).await.unwrap();
+    }
+    drop(tx);
+    let added = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(added.added, 3);
+
+    let leg = |fingerprint: u64| Bm25QueryRequest {
+        terms: Vec::new(),
+        k: 5,
+        global_doc_count: 3,
+        global_total_doc_length: 12,
+        global_doc_frequencies: Vec::new(),
+        k1: 0.0,
+        b: 0.0,
+        min_score: 0.0,
+        fields: vec![Bm25FieldLeg {
+            field: "body".to_string(),
+            terms: vec!["rust".to_string()],
+            global_total_doc_length: 12,
+            global_doc_frequencies: vec![3],
+            weight: 1.0,
+            k1: 1.2,
+            b: 0.75,
+            analysis_fingerprint: fingerprint,
+        }],
+    };
+
+    // The analyzer it was built with: answered.
+    let ok = client
+        .bm25_query(leg(analysis_fingerprint(Some(&folded))))
+        .await
+        .expect("the ingest analyzer must be accepted")
+        .into_inner();
+    assert!(!ok.hits.is_empty(), "matching analyzer should return hits");
+
+    // The OTHER analyzer of the A/B: refused, and the error names both
+    // fingerprints so the mismatch is diagnosable rather than merely
+    // reported.
+    let err = client
+        .bm25_query(leg(analysis_fingerprint(Some(&cased_body_spec()))))
+        .await
+        .expect_err("a mismatched analyzer must be refused, not scored");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(
+        err.message().contains("term identities"),
+        "error should explain WHY: {}",
+        err.message()
+    );
+
+    // 0 means "I do not know my own analyzer", which disables the check
+    // rather than failing closed: probes and tools that hand-type terms
+    // must keep working, and a shard predating fingerprints reads 0 too.
+    let unknown = client
+        .bm25_query(leg(0))
+        .await
+        .expect("an undeclared analyzer must not be refused")
+        .into_inner();
+    assert!(!unknown.hits.is_empty());
 
     node.abort();
     mock.abort();

@@ -425,7 +425,10 @@ fn fused_ties_at_floor_and_kth_slot() {
     let tie_score = oracle[0].score;
     assert!(oracle.iter().all(|h| h.score == tie_score));
     let want_ids: Vec<u32> = (0..10).collect();
-    assert_eq!(oracle.iter().map(|h| h.doc_id).collect::<Vec<_>>(), want_ids);
+    assert_eq!(
+        oracle.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+        want_ids
+    );
     let pruned = |floor: f64| {
         bm25::top_k_fused_pruned(
             &[
@@ -458,7 +461,10 @@ fn fused_ties_at_floor_and_kth_slot() {
     }
     // A hair above the tie: nothing survives.
     let got = pruned(tie_score + 1e-9);
-    assert!(got.is_empty(), "floor above every score must return nothing");
+    assert!(
+        got.is_empty(),
+        "floor above every score must return nothing"
+    );
 
     // Corpus B: the k-th slot ties ACROSS blocks — 12 high docs (name
     // field present) spread over 300 body-only docs; k=10 keeps the
@@ -732,7 +738,11 @@ fn fused_fallbacks_match_exhaustive() {
             k,
             floor,
         );
-        assert_eq!(sig(&want), sig(&got), "heap-store fallback, floor {floor:e}");
+        assert_eq!(
+            sig(&want),
+            sig(&got),
+            "heap-store fallback, floor {floor:e}"
+        );
     }
 
     // Reader with impacts but a negative weight: same fallback.
@@ -923,6 +933,184 @@ fn fused_pruned_distributed_equals_monolithic() {
     // the merge reproduces the monolithic top-k exactly.
     let merged = distributed(want[k - 1].score);
     assert_eq!(sig(&want), sig(&merged), "seeded distributed merge");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A term that lives on ANOTHER shard must not forfeit fused pruning here.
+///
+/// The single-field twin of this gate is
+/// `blockmax.rs::a_term_absent_from_this_shard_does_not_disable_pruning`.
+/// The fused scorer had the same defect and outlived the fix, because
+/// `FieldQuery.stats.dfs` is the GLOBAL df the coordinator computed: a
+/// rare term is non-zero there even on the shards that do not hold it,
+/// those shards have no impact surface to open for it, and the scorer
+/// read that as "this index lacks impacts" and dropped the WHOLE query
+/// to the exhaustive scorer.
+///
+/// Measured on the live 86.6M-chunk fleet before the fix: a two-term
+/// query whose second term existed on exactly one of eight shards took
+/// 3557 ms through the fused route and 10.6 ms after, because the other
+/// seven each walked every posting of the common term. The single-field
+/// route answered the identical query in 6 ms throughout, which is what
+/// made the gap visible at all.
+#[test]
+fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fused_absent_term");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // This shard holds only "court" in body. "12b6" is elsewhere in the
+    // cluster, so its GLOBAL df is non-zero while its local df is 0.
+    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    for i in 0..2000u32 {
+        let tf = if i % 97 == 0 { 5 } else { 1 };
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            AnalyzedDoc {
+                fields: vec![
+                    AnalyzedField {
+                        terms: vec![("court".to_string(), tf, vec![(0, 5)])],
+                        length: 4,
+                    },
+                    AnalyzedField {
+                        terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
+                        length: 1,
+                    },
+                ],
+            },
+        );
+    }
+    let path = dir.join("absent.bm25");
+    store.save(&path).unwrap();
+    let reader = Bm25Reader::open(&path).unwrap();
+
+    let body_terms = vec!["court".to_string(), "12b6".to_string()];
+    let name_terms = vec!["smith".to_string()];
+    let params = Bm25Params::default();
+    // Global dfs: the rare body term is present in the CLUSTER.
+    let body_stats = CorpusStats {
+        doc_count: store.doc_count(),
+        total_doc_length: store.field(0).total_doc_length(),
+        dfs: vec![2000, 10],
+    };
+    let name_stats = field_stats(&store, 1, &name_terms);
+
+    fn queries<'a>(
+        body: &'a dyn Bm25Index,
+        name: &'a dyn Bm25Index,
+        body_terms: &'a [String],
+        name_terms: &'a [String],
+        body_stats: &CorpusStats,
+        name_stats: &CorpusStats,
+        params: Bm25Params,
+    ) -> Vec<FieldQuery<'a>> {
+        vec![
+            FieldQuery {
+                index: body,
+                terms: body_terms,
+                stats: body_stats.clone(),
+                params,
+                weight: 1.0,
+            },
+            FieldQuery {
+                index: name,
+                terms: name_terms,
+                stats: name_stats.clone(),
+                params,
+                weight: 2.0,
+            },
+        ]
+    }
+    macro_rules! q {
+        ($body:expr, $name:expr) => {
+            queries(
+                &$body,
+                &$name,
+                &body_terms,
+                &name_terms,
+                &body_stats,
+                &name_stats,
+                params,
+            )
+        };
+    }
+
+    let oracle = bm25::top_k_fused_exhaustive(&q!(store.field(0), store.field(1)), 10);
+    let mut prune = PruneStats::default();
+    let got = bm25::top_k_fused_pruned_stats(
+        &q!(reader.field(0), reader.field(1)),
+        10,
+        f64::NEG_INFINITY,
+        &mut prune,
+    );
+
+    // Correctness first: skipping a locally-absent pair is only valid
+    // because it contributes 0 to every document on this shard.
+    assert_eq!(
+        sig(&oracle),
+        sig(&got),
+        "skipping a locally-absent term must not change a single fused score"
+    );
+
+    // And the point of the fix: the pruned scorer was ENTERED. Only its
+    // candidate loop touches `candidates_evaluated`; the exhaustive
+    // fallback is handed no PruneStats at all, so a non-zero count is a
+    // precise witness of entry. (`blocks_total` is NOT: the setup loop
+    // has already counted the present term's blocks by the time the
+    // absent one triggers the fallback.) Skip effectiveness is a
+    // property of the fixture's score distribution and is gated
+    // elsewhere.
+    assert!(
+        prune.candidates_evaluated > 0,
+        "the fused query fell back to exhaustive despite every PRESENT term having impacts"
+    );
+
+    // A seeded floor must still hold the filtered-oracle contract.
+    let seeded =
+        bm25::top_k_fused_pruned(&q!(reader.field(0), reader.field(1)), 10, oracle[9].score);
+    assert_eq!(
+        sig(&bm25::filter_fused_to_floor(
+            oracle.clone(),
+            oracle[9].score
+        )),
+        sig(&seeded),
+        "a seeded floor must not change the surviving fused hits"
+    );
+
+    // Control: dropping the absent term entirely must walk the same
+    // blocks. If it does not, the absent term is still costing work.
+    let present_only = vec!["court".to_string()];
+    let mut solo = PruneStats::default();
+    let _ = bm25::top_k_fused_pruned_stats(
+        &[
+            FieldQuery {
+                index: &reader.field(0),
+                terms: &present_only,
+                stats: CorpusStats {
+                    doc_count: store.doc_count(),
+                    total_doc_length: store.field(0).total_doc_length(),
+                    dfs: vec![2000],
+                },
+                params,
+                weight: 1.0,
+            },
+            FieldQuery {
+                index: &reader.field(1),
+                terms: &name_terms,
+                stats: name_stats.clone(),
+                params,
+                weight: 2.0,
+            },
+        ],
+        10,
+        f64::NEG_INFINITY,
+        &mut solo,
+    );
+    assert_eq!(
+        prune.blocks_total, solo.blocks_total,
+        "a locally-absent term should add no blocks to walk"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -273,7 +273,10 @@ async fn run_cell(
         let mut tasks = tokio::task::JoinSet::new();
         for (qi, (_, vector)) in probes.iter().enumerate() {
             let coordinator = Arc::clone(&coordinator);
-            let permit = Arc::clone(&semaphore).acquire_owned().await.expect("semaphore");
+            let permit = Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("semaphore");
             let vector = vector.clone();
             let request_id = format!("sweep-{k}-{qi}");
             tasks.spawn(async move {
@@ -416,8 +419,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!(
         "{:>8} {:>8} {:>8} {:>7} {:>14} {:>12} {:>10} {:>10} {:>8} {:>6} {:>9} {:>9} {:>9} {:>8}",
-        "k", "sharing", "hedge", "shards", "candidates", "cand/query", "floors_pub", "floors_app",
-        "hedged", "won", "p50_ms", "p90_ms", "p99_ms", "qps"
+        "k",
+        "sharing",
+        "hedge",
+        "shards",
+        "candidates",
+        "cand/query",
+        "floors_pub",
+        "floors_app",
+        "hedged",
+        "won",
+        "p50_ms",
+        "p90_ms",
+        "p99_ms",
+        "qps"
     );
 
     let mut json_lines = Vec::new();
@@ -567,10 +582,7 @@ async fn run_lexical_cell(
         if qi >= warmup {
             walls.push(start.elapsed().as_secs_f64() * 1e3);
             if signature.is_empty() {
-                signature = hits
-                    .iter()
-                    .map(|h| (h.doc_id, h.score.to_bits()))
-                    .collect();
+                signature = hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect();
                 kth_best = if hits.len() == k as usize {
                     hits.last().map(|h| h.score).unwrap_or(0.0)
                 } else {
@@ -611,10 +623,7 @@ async fn run_lexical_factorial() -> Result<(), Box<dyn std::error::Error>> {
     let n_queries: usize = arg_or("queries", "20").parse()?;
     let warmup: usize = arg_or("warmup", "2").parse()?;
 
-    for addr in nodes_on
-        .iter()
-        .chain(nodes_off.iter().flatten())
-    {
+    for addr in nodes_on.iter().chain(nodes_off.iter().flatten()) {
         wait_ready(addr).await;
     }
     eprintln!(
@@ -635,7 +644,8 @@ async fn run_lexical_factorial() -> Result<(), Box<dyn std::error::Error>> {
     let mut gate_failures = 0u64;
     for &k in &ks {
         // The on/unseeded cell is the reference signature for this k.
-        let reference = run_lexical_cell(&nodes_on, &analysis, &text, k, n_queries, warmup, 0.0).await;
+        let reference =
+            run_lexical_cell(&nodes_on, &analysis, &text, k, n_queries, warmup, 0.0).await;
         println!(
             "{:>8} {:>9} {:>8} {:>9.3} {:>9.3} {:>9.3}",
             k,
@@ -673,7 +683,8 @@ async fn run_lexical_factorial() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 seed_from_kth(unseeded.kth_best)
             };
-            let seeded = run_lexical_cell(addrs, &analysis, &text, k, n_queries, warmup, base).await;
+            let seeded =
+                run_lexical_cell(addrs, &analysis, &text, k, n_queries, warmup, base).await;
             println!(
                 "{:>8} {:>9} {:>8} {:>9.3} {:>9.3} {:>9.3}",
                 k,

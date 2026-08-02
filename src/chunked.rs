@@ -44,7 +44,15 @@ pub struct ScanStats {
     /// exactly the set of vectors that survived every floor in effect when
     /// their chunk ran — the metric that shows floor sharing saving work.
     pub candidates_collected: u64,
-    /// Floor values published via `publish_floor`.
+    /// Floors OFFERED to `publish_floor`: one per chunk whose heap held
+    /// `k`. This is the scan's own behaviour and does not depend on what
+    /// the caller does with them.
+    pub floors_offered: u64,
+    /// Floors the caller actually put on the wire, which is what
+    /// `--floor-warmup-chunks` and `--floor-min-interval-ms` move. It was
+    /// once the same counter as `floors_offered`, so a knob that
+    /// suppressed nine tenths of the broadcasts read as having done
+    /// nothing at all.
     pub floors_published: u64,
     /// Chunks that ran with an external (coordinator-pushed) floor in effect.
     pub floor_updates_applied: u64,
@@ -157,7 +165,9 @@ pub struct BatchQuery<'a> {
 ///   chunk's threshold with `max(f, local heap floor)`. Return `None` when
 ///   no external floor is known (or floor sharing is disabled).
 /// - `publish_floor`: called after each chunk in which the heap holds `k`
-///   candidates, with the current k-th best score.
+///   candidates, with the current k-th best score. It returns whether the
+///   floor was actually sent, so the scan can report offered and
+///   published separately.
 ///
 /// Returns the shard's local top-k sorted by [`ranks_before`] plus scan
 /// statistics.
@@ -167,7 +177,7 @@ pub fn chunked_topk(
     k: usize,
     chunk_blocks: usize,
     external_floor: &mut dyn FnMut() -> Option<f32>,
-    publish_floor: &mut dyn FnMut(f32),
+    publish_floor: &mut dyn FnMut(f32) -> bool,
     keep_ties: bool,
 ) -> (Vec<ChunkHit>, ScanStats) {
     let queries = [BatchQuery {
@@ -213,7 +223,7 @@ pub fn chunked_topk_batch(
     queries: &[BatchQuery<'_>],
     chunk_blocks: usize,
     external_floor: &mut dyn FnMut(usize) -> Option<f32>,
-    publish_floor: &mut dyn FnMut(usize, f32),
+    publish_floor: &mut dyn FnMut(usize, f32) -> bool,
 ) -> Vec<(Vec<ChunkHit>, ScanStats)> {
     let n = index.len();
     let nq = queries.len();
@@ -306,8 +316,10 @@ pub fn chunked_topk_batch(
             merge_chunk_hits(&mut heaps[qi], &mut chunk_hits, q.k, q.keep_ties);
 
             if heaps[qi].len() >= q.k {
-                publish_floor(qi, heaps[qi][q.k - 1].score);
-                out[qi].1.floors_published += 1;
+                out[qi].1.floors_offered += 1;
+                if publish_floor(qi, heaps[qi][q.k - 1].score) {
+                    out[qi].1.floors_published += 1;
+                }
             }
         }
 
@@ -361,14 +373,10 @@ pub fn chunked_topk_collapsed(
     chunk_blocks: usize,
     parents: &[u64],
     external_floor: &mut dyn FnMut() -> Option<f32>,
-    publish_floor: &mut dyn FnMut(f32),
+    publish_floor: &mut dyn FnMut(f32) -> bool,
 ) -> (Vec<CollapsedHit>, ScanStats) {
     let n = index.len();
-    assert_eq!(
-        parents.len(),
-        n,
-        "parents must map every slot of the index"
-    );
+    assert_eq!(parents.len(), n, "parents must map every slot of the index");
     let mut stats = ScanStats::default();
     if n == 0 || k == 0 {
         return (Vec::new(), stats);
@@ -448,8 +456,10 @@ pub fn chunked_topk_collapsed(
                 floor = kth;
             }
             best.retain(|_, h| h.score >= kth);
-            publish_floor(kth);
-            stats.floors_published += 1;
+            stats.floors_offered += 1;
+            if publish_floor(kth) {
+                stats.floors_published += 1;
+            }
         }
 
         start = end;
@@ -519,7 +529,7 @@ mod tests {
                 k,
                 chunk_blocks,
                 &mut || None,
-                &mut |_| {},
+                &mut |_| false,
                 false,
             );
             let got: Vec<(i64, u32)> = hits
@@ -559,7 +569,7 @@ mod tests {
                 k,
                 chunk_blocks,
                 &mut || None,
-                &mut |_| {},
+                &mut |_| false,
                 false,
             );
             assert_eq!(hits.len(), k);
@@ -589,7 +599,7 @@ mod tests {
         let true_kth = index.search(&query, k).scores_for_query(0)[k - 1];
 
         let (baseline, base_stats) =
-            chunked_topk(&index, &query, k, 2, &mut || None, &mut |_| {}, false);
+            chunked_topk(&index, &query, k, 2, &mut || None, &mut |_| false, false);
 
         // Floor becomes visible after the first chunk, like a coordinator
         // update arriving mid-scan.
@@ -603,7 +613,7 @@ mod tests {
                 polls += 1;
                 (polls > 1).then_some(true_kth)
             },
-            &mut |_| {},
+            &mut |_| false,
             false,
         );
 
@@ -632,7 +642,10 @@ mod tests {
             k,
             1,
             &mut || None,
-            &mut |f| published.push(f),
+            &mut |f| {
+                published.push(f);
+                true
+            },
             false,
         );
 
@@ -660,10 +673,10 @@ mod tests {
             index.add(&query);
         }
 
-        let (capped, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| {}, false);
+        let (capped, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, false);
         assert_eq!(capped.len(), k, "without keep_ties the heap caps at k");
 
-        let (tied, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| {}, true);
+        let (tied, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, true);
         assert_eq!(tied.len(), 6, "whole boundary tie group must survive");
         assert!(tied.iter().all(|h| h.score == tied[0].score));
         assert!(tied.windows(2).all(|w| w[0].slot < w[1].slot));
@@ -691,7 +704,10 @@ mod tests {
                     k,
                     chunk_blocks,
                     &mut || None,
-                    &mut |f| published.push(f),
+                    &mut |f| {
+                        published.push(f);
+                        true
+                    },
                     ties,
                 );
                 solo.push((hits, published));
@@ -706,10 +722,11 @@ mod tests {
                 })
                 .collect();
             let mut published: Vec<Vec<f32>> = vec![Vec::new(); specs.len()];
-            let results = chunked_topk_batch(&index, &batch, chunk_blocks, &mut |_| None, &mut |qi,
-                                                                                              f| {
-                published[qi].push(f)
-            });
+            let results =
+                chunked_topk_batch(&index, &batch, chunk_blocks, &mut |_| None, &mut |qi, f| {
+                    published[qi].push(f);
+                    true
+                });
             for (qi, ((hits, _), (solo_hits, solo_published))) in
                 results.iter().zip(&solo).enumerate()
             {
@@ -733,8 +750,8 @@ mod tests {
         let q1 = unit_vectors(1, dim, 0xBA7C_1001);
         let kth0 = index.search(&q0, k).scores_for_query(0)[k - 1];
 
-        let solo1 = chunked_topk(&index, &q1, k, 2, &mut || None, &mut |_| {}, false).0;
-        let solo0 = chunked_topk(&index, &q0, k, 2, &mut || Some(kth0), &mut |_| {}, false).0;
+        let solo1 = chunked_topk(&index, &q1, k, 2, &mut || None, &mut |_| false, false).0;
+        let solo0 = chunked_topk(&index, &q0, k, 2, &mut || Some(kth0), &mut |_| false, false).0;
 
         let batch = [
             BatchQuery {
@@ -755,7 +772,7 @@ mod tests {
             &batch,
             2,
             &mut |qi| (qi == 0).then_some(kth0),
-            &mut |_, _| {},
+            &mut |_, _| false,
         );
         assert_eq!(results[0].0, solo0, "floored member");
         assert_eq!(results[1].0, solo1, "unfloored member");
@@ -783,7 +800,7 @@ mod tests {
             k,
             64,
             &mut || Some(top + 1.0),
-            &mut |_| {},
+            &mut |_| false,
             false,
         );
         assert!(hits.is_empty());
@@ -818,11 +835,7 @@ mod tests {
         let n = index.len();
         let all = index.search(query, n);
         let mut best: std::collections::HashMap<u64, ChunkHit> = std::collections::HashMap::new();
-        for (&score, &slot) in all
-            .scores_for_query(0)
-            .iter()
-            .zip(all.indices_for_query(0))
-        {
+        for (&score, &slot) in all.scores_for_query(0).iter().zip(all.indices_for_query(0)) {
             let hit = ChunkHit {
                 slot: slot as u32,
                 score,
@@ -840,7 +853,11 @@ mod tests {
                 score: h.score,
             })
             .collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.slot.cmp(&b.slot)));
+        out.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.slot.cmp(&b.slot))
+        });
         out.truncate(k);
         out
     }
@@ -869,7 +886,7 @@ mod tests {
                     chunk_blocks,
                     &parents,
                     &mut || None,
-                    &mut |_| {},
+                    &mut |_| false,
                 );
                 assert_eq!(
                     signature(&hits),
@@ -906,14 +923,14 @@ mod tests {
 
         let want = signature(&collapse_reference(&index, &query, &parents, k));
         for chunk_blocks in [2, 8, 64, 10_000] {
-            let (hits, stats) = chunked_topk_collapsed(
+            let (hits, _stats) = chunked_topk_collapsed(
                 &index,
                 &query,
                 k,
                 chunk_blocks,
                 &parents,
                 &mut || None,
-                &mut |_| {},
+                &mut |_| false,
             );
             assert_eq!(signature(&hits), want, "chunk_blocks={chunk_blocks}");
             assert_eq!(
@@ -935,15 +952,11 @@ mod tests {
         let parents = run_parents(n, 9);
 
         let mut published = Vec::new();
-        let (hits, _) = chunked_topk_collapsed(
-            &index,
-            &query,
-            k,
-            8,
-            &parents,
-            &mut || None,
-            &mut |f| published.push(f),
-        );
+        let (hits, stats) =
+            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |f| {
+                published.push(f);
+                true
+            });
         assert!(!published.is_empty());
         assert!(
             published.windows(2).all(|w| w[0] <= w[1]),
@@ -952,17 +965,24 @@ mod tests {
         let kth = hits[k - 1].score;
         assert!(published.iter().all(|&f| f <= kth));
 
+        // A publisher that accepts everything makes the two counters
+        // agree, and both must match what it actually saw.
+        assert_eq!(stats.floors_offered, stats.floors_published);
+        assert_eq!(stats.floors_published as usize, published.len());
+
+        // A publisher that sends nothing is the shape a warmup window or
+        // a debounce interval produces at the node. The scan still OFFERS
+        // every floor; only the wire count drops. Reporting one number
+        // for both is what made those knobs measure as inert.
+        let (_, muted) =
+            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false);
+        assert_eq!(muted.floors_offered, stats.floors_offered);
+        assert_eq!(muted.floors_published, 0);
+
         // Seed the true k-th best as an external floor: results identical,
         // strictly fewer candidates collected.
-        let (unseeded, base) = chunked_topk_collapsed(
-            &index,
-            &query,
-            k,
-            8,
-            &parents,
-            &mut || None,
-            &mut |_| {},
-        );
+        let (unseeded, base) =
+            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false);
         let (seeded, pruned) = chunked_topk_collapsed(
             &index,
             &query,
@@ -970,7 +990,7 @@ mod tests {
             8,
             &parents,
             &mut || Some(kth),
-            &mut |_| {},
+            &mut |_| false,
         );
         assert_eq!(signature(&unseeded), signature(&seeded));
         assert!(pruned.candidates_collected < base.candidates_collected);

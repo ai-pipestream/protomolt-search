@@ -180,11 +180,13 @@ async fn hybrid_is_deterministic_and_carries_provenance() {
     let first = coordinator
         .fanout_hybrid("h1", "zebra", &query, 8, None, legs_default(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     let second = coordinator
         .fanout_hybrid("h2", "zebra", &query, 8, None, legs_default(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     assert_eq!(
         ids(&first),
         ids(&second),
@@ -284,13 +286,31 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
         CoordinatorServiceImpl::new(vec![mono_addr]).with_bm25(Some(analysis), Default::default());
 
     let got = distributed
-        .fanout_hybrid("d", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
+        .fanout_hybrid(
+            "d",
+            "zebra",
+            &query,
+            N_DOCS as u32,
+            None,
+            legs_default(),
+            false,
+        )
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     let want = monolithic
-        .fanout_hybrid("m", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
+        .fanout_hybrid(
+            "m",
+            "zebra",
+            &query,
+            N_DOCS as u32,
+            None,
+            legs_default(),
+            false,
+        )
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
 
     // Monolithic sanity: doc 0 (both legs) first, then the vector order.
     let want_originals: Vec<usize> = want
@@ -582,7 +602,11 @@ async fn score_blend_follows_documented_arithmetic() {
             .unwrap()
             .0;
         assert_eq!(sig(&hits), sig(&again));
-        assert_eq!(hits[0].doc_id, 0, "{:?}/{:?}", legs.normalization, legs.combination);
+        assert_eq!(
+            hits[0].doc_id, 0,
+            "{:?}/{:?}",
+            legs.normalization, legs.combination
+        );
     }
 
     for h in handles {
@@ -889,7 +913,10 @@ async fn leg_disabling_and_vector_floor() {
         got.sort_unstable();
         let mut want = qualifying.clone();
         want.sort_unstable();
-        assert_eq!(got, want, "{mode:?}: floor must keep exactly the qualifying docs");
+        assert_eq!(
+            got, want,
+            "{mode:?}: floor must keep exactly the qualifying docs"
+        );
         assert!(filtered
             .hits
             .iter()
@@ -913,7 +940,10 @@ async fn leg_disabling_and_vector_floor() {
     got.sort_unstable();
     let mut want = qualifying;
     want.sort_unstable();
-    assert_eq!(got, want, "cascade floor must keep exactly the qualifying docs");
+    assert_eq!(
+        got, want,
+        "cascade floor must keep exactly the qualifying docs"
+    );
     assert!(cascade.cascade_hits.iter().all(|h| h.vector_score >= floor));
 
     for h in handles {
@@ -959,11 +989,13 @@ async fn two_level_fallback_is_reachable_and_deterministic() {
     let first = coordinator
         .fanout_hybrid("t1", "zebra", &query, 8, None, legs_two_level(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     let second = coordinator
         .fanout_hybrid("t2", "zebra", &query, 8, None, legs_two_level(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     assert_eq!(ids(&first), ids(&second));
     // Doc 0 (both legs on its shard) wins; provenance is shard-local.
     assert_eq!(first[0].doc_id, 0);
@@ -1054,15 +1086,8 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
     zebra[3] = "another zebra crossing".to_string();
 
     // Heap-backed shard (Building store → top_k fallback).
-    let (addr_heap, handle_heap) = start_hybrid_shard(
-        &analysis,
-        0,
-        &zebra,
-        corpus.clone(),
-        &shift,
-        &scale,
-    )
-    .await;
+    let (addr_heap, handle_heap) =
+        start_hybrid_shard(&analysis, 0, &zebra, corpus.clone(), &shift, &scale).await;
     // v5-resident shard (index path → Flush → Bm25Reader → pruned leg).
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("hybrid_v5_{}", std::process::id()));
@@ -1089,8 +1114,8 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
     let query = corpus[..DIM].to_vec();
     let mut runs = Vec::new();
     for addr in [addr_heap, addr_v5] {
-        let coordinator =
-            CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis.clone()), Default::default());
+        let coordinator = CoordinatorServiceImpl::new(vec![addr])
+            .with_bm25(Some(analysis.clone()), Default::default());
         runs.push(
             coordinator
                 .fanout_hybrid("h", "zebra", &query, 8, None, legs_default(), false)
@@ -1218,10 +1243,139 @@ async fn debug_block_profiles_every_fusion_mode() {
     assert_eq!(debug.terms, vec!["zebra".to_string()]);
     assert_eq!(debug.shards.len(), 2);
     for shard in &debug.shards {
-        assert!(shard.scan.is_some(), "cascade carries the vector scan stats");
+        assert!(
+            shard.scan.is_some(),
+            "cascade carries the vector scan stats"
+        );
         assert!(shard.vector_hits > 0, "phase-1 candidates counted");
     }
     assert!(debug.total_ms > 0.0);
+
+    mock.abort();
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+/// A leg disabled by a zero weight must not be SCANNED, not merely
+/// discarded at fusion time.
+///
+/// Both fusion functions skip a zero-weight leg, so results were always
+/// correct and this looked settled. But the shard has no weight field to
+/// read: it gates the vector scan on a non-empty `vector` and the BM25
+/// scan on non-empty `terms`, so the coordinator sending both payloads
+/// bought a full scan whose output was then thrown away. On the
+/// 86.6M-chunk fleet a `vector_weight: 0` query still paid ~320 ms of
+/// vector scan out of ~340 ms total — "bm25-only" cost 20x the lexical
+/// leg's own 17 ms.
+///
+/// Result equality is asserted by the leg-disabling test above; what is
+/// under test here is the per-shard hit counts in the debug block, which
+/// report what the shard actually produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x1111_000a);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let mut texts: Vec<String> = (0..2 * SHARD_DOCS)
+        .map(|i| format!("plain document number {i} about nothing special"))
+        .collect();
+    texts[0] = "zebra stripes everywhere".to_string();
+    texts[5] = "another zebra crossing".to_string();
+
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for shard in 0..2usize {
+        let start = shard * SHARD_DOCS;
+        let vecs = corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec();
+        let (addr, handle) = start_hybrid_shard(
+            &analysis,
+            (shard * SHARD_DOCS) as u64,
+            &texts[start..start + SHARD_DOCS],
+            vecs,
+            &shift,
+            &scale,
+        )
+        .await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
+    let query = corpus[..DIM].to_vec();
+
+    // Control: both legs on, both legs report work.
+    let (_, debug) = coordinator
+        .fanout_hybrid("both", "zebra", &query, 8, None, legs_default(), true)
+        .await
+        .unwrap();
+    let debug = debug.unwrap();
+    assert!(
+        debug.shards.iter().all(|s| s.vector_hits > 0),
+        "control: every shard should run the vector leg"
+    );
+    assert!(
+        debug.shards.iter().any(|s| s.bm25_hits > 0),
+        "control: zebra should reach some shard's lexical leg"
+    );
+
+    // Vector leg off: no shard may report a single vector hit.
+    let (_, debug) = coordinator
+        .fanout_hybrid(
+            "novec",
+            "zebra",
+            &query,
+            8,
+            None,
+            HybridLegs {
+                vector_weight: 0.0,
+                ..legs_default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    let debug = debug.unwrap();
+    assert!(
+        debug.shards.iter().all(|s| s.vector_hits == 0),
+        "vector_weight 0 must not scan: {:?}",
+        debug
+            .shards
+            .iter()
+            .map(|s| s.vector_hits)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        debug.shards.iter().any(|s| s.bm25_hits > 0),
+        "the surviving leg must still run"
+    );
+
+    // BM25 leg off: the mirror image.
+    let (_, debug) = coordinator
+        .fanout_hybrid(
+            "nobm25",
+            "zebra",
+            &query,
+            8,
+            None,
+            HybridLegs {
+                bm25_weight: 0.0,
+                ..legs_default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    let debug = debug.unwrap();
+    assert!(
+        debug.shards.iter().all(|s| s.bm25_hits == 0),
+        "bm25_weight 0 must not scan: {:?}",
+        debug.shards.iter().map(|s| s.bm25_hits).collect::<Vec<_>>()
+    );
+    assert!(
+        debug.shards.iter().all(|s| s.vector_hits > 0),
+        "the surviving leg must still run"
+    );
 
     mock.abort();
     for handle in handles {

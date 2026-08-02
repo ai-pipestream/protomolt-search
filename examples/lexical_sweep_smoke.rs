@@ -38,10 +38,7 @@ async fn add_documents(addr: &str, texts: &[&str]) {
         .unwrap();
     }
     drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap();
+    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -92,8 +89,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--queries=5",
         ])
         .output()?;
-    println!("--- cluster_sweep stdout ---\n{}", String::from_utf8_lossy(&out.stdout));
-    println!("--- cluster_sweep stderr ---\n{}", String::from_utf8_lossy(&out.stderr));
+    println!(
+        "--- cluster_sweep stdout ---\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    println!(
+        "--- cluster_sweep stderr ---\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         out.status.success(),
         "cluster_sweep exited with {} (gate failure)",

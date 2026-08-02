@@ -69,7 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = tei_addr.clone();
         let embedded = embedded.clone();
         workers.push(tokio::spawn(async move {
-            let mut client = EmbedClient::connect(addr.clone()).await.expect("connect TEI");
+            let mut client = EmbedClient::connect(addr.clone())
+                .await
+                .expect("connect TEI");
             loop {
                 let next = work_rx.lock().await.recv().await;
                 let Some(chunk) = next else { break };
@@ -95,10 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(r) => break Ok(r),
                         Err(_) if attempt < 5 => {
                             attempt += 1;
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                500 * attempt,
-                            ))
-                            .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt))
+                                .await;
                             if let Ok(fresh) = EmbedClient::connect(addr.clone()).await {
                                 client = fresh;
                             }
@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => break Err(e),
                     }
                 }
-                    .expect("embed");
+                .expect("embed");
                 let vector = response.into_inner().embeddings;
                 embedded.fetch_add(1, Ordering::Relaxed);
                 if done_tx
@@ -136,11 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let writer_task = tokio::spawn(async move {
         while let Some(record) = done_rx.recv().await {
-        assert_eq!(
-            record.vector.len(),
-            dim,
-            "TEI returned a different dim than the output declares (fix --dim)"
-        );
+            assert_eq!(
+                record.vector.len(),
+                dim,
+                "TEI returned a different dim than the output declares (fix --dim)"
+            );
             writer
                 .write(record.opinion_id, record.ordinal, &record.vector)
                 .expect("write embedding");

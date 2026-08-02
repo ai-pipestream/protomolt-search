@@ -28,9 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use turbovec_search::bm25::{self, Bm25Params, CorpusStats};
-use turbovec_search::postings::{
-    AnalyzedDoc, Bm25Index, Bm25Reader, DocTerms, SpillBuilder,
-};
+use turbovec_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, DocTerms, SpillBuilder};
 
 // --- counting allocator -------------------------------------------------
 
@@ -231,9 +229,16 @@ fn main() -> Result<(), String> {
         ("high-df [court]", vec![HIGH_DF_TERM.to_string()]),
         (
             "mixed [court t0 t10]",
-            vec![HIGH_DF_TERM.to_string(), "t0".to_string(), "t10".to_string()],
+            vec![
+                HIGH_DF_TERM.to_string(),
+                "t0".to_string(),
+                "t10".to_string(),
+            ],
         ),
-        ("mid [t0 t10 t100]", vec!["t0".to_string(), "t10".to_string(), "t100".to_string()]),
+        (
+            "mid [t0 t10 t100]",
+            vec!["t0".to_string(), "t10".to_string(), "t100".to_string()],
+        ),
         ("rare", vec![rare]),
         ("rarest", vec![rarest]),
     ];
@@ -254,7 +259,14 @@ fn main() -> Result<(), String> {
         println!("\n== k={k}");
         println!(
             "{:<24} {:>10} {:<12} {:>10} {:>10} {:>8} {:>8} {:>12}",
-            "query", "postings", "config", "wall ms", "allocs/q", "l0 skip%", "l1 leaps", "evaluated"
+            "query",
+            "postings",
+            "config",
+            "wall ms",
+            "allocs/q",
+            "l0 skip%",
+            "l1 leaps",
+            "evaluated"
         );
         for (label, terms) in &shapes {
             let dfs: Vec<u32> = terms.iter().map(|t| v5r.df(t)).collect();
@@ -271,17 +283,10 @@ fn main() -> Result<(), String> {
             let params = Bm25Params::default();
             // The seed for the floor variant: the true k-th best of the
             // unseeded pruned run (exact f64, so ties survive).
-            let seed = bm25::top_k_pruned(
-                &v5r,
-                terms,
-                &stats,
-                params,
-                k,
-                f64::NEG_INFINITY,
-            )
-            .last()
-            .map(|h| h.score)
-            .unwrap_or(f64::NEG_INFINITY);
+            let seed = bm25::top_k_pruned(&v5r, terms, &stats, params, k, f64::NEG_INFINITY)
+                .last()
+                .map(|h| h.score)
+                .unwrap_or(f64::NEG_INFINITY);
 
             #[derive(Clone, Copy)]
             enum Mode {

@@ -129,6 +129,19 @@ pub struct Config {
     /// (v5 files). `false` forces the exhaustive scorer — the A/B
     /// baseline; results are identical either way.
     pub block_max: bool,
+    /// Serve a shard whose BM25 bulk build was interrupted: a
+    /// `.bm25.build` spill directory with no `.bm25` beside it.
+    ///
+    /// Off by default. `Flush` removes the spill directory on success,
+    /// so that pair cannot occur on a shard that finished, and serving it
+    /// is the bad kind of quiet: the node comes up healthy, answers
+    /// vector queries normally, and contributes NOTHING to every lexical
+    /// query, so a fleet ranks against a corpus short one shard's share
+    /// with nothing anywhere saying so.
+    ///
+    /// A shard with neither file is NOT affected — that is what a
+    /// vector-only deployment looks like, and it is a real one.
+    pub allow_missing_bm25: bool,
     /// Coalesce concurrent vector scans into batched kernel calls (up to
     /// four queries per pass over the packed codes). `false` runs one
     /// scan per RPC — the A/B baseline; results are identical either way.
@@ -138,6 +151,12 @@ pub struct Config {
     /// Minimum score improvement before a node publishes its next floor
     /// (0.0 = publish every raise).
     pub floor_delta: f32,
+    /// Publish opportunities a node skips before its first floor goes
+    /// out (0 = publish from the first chunk, the historical behavior).
+    pub floor_warmup_chunks: u32,
+    /// Minimum milliseconds between two published floors (0 = no
+    /// debounce).
+    pub floor_min_interval_ms: u64,
     /// Coordinator: per-shard wall-clock deadline in milliseconds for one
     /// query's shard attempt (0 = no deadline).
     pub shard_deadline_ms: u64,
@@ -152,6 +171,10 @@ pub struct Config {
     /// holds the only top-k). Identical results, different pruning
     /// locus. Off by default.
     pub stream_search: bool,
+    /// Coordinator: hard cap on any client-facing `k`. Requests above it
+    /// are refused (never clamped); a request omitting `k` runs at this
+    /// depth. Must be at least 1.
+    pub max_k: u32,
     /// gRPC message size cap applied to clients and servers.
     pub max_message_bytes: usize,
     /// Issue one demo search against the coordinator at startup.
@@ -196,14 +219,18 @@ struct FileConfig {
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
     block_max: Option<bool>,
+    allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
     floor_delta: Option<f32>,
+    floor_warmup_chunks: Option<u32>,
+    floor_min_interval_ms: Option<u64>,
     shard_deadline_ms: Option<u64>,
     hedge_delay_ms: Option<u64>,
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
     stream_search: Option<bool>,
+    max_k: Option<u32>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
     analysis_addr: Option<String>,
@@ -306,8 +333,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
 
     // Coordinator fan-out list. A shard map (--shard-map) REPLACES
     // --nodes: it carries the same addresses plus topology metadata.
-    let shard_map = match opt(args, "shard-map", "TURBOVEC_SHARD_MAP", file.shard_map.as_deref())
-    {
+    let shard_map = match opt(
+        args,
+        "shard-map",
+        "TURBOVEC_SHARD_MAP",
+        file.shard_map.as_deref(),
+    ) {
         Some(path) => {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("read shard map {path}: {e}"))?;
@@ -317,8 +348,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
         None => None,
     };
-    let nodes_given =
-        opt(args, "nodes", "TURBOVEC_NODES", None).is_some() || file.nodes.is_some();
+    let nodes_given = opt(args, "nodes", "TURBOVEC_NODES", None).is_some() || file.nodes.is_some();
     if shard_map.is_some() && nodes_given {
         return Err("--shard-map replaces --nodes; pass exactly one".to_string());
     }
@@ -496,6 +526,16 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         Some(s) => parse_env_bool(&s),
         None => file.block_max.unwrap_or(true),
     };
+    let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
+        || match opt(
+            args,
+            "allow-missing-bm25",
+            "TURBOVEC_ALLOW_MISSING_BM25",
+            None,
+        ) {
+            Some(s) => parse_env_bool(&s),
+            None => file.allow_missing_bm25.unwrap_or(false),
+        };
     let coalesce = match opt(args, "coalesce", "TURBOVEC_COALESCE", None) {
         Some(s) => parse_env_bool(&s),
         None => file.coalesce.unwrap_or(true),
@@ -531,6 +571,30 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     })
     .transpose()?
     .unwrap_or(0.0);
+    let floor_warmup_chunks = opt(
+        args,
+        "floor-warmup-chunks",
+        "TURBOVEC_FLOOR_WARMUP_CHUNKS",
+        file.floor_warmup_chunks.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u32>()
+            .map_err(|e| format!("invalid floor-warmup-chunks: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(0);
+    let floor_min_interval_ms = opt(
+        args,
+        "floor-min-interval-ms",
+        "TURBOVEC_FLOOR_MIN_INTERVAL_MS",
+        file.floor_min_interval_ms.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid floor-min-interval-ms: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(0);
     let parse_ms = |key: &str, env: &str, file_val: Option<u64>| -> Result<u64, String> {
         opt(args, key, env, file_val.map(|v| v.to_string()).as_deref())
             .map(|s| {
@@ -545,7 +609,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "TURBOVEC_SHARD_DEADLINE_MS",
         file.shard_deadline_ms,
     )?;
-    let hedge_delay_ms = parse_ms("hedge-delay-ms", "TURBOVEC_HEDGE_DELAY_MS", file.hedge_delay_ms)?;
+    let hedge_delay_ms = parse_ms(
+        "hedge-delay-ms",
+        "TURBOVEC_HEDGE_DELAY_MS",
+        file.hedge_delay_ms,
+    )?;
     let replica_addrs: Vec<Option<String>> = match &shard_map {
         Some(map) => map
             .shards
@@ -618,6 +686,26 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
 
+    let max_k = opt(
+        args,
+        "max-k",
+        "TURBOVEC_MAX_K",
+        file.max_k.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u32>()
+            .map_err(|e| format!("invalid max k: {e}"))
+            .and_then(|v| {
+                if v == 0 {
+                    Err("max k must be at least 1 (0 would refuse every query)".to_string())
+                } else {
+                    Ok(v)
+                }
+            })
+    })
+    .transpose()?
+    .unwrap_or(crate::coordinator::DEFAULT_MAX_K);
+
     let analysis_addr = opt(
         args,
         "analysis-addr",
@@ -664,7 +752,9 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or_else(|| vec!["body".to_string()]),
     };
     if bm25_fields.first().map(String::as_str) != Some("body") {
-        return Err("bm25 fields must start with \"body\" (field 0 is the stored body)".to_string());
+        return Err(
+            "bm25 fields must start with \"body\" (field 0 is the stored body)".to_string(),
+        );
     }
     for (i, name) in bm25_fields.iter().enumerate() {
         if bm25_fields[..i].contains(name) {
@@ -680,15 +770,19 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         chunk_blocks,
         share_floors,
         block_max,
+        allow_missing_bm25,
         coalesce,
         scan_parallel,
         floor_delta,
+        floor_warmup_chunks,
+        floor_min_interval_ms,
         shard_deadline_ms,
         hedge_delay_ms,
         replica_addrs,
         max_message_bytes,
         demo_query,
         stream_search,
+        max_k,
         query_dim,
         bit_width,
         save_on_shutdown,
@@ -709,8 +803,37 @@ mod tests {
     }
 
     #[test]
+    fn allow_missing_bm25_is_off_unless_asked_for() {
+        // The default has to be the strict one: a shard silently serving
+        // no postings is the failure this exists to catch, and a default
+        // of "permit" would mean the check never fires where it matters.
+        let base = [
+            "--role=node",
+            "--demo-vectors=10",
+            "--node-listen=127.0.0.1:9001",
+        ];
+        assert!(!parse(&args(&base)).unwrap().allow_missing_bm25);
+        let mut bare = base.to_vec();
+        bare.push("--allow-missing-bm25");
+        assert!(
+            parse(&args(&bare)).unwrap().allow_missing_bm25,
+            "the bare flag must work; an operator will not write =true"
+        );
+        let mut valued = base.to_vec();
+        valued.push("--allow-missing-bm25=true");
+        assert!(parse(&args(&valued)).unwrap().allow_missing_bm25);
+        let mut off = base.to_vec();
+        off.push("--allow-missing-bm25=false");
+        assert!(!parse(&args(&off)).unwrap().allow_missing_bm25);
+    }
+
+    #[test]
     fn bm25_fields_default_body_and_validation() {
-        let base = ["--role=node", "--demo-vectors=10", "--node-listen=127.0.0.1:9001"];
+        let base = [
+            "--role=node",
+            "--demo-vectors=10",
+            "--node-listen=127.0.0.1:9001",
+        ];
         let cfg = parse(&args(&base)).unwrap();
         assert_eq!(cfg.bm25_fields, vec!["body".to_string()]);
 

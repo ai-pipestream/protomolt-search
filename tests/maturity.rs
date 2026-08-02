@@ -101,8 +101,8 @@ async fn replica_failover_returns_identical_results() {
     };
     let mut addrs = cluster.node_addrs.clone();
     let real = std::mem::replace(&mut addrs[1], dead);
-    let coordinator = CoordinatorServiceImpl::new(addrs)
-        .with_replicas(vec![None, Some(real), None]);
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_replicas(vec![None, Some(real), None]);
 
     let result = coordinator
         .fanout_search("failover-test", &query, K, false)
@@ -166,7 +166,10 @@ async fn hedge_counters_record_a_fired_leg() {
         .expect("the hedge must rescue the stalled shard");
     assert_eq!(fanout_hits(&result), expected);
     assert_eq!(result.hedges_fired, 1, "exactly one shard should hedge");
-    assert_eq!(result.hedge_wins, 1, "the hedge must beat a stalled primary");
+    assert_eq!(
+        result.hedge_wins, 1,
+        "the hedge must beat a stalled primary"
+    );
     guard.abort();
     cluster.shutdown().await;
 }
@@ -218,7 +221,10 @@ async fn pooled_channel_reconnects_after_node_restart() {
     let addr = listener.local_addr().unwrap();
     let first = tokio::spawn(
         Server::builder()
-            .add_service(NodeServiceImpl::into_server(build_node(), MAX_MESSAGE_BYTES))
+            .add_service(NodeServiceImpl::into_server(
+                build_node(),
+                MAX_MESSAGE_BYTES,
+            ))
             .serve_with_incoming(nodelay_incoming(listener)),
     );
 
@@ -245,7 +251,10 @@ async fn pooled_channel_reconnects_after_node_restart() {
     };
     let second = tokio::spawn(
         Server::builder()
-            .add_service(NodeServiceImpl::into_server(build_node(), MAX_MESSAGE_BYTES))
+            .add_service(NodeServiceImpl::into_server(
+                build_node(),
+                MAX_MESSAGE_BYTES,
+            ))
             .serve_with_incoming(nodelay_incoming(listener)),
     );
 
@@ -273,9 +282,7 @@ async fn pooled_channel_reconnects_after_node_restart() {
 async fn floor_delta_gate_never_changes_results() {
     // A delta so large no floor ever clears the gate: pruning hints stop
     // flowing entirely, results must not move.
-    use turbovec_search::harness::{
-        build_monolithic, build_shards, fit_calibration, start_node,
-    };
+    use turbovec_search::harness::{build_monolithic, build_shards, fit_calibration, start_node};
     use turbovec_search::node::NodeConfig;
 
     let n = 6_000;

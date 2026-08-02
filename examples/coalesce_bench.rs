@@ -18,7 +18,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use turbovec_search::harness::{fit_calibration, start_node, unit_vectors};
 use turbovec_search::node::{scan_batch_counters, NodeConfig};
 use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{search_shard_request, search_shard_response, SearchShardRequest, StartShardSearch};
+use turbovec_search::pb::{
+    search_shard_request, search_shard_response, SearchShardRequest, StartShardSearch,
+};
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     let prefix = format!("--{name}=");
@@ -79,7 +81,9 @@ async fn main() {
     eprintln!(
         "corpus: {n} x dim {dim}, 4-bit ({} MB packed), k={k}, {} cores",
         n * dim / 2 / (1024 * 1024),
-        std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+        std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(0),
     );
     let corpus = unit_vectors(n, dim, 0xC0A1_E5CE);
     let (shift, scale) = fit_calibration(dim, 4, &corpus[..100_000.min(n) * dim]);

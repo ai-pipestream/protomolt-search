@@ -178,9 +178,8 @@ fn pruned_matches_exhaustive_property() {
             for floor in floors {
                 let want = bm25::filter_to_floor(oracle.clone(), floor);
                 let mut prune = PruneStats::default();
-                let got = bm25::top_k_pruned_stats(
-                    &reader, &terms, &stats, params, k, floor, &mut prune,
-                );
+                let got =
+                    bm25::top_k_pruned_stats(&reader, &terms, &stats, params, k, floor, &mut prune);
                 assert_eq!(
                     sig(&want),
                     sig(&got),
@@ -234,14 +233,14 @@ fn ties_at_floor_and_kth_slot() {
             sig(&got),
             "identical-doc corpus, floor {floor:e}"
         );
-        assert_eq!(
-            got.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
-            want_ids
-        );
+        assert_eq!(got.iter().map(|h| h.doc_id).collect::<Vec<_>>(), want_ids);
     }
     // A hair above the tie: nothing survives.
     let got = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, tie_score + 1e-9);
-    assert!(got.is_empty(), "floor above every score must return nothing");
+    assert!(
+        got.is_empty(),
+        "floor above every score must return nothing"
+    );
 
     // Corpus B: the k-th slot ties ACROSS blocks: 12 high docs (tf=2)
     // spread over 300 tf=1 docs; k=10 keeps the ten smallest ids.
@@ -279,8 +278,7 @@ fn ties_at_floor_and_kth_slot() {
     // ten tied winners; everything else is inert on arrival).
     for (floor, want_evals) in [(f64::NEG_INFINITY, 19u64), (oracle[9].score, 10)] {
         let mut prune = PruneStats::default();
-        let got =
-            bm25::top_k_pruned_stats(&reader, &terms, &stats, params, 10, floor, &mut prune);
+        let got = bm25::top_k_pruned_stats(&reader, &terms, &stats, params, 10, floor, &mut prune);
         assert_eq!(sig(&oracle), sig(&got), "cross-block tie, floor {floor:e}");
         assert_eq!(
             prune.candidates_evaluated, want_evals,
@@ -306,10 +304,13 @@ fn blocks_actually_skip() {
         store.add_document(
             i,
             format!("doc {i}"),
-            AnalyzedDoc::body(vec![
+            AnalyzedDoc::body(
+                vec![
                     ("court".to_string(), 1 + (i / 128) % 5, vec![(0, 4)]),
                     (format!("rare{}", i % 97), 1, vec![(0, 4)]),
-                ], 100 + i % 50),
+                ],
+                100 + i % 50,
+            ),
         );
     }
     let path = dir.join("s.bm25");
@@ -483,8 +484,7 @@ fn seeded_round_trip_never_loses_boundary_hits() {
             }
             // The wire emission: f32 of the k-th score, one ULP down.
             let emitted = bm25::floor_seed(unseeded[k - 1].score as f32);
-            let seeded =
-                bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::from(emitted));
+            let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::from(emitted));
             assert_eq!(
                 sig(&unseeded),
                 sig(&seeded),
@@ -610,9 +610,8 @@ fn pruned_level1_scale_fuzz() {
             for floor in floors {
                 let want = bm25::filter_to_floor(oracle.clone(), floor);
                 let mut prune = PruneStats::default();
-                let got = bm25::top_k_pruned_stats(
-                    &reader, &terms, &stats, params, k, floor, &mut prune,
-                );
+                let got =
+                    bm25::top_k_pruned_stats(&reader, &terms, &stats, params, k, floor, &mut prune);
                 assert_eq!(
                     sig(&want),
                     sig(&got),
@@ -622,5 +621,111 @@ fn pruned_level1_scale_fuzz() {
         }
         let _ = std::fs::remove_file(&path);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A term that lives on ANOTHER shard must not forfeit pruning here.
+///
+/// `CorpusStats.dfs` is the GLOBAL df the coordinator computed, so a rare
+/// term is non-zero there even on the shards that do not contain it.
+/// Those shards have no impact surface to open for it, and the scorer
+/// used to read that as "this index lacks impacts" and drop the WHOLE
+/// query to the exhaustive path -- walking every posting of the common
+/// terms it could otherwise have skipped.
+///
+/// On a sharded corpus this fires for exactly the rare, discriminative
+/// terms that make pruning worth having. Measured on the live 86.6M-chunk
+/// fleet before the fix: "of 12b6" took 2710 ms where "of" alone took 9,
+/// because 7 of 8 shards lacked the rare term and each then walked all
+/// 83.7M postings of "of".
+#[test]
+fn a_term_absent_from_this_shard_does_not_disable_pruning() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bm_absent_term");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // This shard holds only "court". "12b6" exists elsewhere in the
+    // cluster, so its GLOBAL df is non-zero while its local df is 0.
+    let mut store = Bm25Store::new();
+    for i in 0..2000u32 {
+        let tf = if i % 97 == 0 { 5 } else { 1 };
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            AnalyzedDoc::body(vec![("court".to_string(), tf, vec![(0, 5)])], 4),
+        );
+    }
+    let path = dir.join("absent.bm25");
+    store.save(&path).unwrap();
+    let reader = Bm25Reader::open(&path).unwrap();
+
+    let params = Bm25Params::default();
+    let terms = vec!["court".to_string(), "12b6".to_string()];
+    let stats = CorpusStats {
+        doc_count: store.doc_count(),
+        total_doc_length: store.total_doc_length(),
+        // Global dfs: the rare term is present in the CLUSTER.
+        dfs: vec![2000, 10],
+    };
+
+    let oracle = bm25::top_k_exhaustive(&store, &terms, &stats, params, 10);
+    let mut prune = PruneStats::default();
+    let got = bm25::top_k_pruned_stats(
+        &reader,
+        &terms,
+        &stats,
+        params,
+        10,
+        f64::NEG_INFINITY,
+        &mut prune,
+    );
+
+    // Correctness first: skipping a locally-absent term is only valid
+    // because it contributes 0 to every document here.
+    assert_eq!(
+        sig(&oracle),
+        sig(&got),
+        "skipping a locally-absent term must not change a single score"
+    );
+
+    // And the point of the fix: pruning actually ran. The exhaustive
+    // fallback reports no blocks at all, so a non-zero total proves the
+    // pruned path was taken rather than silently bypassed.
+    assert!(
+        prune.blocks_total > 0,
+        "the query fell back to exhaustive despite every PRESENT term having impacts"
+    );
+    // blocks_skipped is deliberately NOT asserted. How much this fixture
+    // skips depends on its score distribution, not on the fix: the bug
+    // was that the pruned scorer was never ENTERED, and blocks_total
+    // proves entry (the exhaustive fallback walks no blocks and reports
+    // none). Other gates in this file cover skip effectiveness.
+    let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, oracle[9].score);
+    assert_eq!(
+        sig(&bm25::filter_to_floor(oracle.clone(), oracle[9].score)),
+        sig(&seeded),
+        "a seeded floor must not change the surviving hits"
+    );
+
+    // The single-term query is the control: it always pruned, and adding
+    // a term this shard does not hold must not make things worse.
+    let mut solo = PruneStats::default();
+    let _ = bm25::top_k_pruned_stats(
+        &reader,
+        &["court".to_string()],
+        &CorpusStats {
+            doc_count: store.doc_count(),
+            total_doc_length: store.total_doc_length(),
+            dfs: vec![2000],
+        },
+        params,
+        10,
+        f64::NEG_INFINITY,
+        &mut solo,
+    );
+    assert_eq!(
+        prune.blocks_total, solo.blocks_total,
+        "a locally-absent term should add no blocks to walk"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

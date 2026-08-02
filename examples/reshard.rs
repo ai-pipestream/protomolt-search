@@ -37,8 +37,7 @@ fn arg(key: &str, default: &str) -> String {
 
 fn opt(key: &str) -> Option<String> {
     let prefix = format!("--{key}=");
-    std::env::args()
-        .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+    std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -69,15 +68,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The reshard core is synchronous; the sidecar client is async. Bridge
     // with block_in_place on the multi-thread runtime (same idiom the
-    // court examples use for sync work under tokio). Each batch rides one
-    // AnalyzeStream, paced by the sidecar's flow control (older sidecars
-    // fall back to concurrent unary calls inside analyze_batch).
+    // court examples use for sync work under tokio). Each batch rides
+    // `--analysis-streams` AnalyzeStreams, paced by the sidecar's flow
+    // control (a sidecar predating the RPC is refused outright, not
+    // quietly downgraded to per-document unary calls that would die deep
+    // into the replay).
+    //
+    // One stream is a pipeline, not a parallel: analysis is the ceiling
+    // on this replay, so raising the count lets the sidecar work on
+    // several documents at once. It cannot change the result -- results
+    // are keyed by sequence and analysis is a pure function of (text,
+    // spec) -- so it is safe to tune against a live sidecar.
+    let streams: usize = arg("analysis-streams", "1").parse()?;
     let addr = analysis_addr.clone();
     let handle = tokio::runtime::Handle::current();
-    let mut analyze = move |docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
-        tokio::task::block_in_place(|| handle.block_on(analyzer::analyze_batch(&addr, docs)))
+    let mut analyze =
+        move |docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
+            tokio::task::block_in_place(|| {
+                handle.block_on(analyzer::analyze_batch_streams(&addr, docs, streams))
+            })
             .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
-    };
+        };
 
     let output = match opt("logs") {
         Some(logs) => {
@@ -96,17 +107,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let slot_base: u64 = arg("slot-base", "0").parse()?;
                     let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
                     reshard::split_logs(
-                        &generations, n, &out_dir, slot_base, slot_stride, vectors_only,
-                        bm25_fields.as_deref(), &mut analyze,
+                        &generations,
+                        n,
+                        &out_dir,
+                        slot_base,
+                        slot_stride,
+                        vectors_only,
+                        bm25_fields.as_deref(),
+                        &mut analyze,
                     )?
                 }
                 None => {
-                    let slot_base = opt("slot-base")
-                        .map(|s| s.parse::<u64>())
-                        .transpose()?;
+                    let slot_base = opt("slot-base").map(|s| s.parse::<u64>()).transpose()?;
                     reshard::merge(
-                        &generations, &out_dir, slot_base, vectors_only,
-                        bm25_fields.as_deref(), &mut analyze,
+                        &generations,
+                        &out_dir,
+                        slot_base,
+                        vectors_only,
+                        bm25_fields.as_deref(),
+                        &mut analyze,
                     )?
                 }
             }
@@ -119,8 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let slot_base: u64 = arg("slot-base", "0").parse()?;
             let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
             reshard::split(
-                &gen, n, &out_dir, slot_base, slot_stride, vectors_only,
-                bm25_fields.as_deref(), &mut analyze,
+                &gen,
+                n,
+                &out_dir,
+                slot_base,
+                slot_stride,
+                vectors_only,
+                bm25_fields.as_deref(),
+                &mut analyze,
             )?
         }
     };
@@ -142,7 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("# node config — one [[shards]] block per child\n");
     print!("{}", reshard::shards_toml(&output));
-    println!("\n# coordinator shard map (also written to {})\n", map_path.display());
+    println!(
+        "\n# coordinator shard map (also written to {})\n",
+        map_path.display()
+    );
     print!("{map}");
     Ok(())
 }

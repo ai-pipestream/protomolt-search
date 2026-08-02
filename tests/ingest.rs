@@ -172,7 +172,8 @@ async fn unseeded_from_scratch_add_constructs_index() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_persists_and_reload_matches() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("turbovec_flush_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("turbovec_flush_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("shard.tv");
 

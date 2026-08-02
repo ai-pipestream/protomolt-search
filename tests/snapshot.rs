@@ -28,10 +28,8 @@ const N: usize = 512;
 fn tempdir(tag: &str) -> std::path::PathBuf {
     // CARGO_TARGET_TMPDIR lives under target/ (a real disk), not the
     // tmpfs /tmp — index files in tests must not consume RAM.
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "turbovec_snap_{tag}_{}",
-        std::process::id()
-    ));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("turbovec_snap_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -69,7 +67,11 @@ fn build_bm25(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
     let mut offset = 0u32;
     for token in text.split_whitespace() {
         let start = text[offset as usize..].find(token).unwrap() as u32 + offset;
-        terms.push((token.to_string(), 1, vec![(start, start + token.len() as u32)]));
+        terms.push((
+            token.to_string(),
+            1,
+            vec![(start, start + token.len() as u32)],
+        ));
         offset = start + token.len() as u32;
     }
     let length = terms.iter().map(|(_, f, _)| f).sum();
@@ -79,7 +81,11 @@ fn build_bm25(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
     path
 }
 
-async fn seed(client: &mut NodeServiceClient<tonic::transport::Channel>, shift: &[f32], scale: &[f32]) {
+async fn seed(
+    client: &mut NodeServiceClient<tonic::transport::Channel>,
+    shift: &[f32],
+    scale: &[f32],
+) {
     client
         .set_calibration(SetCalibrationRequest {
             dim: DIM as u32,
@@ -165,9 +171,7 @@ async fn seeded_install_serves_and_persists() {
 
     // The BM25 sidecar serves too: raw text comes back by global id.
     let docs = client
-        .get_documents(GetDocumentsRequest {
-            doc_ids: vec![100],
-        })
+        .get_documents(GetDocumentsRequest { doc_ids: vec![100] })
         .await
         .unwrap()
         .into_inner();

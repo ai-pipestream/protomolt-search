@@ -1331,7 +1331,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbovec"
 version = "0.9.0"
-source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-streaming#886c062008207269b343cc8105e2706a8655c950"
+source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-streaming#2267c818793daaf9a488410ba63951258a161a1e"
 dependencies = [
  "ordered-float",
  "rand",
