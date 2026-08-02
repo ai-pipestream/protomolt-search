@@ -52,6 +52,26 @@ pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// The char filters run before the stemmer under source 3. STRIP_INVISIBLE and
 /// WHITESPACE are the sidecar's own defaults; FULL_CASE_FOLD is the one
 /// that does the work here.
+///
+/// ACCENT_FOLD is here for the same reason FULL_CASE_FOLD is, and it was
+/// added on measurement rather than principle. Case folding does not
+/// strip diacritics, so an accented spelling stays a separate term.
+/// Sampling 200,000 real chunks: the corpus writes the same surname both
+/// ways, heavily skewed, and neither spelling reaches the other's
+/// documents. `Rodriguez` 1,114 occurrences against `Rodríguez` 21,
+/// `García` 9 against `Garcia` 1,131, `Núñez` 0 against `Nunez` 116.
+/// A litigant's name is the most common thing anyone searches a court
+/// corpus for, and today it cannot be searched reliably in either
+/// spelling. 1,120 word types are split this way in that sample.
+///
+/// Two steps the sidecar now offers are deliberately NOT here, on the
+/// same evidence. DEHYPHENATE (24) repairs line-break hyphenation, which
+/// appears in 0.1% of sampled chunks: this corpus was converted from
+/// XML and HTML sources, so end-of-line hyphens were never introduced,
+/// and it is PDF-derived text that needs that step. NFKC (12) reaches a
+/// similar 0.1%. Neither earns a per-document cost on THIS corpus;
+/// both would on a PDF-sourced one, which is why the step is available
+/// rather than assumed.
 pub fn body_spec() -> AnalysisSpec {
     AnalysisSpec {
         tokenizer: TOKENIZER_WHITESPACE,
@@ -61,6 +81,7 @@ pub fn body_spec() -> AnalysisSpec {
         char_filters: vec![
             CHAR_FILTER_STRIP_INVISIBLE,
             CHAR_FILTER_WHITESPACE,
+            CHAR_FILTER_ACCENT_FOLD,
             CHAR_FILTER_FULL_CASE_FOLD,
         ],
     }
@@ -185,14 +206,29 @@ pub const SOURCE_STEMS: i32 = 2;
 /// `TermVectorOptions.Source.SOURCE_NORMALIZED_STEMS` (char filters, then stem).
 pub const SOURCE_NORMALIZED_STEMS: i32 = 3;
 /// Strip invisible controls. Sidecar wire value
-/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_STRIP_INVISIBLE`.
+/// `TermVectorOptions.NormalizerStep.NORMALIZER_STEP_STRIP_INVISIBLE`.
 pub const CHAR_FILTER_STRIP_INVISIBLE: i32 = 1;
 /// Collapse whitespace. Sidecar wire value
-/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_WHITESPACE`.
+/// `TermVectorOptions.NormalizerStep.NORMALIZER_STEP_WHITESPACE`.
 pub const CHAR_FILTER_WHITESPACE: i32 = 2;
 /// Full Unicode case fold. Sidecar wire value
-/// `TermVectorOptions.NormalizerRung.NORMALIZER_RUNG_FULL_CASE_FOLD`.
+/// `TermVectorOptions.NormalizerStep.NORMALIZER_STEP_FULL_CASE_FOLD`.
 pub const CHAR_FILTER_FULL_CASE_FOLD: i32 = 6;
+/// Unicode NFKC compatibility composition (full-width to ASCII,
+/// superscripts to digits, Roman-numeral codepoints to letters). Sidecar
+/// wire value `NORMALIZER_STEP_NFKC`. Not in [`body_spec`]: measured at
+/// 0.1% of sampled court chunks.
+pub const CHAR_FILTER_NFKC: i32 = 12;
+/// Strip diacritics, so `Rodríguez` and `Rodriguez` are one term.
+/// Sidecar wire value `NORMALIZER_STEP_ACCENT_FOLD`. See [`body_spec`]
+/// for the measurement that put it there.
+pub const CHAR_FILTER_ACCENT_FOLD: i32 = 15;
+/// Rejoin words split by a line-break hyphen. Sidecar wire value
+/// `NORMALIZER_STEP_DEHYPHENATE`. Offset-aware, so it is refused under
+/// `SOURCE_STEMS`. Not in [`body_spec`]: this corpus came from XML and
+/// HTML rather than PDF text, and the pattern appears in 0.1% of
+/// sampled chunks. It is the right step for a PDF-sourced corpus.
+pub const CHAR_FILTER_DEHYPHENATE: i32 = 24;
 
 /// Shared h2 channel to a sidecar address. tonic channels multiplex
 /// concurrent calls over one connection and are cheap to clone; opening
@@ -332,6 +368,12 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
             // number, same values, different vocabulary.
             steps: char_filters,
             source,
+            // One call returning both a folded and an unfolded term
+            // stream. Our A/B arms are separate columns with their own
+            // specs and fingerprints, so each is requested on its own;
+            // this stays off until a caller wants both identities from
+            // a single analysis pass.
+            dual_cased: false,
         }),
         ..Default::default()
     }
@@ -807,9 +849,37 @@ mod tests {
     fn the_corpus_fingerprint_is_pinned() {
         assert_eq!(
             analysis_fingerprint(Some(&body_spec())),
-            0x38b3_6014_eb6d_63eb,
-            "the corpus analyzer fingerprint changed; every v7 shard on disk \
-             carries the old value and would now refuse every query"
+            0x55eb_d3a6_febd_2ac3,
+            "the corpus analyzer fingerprint changed; any shard built under \
+             the old value will refuse every query against this spec, so \
+             changing it commits to a rebuild"
+        );
+    }
+
+    /// The steps measurement said to skip are skipped, and the one it
+    /// said to adopt is adopted. Pinned because the argument for each is
+    /// a corpus measurement recorded in `body_spec`'s docs, not a
+    /// preference: a later edit that quietly adds DEHYPHENATE or NFKC to
+    /// the corpus analyzer should have to change this test and say why.
+    #[test]
+    fn the_corpus_analyzer_folds_accents_and_skips_the_pdf_steps() {
+        let filters = body_spec().char_filters;
+        assert!(
+            filters.contains(&CHAR_FILTER_ACCENT_FOLD),
+            "accent folding is what makes Rodriguez and Rodríguez one term"
+        );
+        assert!(
+            !filters.contains(&CHAR_FILTER_DEHYPHENATE),
+            "this corpus is XML/HTML-derived; line-break hyphens are 0.1% of chunks"
+        );
+        assert!(!filters.contains(&CHAR_FILTER_NFKC));
+        // Folding must not disturb the cased arm: it takes identity from
+        // the surface stem and ignores char filters outright.
+        assert!(cased_body_spec().char_filters.is_empty());
+        assert_ne!(
+            analysis_fingerprint(Some(&body_spec())),
+            analysis_fingerprint(Some(&cased_body_spec())),
+            "the two A/B arms must stay distinguishable on the wire"
         );
     }
 }
