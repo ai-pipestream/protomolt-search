@@ -641,3 +641,165 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     node_a.abort();
     mock.abort();
 }
+
+/// A sidecar that records every UNARY `Analyze` it is asked for, and
+/// otherwise behaves exactly like the shared mock.
+struct CountingMock {
+    inner: turbovec_search::harness::mock_analysis::MockAnalysis,
+    unary: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl turbovec_search::pb::analysis::analysis_service_server::AnalysisService for CountingMock {
+    async fn analyze(
+        &self,
+        request: tonic::Request<turbovec_search::pb::analysis::AnalyzeRequest>,
+    ) -> Result<tonic::Response<turbovec_search::pb::analysis::AnalyzeResponse>, tonic::Status> {
+        self.unary
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::analyze(
+            &self.inner,
+            request,
+        )
+        .await
+    }
+
+    type AnalyzeStreamStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<
+                        turbovec_search::pb::analysis::AnalyzeStreamResponse,
+                        tonic::Status,
+                    >,
+                > + Send,
+        >,
+    >;
+
+    async fn analyze_stream(
+        &self,
+        request: tonic::Request<
+            tonic::Streaming<turbovec_search::pb::analysis::AnalyzeStreamRequest>,
+        >,
+    ) -> Result<tonic::Response<Self::AnalyzeStreamStream>, tonic::Status> {
+        self.streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::analyze_stream(
+            &self.inner,
+            request,
+        )
+        .await
+    }
+
+    async fn get_capabilities(
+        &self,
+        request: tonic::Request<turbovec_search::pb::analysis::GetCapabilitiesRequest>,
+    ) -> Result<
+        tonic::Response<turbovec_search::pb::analysis::GetCapabilitiesResponse>,
+        tonic::Status,
+    > {
+        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::get_capabilities(
+            &self.inner,
+            request,
+        )
+        .await
+    }
+}
+
+/// Extra fields ride AnalyzeStream, not one unary `Analyze` per field.
+///
+/// The body has always streamed; extra fields used to spawn a unary call
+/// each, which at rebuild scale (86.6M chunks x several body columns) is
+/// hundreds of millions of h2 streams against the sidecar the rebuild
+/// README names as the ingest throughput ceiling. This pins the
+/// transport, because nothing else would notice it regressing: the unary
+/// path produced byte-identical postings, just far more slowly.
+///
+/// Ingests 6 two-field documents in ONE call and asserts the sidecar saw
+/// ZERO unary calls, a BOUNDED number of streams (one for the body spec
+/// plus one per distinct field spec, NOT one per document), and the same
+/// per-field term identity the unary path produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
+    let unary = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let streams = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let analysis = format!("http://{}", listener.local_addr().unwrap());
+    let mock = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                turbovec_search::pb::analysis::analysis_service_server::AnalysisServiceServer::new(
+                    CountingMock {
+                        inner: turbovec_search::harness::mock_analysis::MockAnalysis,
+                        unary: unary.clone(),
+                        streams: streams.clone(),
+                    },
+                ),
+            )
+            .serve_with_incoming(turbovec_search::harness::nodelay_incoming(listener)),
+    );
+
+    let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+
+    // Every document in CORPUS[0] and CORPUS[1], in one ingest call: six
+    // documents, four of which carry a case_name.
+    let docs: Vec<AddDocumentsRequest> = CORPUS
+        .iter()
+        .flat_map(|shard| shard.iter())
+        .map(|&(body, name)| doc_request(body, name))
+        .collect();
+    let named = docs.iter().filter(|d| !d.fields.is_empty()).count();
+    assert_eq!(named, 4, "fixture: four documents carry a case_name");
+
+    let (tx, rx) = mpsc::channel(16);
+    for doc in docs {
+        tx.send(doc).await.unwrap();
+    }
+    drop(tx);
+    let added = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((added.added, added.total), (6, 6));
+
+    assert_eq!(
+        unary.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "extra fields must not fall back to unary Analyze; that is the whole point"
+    );
+    // Body spec + field spec, both None here, so two sessions: one for
+    // the body and one shared by every field. The bound that matters is
+    // that it does NOT scale with document or field count.
+    let opened = streams.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        opened <= 2,
+        "expected one stream per distinct spec (<=2), saw {opened}; \
+         streams must not scale with the {named} analyzed fields"
+    );
+
+    // Term identity is unchanged: case_name df("smith") = 3 across the
+    // whole corpus ("Smith v Jones", "Smith v Smith", and "smith" in no
+    // other name), body df("smith") = 1.
+    let stats = client
+        .term_stats(TermStatsRequest {
+            terms: vec!["smith".into()],
+            fields: vec![FieldTerms {
+                field: "case_name".into(),
+                terms: vec!["smith".into(), "vector".into()],
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stats.doc_frequencies, vec![1], "body df(smith)");
+    assert_eq!(
+        stats.field_stats[0].doc_frequencies,
+        vec![2, 1],
+        "case_name df(smith), df(vector) — the unary path's exact values"
+    );
+
+    node.abort();
+    mock.abort();
+}

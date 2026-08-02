@@ -1685,20 +1685,200 @@ fn weight_or_default(value: f32, name: &str) -> Result<f64, Status> {
     Ok(f64::from(value))
 }
 
-/// Spawned per-field analysis tasks for one document's extra fields:
-/// `(field table index, task)` pairs (`docs/multi-field.md`).
-type FieldAnalyses = Vec<(
-    usize,
-    tokio::task::JoinHandle<Result<crate::postings::AnalyzedField, Status>>,
-)>;
+/// Documents held for ordered apply; bounds this side's memory the way
+/// ANALYZE_PIPELINE bounded the unary path.
+const MAX_PENDING: usize = 32;
 
-/// Await one document's extra-field analyses and assemble the
-/// positional [`crate::postings::AnalyzedDoc`]: body at field 0, extras
-/// at their table indexes, gaps empty. Body-only documents pass through
-/// untouched (the exact pre-multi-field shape).
-async fn join_fields(
+/// One event from the extra-field analysis streams.
+enum FieldEvent {
+    /// A field finished: the submission sequence it was tagged with, and
+    /// either its analysis or that ONE field's own failure.
+    Result(u64, Result<crate::postings::AnalyzedField, Status>),
+    /// The stream itself failed, so every field riding it is lost. Kept
+    /// distinct from a per-field error because a dead stream cannot be
+    /// attributed to a sequence, and silently dropping it would hang the
+    /// apply wavefront on a field that is never coming.
+    StreamFailed(Status),
+}
+
+/// Persistent per-spec [`crate::analyzer::AnalyzeStream`] sessions for
+/// documents' extra fields.
+///
+/// Extra fields used to ride concurrent UNARY `Analyze` calls, one h2
+/// stream per field per document. The asymmetry with the body (which has
+/// always streamed) was deliberate: field texts were captions and titles,
+/// small next to the body, so a dedicated stream bought nothing. That
+/// stops being true with multi-field body columns. A rebuild of 86.6M
+/// chunks carrying `case_name` plus two A/B body columns is ~260M unary
+/// calls against the sidecar, which the rebuild README names as the
+/// ingest throughput ceiling, not shard parallelism. The sidecar's
+/// listener has died under rapid-fire unary traffic before, which is why
+/// `analyzer::shared_channel` exists at all.
+///
+/// Fields on ONE document deliberately carry DIFFERENT specs (that is
+/// what a body column IS), so this holds one session per distinct spec,
+/// opened on first use and reused for the rest of the call.
+struct FieldStreams {
+    addr: String,
+    /// Submission handles, one per distinct spec in first-seen order.
+    /// Holding the SUBMITTER here rather than the session is what lets
+    /// [`finish`](Self::finish) half-close every stream by dropping them;
+    /// each session itself is owned by its driver task.
+    sessions: Vec<(Option<crate::pb::AnalysisSpec>, crate::analyzer::AnalyzeSubmit)>,
+    events: tokio::sync::mpsc::Receiver<FieldEvent>,
+    /// Cloned into each driver as it is spawned. Taking it in `finish` is
+    /// what makes `recv` observe `None` once every driver has exited.
+    emit: Option<tokio::sync::mpsc::Sender<FieldEvent>>,
+    /// Monotonic across every session: the sequence is this side's
+    /// routing key, and results are matched by it alone.
+    next_sequence: u64,
+    /// Submitted minus delivered. `recv` must not be selected on when
+    /// this is zero, or it parks on a channel nothing will feed.
+    outstanding: usize,
+}
+
+impl FieldStreams {
+    fn new(addr: &str) -> Self {
+        // Deep enough that drivers rarely block on a full channel while
+        // the apply wavefront is busy; every item is one analyzed field.
+        let (emit, events) = tokio::sync::mpsc::channel(MAX_PENDING * 4);
+        Self {
+            addr: addr.to_string(),
+            sessions: Vec::new(),
+            events,
+            emit: Some(emit),
+            next_sequence: 0,
+            outstanding: 0,
+        }
+    }
+
+    /// Queue one field's text on the session for its spec, opening that
+    /// session if this is the spec's first field. Returns the sequence
+    /// the result will carry.
+    async fn submit(
+        &mut self,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        text: &str,
+    ) -> Result<u64, Status> {
+        let index = match self.sessions.iter().position(|(s, _)| s.as_ref() == spec) {
+            Some(index) => index,
+            None => {
+                let mut session = crate::analyzer::AnalyzeStream::open(&self.addr, spec)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == tonic::Code::Unimplemented {
+                            Status::failed_precondition(format!(
+                                "analysis sidecar at {} does not implement AnalyzeStream; \
+                                 it predates the RPC and must be rebuilt (./gradlew installDist \
+                                 in grpc-opennlp-analysis). Refusing to analyze fields on the \
+                                 removed unary path.",
+                                self.addr
+                            ))
+                        } else {
+                            status
+                        }
+                    })?;
+                let submit = session.submitter();
+                // Hand the driver a session that holds NO submitter of
+                // its own, so the clone kept here is the only one alive
+                // and dropping it in `finish` really does half-close the
+                // stream. `open` leaves a submitter inside the session;
+                // leaving it there means the sidecar never sees the
+                // half-close, and a held response never flushes.
+                session.finish();
+                let emit = self
+                    .emit
+                    .clone()
+                    .ok_or_else(|| Status::internal("field streams already finished"))?;
+                tokio::spawn(drive_field_stream(session, emit));
+                self.sessions.push((spec.cloned(), submit));
+                self.sessions.len() - 1
+            }
+        };
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.sessions[index].1.submit(sequence, text).await?;
+        self.outstanding += 1;
+        Ok(sequence)
+    }
+
+    /// True when a field result is still owed, and therefore when `recv`
+    /// is safe to select on.
+    fn pending(&self) -> bool {
+        self.outstanding > 0
+    }
+
+    /// The next field event. `None` once every driver has exited, which
+    /// only happens after [`finish`](Self::finish) drops the last sender.
+    async fn recv(&mut self) -> Option<FieldEvent> {
+        let event = self.events.recv().await;
+        if matches!(event, Some(FieldEvent::Result(..))) {
+            self.outstanding -= 1;
+        }
+        event
+    }
+
+    /// Half-close every stream so the sidecar drains what is in flight.
+    /// Idempotent, and required before awaiting the final results: a
+    /// sidecar may hold a response until more work arrives (the test mock
+    /// deliberately does), so the last field of a call only lands once
+    /// its stream is closing.
+    fn finish(&mut self) {
+        self.sessions.clear();
+        self.emit = None;
+    }
+}
+
+/// Pump one field session's results into the shared event channel.
+///
+/// Runs as its own task so the main ingest loop never has to poll N
+/// streams by hand, and so a session whose results the sidecar is holding
+/// cannot stall submission on a different session.
+async fn drive_field_stream(
+    mut session: crate::analyzer::AnalyzeStream,
+    emit: tokio::sync::mpsc::Sender<FieldEvent>,
+) {
+    loop {
+        let event = match session.next().await {
+            Ok(Some((sequence, result))) => FieldEvent::Result(
+                sequence,
+                result.map(crate::postings::AnalyzedDoc::into_body),
+            ),
+            Ok(None) => return,
+            Err(status) => FieldEvent::StreamFailed(status),
+        };
+        let failed = matches!(event, FieldEvent::StreamFailed(_));
+        // A closed receiver means the ingest call is already unwinding.
+        if emit.send(event).await.is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// One document held between submission and apply: the request itself,
+/// plus its extra fields filling in as their results arrive.
+struct PendingDoc {
+    doc: AddDocumentsRequest,
+    /// `(field table index, analysis)`, in submission order. `None` until
+    /// that field's result lands.
+    extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
+    /// Extras still unfilled. The document is ready to apply when this is
+    /// zero AND its body result has arrived.
+    outstanding: usize,
+}
+
+/// Assemble one document's positional [`crate::postings::AnalyzedDoc`]:
+/// body at field 0, extras at their table indexes, gaps empty. Body-only
+/// documents pass through untouched (the exact pre-multi-field shape).
+///
+/// Nothing is awaited here. The apply wavefront only reaches a document
+/// once every one of its fields has already landed, which is what keeps
+/// a sidecar that holds a response (the test mock deliberately does, and
+/// the streaming contract permits it) from stalling the whole ingest on
+/// one field.
+fn join_fields(
     body: crate::postings::AnalyzedDoc,
-    extras: FieldAnalyses,
+    extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
 ) -> Result<crate::postings::AnalyzedDoc, Status> {
     if extras.is_empty() {
         return Ok(body);
@@ -1706,10 +1886,13 @@ async fn join_fields(
     let n = extras.iter().map(|&(fi, _)| fi + 1).max().unwrap_or(1);
     let mut fields = vec![crate::postings::AnalyzedField::default(); n];
     fields[0] = body.into_body();
-    for (fi, handle) in extras {
-        fields[fi] = handle
-            .await
-            .map_err(|e| Status::internal(format!("field analysis task failed: {e}")))??;
+    for (fi, analyzed) in extras {
+        fields[fi] = analyzed.ok_or_else(|| {
+            Status::internal(format!(
+                "field {fi} applied before its analysis arrived; the apply \
+                 wavefront must not advance past an unfilled field"
+            ))
+        })?;
     }
     Ok(crate::postings::AnalyzedDoc { fields })
 }
@@ -1717,20 +1900,29 @@ async fn join_fields(
 /// Bulk-ingest internals: the two analysis transports and the shared
 /// per-document apply step.
 impl NodeServiceImpl {
-    /// Validate a document's extra fields against the shard's
-    /// configured field table and start their sidecar analyses
-    /// (concurrent unary calls — field texts are captions and titles,
-    /// small next to the body, so a dedicated stream buys nothing).
-    /// Validation failures surface BEFORE any store or WAL effect.
-    fn spawn_field_analyses(&self, doc: &AddDocumentsRequest) -> Result<FieldAnalyses, Status> {
+    /// Validate a document's extra fields against the shard's configured
+    /// field table and queue their analyses on the per-spec field
+    /// streams. Validation failures surface BEFORE any store or WAL
+    /// effect, and before anything is submitted.
+    ///
+    /// Every field's sequence is recorded in `route` so its result can be
+    /// steered back to `(document sequence, slot in that document's
+    /// extras)`; the sequence is the only key the wire carries.
+    async fn submit_field_analyses(
+        &self,
+        doc: &AddDocumentsRequest,
+        sequence: u64,
+        streams: &mut FieldStreams,
+        route: &mut std::collections::HashMap<u64, (u64, usize)>,
+    ) -> Result<Vec<(usize, Option<crate::postings::AnalyzedField>)>, Status> {
         if doc.fields.is_empty() {
             return Ok(Vec::new());
         }
-        let addr = self.config.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
-        })?;
-        let mut handles = FieldAnalyses::new();
+        // Validate the whole document first: a partially submitted
+        // document would leave orphan sequences in flight that nothing
+        // ever routes.
         let mut seen: Vec<&str> = Vec::new();
+        let mut accepted: Vec<usize> = Vec::with_capacity(doc.fields.len());
         for field in &doc.fields {
             if field.field == "body" {
                 return Err(Status::invalid_argument(
@@ -1761,19 +1953,15 @@ impl NodeServiceImpl {
                     field.field
                 )));
             }
-            let addr = addr.clone();
-            let text = field.text.clone();
-            let spec = field.analysis.clone();
-            handles.push((
-                fi,
-                tokio::spawn(async move {
-                    crate::analyzer::analyze_document(&addr, &text, spec.as_ref())
-                        .await
-                        .map(crate::postings::AnalyzedDoc::into_body)
-                }),
-            ));
+            accepted.push(fi);
         }
-        Ok(handles)
+        let mut extras = Vec::with_capacity(accepted.len());
+        for (slot, (field, fi)) in doc.fields.iter().zip(accepted).enumerate() {
+            let tag = streams.submit(field.analysis.as_ref(), &field.text).await?;
+            route.insert(tag, (sequence, slot));
+            extras.push((fi, None));
+        }
+        Ok(extras)
     }
 
     /// Apply one analyzed document: id assignment, store insert, WAL
@@ -1895,9 +2083,6 @@ impl NodeServiceImpl {
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
-        // Documents held for ordered apply; bounds this side's memory the
-        // way ANALYZE_PIPELINE bounded the unary path.
-        const MAX_PENDING: usize = 32;
         fn store_result(
             results: &mut std::collections::HashMap<u64, crate::postings::AnalyzedDoc>,
             item: Option<(u64, Result<crate::postings::AnalyzedDoc, Status>)>,
@@ -1915,78 +2100,134 @@ impl NodeServiceImpl {
                 )),
             }
         }
+        /// Steer one field result into its document's slot. The route
+        /// table is the only thing that knows which document a sequence
+        /// belonged to, so an unknown sequence is a wire-level bug, not a
+        /// recoverable condition.
+        fn store_field(
+            pending: &mut std::collections::BTreeMap<u64, PendingDoc>,
+            route: &mut std::collections::HashMap<u64, (u64, usize)>,
+            event: Option<FieldEvent>,
+        ) -> Result<(), Status> {
+            match event {
+                Some(FieldEvent::Result(tag, result)) => {
+                    let (sequence, slot) = route.remove(&tag).ok_or_else(|| {
+                        Status::internal(format!("field result {tag} matches no submitted field"))
+                    })?;
+                    // One field failing fails the ingest call, exactly as
+                    // a failed unary field analysis did.
+                    let analyzed = result?;
+                    let doc = pending.get_mut(&sequence).ok_or_else(|| {
+                        Status::internal(format!(
+                            "field result for document {sequence}, which is no longer pending"
+                        ))
+                    })?;
+                    if doc.extras[slot].1.replace(analyzed).is_none() {
+                        doc.outstanding -= 1;
+                    }
+                    Ok(())
+                }
+                Some(FieldEvent::StreamFailed(status)) => Err(status),
+                None => Err(Status::internal(
+                    "field analysis streams ended with fields in flight",
+                )),
+            }
+        }
         enum Step {
             Doc(AddDocumentsRequest),
             InboundClosed,
             Result(Option<(u64, Result<crate::postings::AnalyzedDoc, Status>)>),
+            Field(Option<FieldEvent>),
         }
         let mut spec = first.analysis.clone();
         let mut submit = Some(session.submitter());
-        // Each pending document carries its spawned extra-field
-        // analyses; the session covers the BODY only (extra fields ride
-        // concurrent unary calls, joined at apply time).
-        let mut pending: std::collections::BTreeMap<u64, (AddDocumentsRequest, FieldAnalyses)> =
+        // The body session covers the BODY only; extra fields ride their
+        // own per-spec sessions, and a document applies once its body and
+        // every one of its fields have landed.
+        let mut fields = FieldStreams::new(addr);
+        let mut route: std::collections::HashMap<u64, (u64, usize)> =
+            std::collections::HashMap::new();
+        let mut pending: std::collections::BTreeMap<u64, PendingDoc> =
             std::collections::BTreeMap::new();
         let mut results: std::collections::HashMap<u64, crate::postings::AnalyzedDoc> =
             std::collections::HashMap::new();
-        let first_extras = self.spawn_field_analyses(&first)?;
+        let first_extras = self
+            .submit_field_analyses(&first, 0, &mut fields, &mut route)
+            .await?;
         submit
             .as_ref()
             .expect("submitter set above")
             .submit(0, &first.text)
             .await?;
-        pending.insert(0, (first, first_extras));
+        pending.insert(
+            0,
+            PendingDoc {
+                doc: first,
+                outstanding: first_extras.len(),
+                extras: first_extras,
+            },
+        );
         let mut next_seq = 1u64;
         let mut next_apply = 0u64;
         let mut inbound_open = true;
         loop {
-            while let Some(analyzed) = results.remove(&next_apply) {
-                let (doc, extras) = pending
-                    .remove(&next_apply)
-                    .expect("every result has a pending document");
-                let analyzed = join_fields(analyzed, extras).await?;
-                self.apply_analyzed_document(doc, analyzed, added, first_id)?;
-                next_apply += 1;
-            }
+            self.advance_apply(&mut pending, &mut results, &mut next_apply, added, first_id)?;
             if pending.is_empty() && !inbound_open {
                 break;
             }
-            let step = if inbound_open && pending.len() < MAX_PENDING {
-                tokio::select! {
-                    message = inbound.message() => match message? {
+            // Guards, so a stream that owes nothing is never polled. The
+            // body session owes exactly the pending documents whose body
+            // result has not landed; once it is finished and drained it
+            // yields `None` forever, which `store_result` would rightly
+            // read as truncation.
+            let want_body = pending.len() > results.len();
+            let want_field = fields.pending();
+            // At least one arm is always live: if a document is still
+            // pending after `advance_apply`, the one at the wavefront is
+            // owed either its body or a field.
+            let step = tokio::select! {
+                message = inbound.message(),
+                    if inbound_open && pending.len() < MAX_PENDING => match message? {
                         Some(doc) => Step::Doc(doc),
                         None => Step::InboundClosed,
                     },
-                    result = session.next() => Step::Result(result?),
-                }
-            } else {
-                Step::Result(session.next().await?)
+                result = session.next(), if want_body => Step::Result(result?),
+                event = fields.recv(), if want_field => Step::Field(event),
             };
             match step {
                 Step::Doc(doc) => {
-                    // Extra-field analyses start on arrival (validated
-                    // now, so a bad field fails before the body enters
-                    // the session).
-                    let extras = self.spawn_field_analyses(&doc)?;
+                    // Extra-field analyses are queued on arrival
+                    // (validated now, so a bad field fails before the
+                    // body enters the session).
+                    let extras = self
+                        .submit_field_analyses(&doc, next_seq, &mut fields, &mut route)
+                        .await?;
                     if doc.analysis != spec {
-                        // A mid-stream BODY spec change (rare): drain
-                        // the current session completely so ordering
-                        // holds, then open a new one for the new spec.
-                        // Dropping the submitter clone is what lets the
-                        // old session half-close and drain.
+                        // A mid-stream BODY spec change (rare): collect
+                        // what the current session still owes so nothing
+                        // is lost when it is replaced, then open a new
+                        // one. Dropping the submitter clone is what lets
+                        // the old session half-close and drain.
+                        //
+                        // Only the BODY session is being replaced. Field
+                        // sessions are per-spec and outlive this, and
+                        // draining them here would DEADLOCK: a sidecar
+                        // may hold a result until more work arrives on
+                        // that stream (the test mock deliberately does),
+                        // and no more field work is coming until the new
+                        // body session is open.
                         drop(submit.take());
                         session.finish();
-                        while !pending.is_empty() {
+                        while pending.len() > results.len() {
                             store_result(&mut results, session.next().await?)?;
-                            while let Some(analyzed) = results.remove(&next_apply) {
-                                let (done, done_extras) = pending
-                                    .remove(&next_apply)
-                                    .expect("every result has a pending document");
-                                let analyzed = join_fields(analyzed, done_extras).await?;
-                                self.apply_analyzed_document(done, analyzed, added, first_id)?;
-                                next_apply += 1;
-                            }
                         }
+                        self.advance_apply(
+                            &mut pending,
+                            &mut results,
+                            &mut next_apply,
+                            added,
+                            first_id,
+                        )?;
                         session = crate::analyzer::AnalyzeStream::open(addr, doc.analysis.as_ref())
                             .await?;
                         spec = doc.analysis.clone();
@@ -1997,18 +2238,56 @@ impl NodeServiceImpl {
                         .expect("stream open while inbound open")
                         .submit(next_seq, &doc.text)
                         .await?;
-                    pending.insert(next_seq, (doc, extras));
+                    pending.insert(
+                        next_seq,
+                        PendingDoc {
+                            doc,
+                            outstanding: extras.len(),
+                            extras,
+                        },
+                    );
                     next_seq += 1;
                 }
                 Step::InboundClosed => {
                     inbound_open = false;
                     submit = None;
                     session.finish();
+                    // Half-close the field streams too. A sidecar may
+                    // hold a result until more work arrives, so the last
+                    // field of the call only lands once its stream is
+                    // closing.
+                    fields.finish();
                 }
                 Step::Result(item) => store_result(&mut results, item)?,
+                Step::Field(event) => store_field(&mut pending, &mut route, event)?,
             }
         }
         Ok(())
+    }
+
+    /// Advance the apply wavefront over every consecutive sequence whose
+    /// body AND every extra field have landed, keeping application in
+    /// arrival order.
+    fn advance_apply(
+        &self,
+        pending: &mut std::collections::BTreeMap<u64, PendingDoc>,
+        results: &mut std::collections::HashMap<u64, crate::postings::AnalyzedDoc>,
+        next_apply: &mut u64,
+        added: &mut u64,
+        first_id: &mut u64,
+    ) -> Result<(), Status> {
+        loop {
+            let ready = results.contains_key(next_apply)
+                && pending.get(next_apply).is_some_and(|p| p.outstanding == 0);
+            if !ready {
+                return Ok(());
+            }
+            let analyzed = results.remove(next_apply).expect("readiness just checked");
+            let held = pending.remove(next_apply).expect("readiness just checked");
+            let analyzed = join_fields(analyzed, held.extras)?;
+            self.apply_analyzed_document(held.doc, analyzed, added, first_id)?;
+            *next_apply += 1;
+        }
     }
 }
 
