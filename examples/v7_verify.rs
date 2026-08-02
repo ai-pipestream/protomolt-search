@@ -131,29 +131,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     r.check(
         "every shard finished its bulk build and holds vectors == docs",
         {
-            let bad: Vec<String> = primaries
-                .iter()
-                .filter_map(|t| {
-                    let h = t.health.as_ref()?;
-                    if h.bm25_building || h.num_vectors != h.bm25_docs || h.num_vectors == 0 {
-                        Some(format!(
-                            "shard {} {} vectors / {} docs{}",
-                            t.shard,
-                            h.num_vectors,
-                            h.bm25_docs,
-                            if h.bm25_building {
-                                " (still building)"
-                            } else {
-                                ""
-                            }
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if bad.is_empty() {
-                Ok("all shards consistent".to_string())
+            // A shard with no health report is a FAILURE of this check,
+            // not a shard to skip. Skipping it (which `?` inside the
+            // closure used to do) meant that when every shard was
+            // unreachable this reported "all shards consistent" -- a pass
+            // over zero shards examined, printed directly beneath the
+            // health check that had just failed 0/8.
+            let mut bad: Vec<String> = Vec::new();
+            let mut examined = 0usize;
+            for t in &primaries {
+                let Some(h) = t.health.as_ref() else {
+                    bad.push(format!("shard {}: no health report", t.shard));
+                    continue;
+                };
+                examined += 1;
+                if h.bm25_building || h.num_vectors != h.bm25_docs || h.num_vectors == 0 {
+                    bad.push(format!(
+                        "shard {} {} vectors / {} docs{}",
+                        t.shard,
+                        h.num_vectors,
+                        h.bm25_docs,
+                        if h.bm25_building {
+                            " (still building)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+            if expect_shards > 0 && examined != expect_shards {
+                bad.push(format!(
+                    "examined {examined} shards, expected {expect_shards}"
+                ));
+            }
+            if bad.is_empty() && examined > 0 {
+                Ok(format!("all {examined} shards consistent"))
+            } else if bad.is_empty() {
+                Err("no shards examined: nothing was verified".to_string())
             } else {
                 Err(bad.join("; "))
             }
