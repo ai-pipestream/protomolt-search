@@ -294,75 +294,75 @@ pub mod mock_analysis {
             return Err(Status::invalid_argument("empty text"));
         }
         // Whitespace tokenize with original-text spans.
-            let mut tokens = Vec::new();
-            let mut offset = 0usize;
-            for word in text.split_whitespace() {
-                let start = text[offset..].find(word).map(|i| offset + i).unwrap();
-                let end = start + word.len();
-                tokens.push(Token {
-                    span: Some(Span {
-                        start: start as i32,
-                        end: end as i32,
-                    }),
-                    text: word.to_string(),
-                    pos: String::new(),
-                });
-                offset = end;
-            }
+        let mut tokens = Vec::new();
+        let mut offset = 0usize;
+        for word in text.split_whitespace() {
+            let start = text[offset..].find(word).map(|i| offset + i).unwrap();
+            let end = start + word.len();
+            tokens.push(Token {
+                span: Some(Span {
+                    start: start as i32,
+                    end: end as i32,
+                }),
+                text: word.to_string(),
+                pos: String::new(),
+            });
+            offset = end;
+        }
 
-            let stemming_on = options.stemmer > 1;
-            let stems: Vec<String> = if stemming_on {
-                tokens.iter().map(|t| toy_stem(&t.text)).collect()
-            } else {
-                Vec::new()
-            };
+        let stemming_on = options.stemmer > 1;
+        let stems: Vec<String> = if stemming_on {
+            tokens.iter().map(|t| toy_stem(&t.text)).collect()
+        } else {
+            Vec::new()
+        };
 
-            let mut term_vectors: Vec<TermVector> = Vec::new();
-            if let Some(tv) = &options.term_vectors {
-                if tv.enabled {
-                    const SOURCE_STEMS: i32 = 2;
-                    const MODE_SCORING_ONLY: i32 = 2;
-                    if tv.source == SOURCE_STEMS && !stemming_on {
-                        return Err(Status::invalid_argument("SOURCE_STEMS requires a stemmer"));
-                    }
-                    for (i, token) in tokens.iter().enumerate() {
-                        let identity = if tv.source == SOURCE_STEMS {
-                            stems[i].clone()
-                        } else {
-                            token.text.to_lowercase()
-                        };
-                        let span = token.span.unwrap();
-                        match term_vectors.iter_mut().find(|t| t.term == identity) {
-                            Some(entry) => {
-                                entry.frequency += 1;
-                                if tv.mode != MODE_SCORING_ONLY {
-                                    entry.occurrences.push(span);
-                                }
+        let mut term_vectors: Vec<TermVector> = Vec::new();
+        if let Some(tv) = &options.term_vectors {
+            if tv.enabled {
+                const SOURCE_STEMS: i32 = 2;
+                const MODE_SCORING_ONLY: i32 = 2;
+                if tv.source == SOURCE_STEMS && !stemming_on {
+                    return Err(Status::invalid_argument("SOURCE_STEMS requires a stemmer"));
+                }
+                for (i, token) in tokens.iter().enumerate() {
+                    let identity = if tv.source == SOURCE_STEMS {
+                        stems[i].clone()
+                    } else {
+                        token.text.to_lowercase()
+                    };
+                    let span = token.span.unwrap();
+                    match term_vectors.iter_mut().find(|t| t.term == identity) {
+                        Some(entry) => {
+                            entry.frequency += 1;
+                            if tv.mode != MODE_SCORING_ONLY {
+                                entry.occurrences.push(span);
                             }
-                            None => term_vectors.push(TermVector {
-                                term: identity,
-                                frequency: 1,
-                                occurrences: if tv.mode == MODE_SCORING_ONLY {
-                                    Vec::new()
-                                } else {
-                                    vec![span]
-                                },
-                            }),
                         }
+                        None => term_vectors.push(TermVector {
+                            term: identity,
+                            frequency: 1,
+                            occurrences: if tv.mode == MODE_SCORING_ONLY {
+                                Vec::new()
+                            } else {
+                                vec![span]
+                            },
+                        }),
                     }
                 }
             }
+        }
 
-            Ok(AnalyzeResponse {
-                sentences: Vec::new(),
-                tokens,
-                stems,
-                entities: Vec::new(),
-                term_vectors,
-                embeddings: Vec::new(),
-                warnings: Vec::new(),
-                lemmas: Vec::new(),
-            })
+        Ok(AnalyzeResponse {
+            sentences: Vec::new(),
+            tokens,
+            stems,
+            entities: Vec::new(),
+            term_vectors,
+            embeddings: Vec::new(),
+            warnings: Vec::new(),
+            lemmas: Vec::new(),
+        })
     }
 
     #[tonic::async_trait]
@@ -422,12 +422,12 @@ pub mod mock_analysis {
                             };
                             let result = match analyze_text(&doc.text, options) {
                                 Ok(ok) => analyze_stream_response::Result::Ok(ok),
-                                Err(status) => analyze_stream_response::Result::Error(
-                                    AnalyzeStreamError {
+                                Err(status) => {
+                                    analyze_stream_response::Result::Error(AnalyzeStreamError {
                                         code: status.code() as i32,
                                         message: status.message().to_string(),
-                                    },
-                                ),
+                                    })
+                                }
                             };
                             let response = AnalyzeStreamResponse {
                                 sequence: doc.sequence,
@@ -475,8 +475,8 @@ pub mod mock_analysis {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(
             Server::builder()
-            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
-            .initial_connection_window_size(crate::H2_CONN_WINDOW)
+                .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+                .initial_connection_window_size(crate::H2_CONN_WINDOW)
                 .add_service(
                     AnalysisServiceServer::new(MockAnalysis)
                         .max_decoding_message_size(MAX_MESSAGE_BYTES)

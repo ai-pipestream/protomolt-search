@@ -152,7 +152,8 @@ async fn coordinator_topk(coord: &str, query: &[f32], k: u32) -> Vec<(u64, u32)>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ingest_across_processes_is_lossless_and_persistent() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("turbovec_mp_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("turbovec_mp_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let shard0_path = dir.join("shard-0.tv");
     let shard1_path = dir.join("shard-1.tv");

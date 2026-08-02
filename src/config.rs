@@ -306,8 +306,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
 
     // Coordinator fan-out list. A shard map (--shard-map) REPLACES
     // --nodes: it carries the same addresses plus topology metadata.
-    let shard_map = match opt(args, "shard-map", "TURBOVEC_SHARD_MAP", file.shard_map.as_deref())
-    {
+    let shard_map = match opt(
+        args,
+        "shard-map",
+        "TURBOVEC_SHARD_MAP",
+        file.shard_map.as_deref(),
+    ) {
         Some(path) => {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("read shard map {path}: {e}"))?;
@@ -317,8 +321,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
         None => None,
     };
-    let nodes_given =
-        opt(args, "nodes", "TURBOVEC_NODES", None).is_some() || file.nodes.is_some();
+    let nodes_given = opt(args, "nodes", "TURBOVEC_NODES", None).is_some() || file.nodes.is_some();
     if shard_map.is_some() && nodes_given {
         return Err("--shard-map replaces --nodes; pass exactly one".to_string());
     }
@@ -545,7 +548,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "TURBOVEC_SHARD_DEADLINE_MS",
         file.shard_deadline_ms,
     )?;
-    let hedge_delay_ms = parse_ms("hedge-delay-ms", "TURBOVEC_HEDGE_DELAY_MS", file.hedge_delay_ms)?;
+    let hedge_delay_ms = parse_ms(
+        "hedge-delay-ms",
+        "TURBOVEC_HEDGE_DELAY_MS",
+        file.hedge_delay_ms,
+    )?;
     let replica_addrs: Vec<Option<String>> = match &shard_map {
         Some(map) => map
             .shards
@@ -664,7 +671,9 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or_else(|| vec!["body".to_string()]),
     };
     if bm25_fields.first().map(String::as_str) != Some("body") {
-        return Err("bm25 fields must start with \"body\" (field 0 is the stored body)".to_string());
+        return Err(
+            "bm25 fields must start with \"body\" (field 0 is the stored body)".to_string(),
+        );
     }
     for (i, name) in bm25_fields.iter().enumerate() {
         if bm25_fields[..i].contains(name) {
@@ -710,7 +719,11 @@ mod tests {
 
     #[test]
     fn bm25_fields_default_body_and_validation() {
-        let base = ["--role=node", "--demo-vectors=10", "--node-listen=127.0.0.1:9001"];
+        let base = [
+            "--role=node",
+            "--demo-vectors=10",
+            "--node-listen=127.0.0.1:9001",
+        ];
         let cfg = parse(&args(&base)).unwrap();
         assert_eq!(cfg.bm25_fields, vec!["body".to_string()]);
 

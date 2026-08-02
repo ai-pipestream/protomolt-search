@@ -199,7 +199,8 @@ async fn distributed_bm25_matches_monolithic_exactly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bm25_store_persists_through_flush() {
     let (analysis, mock) = start_mock_analysis().await;
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tvbm25_node_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvbm25_node_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let index_path = dir.join("shard.tv");
     let (addr, node) = start_empty_node(NodeConfig {
@@ -241,7 +242,8 @@ async fn bm25_store_persists_through_flush() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bm25_query_min_score_seeds_floor() {
     let (analysis, mock) = start_mock_analysis().await;
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tvbm25_floor_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvbm25_floor_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Node A: heap-store shape (no index path → in-memory builder).
@@ -421,7 +423,11 @@ async fn bm25_query_min_score_seeds_floor() {
         .into_inner();
     assert!(resp.kth_best < resp.hits[1].score, "kth_best is ULP-down");
     let seeded = query(&addr_b, resp.kth_best).await;
-    assert_eq!(hit_signature(&seeded), hit_signature(&resp.hits), "ULP-down seed round trip");
+    assert_eq!(
+        hit_signature(&seeded),
+        hit_signature(&resp.hits),
+        "ULP-down seed round trip"
+    );
 
     node_a.abort();
     node_b.abort();
@@ -501,7 +507,10 @@ async fn bm25_search_min_score_factorial_across_the_fleet() {
     assert_eq!(reference_sig, hit_signature(&on_seeded), "on/seeded");
 
     // Cells 3-4: block-max off (exhaustive path on the same v5 files).
-    let off_unseeded = coord(&addrs_off).fanout_bm25("rust", k, None).await.unwrap();
+    let off_unseeded = coord(&addrs_off)
+        .fanout_bm25("rust", k, None)
+        .await
+        .unwrap();
     assert_eq!(reference_sig, hit_signature(&off_unseeded), "off/unseeded");
     let off_seeded = coord(&addrs_off)
         .fanout_bm25_seeded("rust", k, None, seed)
@@ -513,10 +522,7 @@ async fn bm25_search_min_score_factorial_across_the_fleet() {
     // unseeded result (the gap between the top two scores is wide).
     assert!(reference[0].score - reference[1].score > 1e-3);
     let mid = (reference[0].score + reference[1].score) / 2.0;
-    let expected: Vec<(u64, u32)> = hit_signature(&reference)
-        .into_iter()
-        .take(1)
-        .collect();
+    let expected: Vec<(u64, u32)> = hit_signature(&reference).into_iter().take(1).collect();
     for addrs in [&addrs_on, &addrs_off] {
         let seeded = coord(addrs)
             .fanout_bm25_seeded("rust", k, None, mid)

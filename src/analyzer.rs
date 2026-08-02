@@ -303,7 +303,7 @@ pub async fn analyze_batch(
     let mut out: Vec<Option<AnalyzedDoc>> = Vec::new();
     out.resize_with(docs.len(), || None);
     let receive = |item: Option<(u64, Result<AnalyzedDoc, Status>)>,
-                       out: &mut Vec<Option<AnalyzedDoc>>|
+                   out: &mut Vec<Option<AnalyzedDoc>>|
      -> Result<(), Status> {
         let Some((sequence, result)) = item else {
             return Err(Status::internal(

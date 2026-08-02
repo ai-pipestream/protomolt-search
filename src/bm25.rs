@@ -867,9 +867,13 @@ pub fn top_k_pruned_stats(
         }
         retain_live(&mut state, &mut finished);
     }
-    prune.blocks_skipped = finished.0 + state.iter().map(|ts| ts.cursor.blocks_skipped).sum::<u64>();
-    prune.l1_groups_skipped =
-        finished.1 + state.iter().map(|ts| ts.cursor.l1_groups_skipped).sum::<u64>();
+    prune.blocks_skipped =
+        finished.0 + state.iter().map(|ts| ts.cursor.blocks_skipped).sum::<u64>();
+    prune.l1_groups_skipped = finished.1
+        + state
+            .iter()
+            .map(|ts| ts.cursor.l1_groups_skipped)
+            .sum::<u64>();
 
     let mut out: Vec<HeapEntry> = heap.into_vec();
     out.sort_by(|a, b| {
@@ -951,7 +955,11 @@ pub fn top_k_fused_pruned_stats(
         .flat_map(|(fi, fq)| (0..fq.terms.len()).map(move |ti| (fi, ti)))
         .collect();
     let n_pairs = pair_meta.len();
-    if n_pairs > 128 || fields.iter().any(|fq| fq.weight < 0.0 || fq.weight.is_nan()) {
+    if n_pairs > 128
+        || fields
+            .iter()
+            .any(|fq| fq.weight < 0.0 || fq.weight.is_nan())
+    {
         return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
     }
 
@@ -1201,8 +1209,8 @@ pub fn top_k_fused_pruned_stats(
                 if nonessential[pos] {
                     bound += ps.block_max;
                 } else if ps.cursor.doc_id() == doc {
-                    bound +=
-                        ps.widf * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[oi].0], ps.avgdl);
+                    bound += ps.widf
+                        * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[oi].0], ps.avgdl);
                 }
             }
         }
@@ -1260,9 +1268,13 @@ pub fn top_k_fused_pruned_stats(
         }
         retain_live(&mut state, &mut finished);
     }
-    prune.blocks_skipped = finished.0 + state.iter().map(|ps| ps.cursor.blocks_skipped).sum::<u64>();
-    prune.l1_groups_skipped =
-        finished.1 + state.iter().map(|ps| ps.cursor.l1_groups_skipped).sum::<u64>();
+    prune.blocks_skipped =
+        finished.0 + state.iter().map(|ps| ps.cursor.blocks_skipped).sum::<u64>();
+    prune.l1_groups_skipped = finished.1
+        + state
+            .iter()
+            .map(|ps| ps.cursor.l1_groups_skipped)
+            .sum::<u64>();
 
     let mut out: Vec<HeapEntry> = heap.into_vec();
     out.sort_by(|a, b| {
@@ -1282,7 +1294,9 @@ pub fn top_k_fused_pruned_stats(
                     (
                         fi,
                         ti,
-                        fields[fi].index.posting_offsets(&fields[fi].terms[ti], e.doc_id),
+                        fields[fi]
+                            .index
+                            .posting_offsets(&fields[fi].terms[ti], e.doc_id),
                     )
                 })
                 .collect(),
@@ -1342,12 +1356,18 @@ mod tests {
         store.add_document(
             0,
             "a".to_string(),
-            AnalyzedDoc::body(vec![("rust".into(), 2, vec![]), ("search".into(), 1, vec![])], 3),
+            AnalyzedDoc::body(
+                vec![("rust".into(), 2, vec![]), ("search".into(), 1, vec![])],
+                3,
+            ),
         );
         store.add_document(
             1,
             "b".to_string(),
-            AnalyzedDoc::body(vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])], 3),
+            AnalyzedDoc::body(
+                vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])],
+                3,
+            ),
         );
         store.add_document(
             2,
@@ -1487,7 +1507,10 @@ mod tests {
             AnalyzedDoc {
                 fields: vec![
                     AnalyzedField {
-                        terms: vec![("rust".into(), 2, vec![(0, 4)]), ("search".into(), 1, vec![])],
+                        terms: vec![
+                            ("rust".into(), 2, vec![(0, 4)]),
+                            ("search".into(), 1, vec![]),
+                        ],
                         length: 3,
                     },
                     AnalyzedField {
@@ -1517,7 +1540,10 @@ mod tests {
                         length: 1,
                     },
                     AnalyzedField {
-                        terms: vec![("rust".into(), 1, vec![(0, 4)]), ("smith".into(), 1, vec![])],
+                        terms: vec![
+                            ("rust".into(), 1, vec![(0, 4)]),
+                            ("smith".into(), 1, vec![]),
+                        ],
                         length: 2,
                     },
                 ],

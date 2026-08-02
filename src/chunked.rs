@@ -364,11 +364,7 @@ pub fn chunked_topk_collapsed(
     publish_floor: &mut dyn FnMut(f32),
 ) -> (Vec<CollapsedHit>, ScanStats) {
     let n = index.len();
-    assert_eq!(
-        parents.len(),
-        n,
-        "parents must map every slot of the index"
-    );
+    assert_eq!(parents.len(), n, "parents must map every slot of the index");
     let mut stats = ScanStats::default();
     if n == 0 || k == 0 {
         return (Vec::new(), stats);
@@ -706,10 +702,10 @@ mod tests {
                 })
                 .collect();
             let mut published: Vec<Vec<f32>> = vec![Vec::new(); specs.len()];
-            let results = chunked_topk_batch(&index, &batch, chunk_blocks, &mut |_| None, &mut |qi,
-                                                                                              f| {
-                published[qi].push(f)
-            });
+            let results =
+                chunked_topk_batch(&index, &batch, chunk_blocks, &mut |_| None, &mut |qi, f| {
+                    published[qi].push(f)
+                });
             for (qi, ((hits, _), (solo_hits, solo_published))) in
                 results.iter().zip(&solo).enumerate()
             {
@@ -818,11 +814,7 @@ mod tests {
         let n = index.len();
         let all = index.search(query, n);
         let mut best: std::collections::HashMap<u64, ChunkHit> = std::collections::HashMap::new();
-        for (&score, &slot) in all
-            .scores_for_query(0)
-            .iter()
-            .zip(all.indices_for_query(0))
-        {
+        for (&score, &slot) in all.scores_for_query(0).iter().zip(all.indices_for_query(0)) {
             let hit = ChunkHit {
                 slot: slot as u32,
                 score,
@@ -840,7 +832,11 @@ mod tests {
                 score: h.score,
             })
             .collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.slot.cmp(&b.slot)));
+        out.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.slot.cmp(&b.slot))
+        });
         out.truncate(k);
         out
     }
@@ -935,15 +931,10 @@ mod tests {
         let parents = run_parents(n, 9);
 
         let mut published = Vec::new();
-        let (hits, _) = chunked_topk_collapsed(
-            &index,
-            &query,
-            k,
-            8,
-            &parents,
-            &mut || None,
-            &mut |f| published.push(f),
-        );
+        let (hits, _) =
+            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |f| {
+                published.push(f)
+            });
         assert!(!published.is_empty());
         assert!(
             published.windows(2).all(|w| w[0] <= w[1]),
@@ -954,15 +945,8 @@ mod tests {
 
         // Seed the true k-th best as an external floor: results identical,
         // strictly fewer candidates collected.
-        let (unseeded, base) = chunked_topk_collapsed(
-            &index,
-            &query,
-            k,
-            8,
-            &parents,
-            &mut || None,
-            &mut |_| {},
-        );
+        let (unseeded, base) =
+            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| {});
         let (seeded, pruned) = chunked_topk_collapsed(
             &index,
             &query,

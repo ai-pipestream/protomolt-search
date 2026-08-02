@@ -25,8 +25,7 @@ use turbovec_search::node::NodeConfig;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastCalibrationRequest, DocLineage,
-    DocumentField,
-    FlushRequest, GetDocumentsRequest,
+    DocumentField, FlushRequest, GetDocumentsRequest,
 };
 
 const SIDECAR_BIN: &str =
@@ -428,7 +427,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let hits = coordinator
             .fanout_cascade("court", &chunk.text, vector, 5, Some(&spec), 0.0, false)
-            .await?.0;
+            .await?
+            .0;
         for hit in &hits {
             println!(
                 "  #{} doc {:>7} (shard {}) vector {:.4}  bm25 {:.4}",
@@ -630,7 +630,12 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("calibration broadcast to {} shards OK", results.len());
 
     let spec = analysis_spec();
-    for (shard, addr) in node_addrs.iter().enumerate().take(end_shard).skip(first_shard) {
+    for (shard, addr) in node_addrs
+        .iter()
+        .enumerate()
+        .take(end_shard)
+        .skip(first_shard)
+    {
         let t0 = Instant::now();
         let (start, end) = bounds[shard];
 
@@ -638,63 +643,63 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         let mut client = NodeServiceClient::connect(addr.clone()).await?;
 
         if !vectors_only {
-        // Documents first (ids 0..), then vectors (slots align). The doc
-        // feeder walks the chunks file and the embeddings block in lock
-        // step, asserting key equality at every position — both files were
-        // written in the same order, so that equality IS the join.
-        let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(256);
-        let spec2 = spec.clone();
-        let case_names2 = case_names.clone();
-        let cp = chunks_path.clone();
-        let ep = embeddings_path.clone();
-        let feeder = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            use std::io::BufRead;
-            let mut emb = EmbBlock::open(&ep, start as u64, dim).map_err(|e| e.to_string())?;
-            let file = std::fs::File::open(&cp).map_err(|e| e.to_string())?;
-            let mut sent = 0usize;
-            for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
-                if i < start {
-                    line.map_err(|e| e.to_string())?;
-                    continue;
-                }
-                if i >= end {
-                    break;
-                }
-                let line = line.map_err(|e| e.to_string())?;
-                let chunk: Chunk = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-                let key = emb.next_key_skip_vector().map_err(|e| e.to_string())?;
-                if key != (chunk.opinion_id, chunk.ordinal) {
-                    return Err(format!(
-                        "chunk/embedding order mismatch at shard {shard} position {i}: \
+            // Documents first (ids 0..), then vectors (slots align). The doc
+            // feeder walks the chunks file and the embeddings block in lock
+            // step, asserting key equality at every position — both files were
+            // written in the same order, so that equality IS the join.
+            let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(256);
+            let spec2 = spec.clone();
+            let case_names2 = case_names.clone();
+            let cp = chunks_path.clone();
+            let ep = embeddings_path.clone();
+            let feeder = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                use std::io::BufRead;
+                let mut emb = EmbBlock::open(&ep, start as u64, dim).map_err(|e| e.to_string())?;
+                let file = std::fs::File::open(&cp).map_err(|e| e.to_string())?;
+                let mut sent = 0usize;
+                for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
+                    if i < start {
+                        line.map_err(|e| e.to_string())?;
+                        continue;
+                    }
+                    if i >= end {
+                        break;
+                    }
+                    let line = line.map_err(|e| e.to_string())?;
+                    let chunk: Chunk = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+                    let key = emb.next_key_skip_vector().map_err(|e| e.to_string())?;
+                    if key != (chunk.opinion_id, chunk.ordinal) {
+                        return Err(format!(
+                            "chunk/embedding order mismatch at shard {shard} position {i}: \
                          chunk ({}, {}), embedding ({}, {})",
-                        chunk.opinion_id, chunk.ordinal, key.0, key.1
-                    ));
+                            chunk.opinion_id, chunk.ordinal, key.0, key.1
+                        ));
+                    }
+                    tx.blocking_send(AddDocumentsRequest {
+                        text: chunk.text,
+                        analysis: Some(spec2.clone()),
+                        lineage: Some(DocLineage {
+                            opinion_id: chunk.opinion_id,
+                            cluster_id: chunk.cluster_id,
+                            span_start: chunk.span_start,
+                            span_end: chunk.span_end,
+                        }),
+                        fields: chunk_fields(&case_names2, chunk.cluster_id),
+                    })
+                    .map_err(|e| e.to_string())?;
+                    sent += 1;
                 }
-                tx.blocking_send(AddDocumentsRequest {
-                    text: chunk.text,
-                    analysis: Some(spec2.clone()),
-                    lineage: Some(DocLineage {
-                        opinion_id: chunk.opinion_id,
-                        cluster_id: chunk.cluster_id,
-                        span_start: chunk.span_start,
-                        span_end: chunk.span_end,
-                    }),
-                    fields: chunk_fields(&case_names2, chunk.cluster_id),
-                })
-                .map_err(|e| e.to_string())?;
-                sent += 1;
-            }
-            if sent != n {
-                return Err(format!("shard {shard}: sent {sent} of {n} docs"));
-            }
-            Ok(())
-        });
-        let docs = client
-            .add_documents(ReceiverStream::new(rx))
-            .await?
-            .into_inner();
-        feeder.await??;
-        assert_eq!(docs.added as usize, n);
+                if sent != n {
+                    return Err(format!("shard {shard}: sent {sent} of {n} docs"));
+                }
+                Ok(())
+            });
+            let docs = client
+                .add_documents(ReceiverStream::new(rx))
+                .await?
+                .into_inner();
+            feeder.await??;
+            assert_eq!(docs.added as usize, n);
         }
 
         // Vectors: a direct seek into the fixed-stride embeddings file;

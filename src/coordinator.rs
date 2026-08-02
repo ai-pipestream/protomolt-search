@@ -21,12 +21,11 @@ use crate::pb::{
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, ClusterHealthRequest,
     ClusterHealthResponse, FloorUpdate, FusionMode, HealthRequest, HybridDebug, HybridHit,
-    HybridSearchRequest, HybridShardDebug,
-    HybridSearchResponse, HybridShardRequest, ScoredHit, SearchRequest, SearchResponse,
-    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
-    ParentGroup, ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch,
-    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
-    VectorRescoreRequest,
+    HybridSearchRequest, HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup,
+    ScoredHit, SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats,
+    StartShardSearch, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermStatsRequest, VectorRescoreRequest,
 };
 use crate::pb::{stream_search_request, stream_search_response};
 
@@ -142,7 +141,10 @@ impl CoordinatorServiceImpl {
             .ok()
             .and_then(|addrs| {
                 let all: Vec<std::net::SocketAddr> = addrs.collect();
-                all.iter().find(|a| a.is_ipv4()).copied().or(all.first().copied())
+                all.iter()
+                    .find(|a| a.is_ipv4())
+                    .copied()
+                    .or(all.first().copied())
             });
         cache.insert(addr.to_string(), resolved);
         resolved
@@ -578,10 +580,13 @@ impl CoordinatorServiceImpl {
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
-                client
-                    .shard_legs(request)
-                    .await
-                    .map(|r| (shard as u32, t0.elapsed().as_secs_f32() * 1e3, r.into_inner()))
+                client.shard_legs(request).await.map(|r| {
+                    (
+                        shard as u32,
+                        t0.elapsed().as_secs_f32() * 1e3,
+                        r.into_inner(),
+                    )
+                })
             }));
         }
         let mut vector_shards = Vec::with_capacity(shard_tasks.len());
@@ -749,10 +754,13 @@ impl CoordinatorServiceImpl {
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
-                client
-                    .hybrid_shard(request)
-                    .await
-                    .map(|r| (shard as u32, t0.elapsed().as_secs_f32() * 1e3, r.into_inner().hits))
+                client.hybrid_shard(request).await.map(|r| {
+                    (
+                        shard as u32,
+                        t0.elapsed().as_secs_f32() * 1e3,
+                        r.into_inner().hits,
+                    )
+                })
             }));
         }
         let mut shard_lists: Vec<(u32, Vec<crate::pb::HybridLegHit>)> = Vec::new();
@@ -764,9 +772,7 @@ impl CoordinatorServiceImpl {
             // Vector-score floor: drop non-qualifying docs from the
             // shard's fused list before level-two fusion.
             if legs.min_vector_score > 0.0 {
-                hits.retain(|h| {
-                    h.vector_rank.is_some() && h.vector_score >= legs.min_vector_score
-                });
+                hits.retain(|h| h.vector_rank.is_some() && h.vector_score >= legs.min_vector_score);
             }
             if debug {
                 // A two-level shard returns one FUSED list; per-leg
@@ -965,7 +971,7 @@ impl CoordinatorServiceImpl {
         let mut flb_heap: std::collections::BinaryHeap<std::cmp::Reverse<F64Ord>> =
             std::collections::BinaryHeap::with_capacity(k as usize + 1);
         let push_flb = |heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<F64Ord>>,
-                            value: f64| {
+                        value: f64| {
             if heap.len() < k as usize {
                 heap.push(std::cmp::Reverse(F64Ord(value)));
             } else if heap.peek().is_some_and(|r| value > r.0 .0) {
@@ -984,8 +990,8 @@ impl CoordinatorServiceImpl {
                 push_flb(&mut flb_heap, fused_of(v, b));
             }
         }
-        let mut s_lb = (flb_heap.len() == k as usize)
-            .then(|| flb_heap.peek().expect("full heap").0 .0);
+        let mut s_lb =
+            (flb_heap.len() == k as usize).then(|| flb_heap.peek().expect("full heap").0 .0);
         let decomposed = s_lb.map(|s| decomposed_floor(s, wb_b1, w_v));
         // min_vector_score is a result-set gate, so it doubles as a
         // free starting floor: suppressed docs are excluded docs.
@@ -1079,9 +1085,7 @@ impl CoordinatorServiceImpl {
             let mut fused: Vec<f64> = exact.iter().map(|&(_, _, v, b)| fused_of(v, b)).collect();
             if fused.len() >= k as usize {
                 let idx = k as usize - 1;
-                *fused
-                    .select_nth_unstable_by(idx, |a, b| b.total_cmp(a))
-                    .1
+                *fused.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1
             } else {
                 f64::NEG_INFINITY
             }
@@ -1101,7 +1105,9 @@ impl CoordinatorServiceImpl {
                 rescore_docs.push((doc, shard, v));
             }
         }
-        let rescored_b = self.fanout_bm25_rescore_scores(terms, global, rescore_ids).await?;
+        let rescored_b = self
+            .fanout_bm25_rescore_scores(terms, global, rescore_ids)
+            .await?;
         for (doc, shard, v) in rescore_docs {
             // Absent from the rescore response = no query term matches
             // the doc: b is exactly 0.
@@ -1178,7 +1184,10 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
             tasks.push(tokio::spawn(async move {
-                client.vector_rescore(request).await.map(|r| r.into_inner().hits)
+                client
+                    .vector_rescore(request)
+                    .await
+                    .map(|r| r.into_inner().hits)
             }));
         }
         let mut scores = HashMap::new();
@@ -1215,7 +1224,10 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
             tasks.push(tokio::spawn(async move {
-                client.bm25_rescore(request).await.map(|r| r.into_inner().hits)
+                client
+                    .bm25_rescore(request)
+                    .await
+                    .map(|r| r.into_inner().hits)
             }));
         }
         let mut scores = HashMap::new();
@@ -1484,8 +1496,7 @@ impl CoordinatorServiceImpl {
             });
         }
 
-        let mut fanout =
-            self.open_stream_fanout(request_id, vector, initial_floor, false)?;
+        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false)?;
 
         // The global top-k: a max-heap whose top is the WORST survivor
         // under the merge's total order, so peek() is the k-th best.
@@ -1512,13 +1523,9 @@ impl CoordinatorServiceImpl {
                     }
                     for rec in batch.hits.chunks_exact(12) {
                         let entry = StreamHeapEntry(MergedHit {
-                            vector_id: u64::from_le_bytes(
-                                rec[..8].try_into().expect("8-byte id"),
-                            ),
+                            vector_id: u64::from_le_bytes(rec[..8].try_into().expect("8-byte id")),
                             shard: shard as u32,
-                            score: f32::from_le_bytes(
-                                rec[8..12].try_into().expect("4-byte score"),
-                            ),
+                            score: f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score")),
                         });
                         if heap.len() < k as usize {
                             heap.push(entry);
@@ -1660,8 +1667,7 @@ impl CoordinatorServiceImpl {
                             }
                         });
                         agg.chunks.push((doc, score));
-                        if score > agg.best_score
-                            || (score == agg.best_score && doc < agg.best_id)
+                        if score > agg.best_score || (score == agg.best_score && doc < agg.best_id)
                         {
                             if score > agg.best_score && score > kth {
                                 dirty = true;
@@ -1671,11 +1677,9 @@ impl CoordinatorServiceImpl {
                         }
                     }
                     if dirty && parents.len() >= k as usize {
-                        let mut bests: Vec<f32> =
-                            parents.values().map(|a| a.best_score).collect();
+                        let mut bests: Vec<f32> = parents.values().map(|a| a.best_score).collect();
                         let idx = k as usize - 1;
-                        let new_kth =
-                            *bests.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1;
+                        let new_kth = *bests.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1;
                         if new_kth > kth {
                             kth = new_kth;
                             // next_down, not bm25::floor_seed: parent
@@ -1821,10 +1825,7 @@ impl CoordinatorServiceImpl {
                 Some((shard, wall_ms, Ok(done))) => {
                     shard_hits.push((
                         shard,
-                        done.hits
-                            .iter()
-                            .map(|h| (h.vector_id, h.score))
-                            .collect(),
+                        done.hits.iter().map(|h| (h.vector_id, h.score)).collect(),
                     ));
                     for hit in done.hits {
                         let entry = best.entry(hit.parent_id).or_insert_with(|| hit.clone());
@@ -2128,7 +2129,10 @@ impl CoordinatorServiceImpl {
                 };
                 let mut client = self.node_client(node)?;
                 rescore_tasks.push(tokio::spawn(async move {
-                    client.bm25_rescore(request).await.map(|r| r.into_inner().hits)
+                    client
+                        .bm25_rescore(request)
+                        .await
+                        .map(|r| r.into_inner().hits)
                 }));
             }
             for task in rescore_tasks {
@@ -2486,14 +2490,12 @@ async fn run_shard_with_hedge(
         }
     };
     match limits.shard_deadline {
-        Some(deadline) => tokio::time::timeout(deadline, attempt)
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded(format!(
-                    "shard {shard} exceeded its {}ms deadline",
-                    deadline.as_millis()
-                ))
-            })?,
+        Some(deadline) => tokio::time::timeout(deadline, attempt).await.map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "shard {shard} exceeded its {}ms deadline",
+                deadline.as_millis()
+            ))
+        })?,
         None => attempt.await,
     }
 }
@@ -2688,8 +2690,7 @@ impl SearchService for CoordinatorServiceImpl {
         // when k hits were returned (see `bm25::floor_seed` — a later
         // seed can never exceed the true k-th best), 0 otherwise.
         let kth_best = if hits.len() == req.k as usize {
-            hits
-                .last()
+            hits.last()
                 .map(|h| crate::bm25::floor_seed(h.score))
                 .unwrap_or(0.0)
         } else {
@@ -2756,7 +2757,8 @@ impl SearchService for CoordinatorServiceImpl {
         // scales bounds by bm25_weight; both must be strictly positive
         // (a single-leg query belongs to GLOBAL_RANK or SCORE_BLEND).
         if options.fusion_mode() == FusionMode::Decomposed
-            && !(vector_weight > 0.0 && vector_weight.is_finite()
+            && !(vector_weight > 0.0
+                && vector_weight.is_finite()
                 && bm25_weight > 0.0
                 && bm25_weight.is_finite())
         {
@@ -2895,9 +2897,7 @@ impl SearchService for CoordinatorServiceImpl {
         for task in tasks {
             match task.await {
                 Ok(target) => targets.push(target),
-                Err(e) => {
-                    return Err(Status::internal(format!("health probe task failed: {e}")))
-                }
+                Err(e) => return Err(Status::internal(format!("health probe task failed: {e}"))),
             }
         }
         Ok(Response::new(ClusterHealthResponse { targets }))

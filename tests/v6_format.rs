@@ -90,14 +90,26 @@ fn v6_reader_answers_identically_to_v5() {
 
     // Common terms span several skip blocks, so the pruned path runs
     // the real cursor machinery, not a trivial single block.
-    assert!(Bm25Index::df(&store, "t0") > 256, "corpus too small to be honest");
-    assert!(v6.has_impacts("t0"), "v6 reader must expose the block-max surface");
+    assert!(
+        Bm25Index::df(&store, "t0") > 256,
+        "corpus too small to be honest"
+    );
+    assert!(
+        v6.has_impacts("t0"),
+        "v6 reader must expose the block-max surface"
+    );
 
     let queries: Vec<Vec<String>> = vec![
         vec!["t0".into()],
         vec!["t1".into(), "t3".into()],
         vec!["t2".into(), "t4".into(), "t7".into(), "missing".into()],
-        vec!["t0".into(), "t5".into(), "t6".into(), "t8".into(), "t9".into()],
+        vec![
+            "t0".into(),
+            "t5".into(),
+            "t6".into(),
+            "t8".into(),
+            "t9".into(),
+        ],
         vec!["missing".into()],
     ];
     let params = Bm25Params::default();
@@ -120,17 +132,28 @@ fn v6_reader_answers_identically_to_v5() {
             // (the coordinator's floor-seed shape). The v5-vs-v6
             // identity is the contract here; pruned-vs-exhaustive
             // exactness is blockmax.rs's.
-            for floor in [f64::NEG_INFINITY, a.last().map_or(f64::NEG_INFINITY, |h| h.score)] {
+            for floor in [
+                f64::NEG_INFINITY,
+                a.last().map_or(f64::NEG_INFINITY, |h| h.score),
+            ] {
                 let ap = bm25::top_k_pruned(&v5, terms, &stats, params, k, floor);
                 let bp = bm25::top_k_pruned(&v6, terms, &stats, params, k, floor);
-                assert_eq!(sig(&ap), sig(&bp), "top_k_pruned({terms:?}, k={k}, floor={floor})");
+                assert_eq!(
+                    sig(&ap),
+                    sig(&bp),
+                    "top_k_pruned({terms:?}, k={k}, floor={floor})"
+                );
             }
         }
     }
 
     // The document plane agrees too.
     for slot in (0..store.next_doc_id()).step_by(97) {
-        assert_eq!(Bm25Index::text(&v5, slot), Bm25Index::text(&v6, slot), "text({slot})");
+        assert_eq!(
+            Bm25Index::text(&v5, slot),
+            Bm25Index::text(&v6, slot),
+            "text({slot})"
+        );
         assert_eq!(
             Bm25Index::lineage(&v5, slot),
             Bm25Index::lineage(&v6, slot),

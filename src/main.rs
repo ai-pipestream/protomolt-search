@@ -81,8 +81,8 @@ fn load_shard_index(
     if !path.exists() {
         return Ok(None);
     }
-    let index = TurboQuantIndex::load(&path)
-        .map_err(|e| format!("load {}: {e}", path.display()))?;
+    let index =
+        TurboQuantIndex::load(&path).map_err(|e| format!("load {}: {e}", path.display()))?;
     index.prepare();
     Ok(Some(index))
 }
@@ -187,8 +187,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let mut shutdown = shutdown_rx.clone();
             handles.push(tokio::spawn(
                 Server::builder()
-                .initial_stream_window_size(turbovec_search::H2_STREAM_WINDOW)
-                .initial_connection_window_size(turbovec_search::H2_CONN_WINDOW)
+                    .initial_stream_window_size(turbovec_search::H2_STREAM_WINDOW)
+                    .initial_connection_window_size(turbovec_search::H2_CONN_WINDOW)
                     .add_service(NodeServiceImpl::into_server(node, max))
                     .serve_with_incoming_shutdown(
                         harness::nodelay_incoming(listener),

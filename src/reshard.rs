@@ -323,8 +323,7 @@ fn build_child(
             Some(&slot) => slot,
             None => {
                 spare += 1;
-                u32::try_from(spare - 1)
-                    .map_err(|_| "document id space exceeds u32".to_string())?
+                u32::try_from(spare - 1).map_err(|_| "document id space exceeds u32".to_string())?
             }
         };
         mapped.push((local, doc));

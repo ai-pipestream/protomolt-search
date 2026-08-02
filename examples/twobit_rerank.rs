@@ -34,7 +34,9 @@ fn read_rows(reader: &mut impl Read, count: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; count * DIM];
     let mut record = vec![0u8; HEADER + DIM * 4];
     for row in 0..count {
-        reader.read_exact(&mut record).expect("embeddings truncated");
+        reader
+            .read_exact(&mut record)
+            .expect("embeddings truncated");
         for d in 0..DIM {
             let base = HEADER + d * 4;
             out[row * DIM + d] =

@@ -45,10 +45,8 @@ const N: usize = 3_000;
 const DOCS: usize = 1_500;
 
 fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "turbovec_reshard_{tag}_{}",
-        std::process::id()
-    ));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("turbovec_reshard_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -181,7 +179,12 @@ fn analyze_one(
 
 /// Top-k of one query as `(global_id, score_bits)`, coordinator order
 /// (score desc, id asc).
-fn topk(index: &TurboQuantIndex, query: &[f32], k: usize, id_of: impl Fn(u64) -> u64) -> Vec<(u64, u32)> {
+fn topk(
+    index: &TurboQuantIndex,
+    query: &[f32],
+    k: usize,
+    id_of: impl Fn(u64) -> u64,
+) -> Vec<(u64, u32)> {
     let results = index.search(query, k);
     let mut hits: Vec<(u64, u32)> = results
         .indices_for_query(0)
@@ -289,8 +292,16 @@ async fn merge_reproduces_monolithic() {
     let (mut a, a_path, _node_a) =
         start_wal_node(&dir, "a.tv", 0, 64, &analysis_addr, &shift, &scale).await;
     ingest(&mut a, &corpus[..half * DIM], half, DOCS / 2).await;
-    let (mut b, b_path, _node_b) =
-        start_wal_node(&dir, "b.tv", half as u64, 64, &analysis_addr, &shift, &scale).await;
+    let (mut b, b_path, _node_b) = start_wal_node(
+        &dir,
+        "b.tv",
+        half as u64,
+        64,
+        &analysis_addr,
+        &shift,
+        &scale,
+    )
+    .await;
     ingest(&mut b, &corpus[half * DIM..], half, DOCS / 2).await;
 
     let generations = [a_path, b_path]
@@ -313,7 +324,11 @@ async fn merge_reproduces_monolithic() {
     assert_eq!(child.num_documents, DOCS as u64);
     assert_eq!(child.slot_offset, 0);
     // Contiguous input ranges replay in id order: the remap is identity.
-    assert!(child.parent_ids.iter().enumerate().all(|(i, &id)| id == i as u64));
+    assert!(child
+        .parent_ids
+        .iter()
+        .enumerate()
+        .all(|(i, &id)| id == i as u64));
 
     // Vector side: merged image == monolithic reference, bitwise.
     let reference = build_monolithic(&corpus, DIM, BIT_WIDTH, &shift, &scale);
@@ -416,7 +431,6 @@ async fn merge_reproduces_monolithic() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-
 /// Split with N == bucket_count: every child owns exactly one bucket
 /// file, and the union of children still reconstructs the parent top-k.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -460,7 +474,10 @@ async fn split_consumes_each_bucket_once() {
         n as u64
     );
     for (i, child) in output.children.iter().enumerate() {
-        assert!(!child.parent_ids.is_empty(), "bucket {i} was never consumed");
+        assert!(
+            !child.parent_ids.is_empty(),
+            "bucket {i} was never consumed"
+        );
         // Child i's ids are exactly bucket i's — each bucket consumed once.
         assert!(
             child
@@ -573,7 +590,10 @@ async fn split_finer_than_buckets_repartitions() {
             .collect();
         merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         merged.truncate(k);
-        assert_eq!(merged, expected, "query {q}: fallback split changed the top-k");
+        assert_eq!(
+            merged, expected,
+            "query {q}: fallback split changed the top-k"
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -602,11 +622,21 @@ fn reshard_refuses_a_log_with_preexisting_state() {
     let gen = writer.dir().to_path_buf();
     drop(writer);
 
-    let mut analyze = |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
-        unreachable!("reshard must refuse before analyzing anything")
-    };
-    let err = reshard::split(&gen, 2, &dir.join("out"), 0, 25_000_000, false, None, &mut analyze)
-        .expect_err("split must refuse preexisting state");
+    let mut analyze =
+        |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
+            unreachable!("reshard must refuse before analyzing anything")
+        };
+    let err = reshard::split(
+        &gen,
+        2,
+        &dir.join("out"),
+        0,
+        25_000_000,
+        false,
+        None,
+        &mut analyze,
+    )
+    .expect_err("split must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
     let err = reshard::merge(&[gen], &dir.join("out"), None, false, None, &mut analyze)
         .expect_err("merge must refuse preexisting state");
@@ -631,8 +661,16 @@ async fn split_logs_redistributes_two_shards_into_four() {
     let (mut a, a_path, _node_a) =
         start_wal_node(&dir, "a.tv", 0, 64, &analysis_addr, &shift, &scale).await;
     ingest(&mut a, &corpus[..half * DIM], half, DOCS / 2).await;
-    let (mut b, b_path, _node_b) =
-        start_wal_node(&dir, "b.tv", half as u64, 64, &analysis_addr, &shift, &scale).await;
+    let (mut b, b_path, _node_b) = start_wal_node(
+        &dir,
+        "b.tv",
+        half as u64,
+        64,
+        &analysis_addr,
+        &shift,
+        &scale,
+    )
+    .await;
     ingest(&mut b, &corpus[half * DIM..], half, DOCS / 2).await;
 
     let generations = [a_path, b_path]
@@ -694,7 +732,10 @@ async fn split_logs_redistributes_two_shards_into_four() {
             .collect();
         merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         merged.truncate(k);
-        assert_eq!(merged, expected, "query {q}: redistribution changed the top-k");
+        assert_eq!(
+            merged, expected,
+            "query {q}: redistribution changed the top-k"
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -830,13 +871,19 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     ] {
         let parent_view = parent.field(f);
         assert_eq!(
-            children.iter().map(|(_, r)| r.field(f).total_doc_length()).sum::<u64>(),
+            children
+                .iter()
+                .map(|(_, r)| r.field(f).total_doc_length())
+                .sum::<u64>(),
             parent_view.total_doc_length(),
             "field {f} total length"
         );
         for term in terms {
             assert_eq!(
-                children.iter().map(|(_, r)| r.field(f).df(term)).sum::<u32>(),
+                children
+                    .iter()
+                    .map(|(_, r)| r.field(f).df(term))
+                    .sum::<u32>(),
                 parent_view.df(term),
                 "field {f} df({term})"
             );
@@ -887,12 +934,9 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     let mut merged: Vec<(u64, u64)> = children
         .iter()
         .flat_map(|(child, reader)| {
-            run(reader).into_iter().map(|d| {
-                (
-                    child.parent_ids[d.doc_id as usize],
-                    d.score.to_bits(),
-                )
-            })
+            run(reader)
+                .into_iter()
+                .map(|d| (child.parent_ids[d.doc_id as usize], d.score.to_bits()))
         })
         .collect();
     merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

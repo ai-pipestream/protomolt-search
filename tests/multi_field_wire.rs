@@ -37,7 +37,10 @@ const CORPUS: [&[(&str, Option<&str>)]; 2] = [
     &[
         ("rust search rust fast", Some("Smith v Jones")),
         ("vector search rust", None),
-        ("smith writes about rust", Some("Acme Corp v Rust Industries")),
+        (
+            "smith writes about rust",
+            Some("Acme Corp v Rust Industries"),
+        ),
     ],
     &[
         ("search engines love rust", Some("Smith v Smith")),
@@ -80,7 +83,11 @@ async fn add_documents(addr: &str, docs: &[(&str, Option<&str>)]) {
     assert_eq!(resp.added as usize, docs.len());
 }
 
-fn two_field_node(analysis: &str, slot_offset: u64, index_path: Option<std::path::PathBuf>) -> NodeConfig {
+fn two_field_node(
+    analysis: &str,
+    slot_offset: u64,
+    index_path: Option<std::path::PathBuf>,
+) -> NodeConfig {
     NodeConfig {
         slot_offset,
         analysis_addr: Some(analysis.to_string()),
@@ -456,10 +463,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
         .unwrap();
     }
     drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap();
+    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
 
     let legs = |k1: f32, b: f32| {
         let mut client = client.clone();

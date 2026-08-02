@@ -117,8 +117,8 @@ async fn start_fixture() -> Fixture {
         addrs.push(addr);
         handles.push(handle);
     }
-    let coordinator = CoordinatorServiceImpl::new(addrs.clone())
-        .with_bm25(Some(analysis), Default::default());
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs.clone()).with_bm25(Some(analysis), Default::default());
     Fixture {
         coordinator,
         addrs,
@@ -222,11 +222,12 @@ async fn decomposed_matches_exhaustive_fused_oracle() {
     // it unfilled (absent docs proven b = 0, no rescore needed).
     for &(w_v, w_b) in &[(1.0f32, 1.0f32), (0.02, 5.0), (5.0, 0.02)] {
         for &leg_k in &[k, N_DOCS as u32] {
-            let want: Vec<_> = oracle_fused(&fx.coordinator, "zebra crossing", &query, w_v, w_b, 0.0)
-                .await
-                .into_iter()
-                .take(k as usize)
-                .collect();
+            let want: Vec<_> =
+                oracle_fused(&fx.coordinator, "zebra crossing", &query, w_v, w_b, 0.0)
+                    .await
+                    .into_iter()
+                    .take(k as usize)
+                    .collect();
             let got = fx
                 .coordinator
                 .fanout_hybrid(
@@ -342,7 +343,11 @@ async fn decomposed_min_vector_score_gates_the_result_set_exactly() {
         .into_iter()
         .take(k as usize)
         .collect();
-    assert_eq!(signature(&got), want, "min_vector_score gate must stay exact");
+    assert_eq!(
+        signature(&got),
+        want,
+        "min_vector_score gate must stay exact"
+    );
     for h in &got {
         assert!(h.vector_score >= min_v);
     }
@@ -381,7 +386,11 @@ async fn vector_rescore_matches_full_search_bitwise() {
             .unwrap()
             .into_inner()
             .hits;
-        assert_eq!(hits.len(), 3, "shard {shard}: out-of-range id must be ignored");
+        assert_eq!(
+            hits.len(),
+            3,
+            "shard {shard}: out-of-range id must be ignored"
+        );
         for hit in hits {
             assert_eq!(
                 Some(&hit.score.to_bits()),
@@ -429,7 +438,11 @@ async fn decomposed_rejects_disabled_or_negative_legs() {
             }))
             .await
             .expect_err("weights outside (0, inf) must be refused");
-        assert_eq!(status.code(), tonic::Code::InvalidArgument, "({v_w}, {b_w})");
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "({v_w}, {b_w})"
+        );
     }
     fx.shutdown().await;
 }
@@ -477,6 +490,9 @@ async fn decomposed_serves_through_hybrid_search_with_debug() {
     let debug = response.debug.expect("debug requested");
     assert_eq!(debug.fusion_mode, FusionMode::Decomposed as i32);
     assert_eq!(debug.shards.len(), N_SHARDS);
-    assert!(!debug.terms.is_empty(), "analyzed terms echo in the profile");
+    assert!(
+        !debug.terms.is_empty(),
+        "analyzed terms echo in the profile"
+    );
     fx.shutdown().await;
 }

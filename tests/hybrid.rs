@@ -180,11 +180,13 @@ async fn hybrid_is_deterministic_and_carries_provenance() {
     let first = coordinator
         .fanout_hybrid("h1", "zebra", &query, 8, None, legs_default(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     let second = coordinator
         .fanout_hybrid("h2", "zebra", &query, 8, None, legs_default(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     assert_eq!(
         ids(&first),
         ids(&second),
@@ -284,13 +286,31 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
         CoordinatorServiceImpl::new(vec![mono_addr]).with_bm25(Some(analysis), Default::default());
 
     let got = distributed
-        .fanout_hybrid("d", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
+        .fanout_hybrid(
+            "d",
+            "zebra",
+            &query,
+            N_DOCS as u32,
+            None,
+            legs_default(),
+            false,
+        )
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     let want = monolithic
-        .fanout_hybrid("m", "zebra", &query, N_DOCS as u32, None, legs_default(), false)
+        .fanout_hybrid(
+            "m",
+            "zebra",
+            &query,
+            N_DOCS as u32,
+            None,
+            legs_default(),
+            false,
+        )
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
 
     // Monolithic sanity: doc 0 (both legs) first, then the vector order.
     let want_originals: Vec<usize> = want
@@ -582,7 +602,11 @@ async fn score_blend_follows_documented_arithmetic() {
             .unwrap()
             .0;
         assert_eq!(sig(&hits), sig(&again));
-        assert_eq!(hits[0].doc_id, 0, "{:?}/{:?}", legs.normalization, legs.combination);
+        assert_eq!(
+            hits[0].doc_id, 0,
+            "{:?}/{:?}",
+            legs.normalization, legs.combination
+        );
     }
 
     for h in handles {
@@ -889,7 +913,10 @@ async fn leg_disabling_and_vector_floor() {
         got.sort_unstable();
         let mut want = qualifying.clone();
         want.sort_unstable();
-        assert_eq!(got, want, "{mode:?}: floor must keep exactly the qualifying docs");
+        assert_eq!(
+            got, want,
+            "{mode:?}: floor must keep exactly the qualifying docs"
+        );
         assert!(filtered
             .hits
             .iter()
@@ -913,7 +940,10 @@ async fn leg_disabling_and_vector_floor() {
     got.sort_unstable();
     let mut want = qualifying;
     want.sort_unstable();
-    assert_eq!(got, want, "cascade floor must keep exactly the qualifying docs");
+    assert_eq!(
+        got, want,
+        "cascade floor must keep exactly the qualifying docs"
+    );
     assert!(cascade.cascade_hits.iter().all(|h| h.vector_score >= floor));
 
     for h in handles {
@@ -959,11 +989,13 @@ async fn two_level_fallback_is_reachable_and_deterministic() {
     let first = coordinator
         .fanout_hybrid("t1", "zebra", &query, 8, None, legs_two_level(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     let second = coordinator
         .fanout_hybrid("t2", "zebra", &query, 8, None, legs_two_level(), false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     assert_eq!(ids(&first), ids(&second));
     // Doc 0 (both legs on its shard) wins; provenance is shard-local.
     assert_eq!(first[0].doc_id, 0);
@@ -1054,15 +1086,8 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
     zebra[3] = "another zebra crossing".to_string();
 
     // Heap-backed shard (Building store → top_k fallback).
-    let (addr_heap, handle_heap) = start_hybrid_shard(
-        &analysis,
-        0,
-        &zebra,
-        corpus.clone(),
-        &shift,
-        &scale,
-    )
-    .await;
+    let (addr_heap, handle_heap) =
+        start_hybrid_shard(&analysis, 0, &zebra, corpus.clone(), &shift, &scale).await;
     // v5-resident shard (index path → Flush → Bm25Reader → pruned leg).
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("hybrid_v5_{}", std::process::id()));
@@ -1089,8 +1114,8 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
     let query = corpus[..DIM].to_vec();
     let mut runs = Vec::new();
     for addr in [addr_heap, addr_v5] {
-        let coordinator =
-            CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis.clone()), Default::default());
+        let coordinator = CoordinatorServiceImpl::new(vec![addr])
+            .with_bm25(Some(analysis.clone()), Default::default());
         runs.push(
             coordinator
                 .fanout_hybrid("h", "zebra", &query, 8, None, legs_default(), false)
@@ -1218,7 +1243,10 @@ async fn debug_block_profiles_every_fusion_mode() {
     assert_eq!(debug.terms, vec!["zebra".to_string()]);
     assert_eq!(debug.shards.len(), 2);
     for shard in &debug.shards {
-        assert!(shard.scan.is_some(), "cascade carries the vector scan stats");
+        assert!(
+            shard.scan.is_some(),
+            "cascade carries the vector scan stats"
+        );
         assert!(shard.vector_hits > 0, "phase-1 candidates counted");
     }
     assert!(debug.total_ms > 0.0);

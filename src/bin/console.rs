@@ -88,7 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "console on http://{listen} -> coordinator {} ({} node(s) for doc text, analysis {})",
         ctx.coordinator,
         ctx.nodes.len(),
-        ctx.analysis.as_deref().unwrap_or("NONE: embedding disabled")
+        ctx.analysis
+            .as_deref()
+            .unwrap_or("NONE: embedding disabled")
     );
     loop {
         let (stream, _) = listener.accept().await?;
@@ -141,20 +143,40 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) -> std::io::Result<()
     }
 
     match (method.as_str(), path.as_str()) {
-        ("GET", "/") => respond(&mut stream, 200, "text/html; charset=utf-8", CONSOLE_HTML.as_bytes()).await,
+        ("GET", "/") => {
+            respond(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                CONSOLE_HTML.as_bytes(),
+            )
+            .await
+        }
         ("GET", "/api/health") => {
             let out = match health(&ctx).await {
                 Ok(v) => (200, v),
                 Err(e) => (502, json!({ "error": e })),
             };
-            respond(&mut stream, out.0, "application/json", out.1.to_string().as_bytes()).await
+            respond(
+                &mut stream,
+                out.0,
+                "application/json",
+                out.1.to_string().as_bytes(),
+            )
+            .await
         }
         ("POST", "/api/search") => {
             let out = match search(&ctx, &body).await {
                 Ok(v) => (200, v),
                 Err(e) => (400, json!({ "error": e })),
             };
-            respond(&mut stream, out.0, "application/json", out.1.to_string().as_bytes()).await
+            respond(
+                &mut stream,
+                out.0,
+                "application/json",
+                out.1.to_string().as_bytes(),
+            )
+            .await
         }
         _ => respond(&mut stream, 404, "text/plain", b"not found").await,
     }
@@ -188,19 +210,19 @@ async fn respond(
 }
 
 fn search_client(addr: &str) -> Result<SearchServiceClient<Channel>, String> {
-    Ok(SearchServiceClient::new(
-        analyzer::shared_channel(addr).map_err(|e| e.to_string())?,
+    Ok(
+        SearchServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
+            .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES),
     )
-    .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES))
 }
 
 fn node_client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
-    Ok(NodeServiceClient::new(
-        analyzer::shared_channel(addr).map_err(|e| e.to_string())?,
+    Ok(
+        NodeServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
+            .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES),
     )
-    .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES))
 }
 
 async fn health(ctx: &Ctx) -> Result<Value, String> {

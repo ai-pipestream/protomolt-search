@@ -215,11 +215,13 @@ async fn cascade_includes_whole_boundary_tie_group_and_is_deterministic() {
     let first = coordinator
         .fanout_cascade("c1", "zebra", &corpus.query, 2, None, 0.0, false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     let second = coordinator
         .fanout_cascade("c2", "zebra", &corpus.query, 2, None, 0.0, false)
         .await
-        .unwrap().0;
+        .unwrap()
+        .0;
     assert_eq!(
         signature(&first),
         signature(&second),
@@ -262,11 +264,13 @@ async fn distributed_cascade_matches_monolithic_exactly() {
         let got = distributed
             .fanout_cascade("d", "zebra", &corpus.query, k, None, 0.0, false)
             .await
-            .unwrap().0;
+            .unwrap()
+            .0;
         let want = monolithic
             .fanout_cascade("m", "zebra", &corpus.query, k, None, 0.0, false)
             .await
-            .unwrap().0;
+            .unwrap()
+            .0;
         assert_cascade_equivalent(&got, &want);
     }
 

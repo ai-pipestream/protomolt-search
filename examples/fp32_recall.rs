@@ -53,10 +53,7 @@ fn fp32_topk(
                     .min_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
                     .expect("nonempty");
                 top.swap_remove(mi);
-                floors[p] = top
-                    .iter()
-                    .map(|&(s, _)| s)
-                    .fold(f32::INFINITY, f32::min);
+                floors[p] = top.iter().map(|&(s, _)| s).fold(f32::INFINITY, f32::min);
             }
         }
     }

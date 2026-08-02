@@ -178,9 +178,8 @@ fn pruned_matches_exhaustive_property() {
             for floor in floors {
                 let want = bm25::filter_to_floor(oracle.clone(), floor);
                 let mut prune = PruneStats::default();
-                let got = bm25::top_k_pruned_stats(
-                    &reader, &terms, &stats, params, k, floor, &mut prune,
-                );
+                let got =
+                    bm25::top_k_pruned_stats(&reader, &terms, &stats, params, k, floor, &mut prune);
                 assert_eq!(
                     sig(&want),
                     sig(&got),
@@ -234,14 +233,14 @@ fn ties_at_floor_and_kth_slot() {
             sig(&got),
             "identical-doc corpus, floor {floor:e}"
         );
-        assert_eq!(
-            got.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
-            want_ids
-        );
+        assert_eq!(got.iter().map(|h| h.doc_id).collect::<Vec<_>>(), want_ids);
     }
     // A hair above the tie: nothing survives.
     let got = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, tie_score + 1e-9);
-    assert!(got.is_empty(), "floor above every score must return nothing");
+    assert!(
+        got.is_empty(),
+        "floor above every score must return nothing"
+    );
 
     // Corpus B: the k-th slot ties ACROSS blocks: 12 high docs (tf=2)
     // spread over 300 tf=1 docs; k=10 keeps the ten smallest ids.
@@ -279,8 +278,7 @@ fn ties_at_floor_and_kth_slot() {
     // ten tied winners; everything else is inert on arrival).
     for (floor, want_evals) in [(f64::NEG_INFINITY, 19u64), (oracle[9].score, 10)] {
         let mut prune = PruneStats::default();
-        let got =
-            bm25::top_k_pruned_stats(&reader, &terms, &stats, params, 10, floor, &mut prune);
+        let got = bm25::top_k_pruned_stats(&reader, &terms, &stats, params, 10, floor, &mut prune);
         assert_eq!(sig(&oracle), sig(&got), "cross-block tie, floor {floor:e}");
         assert_eq!(
             prune.candidates_evaluated, want_evals,
@@ -306,10 +304,13 @@ fn blocks_actually_skip() {
         store.add_document(
             i,
             format!("doc {i}"),
-            AnalyzedDoc::body(vec![
+            AnalyzedDoc::body(
+                vec![
                     ("court".to_string(), 1 + (i / 128) % 5, vec![(0, 4)]),
                     (format!("rare{}", i % 97), 1, vec![(0, 4)]),
-                ], 100 + i % 50),
+                ],
+                100 + i % 50,
+            ),
         );
     }
     let path = dir.join("s.bm25");
@@ -483,8 +484,7 @@ fn seeded_round_trip_never_loses_boundary_hits() {
             }
             // The wire emission: f32 of the k-th score, one ULP down.
             let emitted = bm25::floor_seed(unseeded[k - 1].score as f32);
-            let seeded =
-                bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::from(emitted));
+            let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::from(emitted));
             assert_eq!(
                 sig(&unseeded),
                 sig(&seeded),
@@ -610,9 +610,8 @@ fn pruned_level1_scale_fuzz() {
             for floor in floors {
                 let want = bm25::filter_to_floor(oracle.clone(), floor);
                 let mut prune = PruneStats::default();
-                let got = bm25::top_k_pruned_stats(
-                    &reader, &terms, &stats, params, k, floor, &mut prune,
-                );
+                let got =
+                    bm25::top_k_pruned_stats(&reader, &terms, &stats, params, k, floor, &mut prune);
                 assert_eq!(
                     sig(&want),
                     sig(&got),

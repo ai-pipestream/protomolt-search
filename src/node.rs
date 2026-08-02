@@ -25,27 +25,29 @@ use tonic::{Request, Response, Status, Streaming};
 use turbovec::TurboQuantIndex;
 
 use crate::bm25::{self, Bm25Params};
-use crate::chunked::{chunked_topk_collapsed, 
-    chunked_topk, chunked_topk_batch, BatchQuery, ChunkHit, ScanStats, DEFAULT_CHUNK_BLOCKS,
+use crate::chunked::{
+    chunked_topk, chunked_topk_batch, chunked_topk_collapsed, BatchQuery, ChunkHit, ScanStats,
+    DEFAULT_CHUNK_BLOCKS,
 };
 use crate::fusion::{self, Leg};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
+use crate::pb::wal::{
+    wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker,
+};
 use crate::pb::{
     search_shard_request, search_shard_response, snapshot_chunk, stream_search_request,
-    stream_search_response, AddDocumentsRequest,
-    AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit, Bm25QueryRequest,
-    Bm25QueryResponse, Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest,
-    FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
-    GetDocumentsResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
-    HybridShardResponse,
-    InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone,
-    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse,
-    ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest,
-    StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
-    TermStatsResponse, VectorRescoreRequest, VectorRescoreResponse,
+    stream_search_response, AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest,
+    AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse, Bm25RescoreRequest,
+    Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest,
+    GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse, HealthRequest,
+    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, InstallSnapshotResponse,
+    OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse,
+    SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse,
+    ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch, StoredDocument,
+    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
+    TermOccurrences, TermStatsRequest, TermStatsResponse, VectorRescoreRequest,
+    VectorRescoreResponse,
 };
-use crate::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker};
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
 use crate::wal::{self, WalWriter};
 
@@ -215,7 +217,10 @@ impl Bm25Shard {
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let mut magic = [0u8; 8];
         std::fs::File::open(path)?.read_exact(&mut magic)?;
-        if matches!(&magic, b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506") {
+        if matches!(
+            &magic,
+            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506"
+        ) {
             Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
         } else {
             Ok(Bm25Shard::Building(Bm25Store::load(path)?))
@@ -628,11 +633,7 @@ async fn scan_scheduler(
 
 /// Run one batched scan under the shard read lock and deliver every job's
 /// result. Blocking-pool context.
-fn run_scan_batch(
-    state: &std::sync::RwLock<ShardState>,
-    chunk_blocks: usize,
-    batch: Vec<ScanJob>,
-) {
+fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, batch: Vec<ScanJob>) {
     let guard = state.read().expect("shard state lock poisoned");
     let index = match guard.index.as_ref() {
         Some(index) => index,
@@ -728,9 +729,7 @@ impl NodeServiceImpl {
             let socket = match tokio::net::UdpSocket::bind(addr).await {
                 Ok(socket) => socket,
                 Err(e) => {
-                    eprintln!(
-                        "floor UDP bind {addr}: {e}; floors ride the gRPC streams only"
-                    );
+                    eprintln!("floor UDP bind {addr}: {e}; floors ride the gRPC streams only");
                     return;
                 }
             };
@@ -813,7 +812,10 @@ impl NodeServiceImpl {
     /// (startup found one via [`recover_generation`]): Flush and the
     /// AddDocuments reload path then read/write inside it.
     pub fn with_generation(self, dir: Option<PathBuf>) -> Self {
-        self.state.write().expect("shard state lock poisoned").generation = dir;
+        self.state
+            .write()
+            .expect("shard state lock poisoned")
+            .generation = dir;
         self
     }
 
@@ -865,10 +867,7 @@ impl NodeServiceImpl {
             }
             Arc::new(parents)
         };
-        state
-            .write()
-            .expect("shard state lock poisoned")
-            .parents = Some(Arc::clone(&built));
+        state.write().expect("shard state lock poisoned").parents = Some(Arc::clone(&built));
         built
     }
 
@@ -1057,7 +1056,11 @@ impl NodeServiceImpl {
     /// tear. Replacing an existing generation renames it aside first; the
     /// crash window between the two renames is covered by
     /// [`recover_generation`] at startup.
-    fn apply_snapshot(&self, tmp_dir: &Path, with_bm25: bool) -> Result<InstallSnapshotResponse, Status> {
+    fn apply_snapshot(
+        &self,
+        tmp_dir: &Path,
+        with_bm25: bool,
+    ) -> Result<InstallSnapshotResponse, Status> {
         let path = self
             .config
             .index_path
@@ -1114,7 +1117,10 @@ impl NodeServiceImpl {
 
         guard.bm25 = if with_bm25 {
             Some(Bm25Shard::open(&generation_bm25(&snap)).map_err(|e| {
-                Status::internal(format!("open installed {}: {e}", generation_bm25(&snap).display()))
+                Status::internal(format!(
+                    "open installed {}: {e}",
+                    generation_bm25(&snap).display()
+                ))
             })?)
         } else {
             // Wholesale replacement: an image without a sidecar replaces
@@ -1265,7 +1271,10 @@ impl NodeServiceImpl {
                     guard.index.as_mut().expect("just constructed")
                 }
             };
-            (self.config.slot_offset + index.len() as u64, index.bit_width())
+            (
+                self.config.slot_offset + index.len() as u64,
+                index.bit_width(),
+            )
         };
         // Apply first, log after, under this one lock. A failed apply
         // must never reach the log: its assigned ids would be reused by
@@ -1426,7 +1435,9 @@ impl NodeServiceImpl {
         // Same seed rule as the flat path: one f32 ULP below the k-th
         // fused score when the heap filled, 0 otherwise.
         let kth_best = if hits.len() == req.k as usize {
-            hits.last().map(|h| bm25::floor_seed(h.score)).unwrap_or(0.0)
+            hits.last()
+                .map(|h| bm25::floor_seed(h.score))
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -1925,9 +1936,8 @@ impl NodeServiceImpl {
                                 next_apply += 1;
                             }
                         }
-                        session =
-                            crate::analyzer::AnalyzeStream::open(addr, doc.analysis.as_ref())
-                                .await?;
+                        session = crate::analyzer::AnalyzeStream::open(addr, doc.analysis.as_ref())
+                            .await?;
                         spec = doc.analysis.clone();
                         submit = Some(session.submitter());
                     }
@@ -1949,7 +1959,6 @@ impl NodeServiceImpl {
         }
         Ok(())
     }
-
 }
 
 #[tonic::async_trait]
@@ -2031,9 +2040,9 @@ impl NodeService for NodeServiceImpl {
                 if share && floor > last_published + floor_delta {
                     last_published = floor;
                     let _ = scan_tx.try_send(Ok(SearchShardResponse {
-                        payload: Some(search_shard_response::Payload::FloorUpdate(
-                            FloorUpdate { floor },
-                        )),
+                        payload: Some(search_shard_response::Payload::FloorUpdate(FloorUpdate {
+                            floor,
+                        })),
                     }));
                 }
             };
@@ -2079,9 +2088,7 @@ impl NodeService for NodeServiceImpl {
                         Status::failed_precondition("shard index disappeared mid-setup")
                     })?;
                     if index.len() != parents.len() {
-                        return Err(Status::aborted(
-                            "shard grew between setup and scan; retry",
-                        ));
+                        return Err(Status::aborted("shard grew between setup and scan; retry"));
                     }
                     Ok(chunked_topk_collapsed(
                         index,
@@ -2260,9 +2267,7 @@ impl NodeService for NodeServiceImpl {
             slot_offset: self.config.slot_offset,
             bm25_docs,
             bm25_building,
-            ingest_active: self
-                .ingest_busy
-                .load(std::sync::atomic::Ordering::Acquire),
+            ingest_active: self.ingest_busy.load(std::sync::atomic::Ordering::Acquire),
         }))
     }
 
@@ -2297,7 +2302,9 @@ impl NodeService for NodeServiceImpl {
             };
             if start.initial_floor.is_some_and(f32::is_nan) {
                 let _ = tx
-                    .send(Err(Status::invalid_argument("initial_floor must not be NaN")))
+                    .send(Err(Status::invalid_argument(
+                        "initial_floor must not be NaN",
+                    )))
                     .await;
                 return;
             }
@@ -2408,15 +2415,12 @@ impl NodeService for NodeServiceImpl {
                             // carry live slots; a negative would be an
                             // engine contract break, dropped rather
                             // than wrapped into a bogus global id.
-                            let mut hits: Vec<u8> =
-                                Vec::with_capacity(stride * batch.slots.len());
+                            let mut hits: Vec<u8> = Vec::with_capacity(stride * batch.slots.len());
                             for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
                                 if slot < 0 {
                                     continue;
                                 }
-                                hits.extend_from_slice(
-                                    &(slot_offset + slot as u64).to_le_bytes(),
-                                );
+                                hits.extend_from_slice(&(slot_offset + slot as u64).to_le_bytes());
                                 hits.extend_from_slice(&score.to_le_bytes());
                                 if let Some(p) = parents.as_deref() {
                                     hits.extend_from_slice(&p[slot as usize].to_le_bytes());
@@ -2810,7 +2814,9 @@ impl NodeService for NodeServiceImpl {
         // when the heap filled (so a later f32 seed never exceeds the
         // true k-th best — ties at the floor survive), 0 otherwise.
         let kth_best = if hits.len() == req.k as usize {
-            hits.last().map(|h| bm25::floor_seed(h.score)).unwrap_or(0.0)
+            hits.last()
+                .map(|h| bm25::floor_seed(h.score))
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -3045,9 +3051,7 @@ mod floor_lane_tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn cell_of(cells: &std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>>, token: u64) -> f32 {
-        f32::from_bits(
-            cells.lock().unwrap()[&token].load(Ordering::Acquire),
-        )
+        f32::from_bits(cells.lock().unwrap()[&token].load(Ordering::Acquire))
     }
 
     fn datagram(token: u64, floor: f32) -> Vec<u8> {
@@ -3063,10 +3067,10 @@ mod floor_lane_tests {
     fn floor_datagrams_fold_monotonically_and_ignore_garbage() {
         let cells: std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>> =
             std::sync::Mutex::new(HashMap::new());
-        cells.lock().unwrap().insert(
-            7,
-            Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())),
-        );
+        cells
+            .lock()
+            .unwrap()
+            .insert(7, Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())));
 
         apply_floor_datagram(&cells, &datagram(7, 0.25));
         assert_eq!(cell_of(&cells, 7), 0.25);

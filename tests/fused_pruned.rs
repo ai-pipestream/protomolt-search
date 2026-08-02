@@ -425,7 +425,10 @@ fn fused_ties_at_floor_and_kth_slot() {
     let tie_score = oracle[0].score;
     assert!(oracle.iter().all(|h| h.score == tie_score));
     let want_ids: Vec<u32> = (0..10).collect();
-    assert_eq!(oracle.iter().map(|h| h.doc_id).collect::<Vec<_>>(), want_ids);
+    assert_eq!(
+        oracle.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+        want_ids
+    );
     let pruned = |floor: f64| {
         bm25::top_k_fused_pruned(
             &[
@@ -458,7 +461,10 @@ fn fused_ties_at_floor_and_kth_slot() {
     }
     // A hair above the tie: nothing survives.
     let got = pruned(tie_score + 1e-9);
-    assert!(got.is_empty(), "floor above every score must return nothing");
+    assert!(
+        got.is_empty(),
+        "floor above every score must return nothing"
+    );
 
     // Corpus B: the k-th slot ties ACROSS blocks — 12 high docs (name
     // field present) spread over 300 body-only docs; k=10 keeps the
@@ -732,7 +738,11 @@ fn fused_fallbacks_match_exhaustive() {
             k,
             floor,
         );
-        assert_eq!(sig(&want), sig(&got), "heap-store fallback, floor {floor:e}");
+        assert_eq!(
+            sig(&want),
+            sig(&got),
+            "heap-store fallback, floor {floor:e}"
+        );
     }
 
     // Reader with impacts but a negative weight: same fallback.
