@@ -287,7 +287,7 @@ impl Default for SearchBody {
             text: String::new(),
             vector: None,
             k: 10,
-            mode: "cascade".to_string(),
+            mode: "global_rank".to_string(),
             leg_k: 0,
             rrf_k: 0.0,
             vector_weight: 0.0,
@@ -331,9 +331,21 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
     };
     let embed_ms = t_embed.elapsed().as_secs_f32() * 1e3;
 
+    // GLOBAL_RANK by default, not CASCADE. Cascade generates candidates
+    // from the vector leg and only RERANKS that pool by BM25, so the
+    // lexical leg cannot introduce a document. Measured over 36 queries
+    // on the 86.6M-chunk corpus: cascade retained 0% of the pure-lexical
+    // top-10 on every one of them, where global_rank retained 41%. On a
+    // short query the vector leg's own top hits are section headings
+    // whose text IS the query ("QUALIFIED IMMUNITY", "B. Qualified
+    // Immunity"), and cascade hands all of them straight through --
+    // mean length of its top 6 was 3 words against global_rank's 130.
+    // Global rank is also the faster of the two here (p50 380 vs 428 ms,
+    // p99 579 vs 686) and is the mode documented as reproducing the
+    // monolithic result exactly.
     let fusion_mode = match req.mode.as_str() {
-        "cascade" | "" => FusionMode::Cascade,
-        "global_rank" => FusionMode::GlobalRank,
+        "global_rank" | "" => FusionMode::GlobalRank,
+        "cascade" => FusionMode::Cascade,
         "score_blend" => FusionMode::ScoreBlend,
         "two_level" => FusionMode::TwoLevel,
         other => return Err(format!("unknown mode {other:?}")),
