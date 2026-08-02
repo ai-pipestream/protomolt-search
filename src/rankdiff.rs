@@ -155,14 +155,25 @@ pub fn rbo(a: &[u64], b: &[u64], p: f64) -> f64 {
 /// equivalent documents, which is the near-duplicate tie signature; a
 /// large regret means it actually reached for worse ones.
 ///
-/// Consequently the mean is >= 0 for a properly sorted reference. A
-/// negative value means the reference list handed in was not in
-/// descending score order, which is a caller error worth noticing rather
-/// than a discovery.
-///
 /// A variant doc the reference never scored is skipped and counted in the
 /// returned `unscored`: it may be genuinely better or genuinely worse and
 /// this measure cannot tell, so it must not be quietly averaged in.
+///
+/// READ THE SIGN ONLY WHEN `unscored` IS 0. The cancellation above needs
+/// the compared ranks to be a permutation of the reference's own prefix.
+/// Skipping unscored ranks breaks that: the surviving comparisons are a
+/// SUBSET, the terms no longer pair off, and the mean can come out
+/// negative without the reference being mis-sorted. A negative mean then
+/// says only that on the ranks where a comparison was possible, the
+/// variant happened to hold documents the reference scored above its own
+/// documents at those positions -- an artifact of which ranks dropped
+/// out, not a claim that the variant beat the reference.
+///
+/// So `unscored` is not a footnote, it is the precondition. At
+/// `unscored == 0` the mean is >= 0 and means what it says; as `unscored`
+/// grows the two arms have diverged past what this measure can judge, and
+/// the ranking-order measures ([`rbo`], [`kendall_tau`]) are what remain
+/// interpretable.
 pub fn score_regret(reference: &[(u64, f32)], variant: &[u64], k: usize) -> ScoreRegret {
     let table: HashMap<u64, f32> = reference.iter().copied().collect();
     let depth = k.min(reference.len()).min(variant.len());
@@ -190,9 +201,10 @@ pub fn score_regret(reference: &[(u64, f32)], variant: &[u64], k: usize) -> Scor
 /// The result of [`score_regret`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoreRegret {
-    /// Mean score given up per compared rank, >= 0 for a reference in
-    /// descending score order. A negative value means the reference was
-    /// not sorted, which is a caller error rather than a finding.
+    /// Mean score given up per compared rank. Interpretable only when
+    /// `unscored` is 0, where it is >= 0 for a descending reference; with
+    /// unscored ranks the comparison is a subset and the sign carries no
+    /// meaning. See [`score_regret`].
     pub mean: f64,
     /// Ranks where both sides had a reference score.
     pub counted: usize,
@@ -313,6 +325,38 @@ mod tests {
         let r = score_regret(&reference, &variant, 2);
         assert_eq!(r.unscored, 1, "doc 99 has no reference score");
         assert_eq!(r.counted, 1);
+    }
+
+    #[test]
+    fn unscored_ranks_break_the_cancellation_so_the_sign_stops_meaning_anything() {
+        // Observed live on the canary cluster before it was understood:
+        // a caption-weighted arm reported NEGATIVE regret, which the docs
+        // then called impossible against a sorted reference.
+        //
+        // The cancellation needs the compared ranks to be a permutation
+        // of the reference's prefix. Here the variant drops doc 4 and
+        // introduces unknown 99, so rank 3 is skipped and the survivors
+        // no longer pair off: doc 1 (the reference's best) is compared
+        // against the reference's rank-1 score, and the sum goes
+        // negative without the reference being mis-sorted.
+        let reference = [(1u64, 0.9f32), (2, 0.6), (3, 0.5), (4, 0.4)];
+        let variant = [2u64, 1, 99, 3];
+        let r = score_regret(&reference, &variant, 4);
+        assert_eq!(r.unscored, 1, "99 is outside the reference");
+        assert_eq!(r.counted, 3);
+        assert!(
+            r.mean < 0.0,
+            "negative regret must be reachable via unscored ranks: {r:?}"
+        );
+
+        // And with every variant doc scored, the same reordering cancels
+        // exactly -- the sign is only trustworthy at unscored == 0.
+        let whole = score_regret(&reference, &[2u64, 1, 4, 3], 4);
+        assert_eq!(whole.unscored, 0);
+        assert!(
+            whole.mean.abs() < 1e-12,
+            "a pure permutation must still cancel: {whole:?}"
+        );
     }
 
     #[test]

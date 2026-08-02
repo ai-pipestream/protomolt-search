@@ -148,9 +148,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if d.regret_unscored > 0 {
             // Not folded into the mean: these are documents the reference
-            // never scored, so regret genuinely cannot judge them.
+            // never scored, so regret genuinely cannot judge them. Their
+            // presence also breaks the cancellation that makes regret's
+            // sign readable, so say so rather than letting the number be
+            // read as "the variant did better".
             println!(
-                "{:<20} {} of {} results were outside the reference entirely",
+                "{:<20} {} of {} outside the reference: regret is a subset \
+                 comparison here, read tau/rbo instead",
                 "", d.regret_unscored, d.depth
             );
         }

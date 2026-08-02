@@ -1627,6 +1627,11 @@ message RankingDiff {
   // documents cancels to exactly 0. Read it WITH kendall_tau: a large tau
   // change at zero regret is the near-duplicate shuffle signature, while
   // real regret means the variant reached for worse documents.
+  //
+  // The SIGN is only meaningful when regret_unscored below is 0. The
+  // cancellation needs the compared ranks to be a permutation of the
+  // reference's own prefix, and skipped ranks break that, so a divergent
+  // variant can report a negative mean that says nothing about quality.
   float score_regret = 8;
   // Ranks where both the reference and the variant's document had a
   // reference score, so the regret term above is a mean over these.
