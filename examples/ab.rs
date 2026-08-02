@@ -89,10 +89,57 @@ fn parse_arm(spec: &str, text: &str) -> Result<SearchVariant, String> {
     })
 }
 
+/// Running totals for a whole query set.
+///
+/// One query's diff is an observation, not a decision: the arms can
+/// disagree wildly on a query neither answers well. A choice between two
+/// analysis chains needs the aggregate, and the SPREAD matters as much as
+/// the mean -- a chain that helps half the queries and hurts the other
+/// half averages to "no change" and is not that.
+#[derive(Default)]
+struct Totals {
+    queries: usize,
+    overlap: f64,
+    tau: f64,
+    rbo: f64,
+    flips: usize,
+    diverged: usize,
+    tau_worse: usize,
+    tau_better: usize,
+    incomparable: usize,
+}
+
+impl Totals {
+    /// Returns false when the query could not be compared at all, so
+    /// the caller can report it separately instead of averaging a
+    /// non-measurement into the summary.
+    fn add(&mut self, d: &turbovec_search::pb::RankingDiff) -> bool {
+        if d.depth == 0 {
+            self.incomparable += 1;
+            return false;
+        }
+        self.queries += 1;
+        self.overlap += f64::from(d.overlap_fraction);
+        self.tau += f64::from(d.kendall_tau);
+        self.rbo += f64::from(d.rbo);
+        self.flips += usize::from(d.top1_flipped);
+        self.diverged += usize::from(d.regret_unscored > 0);
+        // Direction of disagreement, counted rather than averaged: the
+        // mean hides a split, and a split is the interesting outcome.
+        if d.kendall_tau < 0.99 {
+            if d.overlap_fraction < 0.5 {
+                self.tau_worse += 1;
+            } else {
+                self.tau_better += 1;
+            }
+        }
+        true
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coord = arg("coord", "127.0.0.1:59291");
-    let query = arg("query", "supreme court certiorari");
     let k: u32 = arg("k", "10").parse()?;
     let specs = args_all("arm");
     if specs.len() < 2 {
@@ -103,12 +150,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(2);
     }
+    let queries: Vec<String> = match arg("queries", "").as_str() {
+        "" => vec![arg("query", "supreme court certiorari")],
+        path => std::fs::read_to_string(path)?
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect(),
+    };
+    if queries.is_empty() {
+        eprintln!("no queries");
+        std::process::exit(2);
+    }
+    let mut client = SearchServiceClient::connect(format!("http://{coord}")).await?;
+
+    // Query-set mode: per-query one-liners, then the aggregate.
+    if queries.len() > 1 {
+        let mut totals: Vec<(String, Totals)> = Vec::new();
+        println!(
+            "{:<44} {:>7} {:>7} {:>8} {:>5}",
+            "query", "overlap", "tau-b", "rbo", "top1"
+        );
+        for q in &queries {
+            let variants: Vec<SearchVariant> = specs
+                .iter()
+                .map(|s| parse_arm(s, q))
+                .collect::<Result<_, _>>()?;
+            let resp = client
+                .variant_search(VariantSearchRequest {
+                    request_id: String::new(),
+                    variants,
+                    k,
+                    rbo_p: arg("rbo-p", "0").parse()?,
+                    interleave: false,
+                    interleave_seed: 0,
+                })
+                .await?
+                .into_inner();
+            for d in &resp.diffs {
+                if totals.iter().all(|(l, _)| *l != d.variant) {
+                    totals.push((d.variant.clone(), Totals::default()));
+                }
+                let slot = totals
+                    .iter_mut()
+                    .find(|(l, _)| *l == d.variant)
+                    .expect("just inserted");
+                let comparable = slot.1.add(d);
+                if resp.diffs.len() == 1 {
+                    let short: String = q.chars().take(44).collect();
+                    if comparable {
+                        println!(
+                            "{:<44} {:>6.0}% {:>7.3} {:>8.4} {:>5}",
+                            short,
+                            d.overlap_fraction * 100.0,
+                            d.kendall_tau,
+                            d.rbo,
+                            if d.top1_flipped { "FLIP" } else { "" }
+                        );
+                    } else {
+                        println!("{short:<44}    NOT COMPARABLE (an arm returned no hits)");
+                    }
+                }
+            }
+        }
+        println!("\nover {} queries:", queries.len());
+        for (label, t) in &totals {
+            let n = t.queries.max(1) as f64;
+            println!(
+                "  [{label}] mean overlap {:.0}%, mean tau {:.3}, mean rbo {:.4}",
+                t.overlap / n * 100.0,
+                t.tau / n,
+                t.rbo / n
+            );
+            println!(
+                "  {:<width$} top-1 changed on {} of {}; {} diverged past what regret can judge",
+                "",
+                t.flips,
+                t.queries,
+                t.diverged,
+                width = label.len() + 2
+            );
+            if t.incomparable > 0 {
+                // Excluded from every mean above, and said out loud: a
+                // query one arm cannot answer is a finding, and silently
+                // dropping it would shrink the denominator invisibly.
+                println!(
+                    "  {:<width$} {} more queries EXCLUDED: an arm returned no hits at all",
+                    "",
+                    t.incomparable,
+                    width = label.len() + 2
+                );
+            }
+            if t.tau_worse + t.tau_better > 0 {
+                println!(
+                    "  {:<width$} disagreed on {} ({} substantially, {} at the margins)",
+                    "",
+                    t.tau_worse + t.tau_better,
+                    t.tau_worse,
+                    t.tau_better,
+                    width = label.len() + 2
+                );
+            }
+        }
+        println!(
+            "\nThese measure disagreement, not quality. Pick the winner with labels \n\
+             or by interleaving (--interleave on a single query), not from this table."
+        );
+        return Ok(());
+    }
+
+    let query = &queries[0];
     let variants: Vec<SearchVariant> = specs
         .iter()
-        .map(|s| parse_arm(s, &query))
+        .map(|s| parse_arm(s, query))
         .collect::<Result<_, _>>()?;
-
-    let mut client = SearchServiceClient::connect(format!("http://{coord}")).await?;
     let resp = client
         .variant_search(VariantSearchRequest {
             request_id: String::new(),
@@ -124,6 +280,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("query: {query:?}   k={k}   request {}", resp.request_id);
     println!();
     for r in &resp.results {
+        // An arm that matched nothing is a fact about the arm, not a
+        // ranking to compare: say so where it cannot be missed, because
+        // every measure below degenerates on it.
+        if r.hits.is_empty() {
+            println!("[{}]  NO HITS -- this arm matched no document", r.label);
+            continue;
+        }
         println!("[{}]  {} hits  {:.1} ms", r.label, r.hits.len(), r.elapsed_ms);
         for (i, h) in r.hits.iter().enumerate() {
             println!("  {:>3}. {:<14} {:.6}", i + 1, h.doc_id, h.score);
@@ -136,6 +299,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "vs reference", "depth", "overlap", "tau-b", "rbo", "regret", "top1"
     );
     for d in &resp.diffs {
+        // depth 0 means one arm returned nothing, so there was no
+        // comparison to make. Printing the numbers anyway would show a
+        // row of plausible values for a measurement that did not happen.
+        if d.depth == 0 {
+            println!(
+                "{:<20} {:>6} NOT COMPARABLE -- an arm returned no hits",
+                d.variant, d.depth
+            );
+            continue;
+        }
         println!(
             "{:<20} {:>6} {:>7.0}% {:>8.3} {:>10.4} {:>8.4} {:>6}",
             d.variant,

@@ -53,6 +53,12 @@ pub fn overlap_at_k(a: &[u64], b: &[u64], k: usize) -> f64 {
 /// is a real, and equal, statement about all of them. Tau-b is the
 /// variant that corrects for exactly those ties.
 pub fn kendall_tau(a: &[u64], b: &[u64]) -> f64 {
+    // Exact agreement is the only thing that earns 1.0, and it is worth
+    // deciding up front: below, a zero denominator ALSO produces no
+    // information, and the two must not be confused.
+    if a == b {
+        return 1.0;
+    }
     let union: Vec<u64> = {
         let mut seen = HashSet::new();
         a.iter()
@@ -62,7 +68,9 @@ pub fn kendall_tau(a: &[u64], b: &[u64]) -> f64 {
             .collect()
     };
     if union.len() < 2 {
-        return 1.0;
+        // The lists differ but there is no pair to compare them on: one
+        // is empty and the other holds a single result. No association.
+        return 0.0;
     }
     let rank_of = |list: &[u64]| -> HashMap<u64, usize> {
         list.iter().enumerate().map(|(i, id)| (*id, i)).collect()
@@ -93,7 +101,17 @@ pub fn kendall_tau(a: &[u64], b: &[u64]) -> f64 {
     let pairs = (union.len() * (union.len() - 1) / 2) as i64;
     let denom = (((pairs - ties_a) as f64) * ((pairs - ties_b) as f64)).sqrt();
     if denom == 0.0 {
-        return 1.0;
+        // One side ties every pair, so it carries no ordering
+        // information: an EMPTY ranking is the common case, since every
+        // union member is equally absent from it. Tau-b is undefined
+        // here, and 0.0 (no association) is the honest report.
+        //
+        // Returning 1.0 was the original behaviour and is badly wrong:
+        // it says an arm that returned nothing agrees perfectly with one
+        // that returned ten results. Found by running a 36-query set
+        // where one arm matched no document -- overlap 0%, rbo 0.0, and
+        // tau 1.000 side by side in the same row.
+        return 0.0;
     }
     (concordant - discordant) as f64 / denom
 }
@@ -188,8 +206,14 @@ pub fn score_regret(reference: &[(u64, f32)], variant: &[u64], k: usize) -> Scor
         }
     }
     ScoreRegret {
+        // NaN, not 0.0, when nothing was comparable. Zero regret reads
+        // as "gave up nothing", which is the opposite of "could not
+        // measure": it is the BEST possible value standing in for no
+        // value at all. NaN cannot be mistaken for a result, does not
+        // average into a summary, and shows up as NaN wherever it is
+        // printed -- it fails loud instead of looking good.
         mean: if counted == 0 {
-            0.0
+            f64::NAN
         } else {
             total / counted as f64
         },
@@ -201,10 +225,12 @@ pub fn score_regret(reference: &[(u64, f32)], variant: &[u64], k: usize) -> Scor
 /// The result of [`score_regret`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoreRegret {
-    /// Mean score given up per compared rank. Interpretable only when
-    /// `unscored` is 0, where it is >= 0 for a descending reference; with
-    /// unscored ranks the comparison is a subset and the sign carries no
-    /// meaning. See [`score_regret`].
+    /// Mean score given up per compared rank, or NaN when `counted` is 0
+    /// and there was nothing to compare.
+    ///
+    /// Interpretable only when `unscored` is 0, where it is >= 0 for a
+    /// descending reference; with unscored ranks the comparison is a
+    /// subset and the sign carries no meaning. See [`score_regret`].
     pub mean: f64,
     /// Ranks where both sides had a reference score.
     pub counted: usize,
@@ -287,6 +313,45 @@ mod tests {
             "dropping half the results cannot be perfect agreement"
         );
         assert!(tau > 0.0, "the order it did return still agrees: {tau}");
+    }
+
+    #[test]
+    fn unmeasurable_regret_is_nan_not_a_flattering_zero() {
+        // counted == 0 means nothing could be compared. Reporting 0.0
+        // there hands back the BEST possible value in place of no value,
+        // which is how an unmeasured arm comes to look like a perfect
+        // one. NaN cannot be read as a result and will not average into
+        // a summary.
+        let reference = [(1u64, 0.9f32), (2, 0.5)];
+        let r = score_regret(&reference, &[97u64, 98], 2);
+        assert_eq!(r.counted, 0, "neither variant doc is in the reference");
+        assert_eq!(r.unscored, 2);
+        assert!(r.mean.is_nan(), "unmeasurable regret must be NaN: {r:?}");
+        // An empty variant is the same situation.
+        assert!(score_regret(&reference, &[], 2).mean.is_nan());
+        // And a real comparison still produces a real number.
+        assert!(score_regret(&reference, &[1u64, 2], 2).mean.is_finite());
+    }
+
+    #[test]
+    fn an_empty_ranking_never_reads_as_agreement() {
+        // Found live: an arm that matched no document scored tau 1.000
+        // against an arm that returned ten, on the same row as overlap
+        // 0% and rbo 0.0000. Every union member is equally absent from
+        // the empty list, so every pair ties, the denominator goes to
+        // zero, and the old code called that perfect agreement.
+        let full = [10u64, 20, 30];
+        assert_eq!(kendall_tau(&[], &full), 0.0, "nothing agrees with everything");
+        assert_eq!(kendall_tau(&full, &[]), 0.0, "and it is symmetric");
+        // The one-result case has no pair to compare at all.
+        assert_eq!(kendall_tau(&[], &[10u64]), 0.0);
+        assert_eq!(kendall_tau(&[10u64], &[]), 0.0);
+        // Two empties really are identical, and still agree.
+        assert_eq!(kendall_tau(&[], &[]), 1.0);
+        assert_eq!(kendall_tau(&full, &full), 1.0);
+        // The other measures already said so; tau now matches them.
+        assert_eq!(overlap_at_k(&[], &full, 3), 0.0);
+        assert_eq!(rbo(&[], &full, 0.9), 0.0);
     }
 
     #[test]

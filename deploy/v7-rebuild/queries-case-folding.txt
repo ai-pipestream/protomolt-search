@@ -1,0 +1,68 @@
+# Query set for the fold-then-stem A/B (SOURCE_STEMS vs
+# SOURCE_NORMALIZED_STEMS on a body column).
+#
+# Chosen for the defect under test, not for general coverage. Porter only
+# transforms lower-case input, so under SOURCE_STEMS a capitalized word is
+# indexed as its literal surface form and never meets the stem its
+# lower-case twin produces. That splits a term in two exactly where legal
+# text capitalizes: captions, party names, court names, statutory titles,
+# and the ALL-CAPS headings that opinions are full of.
+#
+# So these are lower-case queries whose target text is very often NOT.
+# A query whose terms are lower-case in both the query and the corpus
+# cannot distinguish the two chains, and padding the set with those would
+# dilute the measurement into "no change" no matter what the truth is.
+#
+# Run:
+#   ab --coord=... --queries=queries-case-folding.txt \
+#      --arm=stems=body --arm=folded=body_norm --k=10
+
+# Court and caption vocabulary: capitalized in nearly every opinion.
+supreme court certiorari denied
+united states court of appeals for the ninth circuit
+district court granted summary judgment
+in re application of the united states
+petition for writ of habeas corpus
+state of california v superior court
+commissioner of internal revenue
+national labor relations board
+securities and exchange commission
+environmental protection agency
+
+# Statutory and rule titles: title case in the text, lower case in queries.
+federal rules of civil procedure rule 12b6
+americans with disabilities act
+fair labor standards act overtime
+freedom of information act exemption
+title vii employment discrimination
+sherman antitrust act section 1
+uniform commercial code article 9
+bankruptcy code chapter 11 reorganization
+
+# Doctrine names, frequently capitalized mid-sentence in opinions.
+qualified immunity clearly established right
+strict scrutiny compelling government interest
+res judicata collateral estoppel
+respondeat superior vicarious liability
+proximate cause foreseeability
+harmless error standard of review
+de novo review of questions of law
+abuse of discretion standard
+
+# Stemming and folding interacting: plurals and inflections of words that
+# also appear capitalized. This is where the two chains should differ most,
+# because SOURCE_STEMS folds neither and NORMALIZED_STEMS does both.
+appellants argued the courts erred
+defendants motions were denied
+the judges findings of fact
+plaintiffs claims were dismissed
+respondents brief in opposition
+petitioners application for review
+
+# Control group: entirely lower-case in ordinary prose, so both chains
+# should agree. Divergence HERE would mean the normalizer changed
+# something other than case, which is the failure mode worth catching.
+the burden of proof rests with the moving party
+evidence was insufficient to support the verdict
+remanded for further proceedings consistent with this opinion
+the contract was unenforceable for lack of consideration
