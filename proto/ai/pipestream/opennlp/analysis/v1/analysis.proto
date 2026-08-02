@@ -521,6 +521,26 @@ message TermVectorOptions {
     // changes term identity, so it belongs in a parallel column's spec,
     // never silently in the body's.
     NORMALIZER_STEP_SPELLCHECK = 23;
+
+    // Joins words split by typesetting hyphenation at a line break:
+    // "litiga-\ntion" -> "litigation" (also "com-\r\n  plete" -> "complete",
+    // and soft hyphens U+00AD). Only fires between two letters; an inline
+    // hyphen ("well-known") is untouched. The hyphen is always deleted,
+    // which is right for typeset hyphenation and wrong for a genuinely
+    // hyphenated compound split at its hyphen ("well-\nknown" -> "wellknown")
+    // - telling those apart needs a dictionary, which this step deliberately
+    // does not consult.
+    //
+    // This is the one COUNT-CHANGING step: two tokens become one. It is
+    // therefore only valid for SOURCE_TOKENS term identity, where the server
+    // re-tokenizes the normalized text and maps every occurrence span back
+    // to the original offsets (the joined term's span covers the hyphen and
+    // line break in the original). It requires every step in the spec to be
+    // offset-aware: a spec combining it with a step that cannot report an
+    // alignment (NFKC, NFC, CONFUSABLE_SKELETON, ACCENT_FOLD, CASE_FOLD,
+    // URL, NUMBER, SOCIAL_MEDIA, SHRINK, SPELLCHECK) fails with
+    // INVALID_ARGUMENT, as does using it with SOURCE_STEMS.
+    NORMALIZER_STEP_DEHYPHENATE = 24;
   }
 
   // Which layer supplies term identity. This choice decides what a "term" is:
@@ -1033,4 +1053,9 @@ message GetCapabilitiesResponse {
   // Whether a SymSpell spell-check model is configured and
   // NORMALIZER_STEP_SPELLCHECK requests are served without skipping the step.
   bool spellcheck_available = 18;
+
+  // Always true: line-break de-hyphenation (NORMALIZER_STEP_DEHYPHENATE) is
+  // model-free. Reported so a client can tell the feature exists on this
+  // server.
+  bool dehyphenation_available = 19;
 }
