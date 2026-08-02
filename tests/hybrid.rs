@@ -1256,3 +1256,129 @@ async fn debug_block_profiles_every_fusion_mode() {
         handle.abort();
     }
 }
+
+/// A leg disabled by a zero weight must not be SCANNED, not merely
+/// discarded at fusion time.
+///
+/// Both fusion functions skip a zero-weight leg, so results were always
+/// correct and this looked settled. But the shard has no weight field to
+/// read: it gates the vector scan on a non-empty `vector` and the BM25
+/// scan on non-empty `terms`, so the coordinator sending both payloads
+/// bought a full scan whose output was then thrown away. On the
+/// 86.6M-chunk fleet a `vector_weight: 0` query still paid ~320 ms of
+/// vector scan out of ~340 ms total — "bm25-only" cost 20x the lexical
+/// leg's own 17 ms.
+///
+/// Result equality is asserted by the leg-disabling test above; what is
+/// under test here is the per-shard hit counts in the debug block, which
+/// report what the shard actually produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x1111_000a);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let mut texts: Vec<String> = (0..2 * SHARD_DOCS)
+        .map(|i| format!("plain document number {i} about nothing special"))
+        .collect();
+    texts[0] = "zebra stripes everywhere".to_string();
+    texts[5] = "another zebra crossing".to_string();
+
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for shard in 0..2usize {
+        let start = shard * SHARD_DOCS;
+        let vecs = corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec();
+        let (addr, handle) = start_hybrid_shard(
+            &analysis,
+            (shard * SHARD_DOCS) as u64,
+            &texts[start..start + SHARD_DOCS],
+            vecs,
+            &shift,
+            &scale,
+        )
+        .await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
+    let query = corpus[..DIM].to_vec();
+
+    // Control: both legs on, both legs report work.
+    let (_, debug) = coordinator
+        .fanout_hybrid("both", "zebra", &query, 8, None, legs_default(), true)
+        .await
+        .unwrap();
+    let debug = debug.unwrap();
+    assert!(
+        debug.shards.iter().all(|s| s.vector_hits > 0),
+        "control: every shard should run the vector leg"
+    );
+    assert!(
+        debug.shards.iter().any(|s| s.bm25_hits > 0),
+        "control: zebra should reach some shard's lexical leg"
+    );
+
+    // Vector leg off: no shard may report a single vector hit.
+    let (_, debug) = coordinator
+        .fanout_hybrid(
+            "novec",
+            "zebra",
+            &query,
+            8,
+            None,
+            HybridLegs {
+                vector_weight: 0.0,
+                ..legs_default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    let debug = debug.unwrap();
+    assert!(
+        debug.shards.iter().all(|s| s.vector_hits == 0),
+        "vector_weight 0 must not scan: {:?}",
+        debug
+            .shards
+            .iter()
+            .map(|s| s.vector_hits)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        debug.shards.iter().any(|s| s.bm25_hits > 0),
+        "the surviving leg must still run"
+    );
+
+    // BM25 leg off: the mirror image.
+    let (_, debug) = coordinator
+        .fanout_hybrid(
+            "nobm25",
+            "zebra",
+            &query,
+            8,
+            None,
+            HybridLegs {
+                bm25_weight: 0.0,
+                ..legs_default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    let debug = debug.unwrap();
+    assert!(
+        debug.shards.iter().all(|s| s.bm25_hits == 0),
+        "bm25_weight 0 must not scan: {:?}",
+        debug.shards.iter().map(|s| s.bm25_hits).collect::<Vec<_>>()
+    );
+    assert!(
+        debug.shards.iter().all(|s| s.vector_hits > 0),
+        "the surviving leg must still run"
+    );
+
+    mock.abort();
+    for handle in handles {
+        handle.abort();
+    }
+}

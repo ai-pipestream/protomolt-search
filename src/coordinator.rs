@@ -648,16 +648,17 @@ impl CoordinatorServiceImpl {
         debug: bool,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let t_legs = std::time::Instant::now();
+        let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = ShardLegsRequest {
                 request_id: String::new(),
                 k: legs.leg_k,
-                vector: vector.to_vec(),
-                terms: terms.to_vec(),
+                vector: leg_vector.clone(),
+                terms: leg_terms.clone(),
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
-                global_doc_frequencies: global.dfs.clone(),
+                global_doc_frequencies: leg_dfs.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
             };
@@ -819,16 +820,17 @@ impl CoordinatorServiceImpl {
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let t_legs = std::time::Instant::now();
         // Level one: per-shard local fusion.
+        let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = HybridShardRequest {
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
-                vector: vector.to_vec(),
-                terms: terms.to_vec(),
+                vector: leg_vector.clone(),
+                terms: leg_terms.clone(),
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
-                global_doc_frequencies: global.dfs.clone(),
+                global_doc_frequencies: leg_dfs.clone(),
                 vector_weight: legs.vector_weight,
                 bm25_weight: legs.bm25_weight,
                 rrf_k: legs.rrf_k as f32,
@@ -2713,6 +2715,40 @@ pub struct HybridLegs {
     pub min_vector_score: f32,
 }
 
+/// The per-leg payload to put on the wire, blanked for a leg this query
+/// has disabled.
+///
+/// A weight of exactly 0 disables a leg (see `HybridLegs`) and both
+/// fusion functions honor it — but they do so AFTER the shard has
+/// already scanned. A shard has no weight field to read; it gates the
+/// vector scan on a non-empty `vector` and the BM25 scan on non-empty
+/// `terms`, so sending a payload for a disabled leg buys a full scan
+/// whose result is then discarded. Measured on the 86.6M-chunk fleet: a
+/// `vector_weight: 0` query still paid ~320 ms of vector scan out of
+/// ~340 ms total, so "bm25-only" cost 20x what the lexical leg costs
+/// alone.
+///
+/// `dfs` travels with `terms` because `shard_legs` and `hybrid_shard`
+/// both reject a request whose lengths disagree.
+fn leg_payloads(
+    vector: &[f32],
+    terms: &[String],
+    global: &CorpusStats,
+    legs: HybridLegs,
+) -> (Vec<f32>, Vec<String>, Vec<u32>) {
+    let vector = if legs.vector_weight == 0.0 {
+        Vec::new()
+    } else {
+        vector.to_vec()
+    };
+    let (terms, dfs) = if legs.bm25_weight == 0.0 {
+        (Vec::new(), Vec::new())
+    } else {
+        (terms.to_vec(), global.dfs.clone())
+    };
+    (vector, terms, dfs)
+}
+
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
 /// per-shard scan statistics (in completion order), the latter powering the
 /// floor-sharing benchmark.
@@ -2968,6 +3004,16 @@ impl SearchService for CoordinatorServiceImpl {
         }
         if options.min_vector_score.is_nan() {
             return Err(Status::invalid_argument("min_vector_score must not be NaN"));
+        }
+        // A floor on the vector leg's score cannot be met by a query that
+        // does not run the vector leg. Fusion would drop every hit and
+        // return an empty result set, which reads as "nothing matched"
+        // rather than "you asked for two contradictory things".
+        if options.min_vector_score > 0.0 && vector_weight == 0.0 {
+            return Err(Status::invalid_argument(
+                "min_vector_score is set but the vector leg is disabled (vector_weight 0); \
+                 no hit can carry a qualifying vector score",
+            ));
         }
         let legs = HybridLegs {
             leg_k: if options.leg_k == 0 {
