@@ -73,6 +73,30 @@ pub struct NodeConfig {
     /// behavior); a small positive delta trades a sliver of pruning
     /// reactivity for far fewer floor messages on real networks.
     pub floor_delta: f32,
+    /// Publish opportunities to SKIP before the first floor goes out.
+    ///
+    /// The scanner offers a floor after every chunk in which its heap is
+    /// full, so on a large shard that is one message per chunk for the
+    /// whole scan. The earliest floors are also the weakest: they prune
+    /// least, yet each one costs a coordinator broadcast to EVERY shard.
+    /// Skipping the first few trades a little early pruning for a large
+    /// cut in messages. 0 keeps the historical behavior.
+    ///
+    /// Measured on the 86.6M-chunk corpus: 42 chunks per shard, so 42
+    /// publishes per shard per query, 336 across the fleet. Note that a
+    /// CANDIDATE-count warmup does not bite at this granularity -- the
+    /// first chunk alone collects ~6,000 candidates, so the heap is full
+    /// almost immediately; chunks are the unit that actually gates.
+    pub floor_warmup_chunks: u32,
+    /// Minimum wall time between two published floors, in milliseconds.
+    ///
+    /// Independent of `floor_delta`, which gates on score movement: a
+    /// scan can raise its floor meaningfully many times in quick
+    /// succession and still not be worth that many broadcasts. 0 disables
+    /// the debounce. Floors are monotone, so a suppressed one is never
+    /// lost information -- the next publish carries a floor at least as
+    /// high.
+    pub floor_min_interval_ms: u64,
     /// Bit width used when `AddVectors` constructs an index from scratch
     /// (no loaded index, no seeded calibration).
     pub bit_width: usize,
@@ -113,6 +137,8 @@ impl Default for NodeConfig {
             share_floors: true,
             block_max: true,
             floor_delta: 0.0,
+            floor_warmup_chunks: 0,
+            floor_min_interval_ms: 0,
             bit_width: 4,
             index_path: None,
             analysis_addr: None,
@@ -2047,16 +2073,40 @@ impl NodeService for NodeServiceImpl {
             // disposable (they are monotone, so the next chunk's publish
             // supersedes any dropped one). The terminal Done is sent
             // with `.await` below and cannot be dropped.
+            let warmup = config.floor_warmup_chunks;
+            let min_interval = (config.floor_min_interval_ms > 0)
+                .then(|| std::time::Duration::from_millis(config.floor_min_interval_ms));
             let mut last_published = f32::NEG_INFINITY;
+            let mut offers = 0u32;
+            let mut last_at: Option<std::time::Instant> = None;
             let publish_floor = move |floor: f32| {
-                if share && floor > last_published + floor_delta {
-                    last_published = floor;
-                    let _ = scan_tx.try_send(Ok(SearchShardResponse {
-                        payload: Some(search_shard_response::Payload::FloorUpdate(FloorUpdate {
-                            floor,
-                        })),
-                    }));
+                if !share {
+                    return;
                 }
+                // Skip the opening chunks: their floors are the weakest
+                // and cost a broadcast to every shard apiece.
+                offers += 1;
+                if offers <= warmup {
+                    return;
+                }
+                if floor <= last_published + floor_delta {
+                    return;
+                }
+                // Debounce. Suppressing a floor loses nothing: they are
+                // monotone, so the next one published is at least as
+                // high as the one dropped.
+                if let (Some(interval), Some(at)) = (min_interval, last_at) {
+                    if at.elapsed() < interval {
+                        return;
+                    }
+                }
+                last_published = floor;
+                last_at = Some(std::time::Instant::now());
+                let _ = scan_tx.try_send(Ok(SearchShardResponse {
+                    payload: Some(search_shard_response::Payload::FloorUpdate(FloorUpdate {
+                        floor,
+                    })),
+                }));
             };
             let external_floor = move || {
                 if share {

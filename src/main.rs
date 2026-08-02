@@ -196,6 +196,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     coalesce: cfg.coalesce,
                     scan_parallel: cfg.scan_parallel,
                     floor_delta: cfg.floor_delta,
+                    floor_warmup_chunks: cfg.floor_warmup_chunks,
+                    floor_min_interval_ms: cfg.floor_min_interval_ms,
                     bit_width: cfg.bit_width,
                     index_path: shard.index_path.clone(),
                     analysis_addr: shard.analysis_addr.clone(),

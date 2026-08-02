@@ -151,6 +151,12 @@ pub struct Config {
     /// Minimum score improvement before a node publishes its next floor
     /// (0.0 = publish every raise).
     pub floor_delta: f32,
+    /// Publish opportunities a node skips before its first floor goes
+    /// out (0 = publish from the first chunk, the historical behavior).
+    pub floor_warmup_chunks: u32,
+    /// Minimum milliseconds between two published floors (0 = no
+    /// debounce).
+    pub floor_min_interval_ms: u64,
     /// Coordinator: per-shard wall-clock deadline in milliseconds for one
     /// query's shard attempt (0 = no deadline).
     pub shard_deadline_ms: u64,
@@ -213,6 +219,8 @@ struct FileConfig {
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
     floor_delta: Option<f32>,
+    floor_warmup_chunks: Option<u32>,
+    floor_min_interval_ms: Option<u64>,
     shard_deadline_ms: Option<u64>,
     hedge_delay_ms: Option<u64>,
     max_message_mib: Option<usize>,
@@ -553,6 +561,30 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     })
     .transpose()?
     .unwrap_or(0.0);
+    let floor_warmup_chunks = opt(
+        args,
+        "floor-warmup-chunks",
+        "TURBOVEC_FLOOR_WARMUP_CHUNKS",
+        file.floor_warmup_chunks.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u32>()
+            .map_err(|e| format!("invalid floor-warmup-chunks: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(0);
+    let floor_min_interval_ms = opt(
+        args,
+        "floor-min-interval-ms",
+        "TURBOVEC_FLOOR_MIN_INTERVAL_MS",
+        file.floor_min_interval_ms.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid floor-min-interval-ms: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(0);
     let parse_ms = |key: &str, env: &str, file_val: Option<u64>| -> Result<u64, String> {
         opt(args, key, env, file_val.map(|v| v.to_string()).as_deref())
             .map(|s| {
@@ -712,6 +744,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         coalesce,
         scan_parallel,
         floor_delta,
+        floor_warmup_chunks,
+        floor_min_interval_ms,
         shard_deadline_ms,
         hedge_delay_ms,
         replica_addrs,
