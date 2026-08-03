@@ -9,6 +9,12 @@
 
 use crate::postings::{Bm25Index, Posting};
 
+/// A resolved score-function chain plus this shard's numeric-column
+/// read surface (`docs/score-functions.md`); `None` = no chain, and
+/// every chained scorer is then bit-identical to its unchained twin
+/// (the additions are gated, not forked).
+pub type ChainCtx<'a> = Option<(&'a crate::scorefn::ScoreChain, &'a dyn crate::scorefn::NumericRead)>;
+
 /// Default BM25 k1 (term-frequency saturation).
 pub const DEFAULT_K1: f64 = 1.2;
 /// Default BM25 b (document-length normalization).
@@ -232,8 +238,26 @@ pub fn top_k(
     params: Bm25Params,
     k: usize,
 ) -> Vec<ScoredDoc> {
+    top_k_chained(store, terms, stats, params, k, None)
+}
+
+/// [`top_k`] with a score-function chain applied to each document's
+/// BM25 score BEFORE ranking (`docs/score-functions.md`): the returned
+/// top-k and scores are on the FINAL scale.
+pub fn top_k_chained(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    chain: ChainCtx,
+) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     let avgdl = stats.avgdl();
+    let finish = |score: f64, doc_id: u32| match chain {
+        Some((c, cols)) => c.eval(score, doc_id, cols),
+        None => score,
+    };
     fn sort_truncate<T>(docs: &mut Vec<(u32, f64, T)>, k: usize) {
         docs.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -262,7 +286,7 @@ pub fn top_k(
         }
         let mut docs: Vec<(u32, f64, u64)> = scores
             .into_iter()
-            .map(|(doc_id, (score, mask))| (doc_id, score, mask))
+            .map(|(doc_id, (score, mask))| (doc_id, finish(score, doc_id), mask))
             .collect();
         sort_truncate(&mut docs, k);
         // Occurrences are fetched for the k survivors only — on a v5
@@ -299,7 +323,7 @@ pub fn top_k(
         }
         let mut docs: Vec<(u32, f64, Vec<usize>)> = scores
             .into_iter()
-            .map(|(doc_id, (score, tis))| (doc_id, score, tis))
+            .map(|(doc_id, (score, tis))| (doc_id, finish(score, doc_id), tis))
             .collect();
         sort_truncate(&mut docs, k);
         docs.into_iter()
@@ -324,6 +348,20 @@ pub fn top_k_exhaustive(
     stats: &CorpusStats,
     params: Bm25Params,
     k: usize,
+) -> Vec<ScoredDoc> {
+    top_k_exhaustive_chained(store, terms, stats, params, k, None)
+}
+
+/// [`top_k_exhaustive`] with a score-function chain — the exactness
+/// oracle for [`top_k_pruned_chained`]: walk everything, score, chain,
+/// rank.
+pub fn top_k_exhaustive_chained(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    chain: ChainCtx,
 ) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     type TermHits = Vec<(usize, Vec<(u32, u32)>)>;
@@ -350,7 +388,10 @@ pub fn top_k_exhaustive(
         .into_iter()
         .map(|(doc_id, (score, term_offsets))| ScoredDoc {
             doc_id,
-            score,
+            score: match chain {
+                Some((c, cols)) => c.eval(score, doc_id, cols),
+                None => score,
+            },
             term_offsets,
         })
         .collect();
@@ -550,8 +591,59 @@ pub fn top_k_pruned_stats(
     floor: f64,
     prune: &mut PruneStats,
 ) -> Vec<ScoredDoc> {
+    top_k_pruned_chained_stats(store, terms, stats, params, k, floor, None, prune)
+}
+
+/// [`top_k_pruned`] with a score-function chain
+/// (`docs/score-functions.md`): every bound sum is lifted through
+/// [`crate::scorefn::ScoreChain::bound`] before its inert test and
+/// every fully evaluated candidate is chained through
+/// [`crate::scorefn::ScoreChain::eval`] before insertion, so the heap,
+/// the seeded floor, and `kth_best` all operate on FINAL scores. Every
+/// stage is monotone non-decreasing in the incoming score and its
+/// bound covers the column's whole domain including absence, so "upper
+/// bound in, upper bound out" survives the composition and the skip
+/// tests stay sound. Bit-identical to [`top_k_exhaustive_chained`]
+/// (with the seed filter applied); with `chain` `None`, bit-identical
+/// to [`top_k_pruned`].
+pub fn top_k_pruned_chained(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    floor: f64,
+    chain: ChainCtx,
+) -> Vec<ScoredDoc> {
+    let mut prune = PruneStats::default();
+    top_k_pruned_chained_stats(store, terms, stats, params, k, floor, chain, &mut prune)
+}
+
+/// [`top_k_pruned_chained`] with skip accounting.
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_pruned_chained_stats(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    floor: f64,
+    chain: ChainCtx,
+    prune: &mut PruneStats,
+) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     let avgdl = stats.avgdl();
+    // Lift a bound to the final-score scale / finish a true score.
+    // With no chain both are identity, so every float op below is
+    // exactly the unchained scorer's.
+    let lift = |b: f64| match chain {
+        Some((c, _)) => c.bound(b),
+        None => b,
+    };
+    let finish = |score: f64, doc_id: u32| match chain {
+        Some((c, cols)) => c.eval(score, doc_id, cols),
+        None => score,
+    };
 
     // One cursor per scored term. Any missing impact surface falls the
     // whole query back to the exhaustive-in-heap-shape scorer.
@@ -604,7 +696,10 @@ pub fn top_k_pruned_stats(
     }
     let mut state: Vec<TermState> = Vec::new();
     if terms.len() > 128 {
-        return filter_to_floor(top_k(store, terms, stats, params, k), floor);
+        return filter_to_floor(
+            top_k_chained(store, terms, stats, params, k, chain),
+            floor,
+        );
     }
     for (ti, term) in terms.iter().enumerate() {
         // A term absent from THIS shard contributes 0 to every document
@@ -623,7 +718,10 @@ pub fn top_k_pruned_stats(
         let Some(cursor) = store.impacts(term) else {
             // Present here but no impact surface: a genuine format
             // limitation, and the only case that still forfeits pruning.
-            return filter_to_floor(top_k(store, terms, stats, params, k), floor);
+            return filter_to_floor(
+                top_k_chained(store, terms, stats, params, k, chain),
+                floor,
+            );
         };
         let idf = idf(stats.doc_count, stats.dfs[ti]);
         let l1_max = idf
@@ -692,11 +790,11 @@ pub fn top_k_pruned_stats(
             }
         }
         // 1. Termination on the static whole-term bounds.
-        if inert(static_sum) {
+        if inert(lift(static_sum)) {
             break;
         }
         // 2a. Level-1 skip: whole 4096-posting groups at one test.
-        if inert(l1_sum) {
+        if inert(lift(l1_sum)) {
             let d = state
                 .iter()
                 .map(|ts| ts.cursor.l1_last_doc())
@@ -710,7 +808,7 @@ pub fn top_k_pruned_stats(
             continue;
         }
         // 2b. Level-0 range skip.
-        if inert(block_sum) {
+        if inert(lift(block_sum)) {
             let d = state
                 .iter()
                 .map(|ts| ts.cursor.block_last_doc())
@@ -755,7 +853,7 @@ pub fn top_k_pruned_stats(
                     }
                 }
             }
-            if inert(acc) {
+            if inert(lift(acc)) {
                 prefix.push(j);
             } else {
                 break;
@@ -815,7 +913,7 @@ pub fn top_k_pruned_stats(
                 }
             }
         }
-        if inert(bound) {
+        if inert(lift(bound)) {
             // Not insertable now, and the floor only rises: drop it.
             // Advance EVERY cursor past the doc — essential and
             // non-essential alike — so candidate selection stays
@@ -857,6 +955,10 @@ pub fn top_k_pruned_stats(
         for &ti in &touched {
             score += contrib[ti];
         }
+        // The FINAL score: chain applied after the pinned-order sum,
+        // before the floor test and insertion, so the heap and kth are
+        // on the same scale the lifted bounds are.
+        let score = finish(score, doc);
         prune.candidates_evaluated += 1;
         prune.postings_scored += touched.len() as u64;
         // Insert on the exact contract: ties at the seed survive,

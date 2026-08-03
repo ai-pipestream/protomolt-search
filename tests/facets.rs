@@ -54,6 +54,7 @@ async fn add_documents_faceted(
     let (tx, rx) = mpsc::channel(8);
     for (text, facets) in docs {
         tx.send(AddDocumentsRequest {
+            numerics: Vec::new(),
             text: text.to_string(),
             analysis: None,
             lineage: None,
@@ -233,7 +234,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     // d4 sits on the facet-less shard. Years: 1990 (d0), 1991 (d1) —
     // d2 has no year value.
     let (hits, facets) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &want)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &want, &[])
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
@@ -250,7 +251,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
 
     // Counts cover the whole match set even when k surfaces one hit.
     let (hits_k1, facets_k1) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &want)
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &want, &[])
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -259,7 +260,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     // A seeded floor narrows the surfaced hits, never the counts.
     let seed = turbovec_search::bm25::floor_seed(hits[0].score);
     let (seeded_hits, seeded_facets) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, seed, &want)
+        .fanout_bm25_faceted("rust", 6, None, seed, &want, &[])
         .await
         .unwrap();
     assert!(seeded_hits.len() < hits.len(), "the floor trimmed hits");
@@ -268,7 +269,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
 
     // "vector" matches d1, d3: all courts tie, value order decides.
     let (_, vector_facets) = coordinator
-        .fanout_bm25_faceted("vector", 6, None, 0.0, &want)
+        .fanout_bm25_faceted("vector", 6, None, 0.0, &want, &[])
         .await
         .unwrap();
     assert_eq!(counts_of(&vector_facets[0]), vec![("ca9", 1), ("scotus", 1)]);
@@ -306,6 +307,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            score_stages: Vec::new(),
             text: "rust".to_string(),
             k: 6,
             analysis: None,
@@ -325,6 +327,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            score_stages: Vec::new(),
             text: "rust".to_string(),
             k: 6,
             analysis: None,
@@ -426,6 +429,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     // come from the mmapped ords column.
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            score_stages: Vec::new(),
             terms: vec!["rust".into()],
             k: 10,
             global_doc_count: 2,

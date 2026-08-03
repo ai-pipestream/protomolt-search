@@ -118,6 +118,7 @@ async fn start_cluster(
             let feed = tokio::spawn(async move {
                 for text in texts {
                     tx.send(turbovec_search::pb::AddDocumentsRequest {
+                        numerics: Vec::new(),
                         facets: Vec::new(),
                         text,
                         analysis: None,

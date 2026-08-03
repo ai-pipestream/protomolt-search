@@ -118,6 +118,9 @@ pub struct NodeConfig {
     /// fields outside the active table are refused. Non-empty makes
     /// new builders persist as v7.
     pub facet_fields: Vec<String>,
+    /// The numeric field table for NEW builders (f64 columns,
+    /// `docs/score-functions.md`). Same rules as `facet_fields`.
+    pub numeric_fields: Vec<String>,
     /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
     /// Requires `index_path`; the config layer defaults this on for
     /// persisted shards and off for demo shards.
@@ -151,6 +154,7 @@ impl Default for NodeConfig {
             analysis_addr: None,
             bm25_fields: vec!["body".to_string()],
             facet_fields: Vec::new(),
+            numeric_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
             coalesce: true,
@@ -291,6 +295,35 @@ impl Bm25Shard {
         }
     }
 
+    /// The numeric-table index of the numeric field named `name`, if
+    /// the active table has it.
+    fn numeric_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.numeric_index(name),
+            Bm25Shard::Spilling(s) => s.numeric_index(name),
+            Bm25Shard::Resident(r) => r.numeric_index(name),
+        }
+    }
+
+    /// (min, max) of numeric field `ni` over present values. Scoring
+    /// only runs against searchable shapes, so Spilling is unreachable.
+    fn numeric_min_max(&self, ni: usize) -> (f64, f64) {
+        match self {
+            Bm25Shard::Building(s) => s.numeric_min_max(ni),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.numeric_min_max(ni),
+        }
+    }
+
+    /// `doc_id`'s value for numeric field `ni`.
+    fn numeric_value(&self, ni: usize, doc_id: u32) -> Option<f64> {
+        match self {
+            Bm25Shard::Building(s) => s.numeric_value(ni, doc_id),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.numeric_value(ni, doc_id),
+        }
+    }
+
     /// Field `f` as its own searchable [`Bm25Index`]; `None` while
     /// bulk-building, exactly like [`Self::as_index`].
     fn field_view(&self, f: usize) -> Option<Box<dyn Bm25Index + '_>> {
@@ -366,6 +399,32 @@ impl Bm25Shard {
             .collect()
     }
 
+    /// Resolve parsed score stages against THIS shard's numeric table
+    /// (`docs/score-functions.md`): the column index when the table
+    /// has it (`None` = every document absent = identity, which is
+    /// exact) and the column's min/max bound metadata. Only called on
+    /// searchable shapes.
+    fn resolve_chain(
+        &self,
+        specs: &[(crate::scorefn::StageOp, String)],
+    ) -> crate::scorefn::ScoreChain {
+        crate::scorefn::ScoreChain {
+            stages: specs
+                .iter()
+                .map(|(op, column)| {
+                    let column = self.numeric_index(column);
+                    crate::scorefn::Stage {
+                        op: *op,
+                        column,
+                        min_max: column
+                            .map(|ni| self.numeric_min_max(ni))
+                            .unwrap_or((f64::NAN, f64::NAN)),
+                    }
+                })
+                .collect(),
+        }
+    }
+
     /// Open a `.bm25` path in the right shape: every reader-supported
     /// format (v3 through v6) maps disk-resident; only the pre-v3
     /// formats load into the heap builder (and are upgraded to the
@@ -385,6 +444,80 @@ impl Bm25Shard {
             Ok(Bm25Shard::Building(Bm25Store::load(path)?))
         }
     }
+}
+
+/// [`crate::scorefn::NumericRead`] over a searchable shard shape, for
+/// score-chain evaluation during scoring.
+struct ShardNumericRead<'a>(&'a Bm25Shard);
+
+impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
+    fn value(&self, ni: usize, doc_id: u32) -> Option<f64> {
+        self.0.numeric_value(ni, doc_id)
+    }
+}
+
+/// Parse and validate a wire score-stage list into resolved ops plus
+/// their column names — the shard-independent half of chain building
+/// (`docs/score-functions.md`). Refuses unknown ops, empty column
+/// names, and parameters outside each op's admission rule: every
+/// refusal here is a stage whose monotonicity or bound would not hold.
+fn parse_score_stages(
+    stages: &[crate::pb::ScoreStage],
+) -> Result<Vec<(crate::scorefn::StageOp, String)>, Status> {
+    use crate::scorefn::StageOp;
+    stages
+        .iter()
+        .enumerate()
+        .map(|(i, stage)| {
+            if stage.column.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "score stage {i}: a stage names the numeric column it reads"
+                )));
+            }
+            let op = match crate::pb::ScoreOp::try_from(stage.op) {
+                Ok(crate::pb::ScoreOp::MultExpDecay) => {
+                    if !(stage.scale.is_finite() && stage.scale > 0.0) || !stage.origin.is_finite()
+                    {
+                        return Err(Status::invalid_argument(format!(
+                            "score stage {i}: MULT_EXP_DECAY needs finite origin and scale > 0"
+                        )));
+                    }
+                    StageOp::MultExpDecay {
+                        origin: stage.origin,
+                        scale: stage.scale,
+                    }
+                }
+                Ok(crate::pb::ScoreOp::MultLog) => {
+                    if !stage.weight.is_finite() || stage.weight < 0.0 {
+                        return Err(Status::invalid_argument(format!(
+                            "score stage {i}: MULT_LOG needs a finite weight >= 0 (a negative \
+                             weight could turn the factor negative, breaking monotonicity)"
+                        )));
+                    }
+                    StageOp::MultLog {
+                        weight: stage.weight,
+                    }
+                }
+                Ok(crate::pb::ScoreOp::AddLinear) => {
+                    if !stage.weight.is_finite() {
+                        return Err(Status::invalid_argument(format!(
+                            "score stage {i}: ADD_LINEAR needs a finite weight"
+                        )));
+                    }
+                    StageOp::AddLinear {
+                        weight: stage.weight,
+                    }
+                }
+                Ok(crate::pb::ScoreOp::Unspecified) | Err(_) => {
+                    return Err(Status::invalid_argument(format!(
+                        "score stage {i}: unknown op {}",
+                        stage.op
+                    )));
+                }
+            };
+            Ok((op, stage.column.clone()))
+        })
+        .collect()
 }
 
 /// The shard's two indexes behind one lock: the turbovec vector index and
@@ -979,15 +1112,27 @@ impl NodeServiceImpl {
     fn new_builder(&self, generation: Option<&PathBuf>) -> Result<Bm25Shard, Status> {
         let names: Vec<&str> = self.config.bm25_fields.iter().map(String::as_str).collect();
         let facets: Vec<&str> = self.config.facet_fields.iter().map(String::as_str).collect();
+        let numerics: Vec<&str> = self
+            .config
+            .numeric_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).1);
                 SpillBuilder::create_with_fields(&dir, &names)
-                    .map(|b| Bm25Shard::Spilling(b.with_facet_fields(&facets)))
+                    .map(|b| {
+                        Bm25Shard::Spilling(
+                            b.with_facet_fields(&facets).with_numeric_fields(&numerics),
+                        )
+                    })
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
             }
             None => Ok(Bm25Shard::Building(
-                Bm25Store::with_fields(&names).with_facets(&facets),
+                Bm25Store::with_fields(&names)
+                    .with_facets(&facets)
+                    .with_numerics(&numerics),
             )),
         }
     }
@@ -1714,6 +1859,8 @@ impl NodeServiceImpl {
             hits,
             kth_best,
             facets,
+            // The fused route refuses score stages upstream.
+            stage_columns_known: Vec::new(),
         })
     }
 
@@ -2325,6 +2472,39 @@ impl NodeServiceImpl {
             }
             slots
         };
+        // Numeric values: same shape as facets — unknown fields,
+        // repeats, and non-finite values refused before anything
+        // mutates (NaN is the absence sentinel, infinities break the
+        // score-function bound algebra).
+        let numeric_slots: Vec<(usize, f64)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<&str> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.numerics.len());
+            for nv in &doc.numerics {
+                if seen.contains(&nv.field.as_str()) {
+                    return Err(Status::invalid_argument(format!(
+                        "numeric field {:?} repeats in one document",
+                        nv.field
+                    )));
+                }
+                seen.push(&nv.field);
+                let Some(ni) = shard.numeric_index(&nv.field) else {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown numeric field {:?}; this shard's numeric table \
+                         (--numeric-fields) does not have it",
+                        nv.field
+                    )));
+                };
+                if !nv.value.is_finite() {
+                    return Err(Status::invalid_argument(format!(
+                        "numeric field {:?} has a non-finite value; omit absent values instead",
+                        nv.field
+                    )));
+                }
+                slots.push((ni, nv.value));
+            }
+            slots
+        };
         let global_id = self.config.slot_offset + u64::from(doc_id);
         if *added == 0 {
             *first_id = global_id;
@@ -2344,6 +2524,9 @@ impl NodeServiceImpl {
                 for (fi, value) in &facet_slots {
                     store.set_facet(*fi, doc_id, value);
                 }
+                for &(ni, value) in &numeric_slots {
+                    store.set_numeric(ni, doc_id, value);
+                }
             }
             Bm25Shard::Spilling(builder) => {
                 builder
@@ -2351,6 +2534,9 @@ impl NodeServiceImpl {
                     .map_err(|e| Status::internal(format!("spill write: {e}")))?;
                 for (fi, value) in &facet_slots {
                     builder.set_facet(*fi, doc_id, value);
+                }
+                for &(ni, value) in &numeric_slots {
+                    builder.set_numeric(ni, doc_id, value);
                 }
             }
             Bm25Shard::Resident(_) => {
@@ -3412,8 +3598,15 @@ impl NodeService for NodeServiceImpl {
         // Fused multi-field legs replace the flat single-field query
         // (docs/multi-field.md).
         if !req.fields.is_empty() {
+            if !req.score_stages.is_empty() {
+                return Err(Status::invalid_argument(
+                    "score stages are not yet supported on the fused multi-field route; \
+                     drop `fields` to use the flat route, or drop `score_stages`",
+                ));
+            }
             return self.bm25_query_fused(&req).map(Response::new);
         }
+        let stage_specs = parse_score_stages(&req.score_stages)?;
         let params = params_from(req.k1, req.b)?;
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
@@ -3448,6 +3641,17 @@ impl NodeService for NodeServiceImpl {
                 })
                 .collect(),
         };
+        // Which stage columns this shard's numeric table has —
+        // computed regardless of k, like the facet known flags: a
+        // shard lacking a column answers identity (exact), and the
+        // coordinator refuses a column NO shard knows.
+        let stage_columns_known: Vec<bool> = match guard.bm25.as_ref() {
+            Some(store) => stage_specs
+                .iter()
+                .map(|(_, column)| store.numeric_index(column).is_some())
+                .collect(),
+            None => vec![false; stage_specs.len()],
+        };
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
                 let index = store.as_index().ok_or_else(|| {
@@ -3458,6 +3662,17 @@ impl NodeService for NodeServiceImpl {
                     f64::NEG_INFINITY
                 } else {
                     f64::from(req.min_score)
+                };
+                // The score-function chain, resolved against this
+                // shard's numeric table (docs/score-functions.md).
+                // With no stages the ctx is None and every scorer below
+                // is bit-identical to its unchained form.
+                let chain = store.resolve_chain(&stage_specs);
+                let numeric_read = ShardNumericRead(store);
+                let chain_ctx: bm25::ChainCtx = if stage_specs.is_empty() {
+                    None
+                } else {
+                    Some((&chain, &numeric_read))
                 };
                 // Block-max path when every scored term has impacts (v5
                 // shards) and the node flag allows it; the heap store,
@@ -3475,10 +3690,25 @@ impl NodeService for NodeServiceImpl {
                             stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
                         });
                 let docs = if prunable {
-                    bm25::top_k_pruned(index, &req.terms, &stats, params, req.k as usize, floor)
+                    bm25::top_k_pruned_chained(
+                        index,
+                        &req.terms,
+                        &stats,
+                        params,
+                        req.k as usize,
+                        floor,
+                        chain_ctx,
+                    )
                 } else {
                     bm25::filter_to_floor(
-                        bm25::top_k(index, &req.terms, &stats, params, req.k as usize),
+                        bm25::top_k_chained(
+                            index,
+                            &req.terms,
+                            &stats,
+                            params,
+                            req.k as usize,
+                            chain_ctx,
+                        ),
                         floor,
                     )
                 };
@@ -3517,6 +3747,7 @@ impl NodeService for NodeServiceImpl {
             hits,
             kth_best,
             facets,
+            stage_columns_known,
         }))
     }
 

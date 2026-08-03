@@ -772,6 +772,21 @@ message FacetValue {
   string value = 2;
 }
 
+// One numeric value of a document: a single f64 for one declared
+// numeric field ("decision_date" -> 15706, epoch days). Values land in
+// the shard's f64 column (docs/score-functions.md), never in postings.
+// Non-finite values are INVALID_ARGUMENT: NaN is the column's absence
+// sentinel and infinities break the score-function bound algebra.
+message NumericValue {
+  // Numeric field name; must exist in the shard's numeric field table
+  // (--numeric-fields) and must not repeat within one document.
+  // Unknown names are INVALID_ARGUMENT.
+  string field = 1;
+  // The value. A document without a value for a numeric field simply
+  // omits the entry and passes through every score stage unchanged.
+  double value = 2;
+}
+
 // One document on the `AddDocuments` stream.
 message AddDocumentsRequest {
   // Raw document text. Non-empty, at most 1 MiB (the sidecar's cap).
@@ -792,6 +807,9 @@ message AddDocumentsRequest {
   // as `fields`: old WAL logs replay facet-less, and reshard replay is
   // how an existing corpus grows facet columns.
   repeated FacetValue facets = 5;
+  // Numeric values for this document, one entry per declared numeric
+  // field it has a value for. Same durable-record lever as `facets`.
+  repeated NumericValue numerics = 6;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -924,6 +942,52 @@ message Bm25QueryRequest {
   // no counting and no cost. On a fused query the match set is the
   // union over every leg's terms.
   repeated string facet_fields = 11;
+  // Score-function chain (docs/score-functions.md), applied in list
+  // order to each candidate's BM25 score BEFORE the floor test and
+  // heap insertion: hits, `min_score`, and `kth_best` are all on the
+  // FINAL scale. List order is the pinned evaluation order (IEEE math
+  // is not associative), so the coordinator MUST send the same list to
+  // every shard. Currently the flat single-field route only; setting
+  // this with `fields` legs is refused. Empty = identity.
+  repeated ScoreStage score_stages = 12;
+}
+
+// The transform of one score stage. Every op is monotone
+// non-decreasing in the incoming score and ships with a bound rule
+// (docs/score-functions.md) — that is the admission bar, because
+// block-max pruning lifts its bounds through the chain.
+enum ScoreOp {
+  // Unused zero value; refused (a stage must say what it does).
+  SCORE_OP_UNSPECIFIED = 0;
+  // score *= exp(-|x - origin| / scale): recency decay. scale > 0.
+  SCORE_OP_MULT_EXP_DECAY = 1;
+  // score *= 1 + weight * ln(1 + max(x, 0)): log boost. weight >= 0 —
+  // a negative weight could turn the factor negative, which breaks
+  // monotonicity in the score, so it is refused.
+  SCORE_OP_MULT_LOG = 2;
+  // score += weight * x: additive boost, any finite weight. Note that
+  // negative contributions can push final scores to or below zero;
+  // correctness is unaffected, but kth_best seeding degrades to
+  // unseeded for non-positive floors (floor_seed clamps at 0).
+  SCORE_OP_ADD_LINEAR = 3;
+}
+
+// One stage of a score-function chain.
+message ScoreStage {
+  // The transform. SCORE_OP_UNSPECIFIED is refused.
+  ScoreOp op = 1;
+  // The numeric field (--numeric-fields) the stage reads. A document
+  // without a value passes through unchanged (identity) — exact, not
+  // degraded, and the same rule makes a shard that lacks the column
+  // entirely correct. A column NO shard knows is refused by the
+  // coordinator (the typo rule, as for fields and facets).
+  string column = 2;
+  // Weight; used by MULT_LOG (>= 0) and ADD_LINEAR (any finite).
+  double weight = 3;
+  // Decay origin (MULT_EXP_DECAY): the value where the factor is 1.
+  double origin = 4;
+  // Decay scale (MULT_EXP_DECAY): > 0, finite.
+  double scale = 5;
 }
 
 // One field's leg of a fused multi-field BM25 query.
@@ -1003,6 +1067,12 @@ message Bm25QueryResponse {
   // are additive, so the coordinator's global counts are the plain sum
   // over shards — there is no analog of the global-df trap here.
   repeated FacetFieldCounts facets = 3;
+  // Whether this shard's numeric table has each requested score
+  // stage's column, parallel to `score_stages` (empty when none were
+  // sent). A shard without the column answered identity for all its
+  // documents — exact — but the coordinator refuses a column NO shard
+  // knows, because a typo'd chain would otherwise be a silent no-op.
+  repeated bool stage_columns_known = 4;
 }
 
 // One facet value's count within one facet field.
@@ -1087,6 +1157,12 @@ message Bm25SearchRequest {
   // shard; empty means no counting and no cost. A facet field no shard
   // knows is refused (INVALID_ARGUMENT).
   repeated string facet_fields = 6;
+  // Score-function chain (docs/score-functions.md), forwarded verbatim
+  // to every shard's Bm25QueryRequest.score_stages: hits, `min_score`,
+  // and `kth_best` are on the FINAL (chained) scale. Flat single-field
+  // route only for now; setting this with `fields` is refused. A stage
+  // column no shard knows is refused (INVALID_ARGUMENT).
+  repeated ScoreStage score_stages = 7;
 }
 
 // One field of a fused multi-field search.

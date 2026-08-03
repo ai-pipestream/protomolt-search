@@ -38,14 +38,22 @@ magic "TVBM2507"
 u32 n_fields | u32 n_slots
 u64 texts_off | u64 text_index_off | u64 lineages_off
 field table, n_fields entries          <- v6 bytes, unchanged
-u32 n_facets
-facet table, n_facets entries:
-  u16 name_len | name bytes
-  u32 n_values | u64 dict_off | u64 ords_off
+u32 n_columns
+column table, n_columns entries:
+  u16 name_len | name bytes | u8 kind
+  kind 0 (facet): u32 n_values | u64 dict_off | u64 ords_off
+  kind 1 (f64):   u64 min_bits | u64 max_bits | u64 vals_off
 texts | text_index | lineages          <- v6 bytes, unchanged
 per field: doc_lengths | postings | directory   <- v6 bytes, unchanged
-per facet: dict | ords
+per kind-0 column: dict | ords
+per kind-1 column: vals (n_slots x f64, NaN = absent)
 ```
+
+(REVISED 2026-08-03, same day and before any v7 file existed outside
+test artifacts: the facet-only table became a kinded column table when
+numeric columns landed for score functions — `docs/score-functions.md`.
+An unknown kind refuses at open by number, so the next column kind
+needs no new magic. Facet semantics below are unchanged.)
 
 - `dict`: the distinct values in ordinal (first-seen) order, `u16 len |
   bytes` each. Decoded eagerly at open (one entry per distinct value —

@@ -56,6 +56,7 @@ async fn add_documents(addr: &str, texts: &[String]) {
     let feeder = tokio::spawn(async move {
         for text in texts {
             tx.send(AddDocumentsRequest {
+                numerics: Vec::new(),
                 facets: Vec::new(),
                 text,
                 analysis: None,

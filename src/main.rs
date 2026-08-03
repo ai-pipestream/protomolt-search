@@ -203,6 +203,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     analysis_addr: shard.analysis_addr.clone(),
                     bm25_fields: cfg.bm25_fields.clone(),
                     facet_fields: cfg.facet_fields.clone(),
+                    numeric_fields: cfg.numeric_fields.clone(),
                     wal: shard.wal,
                     wal_buckets: shard.wal_buckets,
                 },
