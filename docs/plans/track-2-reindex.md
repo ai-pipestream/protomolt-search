@@ -97,13 +97,18 @@ deliberately not folded in. That decision is argued in `work-queue.md`
 section 1.2 and stands unless the repo service is wired before this
 track starts.
 
-TODO, decide before the build starts because it doubles a column: does
-the rebuild write a second body column under the cased analyzer as a
-standing A/B arm? The A/B machinery is ready for it and multi-field
-columns make it affordable. The cost is index size and build time; the
-benefit is a permanent measurement surface for case-sensitivity
-questions. If track 1's facet columns are also ready by then, the same
-column-writing step carries them.
+Decided 2026-08-02: the rebuild writes a second body column under the
+cased analyzer as a standing A/B arm. The A/B machinery is ready for
+it, multi-field columns make it affordable, and it cannot be added
+later without another full rebuild. The benefit is a permanent
+measurement surface for case-sensitivity questions: the SOURCE_STEMS
+case-fold trap is exactly the kind of question this arm answers with a
+rankdiff instead of an argument. The cost is one more body column's
+disk and build time; if free space on the shard volume fails the
+two-generations check in section 3, this column is the first thing
+dropped. Track 1's facet columns are not expected in time and the
+rebuild does not wait for them; a later rebuild carries them, which is
+accepted policy.
 
 ## 5. Verification, then cutover
 
