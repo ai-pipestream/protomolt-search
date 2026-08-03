@@ -16,6 +16,33 @@ Companion documents: `architecture.md` for how the system fits together,
 Everything else about the corpus waits on this. The analyzer changed and
 the index on disk has not caught up.
 
+**The engine has now overtaken the index too, and this is load bearing.**
+Upstream `fd851e5` ("carry each sealed block's slot base, in memory and
+in v7") extended the v7 layout WITHOUT changing the magic or a version
+field, and `read_block_table` consumes `n_sealed * 4` bytes of slot
+bases unconditionally. A file written before that commit has its scales
+read as slot bases, so every shard in `/work/court-corpus/shards-v7`
+is rejected at load:
+
+```
+load shard-0.tv: sealed block 0 declares slot base 1034133861:
+must be a strictly increasing multiple of the 8192-row block size
+```
+
+It fails loudly rather than scoring garbage, which is the right failure,
+but the consequence is concrete: **the binary built from current `main`
+cannot serve the current shards.** The live cluster therefore runs a
+binary built from `e858f1e`, the last commit before the chain bump,
+whose `Cargo.lock` pins turbovec at `886c062`. `docs/` note for whoever
+does the rebuild: the new shards must be written by the NEW engine, and
+the cutover is atomic, not incremental. Until then, do not rebuild the
+cluster binary from `main` and restart it expecting it to come back.
+
+Worth raising with upstream: extending a format in place, with the same
+magic, means a reader cannot tell an old file from a corrupt one. A
+version byte would have turned this into a clear refusal instead of an
+implausible-slot-base error.
+
 `analyzer::body_spec()` now applies ACCENT_FOLD, and the pinned corpus
 fingerprint moved to `0x55eb_d3a6_febd_2ac3`. The reason is measured
 rather than stylistic: sampling 200,000 real chunks, the corpus writes
@@ -88,22 +115,34 @@ well and "count entities by court and year" badly.
 
 Small, real, and each one makes later work more honest.
 
-- **The live cluster is stale.** Running since 01:55 on 2026-08-02, on a
-  binary that predates the day's work. It still scans the vector leg on
-  BM25-only queries. A restart is a couple of minutes and makes every
-  subsequent measurement trustworthy.
+- ~~The live cluster is stale.~~ Restarted 2026-08-02 on a binary built
+  from `e858f1e` (see 1.1: `main` cannot read these shards). Verified
+  serving: vector p50 247 ms, bm25 52 ms, hybrid 392 ms, against a
+  pre-restart baseline of 221 / 53 / 376. The first query after a
+  restart pages in the mmapped index and can take minutes; that is cold
+  cache, not a regression. Launch script and logs now live in
+  `/work/court-corpus/cluster-logs/`, reconstructed from the running
+  processes' argv so the topology is what was actually serving.
 - **`opinions.ndjson` has no current backup.** 116 GB local, and the NAS
   copy is older and smaller. This is the one worth not leaving.
 - **Port 8600 is ufw-blocked** from the browser:
   `sudo ufw allow from 192.168.0.0/16 to any port 8600`.
-- **Sidecar PR 2** is open as a draft awaiting review.
+- ~~Sidecar PR 2 is open as a draft awaiting review.~~ Merged 2026-08-02
+  (`be4db91` on sidecar main); the live sidecar runs that build with all
+  seven NER models.
 
 ## 3. Known defects, elsewhere
 
-- `dependency_parse` and `pii` return zero annotations and no error from
-  the analysis sidecar. `PiiAnnotator` is added unguarded, so this is
-  independent of the locking work. A layer that silently produces
-  nothing would go into a capture run and yield an empty column.
+- ~~`dependency_parse` and `pii` return zero annotations and no error from
+  the analysis sidecar.~~ Verified fixed 2026-08-02 against the rebuilt
+  sidecar on 127.0.0.1:59202 (sidecar main `be4db91`): `pii` returns
+  email/phone/card mentions with normalized forms, and `dependency_parse`
+  without a configured model returns the documented warning naming
+  `OPENNLP_DEPPARSE_MODEL`. The with-model path is covered in-repo by
+  `ModelBackedLayersTest` (memorized-tree arcs, relations over dependency
+  paths) and the warning path by `ModelDependentLayersTest`; PII by
+  `PiiExtractionTest`. No depparse model is deployed yet — that, not a
+  defect, is why a live server yields no arcs.
 - NER throughput is parked, not solved. What is ruled out: the annotator
   lock (removed, worth 6.7x), GC (about 2 ms pauses), processor
   visibility (the JVM sees all 32), pipeline rebuilding (it is cached),
