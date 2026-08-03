@@ -137,8 +137,27 @@ Small, real, and each one makes later work more honest.
   cache, not a regression. Launch script and logs now live in
   `/work/court-corpus/cluster-logs/`, reconstructed from the running
   processes' argv so the topology is what was actually serving.
-- **`opinions.ndjson` has no current backup.** 116 GB local, and the NAS
-  copy is older and smaller. This is the one worth not leaving.
+- **`opinions.ndjson` backup**, in progress 2026-08-02 to
+  `/Volume1/corpus_data/turbovec/corpus/`. The Jul 29 copy is left in
+  place until the new one completes.
+
+  **Use the LAN address for bulk transfers, and disable delta.**
+  `nas.rokkon.com` resolves to an IPv6 address routed over `tailscale0`
+  and moves about 22 MB/s. The same host at `192.168.1.211` answers in
+  0.2 ms over a 5/10 GbE link. Measured on that path, with a transfer
+  already competing for it: ssh to /dev/null 495 MB/s, ssh plus a real
+  NAS disk write 179 MB/s, and rsync with its default delta transfer
+  only 54 MB/s. Delta costs roughly 3x here because it makes the NAS
+  read the existing 114 GB destination while writing, which buys
+  nothing on a link this fast. So:
+
+  ```
+  rsync -aW --info=progress2 --partial-dir=.rsync-partial \
+    <file> 192.168.1.211:/Volume1/corpus_data/turbovec/corpus/
+  ```
+
+  This matters for what is queued behind it: `chunks-full.ndjson` is
+  126 GB, and the rebuilt v7 shards will be around 280 GB.
 - **Port 8600 is ufw-blocked** from the browser:
   `sudo ufw allow from 192.168.0.0/16 to any port 8600`.
 - ~~Sidecar PR 2 is open as a draft awaiting review.~~ Merged 2026-08-02
