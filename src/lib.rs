@@ -39,6 +39,7 @@ pub mod pb;
 pub mod postings;
 pub mod rankdiff;
 pub mod reshard;
+pub mod scorefn;
 pub mod snapshot;
 pub mod stats_cache;
 pub mod wal;

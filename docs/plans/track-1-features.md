@@ -87,29 +87,45 @@ the matches" is ill-defined there). Facet FILTERING is deliberately
 not in this cut; it lands with the public-API filter syntax and must
 apply before the floor check.
 
-## 3. Functions on columns
+## 3. Functions on columns, and the two-language split
 
 Scoring today is BM25, cosine, or a fixed hybrid blend. The next step is
 letting a query shape the score with column values: recency decay on
 decision date, court-level boosts, page-rank style citation weight when
 we have it.
 
-Proposed scope for a first cut, deliberately narrow:
+DESIGN PINNED 2026-08-03 (`docs/score-functions.md`), superseding the
+first draft of this section. The column features split into two
+languages with a principled boundary:
 
-1. Typed numeric columns (i64, f32) loaded per shard, same storage as
-   facet columns. One mechanism, two features.
-2. A small fixed set of combinators exposed in the request proto:
-   `score * f(column)` and `score + w * f(column)` with `f` drawn from
-   linear, log, and exponential decay. Not a general expression
-   language.
-3. Functions apply on the node during scoring, before the floor check,
-   so pruning stays correct. This is the part that needs care: the floor
-   is only sound if the node scores and the coordinator heap agree on
-   the final score. A function applied after pruning would reorder
-   results the floor already discarded.
+- **CEL selects.** Filters ("court == 'scotus' && year >= '1990'") use
+  CEL as the surface syntax, compiled PER SHARD into dictionary-resolved
+  ordinal predicates — never interpreted per document. A filter only
+  removes documents, so every block-max bound stays a valid upper bound
+  for free; no new pruning math. Constructs that do not compile to
+  dictionary predicates plus boolean algebra are refused by name, never
+  interpreted slowly. (Not yet implemented; lands with the public-API
+  filter syntax, and it is what makes hybrid facets well-defined.)
+- **First-class function chains score.** The final score is a chain of
+  named stages applied in request-list order to the BM25 score, on the
+  node, before the floor test and heap insertion. Every stage signs one
+  contract: monotone non-decreasing in the incoming score, with a
+  computable upper bound given the column's min/max metadata. That
+  single condition makes chaining sound: the chain's bound is the chain
+  applied to the block-max bound, so MaxScore, the shared floors, and
+  kth_best keep working on FINAL scores with no new theorems. List
+  order is the pinned evaluation order (IEEE math is not associative),
+  identical on every shard — distributed == monolith bitwise, and the
+  A/B machinery (SearchVariant carries whole requests) compares
+  chain-vs-no-chain for free. A stage that cannot state its bound does
+  not ship.
 
-The A/B machinery is the test harness here: a variant search with and
-without the function, rankdiff on top, same as the analyzer arms.
+Typed numeric columns (f64 values, NaN = absent, min/max in the column
+table metadata) are the shared prerequisite: facets, CEL filters, and
+score chains all read the same per-document columns — one mechanism,
+three features. A document without a value passes through every stage
+unchanged (identity), which is exact, not a degradation; a column NO
+shard knows is refused, the same typo rule as fields and facets.
 
 TODO: whether function parameters are per-request or registered named
 profiles. Per-request is simpler and is enough for the console.

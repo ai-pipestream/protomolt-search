@@ -186,6 +186,7 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
     let (tx, rx) = mpsc::channel(8);
     for text in TEXTS {
         tx.send(AddDocumentsRequest {
+            numerics: Vec::new(),
             facets: Vec::new(),
             text: text.to_string(),
             analysis: None,

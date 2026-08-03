@@ -355,15 +355,27 @@ fn build_child(
         if table.first().map(String::as_str) != Some("body") {
             return Err("bm25 field table must start with \"body\"".to_string());
         }
-        // The child's facet table is derived from the replayed records
-        // (first-seen order): the WAL is the durable facet record, so a
-        // facet field no record values never reaches the child.
+        // The child's facet and numeric tables are derived from the
+        // replayed records (first-seen order): the WAL is the durable
+        // column record, so a field no record values never reaches the
+        // child.
         let facet_table: Vec<String> = {
             let mut t: Vec<String> = Vec::new();
             for (_, doc) in &mapped {
                 for fv in &doc.facets {
                     if !t.iter().any(|n| n == &fv.field) {
                         t.push(fv.field.clone());
+                    }
+                }
+            }
+            t
+        };
+        let numeric_table: Vec<String> = {
+            let mut t: Vec<String> = Vec::new();
+            for (_, doc) in &mapped {
+                for nv in &doc.numerics {
+                    if !t.iter().any(|n| n == &nv.field) {
+                        t.push(nv.field.clone());
                     }
                 }
             }
@@ -377,9 +389,11 @@ fn build_child(
         let spill_dir = std::path::PathBuf::from(spill_dir);
         let names: Vec<&str> = table.iter().map(String::as_str).collect();
         let facet_names: Vec<&str> = facet_table.iter().map(String::as_str).collect();
+        let numeric_names: Vec<&str> = numeric_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
             .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
-            .with_facet_fields(&facet_names);
+            .with_facet_fields(&facet_names)
+            .with_numeric_fields(&numeric_names);
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -444,6 +458,13 @@ fn build_child(
                         .position(|n| n == &fv.field)
                         .expect("facet table was derived from these records");
                     builder.set_facet(fi, *local, &fv.value);
+                }
+                for nv in &doc.numerics {
+                    let ni = numeric_table
+                        .iter()
+                        .position(|n| n == &nv.field)
+                        .expect("numeric table was derived from these records");
+                    builder.set_numeric(ni, *local, nv.value);
                 }
             }
             i = end;

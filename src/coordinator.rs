@@ -372,18 +372,23 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_faceted(text, k, spec, min_score, &[])
+        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[])
             .await
             .map(|(hits, _)| hits)
     }
 
-    /// [`Self::fanout_bm25_seeded`] with count-then-rank facets: the
-    /// requested facet fields are forwarded to every shard, counted
-    /// there over the full match set, and summed here — counts are
-    /// additive, so the global counts are the plain per-value sum over
-    /// shards. Returns `(hits, merged facet counts)`; the facet list is
-    /// empty when none were requested or the query analyzed to no
-    /// terms (no match set to count).
+    /// [`Self::fanout_bm25_seeded`] with count-then-rank facets and a
+    /// score-function chain. Facet fields are forwarded to every
+    /// shard, counted there over the full match set, and summed here —
+    /// counts are additive, so the global counts are the plain
+    /// per-value sum over shards. Score stages are forwarded verbatim
+    /// in list order (the pinned evaluation order,
+    /// `docs/score-functions.md`), so hits, `min_score`, and
+    /// `kth_best` are on the FINAL scale; a stage column NO shard
+    /// knows is refused after the round, like an unknown facet field.
+    /// Returns `(hits, merged facet counts)`; the facet list is empty
+    /// when none were requested or the query analyzed to no terms (no
+    /// match set to count).
     pub async fn fanout_bm25_faceted(
         &self,
         text: &str,
@@ -391,6 +396,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
         facet_fields: &[String],
+        score_stages: &[crate::pb::ScoreStage],
     ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
@@ -416,7 +422,15 @@ impl CoordinatorServiceImpl {
             let (global, epochs) = self.body_stats(&terms, fresh).await?;
             let claims = if fresh { vec![0; epochs.len()] } else { epochs };
             match self
-                .bm25_query_round(&terms, k, min_score, &global, &claims, facet_fields)
+                .bm25_query_round(
+                    &terms,
+                    k,
+                    min_score,
+                    &global,
+                    &claims,
+                    facet_fields,
+                    score_stages,
+                )
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
@@ -431,7 +445,10 @@ impl CoordinatorServiceImpl {
     /// One Bm25Query fan-out with the GLOBAL stats: every shard scores
     /// identically, so the merge is a straight top-k. `claims[shard]`
     /// travels as that shard's `expected_stats_epoch`; `facet_fields`
-    /// as its `facet_fields` (shard-local counts merge by plain sum).
+    /// as its `facet_fields` (shard-local counts merge by plain sum);
+    /// `score_stages` verbatim (list order is the pinned evaluation
+    /// order, so every shard must see the same list).
+    #[allow(clippy::too_many_arguments)]
     async fn bm25_query_round(
         &self,
         terms: &[String],
@@ -440,6 +457,7 @@ impl CoordinatorServiceImpl {
         global: &CorpusStats,
         claims: &[u64],
         facet_fields: &[String],
+        score_stages: &[crate::pb::ScoreStage],
     ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
@@ -455,23 +473,52 @@ impl CoordinatorServiceImpl {
                 fields: Vec::new(),
                 expected_stats_epoch: claims[shard],
                 facet_fields: facet_fields.to_vec(),
+                score_stages: score_stages.to_vec(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
                 client.bm25_query(request).await.map(|r| {
                     let r = r.into_inner();
-                    (shard as u32, r.hits, r.facets)
+                    (shard as u32, r.hits, r.facets, r.stage_columns_known)
                 })
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
         let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
+        let mut stage_known = vec![false; score_stages.len()];
         for task in query_tasks {
-            let (shard, hits, facets) = task
+            let (shard, hits, facets, known) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
+            if known.len() != score_stages.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} stage-column flags for {} stages",
+                    known.len(),
+                    score_stages.len()
+                )));
+            }
+            for (acc, k) in stage_known.iter_mut().zip(known) {
+                *acc |= k;
+            }
+        }
+        // A stage column NO shard knows is a typo wearing an identity
+        // chain — the whole request would be a silent no-op. Refuse,
+        // naming the column and the knob; a partially-known column is
+        // the heterogeneous fleet and is exact (absent = identity).
+        let unknown: Vec<String> = score_stages
+            .iter()
+            .zip(&stage_known)
+            .filter(|(_, known)| !**known)
+            .map(|(s, _)| format!("{:?}", s.column))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "no shard has numeric column {}: the chain would be a silent no-op. \
+                 Check the spelling, or the nodes' --numeric-fields.",
+                unknown.join(", ")
+            )));
         }
         let facets = merge_facet_counts(facet_fields, &shard_facets)?;
         all.sort_by(|(sa, a), (sb, b)| {
@@ -800,6 +847,9 @@ impl CoordinatorServiceImpl {
                 fields: legs.clone(),
                 expected_stats_epoch: claims[shard],
                 facet_fields: facet_fields.to_vec(),
+                // The fused route does not carry score stages yet; the
+                // public handler refuses the combination.
+                score_stages: Vec::new(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -1393,8 +1443,10 @@ impl CoordinatorServiceImpl {
                     // Hybrid queries do not carry facets (yet): the
                     // vector leg's match set is the whole corpus, so
                     // "counts over the matches" has no single honest
-                    // answer there.
+                    // answer there. Score stages likewise wait for the
+                    // hybrid composition story.
                     facet_fields: Vec::new(),
+                    score_stages: Vec::new(),
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -3341,9 +3393,16 @@ impl SearchService for CoordinatorServiceImpl {
                 req.analysis.as_ref(),
                 req.min_score,
                 &req.facet_fields,
+                &req.score_stages,
             )
             .await?
         } else {
+            if !req.score_stages.is_empty() {
+                return Err(Status::invalid_argument(
+                    "score stages are not yet supported on the fused multi-field route; \
+                     drop `fields` to use the flat route, or drop `score_stages`",
+                ));
+            }
             // `analysis` is documented as ignored once `fields` is set,
             // because term identity is per field. Ignoring it QUIETLY is
             // the trap: the caller believes it asked for the ingest

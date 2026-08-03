@@ -202,6 +202,12 @@ pub struct Config {
     /// columns counted by facet queries. Same rules as `bm25_fields`;
     /// non-empty makes new builders persist as v7.
     pub facet_fields: Vec<String>,
+    /// The numeric field table for NEW shard builders
+    /// (`--numeric-fields=decision_date`): f64 columns read by
+    /// score-function chains (docs/score-functions.md). Same rules as
+    /// `facet_fields`; names must not collide with them (the v7 column
+    /// table holds both and refuses duplicates).
+    pub numeric_fields: Vec<String>,
     /// The shard map the coordinator's `node_addrs` came from, when
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
@@ -243,6 +249,7 @@ struct FileConfig {
     bm25_b: Option<f32>,
     bm25_fields: Option<Vec<String>>,
     facet_fields: Option<Vec<String>>,
+    numeric_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
     shard_map: Option<String>,
@@ -783,6 +790,28 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
     }
 
+    let numeric_fields: Vec<String> =
+        match opt(args, "numeric-fields", "TURBOVEC_NUMERIC_FIELDS", None) {
+            Some(s) => s
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            None => file.numeric_fields.clone().unwrap_or_default(),
+        };
+    for (i, name) in numeric_fields.iter().enumerate() {
+        if numeric_fields[..i].contains(name) {
+            return Err(format!("numeric field {name:?} repeats in the numeric table"));
+        }
+        if facet_fields.contains(name) {
+            return Err(format!(
+                "column {name:?} is declared as both a facet and a numeric field; \
+                 the v7 column table holds one column per name"
+            ));
+        }
+    }
+
     Ok(Config {
         role,
         coord_listen,
@@ -812,6 +841,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         bm25_b,
         bm25_fields,
         facet_fields,
+        numeric_fields,
         shard_map,
     })
 }

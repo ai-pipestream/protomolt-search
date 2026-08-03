@@ -333,6 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- the lexical legs ----------------------------------------------
     let body_only = client
         .bm25_search(Bm25SearchRequest {
+            score_stages: Vec::new(),
             facet_fields: Vec::new(),
             text: query.clone(),
             k,
@@ -357,6 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let case_only = client
         .bm25_search(Bm25SearchRequest {
+            score_stages: Vec::new(),
             facet_fields: Vec::new(),
             text: case_query.clone(),
             k,
@@ -387,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fused = client
         .bm25_search(Bm25SearchRequest {
+            score_stages: Vec::new(),
             facet_fields: Vec::new(),
             text: query.clone(),
             k,
@@ -546,6 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ab_arm = |label: &str, fields: Vec<QueryField>| SearchVariant {
         label: label.to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            score_stages: Vec::new(),
             facet_fields: Vec::new(),
             text: query.clone(),
             k: 0,

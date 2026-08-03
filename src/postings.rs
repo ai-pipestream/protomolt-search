@@ -48,14 +48,23 @@ const MAGIC_V5: &[u8; 8] = b"TVBM2505";
 /// directory run offsets) are RELATIVE to their section's start — the
 /// v4 blob lesson generalized, so sections survive relocation.
 const MAGIC_V6: &[u8; 8] = b"TVBM2506";
-/// v7 layout: v6 plus dictionary-encoded facet columns
-/// (`docs/plans/track-1-features.md` section 2). The header gains a
-/// facet table after the field table (u32 n_facets, then per facet:
-/// name, u32 n_values, u64 dict_off, u64 ords_off); the facet sections
-/// (per facet: dict, then ords) follow the last field group. A store
-/// with NO declared facet fields still writes v6, byte-identical to
-/// every pre-facet build — the format break is opt-in per shard.
+/// v7 layout: v6 plus a kinded per-document column table
+/// (`docs/facets.md`, `docs/score-functions.md`). The header gains a
+/// column table after the field table (u32 n_columns, then per column:
+/// name, u8 kind, kind-specific payload); the column sections follow
+/// the last field group in table order. Kind 0 is a dictionary-encoded
+/// string facet column (u32 n_values, u64 dict_off, u64 ords_off →
+/// dict + ords sections); kind 1 is an f64 numeric column (u64
+/// min_bits, u64 max_bits, u64 vals_off → one n_slots x f64 section,
+/// NaN = absent). An unknown kind refuses at open by number. A store
+/// with NO declared columns still writes v6, byte-identical to every
+/// pre-facet build — the format break is opt-in per shard.
 const MAGIC_V7: &[u8; 8] = b"TVBM2507";
+
+/// v7 column-table kind: dictionary-encoded string facet column.
+const COLUMN_KIND_FACET: u8 = 0;
+/// v7 column-table kind: f64 numeric column (NaN = absent).
+const COLUMN_KIND_F64: u8 = 1;
 
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
@@ -314,6 +323,76 @@ fn validate_facet_names(names: &[&str]) {
     }
 }
 
+/// One f64 numeric column (`docs/score-functions.md`): per-slot values
+/// parallel to the shared slot space, NaN = the document has no value.
+/// min/max over present values are computed at write time into the v7
+/// column table (the bound metadata score-function chains lift with).
+#[derive(Debug)]
+struct NumericStore {
+    /// Numeric field name from the schema.
+    name: String,
+    /// Per-slot value (NaN = no value). May be shorter than the slot
+    /// count; missing trailing slots read as absent.
+    vals: Vec<f64>,
+}
+
+impl NumericStore {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            vals: Vec::new(),
+        }
+    }
+
+    fn value(&self, slot: usize) -> Option<f64> {
+        match self.vals.get(slot).copied() {
+            None => None,
+            Some(v) if v.is_nan() => None,
+            some => some,
+        }
+    }
+
+    /// Record `doc_id`'s value. Finite values only (NaN is the absence
+    /// sentinel, infinities break the bound algebra — callers validate
+    /// into a refusal); one value per (document, field), a second write
+    /// panics.
+    fn set(&mut self, doc_id: u32, value: f64) {
+        assert!(
+            value.is_finite(),
+            "numeric field {:?}: non-finite value for doc {doc_id}",
+            self.name
+        );
+        let slot = doc_id as usize;
+        if self.vals.len() <= slot {
+            self.vals.resize(slot + 1, f64::NAN);
+        }
+        assert!(
+            self.vals[slot].is_nan(),
+            "doc {doc_id} already has a value for numeric field {:?}",
+            self.name
+        );
+        self.vals[slot] = value;
+    }
+
+    /// (min, max) over present values; (NaN, NaN) when none are.
+    fn min_max(&self) -> (f64, f64) {
+        let mut min = f64::NAN;
+        let mut max = f64::NAN;
+        for &v in &self.vals {
+            if v.is_nan() {
+                continue;
+            }
+            if min.is_nan() || v < min {
+                min = v;
+            }
+            if max.is_nan() || v > max {
+                max = v;
+            }
+        }
+        (min, max)
+    }
+}
+
 /// The shard's lexical half: per-field postings and corpus stats over a
 /// shared slot space, plus the raw texts.
 #[derive(Debug)]
@@ -326,9 +405,11 @@ pub struct Bm25Store {
     /// Per-document lineage, parallel to `texts` (`None` when the
     /// document was ingested without lineage).
     lineages: Vec<Option<DocLineage>>,
-    /// Facet columns in facet-id order (empty for facet-less shards,
-    /// which persist as v6).
+    /// Facet columns in facet-id order.
     facets: Vec<FacetStore>,
+    /// Numeric columns in numeric-id order. A store with neither
+    /// facets nor numerics persists as v6.
+    numerics: Vec<NumericStore>,
 }
 
 impl Default for Bm25Store {
@@ -338,6 +419,7 @@ impl Default for Bm25Store {
             texts: Vec::new(),
             lineages: Vec::new(),
             facets: Vec::new(),
+            numerics: Vec::new(),
         }
     }
 }
@@ -367,6 +449,7 @@ impl Bm25Store {
             texts: Vec::new(),
             lineages: Vec::new(),
             facets: Vec::new(),
+            numerics: Vec::new(),
         }
     }
 
@@ -425,6 +508,51 @@ impl Bm25Store {
     /// the dictionary; see [`FacetStore::set`] for the contract.
     pub fn set_facet(&mut self, fi: usize, doc_id: u32, value: &str) {
         self.facets[fi].set(doc_id, value);
+    }
+
+    /// Declare the numeric field table, in numeric-id order (builder
+    /// style, like [`Self::with_facets`]). Must be called before any
+    /// document is added; a store with columns persists as v7.
+    pub fn with_numerics(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "numeric fields must be declared before documents are added"
+        );
+        validate_facet_names(names);
+        self.numerics = names.iter().map(|n| NumericStore::new(n)).collect();
+        self
+    }
+
+    /// Number of numeric fields in the numeric table.
+    pub fn numeric_count(&self) -> usize {
+        self.numerics.len()
+    }
+
+    /// The name of numeric field `ni`. Panics when out of range.
+    pub fn numeric_name(&self, ni: usize) -> &str {
+        &self.numerics[ni].name
+    }
+
+    /// The index of the numeric field named `name`, if the table has it.
+    pub fn numeric_index(&self, name: &str) -> Option<usize> {
+        self.numerics.iter().position(|n| n.name == name)
+    }
+
+    /// `doc_id`'s value for numeric field `ni`, `None` when absent.
+    pub fn numeric_value(&self, ni: usize, doc_id: u32) -> Option<f64> {
+        self.numerics[ni].value(doc_id as usize)
+    }
+
+    /// (min, max) of numeric field `ni` over present values; (NaN, NaN)
+    /// when no document has one.
+    pub fn numeric_min_max(&self, ni: usize) -> (f64, f64) {
+        self.numerics[ni].min_max()
+    }
+
+    /// Record `doc_id`'s value for numeric field `ni`; see
+    /// [`NumericStore::set`] for the contract (finite values only).
+    pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
+        self.numerics[ni].set(doc_id, value);
     }
 
     /// The name of field `f`. Panics when out of range.
@@ -826,10 +954,10 @@ impl Bm25Store {
                 "v5 carries exactly one field; multi-field stores write v6",
             ));
         }
-        if !self.facets.is_empty() {
+        if !self.facets.is_empty() || !self.numerics.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "v5 carries no facet columns; facet-bearing stores write v7",
+                "v5 carries no columns; column-bearing stores write v7",
             ));
         }
         let field = &self.fields[0];
@@ -884,26 +1012,35 @@ impl Bm25Store {
     /// per field: doc_lengths | postings | directory   <- v5-shape sections
     /// ```
     ///
-    /// A store with declared facet fields writes v7 (`TVBM2507`)
-    /// instead: the same layout with a facet table appended to the
-    /// header (u32 n_facets, then per facet: u16 name_len | name |
-    /// u32 n_values | u64 dict_off | u64 ords_off) and, after the last
-    /// field group, per facet a dict section (n_values x (u16 len |
-    /// value bytes), ordinal order) and an ords section (n_slots x
-    /// u32, [`FACET_ABSENT`] = no value). Every facet-less byte is
-    /// identical to the v6 writer's, by construction (the additions
-    /// are gated, not forked).
+    /// A store with declared facet or numeric fields writes v7
+    /// (`TVBM2507`) instead: the same layout with a kinded column
+    /// table appended to the header (u32 n_columns, then per column:
+    /// u16 name_len | name | u8 kind | kind payload — kind 0 facet:
+    /// u32 n_values | u64 dict_off | u64 ords_off; kind 1 f64: u64
+    /// min_bits | u64 max_bits | u64 vals_off) and, after the last
+    /// field group in table order, per facet a dict section (n_values
+    /// x (u16 len | value bytes), ordinal order) and an ords section
+    /// (n_slots x u32, [`FACET_ABSENT`] = no value), then per numeric
+    /// a vals section (n_slots x f64 bits, NaN = no value). Every
+    /// column-less byte is identical to the v6 writer's, by
+    /// construction (the additions are gated, not forked).
     pub fn write_v6_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let n_slots = self.texts.len() as u64;
         let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
-        let facet_table_size: u64 = if self.facets.is_empty() {
+        let has_columns = !self.facets.is_empty() || !self.numerics.is_empty();
+        let column_table_size: u64 = if !has_columns {
             0
         } else {
             4 + self
                 .facets
                 .iter()
-                .map(|f| 2 + f.name.len() as u64 + 4 + 8 + 8)
+                .map(|f| 2 + f.name.len() as u64 + 1 + 4 + 8 + 8)
                 .sum::<u64>()
+                + self
+                    .numerics
+                    .iter()
+                    .map(|n| 2 + n.name.len() as u64 + 1 + 8 + 8 + 8)
+                    .sum::<u64>()
         };
         let header_size: u64 = 8
             + 4
@@ -914,7 +1051,7 @@ impl Bm25Store {
                 .iter()
                 .map(|f| 2 + f.name.len() as u64 + 8 * 5)
                 .sum::<u64>()
-            + facet_table_size;
+            + column_table_size;
         // Size pass per field.
         let mut field_terms: Vec<Vec<&String>> = Vec::with_capacity(self.fields.len());
         let mut field_runs: Vec<Vec<(u64, u64)>> = Vec::with_capacity(self.fields.len());
@@ -938,7 +1075,8 @@ impl Bm25Store {
             section_offs.push((doc_lengths_off, postings_off, directory_off));
             cursor = directory_off + Self::field_directory_size(&field_terms[fi]);
         }
-        // (dict_off, ords_off) per facet, after the last field group.
+        // (dict_off, ords_off) per facet, then vals_off per numeric,
+        // after the last field group — column-table order.
         let mut facet_offs: Vec<(u64, u64)> = Vec::with_capacity(self.facets.len());
         for facet in &self.facets {
             let dict_off = cursor;
@@ -947,12 +1085,13 @@ impl Bm25Store {
             facet_offs.push((dict_off, ords_off));
             cursor = ords_off + 4 * n_slots;
         }
+        let mut numeric_offs: Vec<u64> = Vec::with_capacity(self.numerics.len());
+        for _ in &self.numerics {
+            numeric_offs.push(cursor);
+            cursor = cursor + 8 * n_slots;
+        }
 
-        w.write_all(if self.facets.is_empty() {
-            MAGIC_V6
-        } else {
-            MAGIC_V7
-        })?;
+        w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
         write_u32(w, self.fields.len() as u32)?;
         write_u32(w, n_slots as u32)?;
         write_u64(w, texts_off)?;
@@ -967,14 +1106,24 @@ impl Bm25Store {
             write_u64(w, p_off)?;
             write_u64(w, d_off)?;
         }
-        if !self.facets.is_empty() {
-            write_u32(w, self.facets.len() as u32)?;
+        if has_columns {
+            write_u32(w, (self.facets.len() + self.numerics.len()) as u32)?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                 write_u16(w, facet.name.len() as u16)?;
                 w.write_all(facet.name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_FACET])?;
                 write_u32(w, facet.dict.len() as u32)?;
                 write_u64(w, dict_off)?;
                 write_u64(w, ords_off)?;
+            }
+            for (numeric, &vals_off) in self.numerics.iter().zip(&numeric_offs) {
+                let (min, max) = numeric.min_max();
+                write_u16(w, numeric.name.len() as u16)?;
+                w.write_all(numeric.name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_F64])?;
+                write_u64(w, min.to_bits())?;
+                write_u64(w, max.to_bits())?;
+                write_u64(w, vals_off)?;
             }
         }
         self.write_shared_sections(w, 0)?;
@@ -991,6 +1140,11 @@ impl Bm25Store {
             }
             for slot in 0..n_slots as usize {
                 write_u32(w, facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT))?;
+            }
+        }
+        for numeric in &self.numerics {
+            for slot in 0..n_slots as usize {
+                write_u64(w, numeric.vals.get(slot).copied().unwrap_or(f64::NAN).to_bits())?;
             }
         }
         Ok(())
@@ -1024,10 +1178,10 @@ impl Bm25Store {
                 "v4 carries exactly one field",
             ));
         }
-        if !self.facets.is_empty() {
+        if !self.facets.is_empty() || !self.numerics.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "v4 carries no facet columns; facet-bearing stores write v7",
+                "v4 carries no columns; column-bearing stores write v7",
             ));
         }
         let field = &self.fields[0];
@@ -1123,6 +1277,7 @@ impl Bm25Store {
             texts,
             lineages,
             facets: Vec::new(),
+            numerics: Vec::new(),
         }
     }
 
@@ -1830,23 +1985,44 @@ impl Bm25Store {
             ));
             cursor = base + 40;
         }
-        // Facet table (v7 only): name, value count, dict/ords offsets.
+        // Column table (v7 only): kinded entries — facet (name, value
+        // count, dict/ords offsets) or f64 numeric (name, min/max
+        // metadata skipped here — recomputed at write — and vals
+        // offset). Unknown kinds refuse by number.
         let mut facet_metas: Vec<(String, u32, u64, u64)> = Vec::new();
+        let mut numeric_metas: Vec<(String, u64)> = Vec::new();
         if v7 {
-            let n_facets = u32_at(cursor)? as usize;
+            let n_columns = u32_at(cursor)? as usize;
             cursor += 4;
-            for _ in 0..n_facets {
+            for _ in 0..n_columns {
                 let name_len = u64::from(u16_at(at(cursor, 2)?));
                 let name = String::from_utf8(at(cursor + 2, name_len)?.to_vec())
-                    .map_err(|_| invalid("invalid utf-8 in facet field name"))?;
-                let base = cursor + 2 + name_len;
-                facet_metas.push((
-                    name,
-                    u32_at(base)?,     // n_values
-                    u64_at(base + 4)?, // dict_off
-                    u64_at(base + 12)?, // ords_off
-                ));
-                cursor = base + 20;
+                    .map_err(|_| invalid("invalid utf-8 in column name"))?;
+                let kind = at(cursor + 2 + name_len, 1)?[0];
+                let base = cursor + 2 + name_len + 1;
+                match kind {
+                    COLUMN_KIND_FACET => {
+                        facet_metas.push((
+                            name,
+                            u32_at(base)?,      // n_values
+                            u64_at(base + 4)?,  // dict_off
+                            u64_at(base + 12)?, // ords_off
+                        ));
+                        cursor = base + 20;
+                    }
+                    COLUMN_KIND_F64 => {
+                        // min/max bits at base and base + 8 are write-time
+                        // metadata; the heap store recomputes them.
+                        numeric_metas.push((name, u64_at(base + 16)?));
+                        cursor = base + 24;
+                    }
+                    k => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("column kind {k} unknown to this binary"),
+                        ))
+                    }
+                }
             }
         }
         // Shared sections.
@@ -1927,11 +2103,21 @@ impl Bm25Store {
                 ords,
             });
         }
+        // Numeric columns (v7 only): n_slots x f64 bits, NaN = absent.
+        let mut numerics = Vec::with_capacity(numeric_metas.len());
+        for (name, vals_off) in numeric_metas {
+            let mut vals = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots as u64 {
+                vals.push(f64::from_bits(u64_at(vals_off + 8 * slot)?));
+            }
+            numerics.push(NumericStore { name, vals });
+        }
         Ok(Self {
             fields,
             texts,
             lineages,
             facets,
+            numerics,
         })
     }
 }
@@ -2005,6 +2191,9 @@ pub struct SpillBuilder {
     /// memory ceiling the spill exists for). Non-empty makes `finish`
     /// write v7.
     facets: Vec<FacetStore>,
+    /// Numeric columns in numeric-id order (8 B per slot in heap, same
+    /// argument as `facets`). Non-empty makes `finish` write v7.
+    numerics: Vec<NumericStore>,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
@@ -2056,6 +2245,7 @@ impl SpillBuilder {
             lineages: Vec::new(),
             doc_count: 0,
             facets: Vec::new(),
+            numerics: Vec::new(),
             v4_only,
         })
     }
@@ -2093,6 +2283,41 @@ impl SpillBuilder {
     /// [`FacetStore::set`] for the contract.
     pub fn set_facet(&mut self, fi: usize, doc_id: u32, value: &str) {
         self.facets[fi].set(doc_id, value);
+    }
+
+    /// Declare the numeric field table; same contract as
+    /// [`Bm25Store::with_numerics`]. Must be called before any
+    /// document is added; makes `finish` write v7.
+    pub fn with_numeric_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "numeric fields must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.numerics = names.iter().map(|n| NumericStore::new(n)).collect();
+        self
+    }
+
+    /// Number of numeric fields in the numeric table.
+    pub fn numeric_count(&self) -> usize {
+        self.numerics.len()
+    }
+
+    /// The name of numeric field `ni`. Panics when out of range.
+    pub fn numeric_name(&self, ni: usize) -> &str {
+        &self.numerics[ni].name
+    }
+
+    /// The index of the numeric field named `name`, if the table has it.
+    pub fn numeric_index(&self, name: &str) -> Option<usize> {
+        self.numerics.iter().position(|n| n.name == name)
+    }
+
+    /// Record `doc_id`'s value for numeric field `ni`; see
+    /// [`NumericStore::set`] for the contract (finite values only).
+    pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
+        self.numerics[ni].set(doc_id, value);
     }
 
     /// Override the sort-buffer capacity (tests force multi-run merges
@@ -2387,14 +2612,20 @@ impl SpillBuilder {
 
         // Section geometry, identical to Bm25Store::write_v6_to.
         let n_slots = self.fields[0].doc_lengths.len() as u64;
-        let facet_table_size: u64 = if self.facets.is_empty() {
+        let has_columns = !self.facets.is_empty() || !self.numerics.is_empty();
+        let column_table_size: u64 = if !has_columns {
             0
         } else {
             4 + self
                 .facets
                 .iter()
-                .map(|f| 2 + f.name.len() as u64 + 4 + 8 + 8)
+                .map(|f| 2 + f.name.len() as u64 + 1 + 4 + 8 + 8)
                 .sum::<u64>()
+                + self
+                    .numerics
+                    .iter()
+                    .map(|n| 2 + n.name.len() as u64 + 1 + 8 + 8 + 8)
+                    .sum::<u64>()
         };
         let header_size: u64 = 8
             + 4
@@ -2405,7 +2636,7 @@ impl SpillBuilder {
                 .iter()
                 .map(|f| 2 + f.name.len() as u64 + 8 * 5)
                 .sum::<u64>()
-            + facet_table_size;
+            + column_table_size;
         let texts_off = header_size;
         let text_index_off = texts_off + self.texts_bytes;
         let lineages_off = text_index_off + 12 * n_slots;
@@ -2430,7 +2661,8 @@ impl SpillBuilder {
             section_offs.push((doc_lengths_off, postings_off, directory_off));
             cursor = directory_off + directory_size;
         }
-        // (dict_off, ords_off) per facet, after the last field group.
+        // (dict_off, ords_off) per facet, then vals_off per numeric,
+        // after the last field group — column-table order.
         let mut facet_offs: Vec<(u64, u64)> = Vec::with_capacity(self.facets.len());
         for facet in &self.facets {
             let dict_off = cursor;
@@ -2439,15 +2671,16 @@ impl SpillBuilder {
             facet_offs.push((dict_off, ords_off));
             cursor = ords_off + 4 * n_slots;
         }
+        let mut numeric_offs: Vec<u64> = Vec::with_capacity(self.numerics.len());
+        for _ in &self.numerics {
+            numeric_offs.push(cursor);
+            cursor += 8 * n_slots;
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(if self.facets.is_empty() {
-                MAGIC_V6
-            } else {
-                MAGIC_V7
-            })?;
+            w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
             write_u32(&mut w, self.fields.len() as u32)?;
             write_u32(&mut w, n_slots as u32)?;
             write_u64(&mut w, texts_off)?;
@@ -2462,14 +2695,24 @@ impl SpillBuilder {
                 write_u64(&mut w, p_off)?;
                 write_u64(&mut w, d_off)?;
             }
-            if !self.facets.is_empty() {
-                write_u32(&mut w, self.facets.len() as u32)?;
+            if has_columns {
+                write_u32(&mut w, (self.facets.len() + self.numerics.len()) as u32)?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                     write_u16(&mut w, facet.name.len() as u16)?;
                     w.write_all(facet.name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_FACET])?;
                     write_u32(&mut w, facet.dict.len() as u32)?;
                     write_u64(&mut w, dict_off)?;
                     write_u64(&mut w, ords_off)?;
+                }
+                for (numeric, &vals_off) in self.numerics.iter().zip(&numeric_offs) {
+                    let (min, max) = numeric.min_max();
+                    write_u16(&mut w, numeric.name.len() as u16)?;
+                    w.write_all(numeric.name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_F64])?;
+                    write_u64(&mut w, min.to_bits())?;
+                    write_u64(&mut w, max.to_bits())?;
+                    write_u64(&mut w, vals_off)?;
                 }
             }
             // texts: byte-copy of the spill (already section-encoded).
@@ -2535,6 +2778,14 @@ impl SpillBuilder {
                 }
                 for slot in 0..n_slots as usize {
                     write_u32(&mut w, facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT))?;
+                }
+            }
+            for numeric in &self.numerics {
+                for slot in 0..n_slots as usize {
+                    write_u64(
+                        &mut w,
+                        numeric.vals.get(slot).copied().unwrap_or(f64::NAN).to_bits(),
+                    )?;
                 }
             }
             w.flush()?;
@@ -3326,35 +3577,52 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         ));
         cursor = base + 40;
     }
-    // Facet table (v7 only): names non-empty and unique, offsets
-    // collected. A v7 file with zero facet fields is refused — the
-    // writers emit v6 for that store, so the combination can only be
-    // corruption or a bug.
+    // Column table (v7 only): kinded entries, names non-empty and
+    // unique across the whole table, offsets collected per kind. A v7
+    // file with zero columns is refused — the writers emit v6 for that
+    // store, so the combination can only be corruption or a bug. An
+    // unknown kind refuses by number rather than guessing a payload
+    // width (parsing past it would misread every later entry).
     let mut facets: Vec<(u32, u64, u64)> = Vec::new(); // (n_values, dict, ords)
+    let mut numerics: Vec<(u64, u64, u64)> = Vec::new(); // (min_bits, max_bits, vals)
     if v7 {
-        let n_facets = u64::from(u32_at(cursor)?);
-        if n_facets == 0 {
-            return Err(invalid("v7 file with zero facet fields".into()));
+        let n_columns = u64::from(u32_at(cursor)?);
+        if n_columns == 0 {
+            return Err(invalid("v7 file with zero columns".into()));
         }
         cursor += 4;
-        let mut facet_names: Vec<Vec<u8>> = Vec::new();
-        for i in 0..n_facets {
+        let mut column_names: Vec<Vec<u8>> = Vec::new();
+        for i in 0..n_columns {
             let name_len = u64::from(u16_at(bytes_at(cursor, 2)?));
             if name_len == 0 {
-                return Err(invalid(format!("facet field {i}: empty name")));
+                return Err(invalid(format!("column {i}: empty name")));
             }
             let name = bytes_at(cursor + 2, name_len)?.to_vec();
-            if facet_names.contains(&name) {
-                return Err(invalid(format!("facet field {i}: duplicate name")));
+            if column_names.contains(&name) {
+                return Err(invalid(format!("column {i}: duplicate name")));
             }
-            facet_names.push(name);
-            let base = cursor + 2 + name_len;
-            facets.push((
-                u32_at(base)?,      // n_values
-                u64_at(base + 4)?,  // dict_off
-                u64_at(base + 12)?, // ords_off
-            ));
-            cursor = base + 20;
+            column_names.push(name);
+            let kind = bytes_at(cursor + 2 + name_len, 1)?[0];
+            let base = cursor + 2 + name_len + 1;
+            match kind {
+                COLUMN_KIND_FACET => {
+                    facets.push((
+                        u32_at(base)?,      // n_values
+                        u64_at(base + 4)?,  // dict_off
+                        u64_at(base + 12)?, // ords_off
+                    ));
+                    cursor = base + 20;
+                }
+                COLUMN_KIND_F64 => {
+                    numerics.push((u64_at(base)?, u64_at(base + 8)?, u64_at(base + 16)?));
+                    cursor = base + 24;
+                }
+                k => {
+                    return Err(invalid(format!(
+                        "column {i}: kind {k} unknown to this binary"
+                    )))
+                }
+            }
         }
     }
     let header_end = cursor;
@@ -3376,9 +3644,13 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let lineage_end = lineage_section_end(map, lineages_off, n_slots)?;
     // Per-field groups: contiguous from the lineage end, tiling the
     // file exactly (each group's blob-fill check pins its end to the
-    // next group's start, and the last to the first facet section — or
-    // EOF when there are none).
-    let field_groups_end = facets.first().map_or(file_len, |f| f.1);
+    // next group's start, and the last to the first column section —
+    // or EOF when there are none).
+    let field_groups_end = facets
+        .first()
+        .map(|f| f.1)
+        .or_else(|| numerics.first().map(|n| n.2))
+        .unwrap_or(file_len);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
         if dl_off != expected_start {
@@ -3432,7 +3704,11 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             )));
         }
         let group_end = ords_off + 4 * n_slots;
-        let expected_end = facets.get(i + 1).map_or(file_len, |f| f.1);
+        let expected_end = facets
+            .get(i + 1)
+            .map(|f| f.1)
+            .or_else(|| numerics.first().map(|n| n.2))
+            .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "facet field {i}: ords section does not end at the next section's start"
@@ -3445,6 +3721,51 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     "facet field {i}: ordinal out of dictionary range at slot {slot}"
                 )));
             }
+        }
+        expected_start = group_end;
+    }
+    // Numeric groups: one n_slots x f64 vals section each, tiling to
+    // EOF. Every value is finite or NaN (NaN = absent; infinities
+    // break the score-function bound algebra, so the writer refuses
+    // them and the reader treats one as corruption), and the table's
+    // min/max metadata must agree with a full scan — a bound computed
+    // from stale metadata would prune true hits.
+    for (i, &(min_bits, max_bits, vals_off)) in numerics.iter().enumerate() {
+        if vals_off != expected_start {
+            return Err(invalid(format!(
+                "numeric field {i}: vals section does not start at the previous section's end"
+            )));
+        }
+        let group_end = vals_off + 8 * n_slots;
+        let expected_end = numerics.get(i + 1).map_or(file_len, |n| n.2);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "numeric field {i}: vals section does not end at the next section's start"
+            )));
+        }
+        let mut min = f64::NAN;
+        let mut max = f64::NAN;
+        for slot in 0..n_slots {
+            let v = f64::from_bits(u64_at(vals_off + 8 * slot)?);
+            if v.is_infinite() {
+                return Err(invalid(format!(
+                    "numeric field {i}: non-finite value at slot {slot}"
+                )));
+            }
+            if v.is_nan() {
+                continue;
+            }
+            if min.is_nan() || v < min {
+                min = v;
+            }
+            if max.is_nan() || v > max {
+                max = v;
+            }
+        }
+        if min.to_bits() != min_bits || max.to_bits() != max_bits {
+            return Err(invalid(format!(
+                "numeric field {i}: min/max metadata disagrees with the values"
+            )));
         }
         expected_start = group_end;
     }
@@ -3490,6 +3811,19 @@ struct FacetSlice {
     ords_off: u64,
 }
 
+/// Per-numeric-column read state of one open v7 file: the min/max
+/// bound metadata from the column table plus the map offset of the
+/// fixed-stride vals section, which stays on disk.
+struct NumericSlice {
+    name: String,
+    /// Min over present values (NaN when the column holds none).
+    min: f64,
+    /// Max over present values (NaN when the column holds none).
+    max: f64,
+    /// Absolute offset of the vals section (n_slots x f64 bits).
+    vals_off: u64,
+}
+
 pub struct Bm25Reader {
     map: memmap2::Mmap,
     /// Per-field state, field-id order; never empty. Field 0 is the
@@ -3497,6 +3831,9 @@ pub struct Bm25Reader {
     fields: Vec<FieldSlice>,
     /// Per-facet state, facet-id order (v7 files; empty otherwise).
     facets: Vec<FacetSlice>,
+    /// Per-numeric-column state, numeric-id order (v7 files; empty
+    /// otherwise).
+    numerics: Vec<NumericSlice>,
     /// Documents with postings in any field — the corpus-wide N (a
     /// document is a document; idf never uses a per-field count).
     doc_count: u64,
@@ -3609,6 +3946,47 @@ impl Bm25Reader {
         }
     }
 
+    /// Number of numeric fields in the numeric table (0 pre-v7).
+    pub fn numeric_count(&self) -> usize {
+        self.numerics.len()
+    }
+
+    /// The name of numeric field `ni`. Panics when out of range.
+    pub fn numeric_name(&self, ni: usize) -> &str {
+        &self.numerics[ni].name
+    }
+
+    /// The index of the numeric field named `name`, if the table has it.
+    pub fn numeric_index(&self, name: &str) -> Option<usize> {
+        self.numerics.iter().position(|n| n.name == name)
+    }
+
+    /// (min, max) of numeric field `ni` over present values, from the
+    /// column table's write-time metadata (validated against a full
+    /// scan at open); (NaN, NaN) when no document has a value.
+    pub fn numeric_min_max(&self, ni: usize) -> (f64, f64) {
+        (self.numerics[ni].min, self.numerics[ni].max)
+    }
+
+    /// `doc_id`'s value for numeric field `ni`, `None` when absent.
+    /// One 8 B read of the mmapped fixed-stride vals section.
+    pub fn numeric_value(&self, ni: usize, doc_id: u32) -> Option<f64> {
+        let numeric = &self.numerics[ni];
+        let slot = doc_id as usize;
+        if slot >= self.n_slots() {
+            return None;
+        }
+        let off = numeric.vals_off as usize + 8 * slot;
+        let v = f64::from_bits(u64::from_le_bytes(
+            self.map[off..off + 8].try_into().expect("8 bytes"),
+        ));
+        if v.is_nan() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
     /// Number of terms in field 0's directory.
     pub fn term_count(&self) -> u32 {
         self.fields[0].n_terms
@@ -3689,6 +4067,7 @@ impl Bm25Reader {
                 run_base: 0,
             }],
             facets: Vec::new(),
+            numerics: Vec::new(),
             doc_count,
             lineages_off,
             text_index_off: lineages_off - 12 * n_slots as u64,
@@ -3743,36 +4122,56 @@ impl Bm25Reader {
             });
             cursor = base + 40;
         }
-        // Facet table (v7 only): decode each dictionary eagerly (one
-        // entry per distinct value — small), leave the ords sections in
-        // the map.
+        // Column table (v7 only): decode each facet dictionary eagerly
+        // (one entry per distinct value — small) and each numeric
+        // column's min/max metadata; ords and vals sections stay in the
+        // map. Unknown kinds were already refused by validation.
         let mut facets = Vec::new();
+        let mut numerics = Vec::new();
         if v7 {
-            let n_facets = u32_at(cursor) as usize;
+            let n_columns = u32_at(cursor) as usize;
             cursor += 4;
-            for _ in 0..n_facets {
+            for _ in 0..n_columns {
                 let name_len =
                     u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
                 let name =
                     String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
-                let base = cursor + 2 + name_len;
-                let n_values = u32_at(base) as usize;
-                let dict_off = u64_at(base + 4) as usize;
-                let ords_off = u64_at(base + 12);
-                let mut dict = Vec::with_capacity(n_values);
-                let mut dcur = dict_off;
-                for _ in 0..n_values {
-                    let len =
-                        u16::from_le_bytes(map[dcur..dcur + 2].try_into().unwrap()) as usize;
-                    dict.push(String::from_utf8_lossy(&map[dcur + 2..dcur + 2 + len]).into_owned());
-                    dcur += 2 + len;
+                let kind = map[cursor + 2 + name_len];
+                let base = cursor + 2 + name_len + 1;
+                match kind {
+                    COLUMN_KIND_FACET => {
+                        let n_values = u32_at(base) as usize;
+                        let dict_off = u64_at(base + 4) as usize;
+                        let ords_off = u64_at(base + 12);
+                        let mut dict = Vec::with_capacity(n_values);
+                        let mut dcur = dict_off;
+                        for _ in 0..n_values {
+                            let len = u16::from_le_bytes(map[dcur..dcur + 2].try_into().unwrap())
+                                as usize;
+                            dict.push(
+                                String::from_utf8_lossy(&map[dcur + 2..dcur + 2 + len])
+                                    .into_owned(),
+                            );
+                            dcur += 2 + len;
+                        }
+                        facets.push(FacetSlice {
+                            name,
+                            dict,
+                            ords_off,
+                        });
+                        cursor = base + 20;
+                    }
+                    COLUMN_KIND_F64 => {
+                        numerics.push(NumericSlice {
+                            name,
+                            min: f64::from_bits(u64_at(base)),
+                            max: f64::from_bits(u64_at(base + 8)),
+                            vals_off: u64_at(base + 16),
+                        });
+                        cursor = base + 24;
+                    }
+                    k => unreachable!("validation refused unknown column kind {k}"),
                 }
-                facets.push(FacetSlice {
-                    name,
-                    dict,
-                    ords_off,
-                });
-                cursor = base + 20;
             }
         }
         let doc_count = (0..n_slots)
@@ -3782,6 +4181,7 @@ impl Bm25Reader {
             map,
             fields,
             facets,
+            numerics,
             doc_count,
             lineages_off,
             text_index_off,
