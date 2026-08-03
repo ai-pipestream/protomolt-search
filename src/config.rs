@@ -208,6 +208,13 @@ pub struct Config {
     /// `facet_fields`; names must not collide with them (the v7 column
     /// table holds both and refuses duplicates).
     pub numeric_fields: Vec<String>,
+    /// The map<string, string> column table for NEW shard builders
+    /// (`--map-facet-fields=meta`, docs/map-columns.md). Same rules;
+    /// one name space across all column kinds.
+    pub map_facet_fields: Vec<String>,
+    /// The map<string, f64> column table for NEW shard builders
+    /// (`--map-numeric-fields=attrs`). Same rules.
+    pub map_numeric_fields: Vec<String>,
     /// The shard map the coordinator's `node_addrs` came from, when
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
@@ -250,6 +257,8 @@ struct FileConfig {
     bm25_fields: Option<Vec<String>>,
     facet_fields: Option<Vec<String>>,
     numeric_fields: Option<Vec<String>>,
+    map_facet_fields: Option<Vec<String>>,
+    map_numeric_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
     shard_map: Option<String>,
@@ -812,6 +821,47 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
     }
 
+    let parse_list = |flag: &str, env: &str, file_val: &Option<Vec<String>>| -> Vec<String> {
+        match opt(args, flag, env, None) {
+            Some(s) => s
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            None => file_val.clone().unwrap_or_default(),
+        }
+    };
+    let map_facet_fields = parse_list(
+        "map-facet-fields",
+        "TURBOVEC_MAP_FACET_FIELDS",
+        &file.map_facet_fields,
+    );
+    let map_numeric_fields = parse_list(
+        "map-numeric-fields",
+        "TURBOVEC_MAP_NUMERIC_FIELDS",
+        &file.map_numeric_fields,
+    );
+    // One name space across all column kinds: the v7 column table
+    // refuses duplicates, so the config does too, early and by name.
+    {
+        let mut all: Vec<&String> = Vec::new();
+        for name in facet_fields
+            .iter()
+            .chain(&numeric_fields)
+            .chain(&map_facet_fields)
+            .chain(&map_numeric_fields)
+        {
+            if all.contains(&name) {
+                return Err(format!(
+                    "column {name:?} is declared under more than one column kind; \
+                     the v7 column table holds one column per name"
+                ));
+            }
+            all.push(name);
+        }
+    }
+
     Ok(Config {
         role,
         coord_listen,
@@ -842,6 +892,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         bm25_fields,
         facet_fields,
         numeric_fields,
+        map_facet_fields,
+        map_numeric_fields,
         shard_map,
     })
 }

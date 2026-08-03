@@ -787,6 +787,39 @@ message NumericValue {
   double value = 2;
 }
 
+// One map-facet entry of a document: a single string value under a
+// string key in one declared map<string, string> column
+// (docs/map-columns.md). Keys and values are opaque — never analyzed —
+// and land in the column's dictionaries; the map is ONE column no
+// matter how many distinct keys the corpus carries, which is the
+// structural answer to the field-per-key explosion flattening causes.
+message MapFacetEntry {
+  // Map column name; must exist in the shard's map-facet table
+  // (--map-facet-fields). Unknown names are INVALID_ARGUMENT.
+  string field = 1;
+  // The entry's key. Non-empty (an empty key is almost always a
+  // producer bug; a document without an entry simply omits it). At
+  // most one value per (document, field, key) — map semantics.
+  string key = 2;
+  // The value. Non-empty, exact identity.
+  string value = 3;
+}
+
+// One map-numeric entry of a document: a single f64 under a string key
+// in one declared map<string, f64> column. Same rules as
+// MapFacetEntry; values must be finite (there is no NaN sentinel in
+// map pairs — absence is the key simply not being present — and
+// infinities break the score-function bound algebra).
+message MapNumericEntry {
+  // Map column name; must exist in the shard's map-numeric table
+  // (--map-numeric-fields).
+  string field = 1;
+  // The entry's key. Non-empty; at most one per (document, field, key).
+  string key = 2;
+  // The value. Finite.
+  double value = 3;
+}
+
 // One document on the `AddDocuments` stream.
 message AddDocumentsRequest {
   // Raw document text. Non-empty, at most 1 MiB (the sidecar's cap).
@@ -810,6 +843,12 @@ message AddDocumentsRequest {
   // Numeric values for this document, one entry per declared numeric
   // field it has a value for. Same durable-record lever as `facets`.
   repeated NumericValue numerics = 6;
+  // Map-facet entries for this document (docs/map-columns.md). Same
+  // durable-record lever: old WAL logs replay map-less, reshard replay
+  // is how an existing corpus grows map columns.
+  repeated MapFacetEntry map_facets = 7;
+  // Map-numeric entries for this document. Same lever.
+  repeated MapNumericEntry map_numerics = 8;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -950,6 +989,24 @@ message Bm25QueryRequest {
   // every shard. Currently the flat single-field route only; setting
   // this with `fields` legs is refused. Empty = identity.
   repeated ScoreStage score_stages = 12;
+  // Map-facet keys to count over the FULL match set
+  // (docs/map-columns.md): each entry names a map column and a key,
+  // counted exactly like a plain facet field — count-then-rank, one
+  // ords lookup per matched document, independent of k and the floor.
+  // Answered in Bm25QueryResponse.facets AFTER the plain facet
+  // entries, with FacetFieldCounts.key set.
+  repeated MapFacetField map_facet_fields = 13;
+}
+
+// One map-facet count request: a (column, key) pair. Structured rather
+// than a "column[key]" string so keys never need escaping — keys are
+// arbitrary map keys, and a parsing ambiguity here would miscount
+// silently.
+message MapFacetField {
+  // Map column name (--map-facet-fields).
+  string column = 1;
+  // The key within the column whose values are counted.
+  string key = 2;
 }
 
 // The transform of one score stage. Every op is monotone
@@ -976,11 +1033,14 @@ enum ScoreOp {
 message ScoreStage {
   // The transform. SCORE_OP_UNSPECIFIED is refused.
   ScoreOp op = 1;
-  // The numeric field (--numeric-fields) the stage reads. A document
-  // without a value passes through unchanged (identity) — exact, not
-  // degraded, and the same rule makes a shard that lacks the column
-  // entirely correct. A column NO shard knows is refused by the
-  // coordinator (the typo rule, as for fields and facets).
+  // The numeric field (--numeric-fields) the stage reads — or, when
+  // `key` is set, the map-numeric column (--map-numeric-fields) whose
+  // entry under that key it reads. A document without a value passes
+  // through unchanged (identity) — exact, not degraded, and the same
+  // rule makes a shard that lacks the column entirely correct. A
+  // column (or, for map stages, a (column, key) pair) NO shard knows
+  // is refused by the coordinator (the typo rule, as for fields and
+  // facets).
   string column = 2;
   // Weight; used by MULT_LOG (>= 0) and ADD_LINEAR (any finite).
   double weight = 3;
@@ -988,6 +1048,10 @@ message ScoreStage {
   double origin = 4;
   // Decay scale (MULT_EXP_DECAY): > 0, finite.
   double scale = 5;
+  // When set, `column` names a map-numeric column and the stage reads
+  // its entry under this key (docs/map-columns.md); bounds lift from
+  // that key's min/max metadata. Empty = plain numeric column.
+  string key = 6;
 }
 
 // One field's leg of a fused multi-field BM25 query.
@@ -1085,7 +1149,8 @@ message FacetCount {
 
 // One requested facet field's counts, from one shard or merged.
 message FacetFieldCounts {
-  // The facet field name.
+  // The facet field name — a plain facet column, or a map column when
+  // `key` is set.
   string field = 1;
   // Whether this shard has the field in its facet table. A shard
   // without it answers known=false and no counts — legitimate for a
@@ -1099,6 +1164,12 @@ message FacetFieldCounts {
   // descending, ties by value ascending. Values matched by no document
   // are omitted.
   repeated FacetCount counts = 3;
+  // For a map-facet entry (docs/map-columns.md): the key within the
+  // map column these counts are for. Empty for plain facet fields.
+  // `known` then means "this shard's column has this key in its key
+  // dictionary" — the same partial-knowledge rule, applied per key so
+  // a typo'd key cannot read as zero results everywhere.
+  string key = 4;
 }
 
 // Reads raw texts from the doc store.
@@ -1163,6 +1234,12 @@ message Bm25SearchRequest {
   // route only for now; setting this with `fields` is refused. A stage
   // column no shard knows is refused (INVALID_ARGUMENT).
   repeated ScoreStage score_stages = 7;
+  // Map-facet keys to count over the full match set
+  // (docs/map-columns.md), forwarded to every shard and summed like
+  // plain facet fields; answered in `facets` after the plain entries,
+  // with FacetFieldCounts.key set. A (column, key) pair no shard knows
+  // is refused (INVALID_ARGUMENT).
+  repeated MapFacetField map_facet_fields = 8;
 }
 
 // One field of a fused multi-field search.

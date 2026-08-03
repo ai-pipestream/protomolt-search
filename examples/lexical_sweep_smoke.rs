@@ -29,6 +29,8 @@ async fn add_documents(addr: &str, texts: &[&str]) {
     let (tx, rx) = mpsc::channel(8);
     for text in texts {
         tx.send(AddDocumentsRequest {
+            map_numerics: Vec::new(),
+            map_facets: Vec::new(),
             numerics: Vec::new(),
             facets: Vec::new(),
             text: text.to_string(),

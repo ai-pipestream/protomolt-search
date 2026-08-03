@@ -130,19 +130,31 @@ fn is_stale_stats(status: &Status) -> bool {
 /// as "no results per anything".
 fn merge_facet_counts(
     requested: &[String],
+    map_requested: &[crate::pb::MapFacetField],
     shard_facets: &[Vec<crate::pb::FacetFieldCounts>],
 ) -> Result<Vec<crate::pb::FacetFieldCounts>, Status> {
-    if requested.is_empty() {
+    // Response order is the request order: plain entries, then map
+    // entries — merged positionally.
+    let want: Vec<(String, String)> = requested
+        .iter()
+        .map(|name| (name.clone(), String::new()))
+        .chain(
+            map_requested
+                .iter()
+                .map(|m| (m.column.clone(), m.key.clone())),
+        )
+        .collect();
+    if want.is_empty() {
         return Ok(Vec::new());
     }
-    let mut known = vec![false; requested.len()];
-    let mut sums: Vec<HashMap<String, u64>> = requested.iter().map(|_| HashMap::new()).collect();
+    let mut known = vec![false; want.len()];
+    let mut sums: Vec<HashMap<String, u64>> = want.iter().map(|_| HashMap::new()).collect();
     for per_shard in shard_facets {
-        if per_shard.len() != requested.len() {
+        if per_shard.len() != want.len() {
             return Err(Status::internal(format!(
                 "shard returned {} facet fields for {} requested",
                 per_shard.len(),
-                requested.len()
+                want.len()
             )));
         }
         for (fi, ff) in per_shard.iter().enumerate() {
@@ -152,32 +164,40 @@ fn merge_facet_counts(
             }
         }
     }
-    let unknown: Vec<String> = requested
+    let unknown: Vec<String> = want
         .iter()
         .zip(&known)
         .filter(|(_, k)| !**k)
-        .map(|(name, _)| format!("{name:?}"))
+        .map(|((field, key), _)| {
+            if key.is_empty() {
+                format!("{field:?}")
+            } else {
+                format!("{field:?}[{key:?}]")
+            }
+        })
         .collect();
     if !unknown.is_empty() {
         return Err(Status::invalid_argument(format!(
             "no shard has facet field {}: counting an unknown field would silently answer \
-             zero everywhere. Check the spelling, or the nodes' --facet-fields.",
+             zero everywhere. Check the spelling, or the nodes' --facet-fields / \
+             --map-facet-fields.",
             unknown.join(", ")
         )));
     }
-    Ok(requested
-        .iter()
+    Ok(want
+        .into_iter()
         .zip(sums)
-        .map(|(name, sum)| {
+        .map(|((field, key), sum)| {
             let mut counts: Vec<crate::pb::FacetCount> = sum
                 .into_iter()
                 .map(|(value, count)| crate::pb::FacetCount { value, count })
                 .collect();
             counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
             crate::pb::FacetFieldCounts {
-                field: name.clone(),
+                field,
                 known: true,
                 counts,
+                key,
             }
         })
         .collect())
@@ -372,7 +392,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[])
+        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[], &[])
             .await
             .map(|(hits, _)| hits)
     }
@@ -396,6 +416,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
         facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
         score_stages: &[crate::pb::ScoreStage],
     ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         let addr = self.analysis_addr.clone().ok_or_else(|| {
@@ -429,6 +450,7 @@ impl CoordinatorServiceImpl {
                     &global,
                     &claims,
                     facet_fields,
+                    map_facet_fields,
                     score_stages,
                 )
                 .await
@@ -457,6 +479,7 @@ impl CoordinatorServiceImpl {
         global: &CorpusStats,
         claims: &[u64],
         facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
         score_stages: &[crate::pb::ScoreStage],
     ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
@@ -473,6 +496,7 @@ impl CoordinatorServiceImpl {
                 fields: Vec::new(),
                 expected_stats_epoch: claims[shard],
                 facet_fields: facet_fields.to_vec(),
+                map_facet_fields: map_facet_fields.to_vec(),
                 score_stages: score_stages.to_vec(),
             };
             let mut client = self.node_client(node)?;
@@ -511,16 +535,22 @@ impl CoordinatorServiceImpl {
             .iter()
             .zip(&stage_known)
             .filter(|(_, known)| !**known)
-            .map(|(s, _)| format!("{:?}", s.column))
+            .map(|(s, _)| {
+                if s.key.is_empty() {
+                    format!("{:?}", s.column)
+                } else {
+                    format!("{:?}[{:?}]", s.column, s.key)
+                }
+            })
             .collect();
         if !unknown.is_empty() {
             return Err(Status::invalid_argument(format!(
                 "no shard has numeric column {}: the chain would be a silent no-op. \
-                 Check the spelling, or the nodes' --numeric-fields.",
+                 Check the spelling, or the nodes' --numeric-fields / --map-numeric-fields.",
                 unknown.join(", ")
             )));
         }
-        let facets = merge_facet_counts(facet_fields, &shard_facets)?;
+        let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         all.sort_by(|(sa, a), (sb, b)| {
             b.score
                 .total_cmp(&a.score)
@@ -544,7 +574,7 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[])
+        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[], &[])
             .await
             .map(|(hits, _)| hits)
     }
@@ -559,6 +589,7 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
         facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
     ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
         // route and the single-field route reach the same node scorer,
@@ -634,6 +665,7 @@ impl CoordinatorServiceImpl {
                     &claims,
                     min_score,
                     facet_fields,
+                    map_facet_fields,
                     trace,
                     t0,
                     t_analyzed,
@@ -780,6 +812,7 @@ impl CoordinatorServiceImpl {
         claims: &[u64],
         min_score: f32,
         facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
         trace: bool,
         t0: std::time::Instant,
         t_analyzed: std::time::Duration,
@@ -847,6 +880,7 @@ impl CoordinatorServiceImpl {
                 fields: legs.clone(),
                 expected_stats_epoch: claims[shard],
                 facet_fields: facet_fields.to_vec(),
+                map_facet_fields: map_facet_fields.to_vec(),
                 // The fused route does not carry score stages yet; the
                 // public handler refuses the combination.
                 score_stages: Vec::new(),
@@ -876,7 +910,7 @@ impl CoordinatorServiceImpl {
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
         }
-        let facets = merge_facet_counts(facet_fields, &shard_facets)?;
+        let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let t_query = t0.elapsed();
         if trace {
             eprintln!(
@@ -1446,6 +1480,7 @@ impl CoordinatorServiceImpl {
                     // answer there. Score stages likewise wait for the
                     // hybrid composition story.
                     facet_fields: Vec::new(),
+                    map_facet_fields: Vec::new(),
                     score_stages: Vec::new(),
                 };
                 let mut client = self.node_client(node)?;
@@ -3393,6 +3428,7 @@ impl SearchService for CoordinatorServiceImpl {
                 req.analysis.as_ref(),
                 req.min_score,
                 &req.facet_fields,
+                &req.map_facet_fields,
                 &req.score_stages,
             )
             .await?
@@ -3424,6 +3460,7 @@ impl SearchService for CoordinatorServiceImpl {
                 &req.fields,
                 req.min_score,
                 &req.facet_fields,
+                &req.map_facet_fields,
             )
             .await?
         };
