@@ -71,6 +71,7 @@ async fn start_shard(
     let feeder = tokio::spawn(async move {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                facets: Vec::new(),
                 text: format!("chunk {i} of opinion {opinion} with some plain words"),
                 analysis: None,
                 lineage: Some(DocLineage {

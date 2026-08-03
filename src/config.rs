@@ -197,6 +197,11 @@ pub struct Config {
     /// fields. Existing `.bm25` files keep the table they were written
     /// with. Documents naming fields outside the table are refused.
     pub bm25_fields: Vec<String>,
+    /// The facet field table for NEW shard builders
+    /// (`--facet-fields=court,year`): dictionary-encoded per-doc
+    /// columns counted by facet queries. Same rules as `bm25_fields`;
+    /// non-empty makes new builders persist as v7.
+    pub facet_fields: Vec<String>,
     /// The shard map the coordinator's `node_addrs` came from, when
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
@@ -237,6 +242,7 @@ struct FileConfig {
     bm25_k1: Option<f32>,
     bm25_b: Option<f32>,
     bm25_fields: Option<Vec<String>>,
+    facet_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
     shard_map: Option<String>,
@@ -762,6 +768,21 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
     }
 
+    let facet_fields: Vec<String> = match opt(args, "facet-fields", "TURBOVEC_FACET_FIELDS", None) {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => file.facet_fields.clone().unwrap_or_default(),
+    };
+    for (i, name) in facet_fields.iter().enumerate() {
+        if facet_fields[..i].contains(name) {
+            return Err(format!("facet field {name:?} repeats in the facet table"));
+        }
+    }
+
     Ok(Config {
         role,
         coord_listen,
@@ -790,6 +811,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         bm25_k1,
         bm25_b,
         bm25_fields,
+        facet_fields,
         shard_map,
     })
 }

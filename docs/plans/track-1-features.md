@@ -68,15 +68,24 @@ Two designs to price:
 
 The exactness stance of this engine argues for design 1, with the cost
 made visible: a request flag chooses whether facets are wanted, and a
-query that wants them pays the traversal. TODO: measure that traversal
-cost on the 86.6M corpus before committing; if a full BM25 walk is tens
-of milliseconds the argument is over.
+query that wants them pays the traversal.
 
-Facet fields need column storage. Court, date, opinion type are small
-enumerable values; a per-shard dictionary-encoded column keyed by local
-doc id is enough, and the v6 section table has room for new section
-types. TODO: whether facet columns ship inside the `.bm25` file or as a
-sidecar file with its own fingerprint.
+LANDED 2026-08-03 (`docs/facets.md`): design 1, exactly as argued. The
+traversal was priced first (`examples/facet_walk_probe.rs`): ~1.2
+ns/posting for the union walk, ~2 ns/matched-doc for counting — a
+worst-case stopword query on a 10.8M-doc shard is 15–35 ms, so the
+argument was over. Two of this section's premises resolved differently
+than written: (a) "the v6 section table has room for new section
+types" was wrong — v6 locates sections by positional header slots and
+validation pins an exact tiling, so facet columns are a new magic
+(`TVBM2507`), opt-in per shard via `--facet-fields` (facet-less shards
+still write byte-identical v6); (b) sidecar-vs-in-file was decided
+in-file — the stale-sidecar trap from the v7 rebuild event is real and
+recorded. Counts ride the Bm25Search route, flat and fused; hybrid
+waits for filters (the vector leg matches everything, so "counts over
+the matches" is ill-defined there). Facet FILTERING is deliberately
+not in this cut; it lands with the public-API filter syntax and must
+apply before the floor check.
 
 ## 3. Functions on columns
 

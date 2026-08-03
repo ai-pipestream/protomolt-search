@@ -715,6 +715,7 @@ mod tests {
         wal_record::Op::AddDocuments(LoggedAddDocuments {
             first_id: id,
             documents: vec![AddDocumentsRequest {
+                facets: Vec::new(),
                 text: format!("doc {id}"),
                 analysis: None,
                 lineage: None,

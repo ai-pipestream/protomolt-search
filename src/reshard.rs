@@ -355,6 +355,20 @@ fn build_child(
         if table.first().map(String::as_str) != Some("body") {
             return Err("bm25 field table must start with \"body\"".to_string());
         }
+        // The child's facet table is derived from the replayed records
+        // (first-seen order): the WAL is the durable facet record, so a
+        // facet field no record values never reaches the child.
+        let facet_table: Vec<String> = {
+            let mut t: Vec<String> = Vec::new();
+            for (_, doc) in &mapped {
+                for fv in &doc.facets {
+                    if !t.iter().any(|n| n == &fv.field) {
+                        t.push(fv.field.clone());
+                    }
+                }
+            }
+            t
+        };
         // Children rebuild through the disk spiller for the same reason
         // nodes do: a full-scale child's postings do not fit in heap.
         let path = crate::node::bm25_sidecar_path(tv_path);
@@ -362,8 +376,10 @@ fn build_child(
         spill_dir.push(".build");
         let spill_dir = std::path::PathBuf::from(spill_dir);
         let names: Vec<&str> = table.iter().map(String::as_str).collect();
+        let facet_names: Vec<&str> = facet_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
-            .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?;
+            .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
+            .with_facet_fields(&facet_names);
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -422,6 +438,13 @@ fn build_child(
                         }),
                     )
                     .map_err(|e| format!("spill write (child slot {local}): {e}"))?;
+                for fv in &doc.facets {
+                    let fi = facet_table
+                        .iter()
+                        .position(|n| n == &fv.field)
+                        .expect("facet table was derived from these records");
+                    builder.set_facet(fi, *local, &fv.value);
+                }
             }
             i = end;
         }
