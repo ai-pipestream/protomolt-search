@@ -158,8 +158,16 @@ Small, real, and each one makes later work more honest.
 
   This matters for what is queued behind it: `chunks-full.ndjson` is
   126 GB, and the rebuilt v7 shards will be around 280 GB.
-- **Port 8600 is ufw-blocked** from the browser:
-  `sudo ufw allow from 192.168.0.0/16 to any port 8600`.
+- ~~Port 8600 is ufw-blocked from the browser.~~ Fixed 2026-08-02, and
+  the recorded fix had been wrong: the `192.168.0.0/16` rule already
+  existed and was never what blocked it. This host reaches everything
+  over Tailscale by default, and every other remotely-used service
+  (RDP, 50051, 50055, 8097) carries a `100.64.0.0/10` allowance that
+  8600 lacked. `sudo ufw allow from 100.64.0.0/10 to any port 8600`.
+
+  Worth generalizing: on this box the LAN is the exception that has to
+  be named, not the default. The same assumption made the NAS backup
+  four times slower than it needed to be.
 - ~~Sidecar PR 2 is open as a draft awaiting review.~~ Merged 2026-08-02
   (`be4db91` on sidecar main); the live sidecar runs that build with all
   seven NER models.
