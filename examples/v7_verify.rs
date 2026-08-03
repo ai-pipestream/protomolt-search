@@ -341,6 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             analysis: Some(body_spec()),
             min_score: 0.0,
             fields: Vec::new(),
+            range_facet_fields: Vec::new(),
         })
         .await?
         .into_inner();
@@ -373,6 +374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 k1: 0.0,
                 b: 0.0,
             }],
+            range_facet_fields: Vec::new(),
         })
         .await?
         .into_inner();
@@ -414,6 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b: 0.0,
                 },
             ],
+            range_facet_fields: Vec::new(),
         })
         .await?
         .into_inner();
@@ -560,6 +563,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             analysis: None,
             min_score: 0.0,
             fields,
+            range_facet_fields: Vec::new(),
         })),
     };
     let body_field = || QueryField {

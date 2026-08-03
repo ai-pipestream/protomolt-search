@@ -215,6 +215,11 @@ pub struct Config {
     /// The map<string, f64> column table for NEW shard builders
     /// (`--map-numeric-fields=attrs`). Same rules.
     pub map_numeric_fields: Vec<String>,
+    /// The i64 column table for NEW shard builders
+    /// (`--integer-fields=citations,filed_at`, docs/range-facets.md):
+    /// exact integers past 2^53, and where Timestamp ingest lands as
+    /// epoch micros. Same rules; one name space across all kinds.
+    pub integer_fields: Vec<String>,
     /// The shard map the coordinator's `node_addrs` came from, when
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
@@ -259,6 +264,7 @@ struct FileConfig {
     numeric_fields: Option<Vec<String>>,
     map_facet_fields: Option<Vec<String>>,
     map_numeric_fields: Option<Vec<String>>,
+    integer_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
     shard_map: Option<String>,
@@ -842,6 +848,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "TURBOVEC_MAP_NUMERIC_FIELDS",
         &file.map_numeric_fields,
     );
+    let integer_fields = parse_list(
+        "integer-fields",
+        "TURBOVEC_INTEGER_FIELDS",
+        &file.integer_fields,
+    );
     // One name space across all column kinds: the v7 column table
     // refuses duplicates, so the config does too, early and by name.
     {
@@ -851,6 +862,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .chain(&numeric_fields)
             .chain(&map_facet_fields)
             .chain(&map_numeric_fields)
+            .chain(&integer_fields)
         {
             if all.contains(&name) {
                 return Err(format!(
@@ -894,6 +906,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         numeric_fields,
         map_facet_fields,
         map_numeric_fields,
+        integer_fields,
         shard_map,
     })
 }

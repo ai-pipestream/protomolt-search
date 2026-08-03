@@ -20,6 +20,8 @@ syntax = "proto3";
 // boundary survive.
 package turbovec.search.v1;
 
+import "google/protobuf/timestamp.proto";
+
 // NodeService is the internal shard-owner API. Exactly one node owns a given
 // shard; the coordinator is the only intended client.
 service NodeService {
@@ -787,6 +789,47 @@ message NumericValue {
   double value = 2;
 }
 
+// One integer value of a document: a single i64 for one declared
+// integer field ("citations" -> 4103). Values land in the shard's i64
+// column (docs/range-facets.md), never in postings. An f64 column
+// cannot hold these: past 2^53 it silently rounds, and this engine
+// argues from exactness, so integers get a true i64 kind.
+message IntegerValue {
+  // Integer field name; must exist in the shard's integer field table
+  // (--integer-fields) and must not repeat within one document (nor
+  // across `integers` and `timestamps`, which target the same
+  // columns). Unknown names are INVALID_ARGUMENT.
+  string field = 1;
+  // The value. INT64_MIN is INVALID_ARGUMENT: it is the column's
+  // absence sentinel, so a document cannot hold it. A document without
+  // a value for an integer field simply omits the entry.
+  sint64 value = 2;
+}
+
+// One timestamp value of a document. Pure ingest sugar over
+// IntegerValue: the NODE converts the instant to EPOCH MICROSECONDS
+// and stores it in the named i64 column, so range facets and score
+// stages over the column work in epoch micros and nothing downstream
+// knows about timestamps. i64 micros spans roughly year -290307 to
+// +294247, which covers every court date by a wide margin.
+//
+// Sub-microsecond precision is NOT representable and is dropped: the
+// conversion floors toward negative infinity (nanos are always >= 0 in
+// a valid Timestamp, so it is a plain truncation of the remainder). A
+// producer that needs nanosecond identity must send an IntegerValue of
+// its own and own the unit. The WAL persists this request verbatim, so
+// replay reproduces the same conversion from the same instant.
+message TimestampValue {
+  // Integer field name; must exist in the shard's integer field table
+  // (--integer-fields), the same table `integers` names. A field
+  // valued by both `integers` and `timestamps` in one document is
+  // INVALID_ARGUMENT — a document holds one value per column.
+  string field = 1;
+  // The instant. Refused when the epoch-micros conversion overflows
+  // i64 or lands exactly on INT64_MIN (the absence sentinel).
+  google.protobuf.Timestamp value = 2;
+}
+
 // One map-facet entry of a document: a single string value under a
 // string key in one declared map<string, string> column
 // (docs/map-columns.md). Keys and values are opaque — never analyzed —
@@ -849,6 +892,13 @@ message AddDocumentsRequest {
   repeated MapFacetEntry map_facets = 7;
   // Map-numeric entries for this document. Same lever.
   repeated MapNumericEntry map_numerics = 8;
+  // Integer values for this document, one entry per declared integer
+  // field it has a value for. Same durable-record lever as `facets`.
+  repeated IntegerValue integers = 9;
+  // Timestamp values for this document: sugar over `integers`, stored
+  // as epoch micros in the SAME i64 columns (see TimestampValue). Same
+  // durable-record lever, and replay redoes the conversion.
+  repeated TimestampValue timestamps = 10;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -996,6 +1046,62 @@ message Bm25QueryRequest {
   // Answered in Bm25QueryResponse.facets AFTER the plain facet
   // entries, with FacetFieldCounts.key set.
   repeated MapFacetField map_facet_fields = 13;
+  // Range buckets to count over the FULL match set
+  // (docs/range-facets.md): "how many results per year band". Same
+  // count-then-rank pass as `facet_fields` — one shared match bitmap
+  // serves all three facet kinds — so a query asking for any of them
+  // pays the traversal once. Answered in
+  // Bm25QueryResponse.range_facets, positionally.
+  repeated RangeFacetField range_facet_fields = 14;
+}
+
+// One range-facet count request: a numeric-ish column plus the bucket
+// edges to count into.
+message RangeFacetField {
+  // The column to read: an f64 column (--numeric-fields) or an i64
+  // column (--integer-fields) when `key` is empty, resolved in that
+  // order; a map<string, f64> column (--map-numeric-fields) when `key`
+  // is set. i64 values are converted to double for bucketing.
+  string column = 1;
+  // For a map-numeric column, the key whose values are bucketed. Empty
+  // selects a plain (f64 or i64) column.
+  string key = 2;
+  // Bucket boundaries: at least 2, all finite, STRICTLY ascending —
+  // anything else is INVALID_ARGUMENT naming the column, because a
+  // silently repaired edge list answers a question nobody asked.
+  // Buckets are half-open [edges[i], edges[i+1]), so a value sitting
+  // exactly on an interior edge lands in the UPPER bucket. There are
+  // no implicit underflow/overflow buckets: a value below edges[0] or
+  // at/above the last edge is counted in NO bucket. Explicit edges
+  // only — if you want the tails, ask for them.
+  repeated double edges = 3;
+}
+
+// One bucket's count within one range facet.
+message RangeBucket {
+  // Inclusive lower edge.
+  double from = 1;
+  // Exclusive upper edge.
+  double to = 2;
+  // Matching documents whose value falls in [from, to).
+  uint64 count = 3;
+}
+
+// One requested range facet's counts, from one shard or merged.
+message RangeFacetCounts {
+  // The column name, echoed from the request.
+  string column = 1;
+  // The map key, echoed from the request (empty for plain columns).
+  string key = 2;
+  // Whether this shard can resolve the column (and, for a map entry,
+  // the key). A shard without it answers known=false and no buckets —
+  // legitimate for a heterogeneous fleet — but the coordinator REFUSES
+  // a column NO shard knows, the same typo rule as `facet_fields`.
+  bool known = 3;
+  // One bucket per [edges[i], edges[i+1]) interval, in edge order.
+  // Counts are additive, so the coordinator's merge is the positional
+  // sum. Empty when `known` is false.
+  repeated RangeBucket buckets = 4;
 }
 
 // One map-facet count request: a (column, key) pair. Structured rather
@@ -1137,6 +1243,9 @@ message Bm25QueryResponse {
   // documents — exact — but the coordinator refuses a column NO shard
   // knows, because a typo'd chain would otherwise be a silent no-op.
   repeated bool stage_columns_known = 4;
+  // Range-facet counts over this shard's match set, one entry per
+  // requested range facet in request order. Additive like `facets`.
+  repeated RangeFacetCounts range_facets = 5;
 }
 
 // One facet value's count within one facet field.
@@ -1240,6 +1349,12 @@ message Bm25SearchRequest {
   // with FacetFieldCounts.key set. A (column, key) pair no shard knows
   // is refused (INVALID_ARGUMENT).
   repeated MapFacetField map_facet_fields = 8;
+  // Range buckets to count over the full match set
+  // (docs/range-facets.md), forwarded to every shard and summed
+  // positionally; answered in `range_facets`. A column no shard knows
+  // is refused (INVALID_ARGUMENT), as are edge lists that are not at
+  // least two finite strictly ascending values.
+  repeated RangeFacetField range_facet_fields = 9;
 }
 
 // One field of a fused multi-field search.
@@ -1277,6 +1392,11 @@ message Bm25SearchResponse {
   // query analyzed to no scoring terms — there is no match set to
   // count.
   repeated FacetFieldCounts facets = 3;
+  // Global range-facet counts, one entry per requested range facet in
+  // request order: the positional sum of every shard's bucket counts,
+  // buckets in edge order. EXACT over the full match set, like
+  // `facets`, and empty under the same conditions.
+  repeated RangeFacetCounts range_facets = 4;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.

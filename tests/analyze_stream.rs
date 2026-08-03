@@ -194,6 +194,8 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
             analysis: None,
             lineage: None,
             fields: Vec::new(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await
         .unwrap();

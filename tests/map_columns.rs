@@ -80,6 +80,8 @@ async fn add_documents_mapped(
                     value: *value,
                 })
                 .collect(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await
         .unwrap();
@@ -279,8 +281,8 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     // "rust" matches d0, d1, d2, d4. meta[color]: red (d0, d2), blue
     // (d1); meta[lang]: en (d0), de (d2) — value-ascending on the tie.
     let want = vec![map_field("meta", "color"), map_field("meta", "lang")];
-    let (hits, facets) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &want, &[])
+    let (hits, facets, _) = coordinator
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &want, &[], &[])
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
@@ -292,8 +294,8 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     assert_eq!(counts_of(&facets[1]), vec![("de", 1), ("en", 1)]);
 
     // Counts cover the whole match set at k = 1 too.
-    let (hits_k1, facets_k1) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &want, &[])
+    let (hits_k1, facets_k1, _) = coordinator
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &want, &[], &[])
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -311,6 +313,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
             facet_fields: Vec::new(),
             score_stages: Vec::new(),
             map_facet_fields: vec![map_field("meta", "color")],
+            range_facet_fields: Vec::new(),
         }),
     )
     .await
@@ -320,7 +323,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
 
     // A key NO shard knows is a typo, not an empty drill-down.
     let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[map_field("meta", "colour")], &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[map_field("meta", "colour")], &[], &[])
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -344,6 +347,9 @@ impl NumericRead for ReaderNumerics<'_> {
     }
     fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
         self.0.map_numeric_value(column, key_ord, doc_id)
+    }
+    fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
+        self.0.integer_value(ii, doc_id)
     }
 }
 
@@ -465,12 +471,12 @@ async fn distributed_map_stages_and_ingest_refusals() {
         scale: 0.0,
     }];
     for text in ["rust", "vector"] {
-        let (got, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &stages)
+        let (got, _, _) = distributed
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
             .await
             .unwrap();
-        let (want, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &stages)
+        let (want, _, _) = monolithic
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
             .await
             .unwrap();
         assert_eq!(hit_signature(&got), hit_signature(&want), "query {text:?}");
@@ -478,8 +484,8 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // The chain reorders and absent entries are identity: d2 has no
     // attrs entries, so its score is bitwise the unchained one.
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
-    let (chained, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &stages)
+    let (chained, _, _) = distributed
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages)
         .await
         .unwrap();
     assert_ne!(hit_signature(&unchained), hit_signature(&chained));
@@ -496,7 +502,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
         ..stages[0].clone()
     }];
     let err = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &typo)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -521,6 +527,8 @@ async fn distributed_map_stages_and_ingest_refusals() {
             value: value.to_string(),
         }],
         map_numerics: Vec::new(),
+        integers: Vec::new(),
+        timestamps: Vec::new(),
     };
     let send = |addr: String, req: AddDocumentsRequest| async move {
         let mut client = NodeServiceClient::connect(addr).await.unwrap();

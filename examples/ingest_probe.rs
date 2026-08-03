@@ -89,6 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     Vec::new()
                 },
+                integers: Vec::new(),
+                timestamps: Vec::new(),
             })
             .await
             .map_err(|e| format!("feeder send: {e}"))?;

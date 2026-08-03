@@ -1348,6 +1348,7 @@ dependencies = [
  "csv",
  "memmap2",
  "prost",
+ "prost-types",
  "serde",
  "serde_json",
  "tokio",

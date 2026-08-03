@@ -66,6 +66,8 @@ async fn add_documents_numeric(
                     value: *value,
                 })
                 .collect(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await
         .unwrap();
@@ -225,6 +227,9 @@ impl NumericRead for ReaderNumerics<'_> {
     fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
         self.0.map_numeric_value(column, key_ord, doc_id)
     }
+    fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
+        self.0.integer_value(ii, doc_id)
+    }
 }
 
 /// The exactness gate: on a file-backed shard (impacts present, so the
@@ -349,12 +354,12 @@ async fn distributed_chain_matches_monolith_and_reorders() {
 
     let stages = vec![decay_stage(300.0, 100.0)];
     for text in ["rust", "search rust", "vector"] {
-        let (got, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &stages)
+        let (got, _, _) = distributed
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
             .await
             .unwrap();
-        let (want, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &stages)
+        let (want, _, _) = monolithic
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
             .await
             .unwrap();
         assert_eq!(
@@ -367,8 +372,8 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     // The chain reorders: unchained, d0 (tf=2) outranks d2 on "rust";
     // decayed toward date=300, d2 (factor 1) climbs above d0 (e^-2).
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
-    let (chained, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &stages)
+    let (chained, _, _) = distributed
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages)
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -404,6 +409,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
             fields: Vec::new(),
             facet_fields: Vec::new(),
             score_stages: stages.clone(),
+            range_facet_fields: Vec::new(),
         }),
     )
     .await
@@ -433,7 +439,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ..decay_stage(300.0, 100.0)
     }];
     let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &typo)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -476,7 +482,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ),
     ] {
         let err = coordinator
-            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[bad])
+            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &[bad])
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
@@ -505,6 +511,7 @@ async fn stage_and_ingest_refusals_are_loud() {
             }],
             facet_fields: Vec::new(),
             score_stages: vec![decay_stage(300.0, 100.0)],
+            range_facet_fields: Vec::new(),
         }),
     )
     .await

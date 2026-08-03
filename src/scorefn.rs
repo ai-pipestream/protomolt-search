@@ -34,14 +34,27 @@ pub trait NumericRead {
     /// `doc_id`'s value under `key_ord` in map-numeric column
     /// `column` (`docs/map-columns.md`), `None` when absent.
     fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64>;
+    /// `doc_id`'s value in i64 column `ii` (`docs/range-facets.md`),
+    /// `None` when absent. Kept i64 here and cast at the eval site so
+    /// the storage stays exact and only the arithmetic is float.
+    fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64>;
 }
 
-/// A stage's resolved column on THIS shard: a plain f64 column, or a
-/// map-numeric column entry under a shard-local key ordinal.
+/// A stage's resolved column on THIS shard: a plain f64 column, an
+/// i64 column, or a map-numeric column entry under a shard-local key
+/// ordinal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnRef {
     /// Index into the shard's numeric table.
     Numeric(usize),
+    /// Index into the shard's integer table. Values reach the stage
+    /// arithmetic through `as f64`, which is monotone non-decreasing,
+    /// so a bound computed from the column's min/max converted the
+    /// same way is still a bound (rounding cannot reorder the two
+    /// sides). Above 2^53 the stage arithmetic loses the exactness the
+    /// STORAGE keeps — the point of the kind is that the value comes
+    /// back intact, not that ln() suddenly has 64 bits.
+    Integer(usize),
     /// A map-numeric column and a key ordinal in ITS key dictionary
     /// (ordinals are shard-local, like every dictionary here).
     MapKey {
@@ -93,7 +106,9 @@ pub struct Stage {
     pub column: Option<ColumnRef>,
     /// This shard's (min, max) over the read values — the whole column
     /// for a plain stage, the KEY's values for a map stage; NaN when
-    /// missing or empty. Feeds [`ScoreChain::bound`].
+    /// missing or empty (an i64 column's metadata arrives through the
+    /// same monotone `as f64` cast its values do, and its empty range
+    /// arrives as NaN). Feeds [`ScoreChain::bound`].
     pub min_max: (f64, f64),
 }
 
@@ -112,6 +127,9 @@ impl ScoreChain {
         for stage in &self.stages {
             let x = match stage.column {
                 Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
+                Some(ColumnRef::Integer(ii)) => {
+                    columns.int_value(ii, doc_id).map(|v| v as f64)
+                }
                 Some(ColumnRef::MapKey { column, key_ord }) => {
                     columns.map_value(column, key_ord, doc_id)
                 }
@@ -175,6 +193,9 @@ mod tests {
         fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
             // The unit tests model a map key as one more plain column.
             self.0[column + key_ord as usize][doc_id as usize]
+        }
+        fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
+            self.0[ii][doc_id as usize].map(|v| v as i64)
         }
     }
 

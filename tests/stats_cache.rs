@@ -41,6 +41,8 @@ async fn add_documents(addr: &str, texts: &[&str]) {
             analysis: None,
             lineage: None,
             fields: Vec::new(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await
         .unwrap();
@@ -159,6 +161,7 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         min_score: 0.0,
         fields: Vec::new(),
         expected_stats_epoch: claim,
+        range_facet_fields: Vec::new(),
     };
 
     let with_claim = client
@@ -312,6 +315,8 @@ async fn fused_repeated_query_reuses_cached_stats() {
                     text: name.to_string(),
                     analysis: None,
                 }],
+                integers: Vec::new(),
+                timestamps: Vec::new(),
             })
             .await
             .unwrap();

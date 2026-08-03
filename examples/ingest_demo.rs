@@ -62,6 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             analysis: Some(spec.clone()),
             lineage: None,
             fields: Vec::new(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await?;
     }
@@ -111,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 analysis: Some(spec.clone()),
                 min_score: 0.0,
                 fields: Vec::new(),
+                range_facet_fields: Vec::new(),
             })
             .await?
             .into_inner();

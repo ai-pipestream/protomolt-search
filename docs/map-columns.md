@@ -122,7 +122,7 @@ With maps, the column plane covers most of the proto data model:
 |---|---|
 | string / enum | facet column (kind 0) |
 | double/float/ints (< 2^53) | f64 column (kind 1) |
-| int64/uint64 exact, Timestamp | i64 column (increment 2) |
+| int64/uint64 exact, Timestamp | i64 column (kind 4, `range-facets.md`) |
 | map<string, string> | kind 2 |
 | map<string, numeric> | kind 3 |
 | nested message paths | dotted column names (declared) |
@@ -135,12 +135,17 @@ protobuf" real; the engine's wire stays explicit typed values.
 
 ## Queued behind this
 
-- **Increment 2**: i64 columns (exact past 2^53; Timestamp as epoch
-  micros), range facets with explicit bucket edges over f64/i64/map
-  values. Range FILTERS arrive with CEL; if selective pure-range
-  filters matter, the 1-D analog of Lucene's trie/BKD trick is a
-  static value-sorted (value, doc) section per column — shards are
-  immutable per generation, so a plain sorted array does what tries do.
+- **Increment 2** — LANDED 2026-08-03 (`docs/range-facets.md`): i64
+  columns as kind 4 (exact past 2^53, `i64::MIN` the refused absence
+  sentinel; Timestamp is ingest sugar converting to epoch micros on
+  the node), and range facets with explicit bucket edges over
+  f64/i64/map values, sharing the count-then-rank bitmap with the two
+  facet kinds above. Half-open buckets, no implicit tails, edges
+  validated rather than repaired. Range FILTERS still arrive with CEL;
+  if selective pure-range filters matter, the 1-D analog of Lucene's
+  trie/BKD trick is a static value-sorted (value, doc) section per
+  column — shards are immutable per generation, so a plain sorted
+  array does what tries do.
 - **Increment 3**: geo columns (lat/lon points; bbox = two range
   predicates, haversine radius and Manhattan distance as filters and
   as monotone-decay score stages). Road-network semantics (travel

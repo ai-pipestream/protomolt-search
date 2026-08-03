@@ -102,6 +102,8 @@ async fn start_fixture() -> Fixture {
                     analysis: None,
                     lineage: None,
                     fields: Vec::new(),
+                    integers: Vec::new(),
+                    timestamps: Vec::new(),
                 })
                 .await
                 .unwrap();

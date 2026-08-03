@@ -56,9 +56,13 @@ const MAGIC_V6: &[u8; 8] = b"TVBM2506";
 /// string facet column (u32 n_values, u64 dict_off, u64 ords_off →
 /// dict + ords sections); kind 1 is an f64 numeric column (u64
 /// min_bits, u64 max_bits, u64 vals_off → one n_slots x f64 section,
-/// NaN = absent). An unknown kind refuses at open by number. A store
-/// with NO declared columns still writes v6, byte-identical to every
-/// pre-facet build — the format break is opt-in per shard.
+/// NaN = absent); kinds 2 and 3 are the map columns
+/// (`docs/map-columns.md`); kind 4 is an i64 column (same three-word
+/// payload as kind 1, min/max as i64 bits → one n_slots x i64 section,
+/// `i64::MIN` = absent, `docs/range-facets.md`). An unknown kind
+/// refuses at open by number. A store with NO declared columns still
+/// writes v6, byte-identical to every pre-facet build — the format
+/// break is opt-in per shard.
 const MAGIC_V7: &[u8; 8] = b"TVBM2507";
 
 /// v7 column-table kind: dictionary-encoded string facet column.
@@ -74,6 +78,12 @@ const COLUMN_KIND_MAP_FACET: u8 = 2;
 /// v7 column-table kind: map<string, f64> column: key dict WITH
 /// per-key min/max bound metadata + per-doc (key_ord, f64) pair lists.
 const COLUMN_KIND_MAP_F64: u8 = 3;
+/// v7 column-table kind: i64 column (`docs/range-facets.md`), a
+/// fixed-stride per-slot section like kind 1. Exists because f64 stops
+/// being exact past 2^53 and this engine argues from exactness: an id,
+/// a citation count, or an epoch-micros timestamp must come back the
+/// integer it went in as.
+const COLUMN_KIND_I64: u8 = 4;
 
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
@@ -254,6 +264,12 @@ impl FieldStore {
 /// field" in a facet column, in heap and on disk alike.
 pub const FACET_ABSENT: u32 = u32::MAX;
 
+/// The value marking "this document has no value" in an i64 column
+/// (`docs/range-facets.md`). An i64 column has no NaN to spend, so one
+/// value of the domain pays for absence; ingest refuses it explicitly
+/// rather than letting a real `i64::MIN` disappear.
+pub const INTEGER_ABSENT: i64 = i64::MIN;
+
 /// One dictionary-encoded facet column: the value dictionary in
 /// ordinal (first-seen) order, and a per-slot ordinal table parallel
 /// to the shared slot space. Facet values are opaque strings — never
@@ -397,6 +413,75 @@ impl NumericStore {
             if max.is_nan() || v > max {
                 max = v;
             }
+        }
+        (min, max)
+    }
+}
+
+/// One i64 column (`docs/range-facets.md`): per-slot values parallel
+/// to the shared slot space, [`INTEGER_ABSENT`] = the document has no
+/// value. The exact-integer sibling of [`NumericStore`] — same shape,
+/// same fixed stride, no rounding above 2^53. min/max over present
+/// values are computed at write time into the v7 column table.
+#[derive(Debug)]
+struct IntStore {
+    /// Integer field name from the schema.
+    name: String,
+    /// Per-slot value ([`INTEGER_ABSENT`] = no value). May be shorter
+    /// than the slot count; missing trailing slots read as absent.
+    vals: Vec<i64>,
+}
+
+impl IntStore {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            vals: Vec::new(),
+        }
+    }
+
+    fn value(&self, slot: usize) -> Option<i64> {
+        match self.vals.get(slot).copied() {
+            None | Some(INTEGER_ABSENT) => None,
+            some => some,
+        }
+    }
+
+    /// Record `doc_id`'s value. [`INTEGER_ABSENT`] is refused (callers
+    /// validate it into a loud refusal first); one value per (document,
+    /// field), a second write panics.
+    fn set(&mut self, doc_id: u32, value: i64) {
+        assert!(
+            value != INTEGER_ABSENT,
+            "integer field {:?}: i64::MIN is the absence sentinel and cannot be a value \
+             (doc {doc_id})",
+            self.name
+        );
+        let slot = doc_id as usize;
+        if self.vals.len() <= slot {
+            self.vals.resize(slot + 1, INTEGER_ABSENT);
+        }
+        assert!(
+            self.vals[slot] == INTEGER_ABSENT,
+            "doc {doc_id} already has a value for integer field {:?}",
+            self.name
+        );
+        self.vals[slot] = value;
+    }
+
+    /// (min, max) over present values. A column with none folds to
+    /// `(i64::MAX, i64::MIN)` — min > max is the empty range, which is
+    /// self-describing and cannot collide with any real pair (the NaN
+    /// role, played by an impossible interval instead of a value).
+    fn min_max(&self) -> (i64, i64) {
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        for &v in &self.vals {
+            if v == INTEGER_ABSENT {
+                continue;
+            }
+            min = min.min(v);
+            max = max.max(v);
         }
         (min, max)
     }
@@ -607,9 +692,11 @@ pub struct Bm25Store {
     numerics: Vec<NumericStore>,
     /// map<string, string> columns in map-facet-id order.
     map_facets: Vec<MapFacetStore>,
-    /// map<string, f64> columns in map-numeric-id order. A store with
-    /// no columns of any kind persists as v6.
+    /// map<string, f64> columns in map-numeric-id order.
     map_numerics: Vec<MapNumericStore>,
+    /// i64 columns in integer-id order. A store with no columns of any
+    /// kind persists as v6.
+    integers: Vec<IntStore>,
 }
 
 impl Default for Bm25Store {
@@ -622,6 +709,7 @@ impl Default for Bm25Store {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            integers: Vec::new(),
         }
     }
 }
@@ -654,6 +742,7 @@ impl Bm25Store {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            integers: Vec::new(),
         }
     }
 
@@ -757,6 +846,52 @@ impl Bm25Store {
     /// [`NumericStore::set`] for the contract (finite values only).
     pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
         self.numerics[ni].set(doc_id, value);
+    }
+
+    /// Declare the i64 field table, in integer-id order (builder
+    /// style, like [`Self::with_numerics`]). Must be called before any
+    /// document is added; a store with columns persists as v7.
+    pub fn with_integers(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "integer fields must be declared before documents are added"
+        );
+        validate_facet_names(names);
+        self.integers = names.iter().map(|n| IntStore::new(n)).collect();
+        self
+    }
+
+    /// Number of i64 fields in the integer table.
+    pub fn integer_count(&self) -> usize {
+        self.integers.len()
+    }
+
+    /// The name of integer field `ii`. Panics when out of range.
+    pub fn integer_name(&self, ii: usize) -> &str {
+        &self.integers[ii].name
+    }
+
+    /// The index of the integer field named `name`, if the table has it.
+    pub fn integer_index(&self, name: &str) -> Option<usize> {
+        self.integers.iter().position(|n| n.name == name)
+    }
+
+    /// `doc_id`'s value for integer field `ii`, `None` when absent.
+    pub fn integer_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
+        self.integers[ii].value(doc_id as usize)
+    }
+
+    /// (min, max) of integer field `ii` over present values; the empty
+    /// range `(i64::MAX, i64::MIN)` when no document has one (see
+    /// [`IntStore::min_max`]).
+    pub fn integer_min_max(&self, ii: usize) -> (i64, i64) {
+        self.integers[ii].min_max()
+    }
+
+    /// Record `doc_id`'s value for integer field `ii`; see
+    /// [`IntStore::set`] for the contract (never [`INTEGER_ABSENT`]).
+    pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
+        self.integers[ii].set(doc_id, value);
     }
 
     /// Declare the map<string, string> column table (builder style,
@@ -1334,7 +1469,8 @@ impl Bm25Store {
         let has_columns = !self.facets.is_empty()
             || !self.numerics.is_empty()
             || !self.map_facets.is_empty()
-            || !self.map_numerics.is_empty();
+            || !self.map_numerics.is_empty()
+            || !self.integers.is_empty();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -1357,6 +1493,11 @@ impl Bm25Store {
                     .map_numerics
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
                     .sum::<u64>()
         };
         let header_size: u64 = 8
@@ -1436,6 +1577,13 @@ impl Bm25Store {
             map_numeric_offs.push((keys_off, offsets_off, pairs_off));
             cursor = pairs_off + 12 * total_pairs;
         }
+        // vals_off per i64 column, last in table order (a new kind
+        // appends; the earlier kinds' geometry must not shift).
+        let mut integer_offs: Vec<u64> = Vec::with_capacity(self.integers.len());
+        for _ in &self.integers {
+            integer_offs.push(cursor);
+            cursor += 8 * n_slots;
+        }
 
         w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
         write_u32(w, self.fields.len() as u32)?;
@@ -1458,7 +1606,8 @@ impl Bm25Store {
                 (self.facets.len()
                     + self.numerics.len()
                     + self.map_facets.len()
-                    + self.map_numerics.len()) as u32,
+                    + self.map_numerics.len()
+                    + self.integers.len()) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                 write_u16(w, facet.name.len() as u16)?;
@@ -1500,6 +1649,15 @@ impl Bm25Store {
                 write_u64(w, keys_off)?;
                 write_u64(w, offsets_off)?;
                 write_u64(w, pairs_off)?;
+            }
+            for (c, &vals_off) in self.integers.iter().zip(&integer_offs) {
+                let (min, max) = c.min_max();
+                write_u16(w, c.name.len() as u16)?;
+                w.write_all(c.name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_I64])?;
+                write_u64(w, min as u64)?;
+                write_u64(w, max as u64)?;
+                write_u64(w, vals_off)?;
             }
         }
         self.write_shared_sections(w, 0)?;
@@ -1549,6 +1707,14 @@ impl Bm25Store {
                 write_u32(w, k)?;
                 write_u64(w, v.to_bits())
             })?;
+        }
+        for c in &self.integers {
+            for slot in 0..n_slots as usize {
+                write_u64(
+                    w,
+                    c.vals.get(slot).copied().unwrap_or(INTEGER_ABSENT) as u64,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1683,6 +1849,7 @@ impl Bm25Store {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            integers: Vec::new(),
         }
     }
 
@@ -2399,6 +2566,7 @@ impl Bm25Store {
         let mut map_facet_metas: Vec<(String, u32, u32, u64, u64, u64, u64)> = Vec::new();
         // (name, n_keys, keys, offsets, pairs)
         let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
+        let mut integer_metas: Vec<(String, u64)> = Vec::new();
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
             cursor += 4;
@@ -2443,6 +2611,10 @@ impl Bm25Store {
                             u64_at(base + 20)?, // pairs_off
                         ));
                         cursor = base + 28;
+                    }
+                    COLUMN_KIND_I64 => {
+                        integer_metas.push((name, u64_at(base + 16)?));
+                        cursor = base + 24;
                     }
                     k => {
                         return Err(io::Error::new(
@@ -2621,6 +2793,15 @@ impl Bm25Store {
                 pairs,
             });
         }
+        // i64 columns (v7 only): n_slots x i64, INTEGER_ABSENT = absent.
+        let mut integers = Vec::with_capacity(integer_metas.len());
+        for (name, vals_off) in integer_metas {
+            let mut vals = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots as u64 {
+                vals.push(u64_at(vals_off + 8 * slot)? as i64);
+            }
+            integers.push(IntStore { name, vals });
+        }
         Ok(Self {
             fields,
             texts,
@@ -2629,6 +2810,7 @@ impl Bm25Store {
             numerics,
             map_facets,
             map_numerics,
+            integers,
         })
     }
 }
@@ -2711,6 +2893,9 @@ pub struct SpillBuilder {
     map_facets: Vec<MapFacetStore>,
     /// map<string, f64> columns. Non-empty makes `finish` write v7.
     map_numerics: Vec<MapNumericStore>,
+    /// i64 columns (8 B per slot in heap, same argument as `numerics`).
+    /// Non-empty makes `finish` write v7.
+    integers: Vec<IntStore>,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
@@ -2765,6 +2950,7 @@ impl SpillBuilder {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            integers: Vec::new(),
             v4_only,
         })
     }
@@ -2837,6 +3023,41 @@ impl SpillBuilder {
     /// [`NumericStore::set`] for the contract (finite values only).
     pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
         self.numerics[ni].set(doc_id, value);
+    }
+
+    /// Declare the i64 field table; same contract as
+    /// [`Bm25Store::with_integers`]. Must be called before any
+    /// document is added; makes `finish` write v7.
+    pub fn with_integer_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "integer fields must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.integers = names.iter().map(|n| IntStore::new(n)).collect();
+        self
+    }
+
+    /// Number of i64 fields in the integer table.
+    pub fn integer_count(&self) -> usize {
+        self.integers.len()
+    }
+
+    /// The name of integer field `ii`. Panics when out of range.
+    pub fn integer_name(&self, ii: usize) -> &str {
+        &self.integers[ii].name
+    }
+
+    /// The index of the integer field named `name`, if the table has it.
+    pub fn integer_index(&self, name: &str) -> Option<usize> {
+        self.integers.iter().position(|n| n.name == name)
+    }
+
+    /// Record `doc_id`'s value for integer field `ii`; see
+    /// [`IntStore::set`] for the contract.
+    pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
+        self.integers[ii].set(doc_id, value);
     }
 
     /// Declare the map<string, string> column table; same contract as
@@ -3180,7 +3401,8 @@ impl SpillBuilder {
         let has_columns = !self.facets.is_empty()
             || !self.numerics.is_empty()
             || !self.map_facets.is_empty()
-            || !self.map_numerics.is_empty();
+            || !self.map_numerics.is_empty()
+            || !self.integers.is_empty();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -3203,6 +3425,11 @@ impl SpillBuilder {
                     .map_numerics
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
                     .sum::<u64>()
         };
         let header_size: u64 = 8
@@ -3278,6 +3505,13 @@ impl SpillBuilder {
             map_numeric_offs.push((keys_off, offsets_off, pairs_off));
             cursor = pairs_off + 12 * total_pairs;
         }
+        // vals_off per i64 column, last in table order (a new kind
+        // appends; the earlier kinds' geometry must not shift).
+        let mut integer_offs: Vec<u64> = Vec::with_capacity(self.integers.len());
+        for _ in &self.integers {
+            integer_offs.push(cursor);
+            cursor += 8 * n_slots;
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
@@ -3303,7 +3537,8 @@ impl SpillBuilder {
                     (self.facets.len()
                         + self.numerics.len()
                         + self.map_facets.len()
-                        + self.map_numerics.len()) as u32,
+                        + self.map_numerics.len()
+                        + self.integers.len()) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                     write_u16(&mut w, facet.name.len() as u16)?;
@@ -3345,6 +3580,15 @@ impl SpillBuilder {
                     write_u64(&mut w, keys_off)?;
                     write_u64(&mut w, offsets_off)?;
                     write_u64(&mut w, pairs_off)?;
+                }
+                for (c, &vals_off) in self.integers.iter().zip(&integer_offs) {
+                    let (min, max) = c.min_max();
+                    write_u16(&mut w, c.name.len() as u16)?;
+                    w.write_all(c.name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_I64])?;
+                    write_u64(&mut w, min as u64)?;
+                    write_u64(&mut w, max as u64)?;
+                    write_u64(&mut w, vals_off)?;
                 }
             }
             // texts: byte-copy of the spill (already section-encoded).
@@ -3446,6 +3690,14 @@ impl SpillBuilder {
                     write_u32(w, k)?;
                     write_u64(w, v.to_bits())
                 })?;
+            }
+            for c in &self.integers {
+                for slot in 0..n_slots as usize {
+                    write_u64(
+                        &mut w,
+                        c.vals.get(slot).copied().unwrap_or(INTEGER_ABSENT) as u64,
+                    )?;
+                }
             }
             w.flush()?;
         }
@@ -4248,6 +4500,8 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let mut map_facets: Vec<(u32, u32, u64, u64, u64, u64)> = Vec::new();
     // (n_keys, keys, offsets, pairs)
     let mut map_numerics: Vec<(u32, u64, u64, u64)> = Vec::new();
+    // (min_bits, max_bits, vals)
+    let mut integers: Vec<(u64, u64, u64)> = Vec::new();
     if v7 {
         let n_columns = u64::from(u32_at(cursor)?);
         if n_columns == 0 {
@@ -4300,6 +4554,10 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     ));
                     cursor = base + 28;
                 }
+                COLUMN_KIND_I64 => {
+                    integers.push((u64_at(base)?, u64_at(base + 8)?, u64_at(base + 16)?));
+                    cursor = base + 24;
+                }
                 k => {
                     return Err(invalid(format!(
                         "column {i}: kind {k} unknown to this binary"
@@ -4335,6 +4593,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         .or_else(|| numerics.first().map(|n| n.2))
         .or_else(|| map_facets.first().map(|c| c.2))
         .or_else(|| map_numerics.first().map(|c| c.1))
+        .or_else(|| integers.first().map(|c| c.2))
         .unwrap_or(file_len);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
@@ -4395,6 +4654,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| numerics.first().map(|n| n.2))
             .or_else(|| map_facets.first().map(|c| c.2))
             .or_else(|| map_numerics.first().map(|c| c.1))
+            .or_else(|| integers.first().map(|c| c.2))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -4429,6 +4689,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .map(|n| n.2)
             .or_else(|| map_facets.first().map(|c| c.2))
             .or_else(|| map_numerics.first().map(|c| c.1))
+            .or_else(|| integers.first().map(|c| c.2))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -4505,6 +4766,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .get(i + 1)
             .map(|c| c.2)
             .or_else(|| map_numerics.first().map(|c| c.1))
+            .or_else(|| integers.first().map(|c| c.2))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -4570,7 +4832,11 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         }
         let total_pairs = u64::from(u32_at(offsets_off + 4 * n_slots)?);
         let group_end = pairs_off + 12 * total_pairs;
-        let expected_end = map_numerics.get(i + 1).map_or(file_len, |c| c.1);
+        let expected_end = map_numerics
+            .get(i + 1)
+            .map(|c| c.1)
+            .or_else(|| integers.first().map(|c| c.2))
+            .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "map-numeric column {i}: pairs section does not end at the next section's start"
@@ -4625,6 +4891,42 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                      for key {k}"
                 )));
             }
+        }
+        expected_start = group_end;
+    }
+    // Integer groups (docs/range-facets.md): one n_slots x i64 vals
+    // section each, tiling from the last map-numeric group to EOF. The
+    // table's min/max must agree with a full scan over the NON-sentinel
+    // values — i64::MIN is absence, so a column of nothing but absences
+    // folds to the empty range (i64::MAX, i64::MIN), which is exactly
+    // what the writer emits.
+    for (i, &(min_bits, max_bits, vals_off)) in integers.iter().enumerate() {
+        if vals_off != expected_start {
+            return Err(invalid(format!(
+                "integer field {i}: vals section does not start at the previous section's end"
+            )));
+        }
+        let group_end = vals_off + 8 * n_slots;
+        let expected_end = integers.get(i + 1).map_or(file_len, |c| c.2);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "integer field {i}: vals section does not end at the next section's start"
+            )));
+        }
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        for slot in 0..n_slots {
+            let v = u64_at(vals_off + 8 * slot)? as i64;
+            if v == INTEGER_ABSENT {
+                continue;
+            }
+            min = min.min(v);
+            max = max.max(v);
+        }
+        if min as u64 != min_bits || max as u64 != max_bits {
+            return Err(invalid(format!(
+                "integer field {i}: min/max metadata disagrees with the values"
+            )));
         }
         expected_start = group_end;
     }
@@ -4714,6 +5016,20 @@ struct MapNumericSlice {
     pairs_off: u64,
 }
 
+/// Per-integer-column read state of one open v7 file: the min/max
+/// bound metadata from the column table plus the map offset of the
+/// fixed-stride vals section, which stays on disk.
+struct IntegerSlice {
+    name: String,
+    /// Min over present values (`i64::MAX` when the column holds none;
+    /// see [`IntStore::min_max`] for why the empty range is inverted).
+    min: i64,
+    /// Max over present values (`i64::MIN` when the column holds none).
+    max: i64,
+    /// Absolute offset of the vals section (n_slots x i64).
+    vals_off: u64,
+}
+
 pub struct Bm25Reader {
     map: memmap2::Mmap,
     /// Per-field state, field-id order; never empty. Field 0 is the
@@ -4728,6 +5044,9 @@ pub struct Bm25Reader {
     map_facets: Vec<MapFacetSlice>,
     /// Per-map-numeric-column state (v7 files; empty otherwise).
     map_numerics: Vec<MapNumericSlice>,
+    /// Per-integer-column state, integer-id order (v7 files; empty
+    /// otherwise).
+    integers: Vec<IntegerSlice>,
     /// Documents with postings in any field — the corpus-wide N (a
     /// document is a document; idf never uses a per-field count).
     doc_count: u64,
@@ -4875,6 +5194,46 @@ impl Bm25Reader {
             self.map[off..off + 8].try_into().expect("8 bytes"),
         ));
         if v.is_nan() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Number of i64 fields in the integer table (0 pre-v7).
+    pub fn integer_count(&self) -> usize {
+        self.integers.len()
+    }
+
+    /// The name of integer field `ii`. Panics when out of range.
+    pub fn integer_name(&self, ii: usize) -> &str {
+        &self.integers[ii].name
+    }
+
+    /// The index of the integer field named `name`, if the table has it.
+    pub fn integer_index(&self, name: &str) -> Option<usize> {
+        self.integers.iter().position(|n| n.name == name)
+    }
+
+    /// (min, max) of integer field `ii` over present values, from the
+    /// column table's write-time metadata (validated against a full
+    /// scan at open); the empty range `(i64::MAX, i64::MIN)` when no
+    /// document has a value.
+    pub fn integer_min_max(&self, ii: usize) -> (i64, i64) {
+        (self.integers[ii].min, self.integers[ii].max)
+    }
+
+    /// `doc_id`'s value for integer field `ii`, `None` when absent.
+    /// One 8 B read of the mmapped fixed-stride vals section.
+    pub fn integer_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
+        let integer = &self.integers[ii];
+        let slot = doc_id as usize;
+        if slot >= self.n_slots() {
+            return None;
+        }
+        let off = integer.vals_off as usize + 8 * slot;
+        let v = u64::from_le_bytes(self.map[off..off + 8].try_into().expect("8 bytes")) as i64;
+        if v == INTEGER_ABSENT {
             None
         } else {
             Some(v)
@@ -5080,6 +5439,7 @@ impl Bm25Reader {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            integers: Vec::new(),
             doc_count,
             lineages_off,
             text_index_off: lineages_off - 12 * n_slots as u64,
@@ -5142,6 +5502,7 @@ impl Bm25Reader {
         let mut numerics = Vec::new();
         let mut map_facets = Vec::new();
         let mut map_numerics = Vec::new();
+        let mut integers = Vec::new();
         if v7 {
             // Decode a length-prefixed dictionary of `n` entries
             // starting at `off`, returning (entries, end offset).
@@ -5238,6 +5599,15 @@ impl Bm25Reader {
                         });
                         cursor = base + 28;
                     }
+                    COLUMN_KIND_I64 => {
+                        integers.push(IntegerSlice {
+                            name,
+                            min: u64_at(base) as i64,
+                            max: u64_at(base + 8) as i64,
+                            vals_off: u64_at(base + 16),
+                        });
+                        cursor = base + 24;
+                    }
                     k => unreachable!("validation refused unknown column kind {k}"),
                 }
             }
@@ -5252,6 +5622,7 @@ impl Bm25Reader {
             numerics,
             map_facets,
             map_numerics,
+            integers,
             doc_count,
             lineages_off,
             text_index_off,

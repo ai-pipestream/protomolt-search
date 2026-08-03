@@ -126,6 +126,10 @@ pub struct NodeConfig {
     pub map_facet_fields: Vec<String>,
     /// The map<string, f64> column table for NEW builders. Same rules.
     pub map_numeric_fields: Vec<String>,
+    /// The i64 column table for NEW builders (`docs/range-facets.md`).
+    /// Same rules as `facet_fields`. Timestamp ingest lands in THESE
+    /// columns as epoch micros — it is sugar, not a kind.
+    pub integer_fields: Vec<String>,
     /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
     /// Requires `index_path`; the config layer defaults this on for
     /// persisted shards and off for demo shards.
@@ -162,6 +166,7 @@ impl Default for NodeConfig {
             numeric_fields: Vec::new(),
             map_facet_fields: Vec::new(),
             map_numeric_fields: Vec::new(),
+            integer_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
             coalesce: true,
@@ -331,6 +336,36 @@ impl Bm25Shard {
         }
     }
 
+    /// The integer-table index of the i64 field named `name`, if the
+    /// active table has it.
+    fn integer_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.integer_index(name),
+            Bm25Shard::Spilling(s) => s.integer_index(name),
+            Bm25Shard::Resident(r) => r.integer_index(name),
+        }
+    }
+
+    /// (min, max) of integer field `ii` over present values; the empty
+    /// range (i64::MAX, i64::MIN) when the column holds none. Scoring
+    /// only runs against searchable shapes, so Spilling is unreachable.
+    fn integer_min_max(&self, ii: usize) -> (i64, i64) {
+        match self {
+            Bm25Shard::Building(s) => s.integer_min_max(ii),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.integer_min_max(ii),
+        }
+    }
+
+    /// `doc_id`'s value for integer field `ii`.
+    fn integer_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
+        match self {
+            Bm25Shard::Building(s) => s.integer_value(ii, doc_id),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.integer_value(ii, doc_id),
+        }
+    }
+
     /// The index of the map-facet column named `name`.
     fn map_facet_index(&self, name: &str) -> Option<usize> {
         match self {
@@ -434,12 +469,22 @@ impl Bm25Shard {
     /// resolves one facet ordinal per matched document. A facet field
     /// the shard's table lacks answers `known: false` and no counts —
     /// the coordinator turns all-unknown into a refusal.
+    ///
+    /// All three facet kinds — plain, map-keyed, and range
+    /// (`docs/range-facets.md`) — share the ONE bitmap this builds:
+    /// the traversal is the expensive half, and asking for two kinds
+    /// must not pay for it twice. Range edges are validated by
+    /// [`validate_range_facet_fields`] before this runs.
     fn count_facets(
         &self,
         views: &[(&dyn Bm25Index, &[String])],
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
-    ) -> Vec<crate::pb::FacetFieldCounts> {
+        range_facet_fields: &[crate::pb::RangeFacetField],
+    ) -> (
+        Vec<crate::pb::FacetFieldCounts>,
+        Vec<crate::pb::RangeFacetCounts>,
+    ) {
         let n_slots = self.next_doc_id() as usize;
         let mut bits = vec![0u64; n_slots.div_ceil(64)];
         for &(view, terms) in views {
@@ -527,7 +572,92 @@ impl Bm25Shard {
                 key: req.key.clone(),
             });
         }
-        out
+        // Range facets: one value read per matched document, then a
+        // binary search of the (validated) edge list. Buckets are
+        // half-open [edges[i], edges[i+1]), so a value sitting exactly
+        // on an interior edge lands in the upper bucket; a value below
+        // the first edge or at/above the last is counted in NO bucket.
+        // There are deliberately no implicit tail buckets — the caller
+        // asked for these intervals and gets these intervals.
+        let bucket_counts = |value_of: &dyn Fn(u32) -> Option<f64>, edges: &[f64]| -> Vec<u64> {
+            let mut counts = vec![0u64; edges.len() - 1];
+            for (wi, &word) in bits.iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    let doc = (wi * 64) as u32 + w.trailing_zeros();
+                    if let Some(v) = value_of(doc) {
+                        let upper = edges.partition_point(|&e| e <= v);
+                        if upper > 0 && upper < edges.len() {
+                            counts[upper - 1] += 1;
+                        }
+                    }
+                    w &= w - 1;
+                }
+            }
+            counts
+        };
+        let ranges = range_facet_fields
+            .iter()
+            .map(|req| {
+                let source = self.resolve_range_column(&req.column, &req.key);
+                let Some(source) = source else {
+                    return crate::pb::RangeFacetCounts {
+                        column: req.column.clone(),
+                        key: req.key.clone(),
+                        known: false,
+                        buckets: Vec::new(),
+                    };
+                };
+                let counts = bucket_counts(&|doc| self.range_value(source, doc), &req.edges);
+                crate::pb::RangeFacetCounts {
+                    column: req.column.clone(),
+                    key: req.key.clone(),
+                    known: true,
+                    buckets: counts
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, count)| crate::pb::RangeBucket {
+                            from: req.edges[i],
+                            to: req.edges[i + 1],
+                            count,
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        (out, ranges)
+    }
+
+    /// Resolve a range facet's column against THIS shard's tables:
+    /// with no key the f64 table then the i64 table (one name space
+    /// across kinds, so at most one answers), with a key the
+    /// map-numeric column and its key ordinal. `None` = this shard
+    /// cannot resolve it, which answers `known: false`.
+    fn resolve_range_column(&self, column: &str, key: &str) -> Option<RangeSource> {
+        if key.is_empty() {
+            if let Some(ni) = self.numeric_index(column) {
+                return Some(RangeSource::Numeric(ni));
+            }
+            return self.integer_index(column).map(RangeSource::Integer);
+        }
+        let ci = self.map_numeric_index(column)?;
+        let key_ord = self.map_numeric_key_ord(ci, key)?;
+        Some(RangeSource::MapKey { column: ci, key_ord })
+    }
+
+    /// A document's value for a resolved range source, on the bucket
+    /// scale. i64 values convert with `as f64`: bucketing is a
+    /// comparison against f64 edges, so the edges are the precision
+    /// limit either way, and the cast is monotone so ordering (which is
+    /// all a bucket test uses) is preserved.
+    fn range_value(&self, source: RangeSource, doc_id: u32) -> Option<f64> {
+        match source {
+            RangeSource::Numeric(ni) => self.numeric_value(ni, doc_id),
+            RangeSource::Integer(ii) => self.integer_value(ii, doc_id).map(|v| v as f64),
+            RangeSource::MapKey { column, key_ord } => {
+                self.map_numeric_value(column, key_ord, doc_id)
+            }
+        }
     }
 
     /// Resolve parsed score stages against THIS shard's numeric table
@@ -545,11 +675,22 @@ impl Bm25Shard {
                 .iter()
                 .map(|(op, column, key)| {
                     let (column, min_max) = if key.is_empty() {
-                        let ni = self.numeric_index(column);
-                        (
-                            ni.map(ColumnRef::Numeric),
-                            ni.map(|ni| self.numeric_min_max(ni)),
-                        )
+                        // f64 table first, then i64: one name space
+                        // across kinds (config refuses collisions), so
+                        // at most one of the two ever answers.
+                        match self.numeric_index(column) {
+                            Some(ni) => (
+                                Some(ColumnRef::Numeric(ni)),
+                                Some(self.numeric_min_max(ni)),
+                            ),
+                            None => {
+                                let ii = self.integer_index(column);
+                                (
+                                    ii.map(ColumnRef::Integer),
+                                    ii.map(|ii| int_min_max_as_f64(self.integer_min_max(ii))),
+                                )
+                            }
+                        }
                     } else {
                         // Map stage: both the column and the key must
                         // resolve; bounds lift from the KEY's min/max.
@@ -595,6 +736,124 @@ impl Bm25Shard {
     }
 }
 
+/// A range facet's resolved column on THIS shard. The three shapes a
+/// bucketable value can live in; see [`Bm25Shard::resolve_range_column`].
+#[derive(Debug, Clone, Copy)]
+enum RangeSource {
+    /// Index into the shard's f64 table.
+    Numeric(usize),
+    /// Index into the shard's i64 table.
+    Integer(usize),
+    /// A map-numeric column and a key ordinal in ITS key dictionary.
+    MapKey {
+        /// Index into the shard's map-numeric table.
+        column: usize,
+        /// Key ordinal within that column's key dictionary.
+        key_ord: u32,
+    },
+}
+
+/// Validate a request's range-facet edge lists (`docs/range-facets.md`).
+/// Edges must be at least two finite values in strictly ascending
+/// order: fewer than two describes no interval at all, a non-finite
+/// edge makes the bucket test meaningless, and an unsorted list would
+/// silently answer for intervals nobody asked for. Every refusal names
+/// the column and the knob, like every other column refusal here.
+fn validate_range_facet_fields(fields: &[crate::pb::RangeFacetField]) -> Result<(), Status> {
+    for req in fields {
+        if req.column.is_empty() {
+            return Err(Status::invalid_argument(
+                "range facet: a request names the column it buckets",
+            ));
+        }
+        let named = if req.key.is_empty() {
+            format!("{:?}", req.column)
+        } else {
+            format!("{:?}[{:?}]", req.column, req.key)
+        };
+        if req.edges.len() < 2 {
+            return Err(Status::invalid_argument(format!(
+                "range facet {named}: edges must hold at least 2 values (one bucket); \
+                 got {}",
+                req.edges.len()
+            )));
+        }
+        for (i, e) in req.edges.iter().enumerate() {
+            if !e.is_finite() {
+                return Err(Status::invalid_argument(format!(
+                    "range facet {named}: edge {i} is not finite"
+                )));
+            }
+            if i > 0 && *e <= req.edges[i - 1] {
+                return Err(Status::invalid_argument(format!(
+                    "range facet {named}: edges must be strictly ascending (edge {i} is \
+                     not above edge {})",
+                    i - 1
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Convert a `google.protobuf.Timestamp` to the epoch MICROSECONDS an
+/// i64 column stores (`docs/range-facets.md`). Timestamps are pure
+/// ingest sugar: the node does this once, the column holds plain i64,
+/// and replay from the WAL redoes it from the same instant.
+///
+/// The remainder below a microsecond is not representable and is
+/// dropped; `nanos` is non-negative in a valid Timestamp, so the drop
+/// always floors toward negative infinity and the unit contract holds
+/// on both sides of the epoch. Everything that could make the stored
+/// value a lie instead refuses: `nanos` outside its declared range,
+/// an overflowing conversion, and a result that would collide with the
+/// column's absence sentinel.
+pub(crate) fn timestamp_to_epoch_micros(
+    field: &str,
+    ts: &prost_types::Timestamp,
+) -> Result<i64, Status> {
+    if !(0..1_000_000_000).contains(&ts.nanos) {
+        return Err(Status::invalid_argument(format!(
+            "timestamp field {field:?}: nanos {} is outside [0, 1e9) — not a valid \
+             google.protobuf.Timestamp",
+            ts.nanos
+        )));
+    }
+    let micros = ts
+        .seconds
+        .checked_mul(1_000_000)
+        .and_then(|s| s.checked_add(i64::from(ts.nanos) / 1_000))
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "timestamp field {field:?}: {} seconds does not fit i64 epoch micros",
+                ts.seconds
+            ))
+        })?;
+    if micros == crate::postings::INTEGER_ABSENT {
+        return Err(Status::invalid_argument(format!(
+            "timestamp field {field:?}: this instant converts to i64::MIN epoch micros, \
+             which is the column's absence sentinel"
+        )));
+    }
+    Ok(micros)
+}
+
+/// Every requested range facet answered unknown with no buckets — what
+/// a shard with no lexical half (and therefore no columns) reports.
+fn unknown_range_counts(
+    fields: &[crate::pb::RangeFacetField],
+) -> Vec<crate::pb::RangeFacetCounts> {
+    fields
+        .iter()
+        .map(|req| crate::pb::RangeFacetCounts {
+            column: req.column.clone(),
+            key: req.key.clone(),
+            known: false,
+            buckets: Vec::new(),
+        })
+        .collect()
+}
+
 /// [`crate::scorefn::NumericRead`] over a searchable shard shape, for
 /// score-chain evaluation during scoring.
 struct ShardNumericRead<'a>(&'a Bm25Shard);
@@ -605,6 +864,22 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     }
     fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
         self.0.map_numeric_value(column, key_ord, doc_id)
+    }
+    fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
+        self.0.integer_value(ii, doc_id)
+    }
+}
+
+/// An i64 column's bound metadata on the score-chain's f64 scale. The
+/// empty range (min > max, the i64 column's stand-in for NaN) becomes
+/// the (NaN, NaN) the bound rules already read as "no metadata"; a real
+/// range converts through the same monotone cast the values do, so the
+/// bound still dominates every converted value.
+fn int_min_max_as_f64((min, max): (i64, i64)) -> (f64, f64) {
+    if min > max {
+        (f64::NAN, f64::NAN)
+    } else {
+        (min as f64, max as f64)
     }
 }
 
@@ -1282,6 +1557,12 @@ impl NodeServiceImpl {
             .iter()
             .map(String::as_str)
             .collect();
+        let integers: Vec<&str> = self
+            .config
+            .integer_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).1);
@@ -1291,7 +1572,8 @@ impl NodeServiceImpl {
                             b.with_facet_fields(&facets)
                                 .with_numeric_fields(&numerics)
                                 .with_map_facet_fields(&map_facets)
-                                .with_map_numeric_fields(&map_numerics),
+                                .with_map_numeric_fields(&map_numerics)
+                                .with_integer_fields(&integers),
                         )
                     })
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
@@ -1301,7 +1583,8 @@ impl NodeServiceImpl {
                     .with_facets(&facets)
                     .with_numerics(&numerics)
                     .with_map_facets(&map_facets)
-                    .with_map_numerics(&map_numerics),
+                    .with_map_numerics(&map_numerics)
+                    .with_integers(&integers),
             )),
         }
     }
@@ -1877,12 +2160,14 @@ impl NodeServiceImpl {
                 )));
             }
         }
+        validate_range_facet_fields(&req.range_facet_fields)?;
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         // Filled inside the scoring arm (the facet walk reuses the
         // resolved field views); a shard with no lexical half answers
         // every requested facet field as unknown.
         let mut facets: Vec<crate::pb::FacetFieldCounts> = Vec::new();
+        let mut range_facets: Vec<crate::pb::RangeFacetCounts> = Vec::new();
         let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
             // Facet counting enters the arm even at k == 0 (the flat
             // path counts regardless of k; the scorers return no hits
@@ -1890,7 +2175,8 @@ impl NodeServiceImpl {
             Some(store)
                 if req.k > 0
                     || !req.facet_fields.is_empty()
-                    || !req.map_facet_fields.is_empty() =>
+                    || !req.map_facet_fields.is_empty()
+                    || !req.range_facet_fields.is_empty() =>
             {
                 if store.as_index().is_none() {
                     return Err(Status::failed_precondition(
@@ -1922,14 +2208,21 @@ impl NodeServiceImpl {
                         leg_of_view.push(li);
                     }
                 }
-                if !req.facet_fields.is_empty() || !req.map_facet_fields.is_empty() {
+                if !req.facet_fields.is_empty()
+                    || !req.map_facet_fields.is_empty()
+                    || !req.range_facet_fields.is_empty()
+                {
                     let pairs: Vec<(&dyn Bm25Index, &[String])> = views
                         .iter()
                         .zip(&leg_of_view)
                         .map(|(view, &li)| (view.as_ref(), req.fields[li].terms.as_slice()))
                         .collect();
-                    facets =
-                        store.count_facets(&pairs, &req.facet_fields, &req.map_facet_fields);
+                    (facets, range_facets) = store.count_facets(
+                        &pairs,
+                        &req.facet_fields,
+                        &req.map_facet_fields,
+                        &req.range_facet_fields,
+                    );
                 }
                 // Leg list order is the pinned accumulation order; the
                 // coordinator sends the same order to every shard, so
@@ -2024,6 +2317,7 @@ impl NodeServiceImpl {
                         key,
                     })
                     .collect();
+                range_facets = unknown_range_counts(&req.range_facet_fields);
                 Vec::new()
             }
         };
@@ -2042,6 +2336,7 @@ impl NodeServiceImpl {
             facets,
             // The fused route refuses score stages upstream.
             stage_columns_known: Vec::new(),
+            range_facets,
         })
     }
 
@@ -2761,6 +3056,54 @@ impl NodeServiceImpl {
             }
             slots
         };
+        // Integer values, and timestamps as sugar over them: both land
+        // in the SAME i64 table, so "repeats in one document" spans the
+        // two lists. Same refuse-before-mutating shape as the others,
+        // plus the sentinel rule — i64::MIN means absent in the column,
+        // so a document may not hold it.
+        let integer_slots: Vec<(usize, i64)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<&str> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.integers.len() + doc.timestamps.len());
+            let resolve = |field: &str, seen: &[&str]| -> Result<usize, Status> {
+                if seen.contains(&field) {
+                    return Err(Status::invalid_argument(format!(
+                        "integer field {field:?} repeats in one document (integers and \
+                         timestamps name the same columns)"
+                    )));
+                }
+                shard.integer_index(field).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "unknown integer field {field:?}; this shard's integer table \
+                         (--integer-fields) does not have it"
+                    ))
+                })
+            };
+            for iv in &doc.integers {
+                let ii = resolve(&iv.field, &seen)?;
+                seen.push(&iv.field);
+                if iv.value == crate::postings::INTEGER_ABSENT {
+                    return Err(Status::invalid_argument(format!(
+                        "integer field {:?}: i64::MIN is the column's absence sentinel and \
+                         cannot be a value; omit absent values instead",
+                        iv.field
+                    )));
+                }
+                slots.push((ii, iv.value));
+            }
+            for tv in &doc.timestamps {
+                let ii = resolve(&tv.field, &seen)?;
+                seen.push(&tv.field);
+                let Some(ts) = tv.value.as_ref() else {
+                    return Err(Status::invalid_argument(format!(
+                        "timestamp field {:?} carries no instant; omit the entry instead",
+                        tv.field
+                    )));
+                };
+                slots.push((ii, timestamp_to_epoch_micros(&tv.field, ts)?));
+            }
+            slots
+        };
         let global_id = self.config.slot_offset + u64::from(doc_id);
         if *added == 0 {
             *first_id = global_id;
@@ -2789,6 +3132,9 @@ impl NodeServiceImpl {
                 for &(ci, key, value) in &map_numeric_slots {
                     store.set_map_numeric(ci, doc_id, key, value);
                 }
+                for &(ii, value) in &integer_slots {
+                    store.set_integer(ii, doc_id, value);
+                }
             }
             Bm25Shard::Spilling(builder) => {
                 builder
@@ -2805,6 +3151,9 @@ impl NodeServiceImpl {
                 }
                 for &(ci, key, value) in &map_numeric_slots {
                     builder.set_map_numeric(ci, doc_id, key, value);
+                }
+                for &(ii, value) in &integer_slots {
+                    builder.set_integer(ii, doc_id, value);
                 }
             }
             Bm25Shard::Resident(_) => {
@@ -3875,6 +4224,7 @@ impl NodeService for NodeServiceImpl {
             return self.bm25_query_fused(&req).map(Response::new);
         }
         let stage_specs = parse_score_stages(&req.score_stages)?;
+        validate_range_facet_fields(&req.range_facet_fields)?;
         let params = params_from(req.k1, req.b)?;
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
@@ -3892,8 +4242,12 @@ impl NodeService for NodeServiceImpl {
         // k/floor narrowing (see count_facets). A shard with no
         // lexical half has no facet table: every requested field is
         // legitimately unknown here.
-        let facets = match guard.bm25.as_ref() {
-            Some(store) if !req.facet_fields.is_empty() || !req.map_facet_fields.is_empty() => {
+        let (facets, range_facets) = match guard.bm25.as_ref() {
+            Some(store)
+                if !req.facet_fields.is_empty()
+                    || !req.map_facet_fields.is_empty()
+                    || !req.range_facet_fields.is_empty() =>
+            {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
@@ -3901,24 +4255,27 @@ impl NodeService for NodeServiceImpl {
                     &[(index, &req.terms)],
                     &req.facet_fields,
                     &req.map_facet_fields,
+                    &req.range_facet_fields,
                 )
             }
-            _ => req
-                .facet_fields
-                .iter()
-                .map(|name| (name.clone(), String::new()))
-                .chain(
-                    req.map_facet_fields
-                        .iter()
-                        .map(|m| (m.column.clone(), m.key.clone())),
-                )
-                .map(|(field, key)| crate::pb::FacetFieldCounts {
-                    field,
-                    known: false,
-                    counts: Vec::new(),
-                    key,
-                })
-                .collect(),
+            _ => (
+                req.facet_fields
+                    .iter()
+                    .map(|name| (name.clone(), String::new()))
+                    .chain(
+                        req.map_facet_fields
+                            .iter()
+                            .map(|m| (m.column.clone(), m.key.clone())),
+                    )
+                    .map(|(field, key)| crate::pb::FacetFieldCounts {
+                        field,
+                        known: false,
+                        counts: Vec::new(),
+                        key,
+                    })
+                    .collect(),
+                unknown_range_counts(&req.range_facet_fields),
+            ),
         };
         // Which stage columns this shard's numeric table has —
         // computed regardless of k, like the facet known flags: a
@@ -3930,6 +4287,7 @@ impl NodeService for NodeServiceImpl {
                 .map(|(_, column, key)| {
                     if key.is_empty() {
                         store.numeric_index(column).is_some()
+                            || store.integer_index(column).is_some()
                     } else {
                         store
                             .map_numeric_index(column)
@@ -4036,6 +4394,7 @@ impl NodeService for NodeServiceImpl {
             kth_best,
             facets,
             stage_columns_known,
+            range_facets,
         }))
     }
 
