@@ -16,7 +16,10 @@ Companion documents: `architecture.md` for how the system fits together,
 Everything else about the corpus waits on this. The analyzer changed and
 the index on disk has not caught up.
 
-**The engine has now overtaken the index too, and this is load bearing.**
+**The engine has now overtaken the index too.** This is an operational
+note, not a defect to route around: upstream owns the index format,
+reindexing is accepted, and supporting a previous version is explicitly
+not a goal. Reindexing is cheap, roughly 10 hours for a 280 GB index.
 Upstream `fd851e5` ("carry each sealed block's slot base, in memory and
 in v7") extended the v7 layout WITHOUT changing the magic or a version
 field, and `read_block_table` consumes `n_sealed * 4` bytes of slot
@@ -29,19 +32,20 @@ load shard-0.tv: sealed block 0 declares slot base 1034133861:
 must be a strictly increasing multiple of the 8192-row block size
 ```
 
-It fails loudly rather than scoring garbage, which is the right failure,
-but the consequence is concrete: **the binary built from current `main`
-cannot serve the current shards.** The live cluster therefore runs a
-binary built from `e858f1e`, the last commit before the chain bump,
-whose `Cargo.lock` pins turbovec at `886c062`. `docs/` note for whoever
-does the rebuild: the new shards must be written by the NEW engine, and
-the cutover is atomic, not incremental. Until then, do not rebuild the
-cluster binary from `main` and restart it expecting it to come back.
+It fails loudly rather than scoring garbage, which is the right failure.
+The only thing to know is the sequencing: **a binary built from current
+`main` cannot serve the current shards**, so the live cluster runs one
+built from `e858f1e`, the last commit before the chain bump, whose
+`Cargo.lock` pins turbovec at `886c062`. The rebuild is the cutover and
+it is atomic: new shards are written by the new engine and the binary
+moves at the same moment. Until then, do not rebuild the cluster binary
+from `main` and restart it expecting it to come back.
 
-Worth raising with upstream: extending a format in place, with the same
-magic, means a reader cannot tell an old file from a corrupt one. A
-version byte would have turned this into a clear refusal instead of an
-implausible-slot-base error.
+The one thing worth a word upstream is the error rather than the break:
+same magic and an extended layout means a reader cannot tell an old file
+from a corrupt one, and this surfaces as an implausible slot base rather
+than "this file predates per-block slot bases". That matters to anyone
+holding data they cannot regenerate, which is not us.
 
 `analyzer::body_spec()` now applies ACCENT_FOLD, and the pinned corpus
 fingerprint moved to `0x55eb_d3a6_febd_2ac3`. The reason is measured
@@ -70,6 +74,16 @@ cased analyzer as a standing A/B arm.
 ### 1.2 The NLP capture pass
 
 Separate pass, separate decision, does not compete with the rebuild.
+
+Folding it INTO the rebuild was considered and declined for now. The
+rebuild already pays for the analysis call, so one pass requesting both
+would cost the NER rate rather than the sum: about 10.8 hours against
+15.5 for two passes. The saving is real and smaller than what it costs,
+because a combined pass needs the ingest path to route annotations
+somewhere and the repo service is designed but not wired. Blocking the
+rebuild, which gates everything else, on unbuilt infrastructure is worse
+than spending 4.8 hours of machine time. Revisit only if the repo
+service lands before the rebuild runs.
 
 Settled: annotations are held in the repo service, not the index, and
 search returns a lean hit while the full annotated record is fetched by
