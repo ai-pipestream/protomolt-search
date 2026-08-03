@@ -40,6 +40,7 @@ pub mod postings;
 pub mod rankdiff;
 pub mod reshard;
 pub mod snapshot;
+pub mod stats_cache;
 pub mod wal;
 
 /// Max gRPC message size (encoding and decoding) applied to every client

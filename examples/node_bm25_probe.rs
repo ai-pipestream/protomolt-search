@@ -59,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         b: 0.75,
         min_score: 0.0,
         fields: Vec::new(),
+        expected_stats_epoch: 0,
     };
     // Exactly what `fanout_bm25_fused` sends: the per-field stats move
     // into the leg and the flat fields go empty.
@@ -86,6 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // built any other way.
             analysis_fingerprint: 0,
         }],
+        // Same reasoning as the fingerprint: hand-typed stats carry no
+        // epoch claim.
+        expected_stats_epoch: 0,
     };
 
     println!("{node}  terms {terms:?}  k={k}");
