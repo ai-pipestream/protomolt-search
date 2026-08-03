@@ -9,6 +9,13 @@ Companion documents: `architecture.md` for how the system fits together,
 `multi-field.md` for the index format, and the sidecar's own
 `NLP-SIDECAR-ENHANCEMENTS.md` in the workspace root.
 
+The queue is now organized into three parallel tracks, each with its own
+plan document in `plans/`: `track-1-features.md` (facets, functions on
+columns, caching, layer separation, the public API), `track-2-reindex.md`
+(the v7 rebuild runbook, from item 1.1 below), and
+`track-3-ner-performance.md` (the throughput ceiling in section 3 below,
+written as a research brief for a fresh investigation).
+
 ## 1. Blocking the corpus
 
 ### 1.1 The v7 rebuild, with the new corpus analyzer
