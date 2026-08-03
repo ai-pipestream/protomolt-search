@@ -53,6 +53,7 @@ const OFFSETS: [u64; 2] = [0, 3];
 
 fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
     AddDocumentsRequest {
+        facets: Vec::new(),
         text: body.to_string(),
         analysis: None,
         lineage: None,
@@ -339,6 +340,7 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
     };
 
     let bad = |field: &str, text: &str| AddDocumentsRequest {
+        facets: Vec::new(),
         text: "a body".to_string(),
         analysis: None,
         lineage: None,
@@ -454,6 +456,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
         "court of appeals for the ninth circuit en banc",
     ] {
         tx.send(AddDocumentsRequest {
+            facets: Vec::new(),
             text: text.to_string(),
             analysis: None,
             lineage: None,
@@ -608,6 +611,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            facet_fields: Vec::new(),
             text: "smith rust".to_string(),
             k: 5,
             analysis: None,
@@ -623,6 +627,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     let err = SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            facet_fields: Vec::new(),
             text: "smith rust".to_string(),
             k: 5,
             analysis: Some(spec),
@@ -844,6 +849,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
     assert_eq!(added.added, 3);
 
     let leg = |fingerprint: u64| Bm25QueryRequest {
+        facet_fields: Vec::new(),
         expected_stats_epoch: 0,
         terms: Vec::new(),
         k: 5,

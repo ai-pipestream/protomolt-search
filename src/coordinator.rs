@@ -121,6 +121,68 @@ fn is_stale_stats(status: &Status) -> bool {
         && status.message().starts_with(crate::node::STALE_STATS_EPOCH)
 }
 
+/// Merge per-shard facet counts into global counts: the plain per-value
+/// sum (counts are additive — no node's count depends on another's, so
+/// there is no analog of the global-df trap), `known` when at least one
+/// shard has the field, sorted count-descending with ties by value
+/// ascending. A facet field NO shard knows is refused — the same rule
+/// as an unknown scoring field: zeros everywhere would make a typo read
+/// as "no results per anything".
+fn merge_facet_counts(
+    requested: &[String],
+    shard_facets: &[Vec<crate::pb::FacetFieldCounts>],
+) -> Result<Vec<crate::pb::FacetFieldCounts>, Status> {
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut known = vec![false; requested.len()];
+    let mut sums: Vec<HashMap<String, u64>> = requested.iter().map(|_| HashMap::new()).collect();
+    for per_shard in shard_facets {
+        if per_shard.len() != requested.len() {
+            return Err(Status::internal(format!(
+                "shard returned {} facet fields for {} requested",
+                per_shard.len(),
+                requested.len()
+            )));
+        }
+        for (fi, ff) in per_shard.iter().enumerate() {
+            known[fi] |= ff.known;
+            for c in &ff.counts {
+                *sums[fi].entry(c.value.clone()).or_default() += c.count;
+            }
+        }
+    }
+    let unknown: Vec<String> = requested
+        .iter()
+        .zip(&known)
+        .filter(|(_, k)| !**k)
+        .map(|(name, _)| format!("{name:?}"))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "no shard has facet field {}: counting an unknown field would silently answer \
+             zero everywhere. Check the spelling, or the nodes' --facet-fields.",
+            unknown.join(", ")
+        )));
+    }
+    Ok(requested
+        .iter()
+        .zip(sums)
+        .map(|(name, sum)| {
+            let mut counts: Vec<crate::pb::FacetCount> = sum
+                .into_iter()
+                .map(|(value, count)| crate::pb::FacetCount { value, count })
+                .collect();
+            counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+            crate::pb::FacetFieldCounts {
+                field: name.clone(),
+                known: true,
+                counts,
+            }
+        })
+        .collect())
+}
+
 /// Merged global stats for a fused multi-field query, with the per-node
 /// epochs the shares were valid at (parallel to the node list).
 struct FusedGlobals {
@@ -310,6 +372,26 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
+        self.fanout_bm25_faceted(text, k, spec, min_score, &[])
+            .await
+            .map(|(hits, _)| hits)
+    }
+
+    /// [`Self::fanout_bm25_seeded`] with count-then-rank facets: the
+    /// requested facet fields are forwarded to every shard, counted
+    /// there over the full match set, and summed here — counts are
+    /// additive, so the global counts are the plain per-value sum over
+    /// shards. Returns `(hits, merged facet counts)`; the facet list is
+    /// empty when none were requested or the query analyzed to no
+    /// terms (no match set to count).
+    pub async fn fanout_bm25_faceted(
+        &self,
+        text: &str,
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        min_score: f32,
+        facet_fields: &[String],
+    ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
@@ -323,7 +405,7 @@ impl CoordinatorServiceImpl {
             }
         }
         if terms.is_empty() || k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // (b) each shard's share of the corpus stats, cached per node;
@@ -334,7 +416,7 @@ impl CoordinatorServiceImpl {
             let (global, epochs) = self.body_stats(&terms, fresh).await?;
             let claims = if fresh { vec![0; epochs.len()] } else { epochs };
             match self
-                .bm25_query_round(&terms, k, min_score, &global, &claims)
+                .bm25_query_round(&terms, k, min_score, &global, &claims, facet_fields)
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
@@ -348,7 +430,8 @@ impl CoordinatorServiceImpl {
 
     /// One Bm25Query fan-out with the GLOBAL stats: every shard scores
     /// identically, so the merge is a straight top-k. `claims[shard]`
-    /// travels as that shard's `expected_stats_epoch`.
+    /// travels as that shard's `expected_stats_epoch`; `facet_fields`
+    /// as its `facet_fields` (shard-local counts merge by plain sum).
     async fn bm25_query_round(
         &self,
         terms: &[String],
@@ -356,7 +439,8 @@ impl CoordinatorServiceImpl {
         min_score: f32,
         global: &CorpusStats,
         claims: &[u64],
-    ) -> Result<Vec<Bm25Hit>, Status> {
+        facet_fields: &[String],
+    ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
@@ -370,22 +454,26 @@ impl CoordinatorServiceImpl {
                 min_score,
                 fields: Vec::new(),
                 expected_stats_epoch: claims[shard],
+                facet_fields: facet_fields.to_vec(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
-                client
-                    .bm25_query(request)
-                    .await
-                    .map(|r| (shard as u32, r.into_inner().hits))
+                client.bm25_query(request).await.map(|r| {
+                    let r = r.into_inner();
+                    (shard as u32, r.hits, r.facets)
+                })
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         for task in query_tasks {
-            let (shard, hits) = task
+            let (shard, hits, facets) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             all.extend(hits.into_iter().map(|h| (shard, h)));
+            shard_facets.push(facets);
         }
+        let facets = merge_facet_counts(facet_fields, &shard_facets)?;
         all.sort_by(|(sa, a), (sb, b)| {
             b.score
                 .total_cmp(&a.score)
@@ -393,7 +481,7 @@ impl CoordinatorServiceImpl {
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         all.truncate(k as usize);
-        Ok(all.into_iter().map(|(_, h)| h).collect())
+        Ok((all.into_iter().map(|(_, h)| h).collect(), facets))
     }
 
     /// Fused multi-field Bm25Search (`docs/multi-field.md`): `text` is
@@ -409,6 +497,22 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
+        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[])
+            .await
+            .map(|(hits, _)| hits)
+    }
+
+    /// [`Self::fanout_bm25_fused`] with count-then-rank facets; see
+    /// [`Self::fanout_bm25_faceted`] for the facet contract (on a fused
+    /// query the match set is the union over every leg's terms).
+    pub async fn fanout_bm25_fused_faceted(
+        &self,
+        text: &str,
+        k: u32,
+        fields: &[crate::pb::QueryField],
+        min_score: f32,
+        facet_fields: &[String],
+    ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
         // route and the single-field route reach the same node scorer,
         // so when they disagree by orders of magnitude the question is
@@ -452,7 +556,7 @@ impl CoordinatorServiceImpl {
         }
         let t_analyzed = t0.elapsed();
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         // (b) every field's stats, served from the per-node cache;
         // (c)+(d) run as a round so a stale-stats refusal can rerun
@@ -482,6 +586,7 @@ impl CoordinatorServiceImpl {
                     &globals,
                     &claims,
                     min_score,
+                    facet_fields,
                     trace,
                     t0,
                     t_analyzed,
@@ -627,11 +732,12 @@ impl CoordinatorServiceImpl {
         globals: &FusedGlobals,
         claims: &[u64],
         min_score: f32,
+        facet_fields: &[String],
         trace: bool,
         t0: std::time::Instant,
         t_analyzed: std::time::Duration,
         t_stats: std::time::Duration,
-    ) -> Result<Vec<Bm25Hit>, Status> {
+    ) -> Result<(Vec<Bm25Hit>, Vec<crate::pb::FacetFieldCounts>), Status> {
         let doc_count = globals.doc_count;
         let totals = &globals.totals;
         let dfs = &globals.dfs;
@@ -693,28 +799,34 @@ impl CoordinatorServiceImpl {
                 min_score,
                 fields: legs.clone(),
                 expected_stats_epoch: claims[shard],
+                facet_fields: facet_fields.to_vec(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
                 let started = std::time::Instant::now();
                 client.bm25_query(request).await.map(|r| {
+                    let r = r.into_inner();
                     (
                         shard as u32,
-                        r.into_inner().hits,
+                        r.hits,
+                        r.facets,
                         started.elapsed().as_secs_f64() * 1000.0,
                     )
                 })
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         let mut per_shard: Vec<(u32, f64)> = Vec::new();
         for task in query_tasks {
-            let (shard, hits, ms) = task
+            let (shard, hits, facets, ms) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             per_shard.push((shard, ms));
             all.extend(hits.into_iter().map(|h| (shard, h)));
+            shard_facets.push(facets);
         }
+        let facets = merge_facet_counts(facet_fields, &shard_facets)?;
         let t_query = t0.elapsed();
         if trace {
             eprintln!(
@@ -746,7 +858,7 @@ impl CoordinatorServiceImpl {
                 field_terms.iter().map(Vec::len).sum::<usize>(),
             );
         }
-        Ok(all.into_iter().map(|(_, h)| h).collect())
+        Ok((all.into_iter().map(|(_, h)| h).collect(), facets))
     }
 
     /// Hybrid vector + BM25 search:
@@ -1278,6 +1390,11 @@ impl CoordinatorServiceImpl {
                     min_score: 0.0,
                     fields: Vec::new(),
                     expected_stats_epoch: claims[shard],
+                    // Hybrid queries do not carry facets (yet): the
+                    // vector leg's match set is the whole corpus, so
+                    // "counts over the matches" has no single honest
+                    // answer there.
+                    facet_fields: Vec::new(),
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -3217,9 +3334,15 @@ impl SearchService for CoordinatorServiceImpl {
                 "min_score must be finite (NaN and -inf are not valid floors)",
             ));
         }
-        let hits = if req.fields.is_empty() {
-            self.fanout_bm25_seeded(&req.text, k, req.analysis.as_ref(), req.min_score)
-                .await?
+        let (hits, facets) = if req.fields.is_empty() {
+            self.fanout_bm25_faceted(
+                &req.text,
+                k,
+                req.analysis.as_ref(),
+                req.min_score,
+                &req.facet_fields,
+            )
+            .await?
         } else {
             // `analysis` is documented as ignored once `fields` is set,
             // because term identity is per field. Ignoring it QUIETLY is
@@ -3236,8 +3359,14 @@ impl SearchService for CoordinatorServiceImpl {
                      `fields` to use the single-field route.",
                 ));
             }
-            self.fanout_bm25_fused(&req.text, k, &req.fields, req.min_score)
-                .await?
+            self.fanout_bm25_fused_faceted(
+                &req.text,
+                k,
+                &req.fields,
+                req.min_score,
+                &req.facet_fields,
+            )
+            .await?
         };
         // The merged k-th best: one f32 ULP below the last hit's score
         // when k hits were returned (see `bm25::floor_seed` — a later
@@ -3249,7 +3378,11 @@ impl SearchService for CoordinatorServiceImpl {
         } else {
             0.0
         };
-        Ok(Response::new(Bm25SearchResponse { hits, kth_best }))
+        Ok(Response::new(Bm25SearchResponse {
+            hits,
+            kth_best,
+            facets,
+        }))
     }
 
     async fn hybrid_search(

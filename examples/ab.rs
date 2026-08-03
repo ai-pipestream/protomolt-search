@@ -154,6 +154,7 @@ impl Arm {
                 boost: None,
             }),
             None => search_variant::Query::Bm25(Bm25SearchRequest {
+                facet_fields: Vec::new(),
                 text: text.to_string(),
                 k: 0,
                 // Request-level analysis reaches the single-field route

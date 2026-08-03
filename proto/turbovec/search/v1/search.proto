@@ -757,6 +757,21 @@ message DocumentField {
   AnalysisSpec analysis = 3;
 }
 
+// One facet value of a document: a single string value for one declared
+// facet field ("court" -> "scotus"). Facet values are NOT analyzed —
+// they are opaque identifiers counted exactly as sent — and land in the
+// shard's dictionary-encoded facet column, not in postings.
+message FacetValue {
+  // Facet field name; must exist in the shard's facet field table
+  // (--facet-fields) and must not repeat within one document. Unknown
+  // names are INVALID_ARGUMENT — the same typo protection as
+  // DocumentField.field.
+  string field = 1;
+  // The value. Non-empty; a document without a value for a facet field
+  // simply omits the entry and is counted under no value.
+  string value = 2;
+}
+
 // One document on the `AddDocuments` stream.
 message AddDocumentsRequest {
   // Raw document text. Non-empty, at most 1 MiB (the sidecar's cap).
@@ -772,6 +787,11 @@ message AddDocumentsRequest {
   // durable record, so old logs replay as body-only automatically and
   // reshard replay is the field-migration lever.
   repeated DocumentField fields = 4;
+  // Facet values for this document, one entry per declared facet field
+  // the document has a value for. Rides the same durable-record lever
+  // as `fields`: old WAL logs replay facet-less, and reshard replay is
+  // how an existing corpus grows facet columns.
+  repeated FacetValue facets = 5;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -895,6 +915,15 @@ message Bm25QueryRequest {
   // the pre-epoch semantics, where the stats are simply whatever the
   // coordinator fetched moments before.
   uint64 expected_stats_epoch = 10;
+  // Facet fields to count over the FULL match set (count-then-rank,
+  // docs/plans/track-1-features.md section 2): every document matching
+  // at least one query term is counted, independent of `k` and
+  // `min_score` — the floor bounds what is SURFACED, never what
+  // matched. Counting walks each scored term's doc run to exhaustion,
+  // so a query that asks for facets pays that traversal; empty means
+  // no counting and no cost. On a fused query the match set is the
+  // union over every leg's terms.
+  repeated string facet_fields = 11;
 }
 
 // One field's leg of a fused multi-field BM25 query.
@@ -969,6 +998,37 @@ message Bm25QueryResponse {
   // appends) can seed the fleet with it via
   // Bm25QueryRequest.min_score / Bm25SearchRequest.min_score.
   float kth_best = 2;
+  // Facet counts over this shard's match set, one entry per requested
+  // facet field in request order. Counts are shard-local shares; they
+  // are additive, so the coordinator's global counts are the plain sum
+  // over shards — there is no analog of the global-df trap here.
+  repeated FacetFieldCounts facets = 3;
+}
+
+// One facet value's count within one facet field.
+message FacetCount {
+  // The value, exactly as ingested.
+  string value = 1;
+  // Number of matching documents holding this value.
+  uint64 count = 2;
+}
+
+// One requested facet field's counts, from one shard or merged.
+message FacetFieldCounts {
+  // The facet field name.
+  string field = 1;
+  // Whether this shard has the field in its facet table. A shard
+  // without it answers known=false and no counts — legitimate for a
+  // heterogeneous fleet (its documents hold no values), but the
+  // coordinator REFUSES a facet field NO shard knows, because a typo
+  // would otherwise read as "zero results everywhere". The same rule
+  // as FieldStats.known.
+  bool known = 2;
+  // Non-zero value counts. Node responses list them in dictionary
+  // order; the coordinator's merged response sorts by count
+  // descending, ties by value ascending. Values matched by no document
+  // are omitted.
+  repeated FacetCount counts = 3;
 }
 
 // Reads raw texts from the doc store.
@@ -1020,6 +1080,13 @@ message Bm25SearchRequest {
   // quietly dropping it runs the query under the sidecar's default
   // analysis, whose terms need not exist in the index at all.
   repeated QueryField fields = 5;
+  // Facet fields to count over the full match set (count-then-rank).
+  // Forwarded to every shard's Bm25QueryRequest.facet_fields; the
+  // response carries the summed global counts. A query that asks for
+  // facets pays a full doc-run traversal per scored term on every
+  // shard; empty means no counting and no cost. A facet field no shard
+  // knows is refused (INVALID_ARGUMENT).
+  repeated string facet_fields = 6;
 }
 
 // One field of a fused multi-field search.
@@ -1048,6 +1115,15 @@ message Bm25SearchResponse {
   // 0 otherwise. Seed a later re-query with it via
   // Bm25SearchRequest.min_score.
   float kth_best = 2;
+  // Global facet counts, one entry per requested facet field in
+  // request order: the plain sum of every shard's shares, sorted by
+  // count descending, ties by value ascending. EXACT over the full
+  // match set — computed by full traversal, never sampled from the
+  // candidate pool. `known` is true when at least one shard has the
+  // field (a field no shard knows was refused instead). Empty when the
+  // query analyzed to no scoring terms — there is no match set to
+  // count.
+  repeated FacetFieldCounts facets = 3;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.

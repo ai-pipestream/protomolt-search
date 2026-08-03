@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let feeder = tokio::spawn(async move {
         for i in 0..docs {
             tx.send(AddDocumentsRequest {
+                facets: Vec::new(),
                 text: texts.get(i).cloned().unwrap_or_else(|| {
                     format!("the appellant filed a motion number {i} in the district court")
                 }),

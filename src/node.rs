@@ -111,6 +111,13 @@ pub struct NodeConfig {
     /// existing `.bm25` files keep the table they were written with;
     /// documents naming fields outside the active table are refused.
     pub bm25_fields: Vec<String>,
+    /// The facet field table for NEW builders (dictionary-encoded
+    /// per-doc columns, `docs/plans/track-1-features.md` section 2).
+    /// Same rules as `bm25_fields`: shards loaded from existing files
+    /// keep the table they were written with; documents naming facet
+    /// fields outside the active table are refused. Non-empty makes
+    /// new builders persist as v7.
+    pub facet_fields: Vec<String>,
     /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
     /// Requires `index_path`; the config layer defaults this on for
     /// persisted shards and off for demo shards.
@@ -143,6 +150,7 @@ impl Default for NodeConfig {
             index_path: None,
             analysis_addr: None,
             bm25_fields: vec!["body".to_string()],
+            facet_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
             coalesce: true,
@@ -244,6 +252,45 @@ impl Bm25Shard {
         }
     }
 
+    /// The facet-table index of the facet field named `name`, if the
+    /// active table has it.
+    fn facet_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.facet_index(name),
+            Bm25Shard::Spilling(s) => s.facet_index(name),
+            Bm25Shard::Resident(r) => r.facet_index(name),
+        }
+    }
+
+    /// Number of distinct values facet field `fi` holds. Counting only
+    /// runs against searchable shapes, so the Spilling arm is
+    /// unreachable (a spilling shard refused the query already).
+    fn facet_value_count(&self, fi: usize) -> usize {
+        match self {
+            Bm25Shard::Building(s) => s.facet_value_count(fi),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.facet_value_count(fi),
+        }
+    }
+
+    /// The value of facet field `fi` at ordinal `ord`.
+    fn facet_value(&self, fi: usize, ord: u32) -> &str {
+        match self {
+            Bm25Shard::Building(s) => s.facet_value(fi, ord),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.facet_value(fi, ord),
+        }
+    }
+
+    /// The ordinal of `doc_id`'s value for facet field `fi`.
+    fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.facet_ord(fi, doc_id),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.facet_ord(fi, doc_id),
+        }
+    }
+
     /// Field `f` as its own searchable [`Bm25Index`]; `None` while
     /// bulk-building, exactly like [`Self::as_index`].
     fn field_view(&self, f: usize) -> Option<Box<dyn Bm25Index + '_>> {
@@ -252,6 +299,71 @@ impl Bm25Shard {
             Bm25Shard::Spilling(_) => None,
             Bm25Shard::Resident(r) => Some(Box::new(r.field(f))),
         }
+    }
+
+    /// Count-then-rank facet counting
+    /// (`docs/plans/track-1-features.md` section 2): count the
+    /// requested facet fields over this shard's FULL match set — every
+    /// document holding at least one scored term in any queried field
+    /// — independent of `k`, `min_score`, and block-max pruning, which
+    /// bound what is SURFACED, never what matched. Walks each term's
+    /// doc run to exhaustion (fixed-stride on a v5-shaped reader,
+    /// never occurrence bytes), dedups documents in a slot bitmap, and
+    /// resolves one facet ordinal per matched document. A facet field
+    /// the shard's table lacks answers `known: false` and no counts —
+    /// the coordinator turns all-unknown into a refusal.
+    fn count_facets(
+        &self,
+        views: &[(&dyn Bm25Index, &[String])],
+        facet_fields: &[String],
+    ) -> Vec<crate::pb::FacetFieldCounts> {
+        let n_slots = self.next_doc_id() as usize;
+        let mut bits = vec![0u64; n_slots.div_ceil(64)];
+        for &(view, terms) in views {
+            for term in terms {
+                view.for_each_doc_tf(term, &mut |doc_id, _tf| {
+                    bits[doc_id as usize / 64] |= 1u64 << (doc_id % 64);
+                });
+            }
+        }
+        facet_fields
+            .iter()
+            .map(|name| {
+                let Some(fi) = self.facet_index(name) else {
+                    return crate::pb::FacetFieldCounts {
+                        field: name.clone(),
+                        known: false,
+                        counts: Vec::new(),
+                    };
+                };
+                let mut counts = vec![0u64; self.facet_value_count(fi)];
+                for (wi, &word) in bits.iter().enumerate() {
+                    let mut w = word;
+                    while w != 0 {
+                        let doc = (wi * 64) as u32 + w.trailing_zeros();
+                        if let Some(ord) = self.facet_ord(fi, doc) {
+                            counts[ord as usize] += 1;
+                        }
+                        w &= w - 1;
+                    }
+                }
+                crate::pb::FacetFieldCounts {
+                    field: name.clone(),
+                    known: true,
+                    // Dictionary (ordinal) order — deterministic per
+                    // shard; the coordinator sorts the merged counts.
+                    counts: counts
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &c)| c > 0)
+                        .map(|(ord, &c)| crate::pb::FacetCount {
+                            value: self.facet_value(fi, ord as u32).to_string(),
+                            count: c,
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// Open a `.bm25` path in the right shape: every reader-supported
@@ -266,7 +378,7 @@ impl Bm25Shard {
         std::fs::File::open(path)?.read_exact(&mut magic)?;
         if matches!(
             &magic,
-            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506"
+            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506" | b"TVBM2507"
         ) {
             Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
         } else {
@@ -866,14 +978,17 @@ impl NodeServiceImpl {
     /// Flush); path-less demo shards build in heap.
     fn new_builder(&self, generation: Option<&PathBuf>) -> Result<Bm25Shard, Status> {
         let names: Vec<&str> = self.config.bm25_fields.iter().map(String::as_str).collect();
+        let facets: Vec<&str> = self.config.facet_fields.iter().map(String::as_str).collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).1);
                 SpillBuilder::create_with_fields(&dir, &names)
-                    .map(Bm25Shard::Spilling)
+                    .map(|b| Bm25Shard::Spilling(b.with_facet_fields(&facets)))
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
             }
-            None => Ok(Bm25Shard::Building(Bm25Store::with_fields(&names))),
+            None => Ok(Bm25Shard::Building(
+                Bm25Store::with_fields(&names).with_facets(&facets),
+            )),
         }
     }
 
@@ -1450,8 +1565,15 @@ impl NodeServiceImpl {
         }
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(req.expected_stats_epoch)?;
+        // Filled inside the scoring arm (the facet walk reuses the
+        // resolved field views); a shard with no lexical half answers
+        // every requested facet field as unknown.
+        let mut facets: Vec<crate::pb::FacetFieldCounts> = Vec::new();
         let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
-            Some(store) if req.k > 0 => {
+            // Facet counting enters the arm even at k == 0 (the flat
+            // path counts regardless of k; the scorers return no hits
+            // for k == 0 on their own).
+            Some(store) if req.k > 0 || !req.facet_fields.is_empty() => {
                 if store.as_index().is_none() {
                     return Err(Status::failed_precondition(
                         "bm25 bulk build in progress; Flush first",
@@ -1481,6 +1603,14 @@ impl NodeServiceImpl {
                         views.push(store.field_view(fi).expect("searchable, checked above"));
                         leg_of_view.push(li);
                     }
+                }
+                if !req.facet_fields.is_empty() {
+                    let pairs: Vec<(&dyn Bm25Index, &[String])> = views
+                        .iter()
+                        .zip(&leg_of_view)
+                        .map(|(view, &li)| (view.as_ref(), req.fields[li].terms.as_slice()))
+                        .collect();
+                    facets = store.count_facets(&pairs, &req.facet_fields);
                 }
                 // Leg list order is the pinned accumulation order; the
                 // coordinator sends the same order to every shard, so
@@ -1558,7 +1688,18 @@ impl NodeServiceImpl {
                     })
                     .collect()
             }
-            _ => Vec::new(),
+            _ => {
+                facets = req
+                    .facet_fields
+                    .iter()
+                    .map(|name| crate::pb::FacetFieldCounts {
+                        field: name.clone(),
+                        known: false,
+                        counts: Vec::new(),
+                    })
+                    .collect();
+                Vec::new()
+            }
         };
         // Same seed rule as the flat path: one f32 ULP below the k-th
         // fused score when the heap filled, 0 otherwise.
@@ -1569,7 +1710,11 @@ impl NodeServiceImpl {
         } else {
             0.0
         };
-        Ok(Bm25QueryResponse { hits, kth_best })
+        Ok(Bm25QueryResponse {
+            hits,
+            kth_best,
+            facets,
+        })
     }
 
     fn compute_legs(
@@ -2148,6 +2293,38 @@ impl NodeServiceImpl {
                     .map_err(Status::failed_precondition)?;
             }
         }
+        // Facet values: refuse unknown fields, repeats, and empty
+        // values BEFORE anything mutates — a document that fails
+        // validation must never half-enter the store or reach the log.
+        let facet_slots: Vec<(usize, String)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<&str> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.facets.len());
+            for fv in &doc.facets {
+                if seen.contains(&fv.field.as_str()) {
+                    return Err(Status::invalid_argument(format!(
+                        "facet field {:?} repeats in one document",
+                        fv.field
+                    )));
+                }
+                seen.push(&fv.field);
+                let Some(fi) = shard.facet_index(&fv.field) else {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown facet field {:?}; this shard's facet table \
+                         (--facet-fields) does not have it",
+                        fv.field
+                    )));
+                };
+                if fv.value.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "facet field {:?} has an empty value; omit absent facets instead",
+                        fv.field
+                    )));
+                }
+                slots.push((fi, fv.value.clone()));
+            }
+            slots
+        };
         let global_id = self.config.slot_offset + u64::from(doc_id);
         if *added == 0 {
             *first_id = global_id;
@@ -2164,11 +2341,17 @@ impl NodeServiceImpl {
         match guard.bm25.as_mut().expect("builder just ensured") {
             Bm25Shard::Building(store) => {
                 store.add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage);
+                for (fi, value) in &facet_slots {
+                    store.set_facet(*fi, doc_id, value);
+                }
             }
             Bm25Shard::Spilling(builder) => {
                 builder
                     .add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage)
                     .map_err(|e| Status::internal(format!("spill write: {e}")))?;
+                for (fi, value) in &facet_slots {
+                    builder.set_facet(*fi, doc_id, value);
+                }
             }
             Bm25Shard::Resident(_) => {
                 return Err(Status::internal("shard builder unavailable"));
@@ -3244,6 +3427,27 @@ impl NodeService for NodeServiceImpl {
         }
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(req.expected_stats_epoch)?;
+        // Count-then-rank facets over the full match set, before any
+        // k/floor narrowing (see count_facets). A shard with no
+        // lexical half has no facet table: every requested field is
+        // legitimately unknown here.
+        let facets = match guard.bm25.as_ref() {
+            Some(store) if !req.facet_fields.is_empty() => {
+                let index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                store.count_facets(&[(index, &req.terms)], &req.facet_fields)
+            }
+            _ => req
+                .facet_fields
+                .iter()
+                .map(|name| crate::pb::FacetFieldCounts {
+                    field: name.clone(),
+                    known: false,
+                    counts: Vec::new(),
+                })
+                .collect(),
+        };
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
                 let index = store.as_index().ok_or_else(|| {
@@ -3309,7 +3513,11 @@ impl NodeService for NodeServiceImpl {
         } else {
             0.0
         };
-        Ok(Response::new(Bm25QueryResponse { hits, kth_best }))
+        Ok(Response::new(Bm25QueryResponse {
+            hits,
+            kth_best,
+            facets,
+        }))
     }
 
     async fn bm25_rescore(

@@ -48,6 +48,14 @@ const MAGIC_V5: &[u8; 8] = b"TVBM2505";
 /// directory run offsets) are RELATIVE to their section's start — the
 /// v4 blob lesson generalized, so sections survive relocation.
 const MAGIC_V6: &[u8; 8] = b"TVBM2506";
+/// v7 layout: v6 plus dictionary-encoded facet columns
+/// (`docs/plans/track-1-features.md` section 2). The header gains a
+/// facet table after the field table (u32 n_facets, then per facet:
+/// name, u32 n_values, u64 dict_off, u64 ords_off); the facet sections
+/// (per facet: dict, then ords) follow the last field group. A store
+/// with NO declared facet fields still writes v6, byte-identical to
+/// every pre-facet build — the format break is opt-in per shard.
+const MAGIC_V7: &[u8; 8] = b"TVBM2507";
 
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
@@ -224,6 +232,88 @@ impl FieldStore {
     }
 }
 
+/// The ordinal marking "this document has no value for this facet
+/// field" in a facet column, in heap and on disk alike.
+pub const FACET_ABSENT: u32 = u32::MAX;
+
+/// One dictionary-encoded facet column: the value dictionary in
+/// ordinal (first-seen) order, and a per-slot ordinal table parallel
+/// to the shared slot space. Facet values are opaque strings — never
+/// analyzed — counted exactly as ingested.
+#[derive(Debug)]
+struct FacetStore {
+    /// Facet field name from the schema.
+    name: String,
+    /// Values in ordinal order.
+    dict: Vec<String>,
+    /// value → ordinal (the dictionary's inverse, heap only).
+    index: HashMap<String, u32>,
+    /// Per-slot ordinal ([`FACET_ABSENT`] = no value). May be shorter
+    /// than the slot count; missing trailing slots read as absent.
+    ords: Vec<u32>,
+}
+
+impl FacetStore {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            dict: Vec::new(),
+            index: HashMap::new(),
+            ords: Vec::new(),
+        }
+    }
+
+    fn ord(&self, slot: usize) -> Option<u32> {
+        match self.ords.get(slot).copied() {
+            None | Some(FACET_ABSENT) => None,
+            some => some,
+        }
+    }
+
+    /// Record `doc_id`'s value, interning it in the dictionary. One
+    /// value per (document, facet field); a second write for the same
+    /// slot panics (callers validate duplicates into a refusal before
+    /// applying).
+    fn set(&mut self, doc_id: u32, value: &str) {
+        let slot = doc_id as usize;
+        let ord = match self.index.get(value) {
+            Some(&ord) => ord,
+            None => {
+                let ord = u32::try_from(self.dict.len()).expect("facet dictionary exceeds u32");
+                assert!(ord != FACET_ABSENT, "facet dictionary exhausted u32 ordinals");
+                self.dict.push(value.to_string());
+                self.index.insert(value.to_string(), ord);
+                ord
+            }
+        };
+        if self.ords.len() <= slot {
+            self.ords.resize(slot + 1, FACET_ABSENT);
+        }
+        assert!(
+            self.ords[slot] == FACET_ABSENT,
+            "doc {doc_id} already has a value for facet field {:?}",
+            self.name
+        );
+        self.ords[slot] = ord;
+    }
+}
+
+/// Validate a facet-field name list (shared by the heap store and the
+/// spill builder): non-empty unique names that fit u16 lengths.
+fn validate_facet_names(names: &[&str]) {
+    for (i, name) in names.iter().enumerate() {
+        assert!(!name.is_empty(), "facet field {i} has an empty name");
+        assert!(
+            u16::try_from(name.len()).is_ok(),
+            "facet field name exceeds u16 length"
+        );
+        assert!(
+            !names[..i].contains(name),
+            "duplicate facet field name {name:?}"
+        );
+    }
+}
+
 /// The shard's lexical half: per-field postings and corpus stats over a
 /// shared slot space, plus the raw texts.
 #[derive(Debug)]
@@ -236,6 +326,9 @@ pub struct Bm25Store {
     /// Per-document lineage, parallel to `texts` (`None` when the
     /// document was ingested without lineage).
     lineages: Vec<Option<DocLineage>>,
+    /// Facet columns in facet-id order (empty for facet-less shards,
+    /// which persist as v6).
+    facets: Vec<FacetStore>,
 }
 
 impl Default for Bm25Store {
@@ -244,6 +337,7 @@ impl Default for Bm25Store {
             fields: vec![FieldStore::new("body")],
             texts: Vec::new(),
             lineages: Vec::new(),
+            facets: Vec::new(),
         }
     }
 }
@@ -272,12 +366,65 @@ impl Bm25Store {
             fields: names.iter().map(|n| FieldStore::new(n)).collect(),
             texts: Vec::new(),
             lineages: Vec::new(),
+            facets: Vec::new(),
         }
+    }
+
+    /// Declare the facet field table, in facet-id order (builder style:
+    /// `Bm25Store::with_fields(&["body"]).with_facets(&["court"])`).
+    /// Must be called before any document is added. A store with facet
+    /// fields persists as v7; without, as v6.
+    pub fn with_facets(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "facet fields must be declared before documents are added"
+        );
+        validate_facet_names(names);
+        self.facets = names.iter().map(|n| FacetStore::new(n)).collect();
+        self
     }
 
     /// Number of fields in the field table.
     pub fn field_count(&self) -> usize {
         self.fields.len()
+    }
+
+    /// Number of facet fields in the facet table.
+    pub fn facet_count(&self) -> usize {
+        self.facets.len()
+    }
+
+    /// The name of facet field `fi`. Panics when out of range.
+    pub fn facet_name(&self, fi: usize) -> &str {
+        &self.facets[fi].name
+    }
+
+    /// The index of the facet field named `name`, if the table has it.
+    pub fn facet_index(&self, name: &str) -> Option<usize> {
+        self.facets.iter().position(|f| f.name == name)
+    }
+
+    /// Number of distinct values facet field `fi` holds.
+    pub fn facet_value_count(&self, fi: usize) -> usize {
+        self.facets[fi].dict.len()
+    }
+
+    /// The value of facet field `fi` at ordinal `ord`. Panics when out
+    /// of range.
+    pub fn facet_value(&self, fi: usize, ord: u32) -> &str {
+        &self.facets[fi].dict[ord as usize]
+    }
+
+    /// The ordinal of `doc_id`'s value for facet field `fi`, `None`
+    /// when the document has no value.
+    pub fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
+        self.facets[fi].ord(doc_id as usize)
+    }
+
+    /// Record `doc_id`'s value for facet field `fi`, interning it in
+    /// the dictionary; see [`FacetStore::set`] for the contract.
+    pub fn set_facet(&mut self, fi: usize, doc_id: u32, value: &str) {
+        self.facets[fi].set(doc_id, value);
     }
 
     /// The name of field `f`. Panics when out of range.
@@ -421,8 +568,10 @@ impl Bm25Store {
         }
     }
 
-    /// Persist to `path` (atomically: write tmp, rename). Writes THE
-    /// format, v6 (`TVBM2506`); see [`Self::write_v6_to`].
+    /// Persist to `path` (atomically: write tmp, rename). Writes v6
+    /// (`TVBM2506`) when no facet fields are declared — byte-identical
+    /// to every pre-facet build — and v7 (`TVBM2507`) when they are;
+    /// see [`Self::write_v6_to`].
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let tmp: PathBuf = path.with_extension("bm25tmp");
         {
@@ -677,6 +826,12 @@ impl Bm25Store {
                 "v5 carries exactly one field; multi-field stores write v6",
             ));
         }
+        if !self.facets.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v5 carries no facet columns; facet-bearing stores write v7",
+            ));
+        }
         let field = &self.fields[0];
         let n_slots = self.texts.len() as u64;
         let header_size = 8 + 8 + 8 * 4 + 4;
@@ -728,9 +883,28 @@ impl Bm25Store {
     /// texts | text_index | lineages          <- v5 bytes (index rebased)
     /// per field: doc_lengths | postings | directory   <- v5-shape sections
     /// ```
+    ///
+    /// A store with declared facet fields writes v7 (`TVBM2507`)
+    /// instead: the same layout with a facet table appended to the
+    /// header (u32 n_facets, then per facet: u16 name_len | name |
+    /// u32 n_values | u64 dict_off | u64 ords_off) and, after the last
+    /// field group, per facet a dict section (n_values x (u16 len |
+    /// value bytes), ordinal order) and an ords section (n_slots x
+    /// u32, [`FACET_ABSENT`] = no value). Every facet-less byte is
+    /// identical to the v6 writer's, by construction (the additions
+    /// are gated, not forked).
     pub fn write_v6_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let n_slots = self.texts.len() as u64;
         let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
+        let facet_table_size: u64 = if self.facets.is_empty() {
+            0
+        } else {
+            4 + self
+                .facets
+                .iter()
+                .map(|f| 2 + f.name.len() as u64 + 4 + 8 + 8)
+                .sum::<u64>()
+        };
         let header_size: u64 = 8
             + 4
             + 4
@@ -739,7 +913,8 @@ impl Bm25Store {
                 .fields
                 .iter()
                 .map(|f| 2 + f.name.len() as u64 + 8 * 5)
-                .sum::<u64>();
+                .sum::<u64>()
+            + facet_table_size;
         // Size pass per field.
         let mut field_terms: Vec<Vec<&String>> = Vec::with_capacity(self.fields.len());
         let mut field_runs: Vec<Vec<(u64, u64)>> = Vec::with_capacity(self.fields.len());
@@ -763,8 +938,21 @@ impl Bm25Store {
             section_offs.push((doc_lengths_off, postings_off, directory_off));
             cursor = directory_off + Self::field_directory_size(&field_terms[fi]);
         }
+        // (dict_off, ords_off) per facet, after the last field group.
+        let mut facet_offs: Vec<(u64, u64)> = Vec::with_capacity(self.facets.len());
+        for facet in &self.facets {
+            let dict_off = cursor;
+            let dict_size: u64 = facet.dict.iter().map(|v| 2 + v.len() as u64).sum();
+            let ords_off = dict_off + dict_size;
+            facet_offs.push((dict_off, ords_off));
+            cursor = ords_off + 4 * n_slots;
+        }
 
-        w.write_all(MAGIC_V6)?;
+        w.write_all(if self.facets.is_empty() {
+            MAGIC_V6
+        } else {
+            MAGIC_V7
+        })?;
         write_u32(w, self.fields.len() as u32)?;
         write_u32(w, n_slots as u32)?;
         write_u64(w, texts_off)?;
@@ -779,12 +967,31 @@ impl Bm25Store {
             write_u64(w, p_off)?;
             write_u64(w, d_off)?;
         }
+        if !self.facets.is_empty() {
+            write_u32(w, self.facets.len() as u32)?;
+            for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
+                write_u16(w, facet.name.len() as u16)?;
+                w.write_all(facet.name.as_bytes())?;
+                write_u32(w, facet.dict.len() as u32)?;
+                write_u64(w, dict_off)?;
+                write_u64(w, ords_off)?;
+            }
+        }
         self.write_shared_sections(w, 0)?;
         for (fi, field) in self.fields.iter().enumerate() {
             Self::write_field_doc_lengths(w, field)?;
             let directory =
                 Self::write_field_postings(w, field, &field_terms[fi], &field_runs[fi], 0)?;
             Self::write_field_directory(w, &field_terms[fi], &directory)?;
+        }
+        for facet in &self.facets {
+            for value in &facet.dict {
+                write_u16(w, value.len() as u16)?;
+                w.write_all(value.as_bytes())?;
+            }
+            for slot in 0..n_slots as usize {
+                write_u32(w, facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT))?;
+            }
         }
         Ok(())
     }
@@ -815,6 +1022,12 @@ impl Bm25Store {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "v4 carries exactly one field",
+            ));
+        }
+        if !self.facets.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v4 carries no facet columns; facet-bearing stores write v7",
             ));
         }
         let field = &self.fields[0];
@@ -909,14 +1122,18 @@ impl Bm25Store {
             }],
             texts,
             lineages,
+            facets: Vec::new(),
         }
     }
 
     fn read_from(r: &mut &[u8]) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let magic = take(r, 8)?;
+        if magic == MAGIC_V7 {
+            return Self::read_v6v7_from(r, true);
+        }
         if magic == MAGIC_V6 {
-            return Self::read_v6_from(r);
+            return Self::read_v6v7_from(r, false);
         }
         if magic == MAGIC_V5 {
             return Self::read_v5_from(r);
@@ -1570,7 +1787,7 @@ impl Bm25Store {
     /// Parse a v6 file back into a heap store (same caller contract as
     /// [`Self::read_v3_from`]). All fields are decoded; shared sections
     /// once, then one postings map per field.
-    fn read_v6_from(r: &mut &[u8]) -> io::Result<Self> {
+    fn read_v6v7_from(r: &mut &[u8], v7: bool) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         // `r` starts at file offset 8 (magic consumed); header offsets
         // are absolute file offsets.
@@ -1612,6 +1829,25 @@ impl Bm25Store {
                 u64_at(base + 32)?, // directory_off
             ));
             cursor = base + 40;
+        }
+        // Facet table (v7 only): name, value count, dict/ords offsets.
+        let mut facet_metas: Vec<(String, u32, u64, u64)> = Vec::new();
+        if v7 {
+            let n_facets = u32_at(cursor)? as usize;
+            cursor += 4;
+            for _ in 0..n_facets {
+                let name_len = u64::from(u16_at(at(cursor, 2)?));
+                let name = String::from_utf8(at(cursor + 2, name_len)?.to_vec())
+                    .map_err(|_| invalid("invalid utf-8 in facet field name"))?;
+                let base = cursor + 2 + name_len;
+                facet_metas.push((
+                    name,
+                    u32_at(base)?,     // n_values
+                    u64_at(base + 4)?, // dict_off
+                    u64_at(base + 12)?, // ords_off
+                ));
+                cursor = base + 20;
+            }
         }
         // Shared sections.
         let mut texts = Vec::with_capacity(n_slots);
@@ -1662,10 +1898,40 @@ impl Bm25Store {
                 total_length,
             });
         }
+        // Facet columns (v7 only): dict then per-slot ordinals.
+        let mut facets = Vec::with_capacity(facet_metas.len());
+        for (name, n_values, dict_off, ords_off) in facet_metas {
+            let mut dict = Vec::with_capacity(n_values as usize);
+            let mut index = HashMap::with_capacity(n_values as usize);
+            let mut dcur = dict_off;
+            for ord in 0..n_values {
+                let len = u64::from(u16_at(at(dcur, 2)?));
+                let value = String::from_utf8(at(dcur + 2, len)?.to_vec())
+                    .map_err(|_| invalid("invalid utf-8 in facet value"))?;
+                index.insert(value.clone(), ord);
+                dict.push(value);
+                dcur = dcur + 2 + len;
+            }
+            let mut ords = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots as u64 {
+                let ord = u32_at(ords_off + 4 * slot)?;
+                if ord != FACET_ABSENT && ord >= n_values {
+                    return Err(invalid("facet ordinal out of dictionary range"));
+                }
+                ords.push(ord);
+            }
+            facets.push(FacetStore {
+                name,
+                dict,
+                index,
+                ords,
+            });
+        }
         Ok(Self {
             fields,
             texts,
             lineages,
+            facets,
         })
     }
 }
@@ -1734,6 +2000,11 @@ pub struct SpillBuilder {
     lineages: Vec<Option<DocLineage>>,
     /// Documents with postings in any field.
     doc_count: u64,
+    /// Facet columns in facet-id order (dict + per-slot ordinals stay
+    /// in heap: kilobytes of dictionary plus 4 B per slot, never the
+    /// memory ceiling the spill exists for). Non-empty makes `finish`
+    /// write v7.
+    facets: Vec<FacetStore>,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
@@ -1784,8 +2055,44 @@ impl SpillBuilder {
             text_lens: Vec::new(),
             lineages: Vec::new(),
             doc_count: 0,
+            facets: Vec::new(),
             v4_only,
         })
+    }
+
+    /// Declare the facet field table, in facet-id order; same contract
+    /// as [`Bm25Store::with_facets`]. Must be called before any
+    /// document is added; makes `finish` write v7.
+    pub fn with_facet_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "facet fields must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no facet columns");
+        validate_facet_names(names);
+        self.facets = names.iter().map(|n| FacetStore::new(n)).collect();
+        self
+    }
+
+    /// Number of facet fields in the facet table.
+    pub fn facet_count(&self) -> usize {
+        self.facets.len()
+    }
+
+    /// The name of facet field `fi`. Panics when out of range.
+    pub fn facet_name(&self, fi: usize) -> &str {
+        &self.facets[fi].name
+    }
+
+    /// The index of the facet field named `name`, if the table has it.
+    pub fn facet_index(&self, name: &str) -> Option<usize> {
+        self.facets.iter().position(|f| f.name == name)
+    }
+
+    /// Record `doc_id`'s value for facet field `fi`; see
+    /// [`FacetStore::set`] for the contract.
+    pub fn set_facet(&mut self, fi: usize, doc_id: u32, value: &str) {
+        self.facets[fi].set(doc_id, value);
     }
 
     /// Override the sort-buffer capacity (tests force multi-run merges
@@ -2052,9 +2359,10 @@ impl SpillBuilder {
         Ok(directory)
     }
 
-    /// Merge every field's runs and assemble the v6 file at `path`,
-    /// mirroring [`Bm25Store::write_v6_to`] section for section (the
-    /// dual-writer byte-identity test pins the two).
+    /// Merge every field's runs and assemble the v6 file at `path` —
+    /// v7 when facet fields are declared — mirroring
+    /// [`Bm25Store::write_v6_to`] section for section (the dual-writer
+    /// byte-identity test pins the two).
     fn finish_v6(&mut self, path: &Path) -> io::Result<()> {
         self.spill_run()?;
         self.texts.flush()?;
@@ -2079,6 +2387,15 @@ impl SpillBuilder {
 
         // Section geometry, identical to Bm25Store::write_v6_to.
         let n_slots = self.fields[0].doc_lengths.len() as u64;
+        let facet_table_size: u64 = if self.facets.is_empty() {
+            0
+        } else {
+            4 + self
+                .facets
+                .iter()
+                .map(|f| 2 + f.name.len() as u64 + 4 + 8 + 8)
+                .sum::<u64>()
+        };
         let header_size: u64 = 8
             + 4
             + 4
@@ -2087,7 +2404,8 @@ impl SpillBuilder {
                 .fields
                 .iter()
                 .map(|f| 2 + f.name.len() as u64 + 8 * 5)
-                .sum::<u64>();
+                .sum::<u64>()
+            + facet_table_size;
         let texts_off = header_size;
         let text_index_off = texts_off + self.texts_bytes;
         let lineages_off = text_index_off + 12 * n_slots;
@@ -2112,11 +2430,24 @@ impl SpillBuilder {
             section_offs.push((doc_lengths_off, postings_off, directory_off));
             cursor = directory_off + directory_size;
         }
+        // (dict_off, ords_off) per facet, after the last field group.
+        let mut facet_offs: Vec<(u64, u64)> = Vec::with_capacity(self.facets.len());
+        for facet in &self.facets {
+            let dict_off = cursor;
+            let dict_size: u64 = facet.dict.iter().map(|v| 2 + v.len() as u64).sum();
+            let ords_off = dict_off + dict_size;
+            facet_offs.push((dict_off, ords_off));
+            cursor = ords_off + 4 * n_slots;
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(MAGIC_V6)?;
+            w.write_all(if self.facets.is_empty() {
+                MAGIC_V6
+            } else {
+                MAGIC_V7
+            })?;
             write_u32(&mut w, self.fields.len() as u32)?;
             write_u32(&mut w, n_slots as u32)?;
             write_u64(&mut w, texts_off)?;
@@ -2130,6 +2461,16 @@ impl SpillBuilder {
                 write_u64(&mut w, dl_off)?;
                 write_u64(&mut w, p_off)?;
                 write_u64(&mut w, d_off)?;
+            }
+            if !self.facets.is_empty() {
+                write_u32(&mut w, self.facets.len() as u32)?;
+                for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
+                    write_u16(&mut w, facet.name.len() as u16)?;
+                    w.write_all(facet.name.as_bytes())?;
+                    write_u32(&mut w, facet.dict.len() as u32)?;
+                    write_u64(&mut w, dict_off)?;
+                    write_u64(&mut w, ords_off)?;
+                }
             }
             // texts: byte-copy of the spill (already section-encoded).
             let mut spill = std::fs::File::open(self.dir.join("texts.spill"))?;
@@ -2185,6 +2526,15 @@ impl SpillBuilder {
                 }
                 for (term, ..) in &directories[fi] {
                     w.write_all(term.as_bytes())?;
+                }
+            }
+            for facet in &self.facets {
+                for value in &facet.dict {
+                    write_u16(&mut w, value.len() as u16)?;
+                    w.write_all(value.as_bytes())?;
+                }
+                for slot in 0..n_slots as usize {
+                    write_u32(&mut w, facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT))?;
                 }
             }
             w.flush()?;
@@ -2915,14 +3265,17 @@ fn lineage_section_end(map: &[u8], lineages_off: u64, n_slots: u64) -> io::Resul
     Ok(cur)
 }
 
-/// Full structural validation of a v6 file (`docs/multi-field.md`),
-/// same error-not-panic contract as [`validate_structure`]: the header
-/// and field table, shared-section geometry (contiguous, in order),
-/// the text index and lineage walk, and per field the doc_lengths sum
-/// against the field table's total plus the full v5-shaped directory
-/// and skip-run walk. Field groups must exactly tile the file from the
+/// Full structural validation of a v6 or v7 file
+/// (`docs/multi-field.md`; v7 adds facet columns), same
+/// error-not-panic contract as [`validate_structure`]: the header,
+/// field table, and (v7) facet table, shared-section geometry
+/// (contiguous, in order), the text index and lineage walk, per field
+/// the doc_lengths sum against the field table's total plus the full
+/// v5-shaped directory and skip-run walk, and per facet the dict walk
+/// and an ords scan (every ordinal in dictionary range or absent).
+/// Field groups then facet groups must exactly tile the file from the
 /// lineage section's end to EOF.
-fn validate_structure_v6(map: &[u8]) -> io::Result<()> {
+fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
     let file_len = map.len() as u64;
     let u32_at = |off: u64| -> io::Result<u32> {
@@ -2973,6 +3326,37 @@ fn validate_structure_v6(map: &[u8]) -> io::Result<()> {
         ));
         cursor = base + 40;
     }
+    // Facet table (v7 only): names non-empty and unique, offsets
+    // collected. A v7 file with zero facet fields is refused — the
+    // writers emit v6 for that store, so the combination can only be
+    // corruption or a bug.
+    let mut facets: Vec<(u32, u64, u64)> = Vec::new(); // (n_values, dict, ords)
+    if v7 {
+        let n_facets = u64::from(u32_at(cursor)?);
+        if n_facets == 0 {
+            return Err(invalid("v7 file with zero facet fields".into()));
+        }
+        cursor += 4;
+        let mut facet_names: Vec<Vec<u8>> = Vec::new();
+        for i in 0..n_facets {
+            let name_len = u64::from(u16_at(bytes_at(cursor, 2)?));
+            if name_len == 0 {
+                return Err(invalid(format!("facet field {i}: empty name")));
+            }
+            let name = bytes_at(cursor + 2, name_len)?.to_vec();
+            if facet_names.contains(&name) {
+                return Err(invalid(format!("facet field {i}: duplicate name")));
+            }
+            facet_names.push(name);
+            let base = cursor + 2 + name_len;
+            facets.push((
+                u32_at(base)?,      // n_values
+                u64_at(base + 4)?,  // dict_off
+                u64_at(base + 12)?, // ords_off
+            ));
+            cursor = base + 20;
+        }
+    }
     let header_end = cursor;
     // Shared sections: contiguous from the header end, in order.
     if texts_off != header_end || texts_off > file_len {
@@ -2992,7 +3376,9 @@ fn validate_structure_v6(map: &[u8]) -> io::Result<()> {
     let lineage_end = lineage_section_end(map, lineages_off, n_slots)?;
     // Per-field groups: contiguous from the lineage end, tiling the
     // file exactly (each group's blob-fill check pins its end to the
-    // next group's start, and the last to EOF).
+    // next group's start, and the last to the first facet section — or
+    // EOF when there are none).
+    let field_groups_end = facets.first().map_or(file_len, |f| f.1);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
         if dl_off != expected_start {
@@ -3005,7 +3391,7 @@ fn validate_structure_v6(map: &[u8]) -> io::Result<()> {
                 "field {i}: postings section does not follow doc_lengths"
             )));
         }
-        let section_end = fields.get(i + 1).map_or(file_len, |f| f.1);
+        let section_end = fields.get(i + 1).map_or(field_groups_end, |f| f.1);
         if directory_off < postings_off + 4 || directory_off + 4 > section_end {
             return Err(invalid(format!(
                 "field {i}: directory offset out of the group"
@@ -3023,6 +3409,44 @@ fn validate_structure_v6(map: &[u8]) -> io::Result<()> {
         }
         validate_v5_directory(map, postings_off, directory_off, section_end, postings_off)?;
         expected_start = section_end;
+    }
+    // Facet groups: per facet a dict walk (n_values length-prefixed
+    // entries ending exactly at the ords section) and an ords scan
+    // (4 B per slot, every ordinal in range or absent), tiling from
+    // the last field group to EOF.
+    for (i, &(n_values, dict_off, ords_off)) in facets.iter().enumerate() {
+        if dict_off != expected_start {
+            return Err(invalid(format!(
+                "facet field {i}: dict section does not start at the previous section's end"
+            )));
+        }
+        let mut dcur = dict_off;
+        for _ in 0..n_values {
+            let len = u64::from(u16_at(bytes_at(dcur, 2)?));
+            bytes_at(dcur + 2, len)?;
+            dcur += 2 + len;
+        }
+        if dcur != ords_off {
+            return Err(invalid(format!(
+                "facet field {i}: dict section does not end at the ords section"
+            )));
+        }
+        let group_end = ords_off + 4 * n_slots;
+        let expected_end = facets.get(i + 1).map_or(file_len, |f| f.1);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "facet field {i}: ords section does not end at the next section's start"
+            )));
+        }
+        for slot in 0..n_slots {
+            let ord = u32_at(ords_off + 4 * slot)?;
+            if ord != FACET_ABSENT && ord >= n_values {
+                return Err(invalid(format!(
+                    "facet field {i}: ordinal out of dictionary range at slot {slot}"
+                )));
+            }
+        }
+        expected_start = group_end;
     }
     Ok(())
 }
@@ -3055,11 +3479,24 @@ struct FieldSlice {
     run_base: u64,
 }
 
+/// Per-facet read state of one open v7 file: the decoded value
+/// dictionary (small — one entry per distinct value) plus the map
+/// offset of the fixed-stride ords section, which stays on disk.
+struct FacetSlice {
+    name: String,
+    /// Values in ordinal order, decoded eagerly at open.
+    dict: Vec<String>,
+    /// Absolute offset of the ords section (n_slots x u32).
+    ords_off: u64,
+}
+
 pub struct Bm25Reader {
     map: memmap2::Mmap,
     /// Per-field state, field-id order; never empty. Field 0 is the
     /// body.
     fields: Vec<FieldSlice>,
+    /// Per-facet state, facet-id order (v7 files; empty otherwise).
+    facets: Vec<FacetSlice>,
     /// Documents with postings in any field — the corpus-wide N (a
     /// document is a document; idf never uses a per-field count).
     doc_count: u64,
@@ -3128,6 +3565,50 @@ impl Bm25Reader {
         }
     }
 
+    /// Number of facet fields in the facet table (0 for pre-v7 files).
+    pub fn facet_count(&self) -> usize {
+        self.facets.len()
+    }
+
+    /// The name of facet field `fi`. Panics when out of range.
+    pub fn facet_name(&self, fi: usize) -> &str {
+        &self.facets[fi].name
+    }
+
+    /// The index of the facet field named `name`, if the table has it.
+    pub fn facet_index(&self, name: &str) -> Option<usize> {
+        self.facets.iter().position(|f| f.name == name)
+    }
+
+    /// Number of distinct values facet field `fi` holds.
+    pub fn facet_value_count(&self, fi: usize) -> usize {
+        self.facets[fi].dict.len()
+    }
+
+    /// The value of facet field `fi` at ordinal `ord`. Panics when out
+    /// of range.
+    pub fn facet_value(&self, fi: usize, ord: u32) -> &str {
+        &self.facets[fi].dict[ord as usize]
+    }
+
+    /// The ordinal of `doc_id`'s value for facet field `fi`, `None`
+    /// when the document has no value. One 4 B read of the mmapped
+    /// fixed-stride ords section.
+    pub fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
+        let facet = &self.facets[fi];
+        let slot = doc_id as usize;
+        if slot >= self.n_slots() {
+            return None;
+        }
+        let off = facet.ords_off as usize + 4 * slot;
+        let ord = u32::from_le_bytes(self.map[off..off + 4].try_into().expect("4 bytes"));
+        if ord == FACET_ABSENT {
+            None
+        } else {
+            Some(ord)
+        }
+    }
+
     /// Number of terms in field 0's directory.
     pub fn term_count(&self) -> u32 {
         self.fields[0].n_terms
@@ -3157,13 +3638,16 @@ impl Bm25Reader {
         let file = std::fs::File::open(path)?;
         let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
         if map.len() < 52 {
-            return Err(invalid("not a v3/v4/v5/v6 .bm25 file"));
+            return Err(invalid("not a v3/v4/v5/v6/v7 .bm25 file"));
+        }
+        if &map[..8] == MAGIC_V7 {
+            return Self::open_v6v7(map, true);
         }
         if &map[..8] == MAGIC_V6 {
-            return Self::open_v6(map);
+            return Self::open_v6v7(map, false);
         }
         if &map[..8] != MAGIC_V5 && &map[..8] != MAGIC_V4 && &map[..8] != MAGIC_V3 {
-            return Err(invalid("not a v3/v4/v5/v6 .bm25 file"));
+            return Err(invalid("not a v3/v4/v5/v6/v7 .bm25 file"));
         }
         let v5 = &map[..8] == MAGIC_V5;
         let blob_relative = &map[..8] != MAGIC_V3;
@@ -3204,6 +3688,7 @@ impl Bm25Reader {
                 n_terms,
                 run_base: 0,
             }],
+            facets: Vec::new(),
             doc_count,
             lineages_off,
             text_index_off: lineages_off - 12 * n_slots as u64,
@@ -3214,12 +3699,13 @@ impl Bm25Reader {
         })
     }
 
-    /// Open a validated v6 map, one [`FieldSlice`] per field-table
-    /// entry. Every field's sections are v5-shaped, so the entire v5
+    /// Open a validated v6 or v7 map, one [`FieldSlice`] per
+    /// field-table entry (plus one [`FacetSlice`] per v7 facet-table
+    /// entry). Every field's sections are v5-shaped, so the entire v5
     /// read machinery serves each field with run offsets rebased by
     /// that field's postings section offset.
-    fn open_v6(map: memmap2::Mmap) -> io::Result<Self> {
-        validate_structure_v6(&map)?;
+    fn open_v6v7(map: memmap2::Mmap, v7: bool) -> io::Result<Self> {
+        validate_structure_v6(&map, v7)?;
         let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().unwrap());
         let u64_at = |off: usize| u64::from_le_bytes(map[off..off + 8].try_into().unwrap());
         let n_fields = u32_at(8) as usize;
@@ -3257,12 +3743,45 @@ impl Bm25Reader {
             });
             cursor = base + 40;
         }
+        // Facet table (v7 only): decode each dictionary eagerly (one
+        // entry per distinct value — small), leave the ords sections in
+        // the map.
+        let mut facets = Vec::new();
+        if v7 {
+            let n_facets = u32_at(cursor) as usize;
+            cursor += 4;
+            for _ in 0..n_facets {
+                let name_len =
+                    u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
+                let name =
+                    String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
+                let base = cursor + 2 + name_len;
+                let n_values = u32_at(base) as usize;
+                let dict_off = u64_at(base + 4) as usize;
+                let ords_off = u64_at(base + 12);
+                let mut dict = Vec::with_capacity(n_values);
+                let mut dcur = dict_off;
+                for _ in 0..n_values {
+                    let len =
+                        u16::from_le_bytes(map[dcur..dcur + 2].try_into().unwrap()) as usize;
+                    dict.push(String::from_utf8_lossy(&map[dcur + 2..dcur + 2 + len]).into_owned());
+                    dcur += 2 + len;
+                }
+                facets.push(FacetSlice {
+                    name,
+                    dict,
+                    ords_off,
+                });
+                cursor = base + 20;
+            }
+        }
         let doc_count = (0..n_slots)
             .filter(|&slot| fields.iter().any(|f| f.doc_lengths[slot] > 0))
             .count() as u64;
         Ok(Self {
             map,
             fields,
+            facets,
             doc_count,
             lineages_off,
             text_index_off,

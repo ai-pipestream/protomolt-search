@@ -33,6 +33,7 @@ async fn add_documents(addr: &str, texts: &[&str]) {
     let (tx, rx) = mpsc::channel(8);
     for text in texts {
         tx.send(AddDocumentsRequest {
+            facets: Vec::new(),
             text: text.to_string(),
             analysis: None,
             lineage: None,
@@ -142,6 +143,7 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         .unwrap()
         .into_inner();
     let request = |claim: u64| Bm25QueryRequest {
+        facet_fields: Vec::new(),
         terms: vec!["rust".into()],
         k: 10,
         global_doc_count: stats.doc_count,
@@ -293,6 +295,7 @@ async fn fused_repeated_query_reuses_cached_stats() {
         let (tx, rx) = mpsc::channel(8);
         for (body, name) in *docs {
             tx.send(AddDocumentsRequest {
+                facets: Vec::new(),
                 text: body.to_string(),
                 analysis: None,
                 lineage: None,

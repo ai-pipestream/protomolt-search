@@ -415,6 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  shard {shard}: {i}/{n} documents analyzed");
                     }
                     tx.send(AddDocumentsRequest {
+                        facets: Vec::new(),
                         text: chunk.text.clone(),
                         analysis: Some(spec.clone()),
                         lineage: Some(DocLineage {
@@ -752,6 +753,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                     let fields =
                         chunk_fields(&case_names2, chunk.cluster_id, &body_columns2, &chunk.text);
                     tx.blocking_send(AddDocumentsRequest {
+                        facets: Vec::new(),
                         text: chunk.text,
                         analysis: Some(spec2.clone()),
                         lineage: Some(DocLineage {
