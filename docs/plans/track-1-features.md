@@ -1,0 +1,165 @@
+# Track 1: search engine features
+
+Written 2026-08-02. This is the feature track: what the engine grows next,
+now that the format, the analyzer, and the distributed exactness work are
+settled. It is written for whoever picks the track up cold. Companion
+documents: `architecture.md` for how the system fits together,
+`work-queue.md` for the queue this track was carved out of.
+
+The theme of the track is that the engine is exact and fast but private.
+Everything it can do today is expressed through an internal gRPC surface
+shaped by the console and the ingest pipelines. The features below are
+what turn it into something a product can sit on.
+
+## 1. Layer separation
+
+This comes first because every other feature lands somewhere, and today
+there are only two somewheres: the index and the console. The system
+wants four named layers with owned interfaces:
+
+1. **Document store.** The full record: source text, metadata, lineage,
+   and NLP annotations. Keyed on stable identity (source document plus
+   chunk ordinal), never on index position. This is the repo service
+   from `architecture.md` section 8.1, designed and not wired.
+2. **Index.** What turbovec owns: postings, vectors, columns. Rebuildable
+   from the store at any time, and treated as disposable. The rebuild
+   habit we already have is this principle in practice.
+3. **Analysis.** The NLP sidecar. Already separate, already versioned by
+   fingerprint. The missing piece is that its richer output (entities,
+   lemmas, PII) has nowhere durable to land until the store exists.
+4. **Search.** Coordinator and nodes. Returns lean hits plus lineage
+   keys; the store answers "give me the whole document."
+
+The dependency to be honest about: facets, functions on columns, and the
+public API all get easier if the layer boundaries exist first, but none
+of them strictly require it. The store can lag. What cannot lag is the
+rule that search hits carry stable identity, because every layer joins
+on it.
+
+TODO: decide whether the document store is a new service in this repo, a
+schema in the existing Postgres, or an object layout on the NAS. The
+open question from `architecture.md` still stands: a per-document store
+answers "give me this document" well and "count entities by court and
+year" badly, and the answer may be both a row store and the index's own
+columns.
+
+## 2. Facets and aggregations
+
+The first user-visible feature. "How many results per court, per year,
+per opinion type" is the standard shape of legal search, and nothing in
+the engine computes it today.
+
+The mechanics are friendly to our architecture. Facet counts are
+additive, so each node counts over its own matches and the coordinator
+sums. There is no analog of the global-df trap here: no node's count
+depends on another's. The shared-floor stream needs one change of
+contract, because facets are computed over the full match set while the
+floor exists to avoid materializing the full match set.
+
+Two designs to price:
+
+1. **Count-then-rank.** Nodes run the match iterator to exhaustion,
+   counting facet values as they go, and apply the floor only to what
+   they surface as candidates. Costs full postings traversal per query;
+   BM25 already walks most of it, the vector leg does not.
+2. **Approximate facets.** Count only over documents that survive the
+   floor, and label the counts as computed over the candidate pool.
+   Cheap and wrong in a way users notice on broad queries.
+
+The exactness stance of this engine argues for design 1, with the cost
+made visible: a request flag chooses whether facets are wanted, and a
+query that wants them pays the traversal. TODO: measure that traversal
+cost on the 86.6M corpus before committing; if a full BM25 walk is tens
+of milliseconds the argument is over.
+
+Facet fields need column storage. Court, date, opinion type are small
+enumerable values; a per-shard dictionary-encoded column keyed by local
+doc id is enough, and the v6 section table has room for new section
+types. TODO: whether facet columns ship inside the `.bm25` file or as a
+sidecar file with its own fingerprint.
+
+## 3. Functions on columns
+
+Scoring today is BM25, cosine, or a fixed hybrid blend. The next step is
+letting a query shape the score with column values: recency decay on
+decision date, court-level boosts, page-rank style citation weight when
+we have it.
+
+Proposed scope for a first cut, deliberately narrow:
+
+1. Typed numeric columns (i64, f32) loaded per shard, same storage as
+   facet columns. One mechanism, two features.
+2. A small fixed set of combinators exposed in the request proto:
+   `score * f(column)` and `score + w * f(column)` with `f` drawn from
+   linear, log, and exponential decay. Not a general expression
+   language.
+3. Functions apply on the node during scoring, before the floor check,
+   so pruning stays correct. This is the part that needs care: the floor
+   is only sound if the node scores and the coordinator heap agree on
+   the final score. A function applied after pruning would reorder
+   results the floor already discarded.
+
+The A/B machinery is the test harness here: a variant search with and
+without the function, rankdiff on top, same as the analyzer arms.
+
+TODO: whether function parameters are per-request or registered named
+profiles. Per-request is simpler and is enough for the console.
+
+## 4. Caching
+
+Nothing in the serving path caches today except the OS page cache, and
+measurements say that is mostly right: the index is mmapped, the hot
+postings stay resident, and the first-query-after-restart cost is cold
+pages, not missing caches. Caching work should be evidence-first, in
+this order:
+
+1. **Term statistics cache.** The coordinator re-fetches per-shard df
+   for every query. Frozen per epoch, tiny, trivially correct to cache,
+   already implicated in the df-pruning work. Do first.
+2. **Query result cache.** Keyed on (normalized request, epoch). Epoch
+   keying makes invalidation exact rather than heuristic: a rebuild
+   changes the epoch and the cache empties itself. Worth it for the
+   console's repeated-query pattern; unknown value for real traffic.
+   TODO: measure repeat rates once there is real traffic to measure.
+3. **Vector leg candidates.** The roughly 95 ms gap between the hybrid
+   vector leg and the standalone vector path is a measured oddity in
+   `work-queue.md` section 4. Understand it before caching around it;
+   it may be a bug wearing a latency costume.
+
+What we will not do is cache inside the scoring path where entries
+could survive an index swap. Every cache keys on epoch or it does not
+ship. This is the loud-failure principle applied to staleness.
+
+## 5. The public search API
+
+Last because it consumes all of the above. The internal gRPC surface is
+shaped by trusted callers: it exposes raw k, shard debugging, variant
+arms. A public surface needs:
+
+1. Paging with stable cursors. The floor protocol gives exact top-k,
+   which makes offset paging honest, but deep offsets still cost k.
+   Cursor is (score, stable id) of the last hit; the max-k cap already
+   bounds the worst case.
+2. Facet and filter syntax over the facet columns from section 2.
+3. Auth, quotas, and TLS, which fold in the membership work already
+   queued in `work-queue.md`.
+4. A versioned response shape that hides index internals. No local doc
+   ids, no shard numbers, lineage keys only.
+
+TODO: REST gateway versus public gRPC versus both. The console would be
+the first consumer of whichever ships, which is the cheapest way to find
+out the shape is wrong.
+
+## 6. Sequencing and what this track does not touch
+
+A workable order inside the track: term-stats cache (small, pays back
+immediately), facet columns and count-then-rank facets, functions on
+columns reusing the same column storage, then the public API over the
+lot. The layer-separation design runs alongside as a document first,
+service second.
+
+This track deliberately does not touch the index format beyond adding
+section types, does not touch the analyzer, and does not depend on the
+v7 rebuild (track 2) except that facet columns land in newly built
+shards, so facet work meets the rebuild at the column-writing step.
+If both tracks run at once, that seam is the coordination point.
