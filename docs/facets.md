@@ -53,7 +53,9 @@ per kind-1 column: vals (n_slots x f64, NaN = absent)
 test artifacts: the facet-only table became a kinded column table when
 numeric columns landed for score functions — `docs/score-functions.md`.
 An unknown kind refuses at open by number, so the next column kind
-needs no new magic. Facet semantics below are unchanged.)
+needs no new magic — proven the same day when kinds 2 and 3 (map
+columns, `docs/map-columns.md`) joined without touching kinds 0/1.
+Facet semantics below are unchanged.)
 
 - `dict`: the distinct values in ordinal (first-seen) order, `u16 len |
   bytes` each. Decoded eagerly at open (one entry per distinct value —

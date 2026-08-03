@@ -381,6 +381,28 @@ fn build_child(
             }
             t
         };
+        let map_facet_table: Vec<String> = {
+            let mut t: Vec<String> = Vec::new();
+            for (_, doc) in &mapped {
+                for e in &doc.map_facets {
+                    if !t.iter().any(|n| n == &e.field) {
+                        t.push(e.field.clone());
+                    }
+                }
+            }
+            t
+        };
+        let map_numeric_table: Vec<String> = {
+            let mut t: Vec<String> = Vec::new();
+            for (_, doc) in &mapped {
+                for e in &doc.map_numerics {
+                    if !t.iter().any(|n| n == &e.field) {
+                        t.push(e.field.clone());
+                    }
+                }
+            }
+            t
+        };
         // Children rebuild through the disk spiller for the same reason
         // nodes do: a full-scale child's postings do not fit in heap.
         let path = crate::node::bm25_sidecar_path(tv_path);
@@ -390,10 +412,15 @@ fn build_child(
         let names: Vec<&str> = table.iter().map(String::as_str).collect();
         let facet_names: Vec<&str> = facet_table.iter().map(String::as_str).collect();
         let numeric_names: Vec<&str> = numeric_table.iter().map(String::as_str).collect();
+        let map_facet_names: Vec<&str> = map_facet_table.iter().map(String::as_str).collect();
+        let map_numeric_names: Vec<&str> =
+            map_numeric_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
             .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
             .with_facet_fields(&facet_names)
-            .with_numeric_fields(&numeric_names);
+            .with_numeric_fields(&numeric_names)
+            .with_map_facet_fields(&map_facet_names)
+            .with_map_numeric_fields(&map_numeric_names);
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -465,6 +492,20 @@ fn build_child(
                         .position(|n| n == &nv.field)
                         .expect("numeric table was derived from these records");
                     builder.set_numeric(ni, *local, nv.value);
+                }
+                for e in &doc.map_facets {
+                    let ci = map_facet_table
+                        .iter()
+                        .position(|n| n == &e.field)
+                        .expect("map-facet table was derived from these records");
+                    builder.set_map_facet(ci, *local, &e.key, &e.value);
+                }
+                for e in &doc.map_numerics {
+                    let ci = map_numeric_table
+                        .iter()
+                        .position(|n| n == &e.field)
+                        .expect("map-numeric table was derived from these records");
+                    builder.set_map_numeric(ci, *local, &e.key, e.value);
                 }
             }
             i = end;

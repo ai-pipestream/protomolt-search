@@ -204,6 +204,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     bm25_fields: cfg.bm25_fields.clone(),
                     facet_fields: cfg.facet_fields.clone(),
                     numeric_fields: cfg.numeric_fields.clone(),
+                    map_facet_fields: cfg.map_facet_fields.clone(),
+                    map_numeric_fields: cfg.map_numeric_fields.clone(),
                     wal: shard.wal,
                     wal_buckets: shard.wal_buckets,
                 },

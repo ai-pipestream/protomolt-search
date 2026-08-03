@@ -130,6 +130,15 @@ shard knows is refused, the same typo rule as fields and facets.
 TODO: whether function parameters are per-request or registered named
 profiles. Per-request is simpler and is enough for the console.
 
+LANDED beyond the original scope, 2026-08-03: map<string, string> and
+map<string, f64> columns as first-class kinds (`docs/map-columns.md`) —
+per-(column, key) facet counts and map-keyed score stages with per-key
+bounds, designed against a deep read of tantivy's JSON field (its
+documented regrets each answered structurally). Queued next in the
+column plane: i64 columns + Timestamp + range facets, then geo (bbox,
+haversine, Manhattan) — see the plan tasks; CEL filters remain the
+layer that unifies scalar and map predicates.
+
 ## 4. Caching
 
 Nothing in the serving path caches today except the OS page cache, and

@@ -71,6 +71,8 @@ async fn start_shard(
     let feeder = tokio::spawn(async move {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                map_numerics: Vec::new(),
+                map_facets: Vec::new(),
                 numerics: Vec::new(),
                 facets: Vec::new(),
                 text: format!("chunk {i} of opinion {opinion} with some plain words"),

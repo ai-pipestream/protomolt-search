@@ -154,6 +154,7 @@ impl Arm {
                 boost: None,
             }),
             None => search_variant::Query::Bm25(Bm25SearchRequest {
+                map_facet_fields: Vec::new(),
                 score_stages: Vec::new(),
                 facet_fields: Vec::new(),
                 text: text.to_string(),

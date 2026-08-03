@@ -30,6 +30,8 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
     let feeder = tokio::spawn(async move {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                map_numerics: Vec::new(),
+                map_facets: Vec::new(),
                 numerics: Vec::new(),
                 facets: Vec::new(),
                 text: format!("chunk {i} of opinion {opinion} with some plain words"),

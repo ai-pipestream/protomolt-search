@@ -121,6 +121,11 @@ pub struct NodeConfig {
     /// The numeric field table for NEW builders (f64 columns,
     /// `docs/score-functions.md`). Same rules as `facet_fields`.
     pub numeric_fields: Vec<String>,
+    /// The map<string, string> column table for NEW builders
+    /// (`docs/map-columns.md`). Same rules as `facet_fields`.
+    pub map_facet_fields: Vec<String>,
+    /// The map<string, f64> column table for NEW builders. Same rules.
+    pub map_numeric_fields: Vec<String>,
     /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
     /// Requires `index_path`; the config layer defaults this on for
     /// persisted shards and off for demo shards.
@@ -155,6 +160,8 @@ impl Default for NodeConfig {
             bm25_fields: vec!["body".to_string()],
             facet_fields: Vec::new(),
             numeric_fields: Vec::new(),
+            map_facet_fields: Vec::new(),
+            map_numeric_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
             coalesce: true,
@@ -324,6 +331,88 @@ impl Bm25Shard {
         }
     }
 
+    /// The index of the map-facet column named `name`.
+    fn map_facet_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.map_facet_index(name),
+            Bm25Shard::Spilling(s) => s.map_facet_index(name),
+            Bm25Shard::Resident(r) => r.map_facet_index(name),
+        }
+    }
+
+    /// The key ordinal of `key` in map-facet column `ci`.
+    fn map_facet_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.map_facet_key_ord(ci, key),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_facet_key_ord(ci, key),
+        }
+    }
+
+    /// Number of distinct values map-facet column `ci` holds.
+    fn map_facet_value_count(&self, ci: usize) -> usize {
+        match self {
+            Bm25Shard::Building(s) => s.map_facet_value_count(ci),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_facet_value_count(ci),
+        }
+    }
+
+    /// The value of map-facet column `ci` at ordinal `ord`.
+    fn map_facet_value(&self, ci: usize, ord: u32) -> &str {
+        match self {
+            Bm25Shard::Building(s) => s.map_facet_value(ci, ord),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_facet_value(ci, ord),
+        }
+    }
+
+    /// The value ordinal of `doc_id`'s entry under `key_ord` in
+    /// map-facet column `ci`.
+    fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.map_facet_value_ord(ci, key_ord, doc_id),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_facet_value_ord(ci, key_ord, doc_id),
+        }
+    }
+
+    /// The index of the map-numeric column named `name`.
+    fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.map_numeric_index(name),
+            Bm25Shard::Spilling(s) => s.map_numeric_index(name),
+            Bm25Shard::Resident(r) => r.map_numeric_index(name),
+        }
+    }
+
+    /// The key ordinal of `key` in map-numeric column `ci`.
+    fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.map_numeric_key_ord(ci, key),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_numeric_key_ord(ci, key),
+        }
+    }
+
+    /// (min, max) of map-numeric column `ci` under `key_ord`.
+    fn map_numeric_key_min_max(&self, ci: usize, key_ord: u32) -> (f64, f64) {
+        match self {
+            Bm25Shard::Building(s) => s.map_numeric_key_min_max(ci, key_ord),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_numeric_key_min_max(ci, key_ord),
+        }
+    }
+
+    /// `doc_id`'s value under `key_ord` in map-numeric column `ci`.
+    fn map_numeric_value(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
+        match self {
+            Bm25Shard::Building(s) => s.map_numeric_value(ci, key_ord, doc_id),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_numeric_value(ci, key_ord, doc_id),
+        }
+    }
+
     /// Field `f` as its own searchable [`Bm25Index`]; `None` while
     /// bulk-building, exactly like [`Self::as_index`].
     fn field_view(&self, f: usize) -> Option<Box<dyn Bm25Index + '_>> {
@@ -349,6 +438,7 @@ impl Bm25Shard {
         &self,
         views: &[(&dyn Bm25Index, &[String])],
         facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
     ) -> Vec<crate::pb::FacetFieldCounts> {
         let n_slots = self.next_doc_id() as usize;
         let mut bits = vec![0u64; n_slots.div_ceil(64)];
@@ -359,7 +449,38 @@ impl Bm25Shard {
                 });
             }
         }
-        facet_fields
+        // One counting pass over the matched docs per requested field:
+        // resolve an ordinal, bump a slot. Plain facets read the ords
+        // column; map facets binary-search the doc's pair list for the
+        // requested key (docs/map-columns.md).
+        let count_by = |resolve: &dyn Fn(u32) -> Option<u32>, n_values: usize| -> Vec<u64> {
+            let mut counts = vec![0u64; n_values];
+            for (wi, &word) in bits.iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    let doc = (wi * 64) as u32 + w.trailing_zeros();
+                    if let Some(ord) = resolve(doc) {
+                        counts[ord as usize] += 1;
+                    }
+                    w &= w - 1;
+                }
+            }
+            counts
+        };
+        // Dictionary (ordinal) order — deterministic per shard; the
+        // coordinator sorts the merged counts.
+        let to_wire = |counts: Vec<u64>, value_of: &dyn Fn(u32) -> String| {
+            counts
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c > 0)
+                .map(|(ord, &c)| crate::pb::FacetCount {
+                    value: value_of(ord as u32),
+                    count: c,
+                })
+                .collect()
+        };
+        let mut out: Vec<crate::pb::FacetFieldCounts> = facet_fields
             .iter()
             .map(|name| {
                 let Some(fi) = self.facet_index(name) else {
@@ -367,36 +488,46 @@ impl Bm25Shard {
                         field: name.clone(),
                         known: false,
                         counts: Vec::new(),
+                        key: String::new(),
                     };
                 };
-                let mut counts = vec![0u64; self.facet_value_count(fi)];
-                for (wi, &word) in bits.iter().enumerate() {
-                    let mut w = word;
-                    while w != 0 {
-                        let doc = (wi * 64) as u32 + w.trailing_zeros();
-                        if let Some(ord) = self.facet_ord(fi, doc) {
-                            counts[ord as usize] += 1;
-                        }
-                        w &= w - 1;
-                    }
-                }
+                let counts = count_by(&|doc| self.facet_ord(fi, doc), self.facet_value_count(fi));
                 crate::pb::FacetFieldCounts {
                     field: name.clone(),
                     known: true,
-                    // Dictionary (ordinal) order — deterministic per
-                    // shard; the coordinator sorts the merged counts.
-                    counts: counts
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, &c)| c > 0)
-                        .map(|(ord, &c)| crate::pb::FacetCount {
-                            value: self.facet_value(fi, ord as u32).to_string(),
-                            count: c,
-                        })
-                        .collect(),
+                    counts: to_wire(counts, &|ord| self.facet_value(fi, ord).to_string()),
+                    key: String::new(),
                 }
             })
-            .collect()
+            .collect();
+        for req in map_facet_fields {
+            // Known = the column exists AND its key dictionary has the
+            // key: a key no shard ever ingested would otherwise make a
+            // typo'd drill-down read as zero results everywhere.
+            let resolved = self
+                .map_facet_index(&req.column)
+                .and_then(|ci| self.map_facet_key_ord(ci, &req.key).map(|k| (ci, k)));
+            let Some((ci, key_ord)) = resolved else {
+                out.push(crate::pb::FacetFieldCounts {
+                    field: req.column.clone(),
+                    known: false,
+                    counts: Vec::new(),
+                    key: req.key.clone(),
+                });
+                continue;
+            };
+            let counts = count_by(
+                &|doc| self.map_facet_value_ord(ci, key_ord, doc),
+                self.map_facet_value_count(ci),
+            );
+            out.push(crate::pb::FacetFieldCounts {
+                field: req.column.clone(),
+                known: true,
+                counts: to_wire(counts, &|ord| self.map_facet_value(ci, ord).to_string()),
+                key: req.key.clone(),
+            });
+        }
+        out
     }
 
     /// Resolve parsed score stages against THIS shard's numeric table
@@ -406,19 +537,37 @@ impl Bm25Shard {
     /// searchable shapes.
     fn resolve_chain(
         &self,
-        specs: &[(crate::scorefn::StageOp, String)],
+        specs: &[(crate::scorefn::StageOp, String, String)],
     ) -> crate::scorefn::ScoreChain {
+        use crate::scorefn::ColumnRef;
         crate::scorefn::ScoreChain {
             stages: specs
                 .iter()
-                .map(|(op, column)| {
-                    let column = self.numeric_index(column);
+                .map(|(op, column, key)| {
+                    let (column, min_max) = if key.is_empty() {
+                        let ni = self.numeric_index(column);
+                        (
+                            ni.map(ColumnRef::Numeric),
+                            ni.map(|ni| self.numeric_min_max(ni)),
+                        )
+                    } else {
+                        // Map stage: both the column and the key must
+                        // resolve; bounds lift from the KEY's min/max.
+                        let hit = self
+                            .map_numeric_index(column)
+                            .and_then(|ci| self.map_numeric_key_ord(ci, key).map(|k| (ci, k)));
+                        (
+                            hit.map(|(ci, key_ord)| ColumnRef::MapKey {
+                                column: ci,
+                                key_ord,
+                            }),
+                            hit.map(|(ci, key_ord)| self.map_numeric_key_min_max(ci, key_ord)),
+                        )
+                    };
                     crate::scorefn::Stage {
                         op: *op,
                         column,
-                        min_max: column
-                            .map(|ni| self.numeric_min_max(ni))
-                            .unwrap_or((f64::NAN, f64::NAN)),
+                        min_max: min_max.unwrap_or((f64::NAN, f64::NAN)),
                     }
                 })
                 .collect(),
@@ -454,6 +603,9 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     fn value(&self, ni: usize, doc_id: u32) -> Option<f64> {
         self.0.numeric_value(ni, doc_id)
     }
+    fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
+        self.0.map_numeric_value(column, key_ord, doc_id)
+    }
 }
 
 /// Parse and validate a wire score-stage list into resolved ops plus
@@ -463,7 +615,7 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
 /// refusal here is a stage whose monotonicity or bound would not hold.
 fn parse_score_stages(
     stages: &[crate::pb::ScoreStage],
-) -> Result<Vec<(crate::scorefn::StageOp, String)>, Status> {
+) -> Result<Vec<(crate::scorefn::StageOp, String, String)>, Status> {
     use crate::scorefn::StageOp;
     stages
         .iter()
@@ -515,7 +667,7 @@ fn parse_score_stages(
                     )));
                 }
             };
-            Ok((op, stage.column.clone()))
+            Ok((op, stage.column.clone(), stage.key.clone()))
         })
         .collect()
 }
@@ -1118,13 +1270,28 @@ impl NodeServiceImpl {
             .iter()
             .map(String::as_str)
             .collect();
+        let map_facets: Vec<&str> = self
+            .config
+            .map_facet_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let map_numerics: Vec<&str> = self
+            .config
+            .map_numeric_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).1);
                 SpillBuilder::create_with_fields(&dir, &names)
                     .map(|b| {
                         Bm25Shard::Spilling(
-                            b.with_facet_fields(&facets).with_numeric_fields(&numerics),
+                            b.with_facet_fields(&facets)
+                                .with_numeric_fields(&numerics)
+                                .with_map_facet_fields(&map_facets)
+                                .with_map_numeric_fields(&map_numerics),
                         )
                     })
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
@@ -1132,7 +1299,9 @@ impl NodeServiceImpl {
             None => Ok(Bm25Shard::Building(
                 Bm25Store::with_fields(&names)
                     .with_facets(&facets)
-                    .with_numerics(&numerics),
+                    .with_numerics(&numerics)
+                    .with_map_facets(&map_facets)
+                    .with_map_numerics(&map_numerics),
             )),
         }
     }
@@ -1718,7 +1887,11 @@ impl NodeServiceImpl {
             // Facet counting enters the arm even at k == 0 (the flat
             // path counts regardless of k; the scorers return no hits
             // for k == 0 on their own).
-            Some(store) if req.k > 0 || !req.facet_fields.is_empty() => {
+            Some(store)
+                if req.k > 0
+                    || !req.facet_fields.is_empty()
+                    || !req.map_facet_fields.is_empty() =>
+            {
                 if store.as_index().is_none() {
                     return Err(Status::failed_precondition(
                         "bm25 bulk build in progress; Flush first",
@@ -1749,13 +1922,14 @@ impl NodeServiceImpl {
                         leg_of_view.push(li);
                     }
                 }
-                if !req.facet_fields.is_empty() {
+                if !req.facet_fields.is_empty() || !req.map_facet_fields.is_empty() {
                     let pairs: Vec<(&dyn Bm25Index, &[String])> = views
                         .iter()
                         .zip(&leg_of_view)
                         .map(|(view, &li)| (view.as_ref(), req.fields[li].terms.as_slice()))
                         .collect();
-                    facets = store.count_facets(&pairs, &req.facet_fields);
+                    facets =
+                        store.count_facets(&pairs, &req.facet_fields, &req.map_facet_fields);
                 }
                 // Leg list order is the pinned accumulation order; the
                 // coordinator sends the same order to every shard, so
@@ -1837,10 +2011,17 @@ impl NodeServiceImpl {
                 facets = req
                     .facet_fields
                     .iter()
-                    .map(|name| crate::pb::FacetFieldCounts {
-                        field: name.clone(),
+                    .map(|name| (name.clone(), String::new()))
+                    .chain(
+                        req.map_facet_fields
+                            .iter()
+                            .map(|m| (m.column.clone(), m.key.clone())),
+                    )
+                    .map(|(field, key)| crate::pb::FacetFieldCounts {
+                        field,
                         known: false,
                         counts: Vec::new(),
+                        key,
                     })
                     .collect();
                 Vec::new()
@@ -2505,6 +2686,81 @@ impl NodeServiceImpl {
             }
             slots
         };
+        // Map entries (docs/map-columns.md): unknown columns, empty
+        // keys, repeated (column, key) pairs, empty string values, and
+        // non-finite numeric values all refuse before anything mutates.
+        let map_facet_slots: Vec<(usize, &str, &str)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<(&str, &str)> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.map_facets.len());
+            for e in &doc.map_facets {
+                if e.key.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?}: empty keys are refused (almost always a producer bug)",
+                        e.field
+                    )));
+                }
+                if seen.contains(&(e.field.as_str(), e.key.as_str())) {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?} key {:?} repeats in one document (a map holds one \
+                         value per key)",
+                        e.field, e.key
+                    )));
+                }
+                seen.push((&e.field, &e.key));
+                let Some(ci) = shard.map_facet_index(&e.field) else {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown map column {:?}; this shard's map-facet table \
+                         (--map-facet-fields) does not have it",
+                        e.field
+                    )));
+                };
+                if e.value.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?} key {:?} has an empty value; omit absent entries",
+                        e.field, e.key
+                    )));
+                }
+                slots.push((ci, e.key.as_str(), e.value.as_str()));
+            }
+            slots
+        };
+        let map_numeric_slots: Vec<(usize, &str, f64)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<(&str, &str)> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.map_numerics.len());
+            for e in &doc.map_numerics {
+                if e.key.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?}: empty keys are refused (almost always a producer bug)",
+                        e.field
+                    )));
+                }
+                if seen.contains(&(e.field.as_str(), e.key.as_str())) {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?} key {:?} repeats in one document (a map holds one \
+                         value per key)",
+                        e.field, e.key
+                    )));
+                }
+                seen.push((&e.field, &e.key));
+                let Some(ci) = shard.map_numeric_index(&e.field) else {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown map column {:?}; this shard's map-numeric table \
+                         (--map-numeric-fields) does not have it",
+                        e.field
+                    )));
+                };
+                if !e.value.is_finite() {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?} key {:?} has a non-finite value; omit absent entries",
+                        e.field, e.key
+                    )));
+                }
+                slots.push((ci, e.key.as_str(), e.value));
+            }
+            slots
+        };
         let global_id = self.config.slot_offset + u64::from(doc_id);
         if *added == 0 {
             *first_id = global_id;
@@ -2527,6 +2783,12 @@ impl NodeServiceImpl {
                 for &(ni, value) in &numeric_slots {
                     store.set_numeric(ni, doc_id, value);
                 }
+                for &(ci, key, value) in &map_facet_slots {
+                    store.set_map_facet(ci, doc_id, key, value);
+                }
+                for &(ci, key, value) in &map_numeric_slots {
+                    store.set_map_numeric(ci, doc_id, key, value);
+                }
             }
             Bm25Shard::Spilling(builder) => {
                 builder
@@ -2537,6 +2799,12 @@ impl NodeServiceImpl {
                 }
                 for &(ni, value) in &numeric_slots {
                     builder.set_numeric(ni, doc_id, value);
+                }
+                for &(ci, key, value) in &map_facet_slots {
+                    builder.set_map_facet(ci, doc_id, key, value);
+                }
+                for &(ci, key, value) in &map_numeric_slots {
+                    builder.set_map_numeric(ci, doc_id, key, value);
                 }
             }
             Bm25Shard::Resident(_) => {
@@ -3625,19 +3893,30 @@ impl NodeService for NodeServiceImpl {
         // lexical half has no facet table: every requested field is
         // legitimately unknown here.
         let facets = match guard.bm25.as_ref() {
-            Some(store) if !req.facet_fields.is_empty() => {
+            Some(store) if !req.facet_fields.is_empty() || !req.map_facet_fields.is_empty() => {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
-                store.count_facets(&[(index, &req.terms)], &req.facet_fields)
+                store.count_facets(
+                    &[(index, &req.terms)],
+                    &req.facet_fields,
+                    &req.map_facet_fields,
+                )
             }
             _ => req
                 .facet_fields
                 .iter()
-                .map(|name| crate::pb::FacetFieldCounts {
-                    field: name.clone(),
+                .map(|name| (name.clone(), String::new()))
+                .chain(
+                    req.map_facet_fields
+                        .iter()
+                        .map(|m| (m.column.clone(), m.key.clone())),
+                )
+                .map(|(field, key)| crate::pb::FacetFieldCounts {
+                    field,
                     known: false,
                     counts: Vec::new(),
+                    key,
                 })
                 .collect(),
         };
@@ -3648,7 +3927,16 @@ impl NodeService for NodeServiceImpl {
         let stage_columns_known: Vec<bool> = match guard.bm25.as_ref() {
             Some(store) => stage_specs
                 .iter()
-                .map(|(_, column)| store.numeric_index(column).is_some())
+                .map(|(_, column, key)| {
+                    if key.is_empty() {
+                        store.numeric_index(column).is_some()
+                    } else {
+                        store
+                            .map_numeric_index(column)
+                            .and_then(|ci| store.map_numeric_key_ord(ci, key))
+                            .is_some()
+                    }
+                })
                 .collect(),
             None => vec![false; stage_specs.len()],
         };

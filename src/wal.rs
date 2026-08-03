@@ -715,6 +715,8 @@ mod tests {
         wal_record::Op::AddDocuments(LoggedAddDocuments {
             first_id: id,
             documents: vec![AddDocumentsRequest {
+                map_numerics: Vec::new(),
+                map_facets: Vec::new(),
                 numerics: Vec::new(),
                 facets: Vec::new(),
                 text: format!("doc {id}"),

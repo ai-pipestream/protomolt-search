@@ -31,6 +31,25 @@
 pub trait NumericRead {
     /// `doc_id`'s value in numeric column `ni`, `None` when absent.
     fn value(&self, ni: usize, doc_id: u32) -> Option<f64>;
+    /// `doc_id`'s value under `key_ord` in map-numeric column
+    /// `column` (`docs/map-columns.md`), `None` when absent.
+    fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64>;
+}
+
+/// A stage's resolved column on THIS shard: a plain f64 column, or a
+/// map-numeric column entry under a shard-local key ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnRef {
+    /// Index into the shard's numeric table.
+    Numeric(usize),
+    /// A map-numeric column and a key ordinal in ITS key dictionary
+    /// (ordinals are shard-local, like every dictionary here).
+    MapKey {
+        /// Index into the shard's map-numeric table.
+        column: usize,
+        /// Key ordinal within that column's key dictionary.
+        key_ord: u32,
+    },
 }
 
 /// One stage's transform. Every op is monotone non-decreasing in the
@@ -67,13 +86,14 @@ pub enum StageOp {
 pub struct Stage {
     /// The transform.
     pub op: StageOp,
-    /// The column's index in this shard's numeric table, `None` when
-    /// the shard lacks the column — every document is then absent and
-    /// the stage is identity, which is exact, not degraded (the
-    /// coordinator refuses a column NO shard knows).
-    pub column: Option<usize>,
-    /// This shard's (min, max) over the column's present values, NaN
-    /// when the column is missing or empty. Feeds [`ScoreChain::bound`].
+    /// The resolved column reference, `None` when the shard lacks the
+    /// column (or, for map stages, the key) — every document is then
+    /// absent and the stage is identity, which is exact, not degraded
+    /// (the coordinator refuses a column NO shard knows).
+    pub column: Option<ColumnRef>,
+    /// This shard's (min, max) over the read values — the whole column
+    /// for a plain stage, the KEY's values for a map stage; NaN when
+    /// missing or empty. Feeds [`ScoreChain::bound`].
     pub min_max: (f64, f64),
 }
 
@@ -90,7 +110,14 @@ impl ScoreChain {
     pub fn eval(&self, score: f64, doc_id: u32, columns: &dyn NumericRead) -> f64 {
         let mut s = score;
         for stage in &self.stages {
-            let Some(x) = stage.column.and_then(|ni| columns.value(ni, doc_id)) else {
+            let x = match stage.column {
+                Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
+                Some(ColumnRef::MapKey { column, key_ord }) => {
+                    columns.map_value(column, key_ord, doc_id)
+                }
+                None => None,
+            };
+            let Some(x) = x else {
                 continue;
             };
             s = match stage.op {
@@ -145,6 +172,10 @@ mod tests {
         fn value(&self, ni: usize, doc_id: u32) -> Option<f64> {
             self.0[ni][doc_id as usize]
         }
+        fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
+            // The unit tests model a map key as one more plain column.
+            self.0[column + key_ord as usize][doc_id as usize]
+        }
     }
 
     /// Every op: hand-computed eval, absence identity, and the bound
@@ -155,7 +186,7 @@ mod tests {
         let chain = |op| ScoreChain {
             stages: vec![Stage {
                 op,
-                column: Some(0),
+                column: Some(ColumnRef::Numeric(0)),
                 min_max: (-2.0, 3.0),
             }],
         };
@@ -192,7 +223,7 @@ mod tests {
             stages: vec![
                 Stage {
                     op: StageOp::AddLinear { weight: 0.3 },
-                    column: Some(0),
+                    column: Some(ColumnRef::Numeric(0)),
                     min_max: (-10.0, 10.0),
                 },
                 Stage {
@@ -200,12 +231,12 @@ mod tests {
                         origin: 0.0,
                         scale: 3.0,
                     },
-                    column: Some(1),
+                    column: Some(ColumnRef::Numeric(1)),
                     min_max: (0.5, 7.0),
                 },
                 Stage {
                     op: StageOp::MultLog { weight: 1.0 },
-                    column: Some(1),
+                    column: Some(ColumnRef::Numeric(1)),
                     min_max: (0.5, 7.0),
                 },
             ],

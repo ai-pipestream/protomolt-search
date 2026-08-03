@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same values as court_ingest's analysis_spec().
     let bm25 = client
         .bm25_search(Bm25SearchRequest {
+            map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
             text: "court".into(),

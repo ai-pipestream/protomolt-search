@@ -65,6 +65,15 @@ const MAGIC_V7: &[u8; 8] = b"TVBM2507";
 const COLUMN_KIND_FACET: u8 = 0;
 /// v7 column-table kind: f64 numeric column (NaN = absent).
 const COLUMN_KIND_F64: u8 = 1;
+/// v7 column-table kind: map<string, string> column
+/// (`docs/map-columns.md`): key dict + value dict + per-doc
+/// (key_ord, value_ord) pair lists behind a fixed-stride offsets
+/// section. ONE column regardless of key cardinality — the structural
+/// answer to the field-per-key explosion flattening causes.
+const COLUMN_KIND_MAP_FACET: u8 = 2;
+/// v7 column-table kind: map<string, f64> column: key dict WITH
+/// per-key min/max bound metadata + per-doc (key_ord, f64) pair lists.
+const COLUMN_KIND_MAP_F64: u8 = 3;
 
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
@@ -393,6 +402,193 @@ impl NumericStore {
     }
 }
 
+/// One map<string, string> column (`docs/map-columns.md`): interned
+/// key and value dictionaries plus per-slot (key_ord, value_ord) pair
+/// lists, kept sorted by key ordinal within each document. At most one
+/// value per (document, key) — map semantics.
+#[derive(Debug)]
+struct MapFacetStore {
+    /// Map column name from the schema.
+    name: String,
+    /// Keys in ordinal (first-seen) order.
+    keys: Vec<String>,
+    /// key → ordinal (heap only).
+    key_index: HashMap<String, u32>,
+    /// Values in ordinal (first-seen) order, one dictionary for the
+    /// whole column (values are shared across keys).
+    values: Vec<String>,
+    /// value → ordinal (heap only).
+    value_index: HashMap<String, u32>,
+    /// Per-slot pair lists, sorted by key ordinal. May be shorter than
+    /// the slot count; missing trailing slots read as empty.
+    pairs: Vec<Vec<(u32, u32)>>,
+}
+
+impl MapFacetStore {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            keys: Vec::new(),
+            key_index: HashMap::new(),
+            values: Vec::new(),
+            value_index: HashMap::new(),
+            pairs: Vec::new(),
+        }
+    }
+
+    /// The value ordinal of `doc`'s entry under `key_ord`, `None` when
+    /// the document has no entry for the key.
+    fn value_ord(&self, slot: usize, key_ord: u32) -> Option<u32> {
+        let list = self.pairs.get(slot)?;
+        list.binary_search_by_key(&key_ord, |&(k, _)| k)
+            .ok()
+            .map(|i| list[i].1)
+    }
+
+    /// Record `doc_id`'s entry: intern key and value, insert sorted by
+    /// key ordinal. A second entry under the same (document, key)
+    /// panics (callers validate duplicates into a refusal).
+    fn set(&mut self, doc_id: u32, key: &str, value: &str) {
+        let key_ord = intern(&mut self.keys, &mut self.key_index, key, &self.name);
+        let value_ord = intern(&mut self.values, &mut self.value_index, value, &self.name);
+        let slot = doc_id as usize;
+        if self.pairs.len() <= slot {
+            self.pairs.resize_with(slot + 1, Vec::new);
+        }
+        let list = &mut self.pairs[slot];
+        match list.binary_search_by_key(&key_ord, |&(k, _)| k) {
+            Ok(_) => panic!(
+                "doc {doc_id} already has an entry under key {key:?} in map column {:?}",
+                self.name
+            ),
+            Err(pos) => list.insert(pos, (key_ord, value_ord)),
+        }
+    }
+}
+
+/// One map<string, f64> column: interned key dictionary plus per-slot
+/// (key_ord, value) pair lists, sorted by key ordinal. Per-key min/max
+/// are computed at write time into the column table — the bound
+/// metadata map-keyed score stages lift with.
+#[derive(Debug)]
+struct MapNumericStore {
+    /// Map column name from the schema.
+    name: String,
+    /// Keys in ordinal (first-seen) order.
+    keys: Vec<String>,
+    /// key → ordinal (heap only).
+    key_index: HashMap<String, u32>,
+    /// Per-slot pair lists, sorted by key ordinal; values are finite
+    /// (callers validate).
+    pairs: Vec<Vec<(u32, f64)>>,
+}
+
+impl MapNumericStore {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            keys: Vec::new(),
+            key_index: HashMap::new(),
+            pairs: Vec::new(),
+        }
+    }
+
+    /// `doc`'s value under `key_ord`, `None` when absent.
+    fn value(&self, slot: usize, key_ord: u32) -> Option<f64> {
+        let list = self.pairs.get(slot)?;
+        list.binary_search_by_key(&key_ord, |&(k, _)| k)
+            .ok()
+            .map(|i| list[i].1)
+    }
+
+    /// Record `doc_id`'s entry; finite values only, one per
+    /// (document, key) — same contract shape as [`MapFacetStore::set`].
+    fn set(&mut self, doc_id: u32, key: &str, value: f64) {
+        assert!(
+            value.is_finite(),
+            "map column {:?}: non-finite value under key {key:?} for doc {doc_id}",
+            self.name
+        );
+        let key_ord = intern(&mut self.keys, &mut self.key_index, key, &self.name);
+        let slot = doc_id as usize;
+        if self.pairs.len() <= slot {
+            self.pairs.resize_with(slot + 1, Vec::new);
+        }
+        let list = &mut self.pairs[slot];
+        match list.binary_search_by_key(&key_ord, |&(k, _)| k) {
+            Ok(_) => panic!(
+                "doc {doc_id} already has an entry under key {key:?} in map column {:?}",
+                self.name
+            ),
+            Err(pos) => list.insert(pos, (key_ord, value)),
+        }
+    }
+
+    /// (min, max) per key ordinal over present values; (NaN, NaN) for
+    /// keys that ended up with no entries (cannot happen through `set`,
+    /// but the encoding tolerates it).
+    fn key_min_max(&self) -> Vec<(f64, f64)> {
+        let mut mm = vec![(f64::NAN, f64::NAN); self.keys.len()];
+        for list in &self.pairs {
+            for &(k, v) in list {
+                let (min, max) = &mut mm[k as usize];
+                if min.is_nan() || v < *min {
+                    *min = v;
+                }
+                if max.is_nan() || v > *max {
+                    *max = v;
+                }
+            }
+        }
+        mm
+    }
+}
+
+/// Write a map column's offsets section ((n_slots + 1) x u32 prefix
+/// sums of per-doc pair counts) followed by its pairs section, one
+/// `write_pair` per entry in slot order. Shared by both map kinds and
+/// both writers.
+fn write_map_offsets_and_pairs<W: Write, T>(
+    w: &mut W,
+    n_slots: usize,
+    pairs: &[Vec<T>],
+    mut write_pair: impl FnMut(&mut W, &T) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut running = 0u64;
+    write_u32(w, 0)?;
+    for slot in 0..n_slots {
+        running += pairs.get(slot).map_or(0, |l| l.len()) as u64;
+        write_u32(
+            w,
+            u32::try_from(running).expect("map column exceeds u32 total pairs"),
+        )?;
+    }
+    for list in pairs.iter().take(n_slots) {
+        for pair in list {
+            write_pair(w, pair)?;
+        }
+    }
+    Ok(())
+}
+
+/// Intern `value` into a dictionary, returning its ordinal.
+fn intern(dict: &mut Vec<String>, index: &mut HashMap<String, u32>, value: &str, col: &str) -> u32 {
+    match index.get(value) {
+        Some(&ord) => ord,
+        None => {
+            let ord = u32::try_from(dict.len())
+                .unwrap_or_else(|_| panic!("dictionary of column {col:?} exceeds u32"));
+            assert!(
+                ord != FACET_ABSENT,
+                "dictionary of column {col:?} exhausted u32 ordinals"
+            );
+            dict.push(value.to_string());
+            index.insert(value.to_string(), ord);
+            ord
+        }
+    }
+}
+
 /// The shard's lexical half: per-field postings and corpus stats over a
 /// shared slot space, plus the raw texts.
 #[derive(Debug)]
@@ -407,9 +603,13 @@ pub struct Bm25Store {
     lineages: Vec<Option<DocLineage>>,
     /// Facet columns in facet-id order.
     facets: Vec<FacetStore>,
-    /// Numeric columns in numeric-id order. A store with neither
-    /// facets nor numerics persists as v6.
+    /// Numeric columns in numeric-id order.
     numerics: Vec<NumericStore>,
+    /// map<string, string> columns in map-facet-id order.
+    map_facets: Vec<MapFacetStore>,
+    /// map<string, f64> columns in map-numeric-id order. A store with
+    /// no columns of any kind persists as v6.
+    map_numerics: Vec<MapNumericStore>,
 }
 
 impl Default for Bm25Store {
@@ -420,6 +620,8 @@ impl Default for Bm25Store {
             lineages: Vec::new(),
             facets: Vec::new(),
             numerics: Vec::new(),
+            map_facets: Vec::new(),
+            map_numerics: Vec::new(),
         }
     }
 }
@@ -450,6 +652,8 @@ impl Bm25Store {
             lineages: Vec::new(),
             facets: Vec::new(),
             numerics: Vec::new(),
+            map_facets: Vec::new(),
+            map_numerics: Vec::new(),
         }
     }
 
@@ -553,6 +757,106 @@ impl Bm25Store {
     /// [`NumericStore::set`] for the contract (finite values only).
     pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
         self.numerics[ni].set(doc_id, value);
+    }
+
+    /// Declare the map<string, string> column table (builder style,
+    /// like [`Self::with_facets`]); columns make the store persist v7.
+    pub fn with_map_facets(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "map columns must be declared before documents are added"
+        );
+        validate_facet_names(names);
+        self.map_facets = names.iter().map(|n| MapFacetStore::new(n)).collect();
+        self
+    }
+
+    /// Declare the map<string, f64> column table (builder style).
+    pub fn with_map_numerics(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "map columns must be declared before documents are added"
+        );
+        validate_facet_names(names);
+        self.map_numerics = names.iter().map(|n| MapNumericStore::new(n)).collect();
+        self
+    }
+
+    /// Number of map<string, string> columns.
+    pub fn map_facet_count(&self) -> usize {
+        self.map_facets.len()
+    }
+
+    /// The name of map-facet column `ci`. Panics when out of range.
+    pub fn map_facet_name(&self, ci: usize) -> &str {
+        &self.map_facets[ci].name
+    }
+
+    /// The index of the map-facet column named `name`.
+    pub fn map_facet_index(&self, name: &str) -> Option<usize> {
+        self.map_facets.iter().position(|c| c.name == name)
+    }
+
+    /// The key ordinal of `key` in map-facet column `ci`, if any
+    /// document ever carried it.
+    pub fn map_facet_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_facets[ci].key_index.get(key).copied()
+    }
+
+    /// Number of distinct values map-facet column `ci` holds.
+    pub fn map_facet_value_count(&self, ci: usize) -> usize {
+        self.map_facets[ci].values.len()
+    }
+
+    /// The value of map-facet column `ci` at ordinal `ord`.
+    pub fn map_facet_value(&self, ci: usize, ord: u32) -> &str {
+        &self.map_facets[ci].values[ord as usize]
+    }
+
+    /// The value ordinal of `doc_id`'s entry under `key_ord` in
+    /// map-facet column `ci`, `None` when absent.
+    pub fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
+        self.map_facets[ci].value_ord(doc_id as usize, key_ord)
+    }
+
+    /// Record `doc_id`'s map-facet entry; see [`MapFacetStore::set`].
+    pub fn set_map_facet(&mut self, ci: usize, doc_id: u32, key: &str, value: &str) {
+        self.map_facets[ci].set(doc_id, key, value);
+    }
+
+    /// Number of map<string, f64> columns.
+    pub fn map_numeric_count(&self) -> usize {
+        self.map_numerics.len()
+    }
+
+    /// The name of map-numeric column `ci`. Panics when out of range.
+    pub fn map_numeric_name(&self, ci: usize) -> &str {
+        &self.map_numerics[ci].name
+    }
+
+    /// The index of the map-numeric column named `name`.
+    pub fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        self.map_numerics.iter().position(|c| c.name == name)
+    }
+
+    /// The key ordinal of `key` in map-numeric column `ci`.
+    pub fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_numerics[ci].key_index.get(key).copied()
+    }
+
+    /// (min, max) of map-numeric column `ci` under `key_ord`.
+    pub fn map_numeric_key_min_max(&self, ci: usize, key_ord: u32) -> (f64, f64) {
+        self.map_numerics[ci].key_min_max()[key_ord as usize]
+    }
+
+    /// `doc_id`'s value under `key_ord` in map-numeric column `ci`.
+    pub fn map_numeric_value(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
+        self.map_numerics[ci].value(doc_id as usize, key_ord)
+    }
+
+    /// Record `doc_id`'s map-numeric entry; see [`MapNumericStore::set`].
+    pub fn set_map_numeric(&mut self, ci: usize, doc_id: u32, key: &str, value: f64) {
+        self.map_numerics[ci].set(doc_id, key, value);
     }
 
     /// The name of field `f`. Panics when out of range.
@@ -1027,7 +1331,10 @@ impl Bm25Store {
     pub fn write_v6_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let n_slots = self.texts.len() as u64;
         let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
-        let has_columns = !self.facets.is_empty() || !self.numerics.is_empty();
+        let has_columns = !self.facets.is_empty()
+            || !self.numerics.is_empty()
+            || !self.map_facets.is_empty()
+            || !self.map_numerics.is_empty();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -1040,6 +1347,16 @@ impl Bm25Store {
                     .numerics
                     .iter()
                     .map(|n| 2 + n.name.len() as u64 + 1 + 8 + 8 + 8)
+                    .sum::<u64>()
+                + self
+                    .map_facets
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 4 + 8 * 4)
+                    .sum::<u64>()
+                + self
+                    .map_numerics
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 8 * 3)
                     .sum::<u64>()
         };
         let header_size: u64 = 8
@@ -1088,7 +1405,36 @@ impl Bm25Store {
         let mut numeric_offs: Vec<u64> = Vec::with_capacity(self.numerics.len());
         for _ in &self.numerics {
             numeric_offs.push(cursor);
-            cursor = cursor + 8 * n_slots;
+            cursor += 8 * n_slots;
+        }
+        // (keys_off, values_off, offsets_off, pairs_off) per map-facet
+        // column; the offsets section holds n_slots + 1 prefix sums so
+        // a document's pair count is off[i+1] - off[i].
+        let mut map_facet_offs: Vec<(u64, u64, u64, u64)> =
+            Vec::with_capacity(self.map_facets.len());
+        for c in &self.map_facets {
+            let keys_off = cursor;
+            let keys_size: u64 = c.keys.iter().map(|k| 2 + k.len() as u64).sum();
+            let values_off = keys_off + keys_size;
+            let values_size: u64 = c.values.iter().map(|v| 2 + v.len() as u64).sum();
+            let offsets_off = values_off + values_size;
+            let pairs_off = offsets_off + 4 * (n_slots + 1);
+            let total_pairs: u64 = c.pairs.iter().map(|l| l.len() as u64).sum();
+            map_facet_offs.push((keys_off, values_off, offsets_off, pairs_off));
+            cursor = pairs_off + 8 * total_pairs;
+        }
+        // (keys_off, offsets_off, pairs_off) per map-numeric column;
+        // the key dict entries carry per-key min/max bound metadata.
+        let mut map_numeric_offs: Vec<(u64, u64, u64)> =
+            Vec::with_capacity(self.map_numerics.len());
+        for c in &self.map_numerics {
+            let keys_off = cursor;
+            let keys_size: u64 = c.keys.iter().map(|k| 2 + k.len() as u64 + 16).sum();
+            let offsets_off = keys_off + keys_size;
+            let pairs_off = offsets_off + 4 * (n_slots + 1);
+            let total_pairs: u64 = c.pairs.iter().map(|l| l.len() as u64).sum();
+            map_numeric_offs.push((keys_off, offsets_off, pairs_off));
+            cursor = pairs_off + 12 * total_pairs;
         }
 
         w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
@@ -1107,7 +1453,13 @@ impl Bm25Store {
             write_u64(w, d_off)?;
         }
         if has_columns {
-            write_u32(w, (self.facets.len() + self.numerics.len()) as u32)?;
+            write_u32(
+                w,
+                (self.facets.len()
+                    + self.numerics.len()
+                    + self.map_facets.len()
+                    + self.map_numerics.len()) as u32,
+            )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                 write_u16(w, facet.name.len() as u16)?;
                 w.write_all(facet.name.as_bytes())?;
@@ -1124,6 +1476,30 @@ impl Bm25Store {
                 write_u64(w, min.to_bits())?;
                 write_u64(w, max.to_bits())?;
                 write_u64(w, vals_off)?;
+            }
+            for (c, &(keys_off, values_off, offsets_off, pairs_off)) in
+                self.map_facets.iter().zip(&map_facet_offs)
+            {
+                write_u16(w, c.name.len() as u16)?;
+                w.write_all(c.name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_MAP_FACET])?;
+                write_u32(w, c.keys.len() as u32)?;
+                write_u32(w, c.values.len() as u32)?;
+                write_u64(w, keys_off)?;
+                write_u64(w, values_off)?;
+                write_u64(w, offsets_off)?;
+                write_u64(w, pairs_off)?;
+            }
+            for (c, &(keys_off, offsets_off, pairs_off)) in
+                self.map_numerics.iter().zip(&map_numeric_offs)
+            {
+                write_u16(w, c.name.len() as u16)?;
+                w.write_all(c.name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_MAP_F64])?;
+                write_u32(w, c.keys.len() as u32)?;
+                write_u64(w, keys_off)?;
+                write_u64(w, offsets_off)?;
+                write_u64(w, pairs_off)?;
             }
         }
         self.write_shared_sections(w, 0)?;
@@ -1146,6 +1522,33 @@ impl Bm25Store {
             for slot in 0..n_slots as usize {
                 write_u64(w, numeric.vals.get(slot).copied().unwrap_or(f64::NAN).to_bits())?;
             }
+        }
+        for c in &self.map_facets {
+            for key in &c.keys {
+                write_u16(w, key.len() as u16)?;
+                w.write_all(key.as_bytes())?;
+            }
+            for value in &c.values {
+                write_u16(w, value.len() as u16)?;
+                w.write_all(value.as_bytes())?;
+            }
+            write_map_offsets_and_pairs(w, n_slots as usize, &c.pairs, |w, &(k, v)| {
+                write_u32(w, k)?;
+                write_u32(w, v)
+            })?;
+        }
+        for c in &self.map_numerics {
+            let mm = c.key_min_max();
+            for (key, &(min, max)) in c.keys.iter().zip(&mm) {
+                write_u16(w, key.len() as u16)?;
+                w.write_all(key.as_bytes())?;
+                write_u64(w, min.to_bits())?;
+                write_u64(w, max.to_bits())?;
+            }
+            write_map_offsets_and_pairs(w, n_slots as usize, &c.pairs, |w, &(k, v)| {
+                write_u32(w, k)?;
+                write_u64(w, v.to_bits())
+            })?;
         }
         Ok(())
     }
@@ -1278,6 +1681,8 @@ impl Bm25Store {
             lineages,
             facets: Vec::new(),
             numerics: Vec::new(),
+            map_facets: Vec::new(),
+            map_numerics: Vec::new(),
         }
     }
 
@@ -1985,12 +2390,15 @@ impl Bm25Store {
             ));
             cursor = base + 40;
         }
-        // Column table (v7 only): kinded entries — facet (name, value
-        // count, dict/ords offsets) or f64 numeric (name, min/max
-        // metadata skipped here — recomputed at write — and vals
-        // offset). Unknown kinds refuse by number.
+        // Column table (v7 only): kinded entries. min/max metadata is
+        // skipped here — the heap store recomputes it at the next
+        // write. Unknown kinds refuse by number.
         let mut facet_metas: Vec<(String, u32, u64, u64)> = Vec::new();
         let mut numeric_metas: Vec<(String, u64)> = Vec::new();
+        // (name, n_keys, n_values, keys, values, offsets, pairs)
+        let mut map_facet_metas: Vec<(String, u32, u32, u64, u64, u64, u64)> = Vec::new();
+        // (name, n_keys, keys, offsets, pairs)
+        let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
             cursor += 4;
@@ -2011,10 +2419,30 @@ impl Bm25Store {
                         cursor = base + 20;
                     }
                     COLUMN_KIND_F64 => {
-                        // min/max bits at base and base + 8 are write-time
-                        // metadata; the heap store recomputes them.
                         numeric_metas.push((name, u64_at(base + 16)?));
                         cursor = base + 24;
+                    }
+                    COLUMN_KIND_MAP_FACET => {
+                        map_facet_metas.push((
+                            name,
+                            u32_at(base)?,      // n_keys
+                            u32_at(base + 4)?,  // n_values
+                            u64_at(base + 8)?,  // keys_off
+                            u64_at(base + 16)?, // values_off
+                            u64_at(base + 24)?, // offsets_off
+                            u64_at(base + 32)?, // pairs_off
+                        ));
+                        cursor = base + 40;
+                    }
+                    COLUMN_KIND_MAP_F64 => {
+                        map_numeric_metas.push((
+                            name,
+                            u32_at(base)?,      // n_keys
+                            u64_at(base + 4)?,  // keys_off
+                            u64_at(base + 12)?, // offsets_off
+                            u64_at(base + 20)?, // pairs_off
+                        ));
+                        cursor = base + 28;
                     }
                     k => {
                         return Err(io::Error::new(
@@ -2112,12 +2540,95 @@ impl Bm25Store {
             }
             numerics.push(NumericStore { name, vals });
         }
+        // Map columns (v7 only): decode dictionaries, then split the
+        // pairs section back into per-slot lists via the offsets
+        // section's prefix sums.
+        let read_dict = |off: u64, n: u32| -> io::Result<(Vec<String>, HashMap<String, u32>)> {
+            let mut dict = Vec::with_capacity(n as usize);
+            let mut index = HashMap::with_capacity(n as usize);
+            let mut cur = off;
+            for ord in 0..n {
+                let len = u64::from(u16_at(at(cur, 2)?));
+                let entry = String::from_utf8(at(cur + 2, len)?.to_vec())
+                    .map_err(|_| invalid("invalid utf-8 in map dictionary"))?;
+                index.insert(entry.clone(), ord);
+                dict.push(entry);
+                cur += 2 + len;
+            }
+            Ok((dict, index))
+        };
+        let pair_range = |offsets_off: u64, slot: usize| -> io::Result<(u64, u64)> {
+            Ok((
+                u64::from(u32_at(offsets_off + 4 * slot as u64)?),
+                u64::from(u32_at(offsets_off + 4 * (slot as u64 + 1))?),
+            ))
+        };
+        let mut map_facets = Vec::with_capacity(map_facet_metas.len());
+        for (name, n_keys, n_values, keys_off, values_off, offsets_off, pairs_off) in
+            map_facet_metas
+        {
+            let (keys, key_index) = read_dict(keys_off, n_keys)?;
+            let (values, value_index) = read_dict(values_off, n_values)?;
+            let mut pairs = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots {
+                let (start, end) = pair_range(offsets_off, slot)?;
+                let mut list = Vec::with_capacity((end - start) as usize);
+                for p in start..end {
+                    list.push((u32_at(pairs_off + 8 * p)?, u32_at(pairs_off + 8 * p + 4)?));
+                }
+                pairs.push(list);
+            }
+            map_facets.push(MapFacetStore {
+                name,
+                keys,
+                key_index,
+                values,
+                value_index,
+                pairs,
+            });
+        }
+        let mut map_numerics = Vec::with_capacity(map_numeric_metas.len());
+        for (name, n_keys, keys_off, offsets_off, pairs_off) in map_numeric_metas {
+            // Key entries interleave min/max metadata (recomputed at
+            // the next write), so read_dict does not apply.
+            let mut keys = Vec::with_capacity(n_keys as usize);
+            let mut key_index = HashMap::with_capacity(n_keys as usize);
+            let mut cur = keys_off;
+            for ord in 0..n_keys {
+                let len = u64::from(u16_at(at(cur, 2)?));
+                let entry = String::from_utf8(at(cur + 2, len)?.to_vec())
+                    .map_err(|_| invalid("invalid utf-8 in map dictionary"))?;
+                key_index.insert(entry.clone(), ord);
+                keys.push(entry);
+                cur += 2 + len + 16;
+            }
+            let mut pairs = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots {
+                let (start, end) = pair_range(offsets_off, slot)?;
+                let mut list = Vec::with_capacity((end - start) as usize);
+                for p in start..end {
+                    list.push((
+                        u32_at(pairs_off + 12 * p)?,
+                        f64::from_bits(u64_at(pairs_off + 12 * p + 4)?),
+                    ));
+                }
+                pairs.push(list);
+            }
+            map_numerics.push(MapNumericStore {
+                name,
+                keys,
+                key_index,
+                pairs,
+            });
+        }
         Ok(Self {
             fields,
             texts,
             lineages,
             facets,
             numerics,
+            map_facets,
+            map_numerics,
         })
     }
 }
@@ -2194,6 +2705,12 @@ pub struct SpillBuilder {
     /// Numeric columns in numeric-id order (8 B per slot in heap, same
     /// argument as `facets`). Non-empty makes `finish` write v7.
     numerics: Vec<NumericStore>,
+    /// map<string, string> columns (dictionaries plus per-doc pair
+    /// lists in heap — bytes per entry, never the spill's memory
+    /// ceiling). Non-empty makes `finish` write v7.
+    map_facets: Vec<MapFacetStore>,
+    /// map<string, f64> columns. Non-empty makes `finish` write v7.
+    map_numerics: Vec<MapNumericStore>,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
@@ -2246,6 +2763,8 @@ impl SpillBuilder {
             doc_count: 0,
             facets: Vec::new(),
             numerics: Vec::new(),
+            map_facets: Vec::new(),
+            map_numerics: Vec::new(),
             v4_only,
         })
     }
@@ -2318,6 +2837,52 @@ impl SpillBuilder {
     /// [`NumericStore::set`] for the contract (finite values only).
     pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
         self.numerics[ni].set(doc_id, value);
+    }
+
+    /// Declare the map<string, string> column table; same contract as
+    /// [`Bm25Store::with_map_facets`].
+    pub fn with_map_facet_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "map columns must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.map_facets = names.iter().map(|n| MapFacetStore::new(n)).collect();
+        self
+    }
+
+    /// Declare the map<string, f64> column table; same contract as
+    /// [`Bm25Store::with_map_numerics`].
+    pub fn with_map_numeric_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "map columns must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.map_numerics = names.iter().map(|n| MapNumericStore::new(n)).collect();
+        self
+    }
+
+    /// The index of the map-facet column named `name`.
+    pub fn map_facet_index(&self, name: &str) -> Option<usize> {
+        self.map_facets.iter().position(|c| c.name == name)
+    }
+
+    /// The index of the map-numeric column named `name`.
+    pub fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        self.map_numerics.iter().position(|c| c.name == name)
+    }
+
+    /// Record `doc_id`'s map-facet entry; see [`MapFacetStore::set`].
+    pub fn set_map_facet(&mut self, ci: usize, doc_id: u32, key: &str, value: &str) {
+        self.map_facets[ci].set(doc_id, key, value);
+    }
+
+    /// Record `doc_id`'s map-numeric entry; see [`MapNumericStore::set`].
+    pub fn set_map_numeric(&mut self, ci: usize, doc_id: u32, key: &str, value: f64) {
+        self.map_numerics[ci].set(doc_id, key, value);
     }
 
     /// Override the sort-buffer capacity (tests force multi-run merges
@@ -2612,7 +3177,10 @@ impl SpillBuilder {
 
         // Section geometry, identical to Bm25Store::write_v6_to.
         let n_slots = self.fields[0].doc_lengths.len() as u64;
-        let has_columns = !self.facets.is_empty() || !self.numerics.is_empty();
+        let has_columns = !self.facets.is_empty()
+            || !self.numerics.is_empty()
+            || !self.map_facets.is_empty()
+            || !self.map_numerics.is_empty();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -2625,6 +3193,16 @@ impl SpillBuilder {
                     .numerics
                     .iter()
                     .map(|n| 2 + n.name.len() as u64 + 1 + 8 + 8 + 8)
+                    .sum::<u64>()
+                + self
+                    .map_facets
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 4 + 8 * 4)
+                    .sum::<u64>()
+                + self
+                    .map_numerics
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 8 * 3)
                     .sum::<u64>()
         };
         let header_size: u64 = 8
@@ -2676,6 +3254,30 @@ impl SpillBuilder {
             numeric_offs.push(cursor);
             cursor += 8 * n_slots;
         }
+        let mut map_facet_offs: Vec<(u64, u64, u64, u64)> =
+            Vec::with_capacity(self.map_facets.len());
+        for c in &self.map_facets {
+            let keys_off = cursor;
+            let keys_size: u64 = c.keys.iter().map(|k| 2 + k.len() as u64).sum();
+            let values_off = keys_off + keys_size;
+            let values_size: u64 = c.values.iter().map(|v| 2 + v.len() as u64).sum();
+            let offsets_off = values_off + values_size;
+            let pairs_off = offsets_off + 4 * (n_slots + 1);
+            let total_pairs: u64 = c.pairs.iter().map(|l| l.len() as u64).sum();
+            map_facet_offs.push((keys_off, values_off, offsets_off, pairs_off));
+            cursor = pairs_off + 8 * total_pairs;
+        }
+        let mut map_numeric_offs: Vec<(u64, u64, u64)> =
+            Vec::with_capacity(self.map_numerics.len());
+        for c in &self.map_numerics {
+            let keys_off = cursor;
+            let keys_size: u64 = c.keys.iter().map(|k| 2 + k.len() as u64 + 16).sum();
+            let offsets_off = keys_off + keys_size;
+            let pairs_off = offsets_off + 4 * (n_slots + 1);
+            let total_pairs: u64 = c.pairs.iter().map(|l| l.len() as u64).sum();
+            map_numeric_offs.push((keys_off, offsets_off, pairs_off));
+            cursor = pairs_off + 12 * total_pairs;
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
@@ -2696,7 +3298,13 @@ impl SpillBuilder {
                 write_u64(&mut w, d_off)?;
             }
             if has_columns {
-                write_u32(&mut w, (self.facets.len() + self.numerics.len()) as u32)?;
+                write_u32(
+                    &mut w,
+                    (self.facets.len()
+                        + self.numerics.len()
+                        + self.map_facets.len()
+                        + self.map_numerics.len()) as u32,
+                )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                     write_u16(&mut w, facet.name.len() as u16)?;
                     w.write_all(facet.name.as_bytes())?;
@@ -2713,6 +3321,30 @@ impl SpillBuilder {
                     write_u64(&mut w, min.to_bits())?;
                     write_u64(&mut w, max.to_bits())?;
                     write_u64(&mut w, vals_off)?;
+                }
+                for (c, &(keys_off, values_off, offsets_off, pairs_off)) in
+                    self.map_facets.iter().zip(&map_facet_offs)
+                {
+                    write_u16(&mut w, c.name.len() as u16)?;
+                    w.write_all(c.name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_MAP_FACET])?;
+                    write_u32(&mut w, c.keys.len() as u32)?;
+                    write_u32(&mut w, c.values.len() as u32)?;
+                    write_u64(&mut w, keys_off)?;
+                    write_u64(&mut w, values_off)?;
+                    write_u64(&mut w, offsets_off)?;
+                    write_u64(&mut w, pairs_off)?;
+                }
+                for (c, &(keys_off, offsets_off, pairs_off)) in
+                    self.map_numerics.iter().zip(&map_numeric_offs)
+                {
+                    write_u16(&mut w, c.name.len() as u16)?;
+                    w.write_all(c.name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_MAP_F64])?;
+                    write_u32(&mut w, c.keys.len() as u32)?;
+                    write_u64(&mut w, keys_off)?;
+                    write_u64(&mut w, offsets_off)?;
+                    write_u64(&mut w, pairs_off)?;
                 }
             }
             // texts: byte-copy of the spill (already section-encoded).
@@ -2787,6 +3419,33 @@ impl SpillBuilder {
                         numeric.vals.get(slot).copied().unwrap_or(f64::NAN).to_bits(),
                     )?;
                 }
+            }
+            for c in &self.map_facets {
+                for key in &c.keys {
+                    write_u16(&mut w, key.len() as u16)?;
+                    w.write_all(key.as_bytes())?;
+                }
+                for value in &c.values {
+                    write_u16(&mut w, value.len() as u16)?;
+                    w.write_all(value.as_bytes())?;
+                }
+                write_map_offsets_and_pairs(&mut w, n_slots as usize, &c.pairs, |w, &(k, v)| {
+                    write_u32(w, k)?;
+                    write_u32(w, v)
+                })?;
+            }
+            for c in &self.map_numerics {
+                let mm = c.key_min_max();
+                for (key, &(min, max)) in c.keys.iter().zip(&mm) {
+                    write_u16(&mut w, key.len() as u16)?;
+                    w.write_all(key.as_bytes())?;
+                    write_u64(&mut w, min.to_bits())?;
+                    write_u64(&mut w, max.to_bits())?;
+                }
+                write_map_offsets_and_pairs(&mut w, n_slots as usize, &c.pairs, |w, &(k, v)| {
+                    write_u32(w, k)?;
+                    write_u64(w, v.to_bits())
+                })?;
             }
             w.flush()?;
         }
@@ -3585,6 +4244,10 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     // width (parsing past it would misread every later entry).
     let mut facets: Vec<(u32, u64, u64)> = Vec::new(); // (n_values, dict, ords)
     let mut numerics: Vec<(u64, u64, u64)> = Vec::new(); // (min_bits, max_bits, vals)
+    // (n_keys, n_values, keys, values, offsets, pairs)
+    let mut map_facets: Vec<(u32, u32, u64, u64, u64, u64)> = Vec::new();
+    // (n_keys, keys, offsets, pairs)
+    let mut map_numerics: Vec<(u32, u64, u64, u64)> = Vec::new();
     if v7 {
         let n_columns = u64::from(u32_at(cursor)?);
         if n_columns == 0 {
@@ -3616,6 +4279,26 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                 COLUMN_KIND_F64 => {
                     numerics.push((u64_at(base)?, u64_at(base + 8)?, u64_at(base + 16)?));
                     cursor = base + 24;
+                }
+                COLUMN_KIND_MAP_FACET => {
+                    map_facets.push((
+                        u32_at(base)?,      // n_keys
+                        u32_at(base + 4)?,  // n_values
+                        u64_at(base + 8)?,  // keys_off
+                        u64_at(base + 16)?, // values_off
+                        u64_at(base + 24)?, // offsets_off
+                        u64_at(base + 32)?, // pairs_off
+                    ));
+                    cursor = base + 40;
+                }
+                COLUMN_KIND_MAP_F64 => {
+                    map_numerics.push((
+                        u32_at(base)?,      // n_keys
+                        u64_at(base + 4)?,  // keys_off
+                        u64_at(base + 12)?, // offsets_off
+                        u64_at(base + 20)?, // pairs_off
+                    ));
+                    cursor = base + 28;
                 }
                 k => {
                     return Err(invalid(format!(
@@ -3650,6 +4333,8 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         .first()
         .map(|f| f.1)
         .or_else(|| numerics.first().map(|n| n.2))
+        .or_else(|| map_facets.first().map(|c| c.2))
+        .or_else(|| map_numerics.first().map(|c| c.1))
         .unwrap_or(file_len);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
@@ -3708,6 +4393,8 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .get(i + 1)
             .map(|f| f.1)
             .or_else(|| numerics.first().map(|n| n.2))
+            .or_else(|| map_facets.first().map(|c| c.2))
+            .or_else(|| map_numerics.first().map(|c| c.1))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -3737,7 +4424,12 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             )));
         }
         let group_end = vals_off + 8 * n_slots;
-        let expected_end = numerics.get(i + 1).map_or(file_len, |n| n.2);
+        let expected_end = numerics
+            .get(i + 1)
+            .map(|n| n.2)
+            .or_else(|| map_facets.first().map(|c| c.2))
+            .or_else(|| map_numerics.first().map(|c| c.1))
+            .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "numeric field {i}: vals section does not end at the next section's start"
@@ -3766,6 +4458,173 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             return Err(invalid(format!(
                 "numeric field {i}: min/max metadata disagrees with the values"
             )));
+        }
+        expected_start = group_end;
+    }
+    // Map-facet groups (docs/map-columns.md): key dict, value dict,
+    // offsets ((n_slots + 1) x u32 prefix sums, monotone from 0), and
+    // pairs (per doc strictly key-ordered, ordinals in range), tiling
+    // toward the map-numeric groups or EOF.
+    for (i, &(n_keys, n_values, keys_off, values_off, offsets_off, pairs_off)) in
+        map_facets.iter().enumerate()
+    {
+        if keys_off != expected_start {
+            return Err(invalid(format!(
+                "map-facet column {i}: keys section does not start at the previous section's end"
+            )));
+        }
+        let mut cur = keys_off;
+        for _ in 0..n_keys {
+            let len = u64::from(u16_at(bytes_at(cur, 2)?));
+            bytes_at(cur + 2, len)?;
+            cur += 2 + len;
+        }
+        if cur != values_off {
+            return Err(invalid(format!(
+                "map-facet column {i}: keys section does not end at the values section"
+            )));
+        }
+        for _ in 0..n_values {
+            let len = u64::from(u16_at(bytes_at(cur, 2)?));
+            bytes_at(cur + 2, len)?;
+            cur += 2 + len;
+        }
+        if cur != offsets_off {
+            return Err(invalid(format!(
+                "map-facet column {i}: values section does not end at the offsets section"
+            )));
+        }
+        if pairs_off != offsets_off + 4 * (n_slots + 1) || u32_at(offsets_off)? != 0 {
+            return Err(invalid(format!(
+                "map-facet column {i}: offsets section malformed"
+            )));
+        }
+        let total_pairs = u64::from(u32_at(offsets_off + 4 * n_slots)?);
+        let group_end = pairs_off + 8 * total_pairs;
+        let expected_end = map_facets
+            .get(i + 1)
+            .map(|c| c.2)
+            .or_else(|| map_numerics.first().map(|c| c.1))
+            .unwrap_or(file_len);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "map-facet column {i}: pairs section does not end at the next section's start"
+            )));
+        }
+        let mut prev_end = 0u64;
+        for slot in 0..n_slots {
+            let start = prev_end;
+            let end = u64::from(u32_at(offsets_off + 4 * (slot + 1))?);
+            if end < start || end > total_pairs {
+                return Err(invalid(format!(
+                    "map-facet column {i}: offsets not monotone at slot {slot}"
+                )));
+            }
+            let mut prev_key: Option<u32> = None;
+            for p in start..end {
+                let key_ord = u32_at(pairs_off + 8 * p)?;
+                let val_ord = u32_at(pairs_off + 8 * p + 4)?;
+                if key_ord >= n_keys || val_ord >= n_values {
+                    return Err(invalid(format!(
+                        "map-facet column {i}: ordinal out of range at slot {slot}"
+                    )));
+                }
+                if prev_key.is_some_and(|k| key_ord <= k) {
+                    return Err(invalid(format!(
+                        "map-facet column {i}: pairs not strictly key-ordered at slot {slot}"
+                    )));
+                }
+                prev_key = Some(key_ord);
+            }
+            prev_end = end;
+        }
+        expected_start = group_end;
+    }
+    // Map-numeric groups: key dict with per-key min/max metadata,
+    // offsets, and (key_ord, f64) pairs — finite values only, strictly
+    // key-ordered per doc, per-key min/max re-derived and compared.
+    for (i, &(n_keys, keys_off, offsets_off, pairs_off)) in map_numerics.iter().enumerate() {
+        if keys_off != expected_start {
+            return Err(invalid(format!(
+                "map-numeric column {i}: keys section does not start at the previous \
+                 section's end"
+            )));
+        }
+        let mut key_mm: Vec<(u64, u64)> = Vec::with_capacity(n_keys as usize);
+        let mut cur = keys_off;
+        for _ in 0..n_keys {
+            let len = u64::from(u16_at(bytes_at(cur, 2)?));
+            bytes_at(cur + 2, len)?;
+            key_mm.push((u64_at(cur + 2 + len)?, u64_at(cur + 2 + len + 8)?));
+            cur += 2 + len + 16;
+        }
+        if cur != offsets_off {
+            return Err(invalid(format!(
+                "map-numeric column {i}: keys section does not end at the offsets section"
+            )));
+        }
+        if pairs_off != offsets_off + 4 * (n_slots + 1) || u32_at(offsets_off)? != 0 {
+            return Err(invalid(format!(
+                "map-numeric column {i}: offsets section malformed"
+            )));
+        }
+        let total_pairs = u64::from(u32_at(offsets_off + 4 * n_slots)?);
+        let group_end = pairs_off + 12 * total_pairs;
+        let expected_end = map_numerics.get(i + 1).map_or(file_len, |c| c.1);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "map-numeric column {i}: pairs section does not end at the next section's start"
+            )));
+        }
+        let mut scanned_mm: Vec<(f64, f64)> = vec![(f64::NAN, f64::NAN); n_keys as usize];
+        let mut prev_end = 0u64;
+        for slot in 0..n_slots {
+            let start = prev_end;
+            let end = u64::from(u32_at(offsets_off + 4 * (slot + 1))?);
+            if end < start || end > total_pairs {
+                return Err(invalid(format!(
+                    "map-numeric column {i}: offsets not monotone at slot {slot}"
+                )));
+            }
+            let mut prev_key: Option<u32> = None;
+            for p in start..end {
+                let key_ord = u32_at(pairs_off + 12 * p)?;
+                let v = f64::from_bits(u64_at(pairs_off + 12 * p + 4)?);
+                if key_ord >= n_keys {
+                    return Err(invalid(format!(
+                        "map-numeric column {i}: key ordinal out of range at slot {slot}"
+                    )));
+                }
+                if !v.is_finite() {
+                    return Err(invalid(format!(
+                        "map-numeric column {i}: non-finite value at slot {slot}"
+                    )));
+                }
+                if prev_key.is_some_and(|k| key_ord <= k) {
+                    return Err(invalid(format!(
+                        "map-numeric column {i}: pairs not strictly key-ordered at slot {slot}"
+                    )));
+                }
+                prev_key = Some(key_ord);
+                let (min, max) = &mut scanned_mm[key_ord as usize];
+                if min.is_nan() || v < *min {
+                    *min = v;
+                }
+                if max.is_nan() || v > *max {
+                    *max = v;
+                }
+            }
+            prev_end = end;
+        }
+        for (k, (&(min_bits, max_bits), &(min, max))) in
+            key_mm.iter().zip(&scanned_mm).enumerate()
+        {
+            if min.to_bits() != min_bits || max.to_bits() != max_bits {
+                return Err(invalid(format!(
+                    "map-numeric column {i}: min/max metadata disagrees with the values \
+                     for key {k}"
+                )));
+            }
         }
         expected_start = group_end;
     }
@@ -3824,6 +4683,37 @@ struct NumericSlice {
     vals_off: u64,
 }
 
+/// Per-map-facet-column read state (`docs/map-columns.md`): both
+/// dictionaries decoded eagerly (one entry per distinct key/value);
+/// offsets and pairs sections stay in the map.
+struct MapFacetSlice {
+    name: String,
+    /// Keys in ordinal order.
+    keys: Vec<String>,
+    /// Values in ordinal order.
+    values: Vec<String>,
+    /// Absolute offset of the offsets section ((n_slots + 1) x u32).
+    offsets_off: u64,
+    /// Absolute offset of the pairs section (8 B (key_ord, value_ord)
+    /// entries, strictly key-ordered per document).
+    pairs_off: u64,
+}
+
+/// Per-map-numeric-column read state: the key dictionary with its
+/// per-key min/max bound metadata; offsets and pairs stay in the map.
+struct MapNumericSlice {
+    name: String,
+    /// Keys in ordinal order.
+    keys: Vec<String>,
+    /// Per-key (min, max) over present values, parallel to `keys`.
+    key_min_max: Vec<(f64, f64)>,
+    /// Absolute offset of the offsets section ((n_slots + 1) x u32).
+    offsets_off: u64,
+    /// Absolute offset of the pairs section (12 B (key_ord, f64 bits)
+    /// entries, strictly key-ordered per document).
+    pairs_off: u64,
+}
+
 pub struct Bm25Reader {
     map: memmap2::Mmap,
     /// Per-field state, field-id order; never empty. Field 0 is the
@@ -3834,6 +4724,10 @@ pub struct Bm25Reader {
     /// Per-numeric-column state, numeric-id order (v7 files; empty
     /// otherwise).
     numerics: Vec<NumericSlice>,
+    /// Per-map-facet-column state (v7 files; empty otherwise).
+    map_facets: Vec<MapFacetSlice>,
+    /// Per-map-numeric-column state (v7 files; empty otherwise).
+    map_numerics: Vec<MapNumericSlice>,
     /// Documents with postings in any field — the corpus-wide N (a
     /// document is a document; idf never uses a per-field count).
     doc_count: u64,
@@ -3987,6 +4881,122 @@ impl Bm25Reader {
         }
     }
 
+    /// A document's pair range [start, end) in a map column, from the
+    /// offsets section's prefix sums.
+    fn map_pair_range(&self, offsets_off: u64, doc_id: u32) -> Option<(usize, usize)> {
+        let slot = doc_id as usize;
+        if slot >= self.n_slots() {
+            return None;
+        }
+        let at = |i: usize| {
+            u32::from_le_bytes(
+                self.map[offsets_off as usize + 4 * i..offsets_off as usize + 4 * i + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            ) as usize
+        };
+        Some((at(slot), at(slot + 1)))
+    }
+
+    /// The index of the map-facet column named `name`.
+    pub fn map_facet_index(&self, name: &str) -> Option<usize> {
+        self.map_facets.iter().position(|c| c.name == name)
+    }
+
+    /// The key ordinal of `key` in map-facet column `ci`.
+    pub fn map_facet_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_facets[ci]
+            .keys
+            .iter()
+            .position(|k| k == key)
+            .map(|p| p as u32)
+    }
+
+    /// Number of distinct values map-facet column `ci` holds.
+    pub fn map_facet_value_count(&self, ci: usize) -> usize {
+        self.map_facets[ci].values.len()
+    }
+
+    /// The value of map-facet column `ci` at ordinal `ord`.
+    pub fn map_facet_value(&self, ci: usize, ord: u32) -> &str {
+        &self.map_facets[ci].values[ord as usize]
+    }
+
+    /// The value ordinal of `doc_id`'s entry under `key_ord` in
+    /// map-facet column `ci`, `None` when absent: two offset reads and
+    /// a binary search of the document's (strictly key-ordered) pairs.
+    pub fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
+        let c = &self.map_facets[ci];
+        let (start, end) = self.map_pair_range(c.offsets_off, doc_id)?;
+        let pair = |i: usize| {
+            let off = c.pairs_off as usize + 8 * i;
+            (
+                u32::from_le_bytes(self.map[off..off + 4].try_into().expect("4 bytes")),
+                u32::from_le_bytes(self.map[off + 4..off + 8].try_into().expect("4 bytes")),
+            )
+        };
+        let mut lo = start;
+        let mut hi = end;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, v) = pair(mid);
+            match k.cmp(&key_ord) {
+                std::cmp::Ordering::Equal => return Some(v),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    /// The index of the map-numeric column named `name`.
+    pub fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        self.map_numerics.iter().position(|c| c.name == name)
+    }
+
+    /// The key ordinal of `key` in map-numeric column `ci`.
+    pub fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_numerics[ci]
+            .keys
+            .iter()
+            .position(|k| k == key)
+            .map(|p| p as u32)
+    }
+
+    /// (min, max) of map-numeric column `ci` under `key_ord`, from the
+    /// key dictionary's write-time metadata (validated at open).
+    pub fn map_numeric_key_min_max(&self, ci: usize, key_ord: u32) -> (f64, f64) {
+        self.map_numerics[ci].key_min_max[key_ord as usize]
+    }
+
+    /// `doc_id`'s value under `key_ord` in map-numeric column `ci`,
+    /// `None` when absent.
+    pub fn map_numeric_value(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
+        let c = &self.map_numerics[ci];
+        let (start, end) = self.map_pair_range(c.offsets_off, doc_id)?;
+        let pair = |i: usize| {
+            let off = c.pairs_off as usize + 12 * i;
+            (
+                u32::from_le_bytes(self.map[off..off + 4].try_into().expect("4 bytes")),
+                f64::from_bits(u64::from_le_bytes(
+                    self.map[off + 4..off + 12].try_into().expect("8 bytes"),
+                )),
+            )
+        };
+        let mut lo = start;
+        let mut hi = end;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, v) = pair(mid);
+            match k.cmp(&key_ord) {
+                std::cmp::Ordering::Equal => return Some(v),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
     /// Number of terms in field 0's directory.
     pub fn term_count(&self) -> u32 {
         self.fields[0].n_terms
@@ -4068,6 +5078,8 @@ impl Bm25Reader {
             }],
             facets: Vec::new(),
             numerics: Vec::new(),
+            map_facets: Vec::new(),
+            map_numerics: Vec::new(),
             doc_count,
             lineages_off,
             text_index_off: lineages_off - 12 * n_slots as u64,
@@ -4128,7 +5140,23 @@ impl Bm25Reader {
         // map. Unknown kinds were already refused by validation.
         let mut facets = Vec::new();
         let mut numerics = Vec::new();
+        let mut map_facets = Vec::new();
+        let mut map_numerics = Vec::new();
         if v7 {
+            // Decode a length-prefixed dictionary of `n` entries
+            // starting at `off`, returning (entries, end offset).
+            let read_dict = |off: usize, n: usize| -> (Vec<String>, usize) {
+                let mut entries = Vec::with_capacity(n);
+                let mut cur = off;
+                for _ in 0..n {
+                    let len =
+                        u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
+                    entries
+                        .push(String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned());
+                    cur += 2 + len;
+                }
+                (entries, cur)
+            };
             let n_columns = u32_at(cursor) as usize;
             cursor += 4;
             for _ in 0..n_columns {
@@ -4143,17 +5171,7 @@ impl Bm25Reader {
                         let n_values = u32_at(base) as usize;
                         let dict_off = u64_at(base + 4) as usize;
                         let ords_off = u64_at(base + 12);
-                        let mut dict = Vec::with_capacity(n_values);
-                        let mut dcur = dict_off;
-                        for _ in 0..n_values {
-                            let len = u16::from_le_bytes(map[dcur..dcur + 2].try_into().unwrap())
-                                as usize;
-                            dict.push(
-                                String::from_utf8_lossy(&map[dcur + 2..dcur + 2 + len])
-                                    .into_owned(),
-                            );
-                            dcur += 2 + len;
-                        }
+                        let (dict, _) = read_dict(dict_off, n_values);
                         facets.push(FacetSlice {
                             name,
                             dict,
@@ -4170,6 +5188,56 @@ impl Bm25Reader {
                         });
                         cursor = base + 24;
                     }
+                    COLUMN_KIND_MAP_FACET => {
+                        let n_keys = u32_at(base) as usize;
+                        let n_values = u32_at(base + 4) as usize;
+                        let keys_off = u64_at(base + 8) as usize;
+                        let values_off = u64_at(base + 16) as usize;
+                        let offsets_off = u64_at(base + 24);
+                        let pairs_off = u64_at(base + 32);
+                        let (keys, _) = read_dict(keys_off, n_keys);
+                        let (values, _) = read_dict(values_off, n_values);
+                        map_facets.push(MapFacetSlice {
+                            name,
+                            keys,
+                            values,
+                            offsets_off,
+                            pairs_off,
+                        });
+                        cursor = base + 40;
+                    }
+                    COLUMN_KIND_MAP_F64 => {
+                        let n_keys = u32_at(base) as usize;
+                        let keys_off = u64_at(base + 4) as usize;
+                        let offsets_off = u64_at(base + 12);
+                        let pairs_off = u64_at(base + 20);
+                        // Key entries interleave name and min/max
+                        // metadata, so read_dict does not apply.
+                        let mut keys = Vec::with_capacity(n_keys);
+                        let mut key_min_max = Vec::with_capacity(n_keys);
+                        let mut cur = keys_off;
+                        for _ in 0..n_keys {
+                            let len = u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap())
+                                as usize;
+                            keys.push(
+                                String::from_utf8_lossy(&map[cur + 2..cur + 2 + len])
+                                    .into_owned(),
+                            );
+                            key_min_max.push((
+                                f64::from_bits(u64_at(cur + 2 + len)),
+                                f64::from_bits(u64_at(cur + 2 + len + 8)),
+                            ));
+                            cur += 2 + len + 16;
+                        }
+                        map_numerics.push(MapNumericSlice {
+                            name,
+                            keys,
+                            key_min_max,
+                            offsets_off,
+                            pairs_off,
+                        });
+                        cursor = base + 28;
+                    }
                     k => unreachable!("validation refused unknown column kind {k}"),
                 }
             }
@@ -4182,6 +5250,8 @@ impl Bm25Reader {
             fields,
             facets,
             numerics,
+            map_facets,
+            map_numerics,
             doc_count,
             lineages_off,
             text_index_off,

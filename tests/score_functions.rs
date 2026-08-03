@@ -18,7 +18,7 @@ use turbovec_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, NumericValue, QueryField, ScoreOp, ScoreStage,
 };
 use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
-use turbovec_search::scorefn::{NumericRead, ScoreChain, Stage, StageOp};
+use turbovec_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -52,6 +52,8 @@ async fn add_documents_numeric(
     let (tx, rx) = mpsc::channel(8);
     for (text, numerics) in docs {
         tx.send(AddDocumentsRequest {
+            map_numerics: Vec::new(),
+            map_facets: Vec::new(),
             text: text.to_string(),
             analysis: None,
             lineage: None,
@@ -108,6 +110,7 @@ async fn start_numeric_shards(
 
 fn decay_stage(origin: f64, scale: f64) -> ScoreStage {
     ScoreStage {
+        key: String::new(),
         op: ScoreOp::MultExpDecay as i32,
         column: "date".to_string(),
         weight: 0.0,
@@ -219,6 +222,9 @@ impl NumericRead for ReaderNumerics<'_> {
     fn value(&self, ni: usize, doc_id: u32) -> Option<f64> {
         self.0.numeric_value(ni, doc_id)
     }
+    fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
+        self.0.map_numeric_value(column, key_ord, doc_id)
+    }
 }
 
 /// The exactness gate: on a file-backed shard (impacts present, so the
@@ -262,7 +268,7 @@ fn chained_pruned_matches_chained_exhaustive_bitwise() {
         stages: vec![
             Stage {
                 op: StageOp::AddLinear { weight: -0.002 },
-                column: Some(0),
+                column: Some(ColumnRef::Numeric(0)),
                 min_max: reader.numeric_min_max(0),
             },
             Stage {
@@ -270,12 +276,12 @@ fn chained_pruned_matches_chained_exhaustive_bitwise() {
                     origin: 500.0,
                     scale: 250.0,
                 },
-                column: Some(0),
+                column: Some(ColumnRef::Numeric(0)),
                 min_max: reader.numeric_min_max(0),
             },
             Stage {
                 op: StageOp::MultLog { weight: 0.4 },
-                column: Some(0),
+                column: Some(ColumnRef::Numeric(0)),
                 min_max: reader.numeric_min_max(0),
             },
         ],
@@ -344,11 +350,11 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     let stages = vec![decay_stage(300.0, 100.0)];
     for text in ["rust", "search rust", "vector"] {
         let (got, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &stages)
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &stages)
             .await
             .unwrap();
         let (want, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &stages)
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &stages)
             .await
             .unwrap();
         assert_eq!(
@@ -362,7 +368,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     // decayed toward date=300, d2 (factor 1) climbs above d0 (e^-2).
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
     let (chained, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &stages)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &stages)
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -390,6 +396,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     let resp = SearchService::bm25_search(
         &distributed,
         Request::new(Bm25SearchRequest {
+            map_facet_fields: Vec::new(),
             text: "rust".to_string(),
             k: 6,
             analysis: None,
@@ -426,7 +433,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ..decay_stage(300.0, 100.0)
     }];
     let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &typo)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &typo)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -447,6 +454,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ),
         (
             ScoreStage {
+                key: String::new(),
                 op: ScoreOp::MultLog as i32,
                 column: "date".to_string(),
                 weight: -1.0,
@@ -457,6 +465,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ),
         (
             ScoreStage {
+                key: String::new(),
                 op: ScoreOp::Unspecified as i32,
                 column: "date".to_string(),
                 weight: 0.0,
@@ -467,7 +476,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ),
     ] {
         let err = coordinator
-            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[bad])
+            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[bad])
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
@@ -482,6 +491,7 @@ async fn stage_and_ingest_refusals_are_loud() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            map_facet_fields: Vec::new(),
             text: "rust".to_string(),
             k: 6,
             analysis: None,
