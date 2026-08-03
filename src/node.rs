@@ -294,6 +294,39 @@ struct ShardState {
     /// per slot). Self-validating: rebuilt whenever its length disagrees
     /// with the index, cleared on snapshot install.
     parents: Option<std::sync::Arc<Vec<u64>>>,
+    /// Advances on every mutation of `bm25` (ingest, flush, snapshot
+    /// install, startup attach). `TermStats` reports it and the scoring
+    /// RPCs enforce a caller's claim against it, which is what lets a
+    /// coordinator cache term stats without ever scoring against a
+    /// store the stats no longer describe. Starts at 1: 0 is the wire's
+    /// "no claim". Over-bumping is safe (a cache refetches); a missed
+    /// bump is the only unsound direction.
+    stats_epoch: u64,
+}
+
+/// Message prefix of a stats-epoch refusal. The coordinator's retry
+/// distinguishes this refusal from every other FAILED_PRECONDITION by
+/// this prefix, so it and [`ShardState::check_stats_epoch`] must move
+/// together.
+pub(crate) const STALE_STATS_EPOCH: &str = "stale stats epoch";
+
+impl ShardState {
+    /// Enforce a scoring request's stats-epoch claim (see
+    /// `Bm25QueryRequest.expected_stats_epoch`). Must be called under
+    /// the same guard the scoring reads through — checking on one guard
+    /// acquisition and scoring on another would leave a gap an ingest
+    /// commit can slip into.
+    fn check_stats_epoch(&self, expected: u64) -> Result<(), Status> {
+        if expected != 0 && expected != self.stats_epoch {
+            return Err(Status::failed_precondition(format!(
+                "{STALE_STATS_EPOCH}: the request's global stats were computed at epoch \
+                 {expected} but this shard is at {}; its postings changed in between, so \
+                 those stats no longer describe it",
+                self.stats_epoch
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The persistence path of a shard's BM25 store: `<index path>.bm25`.
@@ -769,6 +802,7 @@ impl NodeServiceImpl {
                 generation: None,
                 wal,
                 parents: None,
+                stats_epoch: 1,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -860,7 +894,11 @@ impl NodeServiceImpl {
 
     /// Attach a preloaded BM25 shard (from `<index path>.bm25`).
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
-        self.state.write().expect("shard state lock poisoned").bm25 = store;
+        {
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            guard.bm25 = store;
+            guard.stats_epoch += 1;
+        }
         self
     }
 
@@ -1002,6 +1040,10 @@ impl NodeServiceImpl {
                         Status::internal(format!("reopen {}: {e}", bm25_path.display()))
                     })?,
             );
+            // The stats are the same numbers after a flush, but a
+            // Spilling shard was refusing TermStats until now — the
+            // bump is what tells a cache to come look again.
+            guard.stats_epoch += 1;
         }
         let written = guard.index.is_some() || guard.bm25.is_some();
         // Durability point reached: the log was fsynced above, then the
@@ -1189,6 +1231,7 @@ impl NodeServiceImpl {
         let num_vectors = loaded.len() as u64;
         guard.index = Some(loaded);
         guard.generation = Some(snap.clone());
+        guard.stats_epoch += 1;
         // The snapshot supersedes the log: fsync and retire the current
         // generation, open gen-(g+1) with the installed image's
         // calibration (same bucket geometry), and mark where it came
@@ -1406,6 +1449,7 @@ impl NodeServiceImpl {
             }
         }
         let guard = self.state.read().expect("shard state lock poisoned");
+        guard.check_stats_epoch(req.expected_stats_epoch)?;
         let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
                 if store.as_index().is_none() {
@@ -1537,8 +1581,10 @@ impl NodeServiceImpl {
         global_doc_frequencies: &[u32],
         params: Bm25Params,
         k: usize,
+        expected_stats_epoch: u64,
     ) -> Result<(RawLeg, RawLeg), Status> {
         let guard = self.state.read().expect("shard state lock poisoned");
+        guard.check_stats_epoch(expected_stats_epoch)?;
 
         let mut vector_leg: Vec<(u64, f64)> = Vec::new();
         if k > 0 && !vector.is_empty() {
@@ -1644,6 +1690,7 @@ impl NodeServiceImpl {
             &req.global_doc_frequencies,
             params_from(req.k1, req.b)?,
             k,
+            req.expected_stats_epoch,
         )?;
 
         let fused = fusion::rrf_fuse(
@@ -2134,6 +2181,7 @@ impl NodeServiceImpl {
                 documents: vec![doc],
             }),
         );
+        guard.stats_epoch += 1;
         *added += 1;
         Ok(())
     }
@@ -3164,6 +3212,7 @@ impl NodeService for NodeServiceImpl {
             total_doc_length,
             doc_frequencies,
             field_stats,
+            stats_epoch: guard.stats_epoch,
         }))
     }
 
@@ -3194,6 +3243,7 @@ impl NodeService for NodeServiceImpl {
             ));
         }
         let guard = self.state.read().expect("shard state lock poisoned");
+        guard.check_stats_epoch(req.expected_stats_epoch)?;
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
                 let index = store.as_index().ok_or_else(|| {
@@ -3291,6 +3341,7 @@ impl NodeService for NodeServiceImpl {
         };
         let offset = self.config.slot_offset;
         let guard = self.state.read().expect("shard state lock poisoned");
+        guard.check_stats_epoch(req.expected_stats_epoch)?;
         let hits = match guard.bm25.as_ref() {
             Some(store) => {
                 // Route global ids to this shard's local range.
@@ -3460,6 +3511,7 @@ impl NodeService for NodeServiceImpl {
                 &req.global_doc_frequencies,
                 params_from(req.k1, req.b)?,
                 req.k as usize,
+                req.expected_stats_epoch,
             )?;
             Ok(ShardLegsResponse {
                 vector_hits: vector_hits

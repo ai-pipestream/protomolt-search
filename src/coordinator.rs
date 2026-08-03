@@ -11,7 +11,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
-use crate::bm25::{self, Bm25Params, CorpusStats};
+use crate::bm25::{Bm25Params, CorpusStats};
 use crate::fusion::{self, Leg};
 use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
 use crate::pb::node_service_client::NodeServiceClient;
@@ -90,6 +90,10 @@ pub struct CoordinatorServiceImpl {
     /// Resolved UDP floor target per node address (`None` =
     /// unresolvable), cached on first use. IPv4 preferred.
     floor_targets: Arc<Mutex<HashMap<String, Option<std::net::SocketAddr>>>>,
+    /// Per-node BM25 term-stat shares, keyed by each node's
+    /// `stats_epoch` (src/stats_cache.rs). Sound because the nodes
+    /// enforce the epoch claim on every scoring request built from it.
+    stats_cache: Arc<crate::stats_cache::StatsCache>,
 }
 
 /// A process-unique, well-mixed stream token for the UDP floor lane
@@ -106,10 +110,33 @@ fn floor_token() -> u64 {
     z.max(1)
 }
 
+/// Whether a node refused a scoring request because its stats epoch
+/// moved past the request's claim. The retry contract: invalidate the
+/// cache, refetch fresh, and repeat the round ONCE with no claim
+/// (`expected_stats_epoch = 0`) — the pre-cache semantics, which cannot
+/// be refused, so a shard under continuous ingest degrades to exactly
+/// the behavior it had before the cache existed instead of livelocking.
+fn is_stale_stats(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().starts_with(crate::node::STALE_STATS_EPOCH)
+}
+
+/// Merged global stats for a fused multi-field query, with the per-node
+/// epochs the shares were valid at (parallel to the node list).
+struct FusedGlobals {
+    doc_count: u64,
+    /// Per field: global sum of that field's document lengths.
+    totals: Vec<u64>,
+    /// Per field: global df per term, in that field's term order.
+    dfs: Vec<Vec<u32>>,
+    epochs: Vec<u64>,
+}
+
 impl CoordinatorServiceImpl {
     /// A coordinator over the given shard nodes (fan-out order = shard
     /// index for merge tie-breaks).
     pub fn new(node_addrs: Vec<String>) -> Self {
+        let stats_cache = Arc::new(crate::stats_cache::StatsCache::new(node_addrs.len()));
         Self {
             node_addrs,
             replica_addrs: Vec::new(),
@@ -121,7 +148,14 @@ impl CoordinatorServiceImpl {
             channels: Arc::new(Mutex::new(HashMap::new())),
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
+            stats_cache,
         }
+    }
+
+    /// The term-stats cache, exposed for tests (`fetch_count` is how a
+    /// test proves the hit path issued no RPCs).
+    pub fn stats_cache(&self) -> &crate::stats_cache::StatsCache {
+        &self.stats_cache
     }
 
     /// The UDP floor socket, bound once (nonblocking: a full local
@@ -292,15 +326,41 @@ impl CoordinatorServiceImpl {
             return Ok(Vec::new());
         }
 
-        // (b) TermStats fan-out: each shard's share of the corpus stats.
-        let global: CorpusStats = self.global_bm25_stats(&terms).await?;
+        // (b) each shard's share of the corpus stats, cached per node;
+        // (c)+(d) run as a round so a stale-stats refusal can rerun
+        // them once against fresh stats with no claim.
+        let mut fresh = false;
+        loop {
+            let (global, epochs) = self.body_stats(&terms, fresh).await?;
+            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            match self
+                .bm25_query_round(&terms, k, min_score, &global, &claims)
+                .await
+            {
+                Err(e) if !fresh && is_stale_stats(&e) => {
+                    self.stats_cache.invalidate_all();
+                    fresh = true;
+                }
+                other => return other,
+            }
+        }
+    }
 
-        // (c) Bm25Query fan-out with the GLOBAL stats: every shard scores
-        // identically, so (d) the merge is a straight top-k.
+    /// One Bm25Query fan-out with the GLOBAL stats: every shard scores
+    /// identically, so the merge is a straight top-k. `claims[shard]`
+    /// travels as that shard's `expected_stats_epoch`.
+    async fn bm25_query_round(
+        &self,
+        terms: &[String],
+        k: u32,
+        min_score: f32,
+        global: &CorpusStats,
+        claims: &[u64],
+    ) -> Result<Vec<Bm25Hit>, Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
-                terms: terms.clone(),
+                terms: terms.to_vec(),
                 k,
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
@@ -309,6 +369,7 @@ impl CoordinatorServiceImpl {
                 b: self.bm25_params.b as f32,
                 min_score,
                 fields: Vec::new(),
+                expected_stats_epoch: claims[shard],
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -393,9 +454,9 @@ impl CoordinatorServiceImpl {
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
             return Ok(Vec::new());
         }
-        // (b) One TermStats fan-out with every field's terms; shares
-        // merge elementwise per field, N summed once (it is shared —
-        // a document is a document).
+        // (b) every field's stats, served from the per-node cache;
+        // (c)+(d) run as a round so a stale-stats refusal can rerun
+        // them once against fresh stats with no claim.
         let stats_fields: Vec<crate::pb::FieldTerms> = fields
             .iter()
             .zip(&field_terms)
@@ -404,52 +465,132 @@ impl CoordinatorServiceImpl {
                 terms: terms.clone(),
             })
             .collect();
-        let mut share_tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
+        let mut fresh = false;
+        loop {
+            let globals = self.fused_stats(&stats_fields, fresh).await?;
+            let claims = if fresh {
+                vec![0; globals.epochs.len()]
+            } else {
+                globals.epochs.clone()
+            };
+            let t_stats = t0.elapsed();
+            match self
+                .bm25_fused_round(
+                    k,
+                    fields,
+                    &field_terms,
+                    &globals,
+                    &claims,
+                    min_score,
+                    trace,
+                    t0,
+                    t_analyzed,
+                    t_stats,
+                )
+                .await
+            {
+                Err(e) if !fresh && is_stale_stats(&e) => {
+                    self.stats_cache.invalidate_all();
+                    fresh = true;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Per-field global stats for a fused query, merged over per-node
+    /// shares served from the stats cache (`fresh` bypasses it; see
+    /// [`Self::body_stats`]). Shares merge elementwise per field, N
+    /// summed once (it is shared — a document is a document).
+    ///
+    /// A partially-known field is tolerated: that is a real
+    /// heterogeneous fleet, and the shards that have it still
+    /// contribute. A field NO shard has is a typo, not a query —
+    /// scoring it as "contributes nothing" would silently return the
+    /// ranking of the REMAINING fields, so a misspelled arm of an A/B
+    /// reads as "no difference". Refused instead.
+    async fn fused_stats(
+        &self,
+        stats_fields: &[crate::pb::FieldTerms],
+        fresh: bool,
+    ) -> Result<FusedGlobals, Status> {
+        let n = self.node_addrs.len();
+        let mut shares: Vec<Option<crate::stats_cache::FusedShare>> = vec![None; n];
+        if !fresh {
+            for (i, share) in shares.iter_mut().enumerate() {
+                *share = self.stats_cache.lookup_fused(i, stats_fields);
+            }
+        }
+        let mut fetch_tasks = Vec::new();
+        for (i, share) in shares.iter().enumerate() {
+            if share.is_some() {
+                continue;
+            }
             let request = TermStatsRequest {
                 terms: Vec::new(),
-                fields: stats_fields.clone(),
+                fields: stats_fields.to_vec(),
             };
-            let mut client = self.node_client(node)?;
-            share_tasks.push(tokio::spawn(async move {
-                client.term_stats(request).await.map(|r| r.into_inner())
-            }));
+            let mut client = self.node_client(&self.node_addrs[i])?;
+            self.stats_cache.note_fetch();
+            fetch_tasks.push((
+                i,
+                tokio::spawn(
+                    async move { client.term_stats(request).await.map(|r| r.into_inner()) },
+                ),
+            ));
         }
-        let mut doc_count = 0u64;
-        let mut totals = vec![0u64; fields.len()];
-        let mut dfs: Vec<Vec<u32>> = field_terms.iter().map(|t| vec![0u32; t.len()]).collect();
-        // Which fields any shard actually has. A field no shard knows is
-        // a typo, not a query: scoring it as "contributes nothing" would
-        // silently return the ranking of the REMAINING fields, so a
-        // misspelled arm of an A/B reads as "no difference".
-        let mut known_somewhere = vec![false; fields.len()];
-        for task in share_tasks {
-            let share = task
+        for (i, task) in fetch_tasks {
+            let resp = task
                 .await
                 .map_err(|e| Status::internal(format!("term stats task failed: {e}")))??;
-            if share.field_stats.len() != fields.len() {
+            if resp.field_stats.len() != stats_fields.len() {
                 return Err(Status::internal(format!(
                     "shard returned {} field stats for {} fields",
-                    share.field_stats.len(),
-                    fields.len()
+                    resp.field_stats.len(),
+                    stats_fields.len()
                 )));
             }
-            doc_count += share.doc_count;
-            for (fi, fs) in share.field_stats.iter().enumerate() {
-                if fs.doc_frequencies.len() != dfs[fi].len() {
+            for (ft, fs) in stats_fields.iter().zip(&resp.field_stats) {
+                if fs.doc_frequencies.len() != ft.terms.len() {
                     return Err(Status::internal("shard field stats df length mismatch"));
                 }
+            }
+            self.stats_cache.store(i, &[], stats_fields, &resp);
+            shares[i] = Some(crate::stats_cache::FusedShare {
+                epoch: resp.stats_epoch,
+                doc_count: resp.doc_count,
+                fields: resp
+                    .field_stats
+                    .iter()
+                    .map(|fs| crate::stats_cache::FusedFieldShare {
+                        total_doc_length: fs.total_doc_length,
+                        known: fs.known,
+                        dfs: fs.doc_frequencies.clone(),
+                    })
+                    .collect(),
+            });
+        }
+        let mut doc_count = 0u64;
+        let mut totals = vec![0u64; stats_fields.len()];
+        let mut dfs: Vec<Vec<u32>> = stats_fields
+            .iter()
+            .map(|ft| vec![0u32; ft.terms.len()])
+            .collect();
+        let mut known_somewhere = vec![false; stats_fields.len()];
+        let mut epochs = Vec::with_capacity(n);
+        for share in shares {
+            let s = share.expect("looked up or fetched above");
+            doc_count += s.doc_count;
+            for (fi, fs) in s.fields.iter().enumerate() {
                 totals[fi] += fs.total_doc_length;
                 known_somewhere[fi] |= fs.known;
-                for (acc, df) in dfs[fi].iter_mut().zip(&fs.doc_frequencies) {
+                for (acc, df) in dfs[fi].iter_mut().zip(&fs.dfs) {
                     *acc += df;
                 }
             }
+            epochs.push(s.epoch);
         }
-        // A partially-known field is tolerated: that is a real
-        // heterogeneous fleet, and the shards that have it still
-        // contribute. A field NO shard has is refused.
-        let unknown: Vec<&str> = fields
+        let unknown: Vec<&str> = stats_fields
             .iter()
             .zip(&known_somewhere)
             .filter(|(_, known)| !**known)
@@ -466,7 +607,34 @@ impl CoordinatorServiceImpl {
                     .join(", ")
             )));
         }
-        let t_stats = t0.elapsed();
+        Ok(FusedGlobals {
+            doc_count,
+            totals,
+            dfs,
+            epochs,
+        })
+    }
+
+    /// One fused Bm25Query fan-out: phases (c) and (d) of
+    /// [`Self::fanout_bm25_fused`]. `claims[shard]` travels as that
+    /// shard's `expected_stats_epoch`.
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_fused_round(
+        &self,
+        k: u32,
+        fields: &[crate::pb::QueryField],
+        field_terms: &[Vec<String>],
+        globals: &FusedGlobals,
+        claims: &[u64],
+        min_score: f32,
+        trace: bool,
+        t0: std::time::Instant,
+        t_analyzed: std::time::Duration,
+        t_stats: std::time::Duration,
+    ) -> Result<Vec<Bm25Hit>, Status> {
+        let doc_count = globals.doc_count;
+        let totals = &globals.totals;
+        let dfs = &globals.dfs;
         // (c) Bm25Query fan-out with per-field legs in entry order.
         // Entry k1/b of 0 pick up the coordinator's configured params,
         // so tuning reaches this path too.
@@ -524,6 +692,7 @@ impl CoordinatorServiceImpl {
                 b: 0.0,
                 min_score,
                 fields: legs.clone(),
+                expected_stats_epoch: claims[shard],
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -619,20 +788,38 @@ impl CoordinatorServiceImpl {
         }
 
         let t = std::time::Instant::now();
-        let global = self.global_bm25_stats(&terms).await?;
-        let stats_ms = t.elapsed().as_secs_f32() * 1e3;
-        let (hits, mut dbg) = match legs.fusion_mode {
-            FusionMode::TwoLevel => {
-                self.fanout_hybrid_two_level(request_id, vector, k, &terms, &global, legs, debug)
-                    .await?
-            }
-            FusionMode::Decomposed => {
-                self.fanout_hybrid_decomposed(request_id, vector, k, &terms, &global, legs, debug)
-                    .await?
-            }
-            _ => {
-                self.fanout_hybrid_global_rank(vector, k, &terms, &global, legs, debug)
-                    .await?
+        // Stats + fusion run as a round: a stale-stats refusal from any
+        // shard reruns them once against fresh stats with no claim.
+        let mut fresh = false;
+        let (hits, mut dbg, stats_ms) = loop {
+            let (global, epochs) = self.body_stats(&terms, fresh).await?;
+            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            let stats_ms = t.elapsed().as_secs_f32() * 1e3;
+            let round = match legs.fusion_mode {
+                FusionMode::TwoLevel => {
+                    self.fanout_hybrid_two_level(
+                        request_id, vector, k, &terms, &global, &claims, legs, debug,
+                    )
+                    .await
+                }
+                FusionMode::Decomposed => {
+                    self.fanout_hybrid_decomposed(
+                        request_id, vector, k, &terms, &global, &claims, legs, debug,
+                    )
+                    .await
+                }
+                _ => {
+                    self.fanout_hybrid_global_rank(vector, k, &terms, &global, &claims, legs, debug)
+                        .await
+                }
+            };
+            match round {
+                Err(e) if !fresh && is_stale_stats(&e) => {
+                    self.stats_cache.invalidate_all();
+                    fresh = true;
+                }
+                Err(e) => return Err(e),
+                Ok((hits, dbg)) => break (hits, dbg, stats_ms),
             }
         };
         if let Some(d) = dbg.as_mut() {
@@ -644,35 +831,79 @@ impl CoordinatorServiceImpl {
         Ok((hits, dbg))
     }
 
-    /// TermStats fan-out: sum every shard's share into GLOBAL BM25 corpus
-    /// stats for `terms`.
-    async fn global_bm25_stats(&self, terms: &[String]) -> Result<CorpusStats, Status> {
-        let mut share_tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
-            let terms = terms.to_vec();
-            let mut client = self.node_client(node)?;
-            share_tasks.push(tokio::spawn(async move {
-                client
-                    .term_stats(TermStatsRequest {
-                        terms,
-                        fields: Vec::new(),
-                    })
-                    .await
-                    .map(|r| r.into_inner())
-            }));
+    /// GLOBAL BM25 corpus stats for `terms`, summed over per-node shares
+    /// served from the stats cache wherever the cached epoch still
+    /// stands; only nodes with a missing or incomplete share are asked.
+    /// `fresh` bypasses the cache entirely — the retry path after a
+    /// shard refused an epoch claim, which is today's uncached
+    /// semantics. Also returns the per-node epochs the shares were
+    /// valid at, for stamping onto the scoring requests as
+    /// `expected_stats_epoch` (the enforcement that makes caching sound;
+    /// see src/stats_cache.rs).
+    async fn body_stats(
+        &self,
+        terms: &[String],
+        fresh: bool,
+    ) -> Result<(CorpusStats, Vec<u64>), Status> {
+        let n = self.node_addrs.len();
+        let mut shares: Vec<Option<crate::stats_cache::BodyShare>> = vec![None; n];
+        if !fresh {
+            for (i, share) in shares.iter_mut().enumerate() {
+                *share = self.stats_cache.lookup_body(i, terms);
+            }
         }
-        let mut shares = Vec::with_capacity(share_tasks.len());
-        for task in share_tasks {
-            let stats = task
-                .await
-                .map_err(|e| Status::internal(format!("term stats task failed: {e}")))??;
-            shares.push((
-                stats.doc_count,
-                stats.total_doc_length,
-                stats.doc_frequencies,
+        let mut fetch_tasks = Vec::new();
+        for (i, share) in shares.iter().enumerate() {
+            if share.is_some() {
+                continue;
+            }
+            let terms_owned = terms.to_vec();
+            let mut client = self.node_client(&self.node_addrs[i])?;
+            self.stats_cache.note_fetch();
+            fetch_tasks.push((
+                i,
+                tokio::spawn(async move {
+                    client
+                        .term_stats(TermStatsRequest {
+                            terms: terms_owned,
+                            fields: Vec::new(),
+                        })
+                        .await
+                        .map(|r| r.into_inner())
+                }),
             ));
         }
-        Ok(bm25::merge_stats(&shares))
+        for (i, task) in fetch_tasks {
+            let resp = task
+                .await
+                .map_err(|e| Status::internal(format!("term stats task failed: {e}")))??;
+            if resp.doc_frequencies.len() != terms.len() {
+                return Err(Status::internal("shard stats df length mismatch"));
+            }
+            self.stats_cache.store(i, terms, &[], &resp);
+            shares[i] = Some(crate::stats_cache::BodyShare {
+                epoch: resp.stats_epoch,
+                doc_count: resp.doc_count,
+                total_doc_length: resp.total_doc_length,
+                dfs: resp.doc_frequencies,
+            });
+        }
+        let mut global = CorpusStats {
+            doc_count: 0,
+            total_doc_length: 0,
+            dfs: vec![0; terms.len()],
+        };
+        let mut epochs = Vec::with_capacity(n);
+        for share in shares {
+            let s = share.expect("looked up or fetched above");
+            global.doc_count += s.doc_count;
+            global.total_doc_length += s.total_doc_length;
+            for (acc, df) in global.dfs.iter_mut().zip(&s.dfs) {
+                *acc += df;
+            }
+            epochs.push(s.epoch);
+        }
+        Ok((global, epochs))
     }
 
     /// FUSION_MODE_GLOBAL_RANK: shards return RAW per-leg lists; the
@@ -680,12 +911,14 @@ impl CoordinatorServiceImpl {
     /// rankings and applies single-level RRF over them. With globally
     /// comparable scores per leg this is exactly the monolithic result
     /// for k <= leg_k (see the proto's FusionMode comments).
+    #[allow(clippy::too_many_arguments)]
     async fn fanout_hybrid_global_rank(
         &self,
         vector: &[f32],
         k: u32,
         terms: &[String],
         global: &CorpusStats,
+        claims: &[u64],
         legs: HybridLegs,
         debug: bool,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
@@ -703,6 +936,7 @@ impl CoordinatorServiceImpl {
                 global_doc_frequencies: leg_dfs.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
+                expected_stats_epoch: claims[shard],
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -850,6 +1084,7 @@ impl CoordinatorServiceImpl {
     /// FUSION_MODE_TWO_LEVEL (fallback for incomparable scores): each
     /// shard fuses locally; the coordinator RRF-merges the shard lists.
     /// NOT partition-independent — see the proto's FusionMode comments.
+    #[allow(clippy::too_many_arguments)]
     async fn fanout_hybrid_two_level(
         &self,
         request_id: &str,
@@ -857,6 +1092,7 @@ impl CoordinatorServiceImpl {
         k: u32,
         terms: &[String],
         global: &CorpusStats,
+        claims: &[u64],
         legs: HybridLegs,
         debug: bool,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
@@ -878,6 +1114,7 @@ impl CoordinatorServiceImpl {
                 rrf_k: legs.rrf_k as f32,
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
+                expected_stats_epoch: claims[shard],
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -999,6 +1236,7 @@ impl CoordinatorServiceImpl {
     ///   or from `VectorRescore` (bitwise identical — one kernel, one
     ///   calibration), b from the leg, from `Bm25Rescore`, or exactly
     ///   0 when the unfilled leg proves no further doc matches.
+    #[allow(clippy::too_many_arguments)]
     async fn fanout_hybrid_decomposed(
         &self,
         request_id: &str,
@@ -1006,6 +1244,7 @@ impl CoordinatorServiceImpl {
         k: u32,
         terms: &[String],
         global: &CorpusStats,
+        claims: &[u64],
         legs: HybridLegs,
         debug: bool,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
@@ -1038,6 +1277,7 @@ impl CoordinatorServiceImpl {
                     b: self.bm25_params.b as f32,
                     min_score: 0.0,
                     fields: Vec::new(),
+                    expected_stats_epoch: claims[shard],
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -1234,7 +1474,7 @@ impl CoordinatorServiceImpl {
             }
         }
         let rescored_b = self
-            .fanout_bm25_rescore_scores(terms, global, rescore_ids)
+            .fanout_bm25_rescore_scores(terms, global, claims, rescore_ids)
             .await?;
         for (doc, shard, v) in rescore_docs {
             // Absent from the rescore response = no query term matches
@@ -1337,6 +1577,7 @@ impl CoordinatorServiceImpl {
         &self,
         terms: &[String],
         global: &CorpusStats,
+        claims: &[u64],
         by_shard: HashMap<u32, Vec<u64>>,
     ) -> Result<HashMap<u64, f32>, Status> {
         let mut tasks = Vec::with_capacity(by_shard.len());
@@ -1349,6 +1590,7 @@ impl CoordinatorServiceImpl {
                 candidate_ids: ids,
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
+                expected_stats_epoch: claims[shard as usize],
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
             tasks.push(tokio::spawn(async move {
@@ -1368,6 +1610,60 @@ impl CoordinatorServiceImpl {
             }
         }
         Ok(scores)
+    }
+
+    /// One cascade phase-2 rescore fan-out: candidates routed to their
+    /// owning shards, scored with the GLOBAL stats. Returns doc -> BM25
+    /// score plus per-shard (rpc ms, hit count) for the debug surface.
+    /// `claims[shard]` travels as that shard's `expected_stats_epoch`.
+    async fn cascade_rescore_round(
+        &self,
+        terms: &[String],
+        global: &CorpusStats,
+        claims: &[u64],
+        by_shard: &std::collections::HashMap<u32, Vec<u64>>,
+    ) -> Result<
+        (
+            std::collections::HashMap<u64, f64>,
+            std::collections::HashMap<u32, (f32, u32)>,
+        ),
+        Status,
+    > {
+        let mut rescore_tasks = Vec::with_capacity(by_shard.len());
+        for (&shard, ids) in by_shard {
+            let node = &self.node_addrs[shard as usize];
+            let request = Bm25RescoreRequest {
+                terms: terms.to_vec(),
+                global_doc_count: global.doc_count,
+                global_total_doc_length: global.total_doc_length,
+                global_doc_frequencies: global.dfs.clone(),
+                candidate_ids: ids.clone(),
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
+                expected_stats_epoch: claims[shard as usize],
+            };
+            let mut client = self.node_client(node)?;
+            rescore_tasks.push(tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                client
+                    .bm25_rescore(request)
+                    .await
+                    .map(|r| (shard, t0.elapsed().as_secs_f32() * 1e3, r.into_inner().hits))
+            }));
+        }
+        let mut bm25_of: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+        let mut rescore_debug: std::collections::HashMap<u32, (f32, u32)> =
+            std::collections::HashMap::new();
+        for task in rescore_tasks {
+            let (shard, rpc_ms, hits) = task
+                .await
+                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??;
+            rescore_debug.insert(shard, (rpc_ms, hits.len() as u32));
+            for hit in hits {
+                bm25_of.insert(hit.doc_id, f64::from(hit.score));
+            }
+        }
+        Ok((bm25_of, rescore_debug))
     }
 
     /// Build the tonic server for this service with explicit message size
@@ -2060,50 +2356,35 @@ impl CoordinatorServiceImpl {
                 terms.push(term);
             }
         }
+        // Phase 2: route candidates to their owning shards for
+        // rescoring. Stats + rescore run as a round (a stale-stats
+        // refusal reruns them once with fresh stats and no claim).
         let t = std::time::Instant::now();
-        let global = self.global_bm25_stats(&terms).await?;
-        let stats_ms = t.elapsed().as_secs_f32() * 1e3;
-
-        // Phase 2: route candidates to their owning shards for rescoring.
-        let t_rescore = std::time::Instant::now();
         let mut by_shard: std::collections::HashMap<u32, Vec<u64>> =
             std::collections::HashMap::new();
         for (doc_id, shard, _) in &pool {
             by_shard.entry(*shard).or_default().push(*doc_id);
         }
-        let mut rescore_tasks = Vec::with_capacity(by_shard.len());
-        for (shard, ids) in by_shard {
-            let node = &self.node_addrs[shard as usize];
-            let request = Bm25RescoreRequest {
-                terms: terms.clone(),
-                global_doc_count: global.doc_count,
-                global_total_doc_length: global.total_doc_length,
-                global_doc_frequencies: global.dfs.clone(),
-                candidate_ids: ids,
-                k1: self.bm25_params.k1 as f32,
-                b: self.bm25_params.b as f32,
-            };
-            let mut client = self.node_client(node)?;
-            rescore_tasks.push(tokio::spawn(async move {
-                let t0 = std::time::Instant::now();
-                client
-                    .bm25_rescore(request)
-                    .await
-                    .map(|r| (shard, t0.elapsed().as_secs_f32() * 1e3, r.into_inner().hits))
-            }));
-        }
-        let mut bm25_of: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
-        let mut rescore_debug: std::collections::HashMap<u32, (f32, u32)> =
-            std::collections::HashMap::new();
-        for task in rescore_tasks {
-            let (shard, rpc_ms, hits) = task
+        let mut fresh = false;
+        let (stats_ms, t_rescore, bm25_of, rescore_debug) = loop {
+            let (global, epochs) = self.body_stats(&terms, fresh).await?;
+            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            let stats_ms = t.elapsed().as_secs_f32() * 1e3;
+            let t_rescore = std::time::Instant::now();
+            match self
+                .cascade_rescore_round(&terms, &global, &claims, &by_shard)
                 .await
-                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??;
-            rescore_debug.insert(shard, (rpc_ms, hits.len() as u32));
-            for hit in hits {
-                bm25_of.insert(hit.doc_id, f64::from(hit.score));
+            {
+                Err(e) if !fresh && is_stale_stats(&e) => {
+                    self.stats_cache.invalidate_all();
+                    fresh = true;
+                }
+                Err(e) => return Err(e),
+                Ok((bm25_of, rescore_debug)) => {
+                    break (stats_ms, t_rescore, bm25_of, rescore_debug);
+                }
             }
-        }
+        };
         let rescore_ms = t_rescore.elapsed().as_secs_f32() * 1e3;
 
         // Rerank: BM25 desc, vector score desc, doc id asc. Top k of the
@@ -2227,10 +2508,11 @@ impl CoordinatorServiceImpl {
             }
         }
 
-        // Candidate-scoped scoring of the window, routed by owning shard.
+        // Candidate-scoped scoring of the window, routed by owning
+        // shard. Stats + rescore run as a round (a stale-stats refusal
+        // reruns them once with fresh stats and no claim).
         let mut scores: HashMap<u64, f64> = HashMap::new();
         if window > 0 && !terms.is_empty() {
-            let global = self.global_bm25_stats(&terms).await?;
             let mut by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
             for (doc_id, shard) in hits[..window.min(hits.len())]
                 .iter()
@@ -2243,33 +2525,24 @@ impl CoordinatorServiceImpl {
             {
                 by_shard.entry(shard).or_default().push(doc_id);
             }
-            let mut rescore_tasks = Vec::with_capacity(by_shard.len());
-            for (shard, ids) in by_shard {
-                let node = &self.node_addrs[shard as usize];
-                let request = Bm25RescoreRequest {
-                    terms: terms.clone(),
-                    global_doc_count: global.doc_count,
-                    global_total_doc_length: global.total_doc_length,
-                    global_doc_frequencies: global.dfs.clone(),
-                    candidate_ids: ids,
-                    k1: self.bm25_params.k1 as f32,
-                    b: self.bm25_params.b as f32,
-                };
-                let mut client = self.node_client(node)?;
-                rescore_tasks.push(tokio::spawn(async move {
-                    client
-                        .bm25_rescore(request)
-                        .await
-                        .map(|r| r.into_inner().hits)
-                }));
-            }
-            for task in rescore_tasks {
-                let shard_hits = task
+            let mut fresh = false;
+            let rescored = loop {
+                let (global, epochs) = self.body_stats(&terms, fresh).await?;
+                let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+                match self
+                    .fanout_bm25_rescore_scores(&terms, &global, &claims, by_shard.clone())
                     .await
-                    .map_err(|e| Status::internal(format!("boost rescore task failed: {e}")))??;
-                for hit in shard_hits {
-                    scores.insert(hit.doc_id, f64::from(hit.score));
+                {
+                    Err(e) if !fresh && is_stale_stats(&e) => {
+                        self.stats_cache.invalidate_all();
+                        fresh = true;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(rescored) => break rescored,
                 }
+            };
+            for (doc_id, score) in rescored {
+                scores.insert(doc_id, f64::from(score));
             }
         }
 

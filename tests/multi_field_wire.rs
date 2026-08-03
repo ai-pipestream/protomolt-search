@@ -470,6 +470,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
         async move {
             client
                 .shard_legs(ShardLegsRequest {
+                    expected_stats_epoch: 0,
                     request_id: String::new(),
                     k: 3,
                     vector: Vec::new(),
@@ -843,6 +844,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
     assert_eq!(added.added, 3);
 
     let leg = |fingerprint: u64| Bm25QueryRequest {
+        expected_stats_epoch: 0,
         terms: Vec::new(),
         k: 5,
         global_doc_count: 3,

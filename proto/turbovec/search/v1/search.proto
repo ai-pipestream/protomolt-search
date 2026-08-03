@@ -836,6 +836,15 @@ message TermStatsResponse {
   repeated uint32 doc_frequencies = 3;
   // Per-field shares, parallel to the request's `fields`.
   repeated FieldStats field_stats = 4;
+  // This shard's stats epoch: a counter that advances on every mutation
+  // of the shard's BM25 store (ingest, flush, load, snapshot install).
+  // Everything in this response is a pure function of the store at one
+  // epoch, so a caller may cache the response for as long as the shard
+  // still reports the same epoch — and may ask the shard to enforce
+  // that, by echoing the epoch back as `expected_stats_epoch` on a
+  // scoring request. Always >= 1 (0 is reserved to mean "no claim" in
+  // the echo).
+  uint64 stats_epoch = 5;
 }
 
 // Phase (c) of the distributed BM25 flow: score with GLOBAL stats.
@@ -876,6 +885,16 @@ message Bm25QueryRequest {
   // fused scores are unchanged — the graceful path for a fleet
   // mid-migration.
   repeated Bm25FieldLeg fields = 9;
+  // The stats epoch (TermStatsResponse.stats_epoch) the global stats in
+  // this request were computed under, for THIS shard. When non-zero and
+  // the shard's current epoch differs, the shard REFUSES with
+  // FAILED_PRECONDITION rather than scoring with stats that no longer
+  // describe it: a coordinator serving stats from a cache would
+  // otherwise degrade silently under ingest, with no bound on how stale
+  // the idf values could get. 0 means "no claim" and is never refused —
+  // the pre-epoch semantics, where the stats are simply whatever the
+  // coordinator fetched moments before.
+  uint64 expected_stats_epoch = 10;
 }
 
 // One field's leg of a fused multi-field BM25 query.
@@ -1236,6 +1255,9 @@ message HybridShardRequest {
   float k1 = 11;
   // BM25 b for the BM25 leg; 0 selects the default (0.75).
   float b = 12;
+  // Stats-epoch claim for the BM25 leg's global stats; see
+  // Bm25QueryRequest.expected_stats_epoch. 0 = no claim.
+  uint64 expected_stats_epoch = 13;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -1423,6 +1445,9 @@ message ShardLegsRequest {
   float k1 = 8;
   // BM25 b for the BM25 leg; 0 selects the default (0.75).
   float b = 9;
+  // Stats-epoch claim for the BM25 leg's global stats; see
+  // Bm25QueryRequest.expected_stats_epoch. 0 = no claim.
+  uint64 expected_stats_epoch = 10;
 }
 
 // One raw leg hit.
@@ -1496,6 +1521,9 @@ message Bm25RescoreRequest {
   float k1 = 6;
   // BM25 b; 0 selects the default (0.75).
   float b = 7;
+  // Stats-epoch claim for the global stats above; see
+  // Bm25QueryRequest.expected_stats_epoch. 0 = no claim.
+  uint64 expected_stats_epoch = 8;
 }
 
 // BM25 scores for the requested candidates, doc id ascending.
