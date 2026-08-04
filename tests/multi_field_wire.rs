@@ -69,6 +69,8 @@ fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
                 }]
             })
             .unwrap_or_default(),
+        integers: Vec::new(),
+        timestamps: Vec::new(),
     }
 }
 
@@ -355,6 +357,8 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
             text: text.to_string(),
             analysis: None,
         }],
+        integers: Vec::new(),
+        timestamps: Vec::new(),
     };
     for (req, why) in [
         (bad("docket", "x"), "unknown field"),
@@ -470,6 +474,8 @@ async fn shard_legs_bm25_params_reach_scoring() {
             analysis: None,
             lineage: None,
             fields: Vec::new(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await
         .unwrap();
@@ -628,6 +634,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             analysis: None,
             min_score: 0.0,
             fields: per_field,
+            range_facet_fields: Vec::new(),
         }),
     )
     .await
@@ -646,6 +653,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             analysis: Some(spec),
             min_score: 0.0,
             fields: query_fields(2.0),
+            range_facet_fields: Vec::new(),
         }),
     )
     .await
@@ -884,6 +892,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
             b: 0.75,
             analysis_fingerprint: fingerprint,
         }],
+        range_facet_fields: Vec::new(),
     };
 
     // The analyzer it was built with: answered.

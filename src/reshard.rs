@@ -403,6 +403,27 @@ fn build_child(
             }
             t
         };
+        // Integers and timestamps name the SAME i64 columns
+        // (docs/range-facets.md), so both lists feed one table — a
+        // child whose records only ever carried timestamps still gets
+        // the column, or the re-apply below would have nowhere to put
+        // them.
+        let integer_table: Vec<String> = {
+            let mut t: Vec<String> = Vec::new();
+            for (_, doc) in &mapped {
+                for name in doc
+                    .integers
+                    .iter()
+                    .map(|e| &e.field)
+                    .chain(doc.timestamps.iter().map(|e| &e.field))
+                {
+                    if !t.iter().any(|n| n == name) {
+                        t.push(name.clone());
+                    }
+                }
+            }
+            t
+        };
         // Children rebuild through the disk spiller for the same reason
         // nodes do: a full-scale child's postings do not fit in heap.
         let path = crate::node::bm25_sidecar_path(tv_path);
@@ -415,12 +436,14 @@ fn build_child(
         let map_facet_names: Vec<&str> = map_facet_table.iter().map(String::as_str).collect();
         let map_numeric_names: Vec<&str> =
             map_numeric_table.iter().map(String::as_str).collect();
+        let integer_names: Vec<&str> = integer_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
             .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
             .with_facet_fields(&facet_names)
             .with_numeric_fields(&numeric_names)
             .with_map_facet_fields(&map_facet_names)
-            .with_map_numeric_fields(&map_numeric_names);
+            .with_map_numeric_fields(&map_numeric_names)
+            .with_integer_fields(&integer_names);
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -506,6 +529,32 @@ fn build_child(
                         .position(|n| n == &e.field)
                         .expect("map-numeric table was derived from these records");
                     builder.set_map_numeric(ci, *local, &e.key, e.value);
+                }
+                for e in &doc.integers {
+                    let ii = integer_table
+                        .iter()
+                        .position(|n| n == &e.field)
+                        .expect("integer table was derived from these records");
+                    builder.set_integer(ii, *local, e.value);
+                }
+                // Timestamps re-run the node's conversion, from the
+                // instant the WAL kept: the child gets the same epoch
+                // micros the parent stored, not a copy of a copy.
+                for e in &doc.timestamps {
+                    let ii = integer_table
+                        .iter()
+                        .position(|n| n == &e.field)
+                        .expect("integer table was derived from these records");
+                    let ts = e.value.as_ref().ok_or_else(|| {
+                        format!(
+                            "record at child slot {local}: timestamp field {:?} carries no \
+                             instant",
+                            e.field
+                        )
+                    })?;
+                    let micros = crate::node::timestamp_to_epoch_micros(&e.field, ts)
+                        .map_err(|e| format!("record at child slot {local}: {}", e.message()))?;
+                    builder.set_integer(ii, *local, micros);
                 }
             }
             i = end;

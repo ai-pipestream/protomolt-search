@@ -723,6 +723,8 @@ mod tests {
                 analysis: None,
                 lineage: None,
                 fields: Vec::new(),
+                integers: Vec::new(),
+                timestamps: Vec::new(),
             }],
         })
     }

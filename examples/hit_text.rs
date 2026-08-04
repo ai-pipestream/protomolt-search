@@ -178,6 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 k1: 0.0,
                 b,
             }],
+            range_facet_fields: Vec::new(),
         })
         .await?
         .into_inner();

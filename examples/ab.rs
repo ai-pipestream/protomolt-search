@@ -176,6 +176,7 @@ impl Arm {
                         ..f.clone()
                     })
                     .collect(),
+                range_facet_fields: Vec::new(),
             }),
         };
         SearchVariant {

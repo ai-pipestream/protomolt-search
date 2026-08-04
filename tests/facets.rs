@@ -68,6 +68,8 @@ async fn add_documents_faceted(
                     value: value.to_string(),
                 })
                 .collect(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await
         .unwrap();
@@ -235,8 +237,8 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     // "rust" matches d0, d1, d2, d4. Courts: ca9 (d1, d2), scotus (d0);
     // d4 sits on the facet-less shard. Years: 1990 (d0), 1991 (d1) —
     // d2 has no year value.
-    let (hits, facets) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &want, &[], &[])
+    let (hits, facets, _) = coordinator
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &want, &[], &[], &[])
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
@@ -252,8 +254,8 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     );
 
     // Counts cover the whole match set even when k surfaces one hit.
-    let (hits_k1, facets_k1) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &want, &[], &[])
+    let (hits_k1, facets_k1, _) = coordinator
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &want, &[], &[], &[])
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -261,8 +263,8 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
 
     // A seeded floor narrows the surfaced hits, never the counts.
     let seed = turbovec_search::bm25::floor_seed(hits[0].score);
-    let (seeded_hits, seeded_facets) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, seed, &want, &[], &[])
+    let (seeded_hits, seeded_facets, _) = coordinator
+        .fanout_bm25_faceted("rust", 6, None, seed, &want, &[], &[], &[])
         .await
         .unwrap();
     assert!(seeded_hits.len() < hits.len(), "the floor trimmed hits");
@@ -270,8 +272,8 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     assert_eq!(counts_of(&seeded_facets[1]), vec![("1990", 1), ("1991", 1)]);
 
     // "vector" matches d1, d3: all courts tie, value order decides.
-    let (_, vector_facets) = coordinator
-        .fanout_bm25_faceted("vector", 6, None, 0.0, &want, &[], &[])
+    let (_, vector_facets, _) = coordinator
+        .fanout_bm25_faceted("vector", 6, None, 0.0, &want, &[], &[], &[])
         .await
         .unwrap();
     assert_eq!(counts_of(&vector_facets[0]), vec![("ca9", 1), ("scotus", 1)]);
@@ -284,8 +286,8 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
         k1: 0.0,
         b: 0.0,
     }];
-    let (fused_hits, fused_facets) = coordinator
-        .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[])
+    let (fused_hits, fused_facets, _) = coordinator
+        .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[], &[])
         .await
         .unwrap();
     assert_eq!(fused_hits.len(), 4);
@@ -317,6 +319,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             min_score: 0.0,
             fields: Vec::new(),
             facet_fields: vec!["court".to_string()],
+            range_facet_fields: Vec::new(),
         }),
     )
     .await
@@ -338,6 +341,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             min_score: 0.0,
             fields: Vec::new(),
             facet_fields: vec!["cuort".to_string()],
+            range_facet_fields: Vec::new(),
         }),
     )
     .await
@@ -446,6 +450,7 @@ async fn spilled_shard_serves_facets_after_flush() {
             fields: Vec::new(),
             expected_stats_epoch: 0,
             facet_fields: vec!["court".to_string()],
+            range_facet_fields: Vec::new(),
         })
         .await
         .unwrap()

@@ -134,10 +134,20 @@ LANDED beyond the original scope, 2026-08-03: map<string, string> and
 map<string, f64> columns as first-class kinds (`docs/map-columns.md`) —
 per-(column, key) facet counts and map-keyed score stages with per-key
 bounds, designed against a deep read of tantivy's JSON field (its
-documented regrets each answered structurally). Queued next in the
-column plane: i64 columns + Timestamp + range facets, then geo (bbox,
-haversine, Manhattan) — see the plan tasks; CEL filters remain the
-layer that unifies scalar and map predicates.
+documented regrets each answered structurally). Then increment 2, the
+same day (`docs/range-facets.md`): i64 columns as kind 4 — because an
+f64 stops being exact at 2^53 and this engine argues from exactness —
+with `i64::MIN` as a refused absence sentinel, Timestamp as pure
+ingest sugar converting to epoch micros on the node, score stages
+reading i64 columns through a monotone cast that leaves every bound
+valid, and range facets with explicit half-open bucket edges over
+f64/i64/map columns, counted over the FULL match set on the ONE match
+bitmap all three facet kinds now share. No implicit tail buckets and
+no repaired edge lists: an edge list that does not describe intervals
+is refused naming the column. Queued next in the column plane: geo
+(bbox, haversine, Manhattan) — see the plan tasks; CEL filters remain
+the layer that unifies scalar and map predicates, and range FILTERS
+land with them.
 
 ## 4. Caching
 

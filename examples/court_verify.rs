@@ -90,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             analysis: Some(turbovec_search::analyzer::body_spec()),
             min_score: 0.0,
             fields: Vec::new(),
+            range_facet_fields: Vec::new(),
         })
         .await?
         .into_inner();

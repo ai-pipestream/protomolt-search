@@ -433,6 +433,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &body_columns,
                             &chunk.text,
                         ),
+                        integers: Vec::new(),
+                        timestamps: Vec::new(),
                     })
                     .await
                     .unwrap();
@@ -769,6 +771,8 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                             span_end: chunk.span_end,
                         }),
                         fields,
+                        integers: Vec::new(),
+                        timestamps: Vec::new(),
                     })
                     .map_err(|e| e.to_string())?;
                     sent += 1;

@@ -44,6 +44,8 @@ async fn add_documents(
             analysis: spec.clone(),
             lineage: None,
             fields: Vec::new(),
+            integers: Vec::new(),
+            timestamps: Vec::new(),
         })
         .await
         .unwrap();
@@ -134,6 +136,7 @@ async fn ingest_through_mock_builds_postings() {
             b: 0.0,
             min_score: 0.0,
             fields: Vec::new(),
+            range_facet_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -288,6 +291,7 @@ async fn bm25_query_min_score_seeds_floor() {
                 b: 0.0,
                 min_score,
                 fields: Vec::new(),
+                range_facet_fields: Vec::new(),
             })
             .await
             .unwrap()
@@ -373,6 +377,7 @@ async fn bm25_query_min_score_seeds_floor() {
             b: 0.0,
             min_score: 0.0,
             fields: Vec::new(),
+            range_facet_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -398,6 +403,7 @@ async fn bm25_query_min_score_seeds_floor() {
             b: 0.0,
             min_score: 0.0,
             fields: Vec::new(),
+            range_facet_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -423,6 +429,7 @@ async fn bm25_query_min_score_seeds_floor() {
                 b: 0.0,
                 min_score: bad,
                 fields: Vec::new(),
+                range_facet_fields: Vec::new(),
             })
             .await
             .expect_err("non-finite min_score must be rejected");
@@ -445,6 +452,7 @@ async fn bm25_query_min_score_seeds_floor() {
             b: 0.0,
             min_score: 0.0,
             fields: Vec::new(),
+            range_facet_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -610,6 +618,7 @@ async fn shard_local_stats_would_differ() {
                 b: 0.0,
                 min_score: 0.0,
                 fields: Vec::new(),
+                range_facet_fields: Vec::new(),
             })
             .await
             .unwrap()

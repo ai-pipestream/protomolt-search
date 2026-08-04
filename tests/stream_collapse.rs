@@ -84,6 +84,8 @@ async fn start_shard(
                     span_end: 10,
                 }),
                 fields: Vec::new(),
+                integers: Vec::new(),
+                timestamps: Vec::new(),
             })
             .await
             .unwrap();

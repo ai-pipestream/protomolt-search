@@ -122,6 +122,8 @@ async fn ingest(
                 analysis: None,
                 lineage: None,
                 fields: Vec::new(),
+                integers: Vec::new(),
+                timestamps: Vec::new(),
             })
             .await
             .unwrap();
@@ -819,6 +821,8 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
                         }]
                     })
                     .unwrap_or_default(),
+                integers: Vec::new(),
+                timestamps: Vec::new(),
             })
             .await
             .unwrap();

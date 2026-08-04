@@ -124,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     analysis: Some(body_spec()),
                     min_score,
                     fields: Vec::new(),
+                    range_facet_fields: Vec::new(),
                 })
                 .await?
                 .into_inner();
