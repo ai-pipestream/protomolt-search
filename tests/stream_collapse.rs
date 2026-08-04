@@ -86,6 +86,7 @@ async fn start_shard(
                 fields: Vec::new(),
                 integers: Vec::new(),
                 timestamps: Vec::new(),
+                geo_points: Vec::new(),
             })
             .await
             .unwrap();

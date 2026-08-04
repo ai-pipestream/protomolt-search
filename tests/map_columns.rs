@@ -82,6 +82,7 @@ async fn add_documents_mapped(
                 .collect(),
             integers: Vec::new(),
             timestamps: Vec::new(),
+            geo_points: Vec::new(),
         })
         .await
         .unwrap();
@@ -282,7 +283,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     // (d1); meta[lang]: en (d0), de (d2) — value-ascending on the tie.
     let want = vec![map_field("meta", "color"), map_field("meta", "lang")];
     let (hits, facets, _) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &want, &[], &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &want, &[], &[], &[])
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
@@ -295,7 +296,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
 
     // Counts cover the whole match set at k = 1 too.
     let (hits_k1, facets_k1, _) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &want, &[], &[])
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &want, &[], &[], &[])
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -314,6 +315,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
             score_stages: Vec::new(),
             map_facet_fields: vec![map_field("meta", "color")],
             range_facet_fields: Vec::new(),
+            geo_filters: Vec::new(),
         }),
     )
     .await
@@ -323,7 +325,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
 
     // A key NO shard knows is a typo, not an empty drill-down.
     let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[map_field("meta", "colour")], &[], &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[map_field("meta", "colour")], &[], &[], &[])
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -350,6 +352,9 @@ impl NumericRead for ReaderNumerics<'_> {
     }
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
+    }
+    fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+        self.0.geo_value(gi, doc_id)
     }
 }
 
@@ -469,14 +474,16 @@ async fn distributed_map_stages_and_ingest_refusals() {
         weight: 1.0,
         origin: 0.0,
         scale: 0.0,
+        origin_lat: 0.0,
+        origin_lon: 0.0,
     }];
     for text in ["rust", "vector"] {
         let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
             .await
             .unwrap();
         let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
             .await
             .unwrap();
         assert_eq!(hit_signature(&got), hit_signature(&want), "query {text:?}");
@@ -485,7 +492,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // attrs entries, so its score is bitwise the unchained one.
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
     let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[])
         .await
         .unwrap();
     assert_ne!(hit_signature(&unchained), hit_signature(&chained));
@@ -502,7 +509,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
         ..stages[0].clone()
     }];
     let err = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[])
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -529,6 +536,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
         map_numerics: Vec::new(),
         integers: Vec::new(),
         timestamps: Vec::new(),
+        geo_points: Vec::new(),
     };
     let send = |addr: String, req: AddDocumentsRequest| async move {
         let mut client = NodeServiceClient::connect(addr).await.unwrap();

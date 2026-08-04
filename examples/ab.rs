@@ -177,6 +177,7 @@ impl Arm {
                     })
                     .collect(),
                 range_facet_fields: Vec::new(),
+                geo_filters: Vec::new(),
             }),
         };
         SearchVariant {

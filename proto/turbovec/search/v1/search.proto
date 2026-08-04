@@ -830,6 +830,26 @@ message TimestampValue {
   google.protobuf.Timestamp value = 2;
 }
 
+// One geo point of a document: a (lat, lon) pair for one declared geo
+// field ("courthouse" -> 38.8904, -77.0090). Values land in the
+// shard's geo-point column (kind 5, docs/geo-columns.md) as a 16-byte
+// fixed-stride pair, never in postings. Coordinates are first-class so
+// that bbox and radius FILTERS and distance-decay score stages can read
+// them exactly, and so a routing enrichment sidecar
+// (docs/plans/routing-enrichment.md) has a place to read from.
+message GeoPointValue {
+  // Geo field name; must exist in the shard's geo field table
+  // (--geo-fields) and must not repeat within one document. Unknown
+  // names are INVALID_ARGUMENT.
+  string field = 1;
+  // Latitude in DEGREES, finite and within [-90, 90]. Anything else is
+  // INVALID_ARGUMENT: a coordinate off the globe is a producer bug, and
+  // NaN is half of the column's absence sentinel.
+  double lat = 2;
+  // Longitude in DEGREES, finite and within [-180, 180]. Same rules.
+  double lon = 3;
+}
+
 // One map-facet entry of a document: a single string value under a
 // string key in one declared map<string, string> column
 // (docs/map-columns.md). Keys and values are opaque — never analyzed —
@@ -899,6 +919,11 @@ message AddDocumentsRequest {
   // as epoch micros in the SAME i64 columns (see TimestampValue). Same
   // durable-record lever, and replay redoes the conversion.
   repeated TimestampValue timestamps = 10;
+  // Geo points for this document, one entry per declared geo field it
+  // has a value for (docs/geo-columns.md). Same durable-record lever:
+  // the WAL keeps the request verbatim, so durability and reshard
+  // replay come free.
+  repeated GeoPointValue geo_points = 11;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -1053,6 +1078,79 @@ message Bm25QueryRequest {
   // pays the traversal once. Answered in
   // Bm25QueryResponse.range_facets, positionally.
   repeated RangeFacetField range_facet_fields = 14;
+  // Geo filters over a geo-point column (docs/geo-columns.md). ALL
+  // filters must pass (AND semantics). Applied on the node BEFORE the
+  // floor test and heap insertion, in the pruned scorer and the
+  // exhaustive oracle identically: a filter only REMOVES documents, so
+  // every block-max bound stays a valid upper bound with no new pruning
+  // math. A document without a value fails every filter — no location
+  // is inside no region — which is exact, not degradation. Answered by
+  // `geo_columns_known`, positionally.
+  repeated GeoFilter geo_filters = 15;
+}
+
+// One geo filter: a geo-point column plus the region a document's point
+// must lie in to survive (docs/geo-columns.md).
+message GeoFilter {
+  // The geo-point column to read (--geo-fields). A shard whose table
+  // lacks it answers known=false and contributes NO hits through this
+  // filter — its documents genuinely hold no locations, so this is
+  // exact — but the coordinator REFUSES a column NO shard knows, the
+  // same typo rule as facets, chains, and range facets.
+  string column = 1;
+  // The region. Exactly one must be set; an unset region is
+  // INVALID_ARGUMENT naming the column (a filter that filters nothing
+  // is a request nobody meant to send).
+  oneof region {
+    // An axis-aligned latitude/longitude box.
+    GeoBbox bbox = 2;
+    // A great-circle or local-Manhattan disc.
+    GeoRadius radius = 3;
+  }
+}
+
+// An axis-aligned bounding box in degrees. All four edges are
+// INCLUSIVE: a point exactly on a boundary is inside.
+message GeoBbox {
+  // Southern edge, finite, within [-90, 90], and <= max_lat.
+  double min_lat = 1;
+  // Northern edge, finite, within [-90, 90].
+  double max_lat = 2;
+  // Western edge, finite, within [-180, 180], and <= max_lon.
+  // min_lon > max_lon would describe an ANTIMERIDIAN-CROSSING box; this
+  // increment REFUSES that by name rather than silently reinterpreting
+  // the pair as a wraparound, because the two readings differ by the
+  // whole planet and only the caller knows which was meant.
+  double min_lon = 3;
+  // Eastern edge, finite, within [-180, 180].
+  double max_lon = 4;
+}
+
+// A disc around an origin. `distance <= meters` is INSIDE (the edge
+// belongs to the disc, like the bbox edges).
+message GeoRadius {
+  // Origin latitude, finite, within [-90, 90].
+  double lat = 1;
+  // Origin longitude, finite, within [-180, 180].
+  double lon = 2;
+  // Radius in METERS: finite and strictly greater than zero. Zero or
+  // negative is INVALID_ARGUMENT naming the column.
+  double meters = 3;
+  // Which distance the radius measures.
+  GeoMetric metric = 4;
+}
+
+// The distance function a radius filter or a decay stage measures with.
+enum GeoMetric {
+  // Unused zero value; refused (a filter must say what it measures).
+  GEO_METRIC_UNSPECIFIED = 0;
+  // Great-circle distance on a sphere of the WGS84 mean radius
+  // 6371008.8 m. The general-purpose choice.
+  GEO_METRIC_HAVERSINE = 1;
+  // Meters along the meridian plus meters along the parallel AT THE
+  // ORIGIN'S latitude — a LOCAL approximation for city-scale use, not a
+  // globe-scale distance (docs/geo-columns.md).
+  GEO_METRIC_MANHATTAN = 2;
 }
 
 // One range-facet count request: a numeric-ish column plus the bucket
@@ -1133,6 +1231,17 @@ enum ScoreOp {
   // correctness is unaffected, but kth_best seeding degrades to
   // unseeded for non-positive floors (floor_seed clamps at 0).
   SCORE_OP_ADD_LINEAR = 3;
+  // score *= exp(-haversine_meters((lat, lon), (origin_lat,
+  // origin_lon)) / scale): distance decay over a GEO-POINT column
+  // (docs/geo-columns.md). Reads `origin_lat`, `origin_lon`, and
+  // `scale` (meters, > 0). The multiplier lies in (0, 1], so the stage
+  // is monotone non-decreasing in the incoming score and its bound lift
+  // is identity — exactly MULT_EXP_DECAY's argument.
+  SCORE_OP_MULT_GEO_DECAY_HAVERSINE = 4;
+  // The same decay measured with the local Manhattan distance (meters
+  // along the meridian plus meters along the parallel at the ORIGIN'S
+  // latitude). A city-scale approximation, not a globe-scale distance.
+  SCORE_OP_MULT_GEO_DECAY_MANHATTAN = 5;
 }
 
 // One stage of a score-function chain.
@@ -1152,12 +1261,20 @@ message ScoreStage {
   double weight = 3;
   // Decay origin (MULT_EXP_DECAY): the value where the factor is 1.
   double origin = 4;
-  // Decay scale (MULT_EXP_DECAY): > 0, finite.
+  // Decay scale: > 0, finite. Value units for MULT_EXP_DECAY; METERS
+  // for the two MULT_GEO_DECAY_* ops.
   double scale = 5;
   // When set, `column` names a map-numeric column and the stage reads
   // its entry under this key (docs/map-columns.md); bounds lift from
   // that key's min/max metadata. Empty = plain numeric column.
   string key = 6;
+  // Decay origin latitude in degrees (MULT_GEO_DECAY_*): finite,
+  // within [-90, 90]. `column` then names a geo-point column
+  // (--geo-fields), resolved after the f64 and i64 tables.
+  double origin_lat = 7;
+  // Decay origin longitude in degrees (MULT_GEO_DECAY_*): finite,
+  // within [-180, 180].
+  double origin_lon = 8;
 }
 
 // One field's leg of a fused multi-field BM25 query.
@@ -1246,6 +1363,13 @@ message Bm25QueryResponse {
   // Range-facet counts over this shard's match set, one entry per
   // requested range facet in request order. Additive like `facets`.
   repeated RangeFacetCounts range_facets = 5;
+  // Whether this shard's geo table has each requested filter's column,
+  // parallel to `geo_filters` (empty when none were sent). A shard
+  // without the column contributed no hits through that filter — its
+  // documents hold no locations, so failing the filter is exact — but
+  // the coordinator refuses a column NO shard knows, because a typo'd
+  // filter would otherwise read as "zero results everywhere".
+  repeated bool geo_columns_known = 6;
 }
 
 // One facet value's count within one facet field.
@@ -1355,6 +1479,16 @@ message Bm25SearchRequest {
   // is refused (INVALID_ARGUMENT), as are edge lists that are not at
   // least two finite strictly ascending values.
   repeated RangeFacetField range_facet_fields = 9;
+  // Geo filters (docs/geo-columns.md), forwarded verbatim to every
+  // shard: ALL must pass, a document without a value fails every one,
+  // and a column no shard knows is refused (INVALID_ARGUMENT). Carried
+  // by the flat and the fused route; the hybrid route REFUSES them,
+  // because its vector leg has no filter machinery yet and silently
+  // filtering only the lexical half would be a lie about the result
+  // set. Facet counting (plain, map, and range) is over the match set
+  // as already defined and is NOT narrowed by these filters in this
+  // increment.
+  repeated GeoFilter geo_filters = 10;
 }
 
 // One field of a fused multi-field search.

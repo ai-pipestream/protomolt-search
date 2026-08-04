@@ -424,6 +424,19 @@ fn build_child(
             }
             t
         };
+        // Geo columns come from one list, so the derivation is the
+        // plain first-seen union (docs/geo-columns.md).
+        let geo_table: Vec<String> = {
+            let mut t: Vec<String> = Vec::new();
+            for (_, doc) in &mapped {
+                for e in &doc.geo_points {
+                    if !t.iter().any(|n| n == &e.field) {
+                        t.push(e.field.clone());
+                    }
+                }
+            }
+            t
+        };
         // Children rebuild through the disk spiller for the same reason
         // nodes do: a full-scale child's postings do not fit in heap.
         let path = crate::node::bm25_sidecar_path(tv_path);
@@ -437,13 +450,15 @@ fn build_child(
         let map_numeric_names: Vec<&str> =
             map_numeric_table.iter().map(String::as_str).collect();
         let integer_names: Vec<&str> = integer_table.iter().map(String::as_str).collect();
+        let geo_names: Vec<&str> = geo_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
             .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
             .with_facet_fields(&facet_names)
             .with_numeric_fields(&numeric_names)
             .with_map_facet_fields(&map_facet_names)
             .with_map_numeric_fields(&map_numeric_names)
-            .with_integer_fields(&integer_names);
+            .with_integer_fields(&integer_names)
+            .with_geo_fields(&geo_names);
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -555,6 +570,13 @@ fn build_child(
                     let micros = crate::node::timestamp_to_epoch_micros(&e.field, ts)
                         .map_err(|e| format!("record at child slot {local}: {}", e.message()))?;
                     builder.set_integer(ii, *local, micros);
+                }
+                for e in &doc.geo_points {
+                    let gi = geo_table
+                        .iter()
+                        .position(|n| n == &e.field)
+                        .expect("geo table was derived from these records");
+                    builder.set_geo(gi, *local, e.lat, e.lon);
                 }
             }
             i = end;

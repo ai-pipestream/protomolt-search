@@ -104,6 +104,7 @@ async fn start_fixture() -> Fixture {
                     fields: Vec::new(),
                     integers: Vec::new(),
                     timestamps: Vec::new(),
+                    geo_points: Vec::new(),
                 })
                 .await
                 .unwrap();

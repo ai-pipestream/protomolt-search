@@ -72,6 +72,7 @@ async fn add_documents_integer(
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             timestamps: Vec::new(),
+            geo_points: Vec::new(),
             integers: integers
                 .iter()
                 .map(|(field, value)| IntegerValue {
@@ -418,7 +419,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // d6 has no value, so neither is counted anywhere.
     let want = vec![range_field("citations", &EDGES)];
     let (hits, _, ranges) = coordinator
-        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &want, &[])
+        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &want, &[], &[])
         .await
         .unwrap();
     assert_eq!(hits.len(), 6);
@@ -438,7 +439,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // Counts cover the whole match set at k = 1 too: the floor bounds
     // what is surfaced, never what matched.
     let (hits_k1, _, ranges_k1) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &[], &want, &[])
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &[], &want, &[], &[])
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -447,7 +448,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // A value sitting exactly on the LAST edge lands in no bucket:
     // "vector" matches d1 (10) and d4 (30).
     let (_, _, vector_ranges) = coordinator
-        .fanout_bm25_faceted("vector", 10, None, 0.0, &[], &[], &want, &[])
+        .fanout_bm25_faceted("vector", 10, None, 0.0, &[], &[], &want, &[], &[])
         .await
         .unwrap();
     assert_eq!(
@@ -469,6 +470,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
             score_stages: Vec::new(),
             map_facet_fields: Vec::new(),
             range_facet_fields: want.clone(),
+            geo_filters: Vec::new(),
         }),
     )
     .await
@@ -485,7 +487,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         b: 0.0,
     }];
     let (_, _, fused_ranges) = coordinator
-        .fanout_bm25_fused_faceted("rust", 10, &fields, 0.0, &[], &[], &want)
+        .fanout_bm25_fused_faceted("rust", 10, &fields, 0.0, &[], &[], &want, &[])
         .await
         .unwrap();
     assert_eq!(buckets_of(&fused_ranges[0]), buckets_of(&ranges[0]));
@@ -500,6 +502,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
             &[],
             &[],
             &[range_field("citation", &EDGES)],
+            &[],
             &[],
         )
         .await
@@ -531,6 +534,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
                 &[],
                 &[range_field("citations", &edges)],
                 &[],
+                &[],
             )
             .await
             .unwrap_err();
@@ -556,6 +560,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
                 &[],
                 &[range_field("citations", &[5.0])],
                 &[],
+                &[],
             )
             .await
             .unwrap_err();
@@ -569,7 +574,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         .fanout_bm25_fused_faceted("", 10, &fields, 0.0, &[], &[], &[range_field(
             "citations",
             &[5.0],
-        )])
+        )], &[])
         .await
         .unwrap_err();
     assert_eq!(
@@ -596,6 +601,9 @@ impl NumericRead for ReaderNumerics<'_> {
     }
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
+    }
+    fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+        self.0.geo_value(gi, doc_id)
     }
 }
 
@@ -726,14 +734,16 @@ async fn distributed_integer_chain_matches_monolith() {
         weight: 1.0,
         origin: 0.0,
         scale: 0.0,
+        origin_lat: 0.0,
+        origin_lon: 0.0,
     }];
     for text in ["rust", "search rust", "vector"] {
         let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages)
+            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[])
             .await
             .unwrap();
         let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages)
+            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[])
             .await
             .unwrap();
         assert_eq!(
@@ -747,7 +757,7 @@ async fn distributed_integer_chain_matches_monolith() {
     // its base score bit for bit.
     let unchained = distributed.fanout_bm25("rust", 10, None).await.unwrap();
     let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &stages)
+        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &stages, &[])
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -818,6 +828,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             field: "filed_at".to_string(),
             value: Some(prost_types::Timestamp { seconds, nanos }),
         }],
+        geo_points: Vec::new(),
     };
     send(
         addr.clone(),
@@ -846,6 +857,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             &[],
             &[range_field("filed_at", &edges)],
             &[],
+            &[],
         )
         .await
         .unwrap();
@@ -869,6 +881,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             &[],
             &[],
             &[range_field("filed_at", &wider)],
+            &[],
             &[],
         )
         .await
@@ -959,6 +972,7 @@ async fn integer_ingest_refusals_are_loud() {
             &[],
             &[],
             &[range_field("citations", &EDGES)],
+            &[],
             &[],
         )
         .await

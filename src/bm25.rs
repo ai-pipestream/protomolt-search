@@ -15,6 +15,29 @@ use crate::postings::{Bm25Index, Posting};
 /// (the additions are gated, not forked).
 pub type ChainCtx<'a> = Option<(&'a crate::scorefn::ScoreChain, &'a dyn crate::scorefn::NumericRead)>;
 
+/// Resolved geo filters plus this shard's column read surface
+/// (`docs/geo-columns.md`); `None` = no filters, and every filtered
+/// scorer is then bit-identical to its unfiltered twin.
+///
+/// A filter only REMOVES documents. Every block-max bound therefore
+/// stays a valid upper bound over the surviving documents with no new
+/// pruning math — the argument `docs/score-functions.md` makes for the
+/// future CEL layer, applied early to the one filter family that could
+/// not wait for it. What DOES change is where the test goes: a filtered
+/// document must never reach the heap, so the test sits immediately
+/// before the floor comparison and insertion, and nowhere else. The
+/// heap's k-th best then tracks the k-th best SURVIVOR, which rises no
+/// faster than the unfiltered one, so the floor stays conservative.
+pub type FilterCtx<'a> = Option<(&'a crate::geo::GeoFilters, &'a dyn crate::scorefn::NumericRead)>;
+
+/// Whether `doc_id` survives `filter` (vacuously true with no filters).
+fn passes(filter: FilterCtx, doc_id: u32) -> bool {
+    match filter {
+        Some((f, cols)) => f.passes(doc_id, cols),
+        None => true,
+    }
+}
+
 /// Default BM25 k1 (term-frequency saturation).
 pub const DEFAULT_K1: f64 = 1.2;
 /// Default BM25 b (document-length normalization).
@@ -252,6 +275,24 @@ pub fn top_k_chained(
     k: usize,
     chain: ChainCtx,
 ) -> Vec<ScoredDoc> {
+    top_k_chained_filtered(store, terms, stats, params, k, chain, None)
+}
+
+/// [`top_k_chained`] with geo filters (`docs/geo-columns.md`): a
+/// document failing any filter is dropped BEFORE ranking, so this is
+/// the exhaustive-in-heap-shape twin of the filtered pruned scorer and
+/// its fallback. With `filter` `None`, bit-identical to
+/// [`top_k_chained`].
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_chained_filtered(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    chain: ChainCtx,
+    filter: FilterCtx,
+) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     let avgdl = stats.avgdl();
     let finish = |score: f64, doc_id: u32| match chain {
@@ -286,6 +327,7 @@ pub fn top_k_chained(
         }
         let mut docs: Vec<(u32, f64, u64)> = scores
             .into_iter()
+            .filter(|&(doc_id, _)| passes(filter, doc_id))
             .map(|(doc_id, (score, mask))| (doc_id, finish(score, doc_id), mask))
             .collect();
         sort_truncate(&mut docs, k);
@@ -323,6 +365,7 @@ pub fn top_k_chained(
         }
         let mut docs: Vec<(u32, f64, Vec<usize>)> = scores
             .into_iter()
+            .filter(|&(doc_id, _)| passes(filter, doc_id))
             .map(|(doc_id, (score, tis))| (doc_id, finish(score, doc_id), tis))
             .collect();
         sort_truncate(&mut docs, k);
@@ -363,6 +406,23 @@ pub fn top_k_exhaustive_chained(
     k: usize,
     chain: ChainCtx,
 ) -> Vec<ScoredDoc> {
+    top_k_exhaustive_chained_filtered(store, terms, stats, params, k, chain, None)
+}
+
+/// [`top_k_exhaustive_chained`] with geo filters — the exactness oracle
+/// for the filtered pruned scorer. The filter is applied at exactly one
+/// place here too (before ranking), so "pruned == exhaustive bitwise"
+/// is a statement about the same predicate on both sides.
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_exhaustive_chained_filtered(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    chain: ChainCtx,
+    filter: FilterCtx,
+) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     type TermHits = Vec<(usize, Vec<(u32, u32)>)>;
     let mut scores: std::collections::HashMap<u32, (f64, TermHits)> =
@@ -386,6 +446,7 @@ pub fn top_k_exhaustive_chained(
     }
     let mut docs: Vec<ScoredDoc> = scores
         .into_iter()
+        .filter(|&(doc_id, _)| passes(filter, doc_id))
         .map(|(doc_id, (score, term_offsets))| ScoredDoc {
             doc_id,
             score: match chain {
@@ -446,6 +507,19 @@ pub struct FusedDoc {
 /// bits. With one field at weight 1.0 the result is bit-identical to
 /// [`top_k_exhaustive`] (`1.0 * x == x` exactly).
 pub fn top_k_fused_exhaustive(fields: &[FieldQuery], k: usize) -> Vec<FusedDoc> {
+    top_k_fused_exhaustive_filtered(fields, k, None)
+}
+
+/// [`top_k_fused_exhaustive`] with geo filters (`docs/geo-columns.md`);
+/// the oracle for the filtered fused pruned scorer. The fused route
+/// carries filters for the same reason it carries range facets: the
+/// match set is the union over every leg's terms, and a filter narrows
+/// that union exactly as it narrows a single leg's.
+pub fn top_k_fused_exhaustive_filtered(
+    fields: &[FieldQuery],
+    k: usize,
+    filter: FilterCtx,
+) -> Vec<FusedDoc> {
     type Hits = Vec<(usize, usize, Vec<(u32, u32)>)>;
     let mut scores: std::collections::HashMap<u32, (f64, Hits)> = std::collections::HashMap::new();
     for (fi, fq) in fields.iter().enumerate() {
@@ -467,6 +541,7 @@ pub fn top_k_fused_exhaustive(fields: &[FieldQuery], k: usize) -> Vec<FusedDoc> 
     }
     let mut docs: Vec<FusedDoc> = scores
         .into_iter()
+        .filter(|&(doc_id, _)| passes(filter, doc_id))
         .map(|(doc_id, (score, term_offsets))| FusedDoc {
             doc_id,
             score,
@@ -631,6 +706,31 @@ pub fn top_k_pruned_chained_stats(
     chain: ChainCtx,
     prune: &mut PruneStats,
 ) -> Vec<ScoredDoc> {
+    top_k_pruned_chained_filtered_stats(store, terms, stats, params, k, floor, chain, None, prune)
+}
+
+/// [`top_k_pruned_chained_stats`] with geo filters
+/// (`docs/geo-columns.md`). The filter gates ONE thing — heap
+/// insertion — and touches no bound, no skip test, and no cursor
+/// advance: removing documents cannot invalidate an upper bound over a
+/// superset, so the whole pruning argument carries over untouched, and
+/// candidates keep being evaluated (and cursors advanced) in exactly
+/// the same order whether or not they survive. Bit-identical to
+/// [`top_k_exhaustive_chained_filtered`] with the seed filter applied;
+/// with `filter` `None`, bit-identical to
+/// [`top_k_pruned_chained_stats`].
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_pruned_chained_filtered_stats(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    floor: f64,
+    chain: ChainCtx,
+    filter: FilterCtx,
+    prune: &mut PruneStats,
+) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     let avgdl = stats.avgdl();
     // Lift a bound to the final-score scale / finish a true score.
@@ -697,7 +797,7 @@ pub fn top_k_pruned_chained_stats(
     let mut state: Vec<TermState> = Vec::new();
     if terms.len() > 128 {
         return filter_to_floor(
-            top_k_chained(store, terms, stats, params, k, chain),
+            top_k_chained_filtered(store, terms, stats, params, k, chain, filter),
             floor,
         );
     }
@@ -719,7 +819,7 @@ pub fn top_k_pruned_chained_stats(
             // Present here but no impact surface: a genuine format
             // limitation, and the only case that still forfeits pruning.
             return filter_to_floor(
-                top_k_chained(store, terms, stats, params, k, chain),
+                top_k_chained_filtered(store, terms, stats, params, k, chain, filter),
                 floor,
             );
         };
@@ -962,8 +1062,12 @@ pub fn top_k_pruned_chained_stats(
         prune.candidates_evaluated += 1;
         prune.postings_scored += touched.len() as u64;
         // Insert on the exact contract: ties at the seed survive,
-        // displacement is strictly-greater.
-        if score >= floor && (!heap_full || score > kth) {
+        // displacement is strictly-greater — and, first, the document
+        // must survive every geo filter. A filtered document is still a
+        // fully evaluated candidate (it was scored, and the counters
+        // above say so); it simply never enters the heap, and the
+        // cursor advance below runs for it unchanged.
+        if passes(filter, doc) && score >= floor && (!heap_full || score > kth) {
             if heap_full {
                 heap.pop();
             }
@@ -1061,6 +1165,20 @@ pub fn top_k_fused_pruned_stats(
     floor: f64,
     prune: &mut PruneStats,
 ) -> Vec<FusedDoc> {
+    top_k_fused_pruned_filtered_stats(fields, k, floor, None, prune)
+}
+
+/// [`top_k_fused_pruned_stats`] with geo filters
+/// (`docs/geo-columns.md`), gating heap insertion and nothing else —
+/// see [`top_k_pruned_chained_filtered_stats`] for why that is the only
+/// place a filter belongs in a block-max loop.
+pub fn top_k_fused_pruned_filtered_stats(
+    fields: &[FieldQuery],
+    k: usize,
+    floor: f64,
+    filter: FilterCtx,
+    prune: &mut PruneStats,
+) -> Vec<FusedDoc> {
     // The pinned accumulation order: oi enumerates (field id, term
     // index) lexicographically.
     let pair_meta: Vec<(usize, usize)> = fields
@@ -1074,7 +1192,7 @@ pub fn top_k_fused_pruned_stats(
             .iter()
             .any(|fq| fq.weight < 0.0 || fq.weight.is_nan())
     {
-        return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
+        return filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
     }
 
     // One cursor per scored pair. Any missing impact surface falls the
@@ -1147,7 +1265,7 @@ pub fn top_k_fused_pruned_stats(
         let Some(cursor) = fq.index.impacts(&fq.terms[ti]) else {
             // Present here but no impact surface: a genuine format
             // limitation, and the only case that still forfeits pruning.
-            return filter_fused_to_floor(top_k_fused_exhaustive(fields, k), floor);
+            return filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
         };
         let avgdl = fq.stats.avgdl();
         let widf = fq.weight * idf(fq.stats.doc_count, fq.stats.dfs[ti]);
@@ -1370,8 +1488,9 @@ pub fn top_k_fused_pruned_stats(
         prune.candidates_evaluated += 1;
         prune.postings_scored += touched.len() as u64;
         // Insert on the exact contract: ties at the seed survive,
-        // displacement is strictly-greater.
-        if score >= floor && (!heap_full || score > kth) {
+        // displacement is strictly-greater, and the document must
+        // survive every geo filter first (see the flat scorer).
+        if passes(filter, doc) && score >= floor && (!heap_full || score > kth) {
             if heap_full {
                 heap.pop();
             }

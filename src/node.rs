@@ -130,6 +130,10 @@ pub struct NodeConfig {
     /// Same rules as `facet_fields`. Timestamp ingest lands in THESE
     /// columns as epoch micros — it is sugar, not a kind.
     pub integer_fields: Vec<String>,
+    /// The geo-point column table for NEW builders
+    /// (`docs/geo-columns.md`). Same rules as `facet_fields`; the
+    /// columns geo FILTERS and distance-decay stages read.
+    pub geo_fields: Vec<String>,
     /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
     /// Requires `index_path`; the config layer defaults this on for
     /// persisted shards and off for demo shards.
@@ -167,6 +171,7 @@ impl Default for NodeConfig {
             map_facet_fields: Vec::new(),
             map_numeric_fields: Vec::new(),
             integer_fields: Vec::new(),
+            geo_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
             coalesce: true,
@@ -364,6 +369,59 @@ impl Bm25Shard {
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.integer_value(ii, doc_id),
         }
+    }
+
+    /// The geo-table index of the geo field named `name`, if the
+    /// active table has it.
+    fn geo_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.geo_index(name),
+            Bm25Shard::Spilling(s) => s.geo_index(name),
+            Bm25Shard::Resident(r) => r.geo_index(name),
+        }
+    }
+
+    /// `doc_id`'s (lat, lon) for geo field `gi`. Scoring only runs
+    /// against searchable shapes, so Spilling is unreachable.
+    fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+        match self {
+            Bm25Shard::Building(s) => s.geo_value(gi, doc_id),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.geo_value(gi, doc_id),
+        }
+    }
+
+    /// Resolve validated geo filters against THIS shard's geo table
+    /// (`docs/geo-columns.md`). A column the table lacks resolves to
+    /// `None`, which fails every document — its documents genuinely
+    /// hold no location, so "not inside the region" is the exact
+    /// answer. The coordinator refuses a column NO shard knows.
+    fn resolve_geo_filters(
+        &self,
+        filters: &[crate::pb::GeoFilter],
+        regions: &[crate::geo::GeoRegion],
+    ) -> crate::geo::GeoFilters {
+        crate::geo::GeoFilters {
+            filters: filters
+                .iter()
+                .zip(regions)
+                .map(|(f, &region)| crate::geo::GeoFilter {
+                    column: self.geo_index(&f.column),
+                    region,
+                })
+                .collect(),
+        }
+    }
+
+    /// Which requested geo filters' columns this shard's table has,
+    /// parallel to `filters`. Computed regardless of `k`, like the
+    /// facet and stage known flags: a typo must refuse even on a query
+    /// that returns nothing.
+    fn geo_columns_known(&self, filters: &[crate::pb::GeoFilter]) -> Vec<bool> {
+        filters
+            .iter()
+            .map(|f| self.geo_index(&f.column).is_some())
+            .collect()
     }
 
     /// The index of the map-facet column named `name`.
@@ -674,6 +732,16 @@ impl Bm25Shard {
             stages: specs
                 .iter()
                 .map(|(op, column, key)| {
+                    // A geo stage reads a geo-point column and nothing
+                    // else: its op carries the origin, and its bound is
+                    // identity, so there is no min/max to lift.
+                    if matches!(op, crate::scorefn::StageOp::MultGeoDecay { .. }) {
+                        return crate::scorefn::Stage {
+                            op: *op,
+                            column: self.geo_index(column).map(ColumnRef::Geo),
+                            min_max: (f64::NAN, f64::NAN),
+                        };
+                    }
                     let (column, min_max) = if key.is_empty() {
                         // f64 table first, then i64: one name space
                         // across kinds (config refuses collisions), so
@@ -801,6 +869,115 @@ pub(crate) fn validate_range_facet_fields(
     Ok(())
 }
 
+/// Refuse a (lat, lon) pair that is not a finite degree pair on the
+/// globe, naming `what`. Shared by ingest, geo filters, and geo score
+/// stages: a coordinate that cannot exist is a producer bug wherever it
+/// arrives, and the engine says so rather than clamping it onto the
+/// nearest pole.
+fn validate_lat_lon(what: &str, lat: f64, lon: f64) -> Result<(), Status> {
+    if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+        return Err(Status::invalid_argument(format!(
+            "{what}: latitude {lat} is not a finite degree in [-90, 90]"
+        )));
+    }
+    if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+        return Err(Status::invalid_argument(format!(
+            "{what}: longitude {lon} is not a finite degree in [-180, 180]"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a request's geo filters (`docs/geo-columns.md`) and resolve
+/// each one's region. Purely local — no shard state involved — so the
+/// coordinator ALSO runs it before its zero-term/k=0 early return, on
+/// the [`validate_range_facet_fields`] pattern: a malformed filter must
+/// refuse even when there is no match set to filter.
+///
+/// What it refuses, each by name and with the knob:
+///
+/// - an empty column name, or an unset `region` (a filter that filters
+///   nothing is not a filter),
+/// - coordinates that are not finite degrees on the globe,
+/// - `min_lat > max_lat`,
+/// - `min_lon > max_lon` — an ANTIMERIDIAN-CROSSING box. This
+///   increment refuses it rather than reinterpreting the pair as a
+///   wraparound: the two readings differ by the whole planet, and only
+///   the caller knows which was meant. Wraparound is future work with
+///   its own decision to make, not a default to guess.
+/// - a radius that is not a finite, strictly positive number of meters,
+///   or one whose metric is unspecified.
+pub(crate) fn validate_geo_filters(
+    filters: &[crate::pb::GeoFilter],
+) -> Result<Vec<crate::geo::GeoRegion>, Status> {
+    filters
+        .iter()
+        .map(|f| {
+            if f.column.is_empty() {
+                return Err(Status::invalid_argument(
+                    "geo filter: a filter names the geo column it reads",
+                ));
+            }
+            let named = format!("geo filter {:?}", f.column);
+            match f.region.as_ref() {
+                Some(crate::pb::geo_filter::Region::Bbox(b)) => {
+                    validate_lat_lon(&format!("{named} bbox min"), b.min_lat, b.min_lon)?;
+                    validate_lat_lon(&format!("{named} bbox max"), b.max_lat, b.max_lon)?;
+                    if b.min_lat > b.max_lat {
+                        return Err(Status::invalid_argument(format!(
+                            "{named}: min_lat {} is above max_lat {}",
+                            b.min_lat, b.max_lat
+                        )));
+                    }
+                    if b.min_lon > b.max_lon {
+                        return Err(Status::invalid_argument(format!(
+                            "{named}: min_lon {} is east of max_lon {}, which would describe \
+                             an antimeridian-crossing box. This increment REFUSES wraparound \
+                             boxes rather than guessing: send two boxes, one each side of \
+                             180 degrees, and union the results yourself.",
+                            b.min_lon, b.max_lon
+                        )));
+                    }
+                    Ok(crate::geo::GeoRegion::Bbox {
+                        min_lat: b.min_lat,
+                        max_lat: b.max_lat,
+                        min_lon: b.min_lon,
+                        max_lon: b.max_lon,
+                    })
+                }
+                Some(crate::pb::geo_filter::Region::Radius(r)) => {
+                    validate_lat_lon(&format!("{named} radius origin"), r.lat, r.lon)?;
+                    if !r.meters.is_finite() || r.meters <= 0.0 {
+                        return Err(Status::invalid_argument(format!(
+                            "{named}: radius meters {} must be finite and above zero",
+                            r.meters
+                        )));
+                    }
+                    let metric = match crate::pb::GeoMetric::try_from(r.metric) {
+                        Ok(crate::pb::GeoMetric::Haversine) => crate::geo::GeoMetric::Haversine,
+                        Ok(crate::pb::GeoMetric::Manhattan) => crate::geo::GeoMetric::Manhattan,
+                        Ok(crate::pb::GeoMetric::Unspecified) | Err(_) => {
+                            return Err(Status::invalid_argument(format!(
+                                "{named}: unknown geo metric {}",
+                                r.metric
+                            )));
+                        }
+                    };
+                    Ok(crate::geo::GeoRegion::Radius {
+                        lat: r.lat,
+                        lon: r.lon,
+                        meters: r.meters,
+                        metric,
+                    })
+                }
+                None => Err(Status::invalid_argument(format!(
+                    "{named}: no region set; a filter must name a bbox or a radius"
+                ))),
+            }
+        })
+        .collect()
+}
+
 /// Convert a `google.protobuf.Timestamp` to the epoch MICROSECONDS an
 /// i64 column stores (`docs/range-facets.md`). Timestamps are pure
 /// ingest sugar: the node does this once, the column holds plain i64,
@@ -873,6 +1050,9 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
     }
+    fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+        self.0.geo_value(gi, doc_id)
+    }
 }
 
 /// An i64 column's bound metadata on the score-chain's f64 scale. The
@@ -938,6 +1118,35 @@ fn parse_score_stages(
                     }
                     StageOp::AddLinear {
                         weight: stage.weight,
+                    }
+                }
+                Ok(op @ (crate::pb::ScoreOp::MultGeoDecayHaversine
+                | crate::pb::ScoreOp::MultGeoDecayManhattan)) => {
+                    if !(stage.scale.is_finite() && stage.scale > 0.0) {
+                        return Err(Status::invalid_argument(format!(
+                            "score stage {i}: MULT_GEO_DECAY needs a finite scale > 0 (meters)"
+                        )));
+                    }
+                    validate_lat_lon(
+                        &format!("score stage {i}"),
+                        stage.origin_lat,
+                        stage.origin_lon,
+                    )?;
+                    if !stage.key.is_empty() {
+                        return Err(Status::invalid_argument(format!(
+                            "score stage {i}: MULT_GEO_DECAY reads a geo-point column, which \
+                             has no keys; leave `key` empty"
+                        )));
+                    }
+                    StageOp::MultGeoDecay {
+                        metric: if op == crate::pb::ScoreOp::MultGeoDecayHaversine {
+                            crate::geo::GeoMetric::Haversine
+                        } else {
+                            crate::geo::GeoMetric::Manhattan
+                        },
+                        origin_lat: stage.origin_lat,
+                        origin_lon: stage.origin_lon,
+                        scale: stage.scale,
                     }
                 }
                 Ok(crate::pb::ScoreOp::Unspecified) | Err(_) => {
@@ -1568,6 +1777,7 @@ impl NodeServiceImpl {
             .iter()
             .map(String::as_str)
             .collect();
+        let geos: Vec<&str> = self.config.geo_fields.iter().map(String::as_str).collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).1);
@@ -1578,7 +1788,8 @@ impl NodeServiceImpl {
                                 .with_numeric_fields(&numerics)
                                 .with_map_facet_fields(&map_facets)
                                 .with_map_numeric_fields(&map_numerics)
-                                .with_integer_fields(&integers),
+                                .with_integer_fields(&integers)
+                                .with_geo_fields(&geos),
                         )
                     })
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
@@ -1589,7 +1800,8 @@ impl NodeServiceImpl {
                     .with_numerics(&numerics)
                     .with_map_facets(&map_facets)
                     .with_map_numerics(&map_numerics)
-                    .with_integers(&integers),
+                    .with_integers(&integers)
+                    .with_geos(&geos),
             )),
         }
     }
@@ -2166,6 +2378,7 @@ impl NodeServiceImpl {
             }
         }
         validate_range_facet_fields(&req.range_facet_fields)?;
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         // Filled inside the scoring arm (the facet walk reuses the
@@ -2173,6 +2386,12 @@ impl NodeServiceImpl {
         // every requested facet field as unknown.
         let mut facets: Vec<crate::pb::FacetFieldCounts> = Vec::new();
         let mut range_facets: Vec<crate::pb::RangeFacetCounts> = Vec::new();
+        // Computed regardless of k and of whether the shard scores, so
+        // a typo'd column refuses on the fused route too.
+        let geo_columns_known = match guard.bm25.as_ref() {
+            Some(store) => store.geo_columns_known(&req.geo_filters),
+            None => vec![false; req.geo_filters.len()],
+        };
         let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
             // Facet counting enters the arm even at k == 0 (the flat
             // path counts regardless of k; the scorers return no hits
@@ -2275,11 +2494,33 @@ impl NodeServiceImpl {
                                     || fq.index.has_impacts(t)
                             })
                     });
+                // Geo filters ride the fused route exactly as range
+                // facets do: the coordinator forwards them verbatim and
+                // the node applies them at the one place a filter
+                // belongs, before heap insertion.
+                let numeric_read = ShardNumericRead(store);
+                let geo_filters = store.resolve_geo_filters(&req.geo_filters, &geo_regions);
+                let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty() {
+                    None
+                } else {
+                    Some((&geo_filters, &numeric_read))
+                };
                 let docs = if prunable {
-                    bm25::top_k_fused_pruned(&queries, req.k as usize, floor)
+                    let mut prune = bm25::PruneStats::default();
+                    bm25::top_k_fused_pruned_filtered_stats(
+                        &queries,
+                        req.k as usize,
+                        floor,
+                        filter_ctx,
+                        &mut prune,
+                    )
                 } else {
                     bm25::filter_fused_to_floor(
-                        bm25::top_k_fused_exhaustive(&queries, req.k as usize),
+                        bm25::top_k_fused_exhaustive_filtered(
+                            &queries,
+                            req.k as usize,
+                            filter_ctx,
+                        ),
                         floor,
                     )
                 };
@@ -2342,6 +2583,7 @@ impl NodeServiceImpl {
             // The fused route refuses score stages upstream.
             stage_columns_known: Vec::new(),
             range_facets,
+            geo_columns_known,
         })
     }
 
@@ -3109,6 +3351,35 @@ impl NodeServiceImpl {
             }
             slots
         };
+        // Geo points (docs/geo-columns.md). Same refuse-before-mutating
+        // shape as the others: every entry resolves and validates before
+        // a single value is written, so a document that names one bad
+        // coordinate leaves no half-applied point behind.
+        let geo_slots: Vec<(usize, f64, f64)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<&str> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.geo_points.len());
+            for gp in &doc.geo_points {
+                if seen.contains(&gp.field.as_str()) {
+                    return Err(Status::invalid_argument(format!(
+                        "geo field {:?} repeats in one document (a document holds one point \
+                         per column)",
+                        gp.field
+                    )));
+                }
+                seen.push(&gp.field);
+                let gi = shard.geo_index(&gp.field).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "unknown geo field {:?}; this shard's geo table (--geo-fields) does \
+                         not have it",
+                        gp.field
+                    ))
+                })?;
+                validate_lat_lon(&format!("geo field {:?}", gp.field), gp.lat, gp.lon)?;
+                slots.push((gi, gp.lat, gp.lon));
+            }
+            slots
+        };
         let global_id = self.config.slot_offset + u64::from(doc_id);
         if *added == 0 {
             *first_id = global_id;
@@ -3140,6 +3411,9 @@ impl NodeServiceImpl {
                 for &(ii, value) in &integer_slots {
                     store.set_integer(ii, doc_id, value);
                 }
+                for &(gi, lat, lon) in &geo_slots {
+                    store.set_geo(gi, doc_id, lat, lon);
+                }
             }
             Bm25Shard::Spilling(builder) => {
                 builder
@@ -3159,6 +3433,9 @@ impl NodeServiceImpl {
                 }
                 for &(ii, value) in &integer_slots {
                     builder.set_integer(ii, doc_id, value);
+                }
+                for &(gi, lat, lon) in &geo_slots {
+                    builder.set_geo(gi, doc_id, lat, lon);
                 }
             }
             Bm25Shard::Resident(_) => {
@@ -4230,6 +4507,7 @@ impl NodeService for NodeServiceImpl {
         }
         let stage_specs = parse_score_stages(&req.score_stages)?;
         validate_range_facet_fields(&req.range_facet_fields)?;
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
         let params = params_from(req.k1, req.b)?;
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
@@ -4289,7 +4567,14 @@ impl NodeService for NodeServiceImpl {
         let stage_columns_known: Vec<bool> = match guard.bm25.as_ref() {
             Some(store) => stage_specs
                 .iter()
-                .map(|(_, column, key)| {
+                .map(|(op, column, key)| {
+                    // A geo stage resolves against the GEO table and
+                    // nowhere else; asking the numeric tables about it
+                    // would report a real column unknown and turn the
+                    // coordinator's typo rule into a false refusal.
+                    if matches!(op, crate::scorefn::StageOp::MultGeoDecay { .. }) {
+                        return store.geo_index(column).is_some();
+                    }
                     if key.is_empty() {
                         store.numeric_index(column).is_some()
                             || store.integer_index(column).is_some()
@@ -4302,6 +4587,14 @@ impl NodeService for NodeServiceImpl {
                 })
                 .collect(),
             None => vec![false; stage_specs.len()],
+        };
+        // Which geo columns this shard has, computed regardless of k
+        // for the same reason: a shard without the column contributes
+        // no hits through the filter (exact — its documents hold no
+        // locations), but a column NO shard knows must refuse.
+        let geo_columns_known = match guard.bm25.as_ref() {
+            Some(store) => store.geo_columns_known(&req.geo_filters),
+            None => vec![false; req.geo_filters.len()],
         };
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
@@ -4325,6 +4618,16 @@ impl NodeService for NodeServiceImpl {
                 } else {
                     Some((&chain, &numeric_read))
                 };
+                // Geo filters, resolved against this shard's geo table
+                // (docs/geo-columns.md). With no filters the ctx is
+                // None and every scorer below is bit-identical to its
+                // unfiltered form.
+                let geo_filters = store.resolve_geo_filters(&req.geo_filters, &geo_regions);
+                let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty() {
+                    None
+                } else {
+                    Some((&geo_filters, &numeric_read))
+                };
                 // Block-max path when every scored term has impacts (v5
                 // shards) and the node flag allows it; the heap store,
                 // v3/v4 files, and --block-max=false keep top_k with the
@@ -4341,7 +4644,8 @@ impl NodeService for NodeServiceImpl {
                             stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
                         });
                 let docs = if prunable {
-                    bm25::top_k_pruned_chained(
+                    let mut prune = bm25::PruneStats::default();
+                    bm25::top_k_pruned_chained_filtered_stats(
                         index,
                         &req.terms,
                         &stats,
@@ -4349,16 +4653,19 @@ impl NodeService for NodeServiceImpl {
                         req.k as usize,
                         floor,
                         chain_ctx,
+                        filter_ctx,
+                        &mut prune,
                     )
                 } else {
                     bm25::filter_to_floor(
-                        bm25::top_k_chained(
+                        bm25::top_k_chained_filtered(
                             index,
                             &req.terms,
                             &stats,
                             params,
                             req.k as usize,
                             chain_ctx,
+                            filter_ctx,
                         ),
                         floor,
                     )
@@ -4400,6 +4707,7 @@ impl NodeService for NodeServiceImpl {
             facets,
             stage_columns_known,
             range_facets,
+            geo_columns_known,
         }))
     }
 

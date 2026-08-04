@@ -59,7 +59,9 @@ const MAGIC_V6: &[u8; 8] = b"TVBM2506";
 /// NaN = absent); kinds 2 and 3 are the map columns
 /// (`docs/map-columns.md`); kind 4 is an i64 column (same three-word
 /// payload as kind 1, min/max as i64 bits → one n_slots x i64 section,
-/// `i64::MIN` = absent, `docs/range-facets.md`). An unknown kind
+/// `i64::MIN` = absent, `docs/range-facets.md`); kind 5 is a geo-point
+/// column (four bbox words + u64 vals_off → one n_slots x (f64, f64)
+/// section, both NaN = absent, `docs/geo-columns.md`). An unknown kind
 /// refuses at open by number. A store with NO declared columns still
 /// writes v6, byte-identical to every pre-facet build — the format
 /// break is opt-in per shard.
@@ -84,6 +86,13 @@ const COLUMN_KIND_MAP_F64: u8 = 3;
 /// a citation count, or an epoch-micros timestamp must come back the
 /// integer it went in as.
 const COLUMN_KIND_I64: u8 = 4;
+/// v7 column-table kind: geo-point column (`docs/geo-columns.md`), a
+/// per-slot (lat, lon) f64 pair at a fixed 16 B stride. BOTH halves NaN
+/// means absent; a half-NaN pair is refused at open as corruption,
+/// because a point with one coordinate is not a point. The table entry
+/// carries the column's bounding box (min/max lat and lon), validated
+/// against a full scan at open like every other kind's metadata.
+const COLUMN_KIND_GEO: u8 = 5;
 
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
@@ -269,6 +278,14 @@ pub const FACET_ABSENT: u32 = u32::MAX;
 /// value of the domain pays for absence; ingest refuses it explicitly
 /// rather than letting a real `i64::MIN` disappear.
 pub const INTEGER_ABSENT: i64 = i64::MIN;
+
+/// The pair marking "this document has no point" in a geo-point column
+/// (`docs/geo-columns.md`). BOTH halves are NaN: a geo column has a NaN
+/// to spend on each axis, and spending both keeps the sentinel
+/// unambiguous. A pair with exactly one NaN is neither a point nor an
+/// absence — the reader refuses it as corruption rather than guessing
+/// which half to believe.
+pub const GEO_ABSENT: (f64, f64) = (f64::NAN, f64::NAN);
 
 /// One dictionary-encoded facet column: the value dictionary in
 /// ordinal (first-seen) order, and a per-slot ordinal table parallel
@@ -487,6 +504,95 @@ impl IntStore {
     }
 }
 
+/// One geo-point column (`docs/geo-columns.md`): per-slot (lat, lon)
+/// pairs parallel to the shared slot space, BOTH NaN = the document has
+/// no point. The column's bounding box is computed at write time into
+/// the v7 column table, on the pattern kind 1 set: metadata the reader
+/// re-derives and compares, never trusts.
+///
+/// One pair per slot at a fixed 16 B stride rather than two f64
+/// columns: a point is one value, and splitting it would let a lat
+/// survive a lost lon. The absence sentinel is the pair (NaN, NaN) for
+/// the same reason — a half-NaN pair is not a sparser point, it is a
+/// corrupt one, and the reader refuses it.
+#[derive(Debug)]
+struct GeoStore {
+    /// Geo field name from the schema.
+    name: String,
+    /// Per-slot (lat, lon) ((NaN, NaN) = no value). May be shorter than
+    /// the slot count; missing trailing slots read as absent.
+    vals: Vec<(f64, f64)>,
+}
+
+impl GeoStore {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            vals: Vec::new(),
+        }
+    }
+
+    fn value(&self, slot: usize) -> Option<(f64, f64)> {
+        match self.vals.get(slot).copied() {
+            None => None,
+            Some((lat, lon)) if lat.is_nan() && lon.is_nan() => None,
+            some => some,
+        }
+    }
+
+    /// Record `doc_id`'s point. Coordinates must be finite and on the
+    /// globe (callers validate these into refusals first); one point per
+    /// (document, field), a second write panics.
+    fn set(&mut self, doc_id: u32, lat: f64, lon: f64) {
+        assert!(
+            lat.is_finite() && (-90.0..=90.0).contains(&lat),
+            "geo field {:?}: latitude {lat} is not a finite degree in [-90, 90] (doc {doc_id})",
+            self.name
+        );
+        assert!(
+            lon.is_finite() && (-180.0..=180.0).contains(&lon),
+            "geo field {:?}: longitude {lon} is not a finite degree in [-180, 180] (doc {doc_id})",
+            self.name
+        );
+        let slot = doc_id as usize;
+        if self.vals.len() <= slot {
+            self.vals.resize(slot + 1, (f64::NAN, f64::NAN));
+        }
+        assert!(
+            self.vals[slot].0.is_nan() && self.vals[slot].1.is_nan(),
+            "doc {doc_id} already has a point for geo field {:?}",
+            self.name
+        );
+        self.vals[slot] = (lat, lon);
+    }
+
+    /// The column's bounding box `(min_lat, max_lat, min_lon, max_lon)`
+    /// over present points; all four NaN when none are, the same empty
+    /// convention kind 1 uses.
+    fn bbox(&self) -> (f64, f64, f64, f64) {
+        let (mut min_lat, mut max_lat) = (f64::NAN, f64::NAN);
+        let (mut min_lon, mut max_lon) = (f64::NAN, f64::NAN);
+        for &(lat, lon) in &self.vals {
+            if lat.is_nan() && lon.is_nan() {
+                continue;
+            }
+            if min_lat.is_nan() || lat < min_lat {
+                min_lat = lat;
+            }
+            if max_lat.is_nan() || lat > max_lat {
+                max_lat = lat;
+            }
+            if min_lon.is_nan() || lon < min_lon {
+                min_lon = lon;
+            }
+            if max_lon.is_nan() || lon > max_lon {
+                max_lon = lon;
+            }
+        }
+        (min_lat, max_lat, min_lon, max_lon)
+    }
+}
+
 /// One map<string, string> column (`docs/map-columns.md`): interned
 /// key and value dictionaries plus per-slot (key_ord, value_ord) pair
 /// lists, kept sorted by key ordinal within each document. At most one
@@ -694,9 +800,11 @@ pub struct Bm25Store {
     map_facets: Vec<MapFacetStore>,
     /// map<string, f64> columns in map-numeric-id order.
     map_numerics: Vec<MapNumericStore>,
-    /// i64 columns in integer-id order. A store with no columns of any
-    /// kind persists as v6.
+    /// i64 columns in integer-id order.
     integers: Vec<IntStore>,
+    /// Geo-point columns in geo-id order (`docs/geo-columns.md`). A
+    /// store with no columns of any kind persists as v6.
+    geos: Vec<GeoStore>,
 }
 
 impl Default for Bm25Store {
@@ -710,6 +818,7 @@ impl Default for Bm25Store {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            geos: Vec::new(),
         }
     }
 }
@@ -743,6 +852,7 @@ impl Bm25Store {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            geos: Vec::new(),
         }
     }
 
@@ -892,6 +1002,51 @@ impl Bm25Store {
     /// [`IntStore::set`] for the contract (never [`INTEGER_ABSENT`]).
     pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
         self.integers[ii].set(doc_id, value);
+    }
+
+    /// Declare the geo-point column table, in geo-id order (builder
+    /// style, like [`Self::with_numerics`]). Must be called before any
+    /// document is added; a store with columns persists as v7.
+    pub fn with_geos(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "geo fields must be declared before documents are added"
+        );
+        validate_facet_names(names);
+        self.geos = names.iter().map(|n| GeoStore::new(n)).collect();
+        self
+    }
+
+    /// Number of geo fields in the geo table.
+    pub fn geo_count(&self) -> usize {
+        self.geos.len()
+    }
+
+    /// The name of geo field `gi`. Panics when out of range.
+    pub fn geo_name(&self, gi: usize) -> &str {
+        &self.geos[gi].name
+    }
+
+    /// The index of the geo field named `name`, if the table has it.
+    pub fn geo_index(&self, name: &str) -> Option<usize> {
+        self.geos.iter().position(|n| n.name == name)
+    }
+
+    /// `doc_id`'s (lat, lon) for geo field `gi`, `None` when absent.
+    pub fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+        self.geos[gi].value(doc_id as usize)
+    }
+
+    /// Geo field `gi`'s bounding box `(min_lat, max_lat, min_lon,
+    /// max_lon)` over present points; all four NaN when there are none.
+    pub fn geo_bbox(&self, gi: usize) -> (f64, f64, f64, f64) {
+        self.geos[gi].bbox()
+    }
+
+    /// Record `doc_id`'s point for geo field `gi`; see [`GeoStore::set`]
+    /// for the contract (finite degrees on the globe, one per document).
+    pub fn set_geo(&mut self, gi: usize, doc_id: u32, lat: f64, lon: f64) {
+        self.geos[gi].set(doc_id, lat, lon);
     }
 
     /// Declare the map<string, string> column table (builder style,
@@ -1470,7 +1625,8 @@ impl Bm25Store {
             || !self.numerics.is_empty()
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
-            || !self.integers.is_empty();
+            || !self.integers.is_empty()
+            || !self.geos.is_empty();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -1498,6 +1654,11 @@ impl Bm25Store {
                     .integers
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .geos
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 5)
                     .sum::<u64>()
         };
         let header_size: u64 = 8
@@ -1584,6 +1745,14 @@ impl Bm25Store {
             integer_offs.push(cursor);
             cursor += 8 * n_slots;
         }
+        // vals_off per geo column, last in table order. Kind 5 appends
+        // for the same reason kind 4 did: kinds 0 through 4 must keep
+        // byte-for-byte the geometry they already have.
+        let mut geo_offs: Vec<u64> = Vec::with_capacity(self.geos.len());
+        for _ in &self.geos {
+            geo_offs.push(cursor);
+            cursor += 16 * n_slots;
+        }
 
         w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
         write_u32(w, self.fields.len() as u32)?;
@@ -1607,7 +1776,8 @@ impl Bm25Store {
                     + self.numerics.len()
                     + self.map_facets.len()
                     + self.map_numerics.len()
-                    + self.integers.len()) as u32,
+                    + self.integers.len()
+                    + self.geos.len()) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                 write_u16(w, facet.name.len() as u16)?;
@@ -1657,6 +1827,17 @@ impl Bm25Store {
                 w.write_all(&[COLUMN_KIND_I64])?;
                 write_u64(w, min as u64)?;
                 write_u64(w, max as u64)?;
+                write_u64(w, vals_off)?;
+            }
+            for (c, &vals_off) in self.geos.iter().zip(&geo_offs) {
+                let (min_lat, max_lat, min_lon, max_lon) = c.bbox();
+                write_u16(w, c.name.len() as u16)?;
+                w.write_all(c.name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_GEO])?;
+                write_u64(w, min_lat.to_bits())?;
+                write_u64(w, max_lat.to_bits())?;
+                write_u64(w, min_lon.to_bits())?;
+                write_u64(w, max_lon.to_bits())?;
                 write_u64(w, vals_off)?;
             }
         }
@@ -1714,6 +1895,13 @@ impl Bm25Store {
                     w,
                     c.vals.get(slot).copied().unwrap_or(INTEGER_ABSENT) as u64,
                 )?;
+            }
+        }
+        for c in &self.geos {
+            for slot in 0..n_slots as usize {
+                let (lat, lon) = c.vals.get(slot).copied().unwrap_or(GEO_ABSENT);
+                write_u64(w, lat.to_bits())?;
+                write_u64(w, lon.to_bits())?;
             }
         }
         Ok(())
@@ -1850,6 +2038,7 @@ impl Bm25Store {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            geos: Vec::new(),
         }
     }
 
@@ -2567,6 +2756,7 @@ impl Bm25Store {
         // (name, n_keys, keys, offsets, pairs)
         let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
         let mut integer_metas: Vec<(String, u64)> = Vec::new();
+        let mut geo_metas: Vec<(String, u64)> = Vec::new();
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
             cursor += 4;
@@ -2615,6 +2805,10 @@ impl Bm25Store {
                     COLUMN_KIND_I64 => {
                         integer_metas.push((name, u64_at(base + 16)?));
                         cursor = base + 24;
+                    }
+                    COLUMN_KIND_GEO => {
+                        geo_metas.push((name, u64_at(base + 32)?));
+                        cursor = base + 40;
                     }
                     k => {
                         return Err(io::Error::new(
@@ -2802,6 +2996,20 @@ impl Bm25Store {
             }
             integers.push(IntStore { name, vals });
         }
+        // Geo columns (v7 only): n_slots x (f64 lat, f64 lon) at a
+        // 16 B stride, (NaN, NaN) = absent. Validation already refused a
+        // half-NaN pair, so the loader takes the bytes as they are.
+        let mut geos = Vec::with_capacity(geo_metas.len());
+        for (name, vals_off) in geo_metas {
+            let mut vals = Vec::with_capacity(n_slots);
+            for slot in 0..n_slots as u64 {
+                vals.push((
+                    f64::from_bits(u64_at(vals_off + 16 * slot)?),
+                    f64::from_bits(u64_at(vals_off + 16 * slot + 8)?),
+                ));
+            }
+            geos.push(GeoStore { name, vals });
+        }
         Ok(Self {
             fields,
             texts,
@@ -2811,6 +3019,7 @@ impl Bm25Store {
             map_facets,
             map_numerics,
             integers,
+            geos,
         })
     }
 }
@@ -2896,6 +3105,9 @@ pub struct SpillBuilder {
     /// i64 columns (8 B per slot in heap, same argument as `numerics`).
     /// Non-empty makes `finish` write v7.
     integers: Vec<IntStore>,
+    /// Geo-point columns (16 B per slot in heap). Non-empty makes
+    /// `finish` write v7.
+    geos: Vec<GeoStore>,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
@@ -2951,6 +3163,7 @@ impl SpillBuilder {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            geos: Vec::new(),
             v4_only,
         })
     }
@@ -3058,6 +3271,41 @@ impl SpillBuilder {
     /// [`IntStore::set`] for the contract.
     pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
         self.integers[ii].set(doc_id, value);
+    }
+
+    /// Declare the geo-point column table; same contract as
+    /// [`Bm25Store::with_geos`]. Must be called before any document is
+    /// added; makes `finish` write v7.
+    pub fn with_geo_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "geo fields must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.geos = names.iter().map(|n| GeoStore::new(n)).collect();
+        self
+    }
+
+    /// Number of geo fields in the geo table.
+    pub fn geo_count(&self) -> usize {
+        self.geos.len()
+    }
+
+    /// The name of geo field `gi`. Panics when out of range.
+    pub fn geo_name(&self, gi: usize) -> &str {
+        &self.geos[gi].name
+    }
+
+    /// The index of the geo field named `name`, if the table has it.
+    pub fn geo_index(&self, name: &str) -> Option<usize> {
+        self.geos.iter().position(|n| n.name == name)
+    }
+
+    /// Record `doc_id`'s point for geo field `gi`; see [`GeoStore::set`]
+    /// for the contract.
+    pub fn set_geo(&mut self, gi: usize, doc_id: u32, lat: f64, lon: f64) {
+        self.geos[gi].set(doc_id, lat, lon);
     }
 
     /// Declare the map<string, string> column table; same contract as
@@ -3402,7 +3650,8 @@ impl SpillBuilder {
             || !self.numerics.is_empty()
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
-            || !self.integers.is_empty();
+            || !self.integers.is_empty()
+            || !self.geos.is_empty();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -3430,6 +3679,11 @@ impl SpillBuilder {
                     .integers
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .geos
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 5)
                     .sum::<u64>()
         };
         let header_size: u64 = 8
@@ -3512,6 +3766,14 @@ impl SpillBuilder {
             integer_offs.push(cursor);
             cursor += 8 * n_slots;
         }
+        // vals_off per geo column, last in table order. Kind 5 appends
+        // for the same reason kind 4 did: kinds 0 through 4 must keep
+        // byte-for-byte the geometry they already have.
+        let mut geo_offs: Vec<u64> = Vec::with_capacity(self.geos.len());
+        for _ in &self.geos {
+            geo_offs.push(cursor);
+            cursor += 16 * n_slots;
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
@@ -3538,7 +3800,8 @@ impl SpillBuilder {
                         + self.numerics.len()
                         + self.map_facets.len()
                         + self.map_numerics.len()
-                        + self.integers.len()) as u32,
+                        + self.integers.len()
+                        + self.geos.len()) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                     write_u16(&mut w, facet.name.len() as u16)?;
@@ -3588,6 +3851,17 @@ impl SpillBuilder {
                     w.write_all(&[COLUMN_KIND_I64])?;
                     write_u64(&mut w, min as u64)?;
                     write_u64(&mut w, max as u64)?;
+                    write_u64(&mut w, vals_off)?;
+                }
+                for (c, &vals_off) in self.geos.iter().zip(&geo_offs) {
+                    let (min_lat, max_lat, min_lon, max_lon) = c.bbox();
+                    write_u16(&mut w, c.name.len() as u16)?;
+                    w.write_all(c.name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_GEO])?;
+                    write_u64(&mut w, min_lat.to_bits())?;
+                    write_u64(&mut w, max_lat.to_bits())?;
+                    write_u64(&mut w, min_lon.to_bits())?;
+                    write_u64(&mut w, max_lon.to_bits())?;
                     write_u64(&mut w, vals_off)?;
                 }
             }
@@ -3697,6 +3971,13 @@ impl SpillBuilder {
                         &mut w,
                         c.vals.get(slot).copied().unwrap_or(INTEGER_ABSENT) as u64,
                     )?;
+                }
+            }
+            for c in &self.geos {
+                for slot in 0..n_slots as usize {
+                    let (lat, lon) = c.vals.get(slot).copied().unwrap_or(GEO_ABSENT);
+                    write_u64(&mut w, lat.to_bits())?;
+                    write_u64(&mut w, lon.to_bits())?;
                 }
             }
             w.flush()?;
@@ -4502,6 +4783,8 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let mut map_numerics: Vec<(u32, u64, u64, u64)> = Vec::new();
     // (min_bits, max_bits, vals)
     let mut integers: Vec<(u64, u64, u64)> = Vec::new();
+    // (min_lat, max_lat, min_lon, max_lon bits, vals)
+    let mut geos: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
     if v7 {
         let n_columns = u64::from(u32_at(cursor)?);
         if n_columns == 0 {
@@ -4558,6 +4841,16 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     integers.push((u64_at(base)?, u64_at(base + 8)?, u64_at(base + 16)?));
                     cursor = base + 24;
                 }
+                COLUMN_KIND_GEO => {
+                    geos.push((
+                        u64_at(base)?,      // min_lat bits
+                        u64_at(base + 8)?,  // max_lat bits
+                        u64_at(base + 16)?, // min_lon bits
+                        u64_at(base + 24)?, // max_lon bits
+                        u64_at(base + 32)?, // vals_off
+                    ));
+                    cursor = base + 40;
+                }
                 k => {
                     return Err(invalid(format!(
                         "column {i}: kind {k} unknown to this binary"
@@ -4594,6 +4887,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         .or_else(|| map_facets.first().map(|c| c.2))
         .or_else(|| map_numerics.first().map(|c| c.1))
         .or_else(|| integers.first().map(|c| c.2))
+        .or_else(|| geos.first().map(|c| c.4))
         .unwrap_or(file_len);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
@@ -4655,6 +4949,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| map_facets.first().map(|c| c.2))
             .or_else(|| map_numerics.first().map(|c| c.1))
             .or_else(|| integers.first().map(|c| c.2))
+            .or_else(|| geos.first().map(|c| c.4))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -4690,6 +4985,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| map_facets.first().map(|c| c.2))
             .or_else(|| map_numerics.first().map(|c| c.1))
             .or_else(|| integers.first().map(|c| c.2))
+            .or_else(|| geos.first().map(|c| c.4))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -4767,6 +5063,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .map(|c| c.2)
             .or_else(|| map_numerics.first().map(|c| c.1))
             .or_else(|| integers.first().map(|c| c.2))
+            .or_else(|| geos.first().map(|c| c.4))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -4836,6 +5133,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .get(i + 1)
             .map(|c| c.1)
             .or_else(|| integers.first().map(|c| c.2))
+            .or_else(|| geos.first().map(|c| c.4))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -4907,7 +5205,11 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             )));
         }
         let group_end = vals_off + 8 * n_slots;
-        let expected_end = integers.get(i + 1).map_or(file_len, |c| c.2);
+        let expected_end = integers
+            .get(i + 1)
+            .map(|c| c.2)
+            .or_else(|| geos.first().map(|c| c.4))
+            .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "integer field {i}: vals section does not end at the next section's start"
@@ -4926,6 +5228,81 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         if min as u64 != min_bits || max as u64 != max_bits {
             return Err(invalid(format!(
                 "integer field {i}: min/max metadata disagrees with the values"
+            )));
+        }
+        expected_start = group_end;
+    }
+    // Geo groups (docs/geo-columns.md): one n_slots x (f64 lat, f64 lon)
+    // section each at a 16 B stride, tiling from the last integer group
+    // to EOF. Three things are checked per slot, and each one is a lie
+    // the reader must never repeat:
+    //
+    // - a HALF-NaN pair is corruption, not a sparser point. (NaN, NaN)
+    //   is absence and a finite pair is a point; anything between is a
+    //   value that lost half of itself, and guessing which half to
+    //   believe is exactly the silent degradation this engine refuses.
+    // - coordinates off the globe (or infinite) never survived ingest,
+    //   so finding one means the bytes are not what the writer wrote.
+    // - the table's bounding box must agree with a full scan, for the
+    //   same reason kind 1's min/max must: metadata is re-derived, never
+    //   trusted, and an empty column folds to four NaNs.
+    for (i, &(min_lat_bits, max_lat_bits, min_lon_bits, max_lon_bits, vals_off)) in
+        geos.iter().enumerate()
+    {
+        if vals_off != expected_start {
+            return Err(invalid(format!(
+                "geo field {i}: vals section does not start at the previous section's end"
+            )));
+        }
+        let group_end = vals_off + 16 * n_slots;
+        let expected_end = geos.get(i + 1).map_or(file_len, |c| c.4);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "geo field {i}: vals section does not end at the next section's start"
+            )));
+        }
+        let (mut min_lat, mut max_lat) = (f64::NAN, f64::NAN);
+        let (mut min_lon, mut max_lon) = (f64::NAN, f64::NAN);
+        for slot in 0..n_slots {
+            let lat = f64::from_bits(u64_at(vals_off + 16 * slot)?);
+            let lon = f64::from_bits(u64_at(vals_off + 16 * slot + 8)?);
+            if lat.is_nan() != lon.is_nan() {
+                return Err(invalid(format!(
+                    "geo field {i}: half-NaN coordinate pair at slot {slot} (absence is BOTH \
+                     halves NaN; one half is a point that lost the other)"
+                )));
+            }
+            if lat.is_nan() {
+                continue;
+            }
+            if !(lat.is_finite() && (-90.0..=90.0).contains(&lat))
+                || !(lon.is_finite() && (-180.0..=180.0).contains(&lon))
+            {
+                return Err(invalid(format!(
+                    "geo field {i}: coordinate ({lat}, {lon}) at slot {slot} is not a finite \
+                     degree pair on the globe"
+                )));
+            }
+            if min_lat.is_nan() || lat < min_lat {
+                min_lat = lat;
+            }
+            if max_lat.is_nan() || lat > max_lat {
+                max_lat = lat;
+            }
+            if min_lon.is_nan() || lon < min_lon {
+                min_lon = lon;
+            }
+            if max_lon.is_nan() || lon > max_lon {
+                max_lon = lon;
+            }
+        }
+        if min_lat.to_bits() != min_lat_bits
+            || max_lat.to_bits() != max_lat_bits
+            || min_lon.to_bits() != min_lon_bits
+            || max_lon.to_bits() != max_lon_bits
+        {
+            return Err(invalid(format!(
+                "geo field {i}: bounding-box metadata disagrees with the values"
             )));
         }
         expected_start = group_end;
@@ -5030,6 +5407,19 @@ struct IntegerSlice {
     vals_off: u64,
 }
 
+/// Per-geo-column read state of one open v7 file: the bounding-box
+/// metadata from the column table plus the map offset of the
+/// fixed-stride vals section, which stays on disk.
+struct GeoSlice {
+    name: String,
+    /// The column's bounding box over present points, all four NaN when
+    /// there are none (the kind-1 empty convention). Validated against a
+    /// full scan at open.
+    bbox: (f64, f64, f64, f64),
+    /// Absolute offset of the vals section (n_slots x (f64, f64)).
+    vals_off: u64,
+}
+
 pub struct Bm25Reader {
     map: memmap2::Mmap,
     /// Per-field state, field-id order; never empty. Field 0 is the
@@ -5047,6 +5437,8 @@ pub struct Bm25Reader {
     /// Per-integer-column state, integer-id order (v7 files; empty
     /// otherwise).
     integers: Vec<IntegerSlice>,
+    /// Per-geo-column state, geo-id order (v7 files; empty otherwise).
+    geos: Vec<GeoSlice>,
     /// Documents with postings in any field — the corpus-wide N (a
     /// document is a document; idf never uses a per-field count).
     doc_count: u64,
@@ -5237,6 +5629,53 @@ impl Bm25Reader {
             None
         } else {
             Some(v)
+        }
+    }
+
+    /// Number of geo fields in the geo table (0 pre-v7).
+    pub fn geo_count(&self) -> usize {
+        self.geos.len()
+    }
+
+    /// The name of geo field `gi`. Panics when out of range.
+    pub fn geo_name(&self, gi: usize) -> &str {
+        &self.geos[gi].name
+    }
+
+    /// The index of the geo field named `name`, if the table has it.
+    pub fn geo_index(&self, name: &str) -> Option<usize> {
+        self.geos.iter().position(|n| n.name == name)
+    }
+
+    /// Geo field `gi`'s bounding box `(min_lat, max_lat, min_lon,
+    /// max_lon)` from the column table's write-time metadata (validated
+    /// against a full scan at open); all four NaN when no document has a
+    /// point.
+    pub fn geo_bbox(&self, gi: usize) -> (f64, f64, f64, f64) {
+        self.geos[gi].bbox
+    }
+
+    /// `doc_id`'s (lat, lon) for geo field `gi`, `None` when absent.
+    /// One 16 B read of the mmapped fixed-stride vals section.
+    pub fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+        let geo = &self.geos[gi];
+        let slot = doc_id as usize;
+        if slot >= self.n_slots() {
+            return None;
+        }
+        let off = geo.vals_off as usize + 16 * slot;
+        let lat = f64::from_bits(u64::from_le_bytes(
+            self.map[off..off + 8].try_into().expect("8 bytes"),
+        ));
+        let lon = f64::from_bits(u64::from_le_bytes(
+            self.map[off + 8..off + 16].try_into().expect("8 bytes"),
+        ));
+        // Validation refused half-NaN pairs at open, so testing one half
+        // decides both.
+        if lat.is_nan() {
+            None
+        } else {
+            Some((lat, lon))
         }
     }
 
@@ -5440,6 +5879,7 @@ impl Bm25Reader {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            geos: Vec::new(),
             doc_count,
             lineages_off,
             text_index_off: lineages_off - 12 * n_slots as u64,
@@ -5503,6 +5943,7 @@ impl Bm25Reader {
         let mut map_facets = Vec::new();
         let mut map_numerics = Vec::new();
         let mut integers = Vec::new();
+        let mut geos = Vec::new();
         if v7 {
             // Decode a length-prefixed dictionary of `n` entries
             // starting at `off`, returning (entries, end offset).
@@ -5608,6 +6049,19 @@ impl Bm25Reader {
                         });
                         cursor = base + 24;
                     }
+                    COLUMN_KIND_GEO => {
+                        geos.push(GeoSlice {
+                            name,
+                            bbox: (
+                                f64::from_bits(u64_at(base)),
+                                f64::from_bits(u64_at(base + 8)),
+                                f64::from_bits(u64_at(base + 16)),
+                                f64::from_bits(u64_at(base + 24)),
+                            ),
+                            vals_off: u64_at(base + 32),
+                        });
+                        cursor = base + 40;
+                    }
                     k => unreachable!("validation refused unknown column kind {k}"),
                 }
             }
@@ -5623,6 +6077,7 @@ impl Bm25Reader {
             map_facets,
             map_numerics,
             integers,
+            geos,
             doc_count,
             lineages_off,
             text_index_off,

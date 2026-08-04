@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fields: Vec::new(),
             integers: Vec::new(),
             timestamps: Vec::new(),
+            geo_points: Vec::new(),
         })
         .await?;
     }
@@ -114,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_score: 0.0,
                 fields: Vec::new(),
                 range_facet_fields: Vec::new(),
+                geo_filters: Vec::new(),
             })
             .await?
             .into_inner();

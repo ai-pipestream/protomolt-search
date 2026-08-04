@@ -342,6 +342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_score: 0.0,
             fields: Vec::new(),
             range_facet_fields: Vec::new(),
+            geo_filters: Vec::new(),
         })
         .await?
         .into_inner();
@@ -375,6 +376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b: 0.0,
             }],
             range_facet_fields: Vec::new(),
+            geo_filters: Vec::new(),
         })
         .await?
         .into_inner();
@@ -417,6 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ],
             range_facet_fields: Vec::new(),
+            geo_filters: Vec::new(),
         })
         .await?
         .into_inner();
@@ -564,6 +567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_score: 0.0,
             fields,
             range_facet_fields: Vec::new(),
+            geo_filters: Vec::new(),
         })),
     };
     let body_field = || QueryField {

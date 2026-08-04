@@ -220,6 +220,11 @@ pub struct Config {
     /// exact integers past 2^53, and where Timestamp ingest lands as
     /// epoch micros. Same rules; one name space across all kinds.
     pub integer_fields: Vec<String>,
+    /// The geo-point column table for NEW shard builders
+    /// (`--geo-fields=courthouse`, docs/geo-columns.md): the columns
+    /// bbox/radius filters and distance-decay stages read. Same rules;
+    /// one name space across all kinds.
+    pub geo_fields: Vec<String>,
     /// The shard map the coordinator's `node_addrs` came from, when
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
@@ -265,6 +270,7 @@ struct FileConfig {
     map_facet_fields: Option<Vec<String>>,
     map_numeric_fields: Option<Vec<String>>,
     integer_fields: Option<Vec<String>>,
+    geo_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
     shard_map: Option<String>,
@@ -853,6 +859,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "TURBOVEC_INTEGER_FIELDS",
         &file.integer_fields,
     );
+    let geo_fields = parse_list("geo-fields", "TURBOVEC_GEO_FIELDS", &file.geo_fields);
     // One name space across all column kinds: the v7 column table
     // refuses duplicates, so the config does too, early and by name.
     {
@@ -863,6 +870,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .chain(&map_facet_fields)
             .chain(&map_numeric_fields)
             .chain(&integer_fields)
+            .chain(&geo_fields)
         {
             if all.contains(&name) {
                 return Err(format!(
@@ -907,6 +915,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         map_facet_fields,
         map_numeric_fields,
         integer_fields,
+        geo_fields,
         shard_map,
     })
 }

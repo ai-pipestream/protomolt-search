@@ -144,10 +144,25 @@ valid, and range facets with explicit half-open bucket edges over
 f64/i64/map columns, counted over the FULL match set on the ONE match
 bitmap all three facet kinds now share. No implicit tail buckets and
 no repaired edge lists: an edge list that does not describe intervals
-is refused naming the column. Queued next in the column plane: geo
-(bbox, haversine, Manhattan) — see the plan tasks; CEL filters remain
-the layer that unifies scalar and map predicates, and range FILTERS
-land with them.
+is refused naming the column. Then increment 3, the same day
+(`docs/geo-columns.md`): geo-point columns as kind 5 — one (lat, lon)
+pair per slot, both-NaN absence and a half-NaN pair refused as
+corruption, a column bounding box validated against a full scan — plus
+the engine's FIRST filter family. Bbox and radius (haversine or local
+Manhattan) filters need no new pruning math, because a filter only
+removes documents and every block-max bound is still an upper bound
+over what is left; the discipline is that the test gates heap
+insertion ONLY, never a skip test or a cursor advance. Edges are
+inside, a document without a point fails every filter, and a column NO
+shard knows is refused — the sharpest case of the typo rule, since a
+typo'd filter would otherwise read as an honest empty result set.
+Antimeridian-crossing boxes are refused by name rather than
+reinterpreted. Distance-decay stages join the chain vocabulary with a
+bound lift of 1.0, which the doc proves is the TIGHTEST sound lift
+under the absence-is-identity contract, bbox metadata notwithstanding.
+Facet counts are NOT narrowed by filters in this increment; that is
+the CEL story. CEL filters remain the layer that unifies scalar and
+map predicates, and range FILTERS land with them.
 
 ## 4. Caching
 
