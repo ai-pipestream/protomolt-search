@@ -50,6 +50,15 @@ machinery is the seam.
    service (it ships a Rust core with Python bindings; we want the Rust
    core behind a small gRPC surface, batch-oriented:
    (origins, destinations) -> cost matrix).
+   LANDED EARLY, 2026-08-03 (`sidecars/route-cost/`, PR #17): the
+   evaluation came out simpler than budgeted (CompassApp::try_from +
+   run(queries) is the whole embedding API; default-features = false
+   drops the ONNX energy stack), so the batch tool exists now,
+   smoke-tested on a self-contained downtown-Denver fixture graph.
+   Batch CLI rather than gRPC, because enrichment is batch-shaped
+   (compute offline, ingest once, the WAL replays forever). Items 2-5
+   below remain this session's work, and they are the substantial
+   part.
 2. Design the anchor set with the consumer (which fixed origins make
    "travel time to X" a useful legal-search signal).
 3. Wire the enrichment into the CourtListener pipeline: geocoded
