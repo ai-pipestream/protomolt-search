@@ -11,7 +11,7 @@ tonic = "0.12"
 prost = "0.13"
 # google.protobuf.Timestamp on the ingest wire compiles to this crate's
 # type; tonic-build emits the reference, the runtime needs the crate.
-prost-types = "0.13"
+prost-types = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
