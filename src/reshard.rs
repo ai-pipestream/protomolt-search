@@ -291,11 +291,17 @@ fn build_child(
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let dim = manifest.dim as usize;
-    let mut index = TurboQuantIndex::new_with_calibration(
-        dim,
+    // An empty manifest pair means the parent was uncalibrated; the
+    // child is then uncalibrated too, which from_parts expresses as
+    // empty TQ+ arrays.
+    let mut index = TurboQuantIndex::from_parts(
+        Some(dim),
         manifest.bit_width as usize,
-        &manifest.calibration_shift,
-        &manifest.calibration_scale,
+        0,
+        Vec::new(),
+        Vec::new(),
+        manifest.calibration_shift.clone(),
+        manifest.calibration_scale.clone(),
     )
     .map_err(|e| format!("construct child index: {e}"))?;
     let mut parent_ids = Vec::with_capacity(vectors.len());

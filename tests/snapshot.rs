@@ -43,7 +43,7 @@ fn build_image(
     scale: &[f32],
     path: &std::path::Path,
 ) -> TurboQuantIndex {
-    let mut index = TurboQuantIndex::new_with_calibration(DIM, BIT_WIDTH, shift, scale).unwrap();
+    let mut index = turbovec_search::harness::seeded_index(DIM, BIT_WIDTH, shift, scale);
     index.add(&corpus[..n * DIM]);
     index.prepare();
     index.write(path).unwrap();
@@ -133,10 +133,10 @@ async fn search_topk(
 async fn seeded_install_serves_and_persists() {
     let dir = tempdir("seeded");
     let (reference, corpus, src_tv) = build_source(&dir);
-    let (shift, scale) = reference
-        .calibration()
-        .map(|(s, c)| (s.to_vec(), c.to_vec()))
-        .unwrap();
+    let (shift, scale) = (
+        reference.tqplus_shift().to_vec(),
+        reference.tqplus_scale().to_vec(),
+    );
     let src_bm25 = build_bm25(&dir, "rust search engines");
 
     let node_tv = dir.join("shard.tv");
@@ -228,10 +228,10 @@ async fn rejects_mismatched_calibration() {
 async fn unseeded_node_adopts_snapshot_calibration() {
     let dir = tempdir("adopt");
     let (reference, corpus, src_tv) = build_source(&dir);
-    let (shift, scale) = reference
-        .calibration()
-        .map(|(s, c)| (s.to_vec(), c.to_vec()))
-        .unwrap();
+    let (shift, scale) = (
+        reference.tqplus_shift().to_vec(),
+        reference.tqplus_scale().to_vec(),
+    );
 
     let node_tv = dir.join("shard.tv");
     let (addr, handle) = common::start_empty_node(NodeConfig {
@@ -404,10 +404,10 @@ async fn replace_generation_swaps_and_survives_restart() {
 async fn flush_after_install_writes_into_generation() {
     let dir = tempdir("flush");
     let (reference, _corpus, src_tv) = build_source(&dir);
-    let (shift, scale) = reference
-        .calibration()
-        .map(|(s, c)| (s.to_vec(), c.to_vec()))
-        .unwrap();
+    let (shift, scale) = (
+        reference.tqplus_shift().to_vec(),
+        reference.tqplus_scale().to_vec(),
+    );
 
     let node_tv = dir.join("shard.tv");
     let (addr, handle) = common::start_empty_node(NodeConfig {

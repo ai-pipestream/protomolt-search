@@ -11,14 +11,14 @@ fn same_vector_same_score_across_layouts() {
     let (shift, scale) = turbovec_search::harness::fit_calibration(dim, 4, &corpus);
     let query = corpus[..dim].to_vec();
 
-    let mut big = turbovec::TurboQuantIndex::new_with_calibration(dim, 4, &shift, &scale).unwrap();
+    let mut big = turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
     big.add(&corpus);
     let big_res = big.search(&query, 12);
 
     // A 4-vector shard holding docs 8..12 of the same corpus: doc 9 lives
     // at slot 9 in the big index and slot 1 here.
     let mut small =
-        turbovec::TurboQuantIndex::new_with_calibration(dim, 4, &shift, &scale).unwrap();
+        turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
     small.add(&corpus[8 * dim..12 * dim]);
     let small_res = small.search(&query, 4);
 
@@ -53,7 +53,7 @@ fn cross_size_scores_differ_only_within_a_few_ulps() {
 
     let score_in = |vecs: &[f32], slot: i64| {
         let mut idx =
-            turbovec::TurboQuantIndex::new_with_calibration(dim, 4, &shift, &scale).unwrap();
+            turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
         idx.add(vecs);
         let res = idx.search(&query, idx.len());
         let pos = res

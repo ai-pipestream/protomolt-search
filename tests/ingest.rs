@@ -147,8 +147,12 @@ async fn unseeded_from_scratch_add_constructs_index() {
     .await;
     assert_eq!(no_dim.unwrap_err().code(), tonic::Code::FailedPrecondition);
 
-    // Supplying dim constructs an unseeded index; turbovec fits calibration
-    // from the first batch.
+    // Supplying dim constructs an unseeded index. On the
+    // explicit-calibration engine nothing fits on its own: the index
+    // stays uncalibrated (plain TurboQuant, order-independent by
+    // construction), and TQ+ arrives only through SetCalibration
+    // before the first add — which is what keeps a fleet's shards
+    // comparable on purpose instead of by first-batch accident.
     let resp = push_batches(
         &mut client,
         vec![AddVectorsRequest {
@@ -165,7 +169,11 @@ async fn unseeded_from_scratch_add_constructs_index() {
         .unwrap()
         .into_inner();
     assert_eq!(cal.dim as usize, DIM);
-    assert!(!cal.shift.is_empty(), "first batch should fit calibration");
+    assert_eq!(cal.num_vectors, 2_000);
+    assert!(
+        cal.shift.is_empty() && cal.scale.is_empty(),
+        "an unseeded index stays uncalibrated; nothing fits on its own"
+    );
 
     handle.abort();
 }
@@ -210,7 +218,7 @@ async fn flush_persists_and_reload_matches() {
     let query = unit_vectors(1, DIM, 0xA100_0002);
     let fresh = {
         let mut idx =
-            turbovec::TurboQuantIndex::new_with_calibration(DIM, 4, &shift, &scale).unwrap();
+            turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
         idx.add(&vectors);
         idx
     };

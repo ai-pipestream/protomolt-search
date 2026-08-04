@@ -91,8 +91,7 @@ async fn main() {
     println!("| coalesce | clients | total queries | wall s | QPS | mean latency ms |");
     println!("|---|---:|---:|---:|---:|---:|");
     for coalesce in [false, true] {
-        let mut index =
-            turbovec::TurboQuantIndex::new_with_calibration(dim, 4, &shift, &scale).unwrap();
+        let mut index = turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
         index.add(&corpus);
         index.prepare();
         let (addr, server) = start_node(
