@@ -1370,3 +1370,190 @@ async fn distributed_geo_decay_matches_monolith() {
     mono.abort();
     mock.abort();
 }
+
+/// The FUSED twin of the exactness gate above: on a file-backed shard
+/// (impacts present, so the fused block-max path really prunes), the
+/// filtered fused pruned scorer is bitwise identical to the filtered
+/// fused exhaustive oracle. The fused scorer has its own insertion
+/// gate, and the flat-path oracle cannot vouch for it — while "fused
+/// route plus filters over file shards" is exactly the production
+/// shape, since the distributed tests above run on heap shards whose
+/// missing impact surfaces fall the node back to the exhaustive path.
+#[test]
+fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("geo_fused_pruned_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The same corpus shape as the flat gate: term "a" everywhere with
+    // a spread of tfs, "b" on every 3rd document, "c" rare, points over
+    // a real chunk of the globe, and every 7th document pointless.
+    let n = 3000u32;
+    let tf_a = |d: u32| 1 + (u64::from(d) * 2654435761 % 7) as u32;
+    let lat = |d: u32| -60.0 + f64::from(d % 121);
+    let lon = |d: u32| -179.0 + f64::from(d % 359);
+    let mut store = Bm25Store::with_fields(&["body"]).with_geos(&["courthouse"]);
+    for doc in 0..n {
+        let mut terms = vec![("a".to_string(), tf_a(doc), Vec::new())];
+        if doc % 3 == 0 {
+            terms.push(("b".to_string(), 1 + doc % 3, Vec::new()));
+        }
+        if doc % 61 == 0 {
+            terms.push(("c".to_string(), 1, Vec::new()));
+        }
+        let len: u32 = terms.iter().map(|(_, tf, _)| tf).sum();
+        store.add_document(doc, ".".to_string(), AnalyzedDoc::body(terms, len));
+        if doc % 7 != 0 {
+            store.set_geo(0, doc, lat(doc), lon(doc));
+        }
+    }
+    let path = dir.join("geo_fused.bm25");
+    store.save(&path).unwrap();
+    let reader = Bm25Reader::open(&path).unwrap();
+    let body = reader.field(0);
+    let cols = ReaderNumerics(&reader);
+    let gi = reader.geo_index("courthouse").unwrap();
+
+    let total_doc_length: u64 = (0..n).map(|d| u64::from(tf_a(d))).sum::<u64>()
+        + (0..n)
+            .filter(|d| d % 3 == 0)
+            .map(|d| u64::from(1 + d % 3))
+            .sum::<u64>()
+        + (0..n).filter(|d| d % 61 == 0).count() as u64;
+    // Two legs over the body field with distinct term sets and non-unit
+    // weights, so the fused accumulation and its pair cursors are
+    // genuinely exercised rather than collapsing to the flat scorer.
+    let leg1_terms: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+    let leg2_terms: Vec<String> = vec!["c".to_string()];
+    let fields = vec![
+        bm25::FieldQuery {
+            index: &body,
+            terms: &leg1_terms,
+            stats: CorpusStats {
+                doc_count: u64::from(n),
+                total_doc_length,
+                dfs: vec![n, n.div_ceil(3)],
+            },
+            params: Bm25Params::default(),
+            weight: 0.75,
+        },
+        bm25::FieldQuery {
+            index: &body,
+            terms: &leg2_terms,
+            stats: CorpusStats {
+                doc_count: u64::from(n),
+                total_doc_length,
+                dfs: vec![n.div_ceil(61)],
+            },
+            params: Bm25Params::default(),
+            weight: 1.25,
+        },
+    ];
+    let signature = |docs: &[bm25::FusedDoc]| -> Vec<(u32, u64)> {
+        docs.iter().map(|d| (d.doc_id, d.score.to_bits())).collect()
+    };
+
+    for region in [
+        // Everything: only the pointless documents are removed.
+        GeoRegion::Bbox {
+            min_lat: -90.0,
+            max_lat: 90.0,
+            min_lon: -180.0,
+            max_lon: 180.0,
+        },
+        // A band that keeps a minority of the corpus.
+        GeoRegion::Bbox {
+            min_lat: 0.0,
+            max_lat: 20.0,
+            min_lon: -180.0,
+            max_lon: 0.0,
+        },
+        GeoRegion::Radius {
+            lat: 38.8977,
+            lon: -77.0365,
+            meters: 3_000_000.0,
+            metric: GeoMetric::Haversine,
+        },
+        GeoRegion::Radius {
+            lat: 0.0,
+            lon: 0.0,
+            meters: 900_000.0,
+            metric: GeoMetric::Manhattan,
+        },
+    ] {
+        let filters = GeoFilters {
+            filters: vec![turbovec_search::geo::GeoFilter {
+                column: Some(gi),
+                region,
+            }],
+        };
+        let filter_ctx = Some((&filters, &cols as &dyn NumericRead));
+        for k in [1usize, 5, 50] {
+            let exhaustive = bm25::top_k_fused_exhaustive_filtered(&fields, k, filter_ctx);
+            let mut prune = bm25::PruneStats::default();
+            let pruned = bm25::top_k_fused_pruned_filtered_stats(
+                &fields,
+                k,
+                f64::NEG_INFINITY,
+                filter_ctx,
+                &mut prune,
+            );
+            assert_eq!(
+                signature(&exhaustive),
+                signature(&pruned),
+                "k={k} {region:?}: filtered fused pruned != filtered fused exhaustive"
+            );
+            // A seeded floor must not change the answer: every returned
+            // score is >= the k-th survivor's, and the filter never
+            // raised the floor.
+            if let Some(kth) = exhaustive.last() {
+                let seeded = bm25::top_k_fused_pruned_filtered_stats(
+                    &fields,
+                    k,
+                    kth.score,
+                    filter_ctx,
+                    &mut bm25::PruneStats::default(),
+                );
+                assert_eq!(
+                    signature(&exhaustive),
+                    signature(&seeded),
+                    "k={k} {region:?}: seeded floor changed the filtered fused answer"
+                );
+            }
+            // Every survivor really is inside the region...
+            for d in &pruned {
+                let (dlat, dlon) = cols.geo_value(gi, d.doc_id).expect("survivor has a point");
+                assert!(region.contains(dlat, dlon), "survivor outside the region");
+            }
+            // ...and the filter is not vacuous.
+            let unfiltered = bm25::top_k_fused_pruned_filtered_stats(
+                &fields,
+                k,
+                f64::NEG_INFINITY,
+                None,
+                &mut bm25::PruneStats::default(),
+            );
+            assert_ne!(
+                signature(&unfiltered),
+                signature(&pruned),
+                "k={k} {region:?}: this filter removed nothing"
+            );
+        }
+    }
+
+    // With no filter the filtered entry point is bit-identical to the
+    // plain fused pruned scorer: the addition is gated, not forked.
+    for k in [1usize, 10] {
+        let plain = bm25::top_k_fused_pruned(&fields, k, f64::NEG_INFINITY);
+        let gated = bm25::top_k_fused_pruned_filtered_stats(
+            &fields,
+            k,
+            f64::NEG_INFINITY,
+            None,
+            &mut bm25::PruneStats::default(),
+        );
+        assert_eq!(signature(&plain), signature(&gated), "k={k}: ungated drift");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
