@@ -81,7 +81,7 @@ async fn mid_scan_floor_update_is_lossless() {
     let corpus = unit_vectors(N, DIM, 0x10AD_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus[..2_000 * DIM]);
     let mut index =
-        turbovec::TurboQuantIndex::new_with_calibration(DIM, 4, &shift, &scale).unwrap();
+        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
     index.add(&corpus);
     index.prepare();
 
@@ -145,7 +145,7 @@ async fn overhigh_floor_yields_fewer_hits() {
     let corpus = unit_vectors(4_096, DIM, 0x10AD_0003);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus[..1_024 * DIM]);
     let mut index =
-        turbovec::TurboQuantIndex::new_with_calibration(DIM, 4, &shift, &scale).unwrap();
+        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
     index.add(&corpus);
 
     let query = unit_vectors(1, DIM, 0x10AD_0004);
@@ -182,7 +182,7 @@ async fn concurrent_coalesced_scans_match_solo() {
     let (shift, scale) = fit_calibration(DIM, 4, &corpus[..2_000 * DIM]);
     let build = || {
         let mut index =
-            turbovec::TurboQuantIndex::new_with_calibration(DIM, 4, &shift, &scale).unwrap();
+            turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
         index.add(&corpus);
         index.prepare();
         index

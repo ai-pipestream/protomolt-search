@@ -241,7 +241,7 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
     // order O over all 12 docs determines the shard assignment below.
     let query = corpus[..DIM].to_vec();
     let mut mono_vectors =
-        turbovec::TurboQuantIndex::new_with_calibration(DIM, 4, &shift, &scale).unwrap();
+        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
     mono_vectors.add(&corpus);
     let order: Vec<usize> = mono_vectors
         .search(&query, N_DOCS)
@@ -373,7 +373,7 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
 
     let query = corpus[..DIM].to_vec();
     let mut mono_index =
-        turbovec::TurboQuantIndex::new_with_calibration(DIM, 4, &shift, &scale).unwrap();
+        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
     mono_index.add(&corpus);
     let order: Vec<usize> = mono_index
         .search(&query, N_DOCS)

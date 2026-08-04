@@ -44,27 +44,49 @@ pub fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     out
 }
 
-/// Fit a TQ+ calibration on a representative sample: build a throwaway
-/// index from the sample and read out its locked (shift, scale).
+/// Fit a TQ+ calibration on a representative sample: calibrate a
+/// throwaway index with it (upstream's explicit `calibrate`, whose fit
+/// is deterministic in the sample) and read out the committed pair.
+///
+/// Sample QUALITY is the caller's responsibility, per upstream's
+/// design: ~1024 uniformly random rows lands within half a point of a
+/// full-corpus fit, while the same count taken as a sorted prefix is
+/// catastrophically biased. There is no warm-up threshold anymore —
+/// a tiny sample fits (deterministically), it just fits noisily.
 pub fn fit_calibration(dim: usize, bit_width: usize, sample: &[f32]) -> (Vec<f32>, Vec<f32>) {
-    // Upstream turbovec fits no calibration below ~1000 vectors (TQ+
-    // warm-up): quantile estimates on fewer samples are noise. Mirror
-    // that here as an explicit identity calibration — the same coordinate
-    // system upstream serves during warm-up — but say so, because on a
-    // real corpus an identity fit means the sampling is broken.
-    let n = sample.len() / dim;
-    if n < 1000 {
-        eprintln!(
-            "fit_calibration: sample of {n} vectors is below the TQ+ warm-up \
-             threshold (1000); using identity calibration. Fine for tiny test \
-             corpora, wrong for real ones: widen the sample."
-        );
-        return (vec![0.0; dim], vec![1.0; dim]);
-    }
     let mut fitting = TurboQuantIndex::new(dim, bit_width).unwrap();
-    fitting.add(sample);
-    let (shift, scale) = fitting.calibration().expect("first add fits calibration");
-    (shift.to_vec(), scale.to_vec())
+    fitting
+        .calibrate(sample)
+        .expect("calibration sample must be non-empty finite rows");
+    (
+        fitting.tqplus_shift().to_vec(),
+        fitting.tqplus_scale().to_vec(),
+    )
+}
+
+/// An empty index committed to an externally fitted calibration pair:
+/// upstream's `from_parts` with zero rows. Every index built from the
+/// same pair encodes a given vector byte-identically regardless of
+/// build history, which is what makes per-shard scores mergeable into
+/// an exact global top-k. (This replaces the fork's former
+/// `new_with_calibration` patch; upstream #474 made the property
+/// expressible with stock API.)
+pub fn seeded_index(
+    dim: usize,
+    bit_width: usize,
+    shift: &[f32],
+    scale: &[f32],
+) -> TurboQuantIndex {
+    TurboQuantIndex::from_parts(
+        Some(dim),
+        bit_width,
+        0,
+        Vec::new(),
+        Vec::new(),
+        shift.to_vec(),
+        scale.to_vec(),
+    )
+    .expect("a fitted calibration pair is valid index parts")
 }
 
 /// One shard's index plus its global id base (the corpus offset of its
@@ -75,16 +97,13 @@ pub struct Shard {
 }
 
 /// Build `n_shards` indexes over contiguous, disjoint partitions of
-/// `corpus`, all seeded with the same calibration — the property that makes
-/// their scores mutually comparable.
+/// `corpus`, all committed to the same calibration — the property that
+/// makes their scores mutually comparable.
 ///
-/// Cuts are aligned to the engine's calibration block
-/// ([`turbovec::DEFAULT_BLOCK_SIZE`] rows): per-block calibration fits
-/// each sealed block on exactly its own rows, so distributed ==
-/// monolithic stays BITWISE only when every shard's sealed blocks hold
-/// exactly the rows the monolithic build seals together. Corpora at or
-/// under one block are unaffected (nothing seals; the seed governs
-/// every row), so small-corpus tests keep their naive cuts.
+/// Cut points are free: with one explicit global pair, codes are a
+/// pure function of (row, pair), so ANY partition of the corpus is
+/// bitwise consistent with the monolithic build. (The block-aligned
+/// cuts the per-block-calibration chain required are gone with it.)
 pub fn build_shards(
     corpus: &[f32],
     dim: usize,
@@ -95,25 +114,17 @@ pub fn build_shards(
 ) -> Vec<Shard> {
     let n = corpus.len() / dim;
     let cut = |i: usize| -> usize {
-        if i == 0 {
-            return 0;
-        }
         if i >= n_shards {
-            return n;
+            n
+        } else {
+            i * n / n_shards
         }
-        let naive = i * n / n_shards;
-        let block = turbovec::DEFAULT_BLOCK_SIZE;
-        if n <= block {
-            return naive;
-        }
-        ((naive + block / 2) / block * block).min(n)
     };
     (0..n_shards)
         .map(|i| {
             let start = cut(i);
             let end = cut(i + 1).max(start);
-            let mut index =
-                TurboQuantIndex::new_with_calibration(dim, bit_width, shift, scale).unwrap();
+            let mut index = seeded_index(dim, bit_width, shift, scale);
             index.add(&corpus[start * dim..end * dim]);
             index.prepare();
             Shard {
@@ -133,7 +144,7 @@ pub fn build_monolithic(
     shift: &[f32],
     scale: &[f32],
 ) -> TurboQuantIndex {
-    let mut index = TurboQuantIndex::new_with_calibration(dim, bit_width, shift, scale).unwrap();
+    let mut index = seeded_index(dim, bit_width, shift, scale);
     index.add(corpus);
     index.prepare();
     index

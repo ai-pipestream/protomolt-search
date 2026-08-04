@@ -1315,6 +1315,39 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
 /// already-populated index. Nonzero preexisting state marks the log as
 /// partial history, which the reshard tool refuses (a log-only replay
 /// would silently drop that state).
+/// The index's committed TQ+ pair, `None` when uncalibrated — the
+/// shape the fork's former `calibration()` getter returned, read here
+/// through upstream's explicit-calibration accessors (#474).
+fn calibration_of(index: &TurboQuantIndex) -> Option<(&[f32], &[f32])> {
+    match index.calibration_state() {
+        turbovec::CalibrationState::Calibrated => {
+            Some((index.tqplus_shift(), index.tqplus_scale()))
+        }
+        _ => None,
+    }
+}
+
+/// Construct an empty index committed to an externally supplied
+/// calibration pair (empty pair = uncalibrated), refusing invalid
+/// parts instead of panicking: this is the wire/replay construction,
+/// and the pair arrives from a request or a manifest, not from code.
+fn seeded_or_plain(
+    dim: usize,
+    bit_width: usize,
+    shift: &[f32],
+    scale: &[f32],
+) -> Result<TurboQuantIndex, turbovec::FromPartsError> {
+    TurboQuantIndex::from_parts(
+        Some(dim),
+        bit_width,
+        0,
+        Vec::new(),
+        Vec::new(),
+        shift.to_vec(),
+        scale.to_vec(),
+    )
+}
+
 fn wal_manifest(
     index: Option<&TurboQuantIndex>,
     config: &NodeConfig,
@@ -1323,7 +1356,7 @@ fn wal_manifest(
 ) -> wal::WalManifest {
     let (dim, bit_width, shift, scale) = match index {
         Some(index) => {
-            let (shift, scale) = index.calibration().unwrap_or((&[], &[]));
+            let (shift, scale) = calibration_of(index).unwrap_or((&[], &[]));
             (
                 index.dim_opt().unwrap_or(0) as u32,
                 index.bit_width() as u32,
@@ -2114,10 +2147,9 @@ impl NodeServiceImpl {
         // Calibration comparability: a shard with a locked calibration
         // (seeded or fitted) only accepts an identically calibrated image.
         if let Some(index) = guard.index.as_ref() {
-            if let Some((shift, scale)) = index.calibration() {
-                let matches = loaded
-                    .calibration()
-                    .is_some_and(|(s, c)| s == shift && c == scale);
+            if let Some((shift, scale)) = calibration_of(index) {
+                let matches =
+                    calibration_of(&loaded).is_some_and(|(s, c)| s == shift && c == scale);
                 if !matches {
                     return Err(Status::failed_precondition(
                         "snapshot calibration differs from the calibration locked on this \
@@ -2202,7 +2234,14 @@ impl NodeServiceImpl {
         let dim = req.dim as usize;
         let bit_width = req.bit_width as usize;
         let build = || {
-            TurboQuantIndex::new_with_calibration(dim, bit_width, &req.shift, &req.scale)
+            if req.shift.len() != dim || req.scale.len() != dim {
+                return Err(Status::invalid_argument(format!(
+                    "invalid calibration: shift/scale hold {}/{} values for dim {dim}",
+                    req.shift.len(),
+                    req.scale.len()
+                )));
+            }
+            seeded_or_plain(dim, bit_width, &req.shift, &req.scale)
                 .map_err(|e| Status::invalid_argument(format!("invalid calibration: {e}")))
         };
         let mut guard = self.state.write().expect("shard state lock poisoned");
@@ -2214,13 +2253,13 @@ impl NodeServiceImpl {
             Some(index) => {
                 let same = index.dim_opt() == Some(dim)
                     && index.bit_width() == bit_width
-                    && index.calibration().is_some_and(|(s, c)| {
+                    && calibration_of(index).is_some_and(|(s, c)| {
                         s == req.shift.as_slice() && c == req.scale.as_slice()
                     });
                 if same {
                     return Ok(true); // idempotent retry
                 }
-                if index.calibration().is_some() {
+                if calibration_of(index).is_some() {
                     return Err(Status::already_exists(
                         "a different calibration is already locked on this shard",
                     ));
@@ -4236,8 +4275,7 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let (dim, bit_width, num_vectors, shift, scale) = match guard.index.as_ref() {
             Some(index) => {
-                let (shift, scale) = index
-                    .calibration()
+                let (shift, scale) = calibration_of(index)
                     .map(|(s, c)| (s.to_vec(), c.to_vec()))
                     .unwrap_or_default();
                 (
@@ -4806,12 +4844,12 @@ impl NodeService for NodeServiceImpl {
                 )));
             }
             // Route global ids into this shard's live slots; the mask
-            // names slots, so it is sized to slot_capacity (== len on
-            // these append-only shards, but the mask contract is
-            // capacity). The kernel short-circuits fully-masked SIMD
-            // blocks, so a tiny allowlist costs a mask walk, not a scan.
+            // names slots and is sized to the slot count (slots are
+            // dense on the mainline engine: no capacity/len split). The
+            // kernel short-circuits fully-masked SIMD blocks, so a tiny
+            // allowlist costs a mask walk, not a scan.
             let n = index.len();
-            let mut mask = vec![false; index.slot_capacity()];
+            let mut mask = vec![false; index.len()];
             let mut allowed = 0usize;
             for &id in &req.candidate_ids {
                 if id >= offset && id - offset < n as u64 {

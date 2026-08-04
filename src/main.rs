@@ -41,14 +41,15 @@ use turbovec_search::pb::{GetCalibrationRequest, SearchRequest, SetCalibrationRe
 fn build_demo_index(demo: DemoConfig) -> Result<TurboQuantIndex, String> {
     let corpus = harness::unit_vectors(demo.vectors, demo.dim, 0xDE10_0001);
     let sample_n = (demo.vectors / 5).max(1).min(demo.vectors);
-    let mut fitting = TurboQuantIndex::new(demo.dim, demo.bit_width)
+    let mut index = TurboQuantIndex::new(demo.dim, demo.bit_width)
         .map_err(|e| format!("demo index construct: {e}"))?;
-    fitting.add(&corpus[..sample_n * demo.dim]);
-    let (shift, scale) = fitting
-        .calibration()
-        .ok_or_else(|| "calibration fitting produced nothing".to_string())?;
-    let mut index = TurboQuantIndex::new_with_calibration(demo.dim, demo.bit_width, shift, scale)
-        .map_err(|e| format!("seeded index construct: {e}"))?;
+    // Calibrate before the add (upstream's explicit pattern): the pair
+    // fits deterministically on the sample and every add encodes under
+    // it, exactly as the multi-shard deployment seeds every shard with
+    // one pair for score comparability.
+    index
+        .calibrate(&corpus[..sample_n * demo.dim])
+        .map_err(|e| format!("demo calibration fit: {e}"))?;
     index.add(&corpus);
     index.prepare();
     Ok(index)

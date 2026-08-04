@@ -5,15 +5,15 @@
 //! cluster, with every shard's terminal summary certifying a completed
 //! scan.
 //!
-//! Two cluster shapes: the seeded default cluster (one 8192-row
-//! calibration block per shard — a single batch per shard, floors moot)
-//! and an unseeded multi-block cluster (1024-row blocks, whole blocks
-//! everywhere, so per-block refits are content-identical across the
-//! sharded and monolithic builds and bitwise equality holds with no
-//! seed at all). Floor RAISES mid-scan are timing-dependent (a fast
-//! shard can finish before the first raise lands), so their volume
-//! effect is asserted only where it is deterministic: the initial
-//! floor, which binds from block 0.
+//! Two cluster shapes: the seeded default cluster (each shard under
+//! one 8192-row emission chunk — a single batch per shard, floors
+//! moot) and an unseeded multi-chunk cluster (16384 rows per shard =
+//! two emission chunks; uncalibrated indexes encode order-independently
+//! by construction on the explicit-calibration engine, so bitwise
+//! equality holds with no seed at all). Floor RAISES mid-scan are
+//! timing-dependent (a fast shard can finish before the first raise
+//! lands), so their volume effect is asserted only where it is
+//! deterministic: the initial floor, which binds from chunk 0.
 
 mod common;
 
@@ -22,25 +22,25 @@ use turbovec::TurboQuantIndex;
 use turbovec_search::coordinator::CoordinatorServiceImpl;
 use turbovec_search::node::NodeConfig;
 
-/// 1024-row calibration blocks: big enough for honest per-block fits
-/// (>= ~1000 samples), small enough that every shard holds 8 blocks and
-/// the stream carries real per-block batches.
-const BLOCK: usize = 1024;
-const SHARD_ROWS: usize = 8192;
+/// The engine's streaming emission-chunk cadence (8192 rows): shards
+/// hold two chunks each, so the stream carries real multi-batch
+/// traffic and floors can bind between batches.
+const CHUNK: usize = 8192;
+const SHARD_ROWS: usize = 2 * CHUNK;
 const N_SHARDS: usize = 3;
 const N: usize = N_SHARDS * SHARD_ROWS;
 const K: u32 = 10;
 
-/// Three unseeded shard nodes over whole 1024-row blocks, plus the
-/// monolithic reference built the same way. Whole blocks mean every
-/// sealed block's fit is a pure function of exactly the rows the
-/// monolithic build seals together, so encodings agree bitwise without
-/// any calibration seed.
-async fn multi_block_cluster() -> (Vec<String>, TurboQuantIndex) {
+/// Three unseeded shard nodes spanning two emission chunks each, plus
+/// the monolithic reference built the same way. No calibration seed is
+/// needed for bitwise agreement: an uncalibrated index is plain
+/// TurboQuant, whose encoded bytes are a pure function of the row —
+/// independent of batching, insertion order, and which shard holds it.
+async fn multi_chunk_cluster() -> (Vec<String>, TurboQuantIndex) {
     let corpus = unit_vectors(N, DIM, 0x5EED_B10C);
     let mut addrs = Vec::new();
     for shard in 0..N_SHARDS {
-        let mut index = TurboQuantIndex::with_block_size(DIM, BIT_WIDTH, BLOCK).unwrap();
+        let mut index = TurboQuantIndex::new(DIM, BIT_WIDTH).unwrap();
         index.add(&corpus[shard * SHARD_ROWS * DIM..(shard + 1) * SHARD_ROWS * DIM]);
         index.prepare();
         let (addr, _handle) = start_node(
@@ -53,7 +53,7 @@ async fn multi_block_cluster() -> (Vec<String>, TurboQuantIndex) {
         .await;
         addrs.push(addr);
     }
-    let mut monolithic = TurboQuantIndex::with_block_size(DIM, BIT_WIDTH, BLOCK).unwrap();
+    let mut monolithic = TurboQuantIndex::new(DIM, BIT_WIDTH).unwrap();
     monolithic.add(&corpus);
     monolithic.prepare();
     (addrs, monolithic)
@@ -67,7 +67,7 @@ fn bits(hits: &[turbovec_search::pb::ScoredHit]) -> Vec<(u64, u32)> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streaming_matches_monolithic_and_fanout_exactly() {
-    let (addrs, monolithic) = multi_block_cluster().await;
+    let (addrs, monolithic) = multi_chunk_cluster().await;
     let coordinator = CoordinatorServiceImpl::new(addrs);
 
     for qi in 0..6u64 {
@@ -96,8 +96,8 @@ async fn streaming_matches_monolithic_and_fanout_exactly() {
             assert!(summary.completed, "query {qi}: shard {shard} not completed");
             assert_eq!(
                 summary.blocks_scanned,
-                (SHARD_ROWS / BLOCK) as u64,
-                "query {qi}: shard {shard} block count"
+                (SHARD_ROWS / CHUNK) as u64,
+                "query {qi}: shard {shard} emission-chunk count"
             );
         }
         // The heap fills immediately (the first batch alone holds far
@@ -106,7 +106,7 @@ async fn streaming_matches_monolithic_and_fanout_exactly() {
     }
 }
 
-/// The seeded default cluster (one whole 8192-row block per shard):
+/// The seeded default cluster (every shard under one emission chunk):
 /// streaming answers bitwise-identically to the collaborative fan-out
 /// and the monolithic reference there too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -142,7 +142,7 @@ async fn streaming_matches_on_seeded_default_cluster() {
 /// emitting a fraction of the corpus.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn initial_floor_is_deterministic_and_lossless() {
-    let (addrs, _monolithic) = multi_block_cluster().await;
+    let (addrs, _monolithic) = multi_chunk_cluster().await;
     let coordinator = CoordinatorServiceImpl::new(addrs);
     let query = unit_vectors(1, DIM, 0xF100_0001);
 
@@ -181,7 +181,7 @@ async fn stream_without_start_is_refused() {
     use turbovec_search::pb::node_service_client::NodeServiceClient;
     use turbovec_search::pb::{stream_search_request, FloorUpdate, StreamSearchRequest};
 
-    let (addrs, _monolithic) = multi_block_cluster().await;
+    let (addrs, _monolithic) = multi_chunk_cluster().await;
     let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
     let outbound = tokio_stream::iter(vec![StreamSearchRequest {
         payload: Some(stream_search_request::Payload::FloorUpdate(FloorUpdate {

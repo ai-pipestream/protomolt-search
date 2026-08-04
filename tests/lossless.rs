@@ -15,11 +15,12 @@ mod common;
 use common::{monolithic_topk, unit_vectors, Cluster, BIT_WIDTH, DIM};
 use turbovec_search::coordinator::CoordinatorServiceImpl;
 
-// Three whole calibration blocks (3 x turbovec::DEFAULT_BLOCK_SIZE).
-// Under per-block calibration a sealed block refits on exactly its own
-// rows, so distributed == monolithic stays BITWISE only when every
-// shard is whole sealed blocks: a tail shard's open block would ride
-// the seed while the monolithic's tail rides its last seal's fit.
+// 24k rows across the cluster. With one explicit global calibration
+// (upstream #474) codes are a pure function of (row, pair), so
+// distributed == monolithic holds bitwise for ANY shard cuts; the
+// whole-block alignment the per-block-calibration chain needed is
+// gone. The size stays big enough that shards stream and prune for
+// real rather than degenerating into one-batch scans.
 const N: usize = 24_576;
 const K: u32 = 10;
 const QUERIES: usize = 8;
