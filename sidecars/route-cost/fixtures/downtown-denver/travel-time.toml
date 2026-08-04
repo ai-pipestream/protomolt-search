@@ -1,0 +1,58 @@
+# Travel-time routing over the downtown Denver fixture graph, for the
+# route-cost smoke tests. Speed-only traversal (posted speeds), cost =
+# trip_time, weights declared HERE so queries stay pure coordinates.
+# Paths are relative to this file, which is how routee-compass resolves
+# them.
+parallelism = 2
+
+[graph]
+vertex_list_input_file = "vertices-compass.csv.gz"
+edge_list = { input_file = "edges-compass.csv.gz" }
+
+[mapping]
+type = "edge"
+geometry.input_file = "edges-geometries-enumerated.txt.gz"
+tolerance.distance = 15.0
+tolerance.unit = "meters"
+queries_without_destinations = false
+matching_type = ["point"]
+
+[search.traversal]
+type = "combined"
+
+[[search.traversal.models]]
+type = "distance"
+distance_unit = "miles"
+
+[[search.traversal.models]]
+type = "speed"
+speed_table_input_file = "edges-posted-speed-enumerated.txt.gz"
+speed_unit = "kph"
+
+[[search.traversal.models]]
+type = "time"
+time_unit = "minutes"
+
+[cost]
+cost_aggregation = "sum"
+
+[cost.weights]
+trip_distance = 0
+trip_time = 1
+
+[cost.vehicle_rates.trip_time]
+type = "raw"
+
+[cost.vehicle_rates.trip_distance]
+type = "raw"
+
+[plugin]
+input_plugins = []
+
+[[plugin.output_plugins]]
+type = "traversal"
+route = "edge_id"
+
+[plugin.output_plugins.summary_ops]
+trip_time = "last"
+trip_distance = "last"
