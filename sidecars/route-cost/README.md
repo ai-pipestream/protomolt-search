@@ -5,7 +5,12 @@ with anchor travel times before ingest. This is work item 1 of
 `docs/plans/routing-enrichment.md` made concrete: routee-compass
 (NREL, BSD-3, https://github.com/NREL/routee-compass) embedded behind
 a small batch surface, built with `default-features = false` so the
-ONNX energy stack never comes along for travel-time work.
+ONNX energy stack never comes along for travel-time work. When
+energy-aware costs are wanted (`trip_energy` in the config), build
+with `--features energy` to pull in routee-compass's powertrain
+models; ONNX inference is already routine in this infrastructure
+(OpenVINO/Intel serve grparse), so that build is an option, not a
+hazard — it is simply not the default for travel-time matrices.
 
 ## The boundary
 

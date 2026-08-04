@@ -247,7 +247,11 @@ fn run() -> Result<u64, String> {
         let record = if let Some(err) = r.get("error") {
             failed += 1;
             json!({ "id": id, "anchor": anchor, "error": err })
-        } else if r.pointer("/route/path").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+        } else if r
+            .pointer("/route/path")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
             // Origin and destination map-matched to the same spot: the
             // route is the empty path, whose cost is the empty sum,
             // exactly zero. Not a fabrication and not a failure; the
@@ -282,13 +286,15 @@ fn run() -> Result<u64, String> {
                          number at --cost-pointer {:?}; the pointer must match what \
                          the config's summary emits. The result's traversal_summary: {}",
                         args.cost_pointer,
-                        r.pointer("/route/traversal_summary").unwrap_or(&Value::Null)
-                    ))
+                        r.pointer("/route/traversal_summary")
+                            .unwrap_or(&Value::Null)
+                    ));
                 }
             }
         };
         serde_json::to_writer(&mut w, &record).map_err(|e| format!("out {}: {e}", args.out))?;
-        w.write_all(b"\n").map_err(|e| format!("out {}: {e}", args.out))?;
+        w.write_all(b"\n")
+            .map_err(|e| format!("out {}: {e}", args.out))?;
     }
     if let Some(missing) = seen.iter().position(|s| !s) {
         return Err(format!(

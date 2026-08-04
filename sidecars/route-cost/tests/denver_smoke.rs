@@ -17,7 +17,10 @@ const V398: (f64, f64) = (39.7533464, -104.995548);
 const OUTSIDE: (f64, f64) = (39.798311884359094, -104.86796368632217);
 
 fn fixture(path: &str) -> String {
-    format!("{}/fixtures/downtown-denver/{path}", env!("CARGO_MANIFEST_DIR"))
+    format!(
+        "{}/fixtures/downtown-denver/{path}",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 fn write_inputs(dir: &std::path::Path, points: &[(&str, (f64, f64))]) -> (String, String) {
@@ -82,7 +85,11 @@ fn matrix_with_an_unroutable_point_reports_it_loudly() {
     );
 
     let records = read_records(&out);
-    assert_eq!(records.len(), 6, "3 points x 2 anchors, one record per pair");
+    assert_eq!(
+        records.len(),
+        6,
+        "3 points x 2 anchors, one record per pair"
+    );
     // Every (id, anchor) pair appears exactly once; nothing is dropped
     // and nothing is doubled.
     let mut pairs: Vec<(String, String)> = records
@@ -120,12 +127,17 @@ fn matrix_with_an_unroutable_point_reports_it_loudly() {
             assert_eq!(r["cost"], 0.0, "{r}");
             assert_eq!(r["empty_route"], true, "{r}");
         } else {
-            let cost = r["cost"].as_f64().unwrap_or_else(|| panic!("finite cost: {r}"));
+            let cost = r["cost"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("finite cost: {r}"));
             assert!(
                 cost.is_finite() && cost > 0.0,
                 "travel minutes between distinct places are positive: {r}"
             );
-            assert_eq!(r["unit"], "minutes", "the config's time_unit rides along: {r}");
+            assert_eq!(
+                r["unit"], "minutes",
+                "the config's time_unit rides along: {r}"
+            );
         }
     }
     // A real route between distinct downtown vertices takes real time.
@@ -168,7 +180,11 @@ fn malformed_inputs_refuse_before_routing() {
     )
     .unwrap();
     let points_path = dir.join("points.jsonl");
-    std::fs::write(&points_path, "{\"id\":\"doc-a\",\"lat\":39.75,\"lon\":-104.99}\n").unwrap();
+    std::fs::write(
+        &points_path,
+        "{\"id\":\"doc-a\",\"lat\":39.75,\"lon\":-104.99}\n",
+    )
+    .unwrap();
     let result = run_route_cost(
         anchors_path.to_str().unwrap(),
         points_path.to_str().unwrap(),
@@ -176,7 +192,10 @@ fn malformed_inputs_refuse_before_routing() {
     );
     assert_eq!(result.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(stderr.contains("union") && stderr.contains("repeats"), "{stderr}");
+    assert!(
+        stderr.contains("union") && stderr.contains("repeats"),
+        "{stderr}"
+    );
 
     // An impossible latitude is a producer bug, refused by name.
     let anchors_path = dir.join("bad_lat.json");
