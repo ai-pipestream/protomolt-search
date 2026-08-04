@@ -379,14 +379,43 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
     }
 }
 
+/// Zero-length terms dropped at the analysis boundary since process
+/// start (see [`analyzed_from`]). The log lines are the visibility;
+/// this counter is what keeps them bounded.
+static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Folds a response's term vectors into a single-field (body)
 /// [`AnalyzedDoc`] (term, tf, original-text offsets, and document
 /// length).
+///
+/// Zero-length terms are dropped HERE, at the one place every analysis
+/// response passes through. A token made entirely of stripped
+/// characters (invisible and format chars: zero-width spaces, soft
+/// hyphens, bidi controls, all routine in PDF- and HTML-derived text)
+/// normalizes to the empty string under `STRIP_INVISIBLE`, and the
+/// sidecar emits that as a term. An empty term is unqueryable by
+/// construction, and the index refuses it at open ("directory entry N:
+/// empty term") — the wrong moment, hours after a bulk ingest started.
+/// Dropping it at the boundary is the same document the sidecar should
+/// have produced; the dropped token contributes nothing to the
+/// document length either, exactly as if the analyzer had never
+/// emitted it.
 fn analyzed_from(response: AnalyzeResponse) -> AnalyzedDoc {
     let mut terms = crate::postings::DocTerms::new();
     let mut length = 0u32;
     for tv in response.term_vectors {
         if tv.frequency <= 0 {
+            continue;
+        }
+        if tv.term.is_empty() {
+            let n = EMPTY_TERMS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 20 || n.is_multiple_of(1_000_000) {
+                eprintln!(
+                    "analysis: dropped zero-length term (occurrence {n} this process): a \
+                     token of stripped characters; unqueryable, and refused at index open \
+                     if it were kept"
+                );
+            }
             continue;
         }
         let offsets = tv
@@ -880,6 +909,39 @@ mod tests {
             analysis_fingerprint(Some(&body_spec())),
             analysis_fingerprint(Some(&cased_body_spec())),
             "the two A/B arms must stay distinguishable on the wire"
+        );
+    }
+
+    /// A token made entirely of stripped characters normalizes to the
+    /// empty string, which the sidecar emits as a term; the boundary
+    /// drops it, and its tf never reaches the document length. The
+    /// result is exactly the document the analyzer should have
+    /// produced.
+    #[test]
+    fn zero_length_terms_are_dropped_at_the_boundary() {
+        use crate::pb::analysis::{Span, TermVector};
+        let tv = |term: &str, tf: i32| TermVector {
+            term: term.to_string(),
+            frequency: tf,
+            occurrences: vec![Span {
+                start: 0,
+                end: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let with_empty = AnalyzeResponse {
+            term_vectors: vec![tv("court", 2), tv("", 3), tv("appeal", 1)],
+            ..Default::default()
+        };
+        let without = AnalyzeResponse {
+            term_vectors: vec![tv("court", 2), tv("appeal", 1)],
+            ..Default::default()
+        };
+        assert_eq!(
+            analyzed_from(with_empty),
+            analyzed_from(without),
+            "the empty term must vanish as if the analyzer never emitted it"
         );
     }
 }
