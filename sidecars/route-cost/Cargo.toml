@@ -1,0 +1,16 @@
+[package]
+name = "route-cost"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Batch travel-cost enrichment sidecar: (anchors x points) -> cost records via routee-compass"
+license = "BSD-3-Clause"
+
+# Deliberately NOT a workspace member of turbovec-search: the engine
+# takes no routing dependency (docs/plans/routing-enrichment.md). This
+# crate builds on its own, with its own lockfile and target directory.
+
+[dependencies]
+routee-compass = { version = "0.19.5", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
