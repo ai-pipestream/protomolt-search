@@ -196,6 +196,7 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
             fields: Vec::new(),
             integers: Vec::new(),
             timestamps: Vec::new(),
+            geo_points: Vec::new(),
         })
         .await
         .unwrap();

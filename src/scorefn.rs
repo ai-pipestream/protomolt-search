@@ -38,6 +38,10 @@ pub trait NumericRead {
     /// `None` when absent. Kept i64 here and cast at the eval site so
     /// the storage stays exact and only the arithmetic is float.
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64>;
+    /// `doc_id`'s (lat, lon) in geo column `gi` (`docs/geo-columns.md`),
+    /// `None` when absent. Also the read surface geo FILTERS use — one
+    /// column read serves selection and scoring alike.
+    fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)>;
 }
 
 /// A stage's resolved column on THIS shard: a plain f64 column, an
@@ -63,6 +67,10 @@ pub enum ColumnRef {
         /// Key ordinal within that column's key dictionary.
         key_ord: u32,
     },
+    /// Index into the shard's geo table (`docs/geo-columns.md`). Only
+    /// the [`StageOp::MultGeoDecay`] ops resolve to this; the scalar
+    /// ops never see it, and it never sees them.
+    Geo(usize),
 }
 
 /// One stage's transform. Every op is monotone non-decreasing in the
@@ -92,6 +100,21 @@ pub enum StageOp {
         /// Addend weight.
         weight: f64,
     },
+    /// `score * exp(-distance_meters(origin, point) / scale)` over a
+    /// GEO-POINT column (`docs/geo-columns.md`). Factor in (0, 1], so
+    /// the stage is monotone non-decreasing in the incoming score and
+    /// its bound lift is identity — [`StageOp::MultExpDecay`]'s
+    /// argument, one dimension up.
+    MultGeoDecay {
+        /// Which distance the decay measures.
+        metric: crate::geo::GeoMetric,
+        /// Origin latitude in degrees (the point where the factor is 1).
+        origin_lat: f64,
+        /// Origin longitude in degrees.
+        origin_lon: f64,
+        /// Decay scale in METERS (> 0).
+        scale: f64,
+    },
 }
 
 /// One resolved stage: the op plus THIS shard's view of its column.
@@ -108,7 +131,9 @@ pub struct Stage {
     /// for a plain stage, the KEY's values for a map stage; NaN when
     /// missing or empty (an i64 column's metadata arrives through the
     /// same monotone `as f64` cast its values do, and its empty range
-    /// arrives as NaN). Feeds [`ScoreChain::bound`].
+    /// arrives as NaN). Feeds [`ScoreChain::bound`]. A geo stage leaves
+    /// it (NaN, NaN): its bound is identity regardless of the column's
+    /// extent, for the reason [`ScoreChain::bound`] spells out.
     pub min_max: (f64, f64),
 }
 
@@ -125,6 +150,24 @@ impl ScoreChain {
     pub fn eval(&self, score: f64, doc_id: u32, columns: &dyn NumericRead) -> f64 {
         let mut s = score;
         for stage in &self.stages {
+            // The geo ops read a PAIR, so they branch before the scalar
+            // read rather than pretending a point is one f64.
+            if let StageOp::MultGeoDecay {
+                metric,
+                origin_lat,
+                origin_lon,
+                scale,
+            } = stage.op
+            {
+                let Some(ColumnRef::Geo(gi)) = stage.column else {
+                    continue;
+                };
+                let Some((lat, lon)) = columns.geo_value(gi, doc_id) else {
+                    continue;
+                };
+                s *= (-metric.meters(origin_lat, origin_lon, lat, lon) / scale).exp();
+                continue;
+            }
             let x = match stage.column {
                 Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
                 Some(ColumnRef::Integer(ii)) => {
@@ -133,7 +176,7 @@ impl ScoreChain {
                 Some(ColumnRef::MapKey { column, key_ord }) => {
                     columns.map_value(column, key_ord, doc_id)
                 }
-                None => None,
+                Some(ColumnRef::Geo(_)) | None => None,
             };
             let Some(x) = x else {
                 continue;
@@ -142,6 +185,7 @@ impl ScoreChain {
                 StageOp::MultExpDecay { origin, scale } => s * (-((x - origin).abs()) / scale).exp(),
                 StageOp::MultLog { weight } => s * (1.0 + weight * (1.0 + x.max(0.0)).ln()),
                 StageOp::AddLinear { weight } => s + weight * x,
+                StageOp::MultGeoDecay { .. } => unreachable!("geo ops returned above"),
             };
         }
         s
@@ -158,6 +202,23 @@ impl ScoreChain {
             ub = match stage.op {
                 // Factor <= 1 everywhere and absence means 1 exactly.
                 StageOp::MultExpDecay { .. } => ub,
+                // Same, one dimension up: exp(-d/scale) <= 1 for every
+                // non-negative distance, and a document without a point
+                // passes through at exactly 1.
+                //
+                // The geo column's BOUNDING BOX cannot tighten this,
+                // and the reason is worth stating because it looks like
+                // it should. A tighter lift would be
+                // exp(-d_min(origin, bbox) / scale) — but the bound must
+                // dominate EVERY document in the block, including the
+                // ones with no point, whose factor is exactly 1. So the
+                // honest lift is max(1, exp(-d_min/scale)) = 1, for
+                // every origin and every box. Tightening needs per-block
+                // presence counts (and then per-block boxes), which is
+                // the same future optimization docs/score-functions.md
+                // already names for MULT_EXP_DECAY — not a correctness
+                // gap, and NOT something a bbox alone can buy.
+                StageOp::MultGeoDecay { .. } => ub,
                 StageOp::MultLog { weight } => {
                     let factor = if max.is_nan() {
                         1.0
@@ -186,7 +247,20 @@ mod tests {
     use super::*;
 
     struct Cols(Vec<Vec<Option<f64>>>);
+    impl Cols {
+        /// A geo read surface backed by one hard-coded column: doc 0 has
+        /// a point, doc 1 does not.
+        fn geo() -> Self {
+            Cols(Vec::new())
+        }
+    }
     impl NumericRead for Cols {
+        fn geo_value(&self, _gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+            match doc_id {
+                0 => Some((38.8977, -77.0365)),
+                _ => None,
+            }
+        }
         fn value(&self, ni: usize, doc_id: u32) -> Option<f64> {
             self.0[ni][doc_id as usize]
         }
@@ -275,6 +349,58 @@ mod tests {
         let unresolved = ScoreChain {
             stages: vec![Stage {
                 op: StageOp::MultLog { weight: 2.0 },
+                column: None,
+                min_max: (f64::NAN, f64::NAN),
+            }],
+        };
+        assert_eq!(unresolved.eval(1.5, 0, &cols), 1.5);
+        assert_eq!(unresolved.bound(1.5), 1.5);
+    }
+
+    /// The geo decay stage: hand-computed multiplier, absence as exact
+    /// identity, an unresolved geo column as identity, and the bound
+    /// lift at 1 (which is what absence forces — see `bound`).
+    #[test]
+    fn geo_decay_eval_matches_hand_computed_and_bounds_at_one() {
+        let cols = Cols::geo();
+        let stage = |metric| ScoreChain {
+            stages: vec![Stage {
+                op: StageOp::MultGeoDecay {
+                    metric,
+                    origin_lat: 38.8899,
+                    origin_lon: -77.0091,
+                    scale: 5_000.0,
+                },
+                column: Some(ColumnRef::Geo(0)),
+                min_max: (f64::NAN, f64::NAN),
+            }],
+        };
+        for metric in [crate::geo::GeoMetric::Haversine, crate::geo::GeoMetric::Manhattan] {
+            let chain = stage(metric);
+            let d = metric.meters(38.8899, -77.0091, 38.8977, -77.0365);
+            assert_eq!(
+                chain.eval(2.0, 0, &cols).to_bits(),
+                (2.0 * (-d / 5_000.0).exp()).to_bits(),
+                "{metric:?}: the multiplier is exp(-distance/scale), exactly"
+            );
+            let factor = chain.eval(2.0, 0, &cols) / 2.0;
+            assert!(factor > 0.0 && factor <= 1.0, "{metric:?}: factor {factor}");
+            assert_eq!(chain.eval(2.0, 1, &cols), 2.0, "absent = identity");
+            // The bound must dominate both documents, and it is 1.0
+            // BECAUSE doc 1 exists: absence caps the factor at identity.
+            assert_eq!(chain.bound(2.0), 2.0);
+            assert!(chain.eval(2.0, 0, &cols) <= chain.bound(2.0));
+            assert!(chain.eval(2.0, 1, &cols) <= chain.bound(2.0));
+        }
+        // A shard whose table lacks the geo column: identity everywhere.
+        let unresolved = ScoreChain {
+            stages: vec![Stage {
+                op: StageOp::MultGeoDecay {
+                    metric: crate::geo::GeoMetric::Haversine,
+                    origin_lat: 0.0,
+                    origin_lon: 0.0,
+                    scale: 1.0,
+                },
                 column: None,
                 min_max: (f64::NAN, f64::NAN),
             }],

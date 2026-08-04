@@ -128,6 +128,7 @@ async fn start_cluster(
                         fields: Vec::new(),
                         integers: Vec::new(),
                         timestamps: Vec::new(),
+                        geo_points: Vec::new(),
                     })
                     .await
                     .unwrap();

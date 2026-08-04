@@ -301,6 +301,35 @@ fn merge_range_counts(
         .collect())
 }
 
+/// Refuse a geo-filter column NO shard knows (`docs/geo-columns.md`).
+/// The same typo rule as fields, facets, chains, and range facets, and
+/// the sharpest case of it: a filter over a misspelled column would
+/// remove EVERY document on every shard and return an empty result set
+/// that looks exactly like an honest "nothing matched". A partially
+/// known column is the heterogeneous fleet and is exact — the shards
+/// without it hold documents with no location, and no location is
+/// inside no region.
+fn refuse_unknown_geo_columns(
+    filters: &[crate::pb::GeoFilter],
+    known: &[bool],
+) -> Result<(), Status> {
+    let unknown: Vec<String> = filters
+        .iter()
+        .zip(known)
+        .filter(|(_, k)| !**k)
+        .map(|(f, _)| format!("{:?}", f.column))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "no shard has geo column {}: filtering on an unknown column would remove every \
+             document and read as an empty result set. Check the spelling, or the nodes' \
+             --geo-fields.",
+            unknown.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Merged global stats for a fused multi-field query, with the per-node
 /// epochs the shares were valid at (parallel to the node list).
 struct FusedGlobals {
@@ -490,7 +519,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[], &[], &[])
+        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[], &[], &[], &[])
             .await
             .map(|(hits, _, _)| hits)
     }
@@ -518,6 +547,7 @@ impl CoordinatorServiceImpl {
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
         score_stages: &[crate::pb::ScoreStage],
+        geo_filters: &[crate::pb::GeoFilter],
     ) -> Result<FacetedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -525,6 +555,10 @@ impl CoordinatorServiceImpl {
         // validate again; this is the coordinator honoring the same
         // contract on the paths that never reach one.)
         crate::node::validate_range_facet_fields(range_facet_fields)?;
+        // Geo-filter validation is local for the same reason
+        // (docs/geo-columns.md): an antimeridian bbox or a zero radius
+        // must refuse whether or not the query has a match set.
+        crate::node::validate_geo_filters(geo_filters)?;
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
@@ -559,6 +593,7 @@ impl CoordinatorServiceImpl {
                     map_facet_fields,
                     range_facet_fields,
                     score_stages,
+                    geo_filters,
                 )
                 .await
             {
@@ -589,6 +624,7 @@ impl CoordinatorServiceImpl {
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
         score_stages: &[crate::pb::ScoreStage],
+        geo_filters: &[crate::pb::GeoFilter],
     ) -> Result<FacetedHits, Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
@@ -607,6 +643,7 @@ impl CoordinatorServiceImpl {
                 map_facet_fields: map_facet_fields.to_vec(),
                 range_facet_fields: range_facet_fields.to_vec(),
                 score_stages: score_stages.to_vec(),
+                geo_filters: geo_filters.to_vec(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -618,6 +655,7 @@ impl CoordinatorServiceImpl {
                         r.facets,
                         r.range_facets,
                         r.stage_columns_known,
+                        r.geo_columns_known,
                     )
                 })
             }));
@@ -626,13 +664,24 @@ impl CoordinatorServiceImpl {
         let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut stage_known = vec![false; score_stages.len()];
+        let mut geo_known = vec![false; geo_filters.len()];
         for task in query_tasks {
-            let (shard, hits, facets, ranges, known) = task
+            let (shard, hits, facets, ranges, known, geo) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
             shard_ranges.push(ranges);
+            if geo.len() != geo_filters.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} geo-column flags for {} filters",
+                    geo.len(),
+                    geo_filters.len()
+                )));
+            }
+            for (acc, k) in geo_known.iter_mut().zip(&geo) {
+                *acc |= *k;
+            }
             if known.len() != score_stages.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} stage-column flags for {} stages",
@@ -661,12 +710,29 @@ impl CoordinatorServiceImpl {
             })
             .collect();
         if !unknown.is_empty() {
+            // A geo decay stage reads a geo column, so pointing the
+            // caller at --numeric-fields alone would send them looking
+            // in the wrong table for a name they spelled wrong.
+            let any_geo = score_stages.iter().zip(&stage_known).any(|(s, known)| {
+                !known
+                    && matches!(
+                        crate::pb::ScoreOp::try_from(s.op),
+                        Ok(crate::pb::ScoreOp::MultGeoDecayHaversine
+                            | crate::pb::ScoreOp::MultGeoDecayManhattan)
+                    )
+            });
+            let knobs = if any_geo {
+                "--numeric-fields / --integer-fields / --map-numeric-fields / --geo-fields"
+            } else {
+                "--numeric-fields / --map-numeric-fields"
+            };
             return Err(Status::invalid_argument(format!(
                 "no shard has numeric column {}: the chain would be a silent no-op. \
-                 Check the spelling, or the nodes' --numeric-fields / --map-numeric-fields.",
+                 Check the spelling, or the nodes' {knobs}.",
                 unknown.join(", ")
             )));
         }
+        refuse_unknown_geo_columns(geo_filters, &geo_known)?;
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         all.sort_by(|(sa, a), (sb, b)| {
@@ -692,7 +758,7 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[], &[], &[])
+        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[], &[], &[], &[])
             .await
             .map(|(hits, _, _)| hits)
     }
@@ -710,10 +776,12 @@ impl CoordinatorServiceImpl {
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
+        geo_filters: &[crate::pb::GeoFilter],
     ) -> Result<FacetedHits, Status> {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
         crate::node::validate_range_facet_fields(range_facet_fields)?;
+        crate::node::validate_geo_filters(geo_filters)?;
         // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
         // route and the single-field route reach the same node scorer,
         // so when they disagree by orders of magnitude the question is
@@ -790,6 +858,7 @@ impl CoordinatorServiceImpl {
                     facet_fields,
                     map_facet_fields,
                     range_facet_fields,
+                    geo_filters,
                     trace,
                     t0,
                     t_analyzed,
@@ -938,6 +1007,7 @@ impl CoordinatorServiceImpl {
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
+        geo_filters: &[crate::pb::GeoFilter],
         trace: bool,
         t0: std::time::Instant,
         t_analyzed: std::time::Duration,
@@ -1010,6 +1080,7 @@ impl CoordinatorServiceImpl {
                 // The fused route does not carry score stages yet; the
                 // public handler refuses the combination.
                 score_stages: Vec::new(),
+                geo_filters: geo_filters.to_vec(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -1021,6 +1092,7 @@ impl CoordinatorServiceImpl {
                         r.hits,
                         r.facets,
                         r.range_facets,
+                        r.geo_columns_known,
                         started.elapsed().as_secs_f64() * 1000.0,
                     )
                 })
@@ -1030,15 +1102,27 @@ impl CoordinatorServiceImpl {
         let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut per_shard: Vec<(u32, f64)> = Vec::new();
+        let mut geo_known = vec![false; geo_filters.len()];
         for task in query_tasks {
-            let (shard, hits, facets, ranges, ms) = task
+            let (shard, hits, facets, ranges, geo, ms) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             per_shard.push((shard, ms));
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
             shard_ranges.push(ranges);
+            if geo.len() != geo_filters.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} geo-column flags for {} filters",
+                    geo.len(),
+                    geo_filters.len()
+                )));
+            }
+            for (acc, k) in geo_known.iter_mut().zip(&geo) {
+                *acc |= *k;
+            }
         }
+        refuse_unknown_geo_columns(geo_filters, &geo_known)?;
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         let t_query = t0.elapsed();
@@ -1613,6 +1697,10 @@ impl CoordinatorServiceImpl {
                     map_facet_fields: Vec::new(),
                     range_facet_fields: Vec::new(),
                     score_stages: Vec::new(),
+                    // Hybrid refuses geo filters upstream: the vector
+                    // leg has no filter machinery, and filtering only
+                    // the lexical half would misdescribe the result set.
+                    geo_filters: Vec::new(),
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -3562,6 +3650,7 @@ impl SearchService for CoordinatorServiceImpl {
                 &req.map_facet_fields,
                 &req.range_facet_fields,
                 &req.score_stages,
+                &req.geo_filters,
             )
             .await?
         } else {
@@ -3594,6 +3683,7 @@ impl SearchService for CoordinatorServiceImpl {
                 &req.facet_fields,
                 &req.map_facet_fields,
                 &req.range_facet_fields,
+                &req.geo_filters,
             )
             .await?
         };

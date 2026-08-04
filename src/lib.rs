@@ -31,6 +31,7 @@ pub mod coordinator;
 pub mod court;
 pub mod dataset;
 pub mod fusion;
+pub mod geo;
 pub mod harness;
 pub mod interleave;
 pub mod merge;

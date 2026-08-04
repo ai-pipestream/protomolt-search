@@ -68,6 +68,7 @@ async fn add_documents_numeric(
                 .collect(),
             integers: Vec::new(),
             timestamps: Vec::new(),
+            geo_points: Vec::new(),
         })
         .await
         .unwrap();
@@ -118,6 +119,8 @@ fn decay_stage(origin: f64, scale: f64) -> ScoreStage {
         weight: 0.0,
         origin,
         scale,
+        origin_lat: 0.0,
+        origin_lon: 0.0,
     }
 }
 
@@ -229,6 +232,9 @@ impl NumericRead for ReaderNumerics<'_> {
     }
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
+    }
+    fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
+        self.0.geo_value(gi, doc_id)
     }
 }
 
@@ -355,11 +361,11 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     let stages = vec![decay_stage(300.0, 100.0)];
     for text in ["rust", "search rust", "vector"] {
         let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
             .await
             .unwrap();
         let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages)
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
             .await
             .unwrap();
         assert_eq!(
@@ -373,7 +379,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     // decayed toward date=300, d2 (factor 1) climbs above d0 (e^-2).
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
     let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[])
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -410,6 +416,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
             facet_fields: Vec::new(),
             score_stages: stages.clone(),
             range_facet_fields: Vec::new(),
+            geo_filters: Vec::new(),
         }),
     )
     .await
@@ -439,7 +446,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ..decay_stage(300.0, 100.0)
     }];
     let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo)
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[])
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -466,6 +473,8 @@ async fn stage_and_ingest_refusals_are_loud() {
                 weight: -1.0,
                 origin: 0.0,
                 scale: 0.0,
+                origin_lat: 0.0,
+                origin_lon: 0.0,
             },
             "weight >= 0",
         ),
@@ -477,12 +486,14 @@ async fn stage_and_ingest_refusals_are_loud() {
                 weight: 0.0,
                 origin: 0.0,
                 scale: 0.0,
+                origin_lat: 0.0,
+                origin_lon: 0.0,
             },
             "unknown op",
         ),
     ] {
         let err = coordinator
-            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &[bad])
+            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &[bad], &[])
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
@@ -512,6 +523,7 @@ async fn stage_and_ingest_refusals_are_loud() {
             facet_fields: Vec::new(),
             score_stages: vec![decay_stage(300.0, 100.0)],
             range_facet_fields: Vec::new(),
+            geo_filters: Vec::new(),
         }),
     )
     .await

@@ -725,6 +725,7 @@ mod tests {
                 fields: Vec::new(),
                 integers: Vec::new(),
                 timestamps: Vec::new(),
+                geo_points: Vec::new(),
             }],
         })
     }

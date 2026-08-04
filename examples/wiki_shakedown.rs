@@ -86,6 +86,7 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
                 fields: Vec::new(),
                 integers: Vec::new(),
                 timestamps: Vec::new(),
+                geo_points: Vec::new(),
             })
             .await
             .unwrap();

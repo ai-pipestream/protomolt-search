@@ -39,6 +39,7 @@ async fn add_documents(addr: &str, texts: &[&str]) {
             fields: Vec::new(),
             integers: Vec::new(),
             timestamps: Vec::new(),
+            geo_points: Vec::new(),
         })
         .await
         .unwrap();

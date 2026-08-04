@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fields: Vec::new(),
         expected_stats_epoch: 0,
         range_facet_fields: Vec::new(),
+        geo_filters: Vec::new(),
     };
     // Exactly what `fanout_bm25_fused` sends: the per-field stats move
     // into the leg and the flat fields go empty.
@@ -98,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // epoch claim.
         expected_stats_epoch: 0,
         range_facet_fields: Vec::new(),
+        geo_filters: Vec::new(),
     };
 
     println!("{node}  terms {terms:?}  k={k}");

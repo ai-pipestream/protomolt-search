@@ -435,6 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                         integers: Vec::new(),
                         timestamps: Vec::new(),
+                        geo_points: Vec::new(),
                     })
                     .await
                     .unwrap();
@@ -773,6 +774,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                         fields,
                         integers: Vec::new(),
                         timestamps: Vec::new(),
+                        geo_points: Vec::new(),
                     })
                     .map_err(|e| e.to_string())?;
                     sent += 1;
