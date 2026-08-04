@@ -519,6 +519,12 @@ impl CoordinatorServiceImpl {
         range_facet_fields: &[crate::pb::RangeFacetField],
         score_stages: &[crate::pb::ScoreStage],
     ) -> Result<FacetedHits, Status> {
+        // Edge-list validation needs no shard, so it must not hide
+        // behind the zero-term early return below: a malformed request
+        // refuses even when there is no match set to count. (The nodes
+        // validate again; this is the coordinator honoring the same
+        // contract on the paths that never reach one.)
+        crate::node::validate_range_facet_fields(range_facet_fields)?;
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
@@ -705,6 +711,9 @@ impl CoordinatorServiceImpl {
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
     ) -> Result<FacetedHits, Status> {
+        // Same rule as fanout_bm25_faceted: edge-list validation needs
+        // no shard, so it runs before the all-legs-empty early return.
+        crate::node::validate_range_facet_fields(range_facet_fields)?;
         // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
         // route and the single-field route reach the same node scorer,
         // so when they disagree by orders of magnitude the question is

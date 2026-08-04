@@ -108,6 +108,9 @@ The bucket rules are stated once and enforced everywhere:
   describes no interval, a non-finite edge makes the comparison
   meaningless, and an unsorted list would answer for intervals that
   were never requested. Nothing here is repaired, sorted, or deduped.
+  Edge validation needs no shard state, so the coordinator runs it
+  BEFORE its zero-term/k=0 early return and the nodes run it again: a
+  malformed list refuses even when there is no match set to count.
 
 Column resolution follows the same order the score stages use: no
 `key` means the f64 table then the i64 table; a `key` means a

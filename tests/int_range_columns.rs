@@ -287,6 +287,120 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Stores that declare SOME column kinds and skip the middle ones. The
+/// validator locates each kind group's end by falling through the
+/// ABSENT kinds to the next declared group's start, and each skip is a
+/// distinct fallback branch a full-kind store never takes: with every
+/// kind present the facet group ends at the numeric group, never at
+/// the integers. One case per skip boundary into the integer section,
+/// with dual-writer identity pinning both writers' offset arithmetic
+/// on the same partial layouts. Open runs full validation, so opening
+/// IS the tiling assertion.
+#[test]
+fn partial_kind_stores_tile_and_validate() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("partial_kinds_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let analyzed = || {
+        AnalyzedDoc::body(
+            vec![("rust".to_string(), 1u32, vec![(0u32, 4u32)])],
+            1,
+        )
+    };
+    // (case, facets, numerics, map facets): integers always present,
+    // so the cases pin facets->integers, numerics->integers, and
+    // map-facets->integers respectively. map-numerics->integers is
+    // pinned by the all-kinds store above.
+    for (case, facets, numerics, map_facets) in [
+        ("facets_int", true, false, false),
+        ("numerics_int", false, true, false),
+        ("mapfacets_int", false, false, true),
+    ] {
+        let mut store = Bm25Store::with_fields(&["body"]);
+        if facets {
+            store = store.with_facets(&["court"]);
+        }
+        if numerics {
+            store = store.with_numerics(&["date"]);
+        }
+        if map_facets {
+            store = store.with_map_facets(&["meta"]);
+        }
+        let mut store = store.with_integers(&["citations"]);
+        store.add_document(0, "doc".to_string(), analyzed());
+        if facets {
+            store.set_facet(0, 0, "scotus");
+        }
+        if numerics {
+            store.set_numeric(0, 0, 1.5);
+        }
+        if map_facets {
+            store.set_map_facet(0, 0, "color", "red");
+        }
+        store.set_integer(0, 0, 7);
+        let path = dir.join(format!("{case}.bm25"));
+        store.save(&path).unwrap();
+
+        let mut builder =
+            SpillBuilder::create_with_fields(&dir.join(format!("{case}.build")), &["body"])
+                .unwrap();
+        if facets {
+            builder = builder.with_facet_fields(&["court"]);
+        }
+        if numerics {
+            builder = builder.with_numeric_fields(&["date"]);
+        }
+        if map_facets {
+            builder = builder.with_map_facet_fields(&["meta"]);
+        }
+        let mut builder = builder.with_integer_fields(&["citations"]);
+        builder
+            .add_document_with_lineage(0, "doc".to_string(), analyzed(), None)
+            .unwrap();
+        if facets {
+            builder.set_facet(0, 0, "scotus");
+        }
+        if numerics {
+            builder.set_numeric(0, 0, 1.5);
+        }
+        if map_facets {
+            builder.set_map_facet(0, 0, "color", "red");
+        }
+        builder.set_integer(0, 0, 7);
+        let spill_path = dir.join(format!("{case}_spill.bm25"));
+        builder.finish(&spill_path).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&spill_path).unwrap(),
+            "{case}: dual writers must agree on partial-kind layouts too"
+        );
+
+        let r = Bm25Reader::open(&path).unwrap_or_else(|e| panic!("{case}: {e}"));
+        assert_eq!(r.integer_value(0, 0), Some(7), "{case}");
+        assert_eq!(r.integer_min_max(0), (7, 7), "{case}");
+        if facets {
+            assert_eq!(
+                r.facet_ord(0, 0).map(|o| r.facet_value(0, o)),
+                Some("scotus"),
+                "{case}"
+            );
+        }
+        if numerics {
+            assert_eq!(r.numeric_value(0, 0), Some(1.5), "{case}");
+        }
+        if map_facets {
+            let ci = r.map_facet_index("meta").unwrap();
+            let key = r.map_facet_key_ord(ci, "color").unwrap();
+            assert_eq!(
+                r.map_facet_value_ord(ci, key, 0).map(|o| r.map_facet_value(ci, o)),
+                Some("red"),
+                "{case}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Distributed range facets: exact over the full match set, additive
 /// across a fleet where one shard lacks the column, unchanged by k, and
 /// answering the boundary rules the edge list promises.
@@ -427,6 +541,42 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
             err.message()
         );
     }
+
+    // A malformed edge list refuses even when the query analyzes to no
+    // terms or asks for k = 0: edge validation needs no shard, so the
+    // coordinator's early return must not swallow it into an empty Ok.
+    for (text, k) in [("", 10u32), ("rust", 0)] {
+        let err = coordinator
+            .fanout_bm25_faceted(
+                text,
+                k,
+                None,
+                0.0,
+                &[],
+                &[],
+                &[range_field("citations", &[5.0])],
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "text {text:?}, k {k}: the early return must not hide the refusal"
+        );
+    }
+    let err = coordinator
+        .fanout_bm25_fused_faceted("", 10, &fields, 0.0, &[], &[], &[range_field(
+            "citations",
+            &[5.0],
+        )])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "the fused route honors the same rule before its own early return"
+    );
 
     for h in handles {
         h.abort();

@@ -759,7 +759,12 @@ enum RangeSource {
 /// edge makes the bucket test meaningless, and an unsorted list would
 /// silently answer for intervals nobody asked for. Every refusal names
 /// the column and the knob, like every other column refusal here.
-fn validate_range_facet_fields(fields: &[crate::pb::RangeFacetField]) -> Result<(), Status> {
+/// Purely local — no shard state involved — so the coordinator ALSO
+/// runs it before its zero-term/k=0 early return: a malformed edge
+/// list must refuse even when there is no match set to count.
+pub(crate) fn validate_range_facet_fields(
+    fields: &[crate::pb::RangeFacetField],
+) -> Result<(), Status> {
     for req in fields {
         if req.column.is_empty() {
             return Err(Status::invalid_argument(
