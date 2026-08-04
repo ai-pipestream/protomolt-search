@@ -12,6 +12,14 @@ models; ONNX inference is already routine in this infrastructure
 (OpenVINO/Intel serve grparse), so that build is an option, not a
 hazard — it is simply not the default for travel-time matrices.
 
+One build-time prerequisite for `--features energy`: `ort` fetches the
+ONNX Runtime binaries at build time over native TLS (`ort-sys` →
+`ureq` → `native-tls` → `openssl-sys`), so the build machine needs
+the system OpenSSL headers (`libssl-dev` / `openssl-devel`) and
+`pkg-config`. Without them the build refuses inside `openssl-sys`, by
+name, before anything is fetched. This is a need of the download step
+only; the default no-energy build involves no OpenSSL at all.
+
 ## The boundary
 
 Routing is an ENRICHMENT SIDECAR, never an index dependency — the same
