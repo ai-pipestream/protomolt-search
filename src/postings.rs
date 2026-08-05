@@ -94,6 +94,30 @@ const COLUMN_KIND_I64: u8 = 4;
 /// against a full scan at open like every other kind's metadata.
 const COLUMN_KIND_GEO: u8 = 5;
 
+/// fsync the directory holding `path`, making a just-renamed entry
+/// durable. `sync_all` on the file covers its bytes and inode, not the
+/// directory entry pointing at it: a crash between the rename and the
+/// directory's own writeback can lose the new name while keeping the
+/// bytes. Every atomic tmp-write-rename persist in this crate ends
+/// with this call. Directories cannot be opened for fsync on Windows;
+/// there the rename's durability rides the metadata journal and this
+/// is a no-op.
+pub(crate) fn fsync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
 /// Level-0 blocks per level-1 record.
@@ -1290,19 +1314,20 @@ impl Bm25Store {
         }
     }
 
-    /// Persist to `path` (atomically: write tmp, rename). Writes v6
-    /// (`TVBM2506`) when no facet fields are declared — byte-identical
-    /// to every pre-facet build — and v7 (`TVBM2507`) when they are;
-    /// see [`Self::write_v6_to`].
+    /// Persist to `path` (atomically: write tmp, fsync, rename, fsync
+    /// parent). Writes v6 (`TVBM2506`) when no facet fields are
+    /// declared — byte-identical to every pre-facet build — and v7
+    /// (`TVBM2507`) when they are; see [`Self::write_v6_to`].
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let tmp: PathBuf = path.with_extension("bm25tmp");
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
             self.write_v6_to(&mut w)?;
             w.flush()?;
+            w.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
-        Ok(())
+        fsync_parent(path)
     }
 
     /// Persist in the v5 format. Correctness oracle only — the
@@ -1314,9 +1339,10 @@ impl Bm25Store {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
             self.write_to(&mut w)?;
             w.flush()?;
+            w.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
-        Ok(())
+        fsync_parent(path)
     }
 
     /// Load from `path`.
@@ -3981,8 +4007,10 @@ impl SpillBuilder {
                 }
             }
             w.flush()?;
+            w.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
+        fsync_parent(path)?;
         std::fs::remove_dir_all(&self.dir)?;
         Ok(())
     }
@@ -4116,8 +4144,10 @@ impl SpillBuilder {
                 w.write_all(term.as_bytes())?;
             }
             w.flush()?;
+            w.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
+        fsync_parent(path)?;
         std::fs::remove_dir_all(&self.dir)?;
         Ok(())
     }
@@ -4654,6 +4684,7 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, dst)?;
+    fsync_parent(dst)?;
     Ok(TranscodeStats {
         n_terms,
         n_slots,

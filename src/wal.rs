@@ -185,11 +185,20 @@ pub struct WalManifest {
     pub format_version: u32,
 }
 
-/// Write the manifest atomically (tmp file + rename).
+/// Write the manifest atomically (tmp file + fsync + rename + parent
+/// fsync). A manifest that vanishes in a crash makes the whole
+/// generation invisible to replay, so the rename's directory entry
+/// gets the same durability as the bytes.
 pub fn write_manifest(gen_dir: &Path, manifest: &WalManifest) -> io::Result<()> {
     let tmp = gen_dir.join("manifest.toml.tmp");
-    std::fs::write(&tmp, toml::to_string(manifest).map_err(io::Error::other)?)?;
-    std::fs::rename(&tmp, manifest_path(gen_dir))
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(toml::to_string(manifest).map_err(io::Error::other)?.as_bytes())?;
+        f.sync_all()?;
+    }
+    let dst = manifest_path(gen_dir);
+    std::fs::rename(&tmp, &dst)?;
+    crate::postings::fsync_parent(&dst)
 }
 
 /// Read and validate a generation's manifest.

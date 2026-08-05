@@ -2161,6 +2161,12 @@ impl NodeServiceImpl {
 
         // The atomic swap: previous generation aside (if any), staging
         // dir into place. Both files move inside ONE directory rename.
+        // The staging dir's own entries are fsynced first (the files'
+        // sync_all covered bytes and inodes, not the names pointing at
+        // them), and the parent is fsynced after so the swap itself
+        // survives a crash.
+        crate::postings::fsync_parent(&generation_tv(tmp_dir))
+            .map_err(|e| Status::internal(format!("fsync staging {}: {e}", tmp_dir.display())))?;
         if snap.exists() {
             std::fs::rename(&snap, &old)
                 .map_err(|e| Status::internal(format!("retire {}: {e}", old.display())))?;
@@ -2173,6 +2179,8 @@ impl NodeServiceImpl {
             return Err(Status::internal(format!("install {}: {e}", snap.display())));
         }
         let _ = std::fs::remove_dir_all(&old);
+        crate::postings::fsync_parent(&snap)
+            .map_err(|e| Status::internal(format!("fsync {}: {e}", snap.display())))?;
 
         guard.bm25 = if with_bm25 {
             Some(Bm25Shard::open(&generation_bm25(&snap)).map_err(|e| {
