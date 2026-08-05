@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = NodeServiceClient::connect(format!("http://{node}")).await?;
 
     let single = Bm25QueryRequest {
+        filter: None,
         map_facet_fields: Vec::new(),
         score_stages: Vec::new(),
         facet_fields: Vec::new(),
@@ -69,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Exactly what `fanout_bm25_fused` sends: the per-field stats move
     // into the leg and the flat fields go empty.
     let fused = Bm25QueryRequest {
+        filter: None,
         map_facet_fields: Vec::new(),
         score_stages: Vec::new(),
         facet_fields: Vec::new(),

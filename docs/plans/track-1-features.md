@@ -104,8 +104,13 @@ languages with a principled boundary:
   removes documents, so every block-max bound stays a valid upper bound
   for free; no new pruning math. Constructs that do not compile to
   dictionary predicates plus boolean algebra are refused by name, never
-  interpreted slowly. (Not yet implemented; lands with the public-API
-  filter syntax, and it is what makes hybrid facets well-defined.)
+  interpreted slowly. (LANDED 2026-08-05, `docs/cel-filters.md`:
+  `Bm25SearchRequest.filter`, a hand-rolled no-regex compiler at the
+  coordinator, the FilterExpr IR resolved per shard, SQL-grade
+  three-valued absence, per-leaf typo rule, and a differential oracle
+  against a reference CEL interpreter. The hybrid route still refuses
+  filters until the vector leg has filter machinery — that increment
+  is what makes hybrid facets well-defined.)
 - **First-class function chains score.** The final score is a chain of
   named stages applied in request-list order to the BM25 score, on the
   node, before the floor test and heap insertion. Every stage signs one
@@ -160,9 +165,11 @@ Antimeridian-crossing boxes are refused by name rather than
 reinterpreted. Distance-decay stages join the chain vocabulary with a
 bound lift of 1.0, which the doc proves is the TIGHTEST sound lift
 under the absence-is-identity contract, bbox metadata notwithstanding.
-Facet counts are NOT narrowed by filters in this increment; that is
-the CEL story. CEL filters remain the layer that unifies scalar and
-map predicates, and range FILTERS land with them.
+Facet counts were NOT narrowed by filters in that increment; the CEL
+increment (2026-08-05, `docs/cel-filters.md`) landed the unification:
+scalar, map, and range FILTERS all compile from one CEL surface, and
+facet counts — plain, map, and range alike — now count the FILTERED
+match set, for the compiled tree and the standalone geo family both.
 
 ## 4. Caching
 

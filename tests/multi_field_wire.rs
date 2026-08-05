@@ -629,6 +629,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -649,6 +650,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     let err = SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -875,6 +877,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
     assert_eq!(added.added, 3);
 
     let leg = |fingerprint: u64| Bm25QueryRequest {
+        filter: None,
         map_facet_fields: Vec::new(),
         score_stages: Vec::new(),
         facet_fields: Vec::new(),

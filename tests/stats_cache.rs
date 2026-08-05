@@ -149,6 +149,7 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         .unwrap()
         .into_inner();
     let request = |claim: u64| Bm25QueryRequest {
+        filter: None,
         map_facet_fields: Vec::new(),
         score_stages: Vec::new(),
         facet_fields: Vec::new(),
@@ -172,7 +173,12 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         .unwrap()
         .into_inner()
         .hits;
-    let no_claim = client.bm25_query(request(0)).await.unwrap().into_inner().hits;
+    let no_claim = client
+        .bm25_query(request(0))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
     assert_eq!(hit_signature(&with_claim), hit_signature(&no_claim));
     assert_eq!(with_claim.len(), 2);
 
@@ -206,11 +212,17 @@ async fn repeated_query_reuses_cached_stats() {
     let coordinator = CoordinatorServiceImpl::new(addrs.clone())
         .with_bm25(Some(analysis.clone()), Default::default());
 
-    let first = coordinator.fanout_bm25("search rust", 6, None).await.unwrap();
+    let first = coordinator
+        .fanout_bm25("search rust", 6, None)
+        .await
+        .unwrap();
     let after_first = coordinator.stats_cache().fetch_count();
     assert_eq!(after_first, 3, "one TermStats fetch per node");
 
-    let second = coordinator.fanout_bm25("search rust", 6, None).await.unwrap();
+    let second = coordinator
+        .fanout_bm25("search rust", 6, None)
+        .await
+        .unwrap();
     assert_eq!(hit_signature(&first), hit_signature(&second));
     assert_eq!(
         coordinator.stats_cache().fetch_count(),
@@ -325,10 +337,7 @@ async fn fused_repeated_query_reuses_cached_stats() {
             .unwrap();
         }
         drop(tx);
-        client
-            .add_documents(ReceiverStream::new(rx))
-            .await
-            .unwrap();
+        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         addrs.push(addr);
         handles.push(handle);
     }

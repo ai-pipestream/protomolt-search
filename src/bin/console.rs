@@ -32,8 +32,8 @@ use turbovec_search::analyzer;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::search_service_client::SearchServiceClient;
 use turbovec_search::pb::{
-    BoostRescore, ClusterHealthRequest, FusionMode, GetDocumentsRequest, HybridDebug,
-    HybridLegOptions, HybridSearchRequest, ScoreCombination, ScoreNormalization,
+    Bm25SearchRequest, BoostRescore, ClusterHealthRequest, FusionMode, GetDocumentsRequest,
+    HybridDebug, HybridLegOptions, HybridSearchRequest, ScoreCombination, ScoreNormalization,
 };
 
 const CONSOLE_HTML: &str = include_str!("console.html");
@@ -278,6 +278,10 @@ struct SearchBody {
     vector_leg: bool,
     bm25_leg: bool,
     min_vector_score: f32,
+    /// CEL filter (docs/cel-filters.md). Empty = off. Runs the LEXICAL
+    /// Bm25Search route; combining it with the vector leg is refused,
+    /// exactly as the engine refuses hybrid filters.
+    filter: String,
     fetch_docs: bool,
 }
 
@@ -304,6 +308,7 @@ impl Default for SearchBody {
             vector_leg: true,
             bm25_leg: true,
             min_vector_score: 0.0,
+            filter: String::new(),
             fetch_docs: true,
         }
     }
@@ -314,22 +319,6 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
     if req.text.is_empty() {
         return Err("text is required".to_string());
     }
-
-    // Query vector: pasted, or embedded through the sidecar.
-    let t_embed = std::time::Instant::now();
-    let vector = match req.vector {
-        Some(v) if !v.is_empty() => v,
-        _ => {
-            let addr = ctx
-                .analysis
-                .as_deref()
-                .ok_or("no --analysis sidecar configured, pass a raw vector instead")?;
-            analyzer::embed_text(addr, &req.text)
-                .await
-                .map_err(|e| format!("embedding failed: {e}"))?
-        }
-    };
-    let embed_ms = t_embed.elapsed().as_secs_f32() * 1e3;
 
     // GLOBAL_RANK by default, not CASCADE. Cascade generates candidates
     // from the vector leg and only RERANKS that pool by BM25, so the
@@ -414,6 +403,46 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         base_weight: req.boost_base_weight,
         boost_weight: req.boost_weight,
     });
+
+    // A CEL filter runs the LEXICAL route: the hybrid route refuses
+    // filters, because its vector leg has no filter machinery yet and
+    // silently filtering only the lexical half would lie about the
+    // result set. The console mirrors that honesty instead of quietly
+    // dropping a leg.
+    if !req.filter.is_empty() {
+        if req.vector_leg {
+            return Err(
+                "a CEL filter runs the lexical Bm25Search route; uncheck the vector leg \
+                 to filter (the hybrid route refuses filters until the vector leg has \
+                 filter machinery)"
+                    .to_string(),
+            );
+        }
+        if boost.is_some() {
+            return Err(
+                "boost rescore rides the hybrid route; clear the boost text to use a \
+                 CEL filter"
+                    .to_string(),
+            );
+        }
+        return bm25_filtered_search(ctx, &req, analysis).await;
+    }
+
+    // Query vector: pasted, or embedded through the sidecar.
+    let t_embed = std::time::Instant::now();
+    let vector = match req.vector {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            let addr = ctx
+                .analysis
+                .as_deref()
+                .ok_or("no --analysis sidecar configured, pass a raw vector instead")?;
+            analyzer::embed_text(addr, &req.text)
+                .await
+                .map_err(|e| format!("embedding failed: {e}"))?
+        }
+    };
+    let embed_ms = t_embed.elapsed().as_secs_f32() * 1e3;
 
     let request = HybridSearchRequest {
         request_id: String::new(),
@@ -528,6 +557,87 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         "embed_ms": embed_ms,
         "hits": hits,
         "debug": response.debug.map(|d| debug_json(&d)),
+    }))
+}
+
+/// The lexical route a CEL filter takes (`docs/cel-filters.md`): one
+/// Bm25Search carrying the filter string, hits shaped like the hybrid
+/// list's lexical half. Documents are fetched by probing every node
+/// with the whole id list — a flat Bm25Hit does not carry its shard,
+/// and a debug console prefers one honest broadcast over a guess.
+async fn bm25_filtered_search(
+    ctx: &Ctx,
+    req: &SearchBody,
+    analysis: Option<turbovec_search::pb::AnalysisSpec>,
+) -> Result<Value, String> {
+    let t0 = std::time::Instant::now();
+    let mut client = search_client(&ctx.coordinator)?;
+    let response = client
+        .bm25_search(Bm25SearchRequest {
+            text: req.text.clone(),
+            k: if req.k == 0 { 10 } else { req.k },
+            analysis,
+            filter: req.filter.clone(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("search failed: {e}"))?
+        .into_inner();
+    let search_ms = t0.elapsed().as_secs_f32() * 1e3;
+    let mut hits: Vec<Value> = response
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            json!({
+                "doc_id": h.doc_id,
+                "shard": "-",
+                "rank": i + 1,
+                "bm25_score": h.score,
+                "bm25_rank": i + 1,
+            })
+        })
+        .collect();
+    if req.fetch_docs && !ctx.nodes.is_empty() && !response.hits.is_empty() {
+        let doc_ids: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
+        for addr in &ctx.nodes {
+            let mut node = node_client(addr)?;
+            let found = node
+                .get_documents(GetDocumentsRequest {
+                    doc_ids: doc_ids.clone(),
+                })
+                .await
+                .map_err(|e| format!("get_documents failed: {e}"))?
+                .into_inner();
+            for doc in found.documents {
+                for hit in &mut hits {
+                    if hit["doc_id"].as_u64() == Some(doc.doc_id) {
+                        hit["text"] = json!(doc.text);
+                        hit["lineage"] = doc
+                            .lineage
+                            .as_ref()
+                            .map(|l| {
+                                json!({
+                                    "opinion_id": l.opinion_id,
+                                    "cluster_id": l.cluster_id,
+                                    "span_start": l.span_start,
+                                    "span_end": l.span_end,
+                                })
+                            })
+                            .into();
+                    }
+                }
+            }
+        }
+    }
+    Ok(json!({
+        "request_id": "",
+        "mode": "bm25+filter",
+        "embed_ms": 0.0,
+        "search_ms": search_ms,
+        "kth_best": response.kth_best,
+        "hits": hits,
+        "debug": Value::Null,
     }))
 }
 

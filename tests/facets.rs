@@ -12,8 +12,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use turbovec_search::coordinator::CoordinatorServiceImpl;
 use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::search_service_server::SearchService;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
+use turbovec_search::pb::search_service_server::SearchService;
 use turbovec_search::pb::{
     AddDocumentsRequest, Bm25QueryRequest, Bm25SearchRequest, FacetValue, FlushRequest,
 };
@@ -36,12 +36,18 @@ type Terms = Vec<(&'static str, u32)>;
 /// df("rust") = 4 (d0, d1, d2, d4), df("vector") = 2 (d1, d3).
 const SHARD_DOCS: [&[(&str, Facets)]; 3] = [
     &[
-        ("rust search rust fast", &[("court", "scotus"), ("year", "1990")]),
+        (
+            "rust search rust fast",
+            &[("court", "scotus"), ("year", "1990")],
+        ),
         ("vector search rust", &[("court", "ca9"), ("year", "1991")]),
     ],
     &[
         ("search engines love rust", &[("court", "ca9")]),
-        ("vector vector vector", &[("court", "scotus"), ("year", "1990")]),
+        (
+            "vector vector vector",
+            &[("court", "scotus"), ("year", "1990")],
+        ),
     ],
     &[("rust", &[]), ("nothing relevant here", &[])],
 ];
@@ -131,8 +137,16 @@ fn facet_columns_roundtrip_and_dual_writers_agree() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let docs: Vec<(&str, Terms, Facets)> = vec![
-        ("rust search", vec![("rust", 1), ("search", 1)], &[("court", "scotus"), ("year", "1990")]),
-        ("vector rust", vec![("rust", 1), ("vector", 1)], &[("court", "ca9")]),
+        (
+            "rust search",
+            vec![("rust", 1), ("search", 1)],
+            &[("court", "scotus"), ("year", "1990")],
+        ),
+        (
+            "vector rust",
+            vec![("rust", 1), ("vector", 1)],
+            &[("court", "ca9")],
+        ),
         ("plain text", vec![("plain", 1), ("text", 1)], &[]),
     ];
     let analyzed = |terms: &[(&str, u32)]| {
@@ -156,7 +170,11 @@ fn facet_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2508", "facet-bearing stores write v8 with a v7-shaped payload");
+    assert_eq!(
+        &bytes[..8],
+        b"TVBM2508",
+        "facet-bearing stores write v8 with a v7-shaped payload"
+    );
 
     // The spill builder produces the same bytes.
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
@@ -239,7 +257,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     // d4 sits on the facet-less shard. Years: 1990 (d0), 1991 (d1) —
     // d2 has no year value.
     let (hits, facets, _) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &want, &[], &[], &[], &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &want, &[], &[], &[], &[], None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
@@ -256,7 +274,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
 
     // Counts cover the whole match set even when k surfaces one hit.
     let (hits_k1, facets_k1, _) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &want, &[], &[], &[], &[])
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &want, &[], &[], &[], &[], None)
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -265,19 +283,25 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     // A seeded floor narrows the surfaced hits, never the counts.
     let seed = turbovec_search::bm25::floor_seed(hits[0].score);
     let (seeded_hits, seeded_facets, _) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, seed, &want, &[], &[], &[], &[])
+        .fanout_bm25_faceted("rust", 6, None, seed, &want, &[], &[], &[], &[], None)
         .await
         .unwrap();
     assert!(seeded_hits.len() < hits.len(), "the floor trimmed hits");
-    assert_eq!(counts_of(&seeded_facets[0]), vec![("ca9", 2), ("scotus", 1)]);
+    assert_eq!(
+        counts_of(&seeded_facets[0]),
+        vec![("ca9", 2), ("scotus", 1)]
+    );
     assert_eq!(counts_of(&seeded_facets[1]), vec![("1990", 1), ("1991", 1)]);
 
     // "vector" matches d1, d3: all courts tie, value order decides.
     let (_, vector_facets, _) = coordinator
-        .fanout_bm25_faceted("vector", 6, None, 0.0, &want, &[], &[], &[], &[])
+        .fanout_bm25_faceted("vector", 6, None, 0.0, &want, &[], &[], &[], &[], None)
         .await
         .unwrap();
-    assert_eq!(counts_of(&vector_facets[0]), vec![("ca9", 1), ("scotus", 1)]);
+    assert_eq!(
+        counts_of(&vector_facets[0]),
+        vec![("ca9", 1), ("scotus", 1)]
+    );
 
     // The fused route counts the same match set (one body leg).
     let fields = vec![turbovec_search::pb::QueryField {
@@ -288,7 +312,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
         b: 0.0,
     }];
     let (fused_hits, fused_facets, _) = coordinator
-        .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[], &[], &[])
+        .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[], &[], &[], None)
         .await
         .unwrap();
     assert_eq!(fused_hits.len(), 4);
@@ -312,6 +336,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             text: "rust".to_string(),
@@ -335,6 +360,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             text: "rust".to_string(),
@@ -440,6 +466,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     // come from the mmapped ords column.
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            filter: None,
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             terms: vec!["rust".into()],

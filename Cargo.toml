@@ -29,3 +29,9 @@ tonic-build = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 bzip2 = "0.4"
 csv = "1"
+# The CEL differential oracle (tests/cel_filters.rs): the reference
+# interpreter the compiled ordinal path is held to agreement with,
+# wherever stock CEL is defined. TEST-ONLY by design — the serving
+# binary compiles filters, it never interprets them, and this crate's
+# dependency tree (regex included) stays out of it.
+cel-interpreter = "0.10"

@@ -117,6 +117,8 @@
       </div>
       <label for="q-minvec">min vector score (0 = off)</label>
       <input id="q-minvec" type="number" value="0" step="0.05" min="0">
+      <label for="q-filter">CEL filter (empty = off; lexical route, uncheck vector leg)</label>
+      <input id="q-filter" placeholder="court == &quot;scotus&quot; &amp;&amp; year >= 1990">
       <div class="row" style="grid-template-columns:1fr 1fr 1fr">
         <div><label for="q-tok">tokenizer</label>
           <select id="q-tok"><option value="default">default</option>
@@ -216,6 +218,7 @@ function knobs() {
     vector_leg: $("q-vleg").checked,
     bm25_leg: $("q-bleg").checked,
     min_vector_score: +$("q-minvec").value || 0,
+    filter: $("q-filter").value.trim(),
     fetch_docs: true,
   };
 }
@@ -227,6 +230,7 @@ function label(p) {
   if (p.min_vector_score) s += " vec\u2265" + p.min_vector_score;
   if (p.mode === "score_blend") s += " " + p.normalization + "/" + p.combination;
   if (p.boost_text) s += " +boost(" + JSON.stringify(p.boost_text) + ")";
+  if (p.filter) s += " filter(" + JSON.stringify(p.filter) + ")";
   return s;
 }
 

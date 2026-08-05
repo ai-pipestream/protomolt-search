@@ -125,6 +125,7 @@ fn body_only(text: &str) -> SearchVariant {
     SearchVariant {
         label: "body-only".to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -150,6 +151,7 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
     SearchVariant {
         label: label.to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -499,6 +501,7 @@ async fn a_failing_arm_is_named_in_the_error() {
 async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
     let (coord, _nodes, _mock) = cluster().await;
     let bm25 = |k: u32| Bm25SearchRequest {
+        filter: String::new(),
         map_facet_fields: Vec::new(),
         score_stages: Vec::new(),
         facet_fields: Vec::new(),
@@ -531,7 +534,11 @@ async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(two.hits.len(), 2, "omitted k must stop at the configured cap");
+    assert_eq!(
+        two.hits.len(),
+        2,
+        "omitted k must stop at the configured cap"
+    );
 
     // ...an explicit k within the cap is honored...
     let one = capped

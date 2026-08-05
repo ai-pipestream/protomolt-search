@@ -312,6 +312,16 @@ impl Bm25Shard {
         }
     }
 
+    /// The ordinal of `value` in facet field `fi`'s dictionary, `None`
+    /// when this shard never ingested it (`docs/cel-filters.md`).
+    fn facet_value_ord_of(&self, fi: usize, value: &str) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.facet_value_ord_of(fi, value),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.facet_value_ord_of(fi, value),
+        }
+    }
+
     /// The numeric-table index of the numeric field named `name`, if
     /// the active table has it.
     fn numeric_index(&self, name: &str) -> Option<usize> {
@@ -424,6 +434,154 @@ impl Bm25Shard {
             .collect()
     }
 
+    /// Resolve a VALIDATED filter tree against this shard's tables
+    /// (`docs/cel-filters.md`): names to table indices, string values
+    /// to dictionary ordinals, number bounds into the resolved
+    /// family's exact domain. A name (or map key) this shard lacks
+    /// resolves to the absent case for every document — exact, the
+    /// same argument as [`Self::resolve_geo_filters`] — and the
+    /// coordinator refuses a leaf NO shard resolves.
+    fn resolve_filter(&self, expr: &crate::pb::FilterExpr) -> crate::filter::ResolvedFilter {
+        use crate::filter::{MapKeyRef, ResolvedFilter, ResolvedLeaf};
+        use crate::pb::filter_expr::Expr;
+        let sorted_ords = |mut ords: Vec<u32>| {
+            ords.sort_unstable();
+            ords.dedup();
+            ords
+        };
+        match expr.expr.as_ref().expect("filter validated before resolve") {
+            Expr::And(list) => {
+                ResolvedFilter::And(list.exprs.iter().map(|e| self.resolve_filter(e)).collect())
+            }
+            Expr::Or(list) => {
+                ResolvedFilter::Or(list.exprs.iter().map(|e| self.resolve_filter(e)).collect())
+            }
+            Expr::Not(child) => ResolvedFilter::Not(Box::new(self.resolve_filter(child))),
+            Expr::Facet(p) => {
+                let column = self.facet_index(&p.column);
+                let ords = match column {
+                    None => Vec::new(),
+                    Some(fi) => sorted_ords(
+                        p.values
+                            .iter()
+                            .filter_map(|v| self.facet_value_ord_of(fi, v))
+                            .collect(),
+                    ),
+                };
+                ResolvedFilter::Leaf(ResolvedLeaf::Facet { column, ords })
+            }
+            Expr::Number(p) => {
+                let lo = p.min.as_ref().and_then(crate::filter::edge_of);
+                let hi = p.max.as_ref().and_then(crate::filter::edge_of);
+                // i64 first, then f64 — the RangeFacetField resolution
+                // order, so the two number surfaces can never disagree
+                // about which table a name means.
+                let leaf = if let Some(ii) = self.integer_index(&p.column) {
+                    let (lo, hi) = crate::filter::int_range(&lo, &hi);
+                    ResolvedLeaf::IntRange { column: ii, lo, hi }
+                } else if let Some(ni) = self.numeric_index(&p.column) {
+                    ResolvedLeaf::F64Range { column: ni, lo, hi }
+                } else {
+                    ResolvedLeaf::NumberUnknown
+                };
+                ResolvedFilter::Leaf(leaf)
+            }
+            Expr::MapFacet(p) => {
+                let target = self
+                    .map_facet_index(&p.column)
+                    .and_then(|ci| self.map_facet_key_ord(ci, &p.key).map(|k| (ci, k)));
+                let ords = match target {
+                    None => Vec::new(),
+                    Some((ci, _)) => sorted_ords(
+                        p.values
+                            .iter()
+                            .filter_map(|v| self.map_facet_value_ord_of(ci, v))
+                            .collect(),
+                    ),
+                };
+                ResolvedFilter::Leaf(ResolvedLeaf::MapFacet { target, ords })
+            }
+            Expr::MapNumber(p) => {
+                let target = self
+                    .map_numeric_index(&p.column)
+                    .and_then(|ci| self.map_numeric_key_ord(ci, &p.key).map(|k| (ci, k)));
+                ResolvedFilter::Leaf(ResolvedLeaf::MapNumber {
+                    target,
+                    lo: p.min.as_ref().and_then(crate::filter::edge_of),
+                    hi: p.max.as_ref().and_then(crate::filter::edge_of),
+                })
+            }
+            Expr::MapHasKey(p) => {
+                // Map-facet first, then map-numeric: the one order,
+                // shared with `filter_columns_known` below.
+                let target = if let Some(ci) = self.map_facet_index(&p.column) {
+                    MapKeyRef::Facet {
+                        column: ci,
+                        key_ord: self.map_facet_key_ord(ci, &p.key),
+                    }
+                } else if let Some(ci) = self.map_numeric_index(&p.column) {
+                    MapKeyRef::Numeric {
+                        column: ci,
+                        key_ord: self.map_numeric_key_ord(ci, &p.key),
+                    }
+                } else {
+                    MapKeyRef::Unknown
+                };
+                ResolvedFilter::Leaf(ResolvedLeaf::MapHasKey(target))
+            }
+            Expr::Has(p) => ResolvedFilter::Leaf(ResolvedLeaf::Has {
+                facet: self.facet_index(&p.column),
+                numeric: self.numeric_index(&p.column),
+                integer: self.integer_index(&p.column),
+                geo: self.geo_index(&p.column),
+            }),
+            Expr::Geo(g) => ResolvedFilter::Leaf(ResolvedLeaf::Geo {
+                column: self.geo_index(&g.column),
+                region: validate_geo_filter(g).expect("filter validated before resolve"),
+            }),
+        }
+    }
+
+    /// Whether this shard can resolve each leaf of `expr`, positionally
+    /// over [`crate::filter::walk_leaves`] order — the wire contract of
+    /// `Bm25QueryResponse.filter_columns_known`. Computed regardless of
+    /// `k`, like every other known flag: a typo must refuse even on a
+    /// query that returns nothing. What "resolve" means per leaf kind
+    /// is pinned on the FilterExpr proto messages.
+    fn filter_columns_known(&self, expr: &crate::pb::FilterExpr) -> Vec<bool> {
+        let mut known = Vec::new();
+        crate::filter::walk_leaves(expr, &mut |leaf| {
+            use crate::filter::LeafRef;
+            known.push(match leaf {
+                LeafRef::Facet(p) => self.facet_index(&p.column).is_some(),
+                LeafRef::Number(p) => {
+                    self.integer_index(&p.column).is_some()
+                        || self.numeric_index(&p.column).is_some()
+                }
+                LeafRef::MapFacet(p) => self
+                    .map_facet_index(&p.column)
+                    .and_then(|ci| self.map_facet_key_ord(ci, &p.key))
+                    .is_some(),
+                LeafRef::MapNumber(p) => self
+                    .map_numeric_index(&p.column)
+                    .and_then(|ci| self.map_numeric_key_ord(ci, &p.key))
+                    .is_some(),
+                LeafRef::MapHasKey(p) => {
+                    self.map_facet_index(&p.column).is_some()
+                        || self.map_numeric_index(&p.column).is_some()
+                }
+                LeafRef::Has(p) => {
+                    self.facet_index(&p.column).is_some()
+                        || self.numeric_index(&p.column).is_some()
+                        || self.integer_index(&p.column).is_some()
+                        || self.geo_index(&p.column).is_some()
+                }
+                LeafRef::Geo(g) => self.geo_index(&g.column).is_some(),
+            });
+        });
+        known
+    }
+
     /// The index of the map-facet column named `name`.
     fn map_facet_index(&self, name: &str) -> Option<usize> {
         match self {
@@ -467,6 +625,16 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_facet_value_ord(ci, key_ord, doc_id),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_facet_value_ord(ci, key_ord, doc_id),
+        }
+    }
+
+    /// The ordinal of `value` in map-facet column `ci`'s value
+    /// dictionary, `None` when this shard never ingested it.
+    fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.map_facet_value_ord_of(ci, value),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.map_facet_value_ord_of(ci, value),
         }
     }
 
@@ -518,15 +686,20 @@ impl Bm25Shard {
 
     /// Count-then-rank facet counting
     /// (`docs/plans/track-1-features.md` section 2): count the
-    /// requested facet fields over this shard's FULL match set — every
+    /// requested facet fields over this shard's match set — every
     /// document holding at least one scored term in any queried field
-    /// — independent of `k`, `min_score`, and block-max pruning, which
-    /// bound what is SURFACED, never what matched. Walks each term's
-    /// doc run to exhaustion (fixed-stride on a v5-shaped reader,
-    /// never occurrence bytes), dedups documents in a slot bitmap, and
-    /// resolves one facet ordinal per matched document. A facet field
-    /// the shard's table lacks answers `known: false` and no counts —
-    /// the coordinator turns all-unknown into a refusal.
+    /// AND passing every filter — independent of `k`, `min_score`, and
+    /// block-max pruning, which bound what is SURFACED, never what
+    /// matched. A filter, by contrast, bounds what MATCHES: a
+    /// filtered-out document is not in the result set, and counting it
+    /// would misstate the drill-down. Walks each term's doc run to
+    /// exhaustion (fixed-stride on a v5-shaped reader, never
+    /// occurrence bytes), dedups documents in a slot bitmap, masks the
+    /// bitmap with THE SAME [`crate::filter::DocFilter::passes`] the
+    /// scorers gate the heap with, and resolves one facet ordinal per
+    /// surviving document. A facet field the shard's table lacks
+    /// answers `known: false` and no counts — the coordinator turns
+    /// all-unknown into a refusal.
     ///
     /// All three facet kinds — plain, map-keyed, and range
     /// (`docs/range-facets.md`) — share the ONE bitmap this builds:
@@ -539,6 +712,7 @@ impl Bm25Shard {
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
+        filter: crate::bm25::FilterCtx,
     ) -> (
         Vec<crate::pb::FacetFieldCounts>,
         Vec<crate::pb::RangeFacetCounts>,
@@ -550,6 +724,20 @@ impl Bm25Shard {
                 view.for_each_doc_tf(term, &mut |doc_id, _tf| {
                     bits[doc_id as usize / 64] |= 1u64 << (doc_id % 64);
                 });
+            }
+        }
+        // One filter evaluation per matched document, exactly like the
+        // ordinal resolution below — never per posting.
+        if let Some((doc_filter, cols)) = filter {
+            for wi in 0..bits.len() {
+                let mut w = bits[wi];
+                while w != 0 {
+                    let doc = (wi * 64) as u32 + w.trailing_zeros();
+                    if !doc_filter.passes(doc, cols) {
+                        bits[wi] &= !(1u64 << (doc % 64));
+                    }
+                    w &= w - 1;
+                }
             }
         }
         // One counting pass over the matched docs per requested field:
@@ -700,7 +888,10 @@ impl Bm25Shard {
         }
         let ci = self.map_numeric_index(column)?;
         let key_ord = self.map_numeric_key_ord(ci, key)?;
-        Some(RangeSource::MapKey { column: ci, key_ord })
+        Some(RangeSource::MapKey {
+            column: ci,
+            key_ord,
+        })
     }
 
     /// A document's value for a resolved range source, on the bucket
@@ -747,10 +938,9 @@ impl Bm25Shard {
                         // across kinds (config refuses collisions), so
                         // at most one of the two ever answers.
                         match self.numeric_index(column) {
-                            Some(ni) => (
-                                Some(ColumnRef::Numeric(ni)),
-                                Some(self.numeric_min_max(ni)),
-                            ),
+                            Some(ni) => {
+                                (Some(ColumnRef::Numeric(ni)), Some(self.numeric_min_max(ni)))
+                            }
                             None => {
                                 let ii = self.integer_index(column);
                                 (
@@ -912,72 +1102,77 @@ fn validate_lat_lon(what: &str, lat: f64, lon: f64) -> Result<(), Status> {
 pub(crate) fn validate_geo_filters(
     filters: &[crate::pb::GeoFilter],
 ) -> Result<Vec<crate::geo::GeoRegion>, Status> {
-    filters
-        .iter()
-        .map(|f| {
-            if f.column.is_empty() {
-                return Err(Status::invalid_argument(
-                    "geo filter: a filter names the geo column it reads",
-                ));
+    filters.iter().map(validate_geo_filter).collect()
+}
+
+/// [`validate_geo_filters`] for one filter — also the validation a geo
+/// LEAF of a compiled filter tree gets (`docs/cel-filters.md`), so the
+/// two ways of sending a region can never diverge on what a legal
+/// region is.
+pub(crate) fn validate_geo_filter(
+    f: &crate::pb::GeoFilter,
+) -> Result<crate::geo::GeoRegion, Status> {
+    if f.column.is_empty() {
+        return Err(Status::invalid_argument(
+            "geo filter: a filter names the geo column it reads",
+        ));
+    }
+    let named = format!("geo filter {:?}", f.column);
+    match f.region.as_ref() {
+        Some(crate::pb::geo_filter::Region::Bbox(b)) => {
+            validate_lat_lon(&format!("{named} bbox min"), b.min_lat, b.min_lon)?;
+            validate_lat_lon(&format!("{named} bbox max"), b.max_lat, b.max_lon)?;
+            if b.min_lat > b.max_lat {
+                return Err(Status::invalid_argument(format!(
+                    "{named}: min_lat {} is above max_lat {}",
+                    b.min_lat, b.max_lat
+                )));
             }
-            let named = format!("geo filter {:?}", f.column);
-            match f.region.as_ref() {
-                Some(crate::pb::geo_filter::Region::Bbox(b)) => {
-                    validate_lat_lon(&format!("{named} bbox min"), b.min_lat, b.min_lon)?;
-                    validate_lat_lon(&format!("{named} bbox max"), b.max_lat, b.max_lon)?;
-                    if b.min_lat > b.max_lat {
-                        return Err(Status::invalid_argument(format!(
-                            "{named}: min_lat {} is above max_lat {}",
-                            b.min_lat, b.max_lat
-                        )));
-                    }
-                    if b.min_lon > b.max_lon {
-                        return Err(Status::invalid_argument(format!(
-                            "{named}: min_lon {} is east of max_lon {}, which would describe \
+            if b.min_lon > b.max_lon {
+                return Err(Status::invalid_argument(format!(
+                    "{named}: min_lon {} is east of max_lon {}, which would describe \
                              an antimeridian-crossing box. This increment REFUSES wraparound \
                              boxes rather than guessing: send two boxes, one each side of \
                              180 degrees, and union the results yourself.",
-                            b.min_lon, b.max_lon
-                        )));
-                    }
-                    Ok(crate::geo::GeoRegion::Bbox {
-                        min_lat: b.min_lat,
-                        max_lat: b.max_lat,
-                        min_lon: b.min_lon,
-                        max_lon: b.max_lon,
-                    })
-                }
-                Some(crate::pb::geo_filter::Region::Radius(r)) => {
-                    validate_lat_lon(&format!("{named} radius origin"), r.lat, r.lon)?;
-                    if !r.meters.is_finite() || r.meters <= 0.0 {
-                        return Err(Status::invalid_argument(format!(
-                            "{named}: radius meters {} must be finite and above zero",
-                            r.meters
-                        )));
-                    }
-                    let metric = match crate::pb::GeoMetric::try_from(r.metric) {
-                        Ok(crate::pb::GeoMetric::Haversine) => crate::geo::GeoMetric::Haversine,
-                        Ok(crate::pb::GeoMetric::Manhattan) => crate::geo::GeoMetric::Manhattan,
-                        Ok(crate::pb::GeoMetric::Unspecified) | Err(_) => {
-                            return Err(Status::invalid_argument(format!(
-                                "{named}: unknown geo metric {}",
-                                r.metric
-                            )));
-                        }
-                    };
-                    Ok(crate::geo::GeoRegion::Radius {
-                        lat: r.lat,
-                        lon: r.lon,
-                        meters: r.meters,
-                        metric,
-                    })
-                }
-                None => Err(Status::invalid_argument(format!(
-                    "{named}: no region set; a filter must name a bbox or a radius"
-                ))),
+                    b.min_lon, b.max_lon
+                )));
             }
-        })
-        .collect()
+            Ok(crate::geo::GeoRegion::Bbox {
+                min_lat: b.min_lat,
+                max_lat: b.max_lat,
+                min_lon: b.min_lon,
+                max_lon: b.max_lon,
+            })
+        }
+        Some(crate::pb::geo_filter::Region::Radius(r)) => {
+            validate_lat_lon(&format!("{named} radius origin"), r.lat, r.lon)?;
+            if !r.meters.is_finite() || r.meters <= 0.0 {
+                return Err(Status::invalid_argument(format!(
+                    "{named}: radius meters {} must be finite and above zero",
+                    r.meters
+                )));
+            }
+            let metric = match crate::pb::GeoMetric::try_from(r.metric) {
+                Ok(crate::pb::GeoMetric::Haversine) => crate::geo::GeoMetric::Haversine,
+                Ok(crate::pb::GeoMetric::Manhattan) => crate::geo::GeoMetric::Manhattan,
+                Ok(crate::pb::GeoMetric::Unspecified) | Err(_) => {
+                    return Err(Status::invalid_argument(format!(
+                        "{named}: unknown geo metric {}",
+                        r.metric
+                    )));
+                }
+            };
+            Ok(crate::geo::GeoRegion::Radius {
+                lat: r.lat,
+                lon: r.lon,
+                meters: r.meters,
+                metric,
+            })
+        }
+        None => Err(Status::invalid_argument(format!(
+            "{named}: no region set; a filter must name a bbox or a radius"
+        ))),
+    }
 }
 
 /// Convert a `google.protobuf.Timestamp` to the epoch MICROSECONDS an
@@ -1024,9 +1219,7 @@ pub(crate) fn timestamp_to_epoch_micros(
 
 /// Every requested range facet answered unknown with no buckets — what
 /// a shard with no lexical half (and therefore no columns) reports.
-fn unknown_range_counts(
-    fields: &[crate::pb::RangeFacetField],
-) -> Vec<crate::pb::RangeFacetCounts> {
+fn unknown_range_counts(fields: &[crate::pb::RangeFacetField]) -> Vec<crate::pb::RangeFacetCounts> {
     fields
         .iter()
         .map(|req| crate::pb::RangeFacetCounts {
@@ -1054,6 +1247,12 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     }
     fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
         self.0.geo_value(gi, doc_id)
+    }
+    fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
+        self.0.facet_ord(fi, doc_id)
+    }
+    fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
+        self.0.map_facet_value_ord(ci, key_ord, doc_id)
     }
 }
 
@@ -1122,8 +1321,10 @@ fn parse_score_stages(
                         weight: stage.weight,
                     }
                 }
-                Ok(op @ (crate::pb::ScoreOp::MultGeoDecayHaversine
-                | crate::pb::ScoreOp::MultGeoDecayManhattan)) => {
+                Ok(
+                    op @ (crate::pb::ScoreOp::MultGeoDecayHaversine
+                    | crate::pb::ScoreOp::MultGeoDecayManhattan),
+                ) => {
                     if !(stage.scale.is_finite() && stage.scale > 0.0) {
                         return Err(Status::invalid_argument(format!(
                             "score stage {i}: MULT_GEO_DECAY needs a finite scale > 0 (meters)"
@@ -1787,7 +1988,12 @@ impl NodeServiceImpl {
     /// Flush); path-less demo shards build in heap.
     fn new_builder(&self, generation: Option<&PathBuf>) -> Result<Bm25Shard, Status> {
         let names: Vec<&str> = self.config.bm25_fields.iter().map(String::as_str).collect();
-        let facets: Vec<&str> = self.config.facet_fields.iter().map(String::as_str).collect();
+        let facets: Vec<&str> = self
+            .config
+            .facet_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
         let numerics: Vec<&str> = self
             .config
             .numeric_fields
@@ -2428,6 +2634,9 @@ impl NodeServiceImpl {
         }
         validate_range_facet_fields(&req.range_facet_fields)?;
         let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        if let Some(f) = req.filter.as_ref() {
+            crate::filter::validate_filter(f)?;
+        }
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         // Filled inside the scoring arm (the facet walk reuses the
@@ -2440,6 +2649,11 @@ impl NodeServiceImpl {
         let geo_columns_known = match guard.bm25.as_ref() {
             Some(store) => store.geo_columns_known(&req.geo_filters),
             None => vec![false; req.geo_filters.len()],
+        };
+        let filter_columns_known = match (guard.bm25.as_ref(), req.filter.as_ref()) {
+            (Some(store), Some(f)) => store.filter_columns_known(f),
+            (None, Some(f)) => vec![false; crate::filter::leaf_count(f)],
+            (_, None) => Vec::new(),
         };
         let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
             // Facet counting enters the arm even at k == 0 (the flat
@@ -2481,6 +2695,23 @@ impl NodeServiceImpl {
                         leg_of_view.push(li);
                     }
                 }
+                // The request's filters, resolved ONCE against this
+                // shard's tables and shared by facet counting and the
+                // scorers below — one resolution, one truth
+                // (docs/geo-columns.md, docs/cel-filters.md). With no
+                // filters the ctx is None and every path below is
+                // bit-identical to its unfiltered form.
+                let numeric_read = ShardNumericRead(store);
+                let doc_filter = crate::filter::DocFilter {
+                    geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+                    pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+                };
+                let filter_ctx: bm25::FilterCtx =
+                    if req.geo_filters.is_empty() && doc_filter.pred.is_none() {
+                        None
+                    } else {
+                        Some((&doc_filter, &numeric_read))
+                    };
                 if !req.facet_fields.is_empty()
                     || !req.map_facet_fields.is_empty()
                     || !req.range_facet_fields.is_empty()
@@ -2495,6 +2726,7 @@ impl NodeServiceImpl {
                         &req.facet_fields,
                         &req.map_facet_fields,
                         &req.range_facet_fields,
+                        filter_ctx,
                     );
                 }
                 // Leg list order is the pinned accumulation order; the
@@ -2543,17 +2775,10 @@ impl NodeServiceImpl {
                                     || fq.index.has_impacts(t)
                             })
                     });
-                // Geo filters ride the fused route exactly as range
-                // facets do: the coordinator forwards them verbatim and
-                // the node applies them at the one place a filter
-                // belongs, before heap insertion.
-                let numeric_read = ShardNumericRead(store);
-                let geo_filters = store.resolve_geo_filters(&req.geo_filters, &geo_regions);
-                let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty() {
-                    None
-                } else {
-                    Some((&geo_filters, &numeric_read))
-                };
+                // Filters ride the fused route exactly as range facets
+                // do: the coordinator forwards them verbatim and the
+                // node applies them at the one place a filter belongs,
+                // before heap insertion (`filter_ctx`, resolved above).
                 let docs = if prunable {
                     let mut prune = bm25::PruneStats::default();
                     bm25::top_k_fused_pruned_filtered_stats(
@@ -2565,11 +2790,7 @@ impl NodeServiceImpl {
                     )
                 } else {
                     bm25::filter_fused_to_floor(
-                        bm25::top_k_fused_exhaustive_filtered(
-                            &queries,
-                            req.k as usize,
-                            filter_ctx,
-                        ),
+                        bm25::top_k_fused_exhaustive_filtered(&queries, req.k as usize, filter_ctx),
                         floor,
                     )
                 };
@@ -2633,6 +2854,7 @@ impl NodeServiceImpl {
             stage_columns_known: Vec::new(),
             range_facets,
             geo_columns_known,
+            filter_columns_known,
         })
     }
 
@@ -4556,6 +4778,9 @@ impl NodeService for NodeServiceImpl {
         let stage_specs = parse_score_stages(&req.score_stages)?;
         validate_range_facet_fields(&req.range_facet_fields)?;
         let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        if let Some(f) = req.filter.as_ref() {
+            crate::filter::validate_filter(f)?;
+        }
         let params = params_from(req.k1, req.b)?;
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
@@ -4569,10 +4794,26 @@ impl NodeService for NodeServiceImpl {
         }
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(req.expected_stats_epoch)?;
-        // Count-then-rank facets over the full match set, before any
-        // k/floor narrowing (see count_facets). A shard with no
-        // lexical half has no facet table: every requested field is
-        // legitimately unknown here.
+        // The request's filters, resolved ONCE against this shard's
+        // tables and shared by facet counting and the scorers below —
+        // one resolution, one truth (docs/geo-columns.md,
+        // docs/cel-filters.md). `None` when the request has none, and
+        // every path below is then bit-identical to its unfiltered
+        // form.
+        let doc_filter: Option<crate::filter::DocFilter> = match guard.bm25.as_ref() {
+            Some(store) if !req.geo_filters.is_empty() || req.filter.is_some() => {
+                Some(crate::filter::DocFilter {
+                    geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+                    pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+                })
+            }
+            _ => None,
+        };
+        // Count-then-rank facets over the match set — term matches
+        // that survive the filters — before any k/floor narrowing
+        // (see count_facets). A shard with no lexical half has no
+        // facet table: every requested field is legitimately unknown
+        // here.
         let (facets, range_facets) = match guard.bm25.as_ref() {
             Some(store)
                 if !req.facet_fields.is_empty()
@@ -4582,11 +4823,16 @@ impl NodeService for NodeServiceImpl {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
+                let numeric_read = ShardNumericRead(store);
+                let filter_ctx: bm25::FilterCtx = doc_filter
+                    .as_ref()
+                    .map(|f| (f, &numeric_read as &dyn crate::scorefn::NumericRead));
                 store.count_facets(
                     &[(index, &req.terms)],
                     &req.facet_fields,
                     &req.map_facet_fields,
                     &req.range_facet_fields,
+                    filter_ctx,
                 )
             }
             _ => (
@@ -4644,6 +4890,12 @@ impl NodeService for NodeServiceImpl {
             Some(store) => store.geo_columns_known(&req.geo_filters),
             None => vec![false; req.geo_filters.len()],
         };
+        // And the filter tree's per-leaf flags, same contract.
+        let filter_columns_known = match (guard.bm25.as_ref(), req.filter.as_ref()) {
+            (Some(store), Some(f)) => store.filter_columns_known(f),
+            (None, Some(f)) => vec![false; crate::filter::leaf_count(f)],
+            (_, None) => Vec::new(),
+        };
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
                 let index = store.as_index().ok_or_else(|| {
@@ -4666,16 +4918,12 @@ impl NodeService for NodeServiceImpl {
                 } else {
                     Some((&chain, &numeric_read))
                 };
-                // Geo filters, resolved against this shard's geo table
-                // (docs/geo-columns.md). With no filters the ctx is
-                // None and every scorer below is bit-identical to its
-                // unfiltered form.
-                let geo_filters = store.resolve_geo_filters(&req.geo_filters, &geo_regions);
-                let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty() {
-                    None
-                } else {
-                    Some((&geo_filters, &numeric_read))
-                };
+                // The filters resolved above, paired with this arm's
+                // read surface (docs/geo-columns.md,
+                // docs/cel-filters.md).
+                let filter_ctx: bm25::FilterCtx = doc_filter
+                    .as_ref()
+                    .map(|f| (f, &numeric_read as &dyn crate::scorefn::NumericRead));
                 // Block-max path when every scored term has impacts (v5
                 // shards) and the node flag allows it; the heap store,
                 // v3/v4 files, and --block-max=false keep top_k with the
@@ -4756,6 +5004,7 @@ impl NodeService for NodeServiceImpl {
             stage_columns_known,
             range_facets,
             geo_columns_known,
+            filter_columns_known,
         }))
     }
 

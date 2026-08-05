@@ -188,17 +188,27 @@ fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
     }
     let trailer = file_len - TRAILER_LEN;
     let u64_at = |off: u64| -> u64 {
-        u64::from_le_bytes(full[off as usize..off as usize + 8].try_into().expect("8 bytes"))
+        u64::from_le_bytes(
+            full[off as usize..off as usize + 8]
+                .try_into()
+                .expect("8 bytes"),
+        )
     };
     if &full[(trailer + 16) as usize..] != TRAILER_MAGIC {
-        return Err(invalid("v8 trailer magic missing: truncated or overwritten tail".into()));
+        return Err(invalid(
+            "v8 trailer magic missing: truncated or overwritten tail".into(),
+        ));
     }
     let integrity_off = u64_at(trailer);
     let base_version = u64_at(trailer + 8);
     let base_v7 = match base_version {
         6 => false,
         7 => true,
-        v => return Err(invalid(format!("v8 trailer names base version {v}, not 6 or 7"))),
+        v => {
+            return Err(invalid(format!(
+                "v8 trailer names base version {v}, not 6 or 7"
+            )))
+        }
     };
     if integrity_off < 52 || integrity_off > trailer {
         return Err(invalid(format!(
@@ -224,8 +234,9 @@ fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
     let mut entries = Vec::with_capacity(n_entries as usize);
     for i in 0..n_entries {
         need(cur, 2)?;
-        let name_len =
-            u64::from(u16::from_le_bytes(full[cur as usize..cur as usize + 2].try_into().unwrap()));
+        let name_len = u64::from(u16::from_le_bytes(
+            full[cur as usize..cur as usize + 2].try_into().unwrap(),
+        ));
         need(cur + 2, name_len + 20)?;
         if name_len == 0 {
             return Err(invalid(format!("v8 integrity entry {i}: empty name")));
@@ -236,9 +247,17 @@ fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
         let base = cur + 2 + name_len;
         let off = u64_at(base);
         let len = u64_at(base + 8);
-        let crc =
-            u32::from_le_bytes(full[(base + 16) as usize..(base + 20) as usize].try_into().unwrap());
-        entries.push(IntegrityEntry { name, off, len, crc });
+        let crc = u32::from_le_bytes(
+            full[(base + 16) as usize..(base + 20) as usize]
+                .try_into()
+                .unwrap(),
+        );
+        entries.push(IntegrityEntry {
+            name,
+            off,
+            len,
+            crc,
+        });
         cur = base + 20;
     }
     need(cur, 4)?;
@@ -267,9 +286,10 @@ fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
                 e.name, e.off
             )));
         }
-        expected = e.off.checked_add(e.len).ok_or_else(|| {
-            invalid(format!("v8 integrity entry {}: length overflows", e.name))
-        })?;
+        expected = e
+            .off
+            .checked_add(e.len)
+            .ok_or_else(|| invalid(format!("v8 integrity entry {}: length overflows", e.name)))?;
     }
     if expected != integrity_off {
         return Err(invalid(format!(
@@ -311,7 +331,8 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
         cursor += 4;
         for _ in 0..n_columns {
             let name_len = u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
-            let name = String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
+            let name =
+                String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
             let kind = map[cursor + 2 + name_len];
             let base = cursor + 2 + name_len + 1;
             match kind {
@@ -379,7 +400,10 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
 /// caller renames and fsyncs the parent.
 pub(crate) fn finalize_v8(path: &Path) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     let tail: Vec<u8> = {
         let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let base_v7 = match map.get(..8) {
@@ -668,7 +692,10 @@ impl FacetStore {
             Some(&ord) => ord,
             None => {
                 let ord = u32::try_from(self.dict.len()).expect("facet dictionary exceeds u32");
-                assert!(ord != FACET_ABSENT, "facet dictionary exhausted u32 ordinals");
+                assert!(
+                    ord != FACET_ABSENT,
+                    "facet dictionary exhausted u32 ordinals"
+                );
                 self.dict.push(value.to_string());
                 self.index.insert(value.to_string(), ord);
                 ord
@@ -1244,6 +1271,15 @@ impl Bm25Store {
         self.facets[fi].ord(doc_id as usize)
     }
 
+    /// The ordinal of `value` in facet field `fi`'s dictionary, `None`
+    /// when this store never ingested it — the value then matches none
+    /// of its documents, which is the exact answer, not a refusal
+    /// (`docs/cel-filters.md`: the typo rule guards structure, not
+    /// data).
+    pub fn facet_value_ord_of(&self, fi: usize, value: &str) -> Option<u32> {
+        self.facets[fi].index.get(value).copied()
+    }
+
     /// Record `doc_id`'s value for facet field `fi`, interning it in
     /// the dictionary; see [`FacetStore::set`] for the contract.
     pub fn set_facet(&mut self, fi: usize, doc_id: u32, value: &str) {
@@ -1438,6 +1474,13 @@ impl Bm25Store {
     /// The value of map-facet column `ci` at ordinal `ord`.
     pub fn map_facet_value(&self, ci: usize, ord: u32) -> &str {
         &self.map_facets[ci].values[ord as usize]
+    }
+
+    /// The ordinal of `value` in map-facet column `ci`'s value
+    /// dictionary, `None` when never ingested — the exact
+    /// matches-nothing answer, like [`Self::facet_value_ord_of`].
+    pub fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32> {
+        self.map_facets[ci].value_index.get(value).copied()
     }
 
     /// The value ordinal of `doc_id`'s entry under `key_ord` in
@@ -2200,7 +2243,15 @@ impl Bm25Store {
         }
         for numeric in &self.numerics {
             for slot in 0..n_slots as usize {
-                write_u64(w, numeric.vals.get(slot).copied().unwrap_or(f64::NAN).to_bits())?;
+                write_u64(
+                    w,
+                    numeric
+                        .vals
+                        .get(slot)
+                        .copied()
+                        .unwrap_or(f64::NAN)
+                        .to_bits(),
+                )?;
             }
         }
         for c in &self.map_facets {
@@ -4289,14 +4340,22 @@ impl SpillBuilder {
                     w.write_all(value.as_bytes())?;
                 }
                 for slot in 0..n_slots as usize {
-                    write_u32(&mut w, facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT))?;
+                    write_u32(
+                        &mut w,
+                        facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT),
+                    )?;
                 }
             }
             for numeric in &self.numerics {
                 for slot in 0..n_slots as usize {
                     write_u64(
                         &mut w,
-                        numeric.vals.get(slot).copied().unwrap_or(f64::NAN).to_bits(),
+                        numeric
+                            .vals
+                            .get(slot)
+                            .copied()
+                            .unwrap_or(f64::NAN)
+                            .to_bits(),
                     )?;
                 }
             }
@@ -5144,7 +5203,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     // width (parsing past it would misread every later entry).
     let mut facets: Vec<(u32, u64, u64)> = Vec::new(); // (n_values, dict, ords)
     let mut numerics: Vec<(u64, u64, u64)> = Vec::new(); // (min_bits, max_bits, vals)
-    // (n_keys, n_values, keys, values, offsets, pairs)
+                                                         // (n_keys, n_values, keys, values, offsets, pairs)
     let mut map_facets: Vec<(u32, u32, u64, u64, u64, u64)> = Vec::new();
     // (n_keys, keys, offsets, pairs)
     let mut map_numerics: Vec<(u32, u64, u64, u64)> = Vec::new();
@@ -5547,8 +5606,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             }
             prev_end = end;
         }
-        for (k, (&(min_bits, max_bits), &(min, max))) in
-            key_mm.iter().zip(&scanned_mm).enumerate()
+        for (k, (&(min_bits, max_bits), &(min, max))) in key_mm.iter().zip(&scanned_mm).enumerate()
         {
             if min.to_bits() != min_bits || max.to_bits() != max_bits {
                 return Err(invalid(format!(
@@ -5940,6 +5998,20 @@ impl Bm25Reader {
         &self.facets[fi].dict[ord as usize]
     }
 
+    /// The ordinal of `value` in facet field `fi`'s dictionary, `None`
+    /// when this file never ingested it. A linear dictionary scan, the
+    /// reader's [`Self::map_facet_key_ord`] pattern: resolution runs
+    /// once per request, not per document, and the on-disk dictionary
+    /// is in first-seen order (the sorted layout stays in the back
+    /// pocket, `docs/map-columns.md`).
+    pub fn facet_value_ord_of(&self, fi: usize, value: &str) -> Option<u32> {
+        self.facets[fi]
+            .dict
+            .iter()
+            .position(|v| v == value)
+            .map(|p| p as u32)
+    }
+
     /// The ordinal of `doc_id`'s value for facet field `fi`, `None`
     /// when the document has no value. One 4 B read of the mmapped
     /// fixed-stride ords section.
@@ -6125,6 +6197,17 @@ impl Bm25Reader {
     /// The value of map-facet column `ci` at ordinal `ord`.
     pub fn map_facet_value(&self, ci: usize, ord: u32) -> &str {
         &self.map_facets[ci].values[ord as usize]
+    }
+
+    /// The ordinal of `value` in map-facet column `ci`'s value
+    /// dictionary, `None` when never ingested — the linear scan
+    /// [`Self::facet_value_ord_of`] explains.
+    pub fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32> {
+        self.map_facets[ci]
+            .values
+            .iter()
+            .position(|v| v == value)
+            .map(|p| p as u32)
     }
 
     /// The value ordinal of `doc_id`'s entry under `key_ord` in
@@ -6390,8 +6473,7 @@ impl Bm25Reader {
                 let mut entries = Vec::with_capacity(n);
                 let mut cur = off;
                 for _ in 0..n {
-                    let len =
-                        u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
+                    let len = u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
                     entries
                         .push(String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned());
                     cur += 2 + len;
@@ -6458,11 +6540,10 @@ impl Bm25Reader {
                         let mut key_min_max = Vec::with_capacity(n_keys);
                         let mut cur = keys_off;
                         for _ in 0..n_keys {
-                            let len = u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap())
-                                as usize;
+                            let len =
+                                u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
                             keys.push(
-                                String::from_utf8_lossy(&map[cur + 2..cur + 2 + len])
-                                    .into_owned(),
+                                String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned(),
                             );
                             key_min_max.push((
                                 f64::from_bits(u64_at(cur + 2 + len)),
@@ -7330,10 +7411,7 @@ mod tests {
     #[test]
     fn v8_roundtrip_serves_and_deep_verifies() {
         for columns in [false, true] {
-            let dir = std::env::temp_dir().join(format!(
-                "v8-rt-{columns}-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir().join(format!("v8-rt-{columns}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("x.bm25");
@@ -7347,7 +7425,10 @@ mod tests {
             let (sections, bytes) = reader.verify_integrity().unwrap();
             let table = reader.integrity.as_ref().unwrap();
             assert_eq!(sections, table.entries.len());
-            assert_eq!(bytes, table.payload_len, "entries must cover the whole payload");
+            assert_eq!(
+                bytes, table.payload_len,
+                "entries must cover the whole payload"
+            );
             assert_eq!(table.base_v7, columns);
             // The store loader takes the same file back.
             Bm25Store::load(&path).unwrap();

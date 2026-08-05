@@ -15,8 +15,8 @@ use turbovec_search::node::NodeConfig;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::search_service_server::SearchService;
 use turbovec_search::pb::{
-    AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, MapFacetEntry, MapFacetField,
-    MapNumericEntry, ScoreOp, ScoreStage,
+    AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, MapFacetEntry, MapFacetField, MapNumericEntry,
+    ScoreOp, ScoreStage,
 };
 use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
 use turbovec_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
@@ -37,7 +37,11 @@ const SHARD_DOCS: [&[(&str, StrEntries, NumEntries)]; 3] = [
             &[("color", "red"), ("lang", "en")],
             &[("boost", 2.0)],
         ),
-        ("vector search rust", &[("color", "blue")], &[("boost", 1.0)]),
+        (
+            "vector search rust",
+            &[("color", "blue")],
+            &[("boost", 1.0)],
+        ),
     ],
     &[
         (
@@ -191,7 +195,11 @@ fn map_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2508", "map columns opt into the v7-shaped v8 payload");
+    assert_eq!(
+        &bytes[..8],
+        b"TVBM2508",
+        "map columns opt into the v7-shaped v8 payload"
+    );
 
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
@@ -232,10 +240,23 @@ fn map_columns_roundtrip_and_dual_writers_agree() {
     assert_eq!(reader.map_facet_key_ord(meta, "colour"), None);
     assert_eq!(reader.map_facet_value_count(meta), 3); // red, en, blue
     let val = |ord: Option<u32>| ord.map(|o| reader.map_facet_value(meta, o).to_string());
-    assert_eq!(val(reader.map_facet_value_ord(meta, color, 0)).as_deref(), Some("red"));
-    assert_eq!(val(reader.map_facet_value_ord(meta, lang, 0)).as_deref(), Some("en"));
-    assert_eq!(reader.map_facet_value_ord(meta, color, 1), None, "doc 1 empty");
-    assert_eq!(val(reader.map_facet_value_ord(meta, color, 2)).as_deref(), Some("blue"));
+    assert_eq!(
+        val(reader.map_facet_value_ord(meta, color, 0)).as_deref(),
+        Some("red")
+    );
+    assert_eq!(
+        val(reader.map_facet_value_ord(meta, lang, 0)).as_deref(),
+        Some("en")
+    );
+    assert_eq!(
+        reader.map_facet_value_ord(meta, color, 1),
+        None,
+        "doc 1 empty"
+    );
+    assert_eq!(
+        val(reader.map_facet_value_ord(meta, color, 2)).as_deref(),
+        Some("blue")
+    );
     assert_eq!(reader.map_facet_value_ord(meta, lang, 2), None);
 
     let attrs = reader.map_numeric_index("attrs").unwrap();
@@ -283,20 +304,26 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     // (d1); meta[lang]: en (d0), de (d2) — value-ascending on the tie.
     let want = vec![map_field("meta", "color"), map_field("meta", "lang")];
     let (hits, facets, _) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &want, &[], &[], &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &want, &[], &[], &[], None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
     assert_eq!(facets.len(), 2);
-    assert_eq!((facets[0].field.as_str(), facets[0].key.as_str()), ("meta", "color"));
+    assert_eq!(
+        (facets[0].field.as_str(), facets[0].key.as_str()),
+        ("meta", "color")
+    );
     assert!(facets[0].known);
     assert_eq!(counts_of(&facets[0]), vec![("red", 2), ("blue", 1)]);
-    assert_eq!((facets[1].field.as_str(), facets[1].key.as_str()), ("meta", "lang"));
+    assert_eq!(
+        (facets[1].field.as_str(), facets[1].key.as_str()),
+        ("meta", "lang")
+    );
     assert_eq!(counts_of(&facets[1]), vec![("de", 1), ("en", 1)]);
 
     // Counts cover the whole match set at k = 1 too.
     let (hits_k1, facets_k1, _) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &want, &[], &[], &[])
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &want, &[], &[], &[], None)
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -306,6 +333,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            filter: String::new(),
             text: "vector".to_string(),
             k: 6,
             analysis: None,
@@ -325,7 +353,18 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
 
     // A key NO shard knows is a typo, not an empty drill-down.
     let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[map_field("meta", "colour")], &[], &[], &[])
+        .fanout_bm25_faceted(
+            "rust",
+            6,
+            None,
+            0.0,
+            &[],
+            &[map_field("meta", "colour")],
+            &[],
+            &[],
+            &[],
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -355,6 +394,12 @@ impl NumericRead for ReaderNumerics<'_> {
     }
     fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
         self.0.geo_value(gi, doc_id)
+    }
+    fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
+        self.0.facet_ord(fi, doc_id)
+    }
+    fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
+        self.0.map_facet_value_ord(ci, key_ord, doc_id)
     }
 }
 
@@ -419,7 +464,10 @@ fn map_keyed_chain_pruned_matches_exhaustive_bitwise() {
     let stats = CorpusStats {
         doc_count: u64::from(n),
         total_doc_length: (0..n).map(|d| u64::from(tf_a(d))).sum::<u64>()
-            + (0..n).filter(|d| d % 3 == 0).map(|d| u64::from(1 + d % 3)).sum::<u64>(),
+            + (0..n)
+                .filter(|d| d % 3 == 0)
+                .map(|d| u64::from(1 + d % 3))
+                .sum::<u64>(),
         dfs: vec![n, n.div_ceil(3)],
     };
     let terms: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
@@ -479,11 +527,11 @@ async fn distributed_map_stages_and_ingest_refusals() {
     }];
     for text in ["rust", "vector"] {
         let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
             .await
             .unwrap();
         let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
             .await
             .unwrap();
         assert_eq!(hit_signature(&got), hit_signature(&want), "query {text:?}");
@@ -492,7 +540,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // attrs entries, so its score is bitwise the unchained one.
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
     let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[], None)
         .await
         .unwrap();
     assert_ne!(hit_signature(&unchained), hit_signature(&chained));
@@ -509,7 +557,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
         ..stages[0].clone()
     }];
     let err = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[], None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -555,7 +603,11 @@ async fn distributed_map_stages_and_ingest_refusals() {
     ] {
         let err = send(addrs[0].clone(), req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
-        assert!(err.message().contains(needle), "{needle}: {}", err.message());
+        assert!(
+            err.message().contains(needle),
+            "{needle}: {}",
+            err.message()
+        );
     }
     let mut dup = bad_facet("meta", "k", "x");
     dup.map_facets.push(MapFacetEntry {

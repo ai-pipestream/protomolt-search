@@ -116,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = Instant::now();
             let r = client
                 .bm25_search(Bm25SearchRequest {
+                    filter: String::new(),
                     map_facet_fields: Vec::new(),
                     score_stages: Vec::new(),
                     facet_fields: Vec::new(),

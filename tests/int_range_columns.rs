@@ -193,7 +193,11 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2508", "integer columns opt into the v7-shaped v8 payload");
+    assert_eq!(
+        &bytes[..8],
+        b"TVBM2508",
+        "integer columns opt into the v7-shaped v8 payload"
+    );
 
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
@@ -276,7 +280,10 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
     only_integer.save(&integer_path).unwrap();
     assert_eq!(&std::fs::read(&integer_path).unwrap()[..8], b"TVBM2508");
     let r = Bm25Reader::open(&integer_path).unwrap();
-    assert_eq!((r.facet_count(), r.numeric_count(), r.integer_count()), (0, 0, 2));
+    assert_eq!(
+        (r.facet_count(), r.numeric_count(), r.integer_count()),
+        (0, 0, 2)
+    );
     assert_eq!(r.integer_min_max(0), (42, 42));
     assert_eq!(
         r.integer_min_max(1),
@@ -302,12 +309,7 @@ fn partial_kind_stores_tile_and_validate() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("partial_kinds_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let analyzed = || {
-        AnalyzedDoc::body(
-            vec![("rust".to_string(), 1u32, vec![(0u32, 4u32)])],
-            1,
-        )
-    };
+    let analyzed = || AnalyzedDoc::body(vec![("rust".to_string(), 1u32, vec![(0u32, 4u32)])], 1);
     // (case, facets, numerics, map facets): integers always present,
     // so the cases pin facets->integers, numerics->integers, and
     // map-facets->integers respectively. map-numerics->integers is
@@ -393,7 +395,8 @@ fn partial_kind_stores_tile_and_validate() {
             let ci = r.map_facet_index("meta").unwrap();
             let key = r.map_facet_key_ord(ci, "color").unwrap();
             assert_eq!(
-                r.map_facet_value_ord(ci, key, 0).map(|o| r.map_facet_value(ci, o)),
+                r.map_facet_value_ord(ci, key, 0)
+                    .map(|o| r.map_facet_value(ci, o)),
                 Some("red"),
                 "{case}"
             );
@@ -419,7 +422,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // d6 has no value, so neither is counted anywhere.
     let want = vec![range_field("citations", &EDGES)];
     let (hits, _, ranges) = coordinator
-        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &want, &[], &[])
+        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &want, &[], &[], None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 6);
@@ -439,7 +442,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // Counts cover the whole match set at k = 1 too: the floor bounds
     // what is surfaced, never what matched.
     let (hits_k1, _, ranges_k1) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &[], &want, &[], &[])
+        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &[], &want, &[], &[], None)
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -448,7 +451,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // A value sitting exactly on the LAST edge lands in no bucket:
     // "vector" matches d1 (10) and d4 (30).
     let (_, _, vector_ranges) = coordinator
-        .fanout_bm25_faceted("vector", 10, None, 0.0, &[], &[], &want, &[], &[])
+        .fanout_bm25_faceted("vector", 10, None, 0.0, &[], &[], &want, &[], &[], None)
         .await
         .unwrap();
     assert_eq!(
@@ -461,6 +464,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            filter: String::new(),
             text: "rust".to_string(),
             k: 10,
             analysis: None,
@@ -487,7 +491,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         b: 0.0,
     }];
     let (_, _, fused_ranges) = coordinator
-        .fanout_bm25_fused_faceted("rust", 10, &fields, 0.0, &[], &[], &want, &[])
+        .fanout_bm25_fused_faceted("rust", 10, &fields, 0.0, &[], &[], &want, &[], None)
         .await
         .unwrap();
     assert_eq!(buckets_of(&fused_ranges[0]), buckets_of(&ranges[0]));
@@ -504,6 +508,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
             &[range_field("citation", &EDGES)],
             &[],
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -535,6 +540,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
                 &[range_field("citations", &edges)],
                 &[],
                 &[],
+                None,
             )
             .await
             .unwrap_err();
@@ -561,6 +567,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
                 &[range_field("citations", &[5.0])],
                 &[],
                 &[],
+                None,
             )
             .await
             .unwrap_err();
@@ -571,10 +578,17 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         );
     }
     let err = coordinator
-        .fanout_bm25_fused_faceted("", 10, &fields, 0.0, &[], &[], &[range_field(
-            "citations",
-            &[5.0],
-        )], &[])
+        .fanout_bm25_fused_faceted(
+            "",
+            10,
+            &fields,
+            0.0,
+            &[],
+            &[],
+            &[range_field("citations", &[5.0])],
+            &[],
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(
@@ -604,6 +618,12 @@ impl NumericRead for ReaderNumerics<'_> {
     }
     fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
         self.0.geo_value(gi, doc_id)
+    }
+    fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
+        self.0.facet_ord(fi, doc_id)
+    }
+    fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
+        self.0.map_facet_value_ord(ci, key_ord, doc_id)
     }
 }
 
@@ -678,7 +698,10 @@ fn integer_chain_pruned_matches_exhaustive_bitwise() {
     let stats = CorpusStats {
         doc_count: u64::from(n),
         total_doc_length: (0..n).map(|d| u64::from(tf_a(d))).sum::<u64>()
-            + (0..n).filter(|d| d % 3 == 0).map(|d| u64::from(1 + d % 3)).sum::<u64>()
+            + (0..n)
+                .filter(|d| d % 3 == 0)
+                .map(|d| u64::from(1 + d % 3))
+                .sum::<u64>()
             + (0..n).filter(|d| d % 61 == 0).count() as u64,
         dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
     };
@@ -739,11 +762,11 @@ async fn distributed_integer_chain_matches_monolith() {
     }];
     for text in ["rust", "search rust", "vector"] {
         let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[])
+            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[], None)
             .await
             .unwrap();
         let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[])
+            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[], None)
             .await
             .unwrap();
         assert_eq!(
@@ -757,7 +780,7 @@ async fn distributed_integer_chain_matches_monolith() {
     // its base score bit for bit.
     let unchained = distributed.fanout_bm25("rust", 10, None).await.unwrap();
     let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &stages, &[])
+        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &stages, &[], None)
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -812,7 +835,10 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             tx.send(r).await.unwrap();
         }
         drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.map(|_| ())
+        client
+            .add_documents(ReceiverStream::new(rx))
+            .await
+            .map(|_| ())
     };
     let stamped = |text: &str, seconds: i64, nanos: i32| AddDocumentsRequest {
         text: text.to_string(),
@@ -843,10 +869,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
     // document falls below the first edge and lands nowhere; the July
     // document sits exactly on the last edge and also lands nowhere;
     // only January falls in the single bucket.
-    let edges = vec![
-        (JAN_2024 * 1_000_000) as f64,
-        (JUL_2024 * 1_000_000) as f64,
-    ];
+    let edges = vec![(JAN_2024 * 1_000_000) as f64, (JUL_2024 * 1_000_000) as f64];
     let (hits, _, ranges) = coordinator
         .fanout_bm25_faceted(
             "rust",
@@ -858,6 +881,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             &[range_field("filed_at", &edges)],
             &[],
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -883,6 +907,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             &[range_field("filed_at", &wider)],
             &[],
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -957,7 +982,11 @@ async fn integer_ingest_refusals_are_loud() {
     let err = add_documents_integer(&addrs[0], &[("some text", &[("cite", 1)])])
         .await
         .unwrap_err();
-    assert!(err.message().contains("--integer-fields"), "{}", err.message());
+    assert!(
+        err.message().contains("--integer-fields"),
+        "{}",
+        err.message()
+    );
 
     // A refused document left nothing behind: the shard still answers
     // the same range counts it did before.
@@ -974,6 +1003,7 @@ async fn integer_ingest_refusals_are_loud() {
             &[range_field("citations", &EDGES)],
             &[],
             &[],
+            None,
         )
         .await
         .unwrap();
