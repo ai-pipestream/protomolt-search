@@ -73,6 +73,13 @@ pub fn fnv1a64(id: u64) -> u64 {
 /// `bucket_of(id, bucket_count) == NNN`.
 pub fn bucket_of(id: u64, n: usize) -> usize {
     assert!(n.is_power_of_two(), "split factor must be a power of two");
+    // Top log2(1) = 0 bits select bucket 0. Spelled out because the
+    // general expression would shift by 64, which panics in debug
+    // builds and wraps to a shift of 0 in release: every id would
+    // route to its own hash-numbered bucket, silently.
+    if n == 1 {
+        return 0;
+    }
     let shift = 64 - n.trailing_zeros();
     (fnv1a64(id) >> shift) as usize
 }
