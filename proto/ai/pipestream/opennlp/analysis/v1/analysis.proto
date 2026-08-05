@@ -1058,4 +1058,246 @@ message GetCapabilitiesResponse {
   // model-free. Reported so a client can tell the feature exists on this
   // server.
   bool dehyphenation_available = 19;
+
+  // Whether the vocabulary listener is enabled on this server
+  // (OPENNLP_VOCAB_DIR is set and the snapshot directory is writable) and
+  // VocabularyService is registered. Reported so a client compiled against an
+  // older contract can tell the feature exists on this server.
+  bool vocab_listener_available = 20;
+}
+
+// VocabularyService exposes the streaming vocabulary statistics collected by
+// the vocabulary listener on the AnalyzeStream ingest path (see
+// VOCABULARY-LISTENER.md): per-window cardinality, frequencies, and heavy
+// hitters over the corpus being indexed, plus drift metrics between windows.
+// It is registered on the same port as AnalysisService, but ONLY when the
+// listener is enabled (OPENNLP_VOCAB_DIR set and writable); on a listener-less
+// server every method resolves to UNIMPLEMENTED and
+// GetCapabilities.vocab_listener_available is false.
+//
+// Nothing here gates anything: the metrics inform an operator's decision to
+// retrain the embedding model; promotion stays with the A/B harness.
+service VocabularyService {
+  // GetVocabStats reports the listener state: the live window's counters and
+  // cardinality estimates per channel, and the persisted snapshots a drift
+  // request can name.
+  rpc GetVocabStats(GetVocabStatsRequest) returns (GetVocabStatsResponse);
+
+  // SnapshotVocab seals and persists the live window and starts a fresh one.
+  // When the live window holds no documents nothing is written and
+  // SnapshotVocabResponse.persisted is false.
+  rpc SnapshotVocab(SnapshotVocabRequest) returns (SnapshotVocabResponse);
+
+  // GetVocabDrift compares two windows per channel: cardinality of both and
+  // their union, the novelty rate, the Jensen-Shannon divergence over the
+  // union of the heavy-hitter lists, and (TOKENS, when an embedding
+  // vocabulary is readable) the out-of-vocabulary share of the newer window.
+  // Either side may be "live" for the current window; an unknown snapshot
+  // reference fails with INVALID_ARGUMENT.
+  rpc GetVocabDrift(GetVocabDriftRequest) returns (GetVocabDriftResponse);
+}
+
+// The two channels every analyzed document feeds. TERMS carries the
+// term-vector entries with their frequencies (exactly the BM25 index
+// identity); TOKENS carries the raw token surface forms, pre-normalization.
+enum VocabChannel {
+  // Unused zero value; never set on a response.
+  VOCAB_CHANNEL_UNSPECIFIED = 0;
+
+  // Term-vector entries of the response (folded source), with frequencies.
+  VOCAB_CHANNEL_TERMS = 1;
+
+  // Raw token texts of the response (surface forms).
+  VOCAB_CHANNEL_TOKENS = 2;
+}
+
+// One heavy hitter: a term with its (near-exact) count in the window.
+message VocabHeavyHitter {
+  // The term or token surface form.
+  string term = 1;
+
+  // Number of occurrences the space-saving sketch attributes to the term.
+  uint64 count = 2;
+}
+
+// Per-channel statistics of one window (the live window in GetVocabStats).
+message VocabChannelStats {
+  // Which channel these statistics describe.
+  VocabChannel channel = 1;
+
+  // Documents fed into the window on this channel.
+  uint64 documents = 2;
+
+  // Total term/token occurrences (with multiplicity) in the window.
+  uint64 term_occurrences = 3;
+
+  // Estimated number of distinct terms (HyperLogLog, ~0.8% standard error).
+  double cardinality_estimate = 4;
+
+  // The heaviest terms of the window, ordered by count descending.
+  repeated VocabHeavyHitter heavy_hitters = 5;
+}
+
+// The index entry of one persisted snapshot: everything a client needs to
+// name it in a drift request, without loading its sketches.
+message VocabSnapshotDescriptor {
+  // File name of the snapshot, for example "snapshot-3-1780000000000.pb".
+  // This is the reference GetVocabDrift names (the bare sequence number works
+  // too).
+  string name = 1;
+
+  // Monotonic sequence number of the snapshot on this server instance's
+  // history.
+  uint64 sequence = 2;
+
+  // When the window that produced the snapshot started, epoch milliseconds.
+  int64 started_epoch_millis = 3;
+
+  // When the window was sealed and persisted, epoch milliseconds.
+  int64 sealed_epoch_millis = 4;
+
+  // Documents the window accumulated (per channel; both channels see the
+  // same documents).
+  uint64 documents = 5;
+
+  // Size of the snapshot file in bytes.
+  uint64 size_bytes = 6;
+}
+
+// GetVocabStatsRequest is empty: stats describe the whole listener.
+message GetVocabStatsRequest {}
+
+// GetVocabStatsResponse reports the listener state and its snapshot history.
+message GetVocabStatsResponse {
+  // Always true when this service answers: the service is only registered
+  // when the listener is enabled. The field exists so the response shape is
+  // stable if registration rules ever change.
+  bool enabled = 1;
+
+  // Documents accumulated in the live (not yet snapshotted) window.
+  uint64 window_documents = 2;
+
+  // Live-window statistics, one entry per channel (TERMS and TOKENS).
+  repeated VocabChannelStats live_channels = 3;
+
+  // Persisted snapshots, ordered by sequence ascending.
+  repeated VocabSnapshotDescriptor snapshots = 4;
+}
+
+// SnapshotVocabRequest is empty: the live window is always the target.
+message SnapshotVocabRequest {}
+
+// SnapshotVocabResponse reports what the explicit snapshot did.
+message SnapshotVocabResponse {
+  // Whether a snapshot was written. False when the live window held no
+  // documents, in which case nothing is persisted and snapshot is absent.
+  bool persisted = 1;
+
+  // The descriptor of the persisted snapshot, when persisted is true.
+  VocabSnapshotDescriptor snapshot = 2;
+}
+
+// GetVocabDriftRequest names the two windows to compare.
+message GetVocabDriftRequest {
+  // The older window: a snapshot name ("snapshot-3-1780000000000.pb"), a bare
+  // sequence number ("3"), or "live" for the current window. Empty or
+  // unknown references fail with INVALID_ARGUMENT.
+  string from = 1;
+
+  // The newer window, same reference rules as from.
+  string to = 2;
+}
+
+// Drift metrics between two windows on one channel.
+message VocabChannelDrift {
+  // Which channel these metrics describe.
+  VocabChannel channel = 1;
+
+  // Estimated distinct-term cardinality of the older window.
+  double from_cardinality = 2;
+
+  // Estimated distinct-term cardinality of the newer window.
+  double to_cardinality = 3;
+
+  // Estimated cardinality of the union (merged HyperLogLog).
+  double union_cardinality = 4;
+
+  // Share of the newer window's distinct vocabulary the older window never
+  // saw: (|union| - |from|) / |to|. In [0, 1]; 0 when the newer window is
+  // empty. The primary "the corpus moved" number.
+  double novelty_rate = 5;
+
+  // Jensen-Shannon divergence (base 2, so in [0, 1]) between the two term
+  // distributions over the union of their heavy-hitter lists, with missing
+  // counts filled from the count-min sketches. Distribution-level movement
+  // even when the vocabulary itself is stable.
+  double jensen_shannon_divergence = 6;
+
+  // Whether embedding_oov_share was computed: only on VOCAB_CHANNEL_TOKENS
+  // and only when an embedding vocabulary was readable from the configured
+  // embeddings directory (vocab.txt, or tokenizer.json model.vocab).
+  bool embedding_oov_computed = 7;
+
+  // Share of the newer window's token mass (over its heavy-hitter list)
+  // whose surface form is ABSENT from the embedding model's vocabulary. When
+  // this climbs, the deployed static model is degrading on fresh text — the
+  // reweight trigger. Meaningful only when embedding_oov_computed is true.
+  double embedding_oov_share = 8;
+}
+
+// GetVocabDriftResponse carries the drift metrics, one entry per channel.
+message GetVocabDriftResponse {
+  // One entry per channel (TERMS and TOKENS), in channel order.
+  repeated VocabChannelDrift channels = 1;
+}
+
+// The persisted form of one channel of a sealed window. The count-min table
+// and HLL registers serialize as raw bytes so every drift metric remains
+// computable between any two historical windows, not just adjacent ones.
+message VocabChannelSnapshot {
+  // Which channel this state belongs to.
+  VocabChannel channel = 1;
+
+  // Documents the window accumulated on this channel.
+  uint64 documents = 2;
+
+  // Total term/token occurrences (with multiplicity) on this channel.
+  uint64 term_occurrences = 3;
+
+  // HyperLogLog precision p (register count is 2^p); 14 at introduction.
+  uint32 hll_precision = 4;
+
+  // The 2^p HLL registers, one byte each, in register order.
+  bytes hll_registers = 5;
+
+  // Count-min sketch depth (rows); 5 at introduction.
+  uint32 cms_depth = 6;
+
+  // Count-min sketch width (columns per row); 2^17 at introduction.
+  uint32 cms_width = 7;
+
+  // The count-min table in row-major order as unsigned 64-bit counters,
+  // little-endian (depth * width * 8 bytes).
+  bytes cms_table = 8;
+
+  // The heavy-hitter list at seal time, ordered by count descending.
+  repeated VocabHeavyHitter heavy_hitters = 9;
+}
+
+// A sealed vocabulary window, persisted as
+// <vocabDir>/snapshot-<sequence>-<sealedEpochMillis>.pb. Snapshots are
+// training data for the embedding reweight, so the format is protobuf: any
+// tooling, JVM or not, can read them with this contract.
+message VocabSnapshot {
+  // Monotonic sequence number of the snapshot on the writing instance.
+  uint64 sequence = 1;
+
+  // When the window started, epoch milliseconds.
+  int64 started_epoch_millis = 2;
+
+  // When the window was sealed, epoch milliseconds.
+  int64 sealed_epoch_millis = 3;
+
+  // The per-channel sketch state (one entry per channel).
+  repeated VocabChannelSnapshot channels = 4;
 }
