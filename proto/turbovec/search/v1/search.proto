@@ -1047,14 +1047,15 @@ message Bm25QueryRequest {
   // the pre-epoch semantics, where the stats are simply whatever the
   // coordinator fetched moments before.
   uint64 expected_stats_epoch = 10;
-  // Facet fields to count over the FULL match set (count-then-rank,
+  // Facet fields to count over the match set (count-then-rank,
   // docs/plans/track-1-features.md section 2): every document matching
-  // at least one query term is counted, independent of `k` and
-  // `min_score` — the floor bounds what is SURFACED, never what
-  // matched. Counting walks each scored term's doc run to exhaustion,
-  // so a query that asks for facets pays that traversal; empty means
-  // no counting and no cost. On a fused query the match set is the
-  // union over every leg's terms.
+  // at least one query term AND passing every filter (`geo_filters`
+  // and `filter`) is counted, independent of `k` and `min_score` — the
+  // floor bounds what is SURFACED, never what matched, while a filter
+  // bounds what MATCHES. Counting walks each scored term's doc run to
+  // exhaustion, so a query that asks for facets pays that traversal;
+  // empty means no counting and no cost. On a fused query the match
+  // set is the union over every leg's terms.
   repeated string facet_fields = 11;
   // Score-function chain (docs/score-functions.md), applied in list
   // order to each candidate's BM25 score BEFORE the floor test and
@@ -1064,15 +1065,17 @@ message Bm25QueryRequest {
   // every shard. Currently the flat single-field route only; setting
   // this with `fields` legs is refused. Empty = identity.
   repeated ScoreStage score_stages = 12;
-  // Map-facet keys to count over the FULL match set
-  // (docs/map-columns.md): each entry names a map column and a key,
+  // Map-facet keys to count over the match set (as `facet_fields`
+  // defines it, filters included; docs/map-columns.md): each entry
+  // names a map column and a key,
   // counted exactly like a plain facet field — count-then-rank, one
   // ords lookup per matched document, independent of k and the floor.
   // Answered in Bm25QueryResponse.facets AFTER the plain facet
   // entries, with FacetFieldCounts.key set.
   repeated MapFacetField map_facet_fields = 13;
-  // Range buckets to count over the FULL match set
-  // (docs/range-facets.md): "how many results per year band". Same
+  // Range buckets to count over the match set (as `facet_fields`
+  // defines it, filters included; docs/range-facets.md): "how many
+  // results per year band". Same
   // count-then-rank pass as `facet_fields` — one shared match bitmap
   // serves all three facet kinds — so a query asking for any of them
   // pays the traversal once. Answered in
@@ -1087,6 +1090,14 @@ message Bm25QueryRequest {
   // is inside no region — which is exact, not degradation. Answered by
   // `geo_columns_known`, positionally.
   repeated GeoFilter geo_filters = 15;
+  // Compiled filter tree (see FilterExpr for the full contract):
+  // applied on the node BEFORE the floor test and heap insertion, in
+  // the pruned scorer and the exhaustive oracle identically, ANDed
+  // with `geo_filters` when both are set. The facet match set (plain,
+  // map, and range) counts only documents that pass BOTH. Answered by
+  // `filter_columns_known`, positionally over the tree's leaves in
+  // depth-first order.
+  FilterExpr filter = 16;
 }
 
 // One geo filter: a geo-point column plus the region a document's point
@@ -1151,6 +1162,180 @@ enum GeoMetric {
   // ORIGIN'S latitude — a LOCAL approximation for city-scale use, not a
   // globe-scale distance (docs/geo-columns.md).
   GEO_METRIC_MANHATTAN = 2;
+}
+
+// A compiled filter expression: the predicate IR the coordinator sends
+// to every shard (docs/cel-filters.md). The public surface syntax is
+// CEL (Bm25SearchRequest.filter); the coordinator parses and compiles
+// it ONCE into this tree, and each shard then resolves column names
+// and string values against its OWN dictionaries — ordinals are
+// shard-local and never travel, and shards never see CEL text.
+//
+// Evaluation is three-valued (Kleene, the SQL rule): a comparison on a
+// document that lacks the value is UNKNOWN; and/or/not propagate it;
+// only a document whose whole tree evaluates TRUE survives. The
+// presence tests (`has`, `map_has_key`) are total — TRUE or FALSE,
+// never UNKNOWN — so they are the one thing an absent value can pass.
+// This deliberately deviates from stock CEL, which ERRORS on a missing
+// field: erroring a fleet-wide scan on its first absent value is
+// unusable, and adopting proto-default zero values instead would make
+// an unset string equal "" — a silent lie. The deviation is pinned in
+// docs/cel-filters.md and in tests.
+//
+// A filter only REMOVES documents, so every block-max bound stays a
+// valid upper bound with no new pruning math — the argument
+// docs/score-functions.md pinned for this layer. Applied on the node
+// BEFORE the floor test and heap insertion, in the pruned scorer and
+// the exhaustive oracle identically; the facet match set is narrowed
+// by it (all three facet kinds count only surviving documents).
+//
+// The typo rule guards STRUCTURE, not data: a column (or map-facet
+// key) no shard knows is refused via `filter_columns_known`, but a
+// VALUE the corpus never held is an honest FALSE — zero results is the
+// true answer when zero documents hold the value.
+message FilterExpr {
+  // Exactly one must be set. An unset node is INVALID_ARGUMENT: an
+  // empty filter is the `filter` field left absent, never an empty
+  // node. Trees deeper than 32 nodes or holding more than 256 leaves
+  // are refused (a filter is a predicate, not a program).
+  oneof expr {
+    // Every child must pass. Kleene AND: any FALSE child makes it
+    // FALSE; otherwise any UNKNOWN child makes it UNKNOWN.
+    FilterList and = 1;
+    // Some child must pass. Kleene OR: any TRUE child makes it TRUE;
+    // otherwise any UNKNOWN child makes it UNKNOWN.
+    FilterList or = 2;
+    // Kleene NOT: TRUE and FALSE swap, UNKNOWN stays UNKNOWN — a
+    // document missing the value fails `!(court == "x")` exactly as it
+    // fails the positive form, and `has` is the escape hatch.
+    FilterExpr not = 3;
+    // String equality/membership on a plain facet column.
+    FacetPredicate facet = 4;
+    // Range or equality on an i64 or f64 column.
+    NumberPredicate number = 5;
+    // String equality/membership on one key of a map-facet column.
+    MapFacetPredicate map_facet = 6;
+    // Range or equality on one key of a map-numeric column.
+    MapNumberPredicate map_number = 7;
+    // Key presence in a map column (CEL `"k" in m`).
+    MapKeyPredicate map_has_key = 8;
+    // Value presence under this name in ANY column family (CEL
+    // `has(col)`).
+    HasPredicate has = 9;
+    // Geo containment: the existing filter family as a leaf, so one
+    // expression can mix regions with scalar predicates.
+    GeoFilter geo = 10;
+  }
+}
+
+// The children of an and/or node. At least one is required: a
+// connective with nothing to connect is refused rather than resolved
+// to a vacuous truth value nobody asked for.
+message FilterList {
+  repeated FilterExpr exprs = 1;
+}
+
+// One bound of a NumberPredicate / MapNumberPredicate range.
+message FilterBound {
+  // The bound's value. Exactly one must be set. Integer bounds against
+  // i64 columns compare in i64 (exact); against f64 columns the
+  // comparison is performed exactly across the two domains — an i64
+  // bound is never rounded through f64, so a bound above 2^53 still
+  // means the integer it says. Double bounds must be finite; against
+  // i64 columns they are normalized to exact integer bounds
+  // (ceil/floor with the exclusivity folded in), never compared in
+  // float.
+  oneof value {
+    int64 int = 1;
+    double num = 2;
+  }
+  // When true the bound itself is outside the range (`>` / `<` rather
+  // than `>=` / `<=`).
+  bool exclusive = 3;
+}
+
+// String equality/membership on a plain facet column: TRUE when the
+// document's value is one of `values`, FALSE when it holds some other
+// value, UNKNOWN when it holds none. Known = the shard's facet table
+// has the column; the literal's TYPE picks the family, so comparing a
+// number-holding column against a string refuses under the typo rule
+// rather than answering an empty set.
+message FacetPredicate {
+  // Facet column name (--facet-fields).
+  string column = 1;
+  // Accepted values, at least one. One value is equality; several are
+  // CEL `in`. Each value resolves against the shard's dictionary; a
+  // value this shard never ingested simply matches none of its
+  // documents.
+  repeated string values = 2;
+}
+
+// Range or equality on an i64 column (--integer-fields) or an f64
+// column (--numeric-fields), resolved in that order per shard. At
+// least one bound is required (use `has` for bare presence); both with
+// min > max is a legal empty range that no present value satisfies.
+// Equality is min == max, both inclusive.
+message NumberPredicate {
+  // Column name.
+  string column = 1;
+  // Lower bound, absent = unbounded below.
+  FilterBound min = 2;
+  // Upper bound, absent = unbounded above.
+  FilterBound max = 3;
+}
+
+// String equality/membership on one key of a map-facet column
+// (docs/map-columns.md). Known = the column exists AND its key
+// dictionary has the key — the same rule as MapFacetField counting: a
+// key no shard ever ingested is drill-down structure spelled wrong.
+message MapFacetPredicate {
+  // Map-facet column name (--map-facet-fields).
+  string column = 1;
+  // The key whose value is tested.
+  string key = 2;
+  // Accepted values, at least one (one = equality, several = CEL `in`).
+  repeated string values = 3;
+}
+
+// Range or equality on one key of a map-numeric column
+// (--map-numeric-fields). Known = column AND key, like
+// MapFacetPredicate; bounds as in NumberPredicate (map-numeric values
+// are f64).
+message MapNumberPredicate {
+  // Map-numeric column name.
+  string column = 1;
+  // The key whose value is tested.
+  string key = 2;
+  // Lower bound, absent = unbounded below.
+  FilterBound min = 3;
+  // Upper bound, absent = unbounded above.
+  FilterBound max = 4;
+}
+
+// Key presence in a map column (CEL `"k" in m`), resolved against the
+// map-facet table first, then map-numeric. TOTAL: TRUE when the
+// document has an entry under the key, FALSE otherwise — `"k" in {}`
+// is false, not unknown, exactly as in CEL. Known = the COLUMN exists;
+// the key is deliberately not part of the known handshake, because the
+// key's presence is the question being asked, and refusing a key no
+// shard ingested would make `!("k" in m)` unanswerable. This is the
+// one deliberate departure from the map-facet counting known rule.
+message MapKeyPredicate {
+  // Map column name.
+  string column = 1;
+  // The key whose presence is tested.
+  string key = 2;
+}
+
+// Value presence under a name (CEL `has(col)`): TRUE when the document
+// holds a value in ANY column family of that name — facet, f64, i64,
+// or geo — FALSE otherwise. TOTAL, never UNKNOWN: this is the escape
+// hatch that lets a query see absence. Known = any family has the
+// name. Map columns are not covered (test a key with `"k" in m`
+// instead); asking `has` of a map column refuses at compile.
+message HasPredicate {
+  // Column name.
+  string column = 1;
 }
 
 // One range-facet count request: a numeric-ish column plus the bucket
@@ -1370,6 +1555,17 @@ message Bm25QueryResponse {
   // the coordinator refuses a column NO shard knows, because a typo'd
   // filter would otherwise read as "zero results everywhere".
   repeated bool geo_columns_known = 6;
+  // Whether this shard can resolve each leaf of the request's `filter`
+  // tree, positionally over the leaves in depth-first order (empty
+  // when no filter was sent). What "resolve" means is per leaf kind —
+  // see each predicate message: facet = the facet table has the
+  // column; number = the i64 or f64 table has it; map predicates =
+  // column and key (column alone for map_has_key); has = any family;
+  // geo = the geo table. A shard that cannot resolve a leaf evaluates
+  // it as the absent case for every document — exact — but the
+  // coordinator refuses a leaf NO shard can resolve, the same typo
+  // rule as every other named column on this response.
+  repeated bool filter_columns_known = 7;
 }
 
 // One facet value's count within one facet field.
@@ -1485,10 +1681,24 @@ message Bm25SearchRequest {
   // by the flat and the fused route; the hybrid route REFUSES them,
   // because its vector leg has no filter machinery yet and silently
   // filtering only the lexical half would be a lie about the result
-  // set. Facet counting (plain, map, and range) is over the match set
-  // as already defined and is NOT narrowed by these filters in this
-  // increment.
+  // set. Facet counting (plain, map, and range) counts only documents
+  // that pass every filter (these and `filter` alike): a filtered-out
+  // document is not in the result set, so counting it would misstate
+  // the drill-down.
   repeated GeoFilter geo_filters = 10;
+  // Filter expression in CEL surface syntax (docs/cel-filters.md),
+  // e.g. `court == "scotus" && year >= 1990 && "color" in tags`. The
+  // coordinator parses and compiles it ONCE into the FilterExpr
+  // predicate IR and forwards that tree to every shard — shards never
+  // see CEL text. Only constructs that compile to dictionary-resolved
+  // predicates plus boolean algebra are accepted; everything else
+  // (arithmetic, ternary, string functions, macros, regex `matches`)
+  // is REFUSED BY NAME at INVALID_ARGUMENT, never interpreted slowly.
+  // Column names no shard knows refuse under the typo rule. ANDed with
+  // `geo_filters` when both are set; same absence semantics and facet
+  // narrowing as FilterExpr documents. Empty = no filter. The hybrid
+  // route refuses it for the same reason it refuses `geo_filters`.
+  string filter = 11;
 }
 
 // One field of a fused multi-field search.

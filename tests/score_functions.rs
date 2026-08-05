@@ -236,6 +236,12 @@ impl NumericRead for ReaderNumerics<'_> {
     fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
         self.0.geo_value(gi, doc_id)
     }
+    fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
+        self.0.facet_ord(fi, doc_id)
+    }
+    fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
+        self.0.map_facet_value_ord(ci, key_ord, doc_id)
+    }
 }
 
 /// The exactness gate: on a file-backed shard (impacts present, so the
@@ -302,7 +308,10 @@ fn chained_pruned_matches_chained_exhaustive_bitwise() {
     let stats = CorpusStats {
         doc_count: u64::from(n),
         total_doc_length: (0..n).map(|d| u64::from(tf_a(d))).sum::<u64>()
-            + (0..n).filter(|d| d % 3 == 0).map(|d| u64::from(1 + d % 3)).sum::<u64>()
+            + (0..n)
+                .filter(|d| d % 3 == 0)
+                .map(|d| u64::from(1 + d % 3))
+                .sum::<u64>()
             + (0..n).filter(|d| d % 61 == 0).count() as u64,
         dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
     };
@@ -361,11 +370,11 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     let stages = vec![decay_stage(300.0, 100.0)];
     for text in ["rust", "search rust", "vector"] {
         let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
             .await
             .unwrap();
         let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[])
+            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
             .await
             .unwrap();
         assert_eq!(
@@ -379,7 +388,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     // decayed toward date=300, d2 (factor 1) climbs above d0 (e^-2).
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
     let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[], None)
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -393,20 +402,22 @@ async fn distributed_chain_matches_monolith_and_reorders() {
         pos(&unchained, 0) < pos(&unchained, 2),
         "unchained: tf wins"
     );
-    assert!(
-        pos(&chained, 2) < pos(&chained, 0),
-        "chained: recency wins"
-    );
+    assert!(pos(&chained, 2) < pos(&chained, 0), "chained: recency wins");
     // d4 sits on the numeric-less shard: absent = identity, so its
     // score is bitwise the unchained one.
     let base = unchained.iter().find(|h| h.doc_id == 4).unwrap().score;
     let with = chained.iter().find(|h| h.doc_id == 4).unwrap().score;
-    assert_eq!(base.to_bits(), with.to_bits(), "absent value must be identity");
+    assert_eq!(
+        base.to_bits(),
+        with.to_bits(),
+        "absent value must be identity"
+    );
 
     // The public RPC carries stages end to end.
     let resp = SearchService::bm25_search(
         &distributed,
         Request::new(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             text: "rust".to_string(),
             k: 6,
@@ -446,7 +457,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ..decay_stage(300.0, 100.0)
     }];
     let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[])
+        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[], None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -493,7 +504,7 @@ async fn stage_and_ingest_refusals_are_loud() {
         ),
     ] {
         let err = coordinator
-            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &[bad], &[])
+            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &[bad], &[], None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
@@ -508,6 +519,7 @@ async fn stage_and_ingest_refusals_are_loud() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            filter: String::new(),
             map_facet_fields: Vec::new(),
             text: "rust".to_string(),
             k: 6,

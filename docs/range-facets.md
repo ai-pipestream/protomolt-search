@@ -150,11 +150,11 @@ by name). Timestamps land in these columns; there is no separate knob.
 
 ## What waits
 
-- **Range FILTERS** ("year >= 1990 narrows the result set") wait for
-  CEL, with facets and filters: a filter must apply BEFORE the floor
-  check to keep pruning sound, and CEL is the syntax that unifies
-  scalar and map predicates. Counting needs none of that machinery,
-  which is why it lands first.
+- **Range FILTERS — arrived** (`docs/cel-filters.md`): `year >= 1990`
+  narrows the result set through the CEL surface, applied BEFORE the
+  floor check exactly as this section required, and facet counts are
+  narrowed by it. Counting landed first because it needed none of
+  that machinery; the machinery has now caught up.
 - **A value-ordered index**, if selective range filters ever dominate.
   Lucene reaches for a BKD tree; in one dimension the tree buys
   nothing a sorted array does not, and shards here are immutable per

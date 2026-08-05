@@ -89,13 +89,12 @@ Rules, stated once and pinned in tests:
   and a typo'd chain is a no-op, but a typo'd FILTER removes every
   document on every shard and hands back an empty result set that looks
   exactly like an honest "nothing matched".
-- **Facet counting is not narrowed.** Plain, map, and range facet
-  counts are over the match set as `docs/facets.md` and
-  `docs/range-facets.md` already define it, and geo filters do not
-  touch them in this increment. Filters narrowing facet counts is the
-  CEL-layer story, where selection is one vocabulary and counting can
-  be defined against it once; wiring geo into it early would mean
-  defining it twice and reconciling later.
+- **Facet counting is narrowed — since the CEL increment.** At this
+  increment's landing, geo filters did NOT narrow facet counts; that
+  was deliberately deferred so the semantics could be defined once at
+  the CEL layer. `docs/cel-filters.md` landed that definition: all
+  three facet kinds now count the filtered match set, for the compiled
+  filter tree and for these standalone geo filters alike.
 - **Routes.** Flat and fused both carry filters (a fused query's match
   set is the union over every leg's terms, and a filter narrows that
   union exactly as it narrows a single leg's). Hybrid cannot carry them
@@ -224,11 +223,14 @@ every other kind.
   Distance bands are `docs/range-facets.md`'s edge list over a derived
   value, so the interesting question is whether the derived value is
   worth a column or a per-query computation.
-- **CEL unification.** Geo filters land as a fixed vocabulary because
-  they could not wait for CEL; when CEL arrives, `geo.within(bbox)` and
-  `geo.distance(origin) < 50000` should compile to these same
-  predicates, and THEN the "filters narrow facet counts" question gets
-  answered once for every filter family instead of once per kind.
+- **CEL unification — arrived** (`docs/cel-filters.md`).
+  `within_bbox(col, ...)`, `within_radius(col, ...)`, and
+  `within_radius_manhattan(col, ...)` compile to these same GeoFilter
+  predicates as leaves of the filter tree, and the "filters narrow
+  facet counts" question was answered there once for every filter
+  family. Distance-as-a-value (`geo.distance(origin) < x`) remains
+  future work with the same answer as geo facets: derive a value,
+  then it is ordinary.
 
 ## The routing seam
 

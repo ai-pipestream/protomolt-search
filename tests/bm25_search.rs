@@ -124,6 +124,7 @@ async fn ingest_through_mock_builds_postings() {
 
     let hits = client
         .bm25_query(Bm25QueryRequest {
+            filter: None,
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -280,6 +281,7 @@ async fn bm25_query_min_score_seeds_floor() {
         async move {
             let mut c = NodeServiceClient::connect(addr).await.unwrap();
             c.bm25_query(Bm25QueryRequest {
+                filter: None,
                 map_facet_fields: Vec::new(),
                 score_stages: Vec::new(),
                 facet_fields: Vec::new(),
@@ -367,6 +369,7 @@ async fn bm25_query_min_score_seeds_floor() {
     let mut client = NodeServiceClient::connect(addr_b.clone()).await.unwrap();
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            filter: None,
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -394,6 +397,7 @@ async fn bm25_query_min_score_seeds_floor() {
     );
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            filter: None,
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -421,6 +425,7 @@ async fn bm25_query_min_score_seeds_floor() {
     for bad in [f32::NAN, f32::NEG_INFINITY] {
         let err = client
             .bm25_query(Bm25QueryRequest {
+                filter: None,
                 map_facet_fields: Vec::new(),
                 score_stages: Vec::new(),
                 facet_fields: Vec::new(),
@@ -445,6 +450,7 @@ async fn bm25_query_min_score_seeds_floor() {
     // re-query seeded with it keeps the boundary hit.
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            filter: None,
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
             facet_fields: Vec::new(),
@@ -612,6 +618,7 @@ async fn shard_local_stats_would_differ() {
             .into_inner();
         let hits = client
             .bm25_query(Bm25QueryRequest {
+                filter: None,
                 map_facet_fields: Vec::new(),
                 score_stages: Vec::new(),
                 facet_fields: Vec::new(),

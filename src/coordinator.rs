@@ -330,6 +330,40 @@ fn refuse_unknown_geo_columns(
     Ok(())
 }
 
+/// The typo rule for compiled filter trees: a leaf NO shard can
+/// resolve is a name spelled wrong (or a literal whose type picked the
+/// wrong table), and filtering on it would read as an empty result
+/// set. Known flags are positional over
+/// [`crate::filter::walk_leaves`] order; the nodes derive theirs from
+/// the same walk, so the zip below cannot misattribute a flag.
+fn refuse_unknown_filter_leaves(
+    filter: Option<&crate::pb::FilterExpr>,
+    known: &[bool],
+) -> Result<(), Status> {
+    let Some(expr) = filter else {
+        return Ok(());
+    };
+    let mut leaves = Vec::new();
+    crate::filter::walk_leaves(expr, &mut |l| leaves.push(l));
+    let unknown: Vec<String> = leaves
+        .iter()
+        .zip(known)
+        .filter(|(_, k)| !**k)
+        .map(|(l, _)| l.describe())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "no shard can resolve filter {}: filtering on an unknown name would read as \
+             an empty result set. Check the spelling and the literal's type (a string \
+             literal selects the facet tables, a number the i64/f64 tables), or the \
+             nodes' --facet-fields / --numeric-fields / --integer-fields / \
+             --map-facet-fields / --map-numeric-fields / --geo-fields.",
+            unknown.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Merged global stats for a fused multi-field query, with the per-node
 /// epochs the shares were valid at (parallel to the node list).
 struct FusedGlobals {
@@ -519,7 +553,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[], &[], &[], &[])
+        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[], &[], &[], &[], None)
             .await
             .map(|(hits, _, _)| hits)
     }
@@ -548,6 +582,7 @@ impl CoordinatorServiceImpl {
         range_facet_fields: &[crate::pb::RangeFacetField],
         score_stages: &[crate::pb::ScoreStage],
         geo_filters: &[crate::pb::GeoFilter],
+        filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -559,6 +594,11 @@ impl CoordinatorServiceImpl {
         // (docs/geo-columns.md): an antimeridian bbox or a zero radius
         // must refuse whether or not the query has a match set.
         crate::node::validate_geo_filters(geo_filters)?;
+        // And filter-tree validation, for the same reason again
+        // (docs/cel-filters.md).
+        if let Some(f) = filter {
+            crate::filter::validate_filter(f)?;
+        }
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
         })?;
@@ -594,6 +634,7 @@ impl CoordinatorServiceImpl {
                     range_facet_fields,
                     score_stages,
                     geo_filters,
+                    filter,
                 )
                 .await
             {
@@ -625,6 +666,7 @@ impl CoordinatorServiceImpl {
         range_facet_fields: &[crate::pb::RangeFacetField],
         score_stages: &[crate::pb::ScoreStage],
         geo_filters: &[crate::pb::GeoFilter],
+        filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
@@ -644,6 +686,7 @@ impl CoordinatorServiceImpl {
                 range_facet_fields: range_facet_fields.to_vec(),
                 score_stages: score_stages.to_vec(),
                 geo_filters: geo_filters.to_vec(),
+                filter: filter.cloned(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -656,6 +699,7 @@ impl CoordinatorServiceImpl {
                         r.range_facets,
                         r.stage_columns_known,
                         r.geo_columns_known,
+                        r.filter_columns_known,
                     )
                 })
             }));
@@ -665,8 +709,10 @@ impl CoordinatorServiceImpl {
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut stage_known = vec![false; score_stages.len()];
         let mut geo_known = vec![false; geo_filters.len()];
+        let filter_leaves = filter.map_or(0, crate::filter::leaf_count);
+        let mut filter_known = vec![false; filter_leaves];
         for task in query_tasks {
-            let (shard, hits, facets, ranges, known, geo) = task
+            let (shard, hits, facets, ranges, known, geo, fknown) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             all.extend(hits.into_iter().map(|h| (shard, h)));
@@ -680,6 +726,16 @@ impl CoordinatorServiceImpl {
                 )));
             }
             for (acc, k) in geo_known.iter_mut().zip(&geo) {
+                *acc |= *k;
+            }
+            if fknown.len() != filter_leaves {
+                return Err(Status::internal(format!(
+                    "shard answered {} filter-leaf flags for {} leaves",
+                    fknown.len(),
+                    filter_leaves
+                )));
+            }
+            for (acc, k) in filter_known.iter_mut().zip(&fknown) {
                 *acc |= *k;
             }
             if known.len() != score_stages.len() {
@@ -733,6 +789,7 @@ impl CoordinatorServiceImpl {
             )));
         }
         refuse_unknown_geo_columns(geo_filters, &geo_known)?;
+        refuse_unknown_filter_leaves(filter, &filter_known)?;
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         all.sort_by(|(sa, a), (sb, b)| {
@@ -758,7 +815,7 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[], &[], &[], &[])
+        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[], &[], &[], &[], None)
             .await
             .map(|(hits, _, _)| hits)
     }
@@ -777,11 +834,15 @@ impl CoordinatorServiceImpl {
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
         geo_filters: &[crate::pb::GeoFilter],
+        filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
         crate::node::validate_range_facet_fields(range_facet_fields)?;
         crate::node::validate_geo_filters(geo_filters)?;
+        if let Some(f) = filter {
+            crate::filter::validate_filter(f)?;
+        }
         // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
         // route and the single-field route reach the same node scorer,
         // so when they disagree by orders of magnitude the question is
@@ -859,6 +920,7 @@ impl CoordinatorServiceImpl {
                     map_facet_fields,
                     range_facet_fields,
                     geo_filters,
+                    filter,
                     trace,
                     t0,
                     t_analyzed,
@@ -1008,6 +1070,7 @@ impl CoordinatorServiceImpl {
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
         geo_filters: &[crate::pb::GeoFilter],
+        filter: Option<&crate::pb::FilterExpr>,
         trace: bool,
         t0: std::time::Instant,
         t_analyzed: std::time::Duration,
@@ -1081,6 +1144,7 @@ impl CoordinatorServiceImpl {
                 // public handler refuses the combination.
                 score_stages: Vec::new(),
                 geo_filters: geo_filters.to_vec(),
+                filter: filter.cloned(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -1093,6 +1157,7 @@ impl CoordinatorServiceImpl {
                         r.facets,
                         r.range_facets,
                         r.geo_columns_known,
+                        r.filter_columns_known,
                         started.elapsed().as_secs_f64() * 1000.0,
                     )
                 })
@@ -1103,8 +1168,10 @@ impl CoordinatorServiceImpl {
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut per_shard: Vec<(u32, f64)> = Vec::new();
         let mut geo_known = vec![false; geo_filters.len()];
+        let filter_leaves = filter.map_or(0, crate::filter::leaf_count);
+        let mut filter_known = vec![false; filter_leaves];
         for task in query_tasks {
-            let (shard, hits, facets, ranges, geo, ms) = task
+            let (shard, hits, facets, ranges, geo, fknown, ms) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             per_shard.push((shard, ms));
@@ -1121,8 +1188,19 @@ impl CoordinatorServiceImpl {
             for (acc, k) in geo_known.iter_mut().zip(&geo) {
                 *acc |= *k;
             }
+            if fknown.len() != filter_leaves {
+                return Err(Status::internal(format!(
+                    "shard answered {} filter-leaf flags for {} leaves",
+                    fknown.len(),
+                    filter_leaves
+                )));
+            }
+            for (acc, k) in filter_known.iter_mut().zip(&fknown) {
+                *acc |= *k;
+            }
         }
         refuse_unknown_geo_columns(geo_filters, &geo_known)?;
+        refuse_unknown_filter_leaves(filter, &filter_known)?;
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         let t_query = t0.elapsed();
@@ -1701,6 +1779,7 @@ impl CoordinatorServiceImpl {
                     // leg has no filter machinery, and filtering only
                     // the lexical half would misdescribe the result set.
                     geo_filters: Vec::new(),
+                    filter: None,
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -3640,6 +3719,10 @@ impl SearchService for CoordinatorServiceImpl {
                 "min_score must be finite (NaN and -inf are not valid floors)",
             ));
         }
+        // CEL text compiles ONCE, here, into the predicate IR the
+        // shards execute (docs/cel-filters.md): every shard sees the
+        // same tree, and none ever sees CEL text.
+        let filter = crate::cel::compile_filter(&req.filter)?;
         let (hits, facets, range_facets) = if req.fields.is_empty() {
             self.fanout_bm25_faceted(
                 &req.text,
@@ -3651,6 +3734,7 @@ impl SearchService for CoordinatorServiceImpl {
                 &req.range_facet_fields,
                 &req.score_stages,
                 &req.geo_filters,
+                filter.as_ref(),
             )
             .await?
         } else {
@@ -3684,6 +3768,7 @@ impl SearchService for CoordinatorServiceImpl {
                 &req.map_facet_fields,
                 &req.range_facet_fields,
                 &req.geo_filters,
+                filter.as_ref(),
             )
             .await?
         };

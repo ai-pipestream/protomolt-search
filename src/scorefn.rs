@@ -26,8 +26,12 @@
 //! not associative across reorderings), identical on every shard, so
 //! distributed results stay bitwise equal to the monolith's.
 
-/// Read surface for numeric columns during scoring, implemented by the
-/// heap store and the mmap reader (via the node's shard wrapper).
+/// Read surface for a shard's columns during scoring and filtering,
+/// implemented by the heap store and the mmap reader (via the node's
+/// shard wrapper). Score chains read the numeric half; compiled
+/// filters (`docs/cel-filters.md`) read all of it — one surface serves
+/// selection and scoring alike, so the two can never disagree about
+/// what a document holds.
 pub trait NumericRead {
     /// `doc_id`'s value in numeric column `ni`, `None` when absent.
     fn value(&self, ni: usize, doc_id: u32) -> Option<f64>;
@@ -42,6 +46,14 @@ pub trait NumericRead {
     /// `None` when absent. Also the read surface geo FILTERS use — one
     /// column read serves selection and scoring alike.
     fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)>;
+    /// `doc_id`'s value ordinal in facet column `fi`
+    /// (`docs/facets.md`), `None` when absent. Filters compare
+    /// ordinals, never strings: values resolve against the shard's
+    /// dictionary once per request.
+    fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32>;
+    /// `doc_id`'s value ordinal under `key_ord` in map-facet column
+    /// `ci` (`docs/map-columns.md`), `None` when absent.
+    fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32>;
 }
 
 /// A stage's resolved column on THIS shard: a plain f64 column, an
@@ -170,9 +182,7 @@ impl ScoreChain {
             }
             let x = match stage.column {
                 Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
-                Some(ColumnRef::Integer(ii)) => {
-                    columns.int_value(ii, doc_id).map(|v| v as f64)
-                }
+                Some(ColumnRef::Integer(ii)) => columns.int_value(ii, doc_id).map(|v| v as f64),
                 Some(ColumnRef::MapKey { column, key_ord }) => {
                     columns.map_value(column, key_ord, doc_id)
                 }
@@ -182,7 +192,9 @@ impl ScoreChain {
                 continue;
             };
             s = match stage.op {
-                StageOp::MultExpDecay { origin, scale } => s * (-((x - origin).abs()) / scale).exp(),
+                StageOp::MultExpDecay { origin, scale } => {
+                    s * (-((x - origin).abs()) / scale).exp()
+                }
                 StageOp::MultLog { weight } => s * (1.0 + weight * (1.0 + x.max(0.0)).ln()),
                 StageOp::AddLinear { weight } => s + weight * x,
                 StageOp::MultGeoDecay { .. } => unreachable!("geo ops returned above"),
@@ -271,12 +283,20 @@ mod tests {
         fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
             self.0[ii][doc_id as usize].map(|v| v as i64)
         }
+        fn facet_ord(&self, _fi: usize, _doc_id: u32) -> Option<u32> {
+            // The chain tests hold no facet columns; the filter tests
+            // (src/filter.rs) bring their own surface.
+            None
+        }
+        fn map_facet_value_ord(&self, _ci: usize, _key_ord: u32, _doc_id: u32) -> Option<u32> {
+            None
+        }
     }
 
     /// Every op: hand-computed eval, absence identity, and the bound
     /// dominating eval over the whole domain.
     #[test]
-    fn stage_eval_matches_hand_computed_and_bound_dominates()  {
+    fn stage_eval_matches_hand_computed_and_bound_dominates() {
         let cols = Cols(vec![vec![Some(3.0), None, Some(-2.0)]]);
         let chain = |op| ScoreChain {
             stages: vec![Stage {
@@ -296,7 +316,11 @@ mod tests {
 
         let log = chain(StageOp::MultLog { weight: 0.5 });
         assert_eq!(log.eval(2.0, 0, &cols), 2.0 * (1.0 + 0.5 * 4.0f64.ln()));
-        assert_eq!(log.eval(2.0, 2, &cols), 2.0, "negative x clamps to factor 1");
+        assert_eq!(
+            log.eval(2.0, 2, &cols),
+            2.0,
+            "negative x clamps to factor 1"
+        );
         assert!(log.bound(2.0) >= log.eval(2.0, 0, &cols));
 
         let add = chain(StageOp::AddLinear { weight: -1.0 });
@@ -375,7 +399,10 @@ mod tests {
                 min_max: (f64::NAN, f64::NAN),
             }],
         };
-        for metric in [crate::geo::GeoMetric::Haversine, crate::geo::GeoMetric::Manhattan] {
+        for metric in [
+            crate::geo::GeoMetric::Haversine,
+            crate::geo::GeoMetric::Manhattan,
+        ] {
             let chain = stage(metric);
             let d = metric.meters(38.8899, -77.0091, 38.8977, -77.0365);
             assert_eq!(

@@ -13,22 +13,30 @@ use crate::postings::{Bm25Index, Posting};
 /// read surface (`docs/score-functions.md`); `None` = no chain, and
 /// every chained scorer is then bit-identical to its unchained twin
 /// (the additions are gated, not forked).
-pub type ChainCtx<'a> = Option<(&'a crate::scorefn::ScoreChain, &'a dyn crate::scorefn::NumericRead)>;
+pub type ChainCtx<'a> = Option<(
+    &'a crate::scorefn::ScoreChain,
+    &'a dyn crate::scorefn::NumericRead,
+)>;
 
-/// Resolved geo filters plus this shard's column read surface
-/// (`docs/geo-columns.md`); `None` = no filters, and every filtered
-/// scorer is then bit-identical to its unfiltered twin.
+/// The request's resolved filters — the standalone geo family plus the
+/// compiled predicate tree (`docs/geo-columns.md`,
+/// `docs/cel-filters.md`) — with this shard's column read surface;
+/// `None` = no filters, and every filtered scorer is then
+/// bit-identical to its unfiltered twin.
 ///
 /// A filter only REMOVES documents. Every block-max bound therefore
 /// stays a valid upper bound over the surviving documents with no new
-/// pruning math — the argument `docs/score-functions.md` makes for the
-/// future CEL layer, applied early to the one filter family that could
-/// not wait for it. What DOES change is where the test goes: a filtered
-/// document must never reach the heap, so the test sits immediately
-/// before the floor comparison and insertion, and nowhere else. The
-/// heap's k-th best then tracks the k-th best SURVIVOR, which rises no
-/// faster than the unfiltered one, so the floor stays conservative.
-pub type FilterCtx<'a> = Option<(&'a crate::geo::GeoFilters, &'a dyn crate::scorefn::NumericRead)>;
+/// pruning math — the argument `docs/score-functions.md` made for this
+/// layer when geo filters landed first. What DOES change is where the
+/// test goes: a filtered document must never reach the heap, so the
+/// test sits immediately before the floor comparison and insertion,
+/// and nowhere else. The heap's k-th best then tracks the k-th best
+/// SURVIVOR, which rises no faster than the unfiltered one, so the
+/// floor stays conservative.
+pub type FilterCtx<'a> = Option<(
+    &'a crate::filter::DocFilter,
+    &'a dyn crate::scorefn::NumericRead,
+)>;
 
 /// Whether `doc_id` survives `filter` (vacuously true with no filters).
 fn passes(filter: FilterCtx, doc_id: u32) -> bool {
@@ -1265,7 +1273,10 @@ pub fn top_k_fused_pruned_filtered_stats(
         let Some(cursor) = fq.index.impacts(&fq.terms[ti]) else {
             // Present here but no impact surface: a genuine format
             // limitation, and the only case that still forfeits pruning.
-            return filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
+            return filter_fused_to_floor(
+                top_k_fused_exhaustive_filtered(fields, k, filter),
+                floor,
+            );
         };
         let avgdl = fq.stats.avgdl();
         let widf = fq.weight * idf(fq.stats.doc_count, fq.stats.dfs[ti]);

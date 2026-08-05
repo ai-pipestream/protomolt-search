@@ -141,7 +141,8 @@ protobuf" real; the engine's wire stays explicit typed values.
   the node), and range facets with explicit bucket edges over
   f64/i64/map values, sharing the count-then-rank bitmap with the two
   facet kinds above. Half-open buckets, no implicit tails, edges
-  validated rather than repaired. Range FILTERS still arrive with CEL;
+  validated rather than repaired. Range FILTERS arrived with CEL
+  (`docs/cel-filters.md`);
   if selective pure-range filters matter, the 1-D analog of Lucene's
   trie/BKD trick is a static value-sorted (value, doc) section per
   column — shards are immutable per generation, so a plain sorted
@@ -151,6 +152,8 @@ protobuf" real; the engine's wire stays explicit typed values.
   as monotone-decay score stages). Road-network semantics (travel
   time/energy) stay in an enrichment sidecar (routee-compass, BSD-3,
   in reference-code) — routing is not indexing.
-- **CEL filters** compile map access natively (`meta["color"] ==
-  "red"`, `has(meta.color)`) to (key_ord, value-ordinal set) predicates
-  — the map design was shaped so that layer needs nothing new.
+- **CEL filters — arrived** (`docs/cel-filters.md`): map access
+  compiles natively (`meta["color"] == "red"`, `"color" in meta`) to
+  (key_ord, value-ordinal set) predicates — the map design was shaped
+  so that layer needed nothing new, and it didn't. (`has()` stays a
+  column-level test; KEY presence is `"k" in m`, CEL's own idiom.)

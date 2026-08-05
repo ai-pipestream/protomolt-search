@@ -25,11 +25,13 @@
 
 pub mod analyzer;
 pub mod bm25;
+pub mod cel;
 pub mod chunked;
 pub mod config;
 pub mod coordinator;
 pub mod court;
 pub mod dataset;
+pub mod filter;
 pub mod fusion;
 pub mod geo;
 pub mod harness;
