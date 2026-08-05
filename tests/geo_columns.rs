@@ -241,7 +241,7 @@ fn geo_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2507", "geo columns opt into v7");
+    assert_eq!(&bytes[..8], b"TVBM2508", "geo columns opt into the v7-shaped v8 payload");
 
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
@@ -349,9 +349,13 @@ fn corrupt_geo_sections_refuse_at_open() {
         );
     }
     store.set_geo(0, 0, 10.0, 20.0);
+    // The geo validators are pinned on a raw v7 payload (a pre-v8
+    // build): under v8 the integrity CRC refuses stomped bytes BEFORE
+    // any semantic walk runs, which is its own pin below.
+    let mut good = Vec::new();
+    store.write_v6_to(&mut good).unwrap();
     let path = dir.join("good.bm25");
-    store.save(&path).unwrap();
-    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &good).unwrap();
     Bm25Reader::open(&path).expect("the untouched file opens");
 
     // The vals section is the last thing in the file: doc 0's pair is
@@ -387,6 +391,24 @@ fn corrupt_geo_sections_refuse_at_open() {
     let p = dir.join("off_globe.bm25");
     std::fs::write(&p, &off_globe).unwrap();
     assert!(Bm25Reader::open(&p).is_err());
+
+    // On a v8 SAVE of the same store, the identical stomp is refused
+    // one layer earlier: the eager integrity check names the column
+    // section before any geo semantics run.
+    let v8_path = dir.join("v8.bm25");
+    store.save(&v8_path).unwrap();
+    let mut v8_bytes = std::fs::read(&v8_path).unwrap();
+    let payload_len = good.len();
+    v8_bytes[payload_len - 32 + 8..payload_len - 16]
+        .copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
+    std::fs::write(&v8_path, &v8_bytes).unwrap();
+    let err = Bm25Reader::open(&v8_path)
+        .err()
+        .expect("v8 must refuse stomped column bytes");
+    assert!(
+        err.to_string().contains("column:courthouse:vals") && err.to_string().contains("CRC"),
+        "v8 refusal names the rotted section, not a symptom: {err}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

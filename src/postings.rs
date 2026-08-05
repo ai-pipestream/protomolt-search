@@ -7,13 +7,15 @@
 //!
 //! Two storage shapes share one read surface ([`Bm25Index`]):
 //!
-//! - [`Bm25Store`] — the heap builder. Ingest appends here; `save` writes
-//!   the v5 format atomically next to the shard's `.tv` as `<index>.bm25`.
-//! - [`Bm25Reader`] — the disk-resident shape. The v5 file is memory
+//! - [`Bm25Store`] — the heap builder. Ingest appends here; `save`
+//!   writes the current format (v8: a v6/v7 payload wearing a CRC
+//!   integrity table, see `MAGIC_V8`) atomically next to the shard's
+//!   `.tv` as `<index>.bm25`.
+//! - [`Bm25Reader`] — the disk-resident shape. The file is memory
 //!   mapped; postings slices and document texts are read from the map on
 //!   demand (the OS page cache is the buffer pool, the Lucene model), so
 //!   a shard far larger than RAM serves from a few MB of heap (per-doc
-//!   length/offset tables only). v3/v4 files stay readable.
+//!   length/offset tables only). v3 through v7 files stay readable.
 //!
 //! v5 (`TVBM2505`, see `docs/block-max.md`) splits each term into three
 //! runs so the scorer never decodes occurrence offsets for non-survivors:
@@ -93,6 +95,341 @@ const COLUMN_KIND_I64: u8 = 4;
 /// carries the column's bounding box (min/max lat and lon), validated
 /// against a full scan at open like every other kind's metadata.
 const COLUMN_KIND_GEO: u8 = 5;
+
+/// v8 layout: a v6 or v7 payload, byte-identical, wearing integrity.
+/// The leading magic becomes `TVBM2508`; after the last payload byte
+/// sits an integrity section (u32 n_entries, then per entry u16
+/// name_len + name + u64 off + u64 len + u32 crc32, then a u32 crc32
+/// of the section itself), and the file ends with a fixed 24-byte
+/// trailer: u64 integrity_off, u64 base_version (6 or 7, naming the
+/// payload shape), `TVBMINTG`. The entries PARTITION the payload —
+/// offset 0, contiguous, ending exactly at integrity_off — one entry
+/// per section (`header`, `texts`, `text_index`, `lineages`,
+/// `field:<name>:{doc_lengths,postings,directory}`,
+/// `column:<name>:<part>`), so a mismatch names what rotted.
+///
+/// Structural validation (above) proves the skeleton is well-formed;
+/// the CRCs prove the payload bytes are the ones the build wrote —
+/// the half no walk could check. Open verifies the table, the
+/// partition, and every section the open already reads (everything
+/// but the big lazily-paged blobs: `texts` and each field's
+/// `postings`); [`Bm25Reader::verify_integrity`] reads and checks all
+/// of them. Because the magic changes, a v8 file that loses its tail
+/// is REFUSED, never quietly demoted to an integrity-less v6/v7 —
+/// checksums that can vanish silently protect nothing. Pre-v8 files
+/// keep opening as before; they simply have nothing to verify.
+const MAGIC_V8: &[u8; 8] = b"TVBM2508";
+/// The v8 trailer's closing magic; the trailer is `u64 integrity_off,
+/// u64 base_version, TVBMINTG`.
+const TRAILER_MAGIC: &[u8; 8] = b"TVBMINTG";
+/// Byte length of the v8 trailer.
+const TRAILER_LEN: u64 = 24;
+
+/// fsync the directory holding `path`, making a just-renamed entry
+/// durable. `sync_all` on the file covers its bytes and inode, not the
+/// directory entry pointing at it: a crash between the rename and the
+/// directory's own writeback can lose the new name while keeping the
+/// bytes. Every atomic tmp-write-rename persist in this crate ends
+/// with this call. Directories cannot be opened for fsync on Windows;
+/// there the rename's durability rides the metadata journal and this
+/// is a no-op.
+pub(crate) fn fsync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// One v8 integrity-table entry: a named payload byte range and the
+/// CRC32 its build recorded for it.
+#[derive(Debug, Clone)]
+pub(crate) struct IntegrityEntry {
+    pub name: String,
+    pub off: u64,
+    pub len: u64,
+    pub crc: u32,
+}
+
+/// The parsed v8 integrity envelope.
+#[derive(Debug)]
+pub(crate) struct IntegrityTable {
+    pub entries: Vec<IntegrityEntry>,
+    /// Where the payload ends and the integrity section begins.
+    pub payload_len: u64,
+    /// Whether the payload is v7-shaped (column table) or v6-shaped.
+    pub base_v7: bool,
+}
+
+/// The big lazily-paged blobs are the only sections open does not
+/// CRC-verify; everything else is read at open anyway, so checking it
+/// there is nearly free. `verify_integrity` checks these too.
+fn integrity_eager(name: &str) -> bool {
+    name != "texts" && !name.ends_with(":postings")
+}
+
+/// Parse and check the v8 envelope of `full` (a whole file, leading
+/// magic already matched): trailer, table, table CRC, and that the
+/// entries partition the payload exactly. Section CRCs are NOT
+/// verified here — callers decide eager vs deep.
+fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let file_len = full.len() as u64;
+    if file_len < 52 + TRAILER_LEN {
+        return Err(invalid("v8 file shorter than header plus trailer".into()));
+    }
+    let trailer = file_len - TRAILER_LEN;
+    let u64_at = |off: u64| -> u64 {
+        u64::from_le_bytes(full[off as usize..off as usize + 8].try_into().expect("8 bytes"))
+    };
+    if &full[(trailer + 16) as usize..] != TRAILER_MAGIC {
+        return Err(invalid("v8 trailer magic missing: truncated or overwritten tail".into()));
+    }
+    let integrity_off = u64_at(trailer);
+    let base_version = u64_at(trailer + 8);
+    let base_v7 = match base_version {
+        6 => false,
+        7 => true,
+        v => return Err(invalid(format!("v8 trailer names base version {v}, not 6 or 7"))),
+    };
+    if integrity_off < 52 || integrity_off > trailer {
+        return Err(invalid(format!(
+            "v8 integrity section offset {integrity_off} outside [52, {trailer}]"
+        )));
+    }
+    let mut cur = integrity_off;
+    let need = |cur: u64, n: u64| -> io::Result<()> {
+        if cur + n > trailer {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("v8 integrity table runs past its section at {cur}"),
+            ));
+        }
+        Ok(())
+    };
+    need(cur, 4)?;
+    let n_entries = u32::from_le_bytes(full[cur as usize..cur as usize + 4].try_into().unwrap());
+    cur += 4;
+    if n_entries == 0 {
+        return Err(invalid("v8 integrity table with zero entries".into()));
+    }
+    let mut entries = Vec::with_capacity(n_entries as usize);
+    for i in 0..n_entries {
+        need(cur, 2)?;
+        let name_len =
+            u64::from(u16::from_le_bytes(full[cur as usize..cur as usize + 2].try_into().unwrap()));
+        need(cur + 2, name_len + 20)?;
+        if name_len == 0 {
+            return Err(invalid(format!("v8 integrity entry {i}: empty name")));
+        }
+        let name = std::str::from_utf8(&full[(cur + 2) as usize..(cur + 2 + name_len) as usize])
+            .map_err(|_| invalid(format!("v8 integrity entry {i}: name is not UTF-8")))?
+            .to_string();
+        let base = cur + 2 + name_len;
+        let off = u64_at(base);
+        let len = u64_at(base + 8);
+        let crc =
+            u32::from_le_bytes(full[(base + 16) as usize..(base + 20) as usize].try_into().unwrap());
+        entries.push(IntegrityEntry { name, off, len, crc });
+        cur = base + 20;
+    }
+    need(cur, 4)?;
+    let stored_table_crc =
+        u32::from_le_bytes(full[cur as usize..cur as usize + 4].try_into().unwrap());
+    let computed = crate::wal::crc32(&full[integrity_off as usize..cur as usize]);
+    if stored_table_crc != computed {
+        return Err(invalid(format!(
+            "v8 integrity table CRC mismatch: stored {stored_table_crc:08x}, computed {computed:08x}"
+        )));
+    }
+    if cur + 4 != trailer {
+        return Err(invalid(format!(
+            "v8 integrity section ends at {} but the trailer starts at {trailer}",
+            cur + 4
+        )));
+    }
+    // The entries must partition [0, integrity_off): a gap would be
+    // bytes no checksum covers, which is the disease this format
+    // exists to refuse.
+    let mut expected = 0u64;
+    for e in &entries {
+        if e.off != expected {
+            return Err(invalid(format!(
+                "v8 integrity entry {} starts at {} but the previous section ended at {expected}",
+                e.name, e.off
+            )));
+        }
+        expected = e.off.checked_add(e.len).ok_or_else(|| {
+            invalid(format!("v8 integrity entry {}: length overflows", e.name))
+        })?;
+    }
+    if expected != integrity_off {
+        return Err(invalid(format!(
+            "v8 integrity entries cover [0, {expected}) but the payload is [0, {integrity_off})"
+        )));
+    }
+    Ok(IntegrityTable {
+        entries,
+        payload_len: integrity_off,
+        base_v7,
+    })
+}
+
+/// Every section start of a STRUCTURALLY VALIDATED v6/v7 payload, in
+/// file order with its integrity name. The walk mirrors
+/// [`Bm25Reader::open_v6v7`]'s header parse; ranges are the gaps
+/// between consecutive starts (the writer lays sections with one
+/// cursor, so they are contiguous by construction).
+fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
+    let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().expect("4 bytes"));
+    let u64_at = |off: usize| u64::from_le_bytes(map[off..off + 8].try_into().expect("8 bytes"));
+    let mut starts: Vec<(String, u64)> = vec![("header".to_string(), 0)];
+    let n_fields = u32_at(8) as usize;
+    starts.push(("texts".to_string(), u64_at(16)));
+    starts.push(("text_index".to_string(), u64_at(24)));
+    starts.push(("lineages".to_string(), u64_at(32)));
+    let mut cursor = 40usize;
+    for _ in 0..n_fields {
+        let name_len = u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
+        let name = String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
+        let base = cursor + 2 + name_len;
+        starts.push((format!("field:{name}:doc_lengths"), u64_at(base + 16)));
+        starts.push((format!("field:{name}:postings"), u64_at(base + 24)));
+        starts.push((format!("field:{name}:directory"), u64_at(base + 32)));
+        cursor = base + 40;
+    }
+    if v7 {
+        let n_columns = u32_at(cursor) as usize;
+        cursor += 4;
+        for _ in 0..n_columns {
+            let name_len = u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
+            let name = String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
+            let kind = map[cursor + 2 + name_len];
+            let base = cursor + 2 + name_len + 1;
+            match kind {
+                COLUMN_KIND_FACET => {
+                    starts.push((format!("column:{name}:dict"), u64_at(base + 4)));
+                    starts.push((format!("column:{name}:ords"), u64_at(base + 12)));
+                    cursor = base + 20;
+                }
+                COLUMN_KIND_F64 => {
+                    starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
+                    cursor = base + 24;
+                }
+                COLUMN_KIND_MAP_FACET => {
+                    starts.push((format!("column:{name}:keys"), u64_at(base + 8)));
+                    starts.push((format!("column:{name}:values"), u64_at(base + 16)));
+                    starts.push((format!("column:{name}:offsets"), u64_at(base + 24)));
+                    starts.push((format!("column:{name}:pairs"), u64_at(base + 32)));
+                    cursor = base + 40;
+                }
+                COLUMN_KIND_MAP_F64 => {
+                    starts.push((format!("column:{name}:keys"), u64_at(base + 4)));
+                    starts.push((format!("column:{name}:offsets"), u64_at(base + 12)));
+                    starts.push((format!("column:{name}:pairs"), u64_at(base + 20)));
+                    cursor = base + 28;
+                }
+                COLUMN_KIND_I64 => {
+                    starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
+                    cursor = base + 24;
+                }
+                COLUMN_KIND_GEO => {
+                    starts.push((format!("column:{name}:vals"), u64_at(base + 32)));
+                    cursor = base + 40;
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("column {name}: unknown kind {other}"),
+                    ))
+                }
+            }
+        }
+    }
+    // Contiguity belt-and-braces: file order and strictly ascending,
+    // or the derived ranges would be nonsense.
+    for pair in starts.windows(2) {
+        if pair[1].1 <= pair[0].1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "section {} at {} does not follow {} at {}",
+                    pair[1].0, pair[1].1, pair[0].0, pair[0].1
+                ),
+            ));
+        }
+    }
+    Ok(starts)
+}
+
+/// The v8 post-pass: turn a finished v6/v7 file into a v8 one in
+/// place. Validates the payload (never stamp integrity onto malformed
+/// bytes), CRCs every section, appends the integrity section and
+/// trailer, and patches the leading magic LAST — a crash mid-pass
+/// leaves a v6/v7 magic with a garbage tail, which the validator's
+/// section-extent checks refuse loudly. Ends with `sync_all`; the
+/// caller renames and fsyncs the parent.
+pub(crate) fn finalize_v8(path: &Path) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let tail: Vec<u8> = {
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let base_v7 = match map.get(..8) {
+            Some(m) if m == MAGIC_V7 => true,
+            Some(m) if m == MAGIC_V6 => false,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "finalize_v8 expects a finished v6 or v7 file",
+                ))
+            }
+        };
+        validate_structure_v6(&map, base_v7)?;
+        let starts = v6v7_section_starts(&map, base_v7)?;
+        let integrity_off = map.len() as u64;
+        let mut section: Vec<u8> = Vec::with_capacity(starts.len() * 48 + 32);
+        section.extend_from_slice(&(starts.len() as u32).to_le_bytes());
+        for (i, (name, off)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(integrity_off, |s| s.1);
+            // The header's CRC must describe the FINAL bytes, whose
+            // magic this pass is about to patch to v8 — computing it
+            // over the still-v6/v7 bytes would refuse every file at
+            // open.
+            let crc = if *off == 0 {
+                let mut header = Vec::with_capacity(end as usize);
+                header.extend_from_slice(MAGIC_V8);
+                header.extend_from_slice(&map[8..end as usize]);
+                crate::wal::crc32(&header)
+            } else {
+                crate::wal::crc32(&map[*off as usize..end as usize])
+            };
+            section.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            section.extend_from_slice(name.as_bytes());
+            section.extend_from_slice(&off.to_le_bytes());
+            section.extend_from_slice(&(end - off).to_le_bytes());
+            section.extend_from_slice(&crc.to_le_bytes());
+        }
+        let table_crc = crate::wal::crc32(&section);
+        section.extend_from_slice(&table_crc.to_le_bytes());
+        section.extend_from_slice(&integrity_off.to_le_bytes());
+        section.extend_from_slice(&if base_v7 { 7u64 } else { 6u64 }.to_le_bytes());
+        section.extend_from_slice(TRAILER_MAGIC);
+        section
+    };
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&tail)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(MAGIC_V8)?;
+    file.sync_all()
+}
 
 /// Postings per level-0 skip block (Lucene uses 128/256; 128 here).
 const BLOCK: usize = 128;
@@ -1290,10 +1627,12 @@ impl Bm25Store {
         }
     }
 
-    /// Persist to `path` (atomically: write tmp, rename). Writes v6
-    /// (`TVBM2506`) when no facet fields are declared — byte-identical
-    /// to every pre-facet build — and v7 (`TVBM2507`) when they are;
-    /// see [`Self::write_v6_to`].
+    /// Persist to `path` (atomically: write tmp, fsync, rename, fsync
+    /// parent). Writes v8: the payload is [`Self::write_v6_to`]'s v6
+    /// bytes when no columns are declared and v7 bytes when they are,
+    /// then [`finalize_v8`] stamps the integrity table over it, so
+    /// every saved file can prove its bytes are the ones this write
+    /// produced.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let tmp: PathBuf = path.with_extension("bm25tmp");
         {
@@ -1301,8 +1640,9 @@ impl Bm25Store {
             self.write_v6_to(&mut w)?;
             w.flush()?;
         }
+        finalize_v8(&tmp)?;
         std::fs::rename(&tmp, path)?;
-        Ok(())
+        fsync_parent(path)
     }
 
     /// Persist in the v5 format. Correctness oracle only — the
@@ -1314,9 +1654,10 @@ impl Bm25Store {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
             self.write_to(&mut w)?;
             w.flush()?;
+            w.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
-        Ok(())
+        fsync_parent(path)
     }
 
     /// Load from `path`.
@@ -2045,6 +2386,27 @@ impl Bm25Store {
     fn read_from(r: &mut &[u8]) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let magic = take(r, 8)?;
+        if magic == MAGIC_V8 {
+            // Rebuild the full-file view (the trailer's offsets are
+            // absolute), check the whole envelope and every CRC — the
+            // bytes are all in memory anyway — then read the payload
+            // as its base version.
+            let mut full = Vec::with_capacity(8 + r.len());
+            full.extend_from_slice(MAGIC_V8);
+            full.extend_from_slice(r);
+            let table = parse_integrity(&full)?;
+            for e in &table.entries {
+                let got = crate::wal::crc32(&full[e.off as usize..(e.off + e.len) as usize]);
+                if got != e.crc {
+                    return Err(invalid(&format!(
+                        "section {} CRC mismatch: stored {:08x}, computed {got:08x}",
+                        e.name, e.crc
+                    )));
+                }
+            }
+            let mut payload = &full[8..table.payload_len as usize];
+            return Self::read_v6v7_from(&mut payload, table.base_v7);
+        }
         if magic == MAGIC_V7 {
             return Self::read_v6v7_from(r, true);
         }
@@ -3982,7 +4344,9 @@ impl SpillBuilder {
             }
             w.flush()?;
         }
+        finalize_v8(&tmp)?;
         std::fs::rename(&tmp, path)?;
+        fsync_parent(path)?;
         std::fs::remove_dir_all(&self.dir)?;
         Ok(())
     }
@@ -4116,8 +4480,10 @@ impl SpillBuilder {
                 w.write_all(term.as_bytes())?;
             }
             w.flush()?;
+            w.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
+        fsync_parent(path)?;
         std::fs::remove_dir_all(&self.dir)?;
         Ok(())
     }
@@ -4654,6 +5020,7 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, dst)?;
+    fsync_parent(dst)?;
     Ok(TranscodeStats {
         n_terms,
         n_slots,
@@ -5462,12 +5829,52 @@ pub struct Bm25Reader {
     /// B present), so random access needs this — one O(n_slots) decode
     /// on the first `lineage()` call, ~4 B/slot of heap, cached.
     lineage_index: std::sync::OnceLock<Vec<u32>>,
+    /// The v8 integrity table (None for pre-v8 files, which have
+    /// nothing to verify). Open has already checked the table itself
+    /// and the eagerly-read sections; [`Self::verify_integrity`]
+    /// checks everything.
+    integrity: Option<IntegrityTable>,
 }
 
 impl Bm25Reader {
     /// The next local doc id (number of document slots).
     pub fn next_doc_id(&self) -> u32 {
         self.n_slots() as u32
+    }
+
+    /// Verify EVERY recorded section CRC against the mapped bytes —
+    /// including the big lazily-paged blobs open skips — and return
+    /// `(sections, bytes)` verified. Reads the whole file. A mismatch
+    /// is an error naming the section; a pre-v8 file is an error
+    /// saying there is nothing to verify, so "unverifiable" can never
+    /// be mistaken for "verified".
+    pub fn verify_integrity(&self) -> io::Result<(usize, u64)> {
+        let Some(table) = &self.integrity else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no integrity table: this file predates v8, rebuild to get checksums",
+            ));
+        };
+        let mut bytes = 0u64;
+        for e in &table.entries {
+            let got = crate::wal::crc32(&self.map[e.off as usize..(e.off + e.len) as usize]);
+            if got != e.crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "section {} ({} bytes at {}) CRC mismatch: stored {:08x}, computed {got:08x} — the bytes are not the ones the build wrote",
+                        e.name, e.len, e.off, e.crc
+                    ),
+                ));
+            }
+            bytes += e.len;
+        }
+        Ok((table.entries.len(), bytes))
+    }
+
+    /// Whether this file carries a v8 integrity table at all.
+    pub fn has_integrity(&self) -> bool {
+        self.integrity.is_some()
     }
 
     /// The shared slot count (every field's doc-length table has it).
@@ -5824,7 +6231,28 @@ impl Bm25Reader {
         let file = std::fs::File::open(path)?;
         let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
         if map.len() < 52 {
-            return Err(invalid("not a v3/v4/v5/v6/v7 .bm25 file"));
+            return Err(invalid("not a v3/v4/v5/v6/v7/v8 .bm25 file"));
+        }
+        if &map[..8] == MAGIC_V8 {
+            let table = parse_integrity(&map)?;
+            // Verify every section open reads anyway; the lazily-paged
+            // blobs (texts, per-field postings) wait for
+            // `verify_integrity`, because reading 50 GB at open would
+            // defeat the mmap paging model.
+            for e in table.entries.iter().filter(|e| integrity_eager(&e.name)) {
+                let got = crate::wal::crc32(&map[e.off as usize..(e.off + e.len) as usize]);
+                if got != e.crc {
+                    return Err(invalid(&format!(
+                        "section {} CRC mismatch: stored {:08x}, computed {got:08x} — the bytes are not the ones the build wrote",
+                        e.name, e.crc
+                    )));
+                }
+            }
+            let base_v7 = table.base_v7;
+            let payload_len = table.payload_len as usize;
+            let mut reader = Self::open_v6v7_bounded(map, base_v7, payload_len)?;
+            reader.integrity = Some(table);
+            return Ok(reader);
         }
         if &map[..8] == MAGIC_V7 {
             return Self::open_v6v7(map, true);
@@ -5833,7 +6261,7 @@ impl Bm25Reader {
             return Self::open_v6v7(map, false);
         }
         if &map[..8] != MAGIC_V5 && &map[..8] != MAGIC_V4 && &map[..8] != MAGIC_V3 {
-            return Err(invalid("not a v3/v4/v5/v6/v7 .bm25 file"));
+            return Err(invalid("not a v3/v4/v5/v6/v7/v8 .bm25 file"));
         }
         let v5 = &map[..8] == MAGIC_V5;
         let blob_relative = &map[..8] != MAGIC_V3;
@@ -5887,6 +6315,7 @@ impl Bm25Reader {
             v5_runs: v5,
             blob_relative,
             lineage_index: std::sync::OnceLock::new(),
+            integrity: None,
         })
     }
 
@@ -5896,7 +6325,17 @@ impl Bm25Reader {
     /// read machinery serves each field with run offsets rebased by
     /// that field's postings section offset.
     fn open_v6v7(map: memmap2::Mmap, v7: bool) -> io::Result<Self> {
-        validate_structure_v6(&map, v7)?;
+        let len = map.len();
+        Self::open_v6v7_bounded(map, v7, len)
+    }
+
+    /// [`Self::open_v6v7`] with the payload's byte length made
+    /// explicit: a v8 file carries its integrity section and trailer
+    /// AFTER the payload, and the structural validator derives the
+    /// last section's extent from where the bytes end, so it must see
+    /// the payload's end, not the file's.
+    fn open_v6v7_bounded(map: memmap2::Mmap, v7: bool, payload_len: usize) -> io::Result<Self> {
+        validate_structure_v6(&map[..payload_len], v7)?;
         let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().unwrap());
         let u64_at = |off: usize| u64::from_le_bytes(map[off..off + 8].try_into().unwrap());
         let n_fields = u32_at(8) as usize;
@@ -6085,6 +6524,7 @@ impl Bm25Reader {
             v5_runs: true,
             blob_relative: true,
             lineage_index: std::sync::OnceLock::new(),
+            integrity: None,
         })
     }
 
@@ -6862,6 +7302,164 @@ mod tests {
             ));
         }
         docs
+    }
+
+    /// A small store for the exhaustive v8 damage sweeps: big enough
+    /// to have every section populated, small enough that flipping
+    /// every byte stays cheap.
+    fn v8_store(columns: bool) -> Bm25Store {
+        let mut store = if columns {
+            Bm25Store::new()
+                .with_facets(&["court"])
+                .with_integers(&["cited"])
+                .with_geos(&["place"])
+        } else {
+            Bm25Store::new()
+        };
+        for (id, text, doc, lineage) in synthetic_corpus().into_iter().take(20) {
+            store.add_document_with_lineage(id, text, doc, lineage);
+            if columns {
+                store.set_facet(0, id, if id % 2 == 0 { "ca9" } else { "scotus" });
+                store.set_integer(0, id, i64::from(id) * 3);
+                store.set_geo(0, id, 40.0 + f64::from(id) * 0.1, -74.0);
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn v8_roundtrip_serves_and_deep_verifies() {
+        for columns in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "v8-rt-{columns}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("x.bm25");
+            let store = v8_store(columns);
+            store.save(&path).unwrap();
+            assert_eq!(&std::fs::read(&path).unwrap()[..8], MAGIC_V8);
+
+            let reader = Bm25Reader::open(&path).unwrap();
+            assert!(reader.has_integrity());
+            assert_eq!(Bm25Index::doc_count(&reader), store.doc_count());
+            let (sections, bytes) = reader.verify_integrity().unwrap();
+            let table = reader.integrity.as_ref().unwrap();
+            assert_eq!(sections, table.entries.len());
+            assert_eq!(bytes, table.payload_len, "entries must cover the whole payload");
+            assert_eq!(table.base_v7, columns);
+            // The store loader takes the same file back.
+            Bm25Store::load(&path).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn v8_bit_flip_anywhere_is_caught_by_open_or_deep_verify() {
+        let dir = std::env::temp_dir().join(format!("v8-flip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.bm25");
+        v8_store(true).save(&path).unwrap();
+        let intact = std::fs::read(&path).unwrap();
+
+        let victim = dir.join("flipped.bm25");
+        for i in 0..intact.len() {
+            let mut bytes = intact.clone();
+            bytes[i] ^= 0x01;
+            std::fs::write(&victim, &bytes).unwrap();
+            match Bm25Reader::open(&victim) {
+                Err(_) => {}
+                Ok(reader) => {
+                    let err = reader.verify_integrity().expect_err(&format!(
+                        "flip at byte {i}: open accepted it and deep verify found nothing"
+                    ));
+                    assert!(
+                        err.to_string().contains("CRC mismatch"),
+                        "flip at byte {i}: unexpected deep-verify error: {err}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v8_truncation_anywhere_refuses_open() {
+        let dir = std::env::temp_dir().join(format!("v8-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.bm25");
+        v8_store(false).save(&path).unwrap();
+        let intact = std::fs::read(&path).unwrap();
+
+        let victim = dir.join("cut.bm25");
+        for len in 0..intact.len() {
+            std::fs::write(&victim, &intact[..len]).unwrap();
+            assert!(
+                Bm25Reader::open(&victim).is_err(),
+                "a v8 file cut to {len} of {} bytes must refuse to open, \
+                 never demote to an integrity-less file",
+                intact.len()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v8_deep_verify_names_the_rotted_section() {
+        let dir = std::env::temp_dir().join(format!("v8-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.bm25");
+        v8_store(false).save(&path).unwrap();
+
+        let reader = Bm25Reader::open(&path).unwrap();
+        let e = reader
+            .integrity
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.name == "field:body:postings")
+            .expect("body postings section exists")
+            .clone();
+        drop(reader);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[(e.off + e.len / 2) as usize] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Postings are not eagerly verified, so open succeeds; the
+        // deep verify must fail NAMING the section.
+        let reader = Bm25Reader::open(&path).unwrap();
+        let err = reader.verify_integrity().unwrap_err();
+        assert!(
+            err.to_string().contains("field:body:postings"),
+            "error must name the rotted section: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pre_v8_files_open_but_report_nothing_to_verify() {
+        let dir = std::env::temp_dir().join(format!("v8-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.bm25");
+        // A raw v6 payload, no integrity pass: what every pre-v8 build
+        // on disk looks like.
+        let mut bytes = Vec::new();
+        v8_store(false).write_v6_to(&mut bytes).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V6);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let reader = Bm25Reader::open(&path).unwrap();
+        assert!(!reader.has_integrity());
+        let err = reader.verify_integrity().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("predates v8"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

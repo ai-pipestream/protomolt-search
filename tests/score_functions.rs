@@ -167,7 +167,7 @@ fn numeric_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2507");
+    assert_eq!(&bytes[..8], b"TVBM2508");
 
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
@@ -213,7 +213,7 @@ fn numeric_columns_roundtrip_and_dual_writers_agree() {
     only_numeric.set_numeric(0, 0, 7.0);
     let numeric_path = dir.join("numeric.bm25");
     only_numeric.save(&numeric_path).unwrap();
-    assert_eq!(&std::fs::read(&numeric_path).unwrap()[..8], b"TVBM2507");
+    assert_eq!(&std::fs::read(&numeric_path).unwrap()[..8], b"TVBM2508");
     let r = Bm25Reader::open(&numeric_path).unwrap();
     assert_eq!((r.facet_count(), r.numeric_count()), (0, 1));
 

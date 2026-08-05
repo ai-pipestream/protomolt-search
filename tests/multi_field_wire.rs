@@ -422,7 +422,7 @@ fn bm25_shard_open_maps_current_formats_resident() {
     store.save(&v6).unwrap();
     assert!(
         matches!(Bm25Shard::open(&v6).unwrap(), Bm25Shard::Resident(_)),
-        "a v6 file must open disk-resident"
+        "a current-format save (v8) must open disk-resident"
     );
 
     // v5 carries exactly one field; build the oracle file from a

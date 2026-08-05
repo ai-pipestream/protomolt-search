@@ -784,18 +784,20 @@ impl Bm25Shard {
     }
 
     /// Open a `.bm25` path in the right shape: every reader-supported
-    /// format (v3 through v6) maps disk-resident; only the pre-v3
+    /// format (v3 through v8) maps disk-resident; only the pre-v3
     /// formats load into the heap builder (and are upgraded to the
     /// current format on the next flush). v5/v6 were missing from this
-    /// list, so a restarted node heap-loaded its whole postings file —
-    /// at real shard sizes that is the exact failure the resident
-    /// reader exists to prevent.
+    /// list once, and v8 repeated the mistake in review, so a
+    /// restarted node heap-loaded its whole postings file — at real
+    /// shard sizes that is the exact failure the resident reader
+    /// exists to prevent. When a format version is added, it goes
+    /// HERE too.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let mut magic = [0u8; 8];
         std::fs::File::open(path)?.read_exact(&mut magic)?;
         if matches!(
             &magic,
-            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506" | b"TVBM2507"
+            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506" | b"TVBM2507" | b"TVBM2508"
         ) {
             Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
         } else {
@@ -2161,6 +2163,12 @@ impl NodeServiceImpl {
 
         // The atomic swap: previous generation aside (if any), staging
         // dir into place. Both files move inside ONE directory rename.
+        // The staging dir's own entries are fsynced first (the files'
+        // sync_all covered bytes and inodes, not the names pointing at
+        // them), and the parent is fsynced after so the swap itself
+        // survives a crash.
+        crate::postings::fsync_parent(&generation_tv(tmp_dir))
+            .map_err(|e| Status::internal(format!("fsync staging {}: {e}", tmp_dir.display())))?;
         if snap.exists() {
             std::fs::rename(&snap, &old)
                 .map_err(|e| Status::internal(format!("retire {}: {e}", old.display())))?;
@@ -2173,6 +2181,8 @@ impl NodeServiceImpl {
             return Err(Status::internal(format!("install {}: {e}", snap.display())));
         }
         let _ = std::fs::remove_dir_all(&old);
+        crate::postings::fsync_parent(&snap)
+            .map_err(|e| Status::internal(format!("fsync {}: {e}", snap.display())))?;
 
         guard.bm25 = if with_bm25 {
             Some(Bm25Shard::open(&generation_bm25(&snap)).map_err(|e| {
