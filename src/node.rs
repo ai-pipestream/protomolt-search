@@ -141,6 +141,15 @@ pub struct NodeConfig {
     /// Number of WAL hash buckets (`bucket-NNN.wal` files per
     /// generation). Fixed at WAL creation; a resumed log keeps its own.
     pub wal_buckets: u32,
+    /// Accumulate vocabulary statistics inline in the AddDocuments
+    /// AnalyzeStream path, snapshotting per window to
+    /// `<index path>.vocab/` (see [`crate::vocab`]). Requires
+    /// `index_path`; defaults off — zero overhead when off.
+    pub vocab: bool,
+    /// Documents per vocabulary window before automatic rollover.
+    pub vocab_window_docs: u64,
+    /// Heavy-hitter list size per vocabulary channel.
+    pub vocab_top_k: usize,
     /// Coalesce concurrent shard scans into batched kernel calls (up to
     /// [`MAX_COALESCE`] queries share each pass over the packed codes —
     /// the scan is bandwidth-bound, so batched queries ride the same
@@ -174,6 +183,9 @@ impl Default for NodeConfig {
             geo_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
+            vocab: false,
+            vocab_window_docs: crate::vocab::DEFAULT_WINDOW_DOCS,
+            vocab_top_k: crate::vocab::HeavyHitters::DEFAULT_CAPACITY,
             coalesce: true,
             scan_parallel: 0,
         }
@@ -1734,6 +1746,46 @@ pub struct NodeServiceImpl {
     /// cell (f32 bits, monotone max). Fed by [`Self::spawn_floor_listener`],
     /// read by the streaming scan between blocks.
     floor_cells: Arc<std::sync::Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>>,
+    /// The shard's vocabulary listener (`<index path>.vocab/`), attached
+    /// to every ingest AnalyzeStream. `None` when vocabulary accumulation
+    /// is off (the default) or its directory failed to initialize.
+    vocab: Option<Arc<crate::vocab::VocabularyListener>>,
+}
+
+/// Open the shard's vocabulary listener at `<index path>.vocab/`,
+/// resuming its snapshot history. Unlike the WAL this is analytics, not
+/// a ledger: a directory that cannot be created, probed, or scanned
+/// degrades the shard to uncounted with a loud warning — ingest itself
+/// is unaffected.
+fn open_vocab(config: &NodeConfig) -> Option<Arc<crate::vocab::VocabularyListener>> {
+    if !config.vocab {
+        return None;
+    }
+    let index_path = config.index_path.as_ref()?;
+    let dir = crate::vocab::vocab_dir(index_path);
+    match crate::vocab::VocabularyListener::create(
+        &dir,
+        config.vocab_window_docs,
+        config.vocab_top_k,
+    ) {
+        Ok(listener) => {
+            eprintln!(
+                "vocab: accumulating to {} (window {} docs, top-K {})",
+                dir.display(),
+                config.vocab_window_docs,
+                config.vocab_top_k
+            );
+            Some(Arc::new(listener))
+        }
+        Err(e) => {
+            eprintln!(
+                "vocab: {} is not writable ({e}); vocabulary accumulation is DISABLED, \
+                 ingest is unaffected",
+                dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// Raise a floor cell (f32 bits) to `floor` if that is higher. Monotone
@@ -1917,6 +1969,7 @@ impl NodeServiceImpl {
     /// Wrap an optional preloaded index in a node service.
     pub fn new(index: Option<TurboQuantIndex>, config: NodeConfig) -> Self {
         let wal = open_wal(index.as_ref(), &config);
+        let vocab = open_vocab(&config);
         Self {
             state: Arc::new(RwLock::new(ShardState {
                 index,
@@ -1930,6 +1983,21 @@ impl NodeServiceImpl {
             config,
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
             floor_cells: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            vocab,
+        }
+    }
+
+    /// The shard's vocabulary listener, when accumulation is enabled.
+    pub fn vocab_listener(&self) -> Option<Arc<crate::vocab::VocabularyListener>> {
+        self.vocab.clone()
+    }
+
+    /// Seal the live vocabulary window on graceful shutdown (the Rust
+    /// counterpart of the Java listener's JVM shutdown hook). No-op when
+    /// accumulation is off or the window is empty.
+    pub fn snapshot_vocab_on_shutdown(&self) {
+        if let Some(vocab) = &self.vocab {
+            vocab.persist_on_shutdown();
         }
     }
 
@@ -3883,8 +3951,12 @@ impl NodeServiceImpl {
                             added,
                             first_id,
                         )?;
-                        session = crate::analyzer::AnalyzeStream::open(addr, doc.analysis.as_ref())
-                            .await?;
+                        session = crate::analyzer::AnalyzeStream::open_with_vocab(
+                            addr,
+                            doc.analysis.as_ref(),
+                            self.vocab.clone(),
+                        )
+                        .await?;
                         spec = doc.analysis.clone();
                         submit = Some(session.submitter());
                     }
@@ -4650,7 +4722,13 @@ impl NodeService for NodeServiceImpl {
         // healthy. Degrading quietly turned a one-line version mismatch
         // into an h2 forensics exercise; failing here names it instead.
         if let Some(first) = inbound.message().await? {
-            match crate::analyzer::AnalyzeStream::open(&addr, first.analysis.as_ref()).await {
+            match crate::analyzer::AnalyzeStream::open_with_vocab(
+                &addr,
+                first.analysis.as_ref(),
+                self.vocab.clone(),
+            )
+            .await
+            {
                 Ok(session) => {
                     self.ingest_streamed(
                         session,

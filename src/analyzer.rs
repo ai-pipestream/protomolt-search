@@ -465,6 +465,13 @@ impl AnalyzeSubmit {
 pub struct AnalyzeStream {
     submit: Option<AnalyzeSubmit>,
     responses: Streaming<AnalyzeStreamResponse>,
+    /// The shard's vocabulary listener, when vocabulary accumulation is
+    /// enabled (`None` costs one branch per response). Feeding happens
+    /// HERE — the only layer where the raw response's `tokens` (surface
+    /// forms, dropped by `analyzed_from`) and `term_vectors` both still
+    /// exist — and only on this bulk path: unary `Analyze` is the query
+    /// path, and query text never enters corpus statistics.
+    vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
 }
 
 impl AnalyzeStream {
@@ -478,6 +485,18 @@ impl AnalyzeStream {
     /// open-then-submit cannot deadlock on a first result that would
     /// only exist after the first submission.
     pub async fn open(addr: &str, spec: Option<&AnalysisSpec>) -> Result<Self, Status> {
+        Self::open_with_vocab(addr, spec, None).await
+    }
+
+    /// [`open`](Self::open) with the shard's vocabulary listener attached:
+    /// every successfully analyzed response feeds its term vectors (TERMS
+    /// channel) and raw token texts (TOKENS channel) before the response
+    /// is folded into an [`AnalyzedDoc`].
+    pub async fn open_with_vocab(
+        addr: &str,
+        spec: Option<&AnalysisSpec>,
+        vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
+    ) -> Result<Self, Status> {
         let mut client = client(addr)?;
         let (requests, feed) = tokio::sync::mpsc::channel(SUBMIT_BUFFER);
         requests
@@ -492,6 +511,7 @@ impl AnalyzeStream {
         Ok(Self {
             submit: Some(AnalyzeSubmit { requests }),
             responses,
+            vocab,
         })
     }
 
@@ -568,7 +588,20 @@ impl AnalyzeStream {
             Some(response) => {
                 let sequence = response.sequence;
                 let result = match response.result {
-                    Some(analyze_stream_response::Result::Ok(ok)) => Ok(analyzed_from(ok)),
+                    Some(analyze_stream_response::Result::Ok(ok)) => {
+                        // Vocabulary feed BEFORE the fold: `analyzed_from`
+                        // drops the raw token texts the TOKENS channel
+                        // counts. The feed never fails ingest.
+                        if let Some(vocab) = &self.vocab {
+                            vocab.feed(
+                                ok.term_vectors
+                                    .iter()
+                                    .map(|tv| (tv.term.as_str(), i64::from(tv.frequency))),
+                                ok.tokens.iter().map(|t| t.text.as_str()),
+                            );
+                        }
+                        Ok(analyzed_from(ok))
+                    }
                     Some(analyze_stream_response::Result::Error(error)) => {
                         Err(Status::new(tonic::Code::from(error.code), error.message))
                     }

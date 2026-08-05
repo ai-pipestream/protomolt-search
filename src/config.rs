@@ -75,6 +75,10 @@ pub struct ShardConfig {
     /// Number of WAL hash buckets (a power of two, max 1024). Fixed at
     /// WAL creation; a resumed log keeps its own.
     pub wal_buckets: u32,
+    /// Accumulate vocabulary statistics inline in this shard's ingest,
+    /// snapshotting to `<index path>.vocab/` (see `docs/VOCABULARY-INDEX.md`).
+    /// Defaults OFF — zero overhead when off. Requires an index path.
+    pub vocab: bool,
 }
 
 /// One shard entry of a coordinator shard map (`--shard-map`): which node
@@ -229,6 +233,11 @@ pub struct Config {
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
     pub shard_map: Option<ShardMap>,
+    /// Documents per vocabulary window before automatic rollover (only
+    /// relevant to shards with `vocab` enabled).
+    pub vocab_window_docs: u64,
+    /// Heavy-hitter list size per vocabulary channel.
+    pub vocab_top_k: usize,
 }
 
 /// Raw TOML file shape; every field optional (file < env < CLI).
@@ -273,6 +282,9 @@ struct FileConfig {
     geo_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
+    vocab: Option<bool>,
+    vocab_window_docs: Option<u64>,
+    vocab_top_k: Option<usize>,
     shard_map: Option<String>,
     shards: Vec<FileShard>,
 }
@@ -288,6 +300,7 @@ struct FileShard {
     analysis_addr: Option<String>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
+    vocab: Option<bool>,
 }
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
@@ -475,6 +488,44 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     };
     let wal_buckets_default = parse_buckets(wal_buckets_default, "--wal-buckets")?;
 
+    // Vocabulary accumulation: default OFF (zero overhead); per-shard file
+    // entries may override the process default. Window and top-K sizing is
+    // process-wide (see docs/VOCABULARY-INDEX.md).
+    let vocab_default = match opt(args, "vocab", "TURBOVEC_VOCAB", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.vocab.unwrap_or(false),
+    };
+    let vocab_window_docs = opt(
+        args,
+        "vocab-window-docs",
+        "TURBOVEC_VOCAB_WINDOW_DOCS",
+        file.vocab_window_docs.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid vocab window docs: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(crate::vocab::DEFAULT_WINDOW_DOCS);
+    if vocab_window_docs == 0 {
+        return Err("vocab window docs must be positive".to_string());
+    }
+    let vocab_top_k = opt(
+        args,
+        "vocab-top-k",
+        "TURBOVEC_VOCAB_TOP_K",
+        file.vocab_top_k.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<usize>()
+            .map_err(|e| format!("invalid vocab top-K: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(crate::vocab::HeavyHitters::DEFAULT_CAPACITY);
+    if vocab_top_k == 0 {
+        return Err("vocab top-K must be positive".to_string());
+    }
+
     let mut shards: Vec<ShardConfig> = if cli_index.is_some() || cli_demo.is_some() {
         if cli_index.is_some() && cli_demo.is_some() {
             return Err("--index and --demo-vectors are mutually exclusive".to_string());
@@ -497,6 +548,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             listen,
             wal: wal_default && demo.is_none(),
             wal_buckets: wal_buckets_default,
+            vocab: vocab_default && demo.is_none(),
             index_path: cli_index.map(PathBuf::from),
             demo,
             slot_offset: cli_offset,
@@ -530,6 +582,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                         shard.wal_buckets.unwrap_or(wal_buckets_default),
                         &format!("shards[{i}]"),
                     )?,
+                    vocab: shard.vocab.unwrap_or(vocab_default) && demo.is_none(),
                     index_path: shard.index.as_ref().map(PathBuf::from),
                     demo,
                     slot_offset: shard.slot_offset.unwrap_or(0),
@@ -917,6 +970,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         integer_fields,
         geo_fields,
         shard_map,
+        vocab_window_docs,
+        vocab_top_k,
     })
 }
 
@@ -1130,6 +1185,43 @@ slot_offset = 20000
         assert!(persisted.shards[0].wal);
         let off = parse(&args(&["--role=node", "--index=/tmp/x.tv", "--wal=false"])).unwrap();
         assert!(!off.shards[0].wal);
+    }
+
+    #[test]
+    fn vocab_defaults_off_and_parses_knobs() {
+        let defaults = parse(&args(&["--role=node", "--index=/tmp/x.tv"])).unwrap();
+        assert!(!defaults.shards[0].vocab);
+        assert_eq!(defaults.vocab_window_docs, 1_000_000);
+        assert_eq!(defaults.vocab_top_k, 1024);
+
+        let on = parse(&args(&[
+            "--role=node",
+            "--index=/tmp/x.tv",
+            "--vocab=true",
+            "--vocab-window-docs=500000",
+            "--vocab-top-k=256",
+        ]))
+        .unwrap();
+        assert!(on.shards[0].vocab);
+        assert_eq!(on.vocab_window_docs, 500_000);
+        assert_eq!(on.vocab_top_k, 256);
+
+        // Demo shards have no index path to snapshot next to.
+        let demo = parse(&args(&["--role=node", "--demo-vectors=10", "--vocab=true"])).unwrap();
+        assert!(!demo.shards[0].vocab);
+
+        assert!(parse(&args(&[
+            "--role=node",
+            "--index=/tmp/x.tv",
+            "--vocab-window-docs=0"
+        ]))
+        .is_err());
+        assert!(parse(&args(&[
+            "--role=node",
+            "--index=/tmp/x.tv",
+            "--vocab-top-k=0"
+        ]))
+        .is_err());
     }
 
     #[test]

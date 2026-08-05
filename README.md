@@ -922,6 +922,12 @@ losslessness at k=1000 over a 24k corpus.
   legs, with per-leg provenance.
 - `src/analyzer.rs` — the analysis-sidecar client (text in, term vectors
   out). No local analysis by design.
+- `src/vocab.rs` — the vocabulary index: streaming corpus statistics
+  (HLL + count-min + space-saving, two channels) accumulated inline in
+  the AddDocuments AnalyzeStream path, snapshot per window to
+  `<index path>.vocab/`. Off by default (`--vocab=true`);
+  `examples/vocab_drift.rs` reads and merges snapshots. See
+  `docs/VOCABULARY-INDEX.md`.
 - `src/node.rs` / `src/coordinator.rs` — the two gRPC services. The node
   owns the shard state machine (empty → seeded → live) behind a write
   lock: chunked scans under the read lock, adds/calibration under the

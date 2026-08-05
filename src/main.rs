@@ -211,6 +211,9 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     geo_fields: cfg.geo_fields.clone(),
                     wal: shard.wal,
                     wal_buckets: shard.wal_buckets,
+                    vocab: shard.vocab,
+                    vocab_window_docs: cfg.vocab_window_docs,
+                    vocab_top_k: cfg.vocab_top_k,
                 },
             )
             .with_bm25(bm25_store)
@@ -320,6 +323,11 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("shutdown: flush failed: {e}"),
             }
         }
+    }
+    // Vocabulary windows seal on shutdown too, independent of the index
+    // flush (analytics, not a ledger — an empty window writes nothing).
+    for node in &node_services {
+        node.snapshot_vocab_on_shutdown();
     }
     Ok(())
 }
