@@ -191,7 +191,7 @@ fn map_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2507", "map columns opt into v7");
+    assert_eq!(&bytes[..8], b"TVBM2508", "map columns opt into the v7-shaped v8 payload");
 
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
         .unwrap()

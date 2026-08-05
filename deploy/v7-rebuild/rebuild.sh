@@ -439,6 +439,28 @@ stage_stop() {
   done
 }
 
+# Deep-verify every shard's .bm25 against its recorded section CRCs
+# (v8 builds; pre-v8 shards report NONE and the stage says so). Reads
+# every byte, so expect roughly a minute per 50 GB shard; run it after
+# a build, after copying shards between machines, or on bit-rot
+# suspicion. Serving keeps working while it runs (read-only mmap).
+stage_verify() {
+  local bin=${BM25_VERIFY:-$REPO/target/release/examples/bm25_verify}
+  [[ -x $bin ]] || die "no bm25_verify at $bin (cargo build --release --examples)"
+  local files=()
+  for ((i = 0; i < SHARDS; i++)); do
+    [[ -f $OUT/shard-$i.tv.bm25 ]] || die "missing $OUT/shard-$i.tv.bm25"
+    files+=("$OUT/shard-$i.tv.bm25")
+  done
+  local rc=0
+  "$bin" "${files[@]}" || rc=$?
+  case $rc in
+    0) say "all $SHARDS bm25 shards verified" ;;
+    2) say "shards predate v8: nothing to verify until the next rebuild" ;;
+    *) die "bm25 integrity verification FAILED" ;;
+  esac
+}
+
 stage_status() {
   for f in "$RUN"/*.pid; do
     [[ -e $f ]] || { say "nothing running"; return; }
@@ -464,10 +486,10 @@ wait_port() {
   die "$what never opened :$port"
 }
 
-(($# > 0)) || die "usage: rebuild.sh <plan|up|calibrate|ingest|down|serve|stop|status>..."
+(($# > 0)) || die "usage: rebuild.sh <plan|up|calibrate|ingest|down|serve|verify|stop|status>..."
 for stage in "$@"; do
   case "$stage" in
-    plan | up | sidecar | calibrate | ingest | down | serve | stop | status) "stage_$stage" ;;
+    plan | up | sidecar | calibrate | ingest | down | serve | verify | stop | status) "stage_$stage" ;;
     *) die "unknown stage $stage" ;;
   esac
 done

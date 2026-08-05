@@ -193,7 +193,7 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2507", "integer columns opt into v7");
+    assert_eq!(&bytes[..8], b"TVBM2508", "integer columns opt into the v7-shaped v8 payload");
 
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
@@ -274,7 +274,7 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
     only_integer.set_integer(0, 0, 42);
     let integer_path = dir.join("integer.bm25");
     only_integer.save(&integer_path).unwrap();
-    assert_eq!(&std::fs::read(&integer_path).unwrap()[..8], b"TVBM2507");
+    assert_eq!(&std::fs::read(&integer_path).unwrap()[..8], b"TVBM2508");
     let r = Bm25Reader::open(&integer_path).unwrap();
     assert_eq!((r.facet_count(), r.numeric_count(), r.integer_count()), (0, 0, 2));
     assert_eq!(r.integer_min_max(0), (42, 42));

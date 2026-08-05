@@ -156,7 +156,7 @@ fn facet_columns_roundtrip_and_dual_writers_agree() {
     let heap_path = dir.join("heap.bm25");
     store.save(&heap_path).unwrap();
     let bytes = std::fs::read(&heap_path).unwrap();
-    assert_eq!(&bytes[..8], b"TVBM2507", "facet-bearing stores write v7");
+    assert_eq!(&bytes[..8], b"TVBM2508", "facet-bearing stores write v8 with a v7-shaped payload");
 
     // The spill builder produces the same bytes.
     let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
@@ -215,8 +215,8 @@ fn facet_columns_roundtrip_and_dual_writers_agree() {
     plain.save(&plain_path).unwrap();
     assert_eq!(
         &std::fs::read(&plain_path).unwrap()[..8],
-        b"TVBM2506",
-        "facet-less stores keep the v6 format"
+        b"TVBM2508",
+        "facet-less stores write v8 with a v6-shaped payload"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -434,7 +434,7 @@ async fn spilled_shard_serves_facets_after_flush() {
         .unwrap()
         .read_exact(&mut magic)
         .unwrap();
-    assert_eq!(&magic, b"TVBM2507", "flushed facet shard is v7");
+    assert_eq!(&magic, b"TVBM2508", "flushed facet shard is v8");
 
     // Query the resident shard with hand-supplied globals; the counts
     // come from the mmapped ords column.

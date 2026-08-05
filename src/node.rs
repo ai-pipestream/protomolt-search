@@ -784,18 +784,20 @@ impl Bm25Shard {
     }
 
     /// Open a `.bm25` path in the right shape: every reader-supported
-    /// format (v3 through v6) maps disk-resident; only the pre-v3
+    /// format (v3 through v8) maps disk-resident; only the pre-v3
     /// formats load into the heap builder (and are upgraded to the
     /// current format on the next flush). v5/v6 were missing from this
-    /// list, so a restarted node heap-loaded its whole postings file —
-    /// at real shard sizes that is the exact failure the resident
-    /// reader exists to prevent.
+    /// list once, and v8 repeated the mistake in review, so a
+    /// restarted node heap-loaded its whole postings file — at real
+    /// shard sizes that is the exact failure the resident reader
+    /// exists to prevent. When a format version is added, it goes
+    /// HERE too.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         let mut magic = [0u8; 8];
         std::fs::File::open(path)?.read_exact(&mut magic)?;
         if matches!(
             &magic,
-            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506" | b"TVBM2507"
+            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506" | b"TVBM2507" | b"TVBM2508"
         ) {
             Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
         } else {
