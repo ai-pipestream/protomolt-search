@@ -1,6 +1,6 @@
 # The bench matrix
 
-What to run after every engine update: three cluster shapes, one driver,
+What to run after every engine update: four cluster shapes, one driver,
 one history file. Everything reads `inventory.env` in this directory --
 that file is the single source of truth for hosts, ports, niceness, and
 paths.
@@ -14,6 +14,7 @@ paths.
 ./run_matrix.sh solo             # everything on krick-1
 ./run_matrix.sh duo              # krick-1 + krick, split evenly
 ./run_matrix.sh fleet            # krick-1 + krick + the live pis
+./run_matrix.sh fleetpi          # pis only, no fast machine at all
 ./run_matrix.sh all              # all three, in that order
 ./run_matrix.sh teardown         # stop every bench process on every host
 ```
@@ -38,6 +39,13 @@ environment variables documented in `inventory.env`.
   floor-scout measurement the engine exists for: two fast collaborators
   plus a fleet of slow machines, and the question of whether mid-query
   floor sharing keeps the slow nodes from gating every query.
+- **fleetpi** -- every shard on a pi, coordinator on cm5ai1: no fast
+  machine anywhere. `FLEETPI_HOSTS` in `inventory.env` is ordered to match
+  the shards the pis already have staged (pi5v1..cm5v1 keep shards 2..7
+  from the fleet setup; pi5ai1 and cm5v2 take shards 0 and 1), so only new
+  hosts ever rsync. Answers the "what if krick and krick-1 went away"
+  question, and how much floor sharing matters when there is no fast leg
+  to lean on.
 
 Every setup starts TWO nodes per shard over the SAME shard files: one with
 `--floor-sharing=true` (port 59700+2n on its host) and one twin with

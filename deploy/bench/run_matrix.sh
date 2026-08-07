@@ -3,19 +3,23 @@
 # run_matrix.sh -- the standard post-engine-update benchmark matrix.
 #
 # usage:
-#   run_matrix.sh <solo|duo|fleet|all> [--shard-set=PATH] [--k=list]
+#   run_matrix.sh <solo|duo|fleet|fleetpi|all> [--shard-set=PATH] [--k=list]
 #                 [--concurrency=list]
 #   run_matrix.sh teardown           stop every bench process, every host
 #   run_matrix.sh -h                 this help
 #
-# The three setups:
-#   solo   all shards on krick-1, coordinator on krick-1. The fast-box
-#          ceiling: what the engine does with no slow collaborator.
-#   duo    shards split evenly across krick-1 + krick, coordinator on
-#          krick. Two fast collaborators.
-#   fleet  shard 0 on krick-1, shard 1 on krick, shards 2.. round-robin
-#          over the live pis, coordinator on krick. The floor-scout
-#          measurement: two fast collaborators plus a fleet of slow ones.
+# The four setups:
+#   solo    all shards on krick-1, coordinator on krick-1. The fast-box
+#           ceiling: what the engine does with no slow collaborator.
+#   duo     shards split evenly across krick-1 + krick, coordinator on
+#           krick. Two fast collaborators.
+#   fleet   shard 0 on krick-1, shard 1 on krick, shards 2.. round-robin
+#           over the live pis, coordinator on krick. The floor-scout
+#           measurement: two fast collaborators plus a fleet of slow ones.
+#   fleetpi every shard on a pi (FLEETPI_HOSTS order matches the shards the
+#           pis already have staged), coordinator on FLEETPI_COORD (cm5ai1).
+#           The no-fast-machine question: does floor sharing still keep an
+#           all-pi fleet from gating on its slowest leg?
 #
 # Every setup stages the shard files (rsync -aW --partial; rsync's own
 # size+mtime check skips files a host already has), starts a floor-sharing
@@ -69,7 +73,7 @@ for a in "$@"; do
     --shard-set=*) SHARD_SET=${a#*=} ;;
     --k=*) K_LIST=${a#*=} ;;
     --concurrency=*) CONCURRENCY_LIST=${a#*=} ;;
-    solo | duo | fleet | all | teardown)
+    solo | duo | fleet | fleetpi | all | teardown)
       [[ -z $SETUP ]] || die "one setup at a time (got $SETUP and $a)"
       SETUP=$a
       ;;
@@ -152,6 +156,26 @@ assign_shards() {
         p=$((p + 1))
       done
       ;;
+    fleetpi)
+      # All shards on pis, one per pi, in FLEETPI_HOSTS order -- that order
+      # matches the shards the pis already have staged, so only new hosts
+      # ever rsync. No fast collaborator anywhere, coordinator included.
+      resolve_pis "${FLEETPI_HOSTS[@]}" ||
+        die "fleetpi setup needs live pis (resolve_pis found none)"
+      ((${#LIVE_PIS[@]} >= N_SHARDS)) ||
+        die "fleetpi needs $N_SHARDS live pis from FLEETPI_HOSTS, got ${#LIVE_PIS[@]} (${LIVE_PIS[*]})"
+      local p=0
+      for i in "${SHARD_IDS[@]}"; do
+        note_shard "${LIVE_PIS[$p]}" "$i"
+        p=$((p + 1))
+      done
+      # The coordinator serves no shard, so resolve its IP here; the shard
+      # loop above only covers the FLEETPI_HOSTS entries.
+      local cip
+      cip=$(host_ipv4 "$FLEETPI_COORD") ||
+        die "fleetpi coordinator $FLEETPI_COORD unreachable"
+      HOST_IP[$FLEETPI_COORD]=$cip
+      ;;
     *) die "internal: unknown setup $setup" ;;
   esac
   say "$setup assignment:"
@@ -186,6 +210,11 @@ stage_host() {
   sdir=$(host_shard_dir "$host")
   if [[ $host == krick && -z $(bench_ssh_target krick) ]]; then
     say "krick serves shards straight from $sdir (no staging)"
+    return
+  fi
+  # A host with no shards (the fleetpi coordinator) has nothing to stage.
+  if [[ -z ${HOST_SHARDS[$host]:-} ]]; then
+    say "$host: no shards assigned, nothing to stage"
     return
   fi
   for i in ${HOST_SHARDS[$host]}; do
@@ -265,6 +294,8 @@ start_host_nodes() {
   local host=$1 root sdir i port script=""
   root=$(host_root "$host")
   sdir=$(host_shard_dir "$host")
+  # A host with no shards (the fleetpi coordinator) starts no nodes.
+  [[ -n ${HOST_SHARDS[$host]:-} ]] || return
   for i in ${HOST_SHARDS[$host]}; do
     port=${SHARD_PORT[$i]}
     script+="$(q "$root")/start-node.sh $(q "$sdir/shard-$i.tv") $port $((i * SLOT_STRIDE)) true"$'\n'
@@ -277,6 +308,9 @@ start_host_nodes() {
 start_coordinator() {
   local host=$COORD_HOST root nodes="" i script
   root=$(host_root "$host")
+  # The fleetpi coordinator lives on a pi; pis get the pi nice level.
+  local cnice=$NICE_FAST
+  case $host in krick | krick-1) ;; *) cnice=$NICE_PI ;; esac
   for i in "${SHARD_IDS[@]}"; do
     nodes+="${nodes:+,}${HOST_IP[${SHARD_HOST[$i]}]}:${SHARD_PORT[$i]}"
   done
@@ -287,7 +321,7 @@ start_coordinator() {
       echo \"bench coordinator already running (pid \$(cat \"\$pidfile\"))\" >&2
       exit 1
     fi
-    nice -n $NICE_FAST $(q "${HOST_BIN[$host]}") --role=coordinator \
+    nice -n $cnice $(q "${HOST_BIN[$host]}") --role=coordinator \
       --coord-listen=0.0.0.0:$COORD_PORT \
       --nodes=$(q "$nodes") \
       --chunk-blocks=$CHUNK_BLOCKS \
@@ -420,8 +454,14 @@ for SETUP in "${SETUPS[@]}"; do
   discover_shards
   resolve_fast_ips
   assign_shards "$SETUP"
-  [[ $SETUP == solo ]] && COORD_HOST=krick-1 || COORD_HOST=krick
+  case $SETUP in
+    solo) COORD_HOST=krick-1 ;;
+    fleetpi) COORD_HOST=$FLEETPI_COORD ;;
+    *) COORD_HOST=krick ;;
+  esac
   mapfile -t HOSTS < <(setup_hosts)
+  # The fleetpi coordinator serves no shard, so setup_hosts missed it.
+  [[ " ${HOSTS[*]} " == *" $COORD_HOST "* ]] || HOSTS+=("$COORD_HOST")
   for h in "${HOSTS[@]}"; do stage_host "$h"; done
   for h in "${HOSTS[@]}"; do
     ensure_host_binary "$h"
