@@ -304,13 +304,16 @@ start_coordinator() {
 wait_ready() {
   local addr=${HOST_IP[$COORD_HOST]}:$COORD_PORT waited
   [[ -x $VERIFY ]] || die "no v7_verify at $VERIFY (cargo build --release --examples)"
-  say "waiting for all $N_SHARDS shards to answer via $addr (postings still paging in)"
-  for waited in $(seq 1 300); do
+  # READY_TIMEOUT_S: cold-starting 8x57G shards pages postings in far
+  # slower than 600s on a fresh box (measured: >750s on krick-1).
+  local budget=${READY_TIMEOUT_S:-3600}
+  say "waiting for all $N_SHARDS shards to answer via $addr (postings still paging in; budget ${budget}s)"
+  for waited in $(seq 1 $((budget / 2))); do
     "$VERIFY" --coord="$addr" --shards="$N_SHARDS" \
-      --ready-only --wait-ready=2 >/dev/null 2>&1 && { say "fleet ready"; return; }
+      --ready-only --wait-ready=2 >/dev/null 2>&1 && { say "fleet ready after ~$((waited * 2))s"; return; }
     sleep 2
   done
-  die "fleet never became ready in 600s; processes left up, logs under each host's $(host_root "$COORD_HOST")/logs"
+  die "fleet never became ready in ${budget}s; processes left up, logs under each host's $(host_root "$COORD_HOST")/logs"
 }
 
 # --- measurement -------------------------------------------------------------
