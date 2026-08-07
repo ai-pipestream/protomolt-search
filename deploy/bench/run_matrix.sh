@@ -295,7 +295,9 @@ start_host_nodes() {
   root=$(host_root "$host")
   sdir=$(host_shard_dir "$host")
   # A host with no shards (the fleetpi coordinator) starts no nodes.
-  [[ -n ${HOST_SHARDS[$host]:-} ]] || return
+  # `return 0`, not bare `return`: the [[ ]] above just failed, and a bare
+  # return would propagate that 1 and trip set -e in the caller.
+  [[ -n ${HOST_SHARDS[$host]:-} ]] || return 0
   for i in ${HOST_SHARDS[$host]}; do
     port=${SHARD_PORT[$i]}
     script+="$(q "$root")/start-node.sh $(q "$sdir/shard-$i.tv") $port $((i * SLOT_STRIDE)) true"$'\n'
