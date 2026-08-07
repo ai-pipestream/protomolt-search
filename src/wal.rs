@@ -33,6 +33,8 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -225,8 +227,19 @@ pub struct WalManifest {
 /// fsync). A manifest that vanishes in a crash makes the whole
 /// generation invisible to replay, so the rename's directory entry
 /// gets the same durability as the bytes.
+///
+/// The tmp name is unique per writer (pid + counter): two nodes
+/// cold-starting the same first generation write their manifests
+/// concurrently, and with one shared `manifest.toml.tmp` the first
+/// rename consumed the path and the second `rename` failed ENOENT —
+/// the fleet's `open WAL ... No such file or directory` panic.
 pub fn write_manifest(gen_dir: &Path, manifest: &WalManifest) -> io::Result<()> {
-    let tmp = gen_dir.join("manifest.toml.tmp");
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = gen_dir.join(format!(
+        "manifest.toml.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(toml::to_string(manifest).map_err(io::Error::other)?.as_bytes())?;
@@ -500,6 +513,74 @@ pub fn truncate_records_at_or_above(gen_dir: &Path, cutoff_id: u64) -> io::Resul
 // Writer
 // ---------------------------------------------------------------------------
 
+/// How long a first-open waits for a concurrent creator's manifest to
+/// appear before giving up. The winning create is a directory create
+/// plus one fsynced small-file rename — milliseconds on disk, still
+/// well under a second on a loaded SD card — so 10 s of slack absorbs
+/// a busy machine without masking a genuinely abandoned generation
+/// directory (which still fails the open, just after the wait).
+const PEER_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
+const PEER_CREATE_POLL: Duration = Duration::from_millis(5);
+
+/// The geometry check `read_manifest` applies — a log that can be
+/// written but never read back must not come into existence.
+fn check_geometry(manifest: &WalManifest) -> io::Result<()> {
+    if !manifest.bucket_count.is_power_of_two()
+        || manifest.bucket_count == 0
+        || 1u64 << manifest.bucket_bits != u64::from(manifest.bucket_count)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "bad bucket geometry: bucket_bits={} bucket_count={}",
+                manifest.bucket_bits, manifest.bucket_count
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Open a shard's WAL the way a starting node does: resume the newest
+/// generation (truncating records at or above `cutoff`, the applied
+/// tip — buffered appends that outlived a crash) or, when no log
+/// exists, create generation 0 from `fresh`.
+///
+/// Concurrent first-open is idempotent: twin nodes sharing the shard
+/// files can cold-start together. A peer's create is visible (the
+/// generation directory) before it is complete (the manifest rename),
+/// so a NotFound while reading a just-appeared generation is retried
+/// until [`PEER_CREATE_TIMEOUT`] rather than failing the open, and the
+/// create side is claimed atomically — every opener returns a valid
+/// writer onto the SAME well-formed generation.
+pub fn open_or_create(wal_dir: &Path, cutoff: u64, fresh: WalManifest) -> io::Result<WalWriter> {
+    let deadline = Instant::now() + PEER_CREATE_TIMEOUT;
+    loop {
+        let attempt = match latest_gen(wal_dir)? {
+            Some((_, gen)) => match read_manifest(&gen) {
+                Ok(m) => {
+                    let dropped = truncate_records_at_or_above(&gen, cutoff)?;
+                    if dropped > 0 {
+                        eprintln!(
+                            "wal: truncated {dropped} record(s) at or above applied tip {cutoff} \
+                             in {} (buffered appends that outlived a crash; never durable-acked)",
+                            gen.display()
+                        );
+                    }
+                    WalWriter::resume(&gen, m)
+                }
+                Err(e) => Err(e),
+            },
+            None => WalWriter::create_or_resume(wal_dir, fresh.clone()),
+        };
+        match attempt {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(PEER_CREATE_POLL);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// One open bucket file: buffered appends plus its own seq counter.
 struct BucketWriter {
     file: BufWriter<File>,
@@ -559,21 +640,13 @@ impl WalWriter {
     /// existing files in the directory are truncated — a create means
     /// "this generation starts now" (initial WAL, or rotation after a
     /// snapshot superseded the old log).
+    ///
+    /// Node startup must NOT use this directly: two nodes cold-starting
+    /// the same shard would both create and clobber each other. Startup
+    /// goes through [`open_or_create`], which converges concurrent
+    /// first-openers on one generation.
     pub fn create(wal_dir: &Path, manifest: WalManifest) -> io::Result<Self> {
-        // The same geometry check read_manifest applies — a log that can
-        // be written but never read back must not come into existence.
-        if !manifest.bucket_count.is_power_of_two()
-            || manifest.bucket_count == 0
-            || 1u64 << manifest.bucket_bits != u64::from(manifest.bucket_count)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "bad bucket geometry: bucket_bits={} bucket_count={}",
-                    manifest.bucket_bits, manifest.bucket_count
-                ),
-            ));
-        }
+        check_geometry(&manifest)?;
         let dir = gen_dir(wal_dir, manifest.generation);
         std::fs::create_dir_all(&dir)?;
         write_manifest(&dir, &manifest)?;
@@ -584,6 +657,61 @@ impl WalWriter {
             buckets: HashMap::new(),
             records_appended: 0,
         })
+    }
+
+    /// Open generation `manifest.generation` for a node that does not
+    /// know whether a peer is creating it at this moment: claim the
+    /// generation directory atomically (`create_dir` fails
+    /// `AlreadyExists` for every opener but the first) and populate it,
+    /// or — once the peer's manifest is visible — resume the peer's
+    /// generation instead. Every concurrent opener ends up with a valid
+    /// writer onto ONE well-formed generation, the cold-start contract
+    /// for twin nodes sharing shard files.
+    ///
+    /// A claimed-but-manifestless directory is a create in mid-flight;
+    /// it is polled until [`PEER_CREATE_TIMEOUT`], not mistaken for a
+    /// resumable generation (an abandoned one still errors, just
+    /// slower). Rotation keeps [`Self::create`]: there a pre-existing
+    /// directory is stale state to truncate, not a peer to join.
+    pub fn create_or_resume(wal_dir: &Path, manifest: WalManifest) -> io::Result<Self> {
+        check_geometry(&manifest)?;
+        std::fs::create_dir_all(wal_dir)?;
+        let dir = gen_dir(wal_dir, manifest.generation);
+        let deadline = Instant::now() + PEER_CREATE_TIMEOUT;
+        loop {
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    // Claimed: this caller materializes the generation.
+                    if manifest.preexisting_vectors > 0 || manifest.preexisting_documents > 0 {
+                        eprintln!(
+                            "wal: shard already holds {} vectors / {} documents; the new \
+                             log records them as preexisting — this shard can serve but cannot be \
+                             resharded from this log (rebuild via InstallSnapshot for full history)",
+                            manifest.preexisting_vectors,
+                            manifest.preexisting_documents
+                        );
+                    }
+                    write_manifest(&dir, &manifest)?;
+                    return Ok(Self {
+                        markers: BucketWriter::create(&markers_path(&dir))?,
+                        dir,
+                        manifest,
+                        buckets: HashMap::new(),
+                        records_appended: 0,
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    match read_manifest(&dir) {
+                        Ok(m) => return Self::resume(&dir, m),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
+                            std::thread::sleep(PEER_CREATE_POLL);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Resume the generation in `gen_dir` after a restart: adopt its
@@ -804,6 +932,23 @@ mod tests {
         bad.bucket_bits = 5;
         write_manifest(&gen, &bad).unwrap();
         assert!(read_manifest(&gen).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_or_resume_adopts_an_existing_generation() {
+        let dir = tempdir("create_or_resume");
+        let mut first = WalWriter::create_or_resume(&dir, manifest(4)).unwrap();
+        first.append(add_op(0)).unwrap();
+        first.flush().unwrap();
+        drop(first);
+        // A second open of the same generation resumes it instead of
+        // truncating the records the first writer logged.
+        let second = WalWriter::create_or_resume(&dir, manifest(4)).unwrap();
+        assert_eq!(second.generation(), 0);
+        drop(second);
+        let path = bucket_path(&gen_dir(&dir, 0), bucket_of(0, 4) as u32);
+        assert_eq!(scan_records(&path).unwrap().last_seq, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1637,6 +1637,12 @@ fn persisted_doc_tip(index_path: &Path) -> u64 {
 /// A log CREATED over an already-populated shard records the shard's
 /// current contents as `preexisting_*` in its manifest: it can serve and
 /// recover, but it is not full history and cannot drive a reshard.
+///
+/// Concurrent first-open is idempotent (see [`wal::open_or_create`]):
+/// twin nodes sharing the shard files can cold-start against a shard
+/// whose WAL directory does not exist yet, and both end up with a
+/// writer onto the same well-formed generation instead of one of them
+/// panicking on the mid-create directory.
 fn open_wal(index: Option<&TurboQuantIndex>, config: &NodeConfig) -> Option<WalWriter> {
     if !config.wal {
         return None;
@@ -1648,32 +1654,10 @@ fn open_wal(index: Option<&TurboQuantIndex>, config: &NodeConfig) -> Option<WalW
     let vector_tip = index.map_or(0, |i| i.len() as u64);
     let doc_tip = persisted_doc_tip(index_path);
     let dir = wal::wal_dir(index_path);
-    let result = match wal::latest_gen(&dir) {
-        Ok(Some((_, gen))) => wal::read_manifest(&gen).and_then(|m| {
-            let cutoff = config.slot_offset + vector_tip.max(doc_tip);
-            let dropped = wal::truncate_records_at_or_above(&gen, cutoff)?;
-            if dropped > 0 {
-                eprintln!(
-                    "wal: truncated {dropped} record(s) at or above applied tip {cutoff} in {} \
-                     (buffered appends that outlived a crash; never durable-acked)",
-                    gen.display()
-                );
-            }
-            WalWriter::resume(&gen, m)
-        }),
-        Ok(None) => {
-            if vector_tip > 0 || doc_tip > 0 {
-                eprintln!(
-                    "wal: shard already holds {vector_tip} vectors / {doc_tip} documents; the new \
-                     log records them as preexisting — this shard can serve but cannot be \
-                     resharded from this log (rebuild via InstallSnapshot for full history)"
-                );
-            }
-            WalWriter::create(&dir, wal_manifest(index, config, 0, (vector_tip, doc_tip)))
-        }
-        Err(e) => Err(e),
-    };
-    let mut writer = result.unwrap_or_else(|e| panic!("open WAL at {}: {e}", dir.display()));
+    let cutoff = config.slot_offset + vector_tip.max(doc_tip);
+    let fresh = wal_manifest(index, config, 0, (vector_tip, doc_tip));
+    let mut writer = wal::open_or_create(&dir, cutoff, fresh)
+        .unwrap_or_else(|e| panic!("open WAL at {}: {e}", dir.display()));
     if writer.manifest().bucket_count != config.wal_buckets {
         eprintln!(
             "wal: --wal-buckets={} ignored; the existing log at {} has bucket_count={}",
