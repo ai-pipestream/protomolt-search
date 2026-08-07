@@ -216,7 +216,13 @@ ensure_host_binary() {
   case $host in
     krick)
       [[ -x $BIN_LOCAL ]] || die "no local binary at $BIN_LOCAL (cargo build --release)"
-      HOST_BIN[$host]=$BIN_LOCAL
+      # The generated start-node.sh execs $DIR/bin/turbovec-search, so the
+      # local host needs the binary under its bench root too. Copy (not
+      # symlink): a cargo rebuild must not swap the file under a live node.
+      must krick "mkdir $root/bin" "mkdir -p $(q "$root")/bin"
+      cp "$BIN_LOCAL" "$root/bin/turbovec-search" ||
+        die "krick: could not copy $BIN_LOCAL into $root/bin"
+      HOST_BIN[$host]=$root/bin/turbovec-search
       ;;
     krick-1)
       if host_sh krick-1 "[[ -x $(q "$KRICK1_CLONE_BIN") ]]"; then
