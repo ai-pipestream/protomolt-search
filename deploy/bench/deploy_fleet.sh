@@ -116,7 +116,7 @@ doctor_host() {
   host_sh "$h" "
     b=$(q "$root")/bin/turbovec-search
     if [[ -x \"\$b\" ]]; then echo \"  binary   present+exec\"; else echo \"  binary   MISSING (\$b)\"; fi
-    echo \"  disk     \$(df -h \"\$HOME\" | awk 'NR==2{print \$4\" free of \"\$2}')\"
+    echo \"  disk     \$(d=$(q "$root"); while [[ ! -d \"\$d\" && \"\$d\" != / ]]; do d=\$(dirname \"\$d\"); done; df -h \"\$d\" | awk -v d=\"\$d\" 'NR==2{print \$4\" free of \"\$2\" (at \"d\")\"}')\"
     echo \"  memory   \$(free -g | awk '/Mem:/{print \$7\" GB avail of \"\$2}')\"
     if (exec 3<>/dev/tcp/127.0.0.1/$FLEET_PORT) 2>/dev/null; then echo '  port     $FLEET_PORT BUSY'; else echo '  port     $FLEET_PORT free'; fi
   " || printf '  doctor script failed\n'

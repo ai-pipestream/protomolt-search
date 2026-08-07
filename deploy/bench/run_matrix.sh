@@ -192,8 +192,18 @@ stage_host() {
     files+=("$SHARD_SET/shard-$i.tv" "$SHARD_SET/shard-$i.tv.bm25")
     [[ -f $SHARD_SET/shard-$i.tv.wal ]] && files+=("$SHARD_SET/shard-$i.tv.wal")
   done
-  say "staging ${#files[@]} files to $host:$sdir"
+  # Disk preflight: refuse by name before a multi-GB rsync runs out of
+  # room halfway (cm5ai1's eMMC is the case this guards).
+  local need=0 f
+  for f in "${files[@]}"; do need=$((need + $(stat -c%s "$f"))); done
   must "$host" "mkdir $sdir" "mkdir -p $(q "$sdir")"
+  local avail
+  avail=$(host_sh "$host" "df -B1 --output=avail $(q "$sdir") | tail -1 | tr -d ' '") ||
+    die "$host: cannot check free space at $sdir"
+  if ((avail < need)); then
+    die "$host: $sdir has $((avail / 2**30)) GB free, needs $((need / 2**30)) GB -- skipping (free space or pick another host)"
+  fi
+  say "staging ${#files[@]} files ($((need / 2**30)) GB) to $host:$sdir ($((avail / 2**30)) GB free)"
   rsync -aW --partial --info=progress2 "${files[@]}" "$host:$sdir/" ||
     die "$host: shard staging rsync failed"
 }
