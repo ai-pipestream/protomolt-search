@@ -27,7 +27,9 @@
 #   OUT, CHUNKS, EMB, CASE_NAMES, SHARDS, DIM, BLOCK, CHUNK_BLOCKS,
 #   FIELDS, PORT_BASE, COORD_PORT, SIDECAR_PORT, SIDECAR_BIN,
 #   OFFSET_STRIDE, EMBEDDINGS_DIR, BIN, INGEST,
-#   WAVE (shards ingesting at once), DISK_MARGIN_GB, BODY_COLUMNS
+#   WAVE (shards ingesting at once), DISK_MARGIN_GB, BODY_COLUMNS,
+#   VOCAB / VOCAB_WINDOW_DOCS / VOCAB_TOP_K (vocabulary harvesting, off
+#   unless VOCAB=1; see docs/VOCABULARY-INDEX.md)
 #
 set -euo pipefail
 
@@ -54,6 +56,13 @@ FIELDS=${FIELDS:-body,case_name}
 #
 # (source 3 = SOURCE_NORMALIZED_STEMS: rungs run, then the stemmer.)
 BODY_COLUMNS=${BODY_COLUMNS:-}
+# Vocabulary harvesting (docs/VOCABULARY-INDEX.md): VOCAB=1 turns on each
+# node's inline vocabulary accumulator, which seals sketch snapshots under
+# <index>.vocab/ as ingest proceeds. No cost to the index itself; merge the
+# per-shard snapshots afterward with examples/vocab_drift --merge.
+VOCAB=${VOCAB:-}
+VOCAB_WINDOW_DOCS=${VOCAB_WINDOW_DOCS:-}
+VOCAB_TOP_K=${VOCAB_TOP_K:-}
 PORT_BASE=${PORT_BASE:-59300}
 COORD_PORT=${COORD_PORT:-59291}
 SIDECAR_PORT=${SIDECAR_PORT:-59202}
@@ -251,6 +260,9 @@ start_node() {
       --bm25-fields="$FIELDS" \
       --stream-search \
       --analysis-addr="http://127.0.0.1:$SIDECAR_PORT" \
+      ${VOCAB:+--vocab=true} \
+      ${VOCAB_WINDOW_DOCS:+--vocab-window-docs="$VOCAB_WINDOW_DOCS"} \
+      ${VOCAB_TOP_K:+--vocab-top-k="$VOCAB_TOP_K"} \
       >>"$LOGS/node-$i.log" 2>&1 &
     local pid=$!
     echo "$pid" >"$RUN/node-$i.pid"
