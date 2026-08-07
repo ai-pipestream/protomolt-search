@@ -87,6 +87,14 @@ INGEST=${INGEST:-$REPO/target/release/examples/court_ingest}
 PROBE=${PROBE:-$REPO/target/release/examples/analyze_probe}
 VERIFY=${VERIFY:-$REPO/target/release/examples/v7_verify}
 
+# Resource cadence for the data plane: shard nodes and the coordinator run
+# niced so an interactive shell and the analysis sidecar stay responsive
+# while the fleet is ingesting or serving. The sidecar itself is NOT niced
+# (it is the ingest throughput ceiling). NICE=0 disables.
+NICE=${NICE:-5}
+NICE_PREFIX=()
+((NICE == 0)) || NICE_PREFIX=(nice -n "$NICE")
+
 RUN="$OUT/run"
 LOGS="$OUT/logs"
 
@@ -251,7 +259,7 @@ stage_up() {
 start_node() {
   local i=$1 port=$((PORT_BASE + i)) attempt
   for attempt in 1 2 3 4 5; do
-    "$BIN" --role=node \
+    "${NICE_PREFIX[@]}" "$BIN" --role=node \
       --node-listen="127.0.0.1:$port" \
       --index="$OUT/shard-$i.tv" \
       --slot-offset="${OFFSETS[i]}" \
@@ -295,8 +303,12 @@ sidecar_can_embed() {
 
 sidecar_up() {
   if port_open "$SIDECAR_PORT"; then
-    if [[ ! -x $PROBE ]] || sidecar_can_embed; then
-      say "analysis sidecar already listening on :$SIDECAR_PORT"
+    if [[ ! -x $PROBE ]]; then
+      say "analysis sidecar already listening on :$SIDECAR_PORT (no probe binary to check it with)"
+      return
+    fi
+    if sidecar_can_embed; then
+      say "reusing healthy sidecar on :$SIDECAR_PORT"
       return
     fi
     # Most likely its jars were replaced under it: a running JVM loads
@@ -417,7 +429,7 @@ stage_serve() {
     start_node "$i"
   done
   say "serving $SHARDS shards on $NODE_LIST (mmaps page in on first query)"
-  "$BIN" --role=coordinator \
+  "${NICE_PREFIX[@]}" "$BIN" --role=coordinator \
     --coord-listen="127.0.0.1:$COORD_PORT" \
     --nodes="$NODE_LIST" \
     --chunk-blocks="$CHUNK_BLOCKS" \
@@ -498,10 +510,28 @@ wait_port() {
   die "$what never opened :$port"
 }
 
+ENGINE_REV=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+# Run one stage under the wall clock: print the elapsed time at stage end
+# and append one JSON record to $OUT/timings.jsonl, so every rebuild leaves
+# its own duration ledger next to the shards it built. A failed stage dies
+# before the append, so the ledger records completed stages only.
+run_stage() {
+  local stage=$1 started ended
+  started=$(date +%s)
+  "stage_$stage"
+  ended=$(date +%s)
+  mkdir -p "$OUT"
+  printf '{"stage":"%s","started_at":%d,"ended_at":%d,"elapsed_s":%d,"shards":%d,"corpus_chunks":%d,"engine_rev":"%s","out":"%s"}\n' \
+    "$stage" "$started" "$ended" "$((ended - started))" "$SHARDS" "$M" \
+    "$ENGINE_REV" "$OUT" >>"$OUT/timings.jsonl"
+  say "stage $stage took $((ended - started))s"
+}
+
 (($# > 0)) || die "usage: rebuild.sh <plan|up|calibrate|ingest|down|serve|verify|stop|status>..."
 for stage in "$@"; do
   case "$stage" in
-    plan | up | sidecar | calibrate | ingest | down | serve | verify | stop | status) "stage_$stage" ;;
+    plan | up | sidecar | calibrate | ingest | down | serve | verify | stop | status) run_stage "$stage" ;;
     *) die "unknown stage $stage" ;;
   esac
 done
