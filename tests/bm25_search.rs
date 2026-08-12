@@ -587,6 +587,58 @@ async fn bm25_search_min_score_factorial_across_the_fleet() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The streaming lexical fan-out (`Bm25QueryStream`, the mid-scan floor
+/// relay) must return exactly what the unary fan-out returns — same
+/// hits, same score bits, same order — unseeded, client-seeded, and at
+/// a k small enough that shard heaps fill and floors actually go on the
+/// wire. Relay timing is nondeterministic; the merged result must not
+/// be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bm25_stream_relay_matches_unary_exactly() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addrs, handles) = start_doc_shards(&analysis).await;
+
+    let unary = CoordinatorServiceImpl::new(addrs.clone())
+        .with_bm25(Some(analysis.clone()), Default::default());
+    let streamed = CoordinatorServiceImpl::new(addrs.clone())
+        .with_bm25(Some(analysis.clone()), Default::default())
+        .with_bm25_stream(true);
+
+    // k=4 fills no 2-doc shard heap (the relay stays silent: protocol
+    // only); k=2 fills shard 0's heap on "rust", so its floor is
+    // published and relayed while siblings scan.
+    for (query, k) in [("rust", 4u32), ("rust", 2), ("vector search rust", 3)] {
+        let reference = unary.fanout_bm25(query, k, None).await.unwrap();
+        let live = streamed.fanout_bm25(query, k, None).await.unwrap();
+        assert_eq!(
+            hit_signature(&reference),
+            hit_signature(&live),
+            "streamed != unary ({query:?}, k={k})"
+        );
+
+        // Client-seeded through the streaming route: the relay's floors
+        // arrive on top of the seed, and seeded must equal unseeded
+        // exactly (the seed is one ULP below the true k-th best).
+        if reference.len() == k as usize {
+            let seed = f32::from_bits(reference[k as usize - 1].score.to_bits() - 1);
+            let seeded = streamed
+                .fanout_bm25_seeded(query, k, None, seed)
+                .await
+                .unwrap();
+            assert_eq!(
+                hit_signature(&reference),
+                hit_signature(&seeded),
+                "streamed seeded != unseeded ({query:?}, k={k})"
+            );
+        }
+    }
+
+    for h in handles {
+        h.abort();
+    }
+    mock.abort();
+}
+
 /// Regression guard: shard-LOCAL stats must produce different scores than
 /// the global-stats flow. If the coordinator ever regresses to local
 /// stats, this test fails.

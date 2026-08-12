@@ -264,21 +264,37 @@ Most of what the vector leg built for floors applies unchanged:
   for free: a merge-join against a sorted candidate list becomes
   `advance(target)` over blocks instead of a full postings walk.
 
-The one piece that does **not** transfer is the mid-query relay, and the
-reason is structural: the vector relay rides the bidi `SearchShard`
-stream, while `Bm25Query` is a **unary** RPC. There is no channel to
-push a raised floor into an in-flight unary call — the coordinator's
-only options would be waiting for the slowest shard anyway (no savings)
-or cancelling and re-issuing with the raised floor (re-issued shards
-redo work already done; the winner's floor rarely justifies a fleet-wide
-redo). A bidi `Bm25QueryStream` mirroring `SearchShard` — per-chunk
-k-th-best publications from each shard, conflated raises pushed back —
-is the shape to build *if* fleet measurements later show lexical wall
-time dominated by one slow shard's long postings while siblings finish
-early. Until then the seeded floor is **client-seeded and unary**:
+The mid-query relay needed one structural addition: the vector relay
+rides the bidi `SearchShard` stream, while `Bm25Query` is a **unary**
+RPC with no channel to push a raised floor into an in-flight call. That
+channel now exists: `Bm25QueryStream` is a bidi RPC mirroring
+`SearchShard` — each shard publishes strict raises of its running
+k-th best (as the emission-safe `floor_seed` value, gated by the same
+`--floor-delta` / `--floor-min-interval-ms` knobs as the vector side),
+the coordinator conflates raises into one watch cell per query and
+relays the max back to every sibling, and the pruned scorer adopts
+external floors between block-bound tests via `bm25::LiveFloorHook`.
+Exactness is unchanged — an adopted floor is a proven lower bound on
+the final global k-th, so it can only skip candidates the merge would
+discard anyway; `tests/bm25_live_floor.rs` pins the hook contract
+against the seeded scorer and
+`tests/bm25_search.rs::bm25_stream_relay_matches_unary_exactly` pins
+the fleet-level hit signature, streamed vs unary, seeded and not.
+
+The relay is opt-in (`--bm25-stream` / `TURBOVEC_BM25_STREAM` on the
+coordinator; nodes always serve the RPC). Measured on the v9 court
+fleet (8 shards, one host, 36 case-folding queries x 3): k=10 is
+noise-level either way; k=100 keeps p50 flat (71 ms) and trims the tail
+— bm25 p90 262 → 231 ms, max 360 → 298 ms. That is the expected shape:
+the relay only converts *sibling* progress into skipped blocks on
+whichever shard is slowest, so it pays in the tail and pays more the
+longer the scan (larger k, more skewed shards, real network fan-outs).
+On a single host where all shards share the same cores the win is
+modest; leave it off unless tail latency at larger k matters. The
+client-seeded unary floor is unchanged and composes with the relay:
 `Bm25SearchRequest.min_score` forwards a floor the caller already holds
 (e.g. the `kth_best` of a previous identical query, re-issued after
-appends) to every shard with the request.
+appends) as the starting floor, and the relay raises it from there.
 
 Before block-max, a raised floor only skipped heap insertions, which is
 why the five-machine round measured a 51% candidate cut at cost parity: a
@@ -318,7 +334,7 @@ Landed in this order, each measurable on its own:
    reader's `posting_offsets` early-exits (its k=1000 column fell from
    16 s to 1.5 s).
 4. **Seeded lexical floor across the fleet** — landed, client-seeded
-   and unary (see above for why no mid-query relay). `kth_best` on
+   and unary. `kth_best` on
    `Bm25QueryResponse` / `Bm25SearchResponse`, `min_score` on
    `Bm25SearchRequest`, the `--block-max` node flag
    (`TURBOVEC_BLOCK_MAX`, default true) for A/B, and `cluster_sweep
@@ -329,6 +345,16 @@ Landed in this order, each measurable on its own:
    remains an operational run; the gate logic and semantics are covered
    by `tests/bm25_search.rs::bm25_search_min_score_factorial_across_the_fleet`
    and the `lexical_sweep_smoke` example.
+5. **Mid-query live-floor relay** — landed, opt-in
+   (`--bm25-stream`). Bidi `Bm25QueryStream`, `bm25::LiveFloorHook`
+   polled between bound tests in the pruned scorer, coordinator-side
+   conflated relay reusing the vector path's watch-cell machinery.
+   Bit-exact by the seeded-floor argument (a relayed floor is a proven
+   global lower bound); pinned by `tests/bm25_live_floor.rs` and the
+   streamed-vs-unary fleet gate in `tests/bm25_search.rs`. Measured
+   (v9 court fleet, 8 shards, one host): k=10 noise, k=100 p50 flat
+   with bm25 p90 262 → 231 ms and max 360 → 298 ms — a tail-only win
+   that should grow with scan length and real network fan-out.
 
 ## Migrating existing shards to v5
 

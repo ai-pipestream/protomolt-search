@@ -171,6 +171,20 @@ service NodeService {
   // select the defaults (1.2 / 0.75). Returns the shard's local top-k.
   rpc Bm25Query(Bm25QueryRequest) returns (Bm25QueryResponse);
 
+  // Bm25Query with a mid-scan floor relay — the lexical twin of
+  // SearchShard (docs/block-max.md, "the floor is already plumbed").
+  // The first client message must be `start`; later messages raise the
+  // shard's score floor, applied at the scorer's next loop iteration.
+  // The shard emits its running k-th best (one f32 ULP down, the same
+  // emission-safe seed `kth_best` carries) as its heap rises, and ends
+  // the stream with exactly one `done` carrying the same response the
+  // unary RPC would have produced. Exactness is the seeded-floor
+  // contract delivered mid-scan: every relayed floor is a proven lower
+  // bound on the final global k-th best, block-max converts it into
+  // blocks never read, and ties at the floor survive. The fused
+  // multi-field route accepts the RPC but does not consume floors yet.
+  rpc Bm25QueryStream(stream Bm25QueryStreamRequest) returns (stream Bm25QueryStreamResponse);
+
   // Reads raw document texts from the shard's doc store (the highlight
   // source). Ids are global; ids outside this shard's range or with no
   // stored text are simply absent from the response.
@@ -1566,6 +1580,33 @@ message Bm25QueryResponse {
   // coordinator refuses a leaf NO shard can resolve, the same typo
   // rule as every other named column on this response.
   repeated bool filter_columns_known = 7;
+}
+
+// One message on the client-to-shard leg of `Bm25QueryStream`.
+message Bm25QueryStreamRequest {
+  oneof payload {
+    // Opens the scan. Exactly one per stream, first message; the same
+    // request the unary Bm25Query takes, `min_score` included (the
+    // relay's floors arrive on top of it, never instead of it).
+    Bm25QueryRequest start = 1;
+    // Raises the shard's score floor mid-scan. Same monotone contract
+    // as the vector relay: senders only raise, receivers ignore
+    // non-raises. Values are emission-safe seeds (one f32 ULP below a
+    // true k-th best), so ties at the floor survive by construction.
+    FloorUpdate floor_update = 2;
+  }
+}
+
+// One message on the shard-to-client leg of `Bm25QueryStream`.
+message Bm25QueryStreamResponse {
+  oneof payload {
+    // The shard's running k-th best, one f32 ULP down (`floor_seed`),
+    // emitted as the local heap rises. Monotone within a stream.
+    FloorUpdate floor_update = 1;
+    // Terminal message, exactly one per stream: the same response the
+    // unary Bm25Query would have returned.
+    Bm25QueryResponse done = 2;
+  }
 }
 
 // One facet value's count within one facet field.

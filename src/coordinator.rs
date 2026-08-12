@@ -17,6 +17,10 @@ use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
 use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
+    bm25_query_stream_request, bm25_query_stream_response, Bm25QueryResponse,
+    Bm25QueryStreamRequest, Bm25QueryStreamResponse,
+};
+use crate::pb::{
     search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest,
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, ClusterHealthRequest,
@@ -78,6 +82,12 @@ pub struct CoordinatorServiceImpl {
     /// Serve `SearchService.Search` over the streaming protocol
     /// (`fanout_stream_search`) instead of the per-shard top-k fan-out.
     stream_search: bool,
+    /// Run the flat `Bm25Search` fan-out over the `Bm25QueryStream`
+    /// floor relay instead of the unary Bm25Query round. Identical
+    /// results (the relay only delivers the seeded-floor contract
+    /// mid-scan); block-max converts each relayed raise into blocks
+    /// never read (docs/block-max.md).
+    bm25_stream: bool,
     /// Hard upper bound on any client-facing `k`. A request above it is
     /// refused (never clamped), and a request that omits `k` (proto3 0)
     /// runs at exactly this depth — the coordinator's stop bound.
@@ -119,6 +129,77 @@ fn floor_token() -> u64 {
 fn is_stale_stats(status: &Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
         && status.message().starts_with(crate::node::STALE_STATS_EPOCH)
+}
+
+/// One shard's leg of the streaming lexical fan-out (`Bm25QueryStream`,
+/// docs/block-max.md): opens the stream with the same request the unary
+/// route sends, folds the shard's published running k-th bests into the
+/// query's conflated global floor cell (monotone max), forwards raises
+/// of that cell back down, and returns the terminal response — which is
+/// exactly the unary response, so the caller's merge is unchanged.
+async fn stream_bm25_shard(
+    mut client: NodeServiceClient<Channel>,
+    request: Bm25QueryRequest,
+    floor_tx: Arc<watch::Sender<f32>>,
+    mut floor_rx: watch::Receiver<f32>,
+) -> Result<Bm25QueryResponse, Status> {
+    let (out_tx, out_rx) = mpsc::channel::<Bm25QueryStreamRequest>(8);
+    out_tx
+        .send(Bm25QueryStreamRequest {
+            payload: Some(bm25_query_stream_request::Payload::Start(request)),
+        })
+        .await
+        .map_err(|_| Status::internal("bm25 stream request channel closed before start"))?;
+    let mut inbound = client
+        .bm25_query_stream(ReceiverStream::new(out_rx))
+        .await?
+        .into_inner();
+    // Forward only raises above what this stream last saw. Conflation
+    // is the watch cell itself: a burst of raises collapses to whatever
+    // is newest when the forwarder wakes, and a dropped intermediate
+    // value loses nothing because floors are monotone.
+    let forwarder = tokio::spawn(async move {
+        let mut last = *floor_rx.borrow_and_update();
+        while floor_rx.changed().await.is_ok() {
+            let floor = *floor_rx.borrow_and_update();
+            if floor > last {
+                last = floor;
+                let update = Bm25QueryStreamRequest {
+                    payload: Some(bm25_query_stream_request::Payload::FloorUpdate(
+                        FloorUpdate { floor },
+                    )),
+                };
+                if out_tx.send(update).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let result = loop {
+        match inbound.message().await {
+            Ok(Some(Bm25QueryStreamResponse {
+                payload: Some(bm25_query_stream_response::Payload::FloorUpdate(u)),
+            })) => {
+                floor_tx.send_if_modified(|cur| {
+                    if !u.floor.is_nan() && u.floor > *cur {
+                        *cur = u.floor;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            Ok(Some(Bm25QueryStreamResponse {
+                payload: Some(bm25_query_stream_response::Payload::Done(done)),
+            })) => break Ok(done),
+            // Empty payload: ignore (forward compatibility).
+            Ok(Some(_)) => {}
+            Ok(None) => break Err(Status::internal("bm25 stream ended without a done message")),
+            Err(e) => break Err(e),
+        }
+    };
+    forwarder.abort();
+    result
 }
 
 /// What a faceted BM25 fan-out returns: the global top-k plus the
@@ -387,6 +468,7 @@ impl CoordinatorServiceImpl {
             bm25_params: Bm25Params::default(),
             limits: FanoutLimits::default(),
             stream_search: false,
+            bm25_stream: false,
             max_k: DEFAULT_MAX_K,
             channels: Arc::new(Mutex::new(HashMap::new())),
             floor_socket: Arc::new(std::sync::OnceLock::new()),
@@ -448,6 +530,15 @@ impl CoordinatorServiceImpl {
     /// differ in where pruning happens, not in what they return.
     pub fn with_stream_search(mut self, on: bool) -> Self {
         self.stream_search = on;
+        self
+    }
+
+    /// Serve flat `Bm25Search` over the `Bm25QueryStream` floor relay:
+    /// shards publish their running k-th best, this coordinator relays
+    /// the fleet maximum back, and block-max turns each raise into
+    /// blocks never read. Results are identical to the unary fan-out.
+    pub fn with_bm25_stream(mut self, on: bool) -> Self {
+        self.bm25_stream = on;
         self
     }
 
@@ -669,6 +760,15 @@ impl CoordinatorServiceImpl {
         filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
+        // The streaming route's relay state: one conflated global floor
+        // cell per query, seeded with the client floor. Shards' published
+        // k-th bests fold into it (monotone max), and a per-stream
+        // forwarder pushes whatever is newest when it wakes — the same
+        // shape the vector relay uses.
+        let relay = self
+            .bm25_stream
+            .then(|| watch::channel(min_score))
+            .map(|(tx, rx)| (Arc::new(tx), rx));
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
                 terms: terms.to_vec(),
@@ -689,6 +789,24 @@ impl CoordinatorServiceImpl {
                 filter: filter.cloned(),
             };
             let mut client = self.node_client(node)?;
+            if let Some((floor_tx, floor_rx)) = relay.clone() {
+                query_tasks.push(tokio::spawn(async move {
+                    stream_bm25_shard(client, request, floor_tx, floor_rx)
+                        .await
+                        .map(|r| {
+                            (
+                                shard as u32,
+                                r.hits,
+                                r.facets,
+                                r.range_facets,
+                                r.stage_columns_known,
+                                r.geo_columns_known,
+                                r.filter_columns_known,
+                            )
+                        })
+                }));
+                continue;
+            }
             query_tasks.push(tokio::spawn(async move {
                 client.bm25_query(request).await.map(|r| {
                     let r = r.into_inner();

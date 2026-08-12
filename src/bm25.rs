@@ -582,6 +582,18 @@ pub struct PruneStats {
     pub candidates_evaluated: u64,
 }
 
+/// Mid-scan floor exchange for the streaming lexical protocol
+/// (`docs/block-max.md`, the bidi relay). Called once per outer loop
+/// iteration of the pruned scorer with the scan's current emission-safe
+/// k-th best (`floor_seed`, `None` until the heap fills); the hook may
+/// publish it. It returns the highest external floor currently known,
+/// or `None`. External floors are emission-safe seeds too, so they are
+/// proven lower bounds on the final global k-th best: raising the
+/// cutoff to one mid-scan only strengthens `inert`, which is monotone
+/// in the floor, and ties at the floor keep surviving — the result is
+/// the seeded-floor contract, delivered while the scan runs.
+pub type LiveFloorHook<'a> = &'a mut dyn FnMut(Option<f32>) -> Option<f32>;
+
 /// One heap entry: a candidate and the query-term membership mask.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HeapEntry {
@@ -739,7 +751,37 @@ pub fn top_k_pruned_chained_filtered_stats(
     filter: FilterCtx,
     prune: &mut PruneStats,
 ) -> Vec<ScoredDoc> {
+    top_k_pruned_chained_filtered_stats_live(
+        store, terms, stats, params, k, floor, chain, filter, prune, None,
+    )
+}
+
+/// [`top_k_pruned_chained_filtered_stats`] with a mid-scan floor
+/// exchange ([`LiveFloorHook`]): the hook is polled once per outer loop
+/// iteration, the shard's running k-th best flows out through it, and
+/// any external floor it returns raises the cutoff for every later
+/// bound test and insertion. With `live` `None` (or a hook that never
+/// raises), bit-identical to the plain variant. A raised floor only
+/// prunes candidates a proven global lower bound already excludes, so
+/// the merged fleet result is identical whatever the relay timing —
+/// only the work skipped changes. The exhaustive fallbacks ignore the
+/// hook: with no skip surface a floor cannot save work, and the seed
+/// filter already applies at the end.
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_pruned_chained_filtered_stats_live(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    floor: f64,
+    chain: ChainCtx,
+    filter: FilterCtx,
+    prune: &mut PruneStats,
+    mut live: Option<LiveFloorHook>,
+) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
+    let mut floor = floor;
     let avgdl = stats.avgdl();
     // Lift a bound to the final-score scale / finish a true score.
     // With no chain both are identity, so every float op below is
@@ -882,6 +924,21 @@ pub fn top_k_pruned_chained_filtered_stats(
         } else {
             f64::NEG_INFINITY
         };
+        // Mid-scan floor exchange: offer the running k-th best (as the
+        // emission-safe f32 seed the wire carries) and adopt any higher
+        // external floor before this iteration's bound tests. Floors
+        // only rise, and `inert` is monotone in the floor, so a raise
+        // here can only skip candidates a proven global lower bound
+        // already excludes.
+        if let Some(hook) = live.as_mut() {
+            let seed = heap_full.then(|| floor_seed(kth as f32));
+            if let Some(external) = hook(seed) {
+                let external = f64::from(external);
+                if external > floor {
+                    floor = external;
+                }
+            }
+        }
         // Inert = cannot enter the heap: below the seed, or (once the
         // heap is full) not strictly above the k-th best. Every bound
         // test below mirrors the insertion rule exactly, and every bound

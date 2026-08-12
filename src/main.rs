@@ -257,6 +257,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             })
             .with_replicas(cfg.replica_addrs.clone())
             .with_stream_search(cfg.stream_search)
+            .with_bm25_stream(cfg.bm25_stream)
             .with_max_k(cfg.max_k);
         if let Some(map) = &cfg.shard_map {
             eprintln!(

@@ -35,18 +35,19 @@ use crate::pb::wal::{
     wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker,
 };
 use crate::pb::{
-    search_shard_request, search_shard_response, snapshot_chunk, stream_search_request,
-    stream_search_response, AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest,
-    AddVectorsResponse, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse, Bm25RescoreRequest,
-    Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest,
-    GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse, HealthRequest,
-    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, InstallSnapshotResponse,
-    OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse,
-    SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse,
-    ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch, StoredDocument,
-    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
-    TermOccurrences, TermStatsRequest, TermStatsResponse, VectorRescoreRequest,
-    VectorRescoreResponse,
+    bm25_query_stream_request, bm25_query_stream_response, search_shard_request,
+    search_shard_response, snapshot_chunk, stream_search_request, stream_search_response,
+    AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit,
+    Bm25QueryRequest, Bm25QueryResponse, Bm25QueryStreamRequest, Bm25QueryStreamResponse,
+    Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse,
+    GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse,
+    HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse,
+    InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
+    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
+    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    VectorRescoreRequest, VectorRescoreResponse,
 };
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
 use crate::wal::{self, WalWriter};
@@ -4006,6 +4007,7 @@ impl NodeServiceImpl {
 impl NodeService for NodeServiceImpl {
     type SearchShardStream = ReceiverStream<Result<SearchShardResponse, Status>>;
     type StreamSearchStream = ReceiverStream<Result<StreamSearchResponse, Status>>;
+    type Bm25QueryStreamStream = ReceiverStream<Result<Bm25QueryStreamResponse, Status>>;
 
     async fn search_shard(
         &self,
@@ -4828,6 +4830,116 @@ impl NodeService for NodeServiceImpl {
             .map(Response::new)
     }
 
+    async fn bm25_query_stream(
+        &self,
+        request: Request<Streaming<Bm25QueryStreamRequest>>,
+    ) -> Result<Response<Self::Bm25QueryStreamStream>, Status> {
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel::<Result<Bm25QueryStreamResponse, Status>>(64);
+        let service = self.clone();
+
+        tokio::spawn(async move {
+            // Protocol: the first message must be Start.
+            let req = match inbound.message().await {
+                Ok(Some(Bm25QueryStreamRequest {
+                    payload: Some(bm25_query_stream_request::Payload::Start(req)),
+                })) => req,
+                Ok(_) => {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument(
+                            "first Bm25QueryStreamRequest must be a Bm25QueryRequest start",
+                        )))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+
+            // Floor updates arrive on the same stream; a pump task folds
+            // them into a watch cell the blocking scan polls each loop
+            // iteration. Updates are monotone maxes, so only raises are
+            // stored — exactly the SearchShard pump.
+            let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
+            tokio::spawn(async move {
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(Bm25QueryStreamRequest {
+                            payload: Some(bm25_query_stream_request::Payload::FloorUpdate(u)),
+                        })) => {
+                            floor_tx.send_if_modified(|cur| {
+                                if !u.floor.is_nan() && u.floor > *cur {
+                                    *cur = u.floor;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        }
+                        // Duplicate Start or empty payload: ignore.
+                        Ok(Some(_)) => {}
+                        // Client closed or the stream broke: stop pumping;
+                        // the scan finishes on its own either way.
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            });
+
+            // The scorer-side hook: publish strict raises of the running
+            // k-th best (gated by the node's floor knobs, never blocking
+            // the scan — dropped raises are superseded by the next one),
+            // and hand back the highest coordinator floor seen.
+            let share = service.config.share_floors;
+            let floor_delta = service.config.floor_delta;
+            let min_interval = (service.config.floor_min_interval_ms > 0)
+                .then(|| std::time::Duration::from_millis(service.config.floor_min_interval_ms));
+            let scan_tx = tx.clone();
+            let mut last_published = f32::NEG_INFINITY;
+            let mut last_at: Option<std::time::Instant> = None;
+            let mut hook = move |seed: Option<f32>| -> Option<f32> {
+                if !share {
+                    return None;
+                }
+                if let Some(seed) = seed {
+                    let debounced = matches!(
+                        (min_interval, last_at),
+                        (Some(interval), Some(at)) if at.elapsed() < interval
+                    );
+                    if seed > last_published + floor_delta && !debounced {
+                        last_published = seed;
+                        last_at = Some(std::time::Instant::now());
+                        let _ = scan_tx.try_send(Ok(Bm25QueryStreamResponse {
+                            payload: Some(bm25_query_stream_response::Payload::FloorUpdate(
+                                FloorUpdate { floor: seed },
+                            )),
+                        }));
+                    }
+                }
+                let f = *floor_rx.borrow();
+                (f != f32::NEG_INFINITY).then_some(f)
+            };
+
+            let outcome = tokio::task::spawn_blocking(move || {
+                service.run_bm25_query_live(req, Some(&mut hook))
+            })
+            .await
+            .unwrap_or_else(|e| Err(Status::internal(format!("bm25 stream task failed: {e}"))));
+            let _ = match outcome {
+                Ok(done) => {
+                    tx.send(Ok(Bm25QueryStreamResponse {
+                        payload: Some(bm25_query_stream_response::Payload::Done(done)),
+                    }))
+                    .await
+                }
+                Err(e) => tx.send(Err(e)).await,
+            };
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn bm25_rescore(
         &self,
         request: Request<Bm25RescoreRequest>,
@@ -5003,6 +5115,18 @@ impl NodeService for NodeServiceImpl {
 // worker -- the same discipline every vector scan path follows.
 impl NodeServiceImpl {
     fn run_bm25_query(&self, req: Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
+        self.run_bm25_query_live(req, None)
+    }
+
+    /// [`Self::run_bm25_query`] with a mid-scan floor exchange for the
+    /// streaming route. Only the flat pruned scorer consumes the hook;
+    /// the fused multi-field route and the exhaustive fallbacks ignore
+    /// it (no skip surface, so a mid-scan floor saves nothing there).
+    fn run_bm25_query_live(
+        &self,
+        req: Bm25QueryRequest,
+        live: Option<bm25::LiveFloorHook>,
+    ) -> Result<Bm25QueryResponse, Status> {
         if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
             return Err(Status::invalid_argument(
                 "min_score must be finite (NaN and -inf are not valid floors)",
@@ -5185,7 +5309,7 @@ impl NodeServiceImpl {
                         });
                 let docs = if prunable {
                     let mut prune = bm25::PruneStats::default();
-                    bm25::top_k_pruned_chained_filtered_stats(
+                    bm25::top_k_pruned_chained_filtered_stats_live(
                         index,
                         &req.terms,
                         &stats,
@@ -5195,6 +5319,7 @@ impl NodeServiceImpl {
                         chain_ctx,
                         filter_ctx,
                         &mut prune,
+                        live,
                     )
                 } else {
                     bm25::filter_to_floor(

@@ -175,6 +175,13 @@ pub struct Config {
     /// holds the only top-k). Identical results, different pruning
     /// locus. Off by default.
     pub stream_search: bool,
+    /// Coordinator: run the flat Bm25Search fan-out over the
+    /// `Bm25QueryStream` floor relay — shards publish their running
+    /// k-th best, the coordinator relays the fleet maximum back, and
+    /// block-max converts every raise into blocks never read.
+    /// Identical results, less work (docs/block-max.md). Off by
+    /// default.
+    pub bm25_stream: bool,
     /// Coordinator: hard cap on any client-facing `k`. Requests above it
     /// are refused (never clamped); a request omitting `k` runs at this
     /// depth. Must be at least 1.
@@ -267,6 +274,7 @@ struct FileConfig {
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
     stream_search: Option<bool>,
+    bm25_stream: Option<bool>,
     max_k: Option<u32>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
@@ -773,6 +781,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
 
+    let bm25_stream = flag_present(args, "bm25-stream")
+        || std::env::var("TURBOVEC_BM25_STREAM")
+            .map(|s| parse_env_bool(&s))
+            .unwrap_or(false)
+        || file.bm25_stream.unwrap_or(false);
+
     let max_k = opt(
         args,
         "max-k",
@@ -876,7 +890,9 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         };
     for (i, name) in numeric_fields.iter().enumerate() {
         if numeric_fields[..i].contains(name) {
-            return Err(format!("numeric field {name:?} repeats in the numeric table"));
+            return Err(format!(
+                "numeric field {name:?} repeats in the numeric table"
+            ));
         }
         if facet_fields.contains(name) {
             return Err(format!(
@@ -955,6 +971,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         max_message_bytes,
         demo_query,
         stream_search,
+        bm25_stream,
         max_k,
         query_dim,
         bit_width,
