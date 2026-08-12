@@ -11,9 +11,9 @@ remainder of their scan against it — losslessly.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream` | Patch fork carrying the two core changes distributed search needs: seeded TQ+ calibration and a seedable top-k floor (`initial_threshold`). Rebased onto upstream main | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s14` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Minimal durable gRPC shard service and exact vector-only coordinator | fork branch `turbovec-pipestream-s14` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s14` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
