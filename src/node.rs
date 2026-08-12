@@ -4820,7 +4820,189 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Bm25QueryRequest>,
     ) -> Result<Response<Bm25QueryResponse>, Status> {
+        let service = self.clone();
         let req = request.into_inner();
+        tokio::task::spawn_blocking(move || service.run_bm25_query(req))
+            .await
+            .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))?
+            .map(Response::new)
+    }
+
+    async fn bm25_rescore(
+        &self,
+        request: Request<Bm25RescoreRequest>,
+    ) -> Result<Response<Bm25RescoreResponse>, Status> {
+        let service = self.clone();
+        let req = request.into_inner();
+        tokio::task::spawn_blocking(move || service.run_bm25_rescore(req))
+            .await
+            .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))?
+            .map(Response::new)
+    }
+
+    async fn vector_rescore(
+        &self,
+        request: Request<VectorRescoreRequest>,
+    ) -> Result<Response<VectorRescoreResponse>, Status> {
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let state = self.state.clone();
+        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
+            let guard = state.read().expect("shard state lock poisoned");
+            // A shard with no index holds none of the candidates.
+            let Some(index) = guard.index.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let Some(dim) = index.dim_opt() else {
+                return Ok(Vec::new());
+            };
+            if req.vector.len() != dim {
+                return Err(Status::invalid_argument(format!(
+                    "query vector has dim {}, index expects {dim}",
+                    req.vector.len()
+                )));
+            }
+            if let Some((_, coord, value)) = turbovec::first_invalid_coord(&req.vector, dim) {
+                return Err(Status::invalid_argument(format!(
+                    "query coordinate {coord} is invalid: {value}"
+                )));
+            }
+            // Route global ids into this shard's live slots; the mask
+            // names slots and is sized to the slot count (slots are
+            // dense on the mainline engine: no capacity/len split). The
+            // kernel short-circuits fully-masked SIMD blocks, so a tiny
+            // allowlist costs a mask walk, not a scan.
+            let n = index.len();
+            let mut mask = vec![false; index.len()];
+            let mut allowed = 0usize;
+            for &id in &req.candidate_ids {
+                if id >= offset && id - offset < n as u64 {
+                    let slot = (id - offset) as usize;
+                    if !mask[slot] {
+                        mask[slot] = true;
+                        allowed += 1;
+                    }
+                }
+            }
+            if allowed == 0 {
+                return Ok(Vec::new());
+            }
+            let results = index
+                .try_search_with_mask(&req.vector, allowed, Some(&mask))
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let hits = results
+                .indices_for_query(0)
+                .iter()
+                .zip(results.scores_for_query(0))
+                .filter(|&(&slot, _)| slot >= 0)
+                .map(|(&slot, &score)| RawLegHit {
+                    doc_id: offset + slot as u64,
+                    score,
+                })
+                .collect();
+            Ok(hits)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
+        Ok(Response::new(VectorRescoreResponse { hits }))
+    }
+
+    async fn get_documents(
+        &self,
+        request: Request<GetDocumentsRequest>,
+    ) -> Result<Response<GetDocumentsResponse>, Status> {
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let mut documents = Vec::new();
+        if let Some(store) = guard.bm25.as_ref() {
+            let store = store.as_index().ok_or_else(|| {
+                Status::failed_precondition("bm25 bulk build in progress; Flush first")
+            })?;
+            for id in req.doc_ids {
+                if id < offset {
+                    continue;
+                }
+                let local = (id - offset) as u32;
+                if let Some(text) = store.text(local) {
+                    documents.push(StoredDocument {
+                        doc_id: id,
+                        text,
+                        lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
+                            opinion_id: l.opinion_id,
+                            cluster_id: l.cluster_id,
+                            span_start: l.span_start,
+                            span_end: l.span_end,
+                        }),
+                    });
+                }
+            }
+        }
+        Ok(Response::new(GetDocumentsResponse { documents }))
+    }
+
+    async fn hybrid_shard(
+        &self,
+        request: Request<HybridShardRequest>,
+    ) -> Result<Response<HybridShardResponse>, Status> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.run_hybrid(request.into_inner()))
+            .await
+            .map_err(|e| Status::internal(format!("hybrid task failed: {e}")))?
+            .map(Response::new)
+    }
+
+    async fn shard_legs(
+        &self,
+        request: Request<ShardLegsRequest>,
+    ) -> Result<Response<ShardLegsResponse>, Status> {
+        let req = request.into_inner();
+        if req.terms.len() != req.global_doc_frequencies.len() {
+            return Err(Status::invalid_argument(
+                "terms and global_doc_frequencies must have the same length",
+            ));
+        }
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let (vector_hits, bm25_hits) = service.compute_legs(
+                &req.vector,
+                &req.terms,
+                req.global_doc_count,
+                req.global_total_doc_length,
+                &req.global_doc_frequencies,
+                params_from(req.k1, req.b)?,
+                req.k as usize,
+                req.expected_stats_epoch,
+            )?;
+            Ok(ShardLegsResponse {
+                vector_hits: vector_hits
+                    .into_iter()
+                    .map(|(doc_id, score)| RawLegHit {
+                        doc_id,
+                        score: score as f32,
+                    })
+                    .collect(),
+                bm25_hits: bm25_hits
+                    .into_iter()
+                    .map(|(doc_id, score)| RawLegHit {
+                        doc_id,
+                        score: score as f32,
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
+        .map(Response::new)
+    }
+}
+
+// The synchronous BM25 scan bodies. The `NodeService` handlers wrap
+// these in `spawn_blocking`: a postings walk is CPU-bound for as long
+// as the highest-df term takes, and it must not occupy an async runtime
+// worker -- the same discipline every vector scan path follows.
+impl NodeServiceImpl {
+    fn run_bm25_query(&self, req: Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
         if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
             return Err(Status::invalid_argument(
                 "min_score must be finite (NaN and -inf are not valid floors)",
@@ -4835,7 +5017,7 @@ impl NodeService for NodeServiceImpl {
                      drop `fields` to use the flat route, or drop `score_stages`",
                 ));
             }
-            return self.bm25_query_fused(&req).map(Response::new);
+            return self.bm25_query_fused(&req);
         }
         let stage_specs = parse_score_stages(&req.score_stages)?;
         validate_range_facet_fields(&req.range_facet_fields)?;
@@ -5059,7 +5241,7 @@ impl NodeService for NodeServiceImpl {
         } else {
             0.0
         };
-        Ok(Response::new(Bm25QueryResponse {
+        Ok(Bm25QueryResponse {
             hits,
             kth_best,
             facets,
@@ -5067,14 +5249,10 @@ impl NodeService for NodeServiceImpl {
             range_facets,
             geo_columns_known,
             filter_columns_known,
-        }))
+        })
     }
 
-    async fn bm25_rescore(
-        &self,
-        request: Request<Bm25RescoreRequest>,
-    ) -> Result<Response<Bm25RescoreResponse>, Status> {
-        let req = request.into_inner();
+    fn run_bm25_rescore(&self, req: Bm25RescoreRequest) -> Result<Bm25RescoreResponse, Status> {
         if req.terms.len() != req.global_doc_frequencies.len() {
             return Err(Status::invalid_argument(
                 "terms and global_doc_frequencies must have the same length",
@@ -5134,163 +5312,7 @@ impl NodeService for NodeServiceImpl {
             }
             None => Vec::new(),
         };
-        Ok(Response::new(Bm25RescoreResponse { hits }))
-    }
-
-    async fn vector_rescore(
-        &self,
-        request: Request<VectorRescoreRequest>,
-    ) -> Result<Response<VectorRescoreResponse>, Status> {
-        let req = request.into_inner();
-        let offset = self.config.slot_offset;
-        let state = self.state.clone();
-        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
-            let guard = state.read().expect("shard state lock poisoned");
-            // A shard with no index holds none of the candidates.
-            let Some(index) = guard.index.as_ref() else {
-                return Ok(Vec::new());
-            };
-            let Some(dim) = index.dim_opt() else {
-                return Ok(Vec::new());
-            };
-            if req.vector.len() != dim {
-                return Err(Status::invalid_argument(format!(
-                    "query vector has dim {}, index expects {dim}",
-                    req.vector.len()
-                )));
-            }
-            if let Some((_, coord, value)) = turbovec::first_invalid_coord(&req.vector, dim) {
-                return Err(Status::invalid_argument(format!(
-                    "query coordinate {coord} is invalid: {value}"
-                )));
-            }
-            // Route global ids into this shard's live slots; the mask
-            // names slots and is sized to the slot count (slots are
-            // dense on the mainline engine: no capacity/len split). The
-            // kernel short-circuits fully-masked SIMD blocks, so a tiny
-            // allowlist costs a mask walk, not a scan.
-            let n = index.len();
-            let mut mask = vec![false; index.len()];
-            let mut allowed = 0usize;
-            for &id in &req.candidate_ids {
-                if id >= offset && id - offset < n as u64 {
-                    let slot = (id - offset) as usize;
-                    if !mask[slot] {
-                        mask[slot] = true;
-                        allowed += 1;
-                    }
-                }
-            }
-            if allowed == 0 {
-                return Ok(Vec::new());
-            }
-            let results = index
-                .try_search_with_mask(&req.vector, allowed, Some(&mask))
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let hits = results
-                .indices_for_query(0)
-                .iter()
-                .zip(results.scores_for_query(0))
-                .filter(|&(&slot, _)| slot >= 0)
-                .map(|(&slot, &score)| RawLegHit {
-                    doc_id: offset + slot as u64,
-                    score,
-                })
-                .collect();
-            Ok(hits)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
-        Ok(Response::new(VectorRescoreResponse { hits }))
-    }
-
-    async fn get_documents(
-        &self,
-        request: Request<GetDocumentsRequest>,
-    ) -> Result<Response<GetDocumentsResponse>, Status> {
-        let req = request.into_inner();
-        let offset = self.config.slot_offset;
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let mut documents = Vec::new();
-        if let Some(store) = guard.bm25.as_ref() {
-            let store = store.as_index().ok_or_else(|| {
-                Status::failed_precondition("bm25 bulk build in progress; Flush first")
-            })?;
-            for id in req.doc_ids {
-                if id < offset {
-                    continue;
-                }
-                let local = (id - offset) as u32;
-                if let Some(text) = store.text(local) {
-                    documents.push(StoredDocument {
-                        doc_id: id,
-                        text,
-                        lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
-                            opinion_id: l.opinion_id,
-                            cluster_id: l.cluster_id,
-                            span_start: l.span_start,
-                            span_end: l.span_end,
-                        }),
-                    });
-                }
-            }
-        }
-        Ok(Response::new(GetDocumentsResponse { documents }))
-    }
-
-    async fn hybrid_shard(
-        &self,
-        request: Request<HybridShardRequest>,
-    ) -> Result<Response<HybridShardResponse>, Status> {
-        let service = self.clone();
-        tokio::task::spawn_blocking(move || service.run_hybrid(request.into_inner()))
-            .await
-            .map_err(|e| Status::internal(format!("hybrid task failed: {e}")))?
-            .map(Response::new)
-    }
-
-    async fn shard_legs(
-        &self,
-        request: Request<ShardLegsRequest>,
-    ) -> Result<Response<ShardLegsResponse>, Status> {
-        let req = request.into_inner();
-        if req.terms.len() != req.global_doc_frequencies.len() {
-            return Err(Status::invalid_argument(
-                "terms and global_doc_frequencies must have the same length",
-            ));
-        }
-        let service = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let (vector_hits, bm25_hits) = service.compute_legs(
-                &req.vector,
-                &req.terms,
-                req.global_doc_count,
-                req.global_total_doc_length,
-                &req.global_doc_frequencies,
-                params_from(req.k1, req.b)?,
-                req.k as usize,
-                req.expected_stats_epoch,
-            )?;
-            Ok(ShardLegsResponse {
-                vector_hits: vector_hits
-                    .into_iter()
-                    .map(|(doc_id, score)| RawLegHit {
-                        doc_id,
-                        score: score as f32,
-                    })
-                    .collect(),
-                bm25_hits: bm25_hits
-                    .into_iter()
-                    .map(|(doc_id, score)| RawLegHit {
-                        doc_id,
-                        score: score as f32,
-                    })
-                    .collect(),
-            })
-        })
-        .await
-        .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
-        .map(Response::new)
+        Ok(Bm25RescoreResponse { hits })
     }
 }
 
