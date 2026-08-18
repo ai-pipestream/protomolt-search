@@ -11,12 +11,15 @@ remainder of their scan against it — losslessly.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s14` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Minimal durable gRPC shard service and exact vector-only coordinator | fork branch `turbovec-pipestream-s14` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s14` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s15` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s15` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s15` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
+The phased public query contract under design is
+[docs/query-api.md](docs/query-api.md): selection first, candidate-scoped
+boosts second, then a named-signal composite scorer.
 Block-max pruning, designed for the lexical leg and measured dead on the
 vector leg: [README-block-max.md](README-block-max.md) (overview) and
 [docs/block-max.md](docs/block-max.md) (design doc).
