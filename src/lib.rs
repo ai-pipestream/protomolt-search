@@ -45,6 +45,7 @@ pub mod reshard;
 pub mod scorefn;
 pub mod snapshot;
 pub mod stats_cache;
+mod stream_signal;
 pub mod vocab;
 pub mod wal;
 

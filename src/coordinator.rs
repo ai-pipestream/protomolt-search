@@ -28,8 +28,8 @@ use crate::pb::{
     HybridSearchRequest, HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup,
     ScoredHit, SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest,
     SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats,
-    StartShardSearch, StartStreamSearch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermStatsRequest, VectorRescoreRequest,
+    StartShardSearch, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary, TermStatsRequest, VectorRescoreRequest,
 };
 use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
@@ -90,13 +90,14 @@ pub struct CoordinatorServiceImpl {
     bm25_stream: bool,
     /// Hard upper bound on any client-facing `k`. A request above it is
     /// refused (never clamped), and a request that omits `k` (proto3 0)
-    /// runs at exactly this depth — the coordinator's stop bound.
+    /// runs at exactly this depth. This bounds the coordinator's heap; it is
+    /// not a node quota or scan-completion signal.
     max_k: u32,
     /// One reusable channel per address, created on first use.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
-    /// Lazily bound UDP socket for the floor fast lane (`None` when the
-    /// bind failed; floors then ride the gRPC streams alone).
-    floor_socket: Arc<std::sync::OnceLock<Option<std::net::UdpSocket>>>,
+    /// Lazily bound UDP socket for the typed stream-signal fast lane (`None`
+    /// when the bind failed; signals then ride the gRPC streams alone).
+    floor_socket: Arc<std::sync::OnceLock<Option<Arc<std::net::UdpSocket>>>>,
     /// Resolved UDP floor target per node address (`None` =
     /// unresolvable), cached on first use. IPv4 preferred.
     floor_targets: Arc<Mutex<HashMap<String, Option<std::net::SocketAddr>>>>,
@@ -106,7 +107,7 @@ pub struct CoordinatorServiceImpl {
     stats_cache: Arc<crate::stats_cache::StatsCache>,
 }
 
-/// A process-unique, well-mixed stream token for the UDP floor lane
+/// A process-unique, well-mixed stream token for the UDP signal lane
 /// (0 is reserved for "no UDP"). Tokens route datagrams to in-flight
 /// streams on a trusted network; they are unique, not secret.
 fn floor_token() -> u64 {
@@ -483,20 +484,20 @@ impl CoordinatorServiceImpl {
         &self.stats_cache
     }
 
-    /// The UDP floor socket, bound once (nonblocking: a full local
+    /// The UDP signal socket, bound once (nonblocking: a full local
     /// buffer drops the datagram, which a monotone hint tolerates).
-    fn floor_socket(&self) -> Option<&std::net::UdpSocket> {
+    fn floor_socket(&self) -> Option<&Arc<std::net::UdpSocket>> {
         self.floor_socket
             .get_or_init(|| {
                 std::net::UdpSocket::bind(("0.0.0.0", 0)).ok().map(|s| {
                     let _ = s.set_nonblocking(true);
-                    s
+                    Arc::new(s)
                 })
             })
             .as_ref()
     }
 
-    /// The UDP floor target for a node address: the same host:port as
+    /// The UDP signal target for a node address: the same host:port as
     /// its gRPC listener, in the UDP namespace. Resolved once and
     /// cached; IPv4 preferred (the fleet pins IPv4).
     fn floor_target(&self, addr: &str) -> Option<std::net::SocketAddr> {
@@ -1998,17 +1999,19 @@ impl CoordinatorServiceImpl {
         let mut remaining = n_nodes;
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
         while remaining > 0 {
-            let (shard, msg) = match fanout.next_message(&summaries).await? {
-                Some(pair) => pair,
-                None => continue,
+            let (shard, msg) = match fanout.next_message(&summaries).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => continue,
+                Err(status) => return fanout.cancel_with(status).await,
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
                     if batch.hits.len() % 12 != 0 {
-                        return Err(Status::internal(format!(
+                        let status = Status::internal(format!(
                             "shard {shard} sent a misaligned batch of {} bytes",
                             batch.hits.len()
-                        )));
+                        ));
+                        return fanout.cancel_with(status).await;
                     }
                     for rec in batch.hits.chunks_exact(12) {
                         let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
@@ -2039,12 +2042,13 @@ impl CoordinatorServiceImpl {
                 }
                 Some(stream_search_response::Payload::Summary(summary)) => {
                     if !summary.completed {
-                        return Err(Status::internal(format!(
+                        let status = Status::internal(format!(
                             "shard {shard} stopped before completing its scan"
-                        )));
+                        ));
+                        return fanout.cancel_with(status).await;
                     }
                     summaries[shard] = Some(summary);
-                    fanout.floor_txs[shard] = None;
+                    fanout.mark_completed(shard);
                     remaining -= 1;
                 }
                 None => {}
@@ -2399,9 +2403,9 @@ impl CoordinatorServiceImpl {
     }
 
     /// Open one `StreamSearch` per shard: Start flows through a held
-    /// sender that later carries floor raises. Each stream also gets a
-    /// UDP token so raises reach the shard on the fast lossy lane as
-    /// well as the reliable stream.
+    /// sender that later carries floor raises or an authoritative Stop. Each
+    /// stream also gets a UDP token so both signals reach the shard first on
+    /// the fast lossy lane and then on the gRPC stream.
     fn open_stream_fanout(
         &self,
         request_id: &str,
@@ -2410,6 +2414,7 @@ impl CoordinatorServiceImpl {
         collapse_parents: bool,
     ) -> Result<StreamFanout, Status> {
         let n_nodes = self.node_addrs.len();
+        let udp_socket = self.floor_socket().cloned();
         let (merged_tx, merged_rx) =
             mpsc::channel::<(usize, Result<Option<StreamSearchResponse>, Status>)>(4 * n_nodes);
         let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
@@ -2469,6 +2474,7 @@ impl CoordinatorServiceImpl {
             merged_rx,
             floor_txs,
             udp_lanes,
+            udp_socket,
         })
     }
 
@@ -2483,15 +2489,14 @@ impl CoordinatorServiceImpl {
                 floor,
             })),
         };
-        let socket = self.floor_socket();
         for (si, tx) in fanout.floor_txs.iter().enumerate() {
             let Some(tx) = tx.as_ref() else {
                 continue;
             };
-            if let (Some(socket), Some((token, target))) = (socket, fanout.udp_lanes[si]) {
-                let mut dgram = [0u8; 12];
-                dgram[..8].copy_from_slice(&token.to_le_bytes());
-                dgram[8..].copy_from_slice(&floor.to_le_bytes());
+            if let (Some(socket), Some((token, target))) =
+                (fanout.udp_socket.as_deref(), fanout.udp_lanes[si])
+            {
+                let dgram = crate::stream_signal::encode_floor(token, floor);
                 let _ = socket.send_to(&dgram, target);
             }
             let _ = tx.try_send(update.clone());
@@ -2505,13 +2510,13 @@ impl CoordinatorServiceImpl {
     /// tightens, `floor_seed(kth)` (one f32 ULP below, so boundary ties
     /// survive) is pushed to every open stream.
     ///
-    /// Exactness: this path never sends Stop, every shard's terminal
-    /// summary must certify `completed = true`, every emission scored
-    /// at or above the floor in effect when its block was scanned, and
-    /// every pushed floor is a lower bound on the global k-th best —
-    /// so nothing that belongs in the top-k was withheld. Results are
-    /// identical to [`Self::fanout_search`] (same scores, same
-    /// `merge_topk` total order).
+    /// Exactness: the successful path never sends Stop, every shard's
+    /// terminal summary must certify `completed = true`, every emission
+    /// scored at or above the floor in effect when its block was scanned,
+    /// and every pushed floor is a lower bound on the global k-th best. An
+    /// error cancels unfinished streams, whose summaries are necessarily
+    /// incomplete and unusable. Successful results are identical to
+    /// [`Self::fanout_search`] (same scores, same `merge_topk` total order).
     ///
     /// `initial_floor` seeds every shard's starting floor — the hybrid
     /// seam, where a finished BM25 leg's decomposed floor prunes the
@@ -2551,19 +2556,21 @@ impl CoordinatorServiceImpl {
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
         let mut floors_sent = 0u64;
         while remaining > 0 {
-            let (shard, msg) = match fanout.next_message(&summaries).await? {
-                Some(pair) => pair,
-                None => continue,
+            let (shard, msg) = match fanout.next_message(&summaries).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => continue,
+                Err(status) => return fanout.cancel_with(status).await,
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
                     // Packed 12-byte LE records: u64 global id, f32
                     // score (see StreamSearchBatch).
                     if batch.hits.len() % 12 != 0 {
-                        return Err(Status::internal(format!(
+                        let status = Status::internal(format!(
                             "shard {shard} sent a misaligned batch of {} bytes",
                             batch.hits.len()
-                        )));
+                        ));
+                        return fanout.cancel_with(status).await;
                     }
                     for rec in batch.hits.chunks_exact(12) {
                         let entry = StreamHeapEntry(MergedHit {
@@ -2599,12 +2606,13 @@ impl CoordinatorServiceImpl {
                 }
                 Some(stream_search_response::Payload::Summary(summary)) => {
                     if !summary.completed {
-                        return Err(Status::internal(format!(
+                        let status = Status::internal(format!(
                             "shard {shard} stopped before completing its scan"
-                        )));
+                        ));
+                        return fanout.cancel_with(status).await;
                     }
                     summaries[shard] = Some(summary);
-                    fanout.floor_txs[shard] = None;
+                    fanout.mark_completed(shard);
                     remaining -= 1;
                 }
                 None => {}
@@ -2681,19 +2689,21 @@ impl CoordinatorServiceImpl {
         let mut last_floor = f32::NEG_INFINITY;
         let mut floors_sent = 0u64;
         while remaining > 0 {
-            let (shard, msg) = match fanout.next_message(&summaries).await? {
-                Some(pair) => pair,
-                None => continue,
+            let (shard, msg) = match fanout.next_message(&summaries).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => continue,
+                Err(status) => return fanout.cancel_with(status).await,
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
                     // Packed 20-byte LE records: u64 global id, f32
                     // score, u64 parent (see StreamSearchBatch).
                     if batch.hits.len() % 20 != 0 {
-                        return Err(Status::internal(format!(
+                        let status = Status::internal(format!(
                             "shard {shard} sent a misaligned collapse batch of {} bytes",
                             batch.hits.len()
-                        )));
+                        ));
+                        return fanout.cancel_with(status).await;
                     }
                     let mut dirty = false;
                     for rec in batch.hits.chunks_exact(20) {
@@ -2739,12 +2749,13 @@ impl CoordinatorServiceImpl {
                 }
                 Some(stream_search_response::Payload::Summary(summary)) => {
                     if !summary.completed {
-                        return Err(Status::internal(format!(
+                        let status = Status::internal(format!(
                             "shard {shard} stopped before completing its scan"
-                        )));
+                        ));
+                        return fanout.cancel_with(status).await;
                     }
                     summaries[shard] = Some(summary);
-                    fanout.floor_txs[shard] = None;
+                    fanout.mark_completed(shard);
                     remaining -= 1;
                 }
                 None => {}
@@ -3396,7 +3407,7 @@ fn decomposed_floor(s_lb: f64, wb_b1: f64, w_v: f64) -> f32 {
 }
 
 /// One open `StreamSearch` fan-out: a merged inbound lane plus the
-/// per-shard floor lanes (reliable stream sender + optional UDP token).
+/// per-shard signal lanes (authoritative stream sender + optional UDP token).
 /// Shared by every streaming consumer — plain top-k, document mode,
 /// and the decomposed hybrid — which differ only in what they do with
 /// the batches and which floor they derive.
@@ -3404,9 +3415,52 @@ struct StreamFanout {
     merged_rx: mpsc::Receiver<(usize, Result<Option<StreamSearchResponse>, Status>)>,
     floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>>,
     udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>>,
+    udp_socket: Option<Arc<std::net::UdpSocket>>,
 }
 
 impl StreamFanout {
+    fn send_udp_cancel(&self) {
+        let Some(socket) = self.udp_socket.as_deref() else {
+            return;
+        };
+        for (shard, tx) in self.floor_txs.iter().enumerate() {
+            if tx.is_none() {
+                continue;
+            }
+            if let Some((token, target)) = self.udp_lanes[shard] {
+                let frame = crate::stream_signal::encode_cancel(token);
+                let _ = socket.send_to(&frame, target);
+            }
+        }
+    }
+
+    /// Abandon every unfinished shard. UDP goes first for low latency; the
+    /// matching gRPC Stop is then awaited on every open request stream and is
+    /// the authoritative signal. A stopped node can only return
+    /// `completed = false`.
+    async fn cancel(&mut self) {
+        self.send_udp_cancel();
+        let senders: Vec<mpsc::Sender<StreamSearchRequest>> =
+            self.floor_txs.iter_mut().filter_map(Option::take).collect();
+        for tx in senders {
+            let _ = tx
+                .send(StreamSearchRequest {
+                    payload: Some(stream_search_request::Payload::Stop(StopStreamSearch {})),
+                })
+                .await;
+        }
+    }
+
+    async fn cancel_with<T>(&mut self, status: Status) -> Result<T, Status> {
+        self.cancel().await;
+        Err(status)
+    }
+
+    fn mark_completed(&mut self, shard: usize) {
+        self.floor_txs[shard] = None;
+        self.udp_lanes[shard] = None;
+    }
+
     /// The next inbound message: `Ok(Some((shard, msg)))` for a payload,
     /// `Ok(None)` for a clean post-summary stream close (callers just
     /// continue), and an error for a shard failure or a close without a
@@ -3431,6 +3485,29 @@ impl StreamFanout {
                 Ok(None)
             }
             Err(e) => Err(Status::internal(format!("shard {shard} failed: {e}"))),
+        }
+    }
+}
+
+impl Drop for StreamFanout {
+    fn drop(&mut self) {
+        if self.floor_txs.iter().all(Option::is_none) {
+            return;
+        }
+        self.send_udp_cancel();
+        let senders: Vec<mpsc::Sender<StreamSearchRequest>> =
+            self.floor_txs.iter_mut().filter_map(Option::take).collect();
+        let send_stops = async move {
+            for tx in senders {
+                let _ = tx
+                    .send(StreamSearchRequest {
+                        payload: Some(stream_search_request::Payload::Stop(StopStreamSearch {})),
+                    })
+                    .await;
+            }
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(send_stops);
         }
     }
 }
@@ -4277,5 +4354,89 @@ fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
         Some(search_variant::Query::Bm25(r)) => &r.text,
         Some(search_variant::Query::Hybrid(r)) => &r.text,
         None => "",
+    }
+}
+
+#[cfg(test)]
+mod stream_cancel_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_uses_typed_udp_then_authoritative_grpc_stop() {
+        let udp_rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = udp_rx.local_addr().unwrap();
+        let udp_tx = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        udp_tx.set_nonblocking(true).unwrap();
+
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (_merged_tx, merged_rx) = mpsc::channel(1);
+        let token = 0x0A11_CE11_u64;
+        let mut fanout = StreamFanout {
+            merged_rx,
+            floor_txs: vec![Some(request_tx)],
+            udp_lanes: vec![Some((token, target))],
+            udp_socket: Some(udp_tx),
+        };
+
+        fanout.cancel().await;
+
+        let request = request_rx.recv().await.expect("authoritative Stop");
+        assert!(matches!(
+            request.payload,
+            Some(stream_search_request::Payload::Stop(_))
+        ));
+        assert!(
+            request_rx.recv().await.is_none(),
+            "request stream must close"
+        );
+
+        let mut frame = [0u8; crate::stream_signal::FRAME_LEN];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), udp_rx.recv_from(&mut frame))
+            .await
+            .expect("UDP cancel timed out")
+            .unwrap();
+        assert_eq!(len, crate::stream_signal::FRAME_LEN);
+        assert_eq!(
+            crate::stream_signal::decode(&frame),
+            Some(crate::stream_signal::StreamSignal::Cancel { token })
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unfinished_fanout_still_stops_both_lanes() {
+        let udp_rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = udp_rx.local_addr().unwrap();
+        let udp_tx = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        udp_tx.set_nonblocking(true).unwrap();
+
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (_merged_tx, merged_rx) = mpsc::channel(1);
+        let token = 0x0D09_CE11_u64;
+        drop(StreamFanout {
+            merged_rx,
+            floor_txs: vec![Some(request_tx)],
+            udp_lanes: vec![Some((token, target))],
+            udp_socket: Some(udp_tx),
+        });
+
+        let request = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("gRPC Stop task timed out")
+            .expect("authoritative Stop");
+        assert!(matches!(
+            request.payload,
+            Some(stream_search_request::Payload::Stop(_))
+        ));
+
+        let mut frame = [0u8; crate::stream_signal::FRAME_LEN];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), udp_rx.recv_from(&mut frame))
+            .await
+            .expect("UDP cancel timed out")
+            .unwrap();
+        assert_eq!(len, crate::stream_signal::FRAME_LEN);
+        assert_eq!(
+            crate::stream_signal::decode(&frame),
+            Some(crate::stream_signal::StreamSignal::Cancel { token })
+        );
     }
 }

@@ -492,7 +492,7 @@ async fn a_failing_arm_is_named_in_the_error() {
 }
 
 /// `k` is optional on every client-facing request: 0 (proto3 unset)
-/// selects the coordinator's `max_k` stop bound, a value within the cap
+/// selects the coordinator's `max_k` heap guardrail, a value within the cap
 /// is honored, and a value above it is refused with both numbers named
 /// rather than silently clamped. The cap is what keeps a coordinator
 /// from being asked to hold an unbounded heap while the shared floor

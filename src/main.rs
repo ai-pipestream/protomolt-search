@@ -218,7 +218,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             )
             .with_bm25(bm25_store)
             .with_generation(generation);
-            // The UDP floor lane shares the gRPC listener's host:port.
+            // The UDP stream-signal lane shares the gRPC listener's host:port.
             node.spawn_floor_listener(addr);
             node_services.push(node.clone());
             eprintln!("NodeService listening on {addr}");

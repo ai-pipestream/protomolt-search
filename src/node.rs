@@ -1727,10 +1727,10 @@ pub struct NodeServiceImpl {
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
     scan_jobs: Arc<std::sync::OnceLock<mpsc::Sender<ScanJob>>>,
-    /// UDP floor lane registry: stream token -> that stream's floor
-    /// cell (f32 bits, monotone max). Fed by [`Self::spawn_floor_listener`],
-    /// read by the streaming scan between blocks.
-    floor_cells: Arc<std::sync::Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>>,
+    /// UDP fast-lane registry: stream token -> that stream's monotone floor
+    /// and advisory cancellation flag. Fed by [`Self::spawn_floor_listener`]
+    /// and polled by the streaming scan before every chunk.
+    stream_signals: Arc<std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>>>,
     /// The shard's vocabulary listener (`<index path>.vocab/`), attached
     /// to every ingest AnalyzeStream. `None` when vocabulary accumulation
     /// is off (the default) or its directory failed to initialize.
@@ -1786,27 +1786,51 @@ fn raise_floor_cell(cell: &std::sync::atomic::AtomicU32, floor: f32) {
     );
 }
 
-/// Fold one UDP floor datagram into its stream's cell. 12 bytes,
-/// little-endian: u64 stream token, f32 floor. Anything else — short or
-/// long datagrams, unknown tokens, NaN or non-raising floors — is
-/// dropped: this lane is an unreliable fast copy of a monotone hint,
-/// and the gRPC stream remains the reliable one.
-fn apply_floor_datagram(
-    cells: &std::sync::Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>,
+struct StreamSignals {
+    floor: std::sync::atomic::AtomicU32,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl StreamSignals {
+    fn new(initial_floor: f32) -> Self {
+        Self {
+            floor: std::sync::atomic::AtomicU32::new(initial_floor.to_bits()),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+/// Fold one typed UDP signal into its stream state. Anything malformed or
+/// addressed to an unknown token is dropped. A UDP cancel is advisory only:
+/// it makes the node return `completed = false`, and the authoritative gRPC
+/// stream carries the matching `StopStreamSearch`.
+fn apply_stream_datagram(
+    signals: &std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>>,
     datagram: &[u8],
 ) {
-    if datagram.len() != 12 {
-        return;
-    }
-    let token = u64::from_le_bytes(datagram[..8].try_into().expect("8 bytes"));
-    let floor = f32::from_le_bytes(datagram[8..12].try_into().expect("4 bytes"));
-    let cell = cells
+    let signal = crate::stream_signal::decode(datagram);
+    let token = match signal {
+        Some(crate::stream_signal::StreamSignal::RaiseFloor { token, .. })
+        | Some(crate::stream_signal::StreamSignal::Cancel { token }) => token,
+        None => return,
+    };
+    let state = signals
         .lock()
-        .expect("floor registry poisoned")
+        .expect("stream signal registry poisoned")
         .get(&token)
         .cloned();
-    if let Some(cell) = cell {
-        raise_floor_cell(&cell, floor);
+    let Some(state) = state else {
+        return;
+    };
+    match signal.expect("validated above") {
+        crate::stream_signal::StreamSignal::RaiseFloor { floor, .. } => {
+            raise_floor_cell(&state.floor, floor);
+        }
+        crate::stream_signal::StreamSignal::Cancel { .. } => {
+            state
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -1967,7 +1991,7 @@ impl NodeServiceImpl {
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
-            floor_cells: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stream_signals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             vocab,
         }
     }
@@ -1986,25 +2010,27 @@ impl NodeServiceImpl {
         }
     }
 
-    /// Bind the UDP floor lane on `addr` — the same host:port as the
-    /// gRPC listener, UDP namespace — and fold incoming datagrams into
-    /// the matching stream's floor cell (see [`apply_floor_datagram`]).
-    /// A failed bind only loses the fast lane: floors still travel on
-    /// every stream's reliable gRPC leg.
+    /// Bind the UDP signal lane on `addr` — the same host:port as the
+    /// gRPC listener, UDP namespace — and fold typed floor/cancel datagrams
+    /// into the matching stream state (see [`apply_stream_datagram`]). A
+    /// failed bind only loses the fast lane: both signals still travel on
+    /// every stream's authoritative gRPC leg.
     pub fn spawn_floor_listener(&self, addr: std::net::SocketAddr) {
-        let cells = Arc::clone(&self.floor_cells);
+        let signals = Arc::clone(&self.stream_signals);
         tokio::spawn(async move {
             let socket = match tokio::net::UdpSocket::bind(addr).await {
                 Ok(socket) => socket,
                 Err(e) => {
-                    eprintln!("floor UDP bind {addr}: {e}; floors ride the gRPC streams only");
+                    eprintln!(
+                        "stream-signal UDP bind {addr}: {e}; signals ride the gRPC streams only"
+                    );
                     return;
                 }
             };
             let mut buf = [0u8; 64];
             loop {
                 match socket.recv_from(&mut buf).await {
-                    Ok((n, _peer)) => apply_floor_datagram(&cells, &buf[..n]),
+                    Ok((n, _peer)) => apply_stream_datagram(&signals, &buf[..n]),
                     Err(_) => continue,
                 }
             }
@@ -4353,7 +4379,7 @@ impl NodeService for NodeServiceImpl {
         let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
         let state = self.state.clone();
         let slot_offset = self.config.slot_offset;
-        let floor_cells = Arc::clone(&self.floor_cells);
+        let stream_signals = Arc::clone(&self.stream_signals);
 
         tokio::spawn(async move {
             // Protocol: the first message must be Start.
@@ -4383,34 +4409,32 @@ impl NodeService for NodeServiceImpl {
                 return;
             }
 
-            // Floor raises fold into one shared cell the blocking scan
-            // polls after each emitted block. Two lanes feed it: the
-            // stream's own FloorUpdate messages (reliable) and, when
-            // the Start carried a token, the node's UDP floor listener
-            // (fast, lossy, same monotone fold).
-            let floor_cell = Arc::new(std::sync::atomic::AtomicU32::new(
-                f32::NEG_INFINITY.to_bits(),
+            // Floor raises and cancellation fold into one stream state that
+            // the blocking scan polls before every chunk. The gRPC request
+            // stream is authoritative; UDP is only a fast lossy duplicate.
+            let signals = Arc::new(StreamSignals::new(
+                start.initial_floor.unwrap_or(f32::NEG_INFINITY),
             ));
             let udp_token = (start.floor_token != 0).then_some(start.floor_token);
             if let Some(token) = udp_token {
-                floor_cells
+                stream_signals
                     .lock()
-                    .expect("floor registry poisoned")
-                    .insert(token, Arc::clone(&floor_cell));
+                    .expect("stream signal registry poisoned")
+                    .insert(token, Arc::clone(&signals));
             }
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stop_pump = Arc::clone(&stop);
-            let pump_cell = Arc::clone(&floor_cell);
+            let pump_signals = Arc::clone(&signals);
             tokio::spawn(async move {
                 loop {
                     match inbound.message().await {
                         Ok(Some(StreamSearchRequest {
                             payload: Some(stream_search_request::Payload::FloorUpdate(u)),
-                        })) => raise_floor_cell(&pump_cell, u.floor),
+                        })) => raise_floor_cell(&pump_signals.floor, u.floor),
                         Ok(Some(StreamSearchRequest {
                             payload: Some(stream_search_request::Payload::Stop(_)),
                         })) => {
-                            stop_pump.store(true, std::sync::atomic::Ordering::Release);
+                            pump_signals
+                                .cancelled
+                                .store(true, std::sync::atomic::Ordering::Release);
                             break;
                         }
                         // Duplicate Start or empty payload: ignore.
@@ -4424,7 +4448,7 @@ impl NodeService for NodeServiceImpl {
             });
 
             let scan_tx = tx.clone();
-            let scan_cell = Arc::clone(&floor_cell);
+            let scan_signals = Arc::clone(&signals);
             let scan =
                 tokio::task::spawn_blocking(move || -> Result<StreamSearchSummary, Status> {
                     // Document mode: resolve each emitted slot's parent.
@@ -4480,50 +4504,70 @@ impl NodeService for NodeServiceImpl {
                     let mut raises = 0u64;
                     let stride = if parents.is_some() { 20 } else { 12 };
                     let summary = index
-                        .try_search_streaming(&start.vector, options, |batch| {
-                            // Pack the batch as fixed-stride LE records
-                            // (u64 global id, f32 score, and in document
-                            // mode the slot's u64 parent), fused into the
-                            // slot-to-global-id rebase — one pass, no
-                            // per-hit messages. Real emissions only
-                            // carry live slots; a negative would be an
-                            // engine contract break, dropped rather
-                            // than wrapped into a bogus global id.
-                            let mut hits: Vec<u8> = Vec::with_capacity(stride * batch.slots.len());
-                            for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
-                                if slot < 0 {
-                                    continue;
+                        .try_search_streaming_controlled(
+                            &start.vector,
+                            options,
+                            |batch| {
+                                // Pack the batch as fixed-stride LE records
+                                // (u64 global id, f32 score, and in document
+                                // mode the slot's u64 parent), fused into the
+                                // slot-to-global-id rebase — one pass, no
+                                // per-hit messages. Real emissions only
+                                // carry live slots; a negative would be an
+                                // engine contract break, dropped rather
+                                // than wrapped into a bogus global id.
+                                let mut hits: Vec<u8> =
+                                    Vec::with_capacity(stride * batch.slots.len());
+                                for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
+                                    if slot < 0 {
+                                        continue;
+                                    }
+                                    hits.extend_from_slice(
+                                        &(slot_offset + slot as u64).to_le_bytes(),
+                                    );
+                                    hits.extend_from_slice(&score.to_le_bytes());
+                                    if let Some(p) = parents.as_deref() {
+                                        hits.extend_from_slice(&p[slot as usize].to_le_bytes());
+                                    }
                                 }
-                                hits.extend_from_slice(&(slot_offset + slot as u64).to_le_bytes());
-                                hits.extend_from_slice(&score.to_le_bytes());
-                                if let Some(p) = parents.as_deref() {
-                                    hits.extend_from_slice(&p[slot as usize].to_le_bytes());
+                                let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
+                                    payload: Some(stream_search_response::Payload::Batch(
+                                        StreamSearchBatch { hits },
+                                    )),
+                                }));
+                                if sent.is_err() {
+                                    turbovec::StreamControl::Stop
+                                } else {
+                                    turbovec::StreamControl::Continue
                                 }
-                            }
-                            let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
-                                payload: Some(stream_search_response::Payload::Batch(
-                                    StreamSearchBatch { hits },
-                                )),
-                            }));
-                            // A dead response channel means the client is
-                            // gone: stop scanning, nobody is listening.
-                            if sent.is_err() || stop.load(std::sync::atomic::Ordering::Acquire) {
-                                return turbovec::StreamControl::Stop;
-                            }
-                            let f = f32::from_bits(
-                                scan_cell.load(std::sync::atomic::Ordering::Acquire),
-                            );
-                            if f > floor_now {
-                                floor_now = f;
-                                raises += 1;
-                                turbovec::StreamControl::RaiseFloor(f)
-                            } else {
-                                turbovec::StreamControl::Continue
-                            }
-                        })
+                            },
+                            || {
+                                if scan_signals
+                                    .cancelled
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                                {
+                                    return turbovec::StreamControl::Stop;
+                                }
+                                let f = f32::from_bits(
+                                    scan_signals
+                                        .floor
+                                        .load(std::sync::atomic::Ordering::Acquire),
+                                );
+                                if f > floor_now {
+                                    floor_now = f;
+                                    raises += 1;
+                                    turbovec::StreamControl::RaiseFloor(f)
+                                } else {
+                                    turbovec::StreamControl::Continue
+                                }
+                            },
+                        )
                         .map_err(|e| Status::invalid_argument(e.to_string()))?;
                     Ok(StreamSearchSummary {
-                        completed: summary.completed,
+                        completed: summary.completed
+                            && !scan_signals
+                                .cancelled
+                                .load(std::sync::atomic::Ordering::Acquire),
                         emitted: summary.emitted as u64,
                         blocks_scanned: summary.blocks_scanned as u64,
                         floor_raises_applied: raises,
@@ -4531,9 +4575,9 @@ impl NodeService for NodeServiceImpl {
                 });
             let outcome = scan.await;
             if let Some(token) = udp_token {
-                floor_cells
+                stream_signals
                     .lock()
-                    .expect("floor registry poisoned")
+                    .expect("stream signal registry poisoned")
                     .remove(&token);
             }
             match outcome {
@@ -5444,48 +5488,62 @@ impl NodeServiceImpl {
 #[cfg(test)]
 mod floor_lane_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::Ordering;
 
-    fn cell_of(cells: &std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>>, token: u64) -> f32 {
-        f32::from_bits(cells.lock().unwrap()[&token].load(Ordering::Acquire))
+    fn state_of(
+        signals: &std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>>,
+        token: u64,
+    ) -> Arc<StreamSignals> {
+        Arc::clone(&signals.lock().unwrap()[&token])
     }
 
-    fn datagram(token: u64, floor: f32) -> Vec<u8> {
-        let mut d = Vec::with_capacity(12);
-        d.extend_from_slice(&token.to_le_bytes());
-        d.extend_from_slice(&floor.to_le_bytes());
-        d
+    fn floor_of(signals: &std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>>, token: u64) -> f32 {
+        f32::from_bits(state_of(signals, token).floor.load(Ordering::Acquire))
     }
 
-    /// The UDP fold: raises apply, non-raises and garbage never do, and
-    /// no input shape can panic the listener.
+    /// Typed UDP raises remain monotone, cancellation is sticky, and garbage
+    /// cannot mutate either signal or panic the listener.
     #[test]
-    fn floor_datagrams_fold_monotonically_and_ignore_garbage() {
-        let cells: std::sync::Mutex<HashMap<u64, Arc<AtomicU32>>> =
+    fn stream_datagrams_fold_typed_signals_and_ignore_garbage() {
+        let signals: std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>> =
             std::sync::Mutex::new(HashMap::new());
-        cells
+        signals
             .lock()
             .unwrap()
-            .insert(7, Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())));
+            .insert(7, Arc::new(StreamSignals::new(f32::NEG_INFINITY)));
 
-        apply_floor_datagram(&cells, &datagram(7, 0.25));
-        assert_eq!(cell_of(&cells, 7), 0.25);
-        // Lower, equal, and NaN floors are ignored.
-        apply_floor_datagram(&cells, &datagram(7, 0.10));
-        apply_floor_datagram(&cells, &datagram(7, 0.25));
-        apply_floor_datagram(&cells, &datagram(7, f32::NAN));
-        assert_eq!(cell_of(&cells, 7), 0.25);
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.25));
+        assert_eq!(floor_of(&signals, 7), 0.25);
+        // Lower and equal floors are ignored.
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.10));
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.25));
+        assert_eq!(floor_of(&signals, 7), 0.25);
         // Duplicated and reordered raises: max wins regardless.
-        apply_floor_datagram(&cells, &datagram(7, 0.75));
-        apply_floor_datagram(&cells, &datagram(7, 0.50));
-        apply_floor_datagram(&cells, &datagram(7, 0.75));
-        assert_eq!(cell_of(&cells, 7), 0.75);
-        // Unknown tokens, short, long, and empty datagrams: dropped.
-        apply_floor_datagram(&cells, &datagram(8, 9.0));
-        apply_floor_datagram(&cells, &datagram(7, 9.0)[..11].to_vec());
-        apply_floor_datagram(&cells, &[0u8; 13]);
-        apply_floor_datagram(&cells, &[]);
-        assert_eq!(cell_of(&cells, 7), 0.75);
-        assert_eq!(cells.lock().unwrap().len(), 1);
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.75));
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.50));
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.75));
+        assert_eq!(floor_of(&signals, 7), 0.75);
+
+        let state = state_of(&signals, 7);
+        assert!(!state.cancelled.load(Ordering::Acquire));
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_cancel(7));
+        assert!(state.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            floor_of(&signals, 7),
+            0.75,
+            "cancel is not a score sentinel"
+        );
+
+        // Unknown tokens, malformed frames, and empty datagrams are dropped.
+        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(8, 9.0));
+        apply_stream_datagram(
+            &signals,
+            &crate::stream_signal::encode_floor(7, 9.0)[..crate::stream_signal::FRAME_LEN - 1],
+        );
+        apply_stream_datagram(&signals, &[0u8; crate::stream_signal::FRAME_LEN + 1]);
+        apply_stream_datagram(&signals, &[]);
+        assert_eq!(floor_of(&signals, 7), 0.75);
+        assert!(state.cancelled.load(Ordering::Acquire));
+        assert_eq!(signals.lock().unwrap().len(), 1);
     }
 }

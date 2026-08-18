@@ -17,7 +17,7 @@ The public model separates three things that are easy to conflate:
 ```mermaid
 flowchart LR
     Request["Query request"] --> Select["Selection: search + filter clauses"]
-    Select -->|"candidate_k candidates"| Boost["Candidate-scoped boost queries"]
+    Select -->|"selection_k candidates"| Boost["Candidate-scoped boost queries"]
     Boost --> Score["Composite scorer over named signals"]
     Score -->|"top k"| Result["Hits + score provenance"]
 ```
@@ -75,15 +75,25 @@ truncated blend, or return a partial shard set.
 ## Boost phase
 
 A `BoostQuery` contains a normal scoring query and an `id`. It runs against the
-selection's top `candidate_k` documents, never the corpus. Its query relevance
+selection's top `selection_k` documents, never the corpus. Its query relevance
 becomes another named signal. The selected candidate set is immutable during
 this phase.
 
-`candidate_k` and output `k` are deliberately separate:
+`selection_k` and output `k` are deliberately separate:
 
 \[
-k \leq candidate\_k
+k \leq selection\_k
 \]
+
+`selection_k` is coordinator-owned. Streaming vector nodes remain completely
+k-blind: they receive a query and a monotonically rising score floor, emit
+every qualifying candidate, and issue their own completion certificate. The
+coordinator uses `selection_k` for its first-stage global heap and later trims
+the post-boost result to `k`.
+
+The initial implementation may reuse the coordinator's existing `max_k`
+guardrail, making request validation `k <= selection_k <= max_k`. A later
+separate selection-depth cap is an operational choice, not node protocol.
 
 The final response is the best `k` documents under the post-boost scorer from
 that candidate set. It is not represented as the global top-k of the boosted
@@ -91,7 +101,7 @@ formula unless the selection strategy itself included the boost signal and
 proved that stronger claim.
 
 This is the honest form of the existing rescore-window behavior. A caller that
-needs more recall under a strong boost increases `candidate_k`; the server does
+needs more recall under a strong boost increases `selection_k`; the server does
 not silently over-fetch by an undocumented factor.
 
 ## Composite scorer
@@ -142,7 +152,7 @@ shape, phase ordering, and refusal rules are the stable design decisions.
 message QueryRequest {
   string request_id = 1;
   uint32 k = 2;
-  uint32 candidate_k = 3;
+  uint32 selection_k = 3;
   SelectionQuery selection = 4;
   repeated BoostQuery boosts = 5;
   CompositeScorer scorer = 6;
@@ -176,7 +186,7 @@ message FilterQuery {
 message CompositeSearchStrategy {
   SelectionOperator operator = 1;
   repeated SelectionQuery clauses = 2;
-  CandidateScoreStrategy scoring = 3;
+  SelectionScoreStrategy scoring = 3;
 }
 
 enum SelectionOperator {
@@ -185,7 +195,7 @@ enum SelectionOperator {
   SELECTION_OPERATOR_OR = 2;
 }
 
-message CandidateScoreStrategy {
+message SelectionScoreStrategy {
   oneof strategy {
     SingleScore single = 1;
     RrfScore rrf = 2;

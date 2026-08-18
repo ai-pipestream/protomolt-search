@@ -22,7 +22,7 @@ outside the cluster in a separate NLP sidecar process, and document storage
 is headed toward a repo service that holds source material and derived data
 the index itself should not carry. Clients talk to a coordinator over gRPC;
 everything behind the coordinator is also gRPC, with one deliberate
-exception described later (a UDP fast lane for score floors).
+exception described later (a UDP fast lane for typed stream signals).
 
 ```mermaid
 C4Context
@@ -56,9 +56,9 @@ flowchart TB
         n3["Search node<br/>shard N (.tv + .bm25)"]
     end
     client["Client"] -->|"gRPC: SearchService"| coord
-    coord -->|"gRPC: NodeService<br/>+ UDP floor lane"| n1
-    coord -->|"gRPC: NodeService<br/>+ UDP floor lane"| n2
-    coord -->|"gRPC: NodeService<br/>+ UDP floor lane"| n3
+    coord -->|"gRPC: NodeService<br/>+ UDP signal lane"| n1
+    coord -->|"gRPC: NodeService<br/>+ UDP signal lane"| n2
+    coord -->|"gRPC: NodeService<br/>+ UDP signal lane"| n3
     n1 -->|"gRPC: AnalyzeStream"| nlp["OpenNLP sidecar"]
     coord -->|"gRPC: AnalyzeStream<br/>(query analysis)"| nlp
     coord -.->|"planned"| repo["Repo service"]
@@ -118,19 +118,33 @@ the whole query. Nodes never receive a result quota; they stream candidates
 and prune against a shared floor score that the coordinator raises as
 better results arrive.
 
-Floors travel two ways. The authoritative path is the open gRPC stream each
-node holds for the query. Beside it runs a UDP fast lane: small datagrams
-on the same host and port, folded into the node's floor cell as a monotonic
-maximum. Floors only rise, so a lost or reordered datagram costs a little
-extra work and can never change a result. The fast lane is an optimization
-with tightly bounded failure, which is why it is allowed to be UDP.
+Stream signals travel two ways. The authoritative path is the open gRPC
+stream each node holds for the query. Beside it runs a UDP fast lane: typed
+datagrams on the same host and port carry monotonic floor raises or advisory
+cancellation. Every UDP signal has a gRPC twin. A lost or reordered floor
+costs extra work; a lost cancellation delays abandonment. Neither can change
+a successful result, which is why this narrow lane is allowed to be UDP.
 
 The result is still exact, and that claim is structural rather than
-statistical. Every node ends its stream with a completion frame, the
-coordinator answers only after all frames arrive, and candidates that were
-emitted before a floor passed them are filtered at the merge. The
-distributed answer is bitwise identical to running the same query on one
-machine, and the test suite pins that equivalence.
+statistical. Every node ends its stream with a node-issued completion frame,
+the coordinator answers only after all frames arrive with `completed=true`,
+and candidates that were emitted before a floor passed them are filtered at
+the merge. Cancellation always yields `completed=false`. The distributed
+answer is bitwise identical to running the same query on one machine, and the
+test suite pins that equivalence.
+
+Cancellation is not early completion. A node may eventually finish before
+visiting every remaining vector block only when the engine can prove that an
+upper bound over every unvisited block is below the current inclusive floor:
+
+\[
+\max UB(\text{unvisited blocks}) < floor
+\]
+
+That proof is node-local and would still produce a node-issued
+`completed=true`. The current TurboVec streaming API exposes live floor control
+but no remaining-range bound, so nodes currently traverse every logical scan
+chunk unless cancelled. UDP `CANCEL` can never substitute for this proof.
 
 Beyond plain vector search, the coordinator owns:
 
@@ -284,10 +298,11 @@ the SearchService: search, BM25 search, hybrid search, variant search, and
 ingest administration. Coordinator to node is the NodeService: the
 streaming search protocol with its floor relay, lexical queries, rescoring,
 document ingestion, and snapshot install. Node and coordinator to sidecar
-is the analysis stream. The UDP floor lane shares the node's listen address
-and carries only monotonic floor hints; correctness never depends on a
-datagram arriving. This section intentionally stops here; message-level
-detail belongs to the proto files and the appendix.
+is the analysis stream. The UDP signal lane shares the node's listen address
+and carries typed monotonic floor hints or advisory cancellation. The same
+signal also travels over gRPC, and correctness never depends on a datagram
+arriving. This section intentionally stops here; message-level detail belongs
+to the proto files and the appendix.
 
 ## Appendix
 

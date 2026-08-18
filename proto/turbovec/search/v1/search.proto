@@ -479,12 +479,14 @@ message StartStreamSearch {
   // best (for example a finished BM25 leg's decomposed floor). Absent
   // means no floor, which emits the entire shard.
   optional float initial_floor = 3;
-  // Token identifying this stream on the node's UDP floor lane (the
-  // same host:port as the gRPC listener, UDP namespace). 12-byte
-  // little-endian datagrams of u64 token + f32 floor fold into this
-  // stream's floor exactly like FloorUpdate messages: an unreliable
-  // fast copy of the same monotone hint, so loss, duplication, and
-  // reordering cost nothing (the gRPC stream stays the reliable lane).
+  // Token identifying this stream on the node's UDP signal lane (the
+  // same host:port as the gRPC listener, UDP namespace). A typed frame is 20
+  // bytes: ASCII `TVS1`, u8 opcode, three zero reserved bytes, little-endian
+  // u64 token, then a little-endian f32 value. Opcodes carry either a floor
+  // raise or advisory cancellation. Every datagram has an authoritative twin
+  // on the gRPC request stream, so loss, duplication, and reordering can only
+  // delay pruning or cancellation. UDP cancellation never certifies
+  // completion.
   // 0 disables the UDP lane for this stream.
   uint64 floor_token = 4;
   // Document-mode streaming: when true, every batch record carries the
@@ -502,7 +504,10 @@ message StartStreamSearch {
   bool collapse_parents = 5;
 }
 
-// Abandon request for a streaming scan.
+// Authoritative abandon request for a streaming scan. The coordinator may
+// send a typed UDP CANCEL first to reduce reaction latency, but this gRPC
+// message defines the protocol action. A stopped scan returns
+// `StreamSearchSummary.completed = false`.
 message StopStreamSearch {}
 
 // One message on the shard-to-client leg of `StreamSearch`.
@@ -539,11 +544,13 @@ message StreamSearchBatch {
 
 // What the scan did; terminal message of a `StreamSearch` stream.
 message StreamSearchSummary {
-  // True when every block was scanned to the end: for this query, every
-  // live slot scoring at or above the floor in effect when its block
-  // was scored was emitted — the exactness certificate a merging
-  // coordinator waits for. False only after `StopStreamSearch` (or a
-  // broken client connection).
+  // Node-issued exactness certificate. True only when the node's engine
+  // completed the scan: for this query, every live slot scoring at or above
+  // the floor in effect when its block was scored was emitted. Today that
+  // means traversing every logical chunk. A future node may also certify that
+  // a bound over every unvisited block is strictly below the inclusive floor.
+  // A coordinator cannot manufacture this value; StopStreamSearch, UDP
+  // CANCEL, or a broken client connection produces false.
   bool completed = 1;
   // Candidates emitted across all batches.
   uint64 emitted = 2;
@@ -673,8 +680,9 @@ message SearchRequest {
   // when empty and echoes it back.
   string request_id = 1;
   // Number of global top hits to return. Optional: 0 (proto3 unset)
-  // selects the coordinator's configured `max_k` (default 10000, its
-  // stop bound); a value above `max_k` is refused, never clamped.
+  // selects the coordinator's configured `max_k` (default 10000, its heap
+  // guardrail); a value above `max_k` is refused, never clamped. Streaming
+  // nodes never receive either value.
   uint32 k = 2;
   // The query vector. Length must equal the shard dimension.
   repeated float vector = 3;

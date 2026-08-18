@@ -195,3 +195,64 @@ async fn stream_without_start_is_refused() {
         "a stream opened without Start must error, got {first:?}"
     );
 }
+
+/// Stop is cancellation, never completion: even when the node receives it on
+/// the authoritative gRPC lane, the terminal summary cannot certify the scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grpc_stop_returns_an_incomplete_node_certificate() {
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use turbovec_search::pb::node_service_client::NodeServiceClient;
+    use turbovec_search::pb::{
+        stream_search_request, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
+    };
+
+    let corpus = unit_vectors(8 * CHUNK, DIM, 0xCA11_CE11);
+    let mut index = TurboQuantIndex::new(DIM, BIT_WIDTH).unwrap();
+    index.add(&corpus);
+    index.prepare();
+    let (addr, _handle) = start_node(index, NodeConfig::default()).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    let query = unit_vectors(1, DIM, 0xCA11_0001);
+
+    let (tx, rx) = mpsc::channel(2);
+    tx.send(StreamSearchRequest {
+        payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+            request_id: "grpc-cancel".to_string(),
+            vector: query,
+            initial_floor: None,
+            floor_token: 0,
+            collapse_parents: false,
+        })),
+    })
+    .await
+    .unwrap();
+    let mut inbound = client
+        .stream_search(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    tx.send(StreamSearchRequest {
+        payload: Some(stream_search_request::Payload::Stop(StopStreamSearch {})),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+
+    let summary = loop {
+        let message = inbound.message().await.unwrap().expect("terminal summary");
+        if let Some(turbovec_search::pb::stream_search_response::Payload::Summary(summary)) =
+            message.payload
+        {
+            break summary;
+        }
+    };
+    assert!(
+        !summary.completed,
+        "a stopped scan cannot certify exactness"
+    );
+    assert!(
+        summary.blocks_scanned < 8,
+        "Stop arrived only after the whole scan completed: {summary:?}"
+    );
+}
