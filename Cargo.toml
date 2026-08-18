@@ -6,7 +6,7 @@ license = "MIT"
 description = "Distributed top-k search over turbovec shard indexes with collaborative mid-query floor sharing"
 
 [dependencies]
-turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s14" }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s16" }
 tonic = "0.12"
 prost = "0.13"
 # google.protobuf.Timestamp on the ingest wire compiles to this crate's

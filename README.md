@@ -11,10 +11,15 @@ remainder of their scan against it — losslessly.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s15` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s15` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s15` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s16` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s16` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s16` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
+
+The `s16` dependency reads and writes only TurboVec v7 vector indexes. It
+refuses pre-v7 `.tv` files, so build and verify a new shard generation before
+cutting this binary over an older corpus. BM25 sidecar format compatibility is
+independent of this vector-container break.
 
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
 The phased public query contract under design is
@@ -978,11 +983,10 @@ the heap builder (bulk-load discipline: build in memory, flush back).
 This is what makes a corpus larger than machine memory work: the
 postings (~130 GB at full CourtListener scale) and doc text (~40 GB)
 live in page cache shared across all consumers, not per-process heap.
-The turbovec vector index remains heap-resident today (v6 `load()`
-keeps packed codes in heap Vecs and builds the blocked copy lazily on
-first search) — at full-court scale that is ~3 GB packed + ~3 GB
-blocked across the cluster, which fits; mmap support there is a
-fork-level decision (see the TODO list).
+The turbovec vector index remains heap-resident today. A v7 `load()` transforms
+the stored sequential blocks into the native blocked search layout and retains
+that heap representation; mmap support remains a fork-level decision (see the
+TODO list).
 
 ## TODO
 
