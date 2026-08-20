@@ -11,9 +11,9 @@ remainder of their scan against it — losslessly.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s16` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s16` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s16` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s17` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s17` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s17` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 The `s16` dependency reads and writes only TurboVec v7 vector indexes. It
