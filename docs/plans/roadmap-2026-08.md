@@ -491,10 +491,30 @@ whole cost avoided.
 
 ## F. What makes it a protobuf search engine rather than our corpus's engine
 
-### 19. Descriptor-derived mappings, increment 1 — LANDED
+### 19. Descriptor-derived mappings, increments 1 and 2 — LANDED
 
-**Landed 2026-08-25** exactly at the scoped increment: derivation plus
-dry-run planning plus the fingerprint, no ingest.
+**Increment 2 landed 2026-08-25**: bind plus protobuf-native ingest,
+all protobuf/CEL, no JSON. `NodeService.IngestMapped` is a client
+stream whose first message BINDS a plan — the client's reviewed
+fingerprint is required, the node re-derives locally and refuses a
+mismatch naming both sides, and every landing column the shard does
+not declare refuses up front in one message — and whose later messages
+are the serialized protobuf documents themselves. The extractor
+(`src/mapping.rs`) walks each document's wire bytes against a
+field-number trie compiled from the descriptor (unknown fields skip,
+merge semantics honored) and reduces them to the ORDINARY
+`AddDocumentsRequest` value lists plus the vector, so the analysis
+session, the column validation, the CEL materialization from the bind,
+and the WAL records are the ones ordinary ingest already has — replay
+never needs the descriptor. Each document's vector applies in LOCKSTEP
+at the same id under the same lock (its own AddVectors WAL record); a
+shard whose document leg ran ahead refuses by name. Deliberately
+deferred: chunked plans, a durable shard-level binding (the stored
+format increment), per-field analyzer resolution. Pinned in
+`tests/mapped_ingest.rs`.
+
+**Increment 1 landed 2026-08-25** exactly at the scoped increment:
+derivation plus dry-run planning plus the fingerprint, no ingest.
 `SearchService.PlanIndex` (`src/mapping.rs`) derives the plan, maps
 each field onto its engine column family (repeated scalars and
 OBJECT/NESTED/BINARY visibly land on FAMILY_NONE), reads protomolt's
@@ -506,7 +526,6 @@ contradictory or unsupported hints, conflicting extension declarations
 — is implemented and pinned in `tests/descriptor_mappings.rs`. The
 exchange contract and hint vocabulary are vendored byte-identical from
 protomolt rev 74d172d9, gated by `scripts/check-vendored-protos.sh`.
-Binding and protobuf-native ingest are the next increments.
 
 The original rationale, kept:
 

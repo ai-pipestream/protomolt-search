@@ -136,10 +136,10 @@ at ingest there is no fleet-wide table to check a spelling against, and
 the declared-column check on the OUTPUT name is where typos surface.
 
 Changing a materialization expression changes what an index means, so
-it is an index compatibility event — rebuild, not mutate. (Binding
-expressions to a fingerprinted mapping is the descriptor-mappings
-integration, `docs/descriptor-mappings.md` section 4, which this
-increment's machinery was built to serve.)
+it is an index compatibility event — rebuild, not mutate. Mapped
+ingest carries the spec on its bind (`MappedBind.materialize`,
+`docs/descriptor-mappings.md` section 4a), so derived columns compute
+from a protobuf document's own mapped values with the same contract.
 
 ## 6. What this is not
 

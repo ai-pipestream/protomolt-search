@@ -38,11 +38,12 @@ pub enum Route {
     GetDocuments,
     AddDocuments,
     AddVectors,
+    IngestMapped,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter table.
-const REQUEST_ROUTES: [(Route, &str); 12] = [
+const REQUEST_ROUTES: [(Route, &str); 13] = [
     (Route::SearchShard, "search_shard"),
     (Route::StreamSearch, "stream_search"),
     (Route::BrowseShard, "browse_shard"),
@@ -55,6 +56,7 @@ const REQUEST_ROUTES: [(Route, &str); 12] = [
     (Route::GetDocuments, "get_documents"),
     (Route::AddDocuments, "add_documents"),
     (Route::AddVectors, "add_vectors"),
+    (Route::IngestMapped, "ingest_mapped"),
 ];
 
 // A `const` here is the repeat-element initializer for the array

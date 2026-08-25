@@ -42,6 +42,7 @@ use crate::pb::{
     Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse,
     GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse,
     HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse,
+    IngestMappedRequest, IngestMappedResponse,
     InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest,
     SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
     ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
@@ -3708,12 +3709,95 @@ async fn drive_field_stream(
 /// plus its extra fields filling in as their results arrive.
 struct PendingDoc {
     doc: AddDocumentsRequest,
+    /// The document's dense vector, mapped ingest only: it applies in
+    /// LOCKSTEP with the document, landing at the same id. `None` on
+    /// the ordinary AddDocuments path.
+    vector: Option<Vec<f32>>,
     /// `(field table index, analysis)`, in submission order. `None` until
     /// that field's result lands.
     extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
     /// Extras still unfilled. The document is ready to apply when this is
     /// zero AND its body result has arrived.
     outstanding: usize,
+}
+
+/// One document entering the shared ingest pipeline: the ordinary
+/// request plus, on the mapped path, its vector.
+struct IngestDoc {
+    req: AddDocumentsRequest,
+    vector: Option<Vec<f32>>,
+}
+
+/// Where the ingest pipeline's documents come from: the ordinary
+/// AddDocuments stream verbatim, or the mapped stream decoding each
+/// serialized protobuf document against the bound plan. One pipeline,
+/// two front doors — the mapped path reuses the analysis session, the
+/// apply wavefront, the column validation, and the WAL records
+/// unchanged.
+enum IngestSource<'a> {
+    Plain(&'a mut Streaming<AddDocumentsRequest>),
+    /// Boxed: the extractor's trie dwarfs the plain variant.
+    Mapped(Box<MappedSource<'a>>),
+}
+
+struct MappedSource<'a> {
+    stream: &'a mut Streaming<crate::pb::IngestMappedRequest>,
+    extractor: crate::mapping::Extractor,
+    /// Session properties from the bind, attached to every decoded
+    /// document.
+    analysis: Option<crate::pb::AnalysisSpec>,
+    materialize: Option<crate::pb::MaterializeSpec>,
+    /// Documents decoded so far; extraction errors name the failing
+    /// position.
+    position: u64,
+}
+
+impl IngestSource<'_> {
+    async fn next(&mut self) -> Result<Option<IngestDoc>, Status> {
+        match self {
+            IngestSource::Plain(stream) => Ok(stream
+                .message()
+                .await?
+                .map(|req| IngestDoc { req, vector: None })),
+            IngestSource::Mapped(source) => source.next().await,
+        }
+    }
+}
+
+impl MappedSource<'_> {
+    async fn next(&mut self) -> Result<Option<IngestDoc>, Status> {
+        use crate::pb::ingest_mapped_request::Payload;
+        match self.stream.message().await? {
+            None => Ok(None),
+            Some(message) => match message.payload {
+                Some(Payload::Document(bytes)) => Ok(Some(self.decode(&bytes)?)),
+                Some(Payload::Bind(_)) => Err(Status::invalid_argument(
+                    "bind repeats mid-stream; a mapped stream binds exactly once, first",
+                )),
+                None => Err(Status::invalid_argument(
+                    "empty IngestMappedRequest payload",
+                )),
+            },
+        }
+    }
+
+    fn decode(&mut self, bytes: &[u8]) -> Result<IngestDoc, Status> {
+        let position = self.position;
+        self.position += 1;
+        let extracted = self.extractor.extract(bytes).map_err(|status| {
+            Status::new(
+                status.code(),
+                format!("document {position}: {}", status.message()),
+            )
+        })?;
+        let mut req = extracted.request;
+        req.analysis = self.analysis.clone();
+        req.materialize = self.materialize.clone();
+        Ok(IngestDoc {
+            req,
+            vector: Some(extracted.vector),
+        })
+    }
 }
 
 /// Assemble one document's positional [`crate::postings::AnalyzedDoc`]:
@@ -4090,6 +4174,7 @@ impl NodeServiceImpl {
         &self,
         doc: AddDocumentsRequest,
         analyzed: crate::postings::AnalyzedDoc,
+        vector: Option<Vec<f32>>,
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
@@ -4123,6 +4208,39 @@ impl NodeServiceImpl {
         // Shared positional id space with the vector side: the next id
         // is past both indexes' tips.
         let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
+        // Mapped ingest carries the document's vector, applied in
+        // LOCKSTEP below. Validate it BEFORE anything mutates, the same
+        // rule every column list follows: dimension against the index,
+        // coordinates finite, and — after doc_id is known — the tips in
+        // agreement, so a document that fails never half-enters either
+        // leg.
+        let vector_dim = match vector.as_deref() {
+            Some(v) => {
+                let dim = v.len();
+                if let Some(known) = guard.index.as_ref().and_then(|i| i.dim_opt()) {
+                    if known != dim {
+                        return Err(Status::invalid_argument(format!(
+                            "mapped vector has {dim} floats but the shard's index is dim {known}"
+                        )));
+                    }
+                }
+                if let Some((_, ci, value)) = turbovec::first_invalid_coord(v, dim) {
+                    return Err(Status::invalid_argument(format!(
+                        "mapped vector coordinate {ci} is {value}; vectors must be finite"
+                    )));
+                }
+                if guard.index.is_none() {
+                    // From-scratch, unseeded: same single-shard
+                    // convenience the AddVectors path allows.
+                    guard.index = Some(
+                        TurboQuantIndex::new(dim, self.config.bit_width)
+                            .map_err(|e| Status::invalid_argument(format!("{e}")))?,
+                    );
+                }
+                Some(dim)
+            }
+            None => None,
+        };
         if guard.bm25.is_none() {
             let builder = self.new_builder(guard.generation.as_ref())?;
             guard.bm25 = Some(builder);
@@ -4134,6 +4252,20 @@ impl NodeServiceImpl {
                 .expect("builder just ensured")
                 .next_doc_id(),
         );
+        // The lockstep rule: a mapped document's vector lands at the
+        // SAME id, which is only true when the vector leg's tip is the
+        // id being assigned. A shard whose document leg ran ahead (per-
+        // leg ingest history) cannot take mapped documents — the vector
+        // would land below its document and silently corrupt every
+        // hybrid result, so it refuses by name instead.
+        if vector.is_some() && u64::from(doc_id) != u64::from(vector_tip) {
+            return Err(Status::failed_precondition(format!(
+                "the shard's document leg is ahead of its vector leg ({} documents, \
+                 {vector_tip} vectors); mapped ingest appends both legs in lockstep — \
+                 rebuild the shard or backfill vectors with AddVectors first",
+                doc_id
+            )));
+        }
         // Multi-field documents were positioned against the CONFIGURED
         // table; the ACTIVE table (possibly loaded from a file) must be
         // at least as wide and agree on names, or the document would
@@ -4475,9 +4607,113 @@ impl NodeServiceImpl {
                 documents: vec![doc],
             }),
         );
+        // The mapped document's vector, at the same id, under the same
+        // lock, with the same WAL record AddVectors writes — replay
+        // rebuilds both legs from their own records. Failure here is
+        // ruled out by the validation above; if it happens anyway the
+        // legs have diverged by one and the next mapped document
+        // refuses on the lockstep check, loudly.
+        if let Some(v) = vector {
+            let dim = vector_dim.expect("validated alongside the vector");
+            let index = guard.index.as_mut().expect("ensured during validation");
+            index.add_2d(&v, dim).map_err(|e| {
+                Status::internal(format!(
+                    "vector apply failed after validation: {e}; the shard's legs may have \
+                     diverged — the next mapped document will refuse if so"
+                ))
+            })?;
+            let bit_width = index.bit_width();
+            if let Some(wal) = guard.wal.as_mut() {
+                wal.update_manifest(|m| {
+                    if m.dim == 0 {
+                        m.dim = dim as u32;
+                        m.bit_width = bit_width as u32;
+                    }
+                });
+            }
+            wal_append_or_degrade(
+                &mut guard.wal,
+                wal_record::Op::AddVectors(LoggedAddVectors {
+                    first_id: global_id,
+                    batch: Some(AddVectorsRequest {
+                        vectors: v,
+                        dim: dim as u32,
+                    }),
+                }),
+            );
+        }
         guard.stats_epoch += 1;
         *added += 1;
         Ok(())
+    }
+
+    /// Validate one mapped bind against this shard: derive the plan
+    /// (derivation is deterministic, so both sides compute it
+    /// independently), hold it to the client's expected fingerprint,
+    /// and refuse — up front, naming every gap at once — landing
+    /// columns this shard does not declare. Nothing streams until the
+    /// bind stands.
+    fn bind_mapped(&self, bind: &crate::pb::MappedBind) -> Result<crate::mapping::Extractor, Status> {
+        if bind.expected_fingerprint.is_empty() {
+            return Err(Status::invalid_argument(
+                "expected_fingerprint is required: dry-run the plan with PlanIndex first, \
+                 review it, and bind the fingerprint you saw",
+            ));
+        }
+        let extractor = crate::mapping::Extractor::new(
+            &bind.descriptor_set,
+            &bind.message_type,
+            &bind.body_path,
+        )?;
+        let plan = extractor.plan();
+        if plan.fingerprint != bind.expected_fingerprint {
+            return Err(Status::failed_precondition(format!(
+                "plan fingerprint mismatch: this node derives {} but the bind expects {}; \
+                 the descriptor set or the derivation rules changed since the plan was \
+                 reviewed — re-run PlanIndex and review the difference",
+                plan.fingerprint, bind.expected_fingerprint
+            )));
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for field in &plan.fields {
+            use crate::pb::ColumnFamily;
+            let name = &field.name;
+            let (table, flag) = if field.family == ColumnFamily::TextField as i32 {
+                if field.path == extractor.body_path() {
+                    // The body is the top-level text; it needs no
+                    // declared column.
+                    continue;
+                }
+                if name == "body" {
+                    return Err(Status::invalid_argument(format!(
+                        "mapped text field {} lands as \"body\" but is not the bound body; \
+                         rename it with a hint, or bind it as body_path",
+                        field.path
+                    )));
+                }
+                (&self.config.bm25_fields, "--bm25-fields")
+            } else if field.family == ColumnFamily::Facet as i32 {
+                (&self.config.facet_fields, "--facet-fields")
+            } else if field.family == ColumnFamily::I64 as i32 {
+                (&self.config.integer_fields, "--integer-fields")
+            } else if field.family == ColumnFamily::F64 as i32 {
+                (&self.config.numeric_fields, "--numeric-fields")
+            } else {
+                // VECTOR is the dense leg; NONE lands nowhere, visibly.
+                continue;
+            };
+            if !table.iter().any(|declared| declared == name) {
+                missing.push(format!("{name:?} ({flag})"));
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "the plan lands columns this shard does not declare: {}; declare them and \
+                 restart the node, or revise the plan",
+                missing.join(", ")
+            )));
+        }
+        Ok(extractor)
     }
 
     /// Bulk ingest over one AnalyzeStream: submissions run ahead of the
@@ -4487,8 +4723,8 @@ impl NodeServiceImpl {
     async fn ingest_streamed(
         &self,
         mut session: crate::analyzer::AnalyzeStream,
-        first: AddDocumentsRequest,
-        inbound: &mut Streaming<AddDocumentsRequest>,
+        first: IngestDoc,
+        source: &mut IngestSource<'_>,
         addr: &str,
         added: &mut u64,
         first_id: &mut u64,
@@ -4548,11 +4784,15 @@ impl NodeServiceImpl {
         // ingested document for no held memory.
         #[allow(clippy::large_enum_variant)]
         enum Step {
-            Doc(AddDocumentsRequest),
+            Doc(IngestDoc),
             InboundClosed,
             Result(Option<(u64, Result<crate::postings::AnalyzedDoc, Status>)>),
             Field(Option<FieldEvent>),
         }
+        let IngestDoc {
+            req: first,
+            vector: first_vector,
+        } = first;
         let mut spec = first.analysis.clone();
         let mut quality = first.quality.clone();
         let mut geography = first.geography.clone();
@@ -4579,6 +4819,7 @@ impl NodeServiceImpl {
             0,
             PendingDoc {
                 doc: first,
+                vector: first_vector,
                 outstanding: first_extras.len(),
                 extras: first_extras,
             },
@@ -4602,7 +4843,7 @@ impl NodeServiceImpl {
             // pending after `advance_apply`, the one at the wavefront is
             // owed either its body or a field.
             let step = tokio::select! {
-                message = inbound.message(),
+                message = source.next(),
                     if inbound_open && pending.len() < MAX_PENDING => match message? {
                         Some(doc) => Step::Doc(doc),
                         None => Step::InboundClosed,
@@ -4612,6 +4853,10 @@ impl NodeServiceImpl {
             };
             match step {
                 Step::Doc(doc) => {
+                    let IngestDoc {
+                        req: doc,
+                        vector: doc_vector,
+                    } = doc;
                     // Extra-field analyses are queued on arrival
                     // (validated now, so a bad field fails before the
                     // body enters the session).
@@ -4671,6 +4916,7 @@ impl NodeServiceImpl {
                         next_seq,
                         PendingDoc {
                             doc,
+                            vector: doc_vector,
                             outstanding: extras.len(),
                             extras,
                         },
@@ -4714,7 +4960,7 @@ impl NodeServiceImpl {
             let analyzed = results.remove(next_apply).expect("readiness just checked");
             let held = pending.remove(next_apply).expect("readiness just checked");
             let analyzed = join_fields(analyzed, held.extras)?;
-            self.apply_analyzed_document(held.doc, analyzed, added, first_id)?;
+            self.apply_analyzed_document(held.doc, analyzed, held.vector, added, first_id)?;
             *next_apply += 1;
         }
     }
@@ -5682,6 +5928,7 @@ impl NodeService for NodeServiceImpl {
             Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
         })?;
         let mut inbound = request.into_inner();
+        let mut source = IngestSource::Plain(&mut inbound);
         let mut added = 0u64;
         let mut first_id = 0u64;
         // Analysis dominates bulk ingest, and the only supported transport
@@ -5697,12 +5944,12 @@ impl NodeService for NodeServiceImpl {
         // "h2 protocol error" while this node logged nothing and stayed
         // healthy. Degrading quietly turned a one-line version mismatch
         // into an h2 forensics exercise; failing here names it instead.
-        if let Some(first) = inbound.message().await? {
+        if let Some(first) = source.next().await? {
             match crate::analyzer::AnalyzeStream::open_with_vocab(
                 &addr,
-                first.analysis.as_ref(),
+                first.req.analysis.as_ref(),
                 self.vocab.clone(),
-                session_layers(&first),
+                session_layers(&first.req),
             )
             .await
             {
@@ -5710,7 +5957,7 @@ impl NodeService for NodeServiceImpl {
                     self.ingest_streamed(
                         session,
                         first,
-                        &mut inbound,
+                        &mut source,
                         &addr,
                         &mut added,
                         &mut first_id,
@@ -5740,6 +5987,88 @@ impl NodeService for NodeServiceImpl {
             added,
             total,
             first_id,
+        }))
+    }
+
+    async fn ingest_mapped(
+        &self,
+        request: Request<Streaming<IngestMappedRequest>>,
+    ) -> Result<Response<IngestMappedResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::IngestMapped);
+        let _ingest = self.claim_ingest()?;
+        let addr = self.config.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
+        })?;
+        let mut inbound = request.into_inner();
+        // Protocol: the first message must be the bind, and the bind
+        // must stand — fingerprint agreement, declared columns, a body
+        // — before a single document streams.
+        let bind = match inbound.message().await? {
+            Some(IngestMappedRequest {
+                payload: Some(crate::pb::ingest_mapped_request::Payload::Bind(bind)),
+            }) => bind,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first IngestMappedRequest must be a MappedBind",
+                ))
+            }
+        };
+        let extractor = self.bind_mapped(&bind)?;
+        let fingerprint = extractor.plan().fingerprint.clone();
+        let mut added = 0u64;
+        let mut first_id = 0u64;
+        let mut source = IngestSource::Mapped(Box::new(MappedSource {
+            stream: &mut inbound,
+            extractor,
+            analysis: bind.analysis.clone(),
+            materialize: bind.materialize.clone(),
+            position: 0,
+        }));
+        if let Some(first) = source.next().await? {
+            match crate::analyzer::AnalyzeStream::open_with_vocab(
+                &addr,
+                first.req.analysis.as_ref(),
+                self.vocab.clone(),
+                session_layers(&first.req),
+            )
+            .await
+            {
+                Ok(session) => {
+                    self.ingest_streamed(
+                        session,
+                        first,
+                        &mut source,
+                        &addr,
+                        &mut added,
+                        &mut first_id,
+                    )
+                    .await?;
+                }
+                Err(status) if status.code() == tonic::Code::Unimplemented => {
+                    return Err(Status::failed_precondition(format!(
+                        "analysis sidecar at {addr} does not implement AnalyzeStream; \
+                         it predates the RPC and must be rebuilt (./gradlew installDist \
+                         in grpc-opennlp-analysis). Refusing to ingest on the removed \
+                         unary path."
+                    )));
+                }
+                Err(status) => return Err(status),
+            }
+        }
+        let total = self
+            .state
+            .read()
+            .expect("shard state lock poisoned")
+            .bm25
+            .as_ref()
+            .map_or(0, |b| b.doc_count());
+        // Each mapped document carries exactly one vector.
+        crate::metrics::add_ingested(added, added);
+        Ok(Response::new(IngestMappedResponse {
+            added,
+            total,
+            first_id,
+            fingerprint,
         }))
     }
 
