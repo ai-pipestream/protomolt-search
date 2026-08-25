@@ -1,6 +1,7 @@
 # Descriptor-derived mappings and the descriptor exchange contract
 
-Status: **increment 1 implemented** (2026-08-25) — dry-run derivation.
+Status: **increments 1 and 2 implemented** (2026-08-25) — dry-run
+derivation, and bind + protobuf-native ingest (section 4a).
 `SearchService.PlanIndex` derives the deterministic, fingerprinted plan
 for one message type inside a serialized FileDescriptorSet
 (`src/mapping.rs`, `tests/descriptor_mappings.rs`): kinds inferred with
@@ -16,12 +17,17 @@ the hand-rolled `src/sha256.rs`, pinned to the NIST vectors). Every
 refusal in section 2 is implemented and pinned by tests: ambiguous or
 missing vector/doc-id candidates, contradictory hints, chunk-scope
 violations, range/TREE_PATH/chunking-policy hints, conflicting
-extension declarations. Binding, protobuf-native ingest, and the stored
-format are later increments; the ingest-time CEL machinery they will
-bind to landed with `docs/cel-values.md`.
+extension declarations. Increment 2 binds and ingests (section 4a);
+the stored format is a later increment. The ingest-time CEL machinery
+the bind carries landed with `docs/cel-values.md`.
 
-The exchange contract is now drafted and vendored (section 5). The
-original framing, kept:
+The exchange contract is now drafted and vendored (section 5). Increment 2 landed the same day: binding and
+protobuf-native ingest (`NodeService.IngestMapped`, section 4a) — the
+documents stream as the serialized protobuf messages they already are
+and reduce, by walking their wire bytes against the plan, onto the
+ORDINARY ingest path. Still later increments: chunked plans, and the
+durable shard-level binding (the stored-format work). The original
+framing, kept:
 
 The ownership move is decided (descriptor-derived mappings belong to
 turbovec-search, not turbovec-grpc), and the reference implementation
@@ -141,10 +147,11 @@ deliberate:
   the pruned-versus-exhaustive bitwise equivalence all stand, by the
   same removal-only argument the geo increment used.
 
-TODO: whether chunk scopes land in the first increment or wait. The
-engine already has lineage records and a parent-collapse mode in hybrid
-fusion; the port should reuse those rather than import the reference's
-parent tables unchanged.
+Chunk scopes wait (resolved with increment 2): a chunked plan derives
+and fingerprints, but binding one for ingest refuses by name. The
+engine already has lineage records and a parent-collapse mode in
+hybrid fusion; the chunk increment should reuse those rather than
+import the reference's parent tables unchanged.
 
 ## 4. First-class CEL: the extension surface
 
@@ -182,6 +189,68 @@ with the same split: wherever stock CEL is defined, the compiled path
 must agree with it; the three-valued absence semantics remain our
 documented deviation, pinned by our own tests, never hidden inside the
 oracle.
+
+## 4a. Bind and ingest, as landed
+
+`NodeService.IngestMapped` is a client stream: the first message is a
+`MappedBind`, every later message is one serialized protobuf document
+of the bound type. The contract, piece by piece:
+
+- **Binding is agreement on the plan.** The bind carries the
+  descriptor set, the message type, and the REQUIRED
+  `expected_fingerprint` — the fingerprint the client reviewed on its
+  PlanIndex dry run. The node re-derives the plan locally (derivation
+  is deterministic, so both sides compute it independently) and
+  refuses a mismatch naming both fingerprints. An empty expected
+  fingerprint refuses too: dry-run first, then bind what you saw.
+- **The bind stands or nothing streams.** Landing columns are checked
+  against the shard's declared tables up front — every gap named in
+  one message with its flag (`--facet-fields`, `--integer-fields`,
+  `--numeric-fields`, `--bm25-fields`) — along with the body choice:
+  `body_path` picks which TEXT field is the stored body (optional
+  exactly when the plan has one), and the remaining TEXT fields index
+  as ordinary multi-field columns. A chunked plan, a plan with no TEXT
+  field, and a TEXT-kind document id all refuse at bind.
+- **Extraction is the same hand-rolled wire discipline as the hint
+  pass.** The bind compiles a trie over descriptor field NUMBERS; each
+  document's bytes walk it once — unknown fields skip, repeated
+  occurrences follow protobuf merge semantics, malformed bytes refuse
+  by position ("document 17: ..."). Values land by planned family:
+  strings, bools ("true"/"false"), enums (the value NAME from the
+  descriptor; an undeclared number refuses — schema drift, not a
+  value), integers (every proto encoding; a uint above i64::MAX
+  refuses), Timestamps (as `TimestampValue`, so the ordinary
+  epoch-micros conversion and its refusals apply), floats and doubles.
+  A double vector narrows to the engine's f32 plane — the one lossy
+  landing, stated here. An empty wire string is proto3 absence and
+  lands nothing; the body, the id, and the vector are required and
+  refuse when absent.
+- **The ordinary path does the rest.** Each decoded document becomes an
+  ordinary `AddDocumentsRequest` — the bind's `analysis` and CEL
+  `materialize` specs attached as session properties — and enters the
+  same streaming analysis session, the same column validation, the
+  same apply, the same WAL record. Replay never needs the descriptor:
+  the log carries the reduced values.
+- **Ids stay positional; the two legs append in lockstep.** This
+  engine's ids are server-assigned slots shared by both legs, so the
+  mapped document takes the next id and its vector applies at the SAME
+  id under the same lock, with the same WAL record `AddVectors`
+  writes. A shard whose document leg ran ahead refuses by name (the
+  vector would land below its document and silently corrupt every
+  hybrid result). The document id FIELD lands on its planned family —
+  a keyword id on the facet plane, an integer id on the i64 plane —
+  exact and filterable; the reference's 8-byte SHA-256 reduction
+  remains the contract for id-KEYED features (upserts, chunk-parent
+  joins) when an increment needs one, but storing the exact value
+  loses nothing today.
+
+What this increment deliberately leaves out: chunked plans (refused at
+bind), a durable shard-level binding — today the fingerprint is
+enforced per stream, and pinning an index to its plan across restarts
+is the stored-format increment — and per-field analyzer resolution
+(the plan records analyzer NAMES; non-body text fields analyze under
+sidecar defaults, and analysis identity is enforced by the analysis
+fingerprint as everywhere).
 
 ## 5. Vendoring and the BYO-descriptor flow
 

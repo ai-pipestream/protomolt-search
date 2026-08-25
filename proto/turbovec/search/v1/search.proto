@@ -158,6 +158,32 @@ service NodeService {
   // INVALID_ARGUMENT on empty or oversized text.
   rpc AddDocuments(stream AddDocumentsRequest) returns (AddDocumentsResponse);
 
+  // Protobuf-native mapped ingest (docs/descriptor-mappings.md,
+  // increment 2): documents arrive as the serialized protobuf messages
+  // they already are, decoded against a derived plan the stream BINDS
+  // first, and land on the ORDINARY ingest path — the same analysis
+  // session, the same column validation, the same WAL records — so
+  // nothing is transcoded to JSON or any intermediate document model,
+  // and replay never needs the descriptor.
+  //
+  // Protocol: the first message must be `bind` (descriptor set, message
+  // type, and the REQUIRED expected plan fingerprint from PlanIndex);
+  // every later message is one serialized document of the bound type.
+  // The node re-derives the plan locally and refuses a fingerprint
+  // mismatch (FAILED_PRECONDITION naming both): binding is agreement on
+  // the PLAN. Bind also refuses, up front and by name, a plan whose
+  // landing columns this shard does not declare, a chunked plan (a
+  // later increment), and a plan with no TEXT field to serve as the
+  // body.
+  //
+  // Each mapped document carries its vector, and the two legs append in
+  // LOCKSTEP under one lock: the document takes the next id and its
+  // vector lands at the same slot, refused (FAILED_PRECONDITION naming
+  // both tips) when the shard's document leg is ahead of its vector
+  // leg. A document that fails extraction fails the stream by position
+  // ("document 17: ..."), nothing half-applies.
+  rpc IngestMapped(stream IngestMappedRequest) returns (IngestMappedResponse);
+
   // Returns this shard's per-term document frequencies and corpus stats —
   // phase (b) of the distributed BM25 flow. The coordinator sums these
   // across all shards to build the GLOBAL stats every shard then scores
@@ -3420,6 +3446,75 @@ message MappedPlan {
   // different descriptor sets may derive the same plan, and the plan is
   // what an index is bound to.
   string descriptor_sha256 = 9;
+}
+
+// One message on the IngestMapped stream: the bind first, then
+// serialized documents.
+message IngestMappedRequest {
+  oneof payload {
+    // The stream's binding. Exactly one, first; a repeat mid-stream is
+    // refused.
+    MappedBind bind = 1;
+
+    // One serialized protobuf message of the bound type. Decoded by
+    // walking the wire bytes against the plan — unknown fields skip,
+    // repeated occurrences follow protobuf merge semantics, malformed
+    // bytes refuse by position.
+    bytes document = 2;
+  }
+}
+
+// The binding that opens a mapped ingest stream. Everything here is a
+// session property, constant for the stream, like AnalysisSpec on the
+// ordinary AddDocuments stream.
+message MappedBind {
+  // Serialized google.protobuf.FileDescriptorSet with every import
+  // included (protoc --include_imports) — the same bytes PlanIndex
+  // takes.
+  bytes descriptor_set = 1;
+
+  // Fully qualified message type to bind, e.g. "shop.v1.Product".
+  string message_type = 2;
+
+  // REQUIRED: the plan fingerprint the client reviewed (PlanIndex).
+  // The node re-derives the plan locally — derivation is deterministic,
+  // so both sides compute it independently — and refuses a mismatch.
+  // An empty value is refused: dry-run first, then bind what you saw.
+  string expected_fingerprint = 3;
+
+  // Which TEXT field is the document BODY (the stored, highlighted
+  // text). Empty binds the plan's ONLY text field; a plan with several
+  // refuses by name until this picks one. The remaining text fields
+  // index as ordinary multi-field columns (docs/multi-field.md) under
+  // their engine names.
+  string body_path = 4;
+
+  // Body analysis options for every document on the stream. Absent =
+  // sidecar defaults, the same rule as AddDocumentsRequest.analysis.
+  // Non-body text fields analyze under sidecar defaults in this
+  // increment; the plan's analyzer NAMES are recorded, not resolved.
+  AnalysisSpec analysis = 5;
+
+  // CEL materialization (docs/cel-values.md) applied to every mapped
+  // document: derived columns computed from the document's OWN mapped
+  // values, stored as ordinary typed columns. The WAL logs each
+  // document with the derived values and the spec cleared, so replay
+  // never re-evaluates — the same contract as ordinary ingest.
+  MaterializeSpec materialize = 6;
+}
+
+message IngestMappedResponse {
+  // Documents applied (each carrying one vector).
+  uint64 added = 1;
+
+  // The shard's total BM25 document count afterwards.
+  uint64 total = 2;
+
+  // Global id of the first document this call applied.
+  uint64 first_id = 3;
+
+  // The bound plan fingerprint, echoed for provenance.
+  string fingerprint = 4;
 }
 
 // ---------------------------------------------------------------------------
