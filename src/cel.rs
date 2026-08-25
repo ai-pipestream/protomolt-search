@@ -45,7 +45,11 @@ pub fn compile_filter(text: &str) -> Result<Option<pb::FilterExpr>, Status> {
         return Ok(None);
     }
     let toks = lex(trimmed)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        value_mode: false,
+    };
     let ast = p.expr()?;
     p.expect_end()?;
     let expr = compile(&ast)?;
@@ -430,6 +434,32 @@ enum Ast {
     Float(f64),
     Str(String),
     List(Vec<Ast>),
+    /// Value mode only: binary arithmetic.
+    Arith(Box<Ast>, VOp, Box<Ast>),
+    /// Value mode only: unary minus on a non-literal.
+    Neg(Box<Ast>),
+}
+
+/// Arithmetic operators, value mode only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+impl VOp {
+    fn name(self) -> &'static str {
+        match self {
+            VOp::Add => "+",
+            VOp::Sub => "-",
+            VOp::Mul => "*",
+            VOp::Div => "/",
+            VOp::Mod => "%",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +501,10 @@ impl RelOp {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Value mode (`compile_value`): arithmetic is grammar, not a
+    /// refusal, and parenthesized subterms re-enter the VALUE grammar.
+    /// Predicate mode is the original filter front-end, untouched.
+    value_mode: bool,
 }
 
 impl Parser {
@@ -521,6 +555,16 @@ impl Parser {
         match self.peek() {
             None => "end of input".to_string(),
             Some(t) => format!("{t:?}"),
+        }
+    }
+
+    /// Subexpression entry for parentheses and call arguments: the
+    /// grammar re-entered matches the front-end that is parsing.
+    fn expr_any(&mut self) -> Result<Ast, Status> {
+        if self.value_mode {
+            self.value_expr()
+        } else {
+            self.expr()
         }
     }
 
@@ -635,7 +679,7 @@ impl Parser {
                     let mut args = vec![e];
                     if self.peek() != Some(&Tok::RParen) {
                         loop {
-                            args.push(self.expr()?);
+                            args.push(self.expr_any()?);
                             if !self.eat(&Tok::Comma) {
                                 break;
                             }
@@ -655,7 +699,7 @@ impl Parser {
                     }
                 }
             } else if self.eat(&Tok::LBracket) {
-                let key = self.expr()?;
+                let key = self.expr_any()?;
                 self.expect(Tok::RBracket, "`]`")?;
                 match (&e, key) {
                     (Ast::Ident(col), Ast::Str(k)) => e = Ast::MapAccess(col.clone(), k),
@@ -680,7 +724,7 @@ impl Parser {
     fn primary(&mut self) -> Result<Ast, Status> {
         match self.next() {
             Some(Tok::LParen) => {
-                let e = self.expr()?;
+                let e = self.expr_any()?;
                 self.expect(Tok::RParen, "`)`")?;
                 Ok(e)
             }
@@ -702,7 +746,7 @@ impl Parser {
                     let mut args = Vec::new();
                     if self.peek() != Some(&Tok::RParen) {
                         loop {
-                            args.push(self.expr()?);
+                            args.push(self.expr_any()?);
                             if !self.eat(&Tok::Comma) {
                                 break;
                             }
@@ -722,6 +766,80 @@ impl Parser {
             ))),
             None => Err(refuse("unexpected end of input")),
         }
+    }
+
+    // -- value mode -------------------------------------------------
+
+    /// Top level of a VALUE expression: additive arithmetic, then
+    /// refusals by name for the predicate constructs a value cannot be.
+    fn value_expr(&mut self) -> Result<Ast, Status> {
+        let e = self.additive()?;
+        let offender = match self.peek() {
+            Some(Tok::EqEq) => Some("=="),
+            Some(Tok::NotEq) => Some("!="),
+            Some(Tok::Lt) => Some("<"),
+            Some(Tok::Le) => Some("<="),
+            Some(Tok::Gt) => Some(">"),
+            Some(Tok::Ge) => Some(">="),
+            Some(Tok::In) => Some("in"),
+            Some(Tok::AndAnd) => Some("&&"),
+            Some(Tok::OrOr) => Some("||"),
+            Some(Tok::Question) => Some("?"),
+            _ => None,
+        };
+        if let Some(sym) = offender {
+            return Err(refuse(format!(
+                "`{sym}` is a predicate construct; a value expression computes a \
+                 number (or reads a string column), it does not select — selection \
+                 belongs in the filter"
+            )));
+        }
+        Ok(e)
+    }
+
+    fn additive(&mut self) -> Result<Ast, Status> {
+        let mut e = self.multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Plus) => VOp::Add,
+                Some(Tok::Minus) => VOp::Sub,
+                _ => return Ok(e),
+            };
+            self.pos += 1;
+            e = Ast::Arith(Box::new(e), op, Box::new(self.multiplicative()?));
+        }
+    }
+
+    fn multiplicative(&mut self) -> Result<Ast, Status> {
+        let mut e = self.value_unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Star) => VOp::Mul,
+                Some(Tok::Slash) => VOp::Div,
+                Some(Tok::Percent) => VOp::Mod,
+                _ => return Ok(e),
+            };
+            self.pos += 1;
+            e = Ast::Arith(Box::new(e), op, Box::new(self.value_unary()?));
+        }
+    }
+
+    fn value_unary(&mut self) -> Result<Ast, Status> {
+        if self.peek() == Some(&Tok::Bang) {
+            return Err(refuse(
+                "`!` is a predicate construct; a value expression computes a value",
+            ));
+        }
+        if self.eat(&Tok::Minus) {
+            // Literals fold; anything else keeps an explicit negate
+            // node, because stock CEL negates (and -0.0 is not 0-x).
+            return match self.value_unary()? {
+                Ast::Int(v) => Ok(Ast::Int(-v)),
+                Ast::Float(v) => Ok(Ast::Float(-v)),
+                other => Ok(Ast::Neg(Box::new(other))),
+            };
+        }
+        self.member()
     }
 }
 
@@ -788,6 +906,9 @@ fn compile(ast: &Ast) -> Result<pb::FilterExpr, Status> {
         Ast::List(_) => Err(refuse(
             "a bare list is not a predicate; lists appear on the right of `in`",
         )),
+        Ast::Arith(..) | Ast::Neg(_) => {
+            unreachable!("the predicate parser refuses arithmetic before building it")
+        }
     }
 }
 
@@ -824,6 +945,9 @@ fn side_of(ast: &Ast) -> Result<Side, Status> {
         Ast::Or(_) | Ast::And(_) | Ast::Not(_) | Ast::Rel(..) => Err(refuse(
             "a boolean expression cannot be a comparison operand; relations do not nest",
         )),
+        Ast::Arith(..) | Ast::Neg(_) => {
+            unreachable!("the predicate parser refuses arithmetic before building it")
+        }
     }
 }
 
@@ -1281,6 +1405,232 @@ fn parse_rfc3339_micros(s: &str) -> Result<i64, Status> {
         .checked_mul(1_000_000)
         .and_then(|us| us.checked_add(micros_frac))
         .ok_or_else(|| bad("does not fit epoch microseconds"))
+}
+
+
+// ---------------------------------------------------------------------
+// Value compiler (Ast -> pb::ValueExpr, docs/cel-values.md)
+// ---------------------------------------------------------------------
+
+/// Static type of a value expression as far as literals determine it.
+/// `None` means "depends on a column", resolved (and type-checked)
+/// per shard against its own tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VType {
+    Int,
+    Double,
+}
+
+/// Compile a CEL VALUE expression (projections, materialized columns):
+/// column reads, int and double literals, `+ - * / %`, unary minus,
+/// and `double()`. Everything else refuses by name, exactly like the
+/// filter front-end. Typing is stock CEL's — int with int, double with
+/// double — checked here as far as literals pin it down and finished
+/// per shard where column kinds are known.
+pub fn compile_value(text: &str) -> Result<pb::ValueExpr, Status> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(refuse("empty value expression"));
+    }
+    let toks = lex(trimmed)?;
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        value_mode: true,
+    };
+    let ast = p.value_expr()?;
+    p.expect_end()?;
+    let (expr, _) = compile_value_ast(&ast, 0)?;
+    Ok(expr)
+}
+
+/// Depth cap for value expressions, same defensive posture as the
+/// filter tree caps.
+const VALUE_MAX_DEPTH: usize = 32;
+
+fn value_of(expr: pb::value_expr::Expr) -> pb::ValueExpr {
+    pb::ValueExpr { expr: Some(expr) }
+}
+
+fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+    use pb::value_expr::Expr as V;
+    if depth > VALUE_MAX_DEPTH {
+        return Err(refuse(format!(
+            "value expression nests deeper than {VALUE_MAX_DEPTH} levels"
+        )));
+    }
+    match ast {
+        Ast::Ident(name) => match name.as_str() {
+            "true" | "false" => Err(refuse(
+                "boolean literals are not values here; the engine has no boolean columns",
+            )),
+            "null" => Err(refuse(
+                "null is not a value; an absent input already propagates to an absent result",
+            )),
+            _ => Ok((value_of(V::Column(name.clone())), None)),
+        },
+        Ast::MapAccess(col, key) => Ok((
+            value_of(V::Map(pb::MapRead {
+                column: col.clone(),
+                key: key.clone(),
+            })),
+            None,
+        )),
+        Ast::Int(v) => Ok((
+            value_of(V::IntLiteral(int_literal(*v)?)),
+            Some(VType::Int),
+        )),
+        Ast::Float(v) => {
+            if !v.is_finite() {
+                return Err(refuse(format!(
+                    "float literal {v} is not finite; no column holds NaN or infinity"
+                )));
+            }
+            Ok((value_of(V::FloatLiteral(*v)), Some(VType::Double)))
+        }
+        Ast::Neg(inner) => {
+            let (expr, vt) = compile_value_ast(inner, depth + 1)?;
+            Ok((value_of(V::Negate(Box::new(expr))), vt))
+        }
+        Ast::Arith(l, op, r) => {
+            let (le, lt) = compile_value_ast(l, depth + 1)?;
+            let (re, rt) = compile_value_ast(r, depth + 1)?;
+            let vt = match (lt, rt) {
+                (Some(a), Some(b)) if a != b => {
+                    return Err(refuse(format!(
+                        "`{}` mixes int and double operands; stock CEL does not coerce — \
+                         convert explicitly with double()",
+                        op.name()
+                    )));
+                }
+                (Some(a), _) | (_, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            if *op == VOp::Mod && vt == Some(VType::Double) {
+                return Err(refuse(
+                    "`%` is integer-only in CEL; there is no double remainder",
+                ));
+            }
+            let wire_op = match op {
+                VOp::Add => pb::ArithOp::Add,
+                VOp::Sub => pb::ArithOp::Sub,
+                VOp::Mul => pb::ArithOp::Mul,
+                VOp::Div => pb::ArithOp::Div,
+                VOp::Mod => pb::ArithOp::Mod,
+            };
+            Ok((
+                value_of(V::Arith(Box::new(pb::ValueArith {
+                    left: Some(Box::new(le)),
+                    right: Some(Box::new(re)),
+                    op: wire_op as i32,
+                }))),
+                vt,
+            ))
+        }
+        Ast::Call(name, args) => match name.as_str() {
+            "double" => {
+                if args.len() != 1 {
+                    return Err(refuse("double() takes exactly one argument"));
+                }
+                let (inner, _) = compile_value_ast(&args[0], depth + 1)?;
+                Ok((value_of(V::ToDouble(Box::new(inner))), Some(VType::Double)))
+            }
+            "int" | "uint" => Err(refuse(format!(
+                "{name}() conversion does not compile; compute in double, or store \
+                 the value as an integer column"
+            ))),
+            "timestamp" => Err(refuse(
+                "timestamp() is a filter literal; a projection over an i64 date column \
+                 already reads epoch micros",
+            )),
+            "has" => Err(refuse(
+                "has() is a predicate; an absent input already propagates to an \
+                 absent result",
+            )),
+            "matches" | "contains" | "startsWith" | "endsWith" | "size" => Err(refuse(format!(
+                "{name}() does not compile to a value; string functions are not in \
+                 the engine's vocabulary"
+            ))),
+            other => Err(refuse(format!(
+                "unknown function {other}() in a value expression; the vocabulary is \
+                 arithmetic and double()"
+            ))),
+        },
+        Ast::Str(_) => Err(refuse(
+            "a string literal is not a computable value; string projections are \
+             bare facet or map-facet column reads",
+        )),
+        Ast::List(_) => Err(refuse("a list is not a value")),
+        Ast::Or(_) | Ast::And(_) | Ast::Not(_) | Ast::Rel(..) => Err(refuse(
+            "a predicate is not a value; selection belongs in the filter",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod value_tests {
+    use super::*;
+
+    fn refusal(text: &str) -> String {
+        compile_value(text)
+            .expect_err("must refuse")
+            .message()
+            .to_string()
+    }
+
+    /// Literal-only type conflicts refuse at compile, before any shard
+    /// is involved.
+    #[test]
+    fn literal_type_conflicts_refuse_at_compile() {
+        assert!(refusal("1 + 2.0").contains("double()"));
+        assert!(refusal("3.5 % 2.0").contains("integer-only"));
+        assert!(refusal("2.0 - 1").contains("double()"));
+    }
+
+    /// The predicate vocabulary refuses by name in value position.
+    #[test]
+    fn predicate_constructs_refuse_by_name() {
+        assert!(refusal("a == b").contains("=="));
+        assert!(refusal("a && b").contains("&&"));
+        assert!(refusal("!a").contains("`!`"));
+        assert!(refusal("a ? b : c").contains("?"));
+        assert!(refusal("has(a)").contains("has()"));
+        assert!(refusal("a.matches(\"x\")").contains("matches()"));
+        assert!(refusal("\"lit\"").contains("string literal"));
+        assert!(refusal("[1, 2]").contains("list"));
+        assert!(refusal("int(a)").contains("int()"));
+    }
+
+    /// Shapes that must compile: precedence, parens re-entering the
+    /// value grammar, dotted and map reads, double(), unary minus.
+    #[test]
+    fn the_value_grammar_compiles_its_vocabulary() {
+        for text in [
+            "a + b * c",
+            "(a + b) * c",
+            "meta.price / 2.0",
+            "prices[\"usd\"] * 1.1",
+            "double(year) + 0.5",
+            "-a * 2",
+            "-(a + b)",
+            "7 % 3",
+        ] {
+            compile_value(text).unwrap_or_else(|e| panic!("{text:?}: {}", e.message()));
+        }
+    }
+
+    /// Unary minus folds literals (so i64::MIN is expressible) and
+    /// keeps a negate node otherwise.
+    #[test]
+    fn unary_minus_folds_literals_only() {
+        let min = compile_value("-9223372036854775808").unwrap();
+        assert_eq!(
+            min.expr,
+            Some(pb::value_expr::Expr::IntLiteral(i64::MIN))
+        );
+        let neg = compile_value("-a").unwrap();
+        assert!(matches!(neg.expr, Some(pb::value_expr::Expr::Negate(_))));
+    }
 }
 
 #[cfg(test)]

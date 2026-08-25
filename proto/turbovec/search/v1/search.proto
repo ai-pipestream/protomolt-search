@@ -325,6 +325,27 @@ service SearchService {
   // composite scorer, profile timings — is refused by name until its
   // ordinary engine path exists.
   rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Descriptor-derived mappings, dry-run increment
+  // (docs/descriptor-mappings.md): derive the deterministic,
+  // fingerprinted index plan for one message type inside a serialized
+  // google.protobuf.FileDescriptorSet, without creating anything. The
+  // same descriptor set and type name produce the same fields, in the
+  // same order, with the same fingerprint, on every node and every run;
+  // two engines agree on their mapping exactly when the fingerprints
+  // agree.
+  //
+  // Derivation refuses rather than guesses: no resolvable vector field,
+  // no resolvable document id, an ambiguous candidate set, or a hint
+  // that contradicts the field it sits on all fail INVALID_ARGUMENT
+  // naming the field and the hint that would fix it. Fields may carry
+  // explicit hints as descriptor options using the vendored
+  // ai.pipestream.proto.index.hints.v1 extension; a proto annotated for
+  // protomolt's indexers is understood here without modification.
+  //
+  // Binding and protobuf-native ingest are later increments; this RPC
+  // is the part an operator argues with first.
+  rpc PlanIndex(PlanIndexRequest) returns (PlanIndexResponse);
 }
 
 // One shard's slice of a filter-only browse.
@@ -1177,6 +1198,17 @@ message AddDocumentsRequest {
   // indistinguishable from "no locations found" and would silently
   // ingest an entire corpus as place-less.
   GeographySpec geography = 13;
+
+  // Ingest-time materialization (docs/cel-values.md): derived columns
+  // computed from THIS document's own values, once, here at ingest,
+  // stored as ordinary typed columns. Filters, facets, score chains,
+  // and projections over them need no new machinery. Like the quality
+  // and geography specs, this is materialize-then-ordinary-path: the
+  // WAL logs the document with the derived values already in its
+  // numerics/integers lists and this spec cleared, so replay never
+  // re-evaluates. A change to this spec mid-session is a session
+  // property change, applied from the next document on.
+  MaterializeSpec materialize = 14;
 }
 
 // Which quality columns to derive from the sidecar's model-free noise
@@ -1414,6 +1446,14 @@ message Bm25QueryRequest {
   // the caller's explicit choice — the same made-visible trade
   // count-then-rank settled on.
   repeated string cardinality_fields = 18;
+
+  // Compiled projections, evaluated per returned hit (Bm25Hit.projected,
+  // in this order). A column reference this shard's tables lack reads
+  // as ABSENT for every document here — exact, this shard's documents
+  // hold no such value — and resolution knowledge is reported in
+  // projection_leaves_known so the coordinator can refuse a column no
+  // shard knows.
+  repeated CompiledProjection projections = 19;
 }
 
 // One geo filter: a geo-point column plus the region a document's point
@@ -1836,6 +1876,14 @@ message Bm25Hit {
   // Per-query-term occurrences in this document (terms absent from the
   // document are omitted).
   repeated TermOccurrences terms = 3;
+
+  // Projected values, aligned with the request's projections in
+  // request order. Empty when the request carried none. An unset value
+  // oneof is ABSENCE: an input column the document does not hold, or
+  // integer arithmetic stock CEL would call an error (overflow,
+  // division by zero) — the engine's Kleene rule, absence in, absence
+  // out, never a fabricated default.
+  repeated ProjectedValue projected = 4;
 }
 
 // A shard's BM25 top-k.
@@ -1887,6 +1935,13 @@ message Bm25QueryResponse {
   // One entry per requested cardinality field, in request order, with
   // the shard's distinct VALUES (the coordinator unions and counts).
   repeated FacetDistinct distinct = 9;
+
+  // Whether this shard resolved each column-read leaf of the request's
+  // `projections`, positionally over the leaves in expression order
+  // then depth-first within each expression (empty when none were
+  // sent). A leaf no shard resolves is a typo'd column: the
+  // coordinator refuses it by name rather than answering all-absent.
+  repeated bool projection_leaves_known = 10;
 }
 
 // One message on the client-to-shard leg of `Bm25QueryStream`.
@@ -2056,6 +2111,15 @@ message Bm25SearchRequest {
   // forwarded to every shard and unioned by VALUE. See
   // Bm25QueryRequest.cardinality_fields for the cost contract.
   repeated string cardinality_fields = 13;
+
+  // Query-time projections (docs/cel-values.md): named CEL value
+  // expressions computed per RETURNED hit, after selection, over the
+  // hit's own columns — compiled ONCE here at the coordinator into the
+  // ValueExpr IR, resolved per shard against local tables, never
+  // interpreted per document. Values ride each hit in request order.
+  // A projection never selects and never scores: it annotates. Flat
+  // (non-fused) route only, like stats_fields.
+  repeated NamedProjection projections = 14;
 }
 
 // One field of a fused multi-field search.
@@ -2913,6 +2977,12 @@ message QueryRequest {
   // or f64 column; documents without a value are excluded, because
   // absence has no honest position in a column order.
   QuerySort sort = 9;
+
+  // Query-time projections (docs/cel-values.md), by name per hit.
+  // Increment 1 executes them on the single-lexical-leaf shape (the
+  // Bm25Search delegate); other shapes refuse by name until their
+  // ordinary route carries projections.
+  repeated NamedProjection projections = 10;
 }
 
 // A column sort order for browse.
@@ -3153,6 +3223,10 @@ message QueryHit {
   // Sorted browse only: this document's sort-column value (i64 values
   // through the monotone f64 cast). 0 elsewhere.
   double sort_key = 6;
+
+  // Projected values, aligned with QueryRequest.projections in request
+  // order. Empty when the request carried none.
+  repeated ProjectedValue projected = 7;
 }
 
 // One named raw relevance signal.
@@ -3163,4 +3237,346 @@ message QuerySignal {
   // calibrated dot product for dense, boost BM25 for a boost). Scales
   // are per-signal; the contract never pretends they share one.
   float score = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor-derived mappings (docs/descriptor-mappings.md), increment 1:
+// dry-run plan derivation. Descriptors are vocabulary, mappings are policy:
+// the FileDescriptorSet says what fields a message has; this engine decides
+// which become columns, which is the document id, and what a chunk is —
+// deterministically, with a fingerprint, refusing wherever a guess would be
+// required.
+
+// PlanIndexRequest asks for a dry-run derivation.
+message PlanIndexRequest {
+  // A serialized google.protobuf.FileDescriptorSet containing the message
+  // type and every import it needs (protoc --include_imports, or any
+  // registry that stores complete sets — the descriptor exchange contract
+  // moves exactly these bytes, content-addressed by SHA-256).
+  bytes descriptor_set = 1;
+
+  // Fully qualified message type to plan over, e.g. "shop.v1.Product".
+  // No leading dot.
+  string message_type = 2;
+}
+
+// PlanIndexResponse returns the plan a future bind would bind.
+message PlanIndexResponse {
+  // The derived plan.
+  MappedPlan plan = 1;
+}
+
+// MappedKind is the resolved index type of one planned field, aligned with
+// the ai.pipestream hint vocabulary where the concepts coincide. Every
+// planned field has a definite kind.
+enum MappedKind {
+  // Zero value. Never present in a derived plan.
+  MAPPED_KIND_UNSPECIFIED = 0;
+  // Full-text analyzed string.
+  MAPPED_KIND_TEXT = 1;
+  // Exact-value string (enum fields plan as their value names).
+  MAPPED_KIND_KEYWORD = 2;
+  // 32-bit integer.
+  MAPPED_KIND_INT32 = 3;
+  // 64-bit integer.
+  MAPPED_KIND_INT64 = 4;
+  // 32-bit float.
+  MAPPED_KIND_FLOAT = 5;
+  // 64-bit float.
+  MAPPED_KIND_DOUBLE = 6;
+  // Boolean.
+  MAPPED_KIND_BOOLEAN = 7;
+  // Date/time, sourced from google.protobuf.Timestamp, landing as epoch
+  // MICROSECONDS in the i64 family — the unit timestamp() filter literals
+  // already compile to (docs/range-facets.md).
+  MAPPED_KIND_DATE = 8;
+  // Opaque bytes. Recorded, no column family.
+  MAPPED_KIND_BINARY = 9;
+  // The KNN vector the dense leg is built over.
+  MAPPED_KIND_VECTOR = 10;
+  // A message field kept as a single un-expanded entry. Recorded, no
+  // column family: this is a flat engine.
+  MAPPED_KIND_OBJECT = 11;
+  // A repeated or map message field kept as a single un-expanded entry.
+  // Recorded, no column family.
+  MAPPED_KIND_NESTED = 12;
+}
+
+// MappedRole is the structural role a field plays, beyond its kind.
+enum MappedRole {
+  // A regular field.
+  MAPPED_ROLE_NONE = 0;
+  // The document's stable identity. Exactly one per plan. An integer id
+  // is used verbatim; a string id is reduced to the first 8 bytes of
+  // SHA-256 over its UTF-8 bytes, big-endian — part of this contract, so
+  // any client can compute the same id.
+  MAPPED_ROLE_DOC_ID = 1;
+  // The repeated message field holding child chunks. At most one per
+  // plan; its children are planned as their own unprefixed fields.
+  MAPPED_ROLE_CHUNKS = 2;
+  // Per-chunk identity inside the CHUNKS scope.
+  MAPPED_ROLE_CHUNK_ID = 3;
+}
+
+// ColumnFamily names the engine column plane a mapped field lands on. The
+// dry run makes non-landing fields VISIBLE: FAMILY_NONE is recorded in the
+// plan, never silently dropped at ingest.
+enum ColumnFamily {
+  // Recorded in the plan, stored nowhere. OBJECT/NESTED/BINARY fields,
+  // and repeated scalars: the facet, i64, and f64 planes hold one value
+  // per document slot, and this engine does not guess a collapse rule.
+  COLUMN_FAMILY_NONE = 0;
+  // The analyzed BM25 field plane (multi-field columns, docs/bm25.md).
+  COLUMN_FAMILY_TEXT_FIELD = 1;
+  // The facet ordinal plane (docs/facets.md). KEYWORD and BOOLEAN
+  // ("true"/"false") land here.
+  COLUMN_FAMILY_FACET = 2;
+  // The i64 plane (docs/range-facets.md). INT32, INT64, and DATE (epoch
+  // micros) land here.
+  COLUMN_FAMILY_I64 = 3;
+  // The f64 plane (NaN-absent). FLOAT and DOUBLE land here.
+  COLUMN_FAMILY_F64 = 4;
+  // The dense vector leg.
+  COLUMN_FAMILY_VECTOR = 5;
+}
+
+// MappedField is one field of the derived plan.
+message MappedField {
+  // Dotted path of proto field names from the message root, e.g.
+  // "metadata.created_at". This is how a future extractor navigates a
+  // document; it never changes with naming conventions.
+  string path = 1;
+
+  // Engine column name: the underscore-joined qualified name, or the
+  // hint's explicit override. Filters and projections address the field
+  // by this name.
+  string name = 2;
+
+  // Resolved index kind. Never MAPPED_KIND_UNSPECIFIED.
+  MappedKind kind = 3;
+
+  // True for a repeated or map field.
+  bool repeated = 4;
+
+  // Structural role, from the hint's block_role or name-based
+  // resolution.
+  MappedRole role = 5;
+
+  // Declared vector dimensionality for a VECTOR field, 0 when the hint
+  // does not declare one (the first document then binds it).
+  uint32 vector_dims = 6;
+
+  // Index-time analyzer name for a TEXT field, empty for the default.
+  // Analysis identity is enforced by the analysis fingerprint at ingest
+  // and query; the plan records the requested name.
+  string analyzer = 7;
+
+  // Query-time analyzer when it differs from the index-time one.
+  string search_analyzer = 8;
+
+  // The column plane this field lands on. Absence semantics on every
+  // family are the engine's Kleene rule (docs/cel-filters.md): an unset
+  // proto3 scalar stores NOTHING, a comparison over the missing value is
+  // UNKNOWN, and negation cannot launder absence into a match — mapped
+  // fields never inherit proto3's default-value lie.
+  ColumnFamily family = 9;
+}
+
+// MappedPlan is the complete derived plan for one message type.
+message MappedPlan {
+  // Fully qualified message type the plan was derived from.
+  string message_type = 1;
+
+  // Planned fields, in derivation order. The order is a function of the
+  // descriptor, so it is part of what the fingerprint covers.
+  repeated MappedField fields = 2;
+
+  // Lowercase hex SHA-256 over the canonical encoding of this plan
+  // (fixed-layout bytes, never protobuf serialization). Two plans are
+  // the same plan exactly when these agree; a drift at restore time is
+  // an index compatibility event, not a warning.
+  string fingerprint = 3;
+
+  // Path of the field ingest will read the vector from.
+  string vector_path = 4;
+
+  // Path of the field ingest will read the document id from.
+  string doc_id_path = 5;
+
+  // Vector dimensionality the plan declares, 0 when unknown until the
+  // first document binds it.
+  uint32 dim = 6;
+
+  // Path of the CHUNKS scope; empty for a flat plan.
+  string chunks_path = 7;
+
+  // Path of the CHUNK_ID field; empty when the scope numbers its chunks
+  // by ordinal (or the plan is flat).
+  string chunk_id_path = 8;
+
+  // Lowercase hex SHA-256 of the request's descriptor_set bytes: the
+  // set's content address, the same identity the descriptor exchange
+  // contract registers. NOT covered by the plan fingerprint — two
+  // different descriptor sets may derive the same plan, and the plan is
+  // what an index is bound to.
+  string descriptor_sha256 = 9;
+}
+
+// ---------------------------------------------------------------------------
+// First-class CEL values (docs/cel-values.md): the same compiled dialect
+// that selects (FilterExpr) extended to PRODUCE values — query-time
+// projections per hit, ingest-time materialized columns. Compile once,
+// resolve per shard, never interpret per document; a construct that does
+// not compile is refused by name.
+
+// One named projection as the public surface carries it.
+message NamedProjection {
+  // Name the values are returned under. Non-empty, request-unique.
+  string name = 1;
+
+  // CEL value expression over the document's columns: column reads
+  // (dotted names fold, map access by string-literal key), int and
+  // double literals, `+ - * / %`, unary minus, and `double()`. Typing
+  // is stock CEL's: int with int, double with double, mixed arithmetic
+  // refused naming double(). A bare facet or map-facet read projects
+  // the string value; strings join no arithmetic.
+  string expression = 2;
+}
+
+// One compiled projection on the internal fan-out.
+message CompiledProjection {
+  // Name, echoed for provenance; values align positionally.
+  string name = 1;
+
+  // The compiled expression.
+  ValueExpr expr = 2;
+}
+
+// ValueExpr is the compiled value-expression IR, the sibling of
+// FilterExpr: leaves read columns or hold literals, nodes are pure
+// arithmetic. Shards resolve column names against their own
+// dictionaries and evaluate with array reads — never text, never an
+// interpreter.
+message ValueExpr {
+  oneof expr {
+    // Read one column by engine name. Resolves per shard to an f64,
+    // i64, facet, or map-numeric-free column; the value's type is the
+    // column's. Absent value = absent result.
+    string column = 1;
+
+    // Read one map-column entry under a string key.
+    MapRead map = 2;
+
+    // Integer literal (CEL int, i64).
+    sint64 int_literal = 3;
+
+    // Double literal. Always finite: NaN and infinity do not lex.
+    double float_literal = 4;
+
+    // Binary arithmetic over two subexpressions of the SAME type.
+    ValueArith arith = 5;
+
+    // CEL double(x): int to double conversion (identity on double).
+    ValueExpr to_double = 6;
+
+    // Unary minus. Kept as its own node because -x and 0-x differ on
+    // IEEE signed zero, and stock CEL negates.
+    ValueExpr negate = 7;
+  }
+}
+
+// One map-column read.
+message MapRead {
+  // Map column name.
+  string column = 1;
+
+  // Entry key, a string literal in the source expression. A key this
+  // shard's key dictionary lacks reads as absent.
+  string key = 2;
+}
+
+// Binary arithmetic node.
+message ValueArith {
+  // Left operand.
+  ValueExpr left = 1;
+
+  // Right operand.
+  ValueExpr right = 2;
+
+  // The operation.
+  ArithOp op = 3;
+}
+
+// Arithmetic operations, CEL semantics per type: i64 ops are checked
+// (overflow, division by zero, and i64::MIN edge cases evaluate to
+// ABSENT where stock CEL errors — the documented deviation, absence
+// instead of failure); f64 ops are IEEE. Integer division truncates
+// toward zero and % is remainder, exactly CEL's.
+enum ArithOp {
+  // Zero value. Never present in a compiled expression.
+  ARITH_OP_UNSPECIFIED = 0;
+  // Addition.
+  ARITH_OP_ADD = 1;
+  // Subtraction.
+  ARITH_OP_SUB = 2;
+  // Multiplication.
+  ARITH_OP_MUL = 3;
+  // Division.
+  ARITH_OP_DIV = 4;
+  // Remainder (integers only, like CEL).
+  ARITH_OP_MOD = 5;
+}
+
+// One projected value. The unset oneof is ABSENCE.
+message ProjectedValue {
+  oneof value {
+    // A double-typed result.
+    double double_value = 1;
+
+    // An int-typed result.
+    sint64 int_value = 2;
+
+    // A string result: a bare facet or map-facet column read.
+    string string_value = 3;
+  }
+}
+
+// Ingest-time materialization spec: a session property of the ingest
+// stream, like the quality and geography specs.
+message MaterializeSpec {
+  // Derived columns, evaluated in list order against each document's
+  // own request values (numerics, integers, map numerics). Names must
+  // not collide with each other or with columns the request itself
+  // carries — a collision refuses the document, it never overwrites.
+  repeated MaterializedColumn columns = 1;
+}
+
+// The stored kind of one materialized column. Explicit, never
+// inferred: the expression's evaluated type must MATCH (write
+// double(...) to land an integer expression in the f64 family), so
+// the column's family cannot drift with the data.
+enum MaterializeKind {
+  // Zero value. Refused.
+  MATERIALIZE_KIND_UNSPECIFIED = 0;
+  // The f64 family; the expression must evaluate double-typed.
+  MATERIALIZE_KIND_F64 = 1;
+  // The i64 family; the expression must evaluate int-typed.
+  MATERIALIZE_KIND_I64 = 2;
+}
+
+// One derived column.
+message MaterializedColumn {
+  // Column name the derived value stores under.
+  string name = 1;
+
+  // CEL value expression over the document's own values, the same
+  // dialect NamedProjection documents. A name the document does not
+  // carry is ABSENT, and absence propagates: the derived value is then
+  // simply not stored for this document (Kleene, never proto3
+  // defaults). String-typed expressions are refused: a bare column
+  // copy stores nothing new.
+  string expression = 2;
+
+  // Target family. The evaluated type must match, per document.
+  MaterializeKind kind = 3;
 }

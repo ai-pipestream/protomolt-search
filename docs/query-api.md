@@ -256,6 +256,7 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | one lexical boost on a composite selection | `BoostRescore` |
 | filters only (browse, id order, `after`-floor paging) | `BrowseShard` fan-out |
 | browse + `sort` by i64/f64 column (asc/desc) | `BrowseShard` column-keyed heap |
+| projections on one lexical leaf | `Bm25Search.projections` (`docs/cel-values.md`) |
 
 `selection_k` maps to the hybrid leg depth; the response is the best `k`
 of that candidate set (`k <= selection_k` enforced; a `selection_k` that

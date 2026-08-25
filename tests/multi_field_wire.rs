@@ -53,6 +53,7 @@ const OFFSETS: [u64; 2] = [0, 3];
 
 fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
     AddDocumentsRequest {
+        materialize: None,
         map_numerics: Vec::new(),
         map_facets: Vec::new(),
         numerics: Vec::new(),
@@ -348,6 +349,7 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
     };
 
     let bad = |field: &str, text: &str| AddDocumentsRequest {
+        materialize: None,
         map_numerics: Vec::new(),
         map_facets: Vec::new(),
         numerics: Vec::new(),
@@ -472,6 +474,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
         "court of appeals for the ninth circuit en banc",
     ] {
         tx.send(AddDocumentsRequest {
+            materialize: None,
             map_numerics: Vec::new(),
             map_facets: Vec::new(),
             numerics: Vec::new(),
@@ -636,6 +639,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
@@ -659,6 +663,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     let err = SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
@@ -888,6 +893,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
     assert_eq!(added.added, 3);
 
     let leg = |fingerprint: u64| Bm25QueryRequest {
+        projections: Vec::new(),
         filter: None,
         map_facet_fields: Vec::new(),
         score_stages: Vec::new(),

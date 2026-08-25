@@ -1356,6 +1356,33 @@ fn unknown_range_counts(fields: &[crate::pb::RangeFacetField]) -> Vec<crate::pb:
 /// score-chain evaluation during scoring.
 struct ShardNumericRead<'a>(&'a Bm25Shard);
 
+/// The value-expression resolution surface (`docs/cel-values.md`):
+/// the same name-to-index lookups filters use, packaged as the trait
+/// `values::resolve` consumes.
+impl crate::values::ColumnLookup for Bm25Shard {
+    fn numeric_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::numeric_index(self, name)
+    }
+    fn integer_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::integer_index(self, name)
+    }
+    fn facet_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::facet_index(self, name)
+    }
+    fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::map_numeric_index(self, name)
+    }
+    fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        Bm25Shard::map_numeric_key_ord(self, ci, key)
+    }
+    fn map_facet_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::map_facet_index(self, name)
+    }
+    fn map_facet_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        Bm25Shard::map_facet_key_ord(self, ci, key)
+    }
+}
+
 impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     fn value(&self, ni: usize, doc_id: u32) -> Option<f64> {
         self.0.numeric_value(ni, doc_id)
@@ -1397,6 +1424,28 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
 /// same as an all-true allowlist: an unfiltered scan batches with every
 /// other unfiltered scan and takes a path bit-identical to the one it
 /// took before filters existed.
+/// Render one evaluated projection value onto the wire. Absence is the
+/// unset oneof; string ordinals render against the dictionary the
+/// shard owns.
+fn projected_value(
+    val: Option<crate::values::Val>,
+    store: &Bm25Shard,
+) -> crate::pb::ProjectedValue {
+    use crate::pb::projected_value::Value as W;
+    let value = match val {
+        None => None,
+        Some(crate::values::Val::Int(v)) => Some(W::IntValue(v)),
+        Some(crate::values::Val::Double(v)) => Some(W::DoubleValue(v)),
+        Some(crate::values::Val::FacetOrd { column, ord }) => {
+            Some(W::StringValue(store.facet_value(column, ord).to_string()))
+        }
+        Some(crate::values::Val::MapFacetOrd { column, ord }) => Some(W::StringValue(
+            store.map_facet_value(column, ord).to_string(),
+        )),
+    };
+    crate::pb::ProjectedValue { value }
+}
+
 fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,
     n: usize,
@@ -1938,6 +1987,18 @@ pub struct NodeServiceImpl {
     /// to every ingest AnalyzeStream. `None` when vocabulary accumulation
     /// is off (the default) or its directory failed to initialize.
     vocab: Option<Arc<crate::vocab::VocabularyListener>>,
+    /// Compiled materialization spec for the current ingest stream
+    /// (docs/cel-values.md): expressions compile once per spec CHANGE,
+    /// never per document — the ingest analog of the query rule.
+    materialize_cache: Arc<std::sync::Mutex<Option<CompiledMaterialize>>>,
+}
+
+/// One compiled MaterializeSpec, cached against spec equality.
+struct CompiledMaterialize {
+    /// The spec these columns were compiled from, for the equality test.
+    spec: crate::pb::MaterializeSpec,
+    /// (column name, compiled expression, target kind), in spec order.
+    columns: Vec<(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)>,
 }
 
 /// Open the shard's vocabulary listener at `<index path>.vocab/`,
@@ -2244,6 +2305,7 @@ impl NodeServiceImpl {
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
             stream_signals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             vocab,
+            materialize_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -2965,6 +3027,13 @@ impl NodeServiceImpl {
     /// `FieldStats.known`); skipping alone would turn a misspelled field
     /// into a silently different ranking.
     fn bm25_query_fused(&self, req: &Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
+        if !req.projections.is_empty() {
+            return Err(Status::invalid_argument(
+                "projection: projections are not certified on the fused route yet; \
+                 use the flat Bm25Search route",
+            ));
+        }
+
         for leg in &req.fields {
             if leg.terms.len() != leg.global_doc_frequencies.len() {
                 return Err(Status::invalid_argument(format!(
@@ -3147,6 +3216,7 @@ impl NodeServiceImpl {
                 };
                 docs.into_iter()
                     .map(|doc| Bm25Hit {
+                        projected: Vec::new(),
                         doc_id: self.config.slot_offset + u64::from(doc.doc_id),
                         score: doc.score as f32,
                         terms: doc
@@ -3198,6 +3268,7 @@ impl NodeServiceImpl {
             0.0
         };
         Ok(Bm25QueryResponse {
+            projection_leaves_known: Vec::new(),
             hits,
             kth_best,
             facets,
@@ -3874,6 +3945,144 @@ impl NodeServiceImpl {
         Ok(extras)
     }
 
+    /// Compile (or fetch the cached compilation of) one ingest
+    /// materialization spec. Validation is whole-spec: empty or
+    /// duplicate names, an unset kind, or an expression that does not
+    /// compile all refuse before any document is touched.
+    fn compiled_materialize(
+        &self,
+        spec: &crate::pb::MaterializeSpec,
+    ) -> Result<Vec<(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)>, Status> {
+        let mut cache = self
+            .materialize_cache
+            .lock()
+            .expect("materialize cache lock poisoned");
+        if let Some(compiled) = cache.as_ref() {
+            if compiled.spec == *spec {
+                return Ok(compiled.columns.clone());
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut columns = Vec::with_capacity(spec.columns.len());
+        for column in &spec.columns {
+            if column.name.is_empty() {
+                return Err(Status::invalid_argument(
+                    "materialize: a derived column needs a non-empty name",
+                ));
+            }
+            if !names.insert(column.name.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "materialize: duplicate derived column {:?}",
+                    column.name
+                )));
+            }
+            let kind = match crate::pb::MaterializeKind::try_from(column.kind) {
+                Ok(crate::pb::MaterializeKind::F64) => crate::pb::MaterializeKind::F64,
+                Ok(crate::pb::MaterializeKind::I64) => crate::pb::MaterializeKind::I64,
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "materialize: column {:?} declares no target kind; kinds are \
+                         explicit (MATERIALIZE_KIND_F64 or MATERIALIZE_KIND_I64), \
+                         never inferred from data",
+                        column.name
+                    )))
+                }
+            };
+            let expr = crate::cel::compile_value(&column.expression).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "materialize: column {:?}: {}",
+                    column.name,
+                    e.message()
+                ))
+            })?;
+            columns.push((column.name.clone(), expr, kind));
+        }
+        *cache = Some(CompiledMaterialize {
+            spec: spec.clone(),
+            columns: columns.clone(),
+        });
+        Ok(columns)
+    }
+
+    /// Materialize derived columns (docs/cel-values.md): evaluate each
+    /// declared expression against THIS document's own values and push
+    /// the results into the ordinary `numerics` / `integers` lists, so
+    /// name resolution, the duplicate refusal, the apply, and the WAL
+    /// record all take the path they already take. Runs AFTER the
+    /// quality and geography layers so their derived columns are
+    /// readable inputs. Clearing the spec makes replay exact: the
+    /// logged request carries the values, so replay never evaluates
+    /// twice. An absent result stores nothing (the Kleene rule); a type
+    /// conflict the document exposes refuses loudly.
+    fn materialize_columns(
+        &self,
+        mut doc: AddDocumentsRequest,
+    ) -> Result<AddDocumentsRequest, Status> {
+        let Some(spec) = doc.materialize.take() else {
+            return Ok(doc);
+        };
+        if spec.columns.is_empty() {
+            return Ok(doc);
+        }
+        let compiled = self.compiled_materialize(&spec)?;
+        let mut env = crate::values::IngestEnv::default();
+        for nv in &doc.numerics {
+            env.numerics.insert(nv.field.clone(), nv.value);
+        }
+        for iv in &doc.integers {
+            env.integers.insert(iv.field.clone(), iv.value);
+        }
+        for entry in &doc.map_numerics {
+            env.map_numerics
+                .insert((entry.field.clone(), entry.key.clone()), entry.value);
+        }
+        for (name, expr, kind) in &compiled {
+            let value = crate::values::eval_ingest(expr, &env).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "materialize: column {name:?}: {}",
+                    e.message()
+                ))
+            })?;
+            match value {
+                None => {}
+                Some(crate::values::IngestVal::Double(v)) => {
+                    if *kind != crate::pb::MaterializeKind::F64 {
+                        return Err(Status::invalid_argument(format!(
+                            "materialize: column {name:?} declares I64 but its \
+                             expression evaluated double on this document; stock CEL \
+                             does not coerce — align the kind or the expression"
+                        )));
+                    }
+                    doc.numerics.push(crate::pb::NumericValue {
+                        field: name.clone(),
+                        value: v,
+                    });
+                }
+                Some(crate::values::IngestVal::Int(v)) => {
+                    if *kind != crate::pb::MaterializeKind::I64 {
+                        return Err(Status::invalid_argument(format!(
+                            "materialize: column {name:?} declares F64 but its \
+                             expression evaluated int on this document; write \
+                             double(...) to land it in the f64 family"
+                        )));
+                    }
+                    // i64::MIN is the i64 column's absence sentinel, so
+                    // the one unrepresentable computed value stores as
+                    // ABSENT — the same edge the checked arithmetic
+                    // already maps to absence.
+                    if v == i64::MIN {
+                        continue;
+                    }
+                    doc.integers.push(crate::pb::IntegerValue {
+                        field: name.clone(),
+                        value: v,
+                    });
+                }
+            }
+        }
+        Ok(doc)
+    }
+
     /// Apply one analyzed document: id assignment, store insert, WAL
     /// append. Must be called in arrival order — both transports
     /// guarantee it.
@@ -3893,6 +4102,7 @@ impl NodeServiceImpl {
         // replay never calls the sidecar and never derives twice.
         let doc = materialize_quality(doc, &analyzed)?;
         let doc = materialize_geography(doc, &analyzed)?;
+        let doc = self.materialize_columns(doc)?;
         let mut guard = self.state.write().expect("shard state lock poisoned");
         // A disk-resident shard that receives more documents is first
         // reloaded into the heap builder (the append path is
@@ -6087,6 +6297,25 @@ impl NodeServiceImpl {
             (None, Some(f)) => vec![false; crate::filter::leaf_count(f)],
             (_, None) => Vec::new(),
         };
+        // Projection column-read leaves, same contract again: a leaf
+        // this shard lacks reads absent (exact), a leaf NO shard knows
+        // is a typo the coordinator refuses (docs/cel-values.md).
+        let projection_leaves: Vec<crate::values::ValueLeaf> = {
+            let mut leaves = Vec::new();
+            for p in &req.projections {
+                if let Some(expr) = p.expr.as_ref() {
+                    crate::values::column_leaves(expr, &mut leaves);
+                }
+            }
+            leaves
+        };
+        let projection_leaves_known: Vec<bool> = match guard.bm25.as_ref() {
+            Some(store) => projection_leaves
+                .iter()
+                .map(|leaf| crate::values::leaf_known(leaf, store))
+                .collect(),
+            None => vec![false; projection_leaves.len()],
+        };
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
                 let index = store.as_index().ok_or_else(|| {
@@ -6103,6 +6332,18 @@ impl NodeServiceImpl {
                 // With no stages the ctx is None and every scorer below
                 // is bit-identical to its unchained form.
                 let chain = store.resolve_chain(&stage_specs);
+                // Projections resolve against this shard's tables once
+                // per request; type conflicts refuse here, by name.
+                let resolved_projections: Vec<crate::values::ResolvedValue> = req
+                    .projections
+                    .iter()
+                    .map(|p| {
+                        let expr = p.expr.as_ref().ok_or_else(|| {
+                            Status::invalid_argument("projection: empty compiled expression")
+                        })?;
+                        crate::values::resolve(expr, store).map(|(rv, _)| rv)
+                    })
+                    .collect::<Result<_, Status>>()?;
                 let numeric_read = ShardNumericRead(store);
                 let chain_ctx: bm25::ChainCtx = if stage_specs.is_empty() {
                     None
@@ -6160,6 +6401,15 @@ impl NodeServiceImpl {
                 };
                 docs.into_iter()
                     .map(|doc| Bm25Hit {
+                        projected: resolved_projections
+                            .iter()
+                            .map(|rv| {
+                                projected_value(
+                                    crate::values::eval(rv, doc.doc_id, &numeric_read),
+                                    store,
+                                )
+                            })
+                            .collect(),
                         doc_id: self.config.slot_offset + u64::from(doc.doc_id),
                         score: doc.score as f32,
                         terms: doc
@@ -6190,6 +6440,7 @@ impl NodeServiceImpl {
             0.0
         };
         Ok(Bm25QueryResponse {
+            projection_leaves_known,
             hits,
             kth_best,
             facets,
@@ -6243,6 +6494,7 @@ impl NodeServiceImpl {
                 bm25::score_candidates(index, &req.terms, &stats, params, &local)
                     .into_iter()
                     .map(|doc| Bm25Hit {
+                        projected: Vec::new(),
                         doc_id: offset + u64::from(doc.doc_id),
                         score: doc.score as f32,
                         terms: doc

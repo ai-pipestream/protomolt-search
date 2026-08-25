@@ -52,6 +52,7 @@ async fn add_documents_numeric(
     let (tx, rx) = mpsc::channel(8);
     for (text, numerics) in docs {
         tx.send(AddDocumentsRequest {
+            materialize: None,
             map_numerics: Vec::new(),
             map_facets: Vec::new(),
             text: text.to_string(),
@@ -419,6 +420,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     let resp = SearchService::bm25_search(
         &distributed,
         Request::new(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             text: "rust".to_string(),
@@ -523,6 +525,7 @@ async fn stage_and_ingest_refusals_are_loud() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             text: "rust".to_string(),
