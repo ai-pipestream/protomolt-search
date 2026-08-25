@@ -47,6 +47,8 @@ async fn add_documents(
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -140,6 +142,8 @@ async fn ingest_through_mock_builds_postings() {
             fields: Vec::new(),
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -297,6 +301,8 @@ async fn bm25_query_min_score_seeds_floor() {
                 fields: Vec::new(),
                 range_facet_fields: Vec::new(),
                 geo_filters: Vec::new(),
+                stats_fields: Vec::new(),
+                cardinality_fields: Vec::new(),
             })
             .await
             .unwrap()
@@ -385,6 +391,8 @@ async fn bm25_query_min_score_seeds_floor() {
             fields: Vec::new(),
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -413,6 +421,8 @@ async fn bm25_query_min_score_seeds_floor() {
             fields: Vec::new(),
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -441,6 +451,8 @@ async fn bm25_query_min_score_seeds_floor() {
                 fields: Vec::new(),
                 range_facet_fields: Vec::new(),
                 geo_filters: Vec::new(),
+                stats_fields: Vec::new(),
+                cardinality_fields: Vec::new(),
             })
             .await
             .expect_err("non-finite min_score must be rejected");
@@ -466,6 +478,8 @@ async fn bm25_query_min_score_seeds_floor() {
             fields: Vec::new(),
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })
         .await
         .unwrap()
@@ -686,6 +700,8 @@ async fn shard_local_stats_would_differ() {
                 fields: Vec::new(),
                 range_facet_fields: Vec::new(),
                 geo_filters: Vec::new(),
+                stats_fields: Vec::new(),
+                cardinality_fields: Vec::new(),
             })
             .await
             .unwrap()

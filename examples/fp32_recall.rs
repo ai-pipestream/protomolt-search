@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut quant: Vec<Vec<u64>> = Vec::with_capacity(probes.len());
     for (qi, vector) in probes.iter().enumerate() {
         let result = coordinator
-            .fanout_search(&format!("recall-{qi}"), vector, kmax as u32, true)
+            .fanout_search(&format!("recall-{qi}"), vector, kmax as u32, true, &Default::default())
             .await?;
         let mut hits: Vec<(u64, f32)> = result
             .shard_hits

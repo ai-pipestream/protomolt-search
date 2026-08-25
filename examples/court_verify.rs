@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             k,
             vector: first.vector,
             collapse_parents: false,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -93,6 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fields: Vec::new(),
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })
         .await?
         .into_inner();

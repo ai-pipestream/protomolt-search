@@ -69,6 +69,8 @@ async fn add_documents_numeric(
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -428,6 +430,8 @@ async fn distributed_chain_matches_monolith_and_reorders() {
             score_stages: stages.clone(),
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await
@@ -536,6 +540,8 @@ async fn stage_and_ingest_refusals_are_loud() {
             score_stages: vec![decay_stage(300.0, 100.0)],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await

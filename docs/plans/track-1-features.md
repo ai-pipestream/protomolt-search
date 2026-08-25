@@ -108,9 +108,11 @@ languages with a principled boundary:
   `Bm25SearchRequest.filter`, a hand-rolled no-regex compiler at the
   coordinator, the FilterExpr IR resolved per shard, SQL-grade
   three-valued absence, per-leaf typo rule, and a differential oracle
-  against a reference CEL interpreter. The hybrid route still refuses
-  filters until the vector leg has filter machinery — that increment
-  is what makes hybrid facets well-defined.)
+  against a reference CEL interpreter. The hybrid route refused
+  filters until the vector leg had filter machinery; that increment
+  LANDED 2026-08-24, `docs/vector-filters.md` — a slot allowlist from
+  the same resolved predicate, every fusion mode filtering both legs,
+  which is what makes hybrid facets well-defined.)
 - **First-class function chains score.** The final score is a chain of
   named stages applied in request-list order to the BM25 score, on the
   node, before the floor test and heap insertion. Every stage signs one

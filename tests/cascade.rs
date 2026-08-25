@@ -129,6 +129,8 @@ async fn start_cluster(
                         integers: Vec::new(),
                         timestamps: Vec::new(),
                         geo_points: Vec::new(),
+                        quality: None,
+                        geography: None,
                     })
                     .await
                     .unwrap();
@@ -220,12 +222,12 @@ async fn cascade_includes_whole_boundary_tie_group_and_is_deterministic() {
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
 
     let first = coordinator
-        .fanout_cascade("c1", "zebra", &corpus.query, 2, None, 0.0, false)
+        .fanout_cascade("c1", "zebra", &corpus.query, 2, None, 0.0, false, &Default::default())
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_cascade("c2", "zebra", &corpus.query, 2, None, 0.0, false)
+        .fanout_cascade("c2", "zebra", &corpus.query, 2, None, 0.0, false, &Default::default())
         .await
         .unwrap()
         .0;
@@ -269,12 +271,12 @@ async fn distributed_cascade_matches_monolithic_exactly() {
 
     for k in [2u32, 4, 12] {
         let got = distributed
-            .fanout_cascade("d", "zebra", &corpus.query, k, None, 0.0, false)
+            .fanout_cascade("d", "zebra", &corpus.query, k, None, 0.0, false, &Default::default())
             .await
             .unwrap()
             .0;
         let want = monolithic
-            .fanout_cascade("m", "zebra", &corpus.query, k, None, 0.0, false)
+            .fanout_cascade("m", "zebra", &corpus.query, k, None, 0.0, false, &Default::default())
             .await
             .unwrap()
             .0;
@@ -304,7 +306,7 @@ async fn floor_shared_candidates_equal_full_scan_candidates() {
         let (addrs, handles) = start_cluster(&analysis, &corpus, 3, &shift, &scale, share).await;
         let coordinator = CoordinatorServiceImpl::new(addrs);
         let result = coordinator
-            .fanout_search("e", &corpus.query, 2, true)
+            .fanout_search("e", &corpus.query, 2, true, &Default::default())
             .await
             .unwrap();
         per_mode.push(result);

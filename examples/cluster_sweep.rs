@@ -190,7 +190,7 @@ async fn run_query(
 ) -> QueryOutcome {
     let start = Instant::now();
     let result = coordinator
-        .fanout_search(request_id, vector, k, false)
+        .fanout_search(request_id, vector, k, false, &Default::default())
         .await
         .expect("fanout search");
     let wall_ms = start.elapsed().as_secs_f64() * 1e3;

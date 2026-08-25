@@ -41,7 +41,7 @@ async fn scores(
     vector: &[f32],
     k: u32,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let result = coordinator.fanout_search(tag, vector, k, true).await?;
+    let result = coordinator.fanout_search(tag, vector, k, true, &Default::default()).await?;
     let mut all: Vec<f32> = result
         .shard_hits
         .iter()

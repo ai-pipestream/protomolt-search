@@ -152,6 +152,7 @@ impl Arm {
                 legs: Some(*legs),
                 debug: false,
                 boost: None,
+                ..Default::default()
             }),
             None => search_variant::Query::Bm25(Bm25SearchRequest {
                 filter: String::new(),
@@ -179,6 +180,8 @@ impl Arm {
                     .collect(),
                 range_facet_fields: Vec::new(),
                 geo_filters: Vec::new(),
+                stats_fields: Vec::new(),
+                cardinality_fields: Vec::new(),
             }),
         };
         SearchVariant {

@@ -87,6 +87,8 @@ async fn start_shard(
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .unwrap();
@@ -171,6 +173,7 @@ async fn document_search(
             k,
             vector: query.to_vec(),
             collapse_parents: true,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -197,6 +200,7 @@ async fn document_mode_matches_bidi_collapse_and_retrieves_chunk_groups() {
             k,
             vector: query.clone(),
             collapse_parents: true,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -213,7 +217,7 @@ async fn document_mode_matches_bidi_collapse_and_retrieves_chunk_groups() {
     // the returned floor, score descending then id.
     let deep = fx
         .bidi
-        .fanout_search("deep", &query, 2 * SHARD_DOCS as u32, false)
+        .fanout_search("deep", &query, 2 * SHARD_DOCS as u32, false, &Default::default())
         .await
         .unwrap();
     assert_eq!(streamed.groups.len(), streamed.hits.len());
@@ -332,6 +336,7 @@ async fn plain_streaming_search_is_untouched() {
             k: 5,
             vector: query.clone(),
             collapse_parents: false,
+            ..Default::default()
         }))
         .await
         .unwrap()

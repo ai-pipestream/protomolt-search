@@ -105,6 +105,8 @@ async fn start_fixture() -> Fixture {
                     integers: Vec::new(),
                     timestamps: Vec::new(),
                     geo_points: Vec::new(),
+                    quality: None,
+                    geography: None,
                 })
                 .await
                 .unwrap();
@@ -169,7 +171,7 @@ async fn oracle_fused(
     min_vector_score: f32,
 ) -> Vec<(u64, u32, u32, u32)> {
     let deep_v = coordinator
-        .fanout_stream_search("oracle-v", query, N_DOCS as u32, None)
+        .fanout_stream_search("oracle-v", query, N_DOCS as u32, None, &Default::default())
         .await
         .expect("deep vector fan-out");
     let deep_b = coordinator
@@ -245,6 +247,7 @@ async fn decomposed_matches_exhaustive_fused_oracle() {
                     None,
                     legs_decomposed(w_v, w_b, leg_k),
                     false,
+                    &Default::default(),
                 )
                 .await
                 .expect("decomposed fan-out")
@@ -266,13 +269,13 @@ async fn decomposed_is_deterministic_across_racy_floor_timing() {
     let legs = || legs_decomposed(1.0, 0.5, 12);
     let first = fx
         .coordinator
-        .fanout_hybrid("det-1", "zebra", &query, 12, None, legs(), false)
+        .fanout_hybrid("det-1", "zebra", &query, 12, None, legs(), false, &Default::default())
         .await
         .unwrap()
         .0;
     let second = fx
         .coordinator
-        .fanout_hybrid("det-2", "zebra", &query, 12, None, legs(), false)
+        .fanout_hybrid("det-2", "zebra", &query, 12, None, legs(), false, &Default::default())
         .await
         .unwrap()
         .0;
@@ -310,6 +313,7 @@ async fn decomposed_empty_bm25_leg_degenerates_to_scaled_vector_ranking() {
             None,
             legs_decomposed(2.5, 1.0, 20),
             false,
+            &Default::default(),
         )
         .await
         .unwrap()
@@ -333,7 +337,7 @@ async fn decomposed_min_vector_score_gates_the_result_set_exactly() {
     // absent at this boundary).
     let deep_v = fx
         .coordinator
-        .fanout_stream_search("gate-deep", &query, N_DOCS as u32, None)
+        .fanout_stream_search("gate-deep", &query, N_DOCS as u32, None, &Default::default())
         .await
         .unwrap();
     let min_v = deep_v.hits[19].score;
@@ -341,7 +345,7 @@ async fn decomposed_min_vector_score_gates_the_result_set_exactly() {
     legs.min_vector_score = min_v;
     let got = fx
         .coordinator
-        .fanout_hybrid("gate-1", "zebra crossing", &query, k, None, legs, false)
+        .fanout_hybrid("gate-1", "zebra crossing", &query, k, None, legs, false, &Default::default())
         .await
         .unwrap()
         .0;
@@ -370,7 +374,7 @@ async fn vector_rescore_matches_full_search_bitwise() {
     let query = fx.corpus[3 * DIM..4 * DIM].to_vec();
     let deep = fx
         .coordinator
-        .fanout_stream_search("vr-deep", &query, N_DOCS as u32, None)
+        .fanout_stream_search("vr-deep", &query, N_DOCS as u32, None, &Default::default())
         .await
         .unwrap();
     let score_of: HashMap<u64, u32> = deep
@@ -442,6 +446,7 @@ async fn decomposed_rejects_disabled_or_negative_legs() {
                 }),
                 debug: false,
                 boost: None,
+                ..Default::default()
             }))
             .await
             .expect_err("weights outside (0, inf) must be refused");
@@ -475,6 +480,7 @@ async fn decomposed_serves_through_hybrid_search_with_debug() {
             }),
             debug: true,
             boost: None,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -489,6 +495,7 @@ async fn decomposed_serves_through_hybrid_search_with_debug() {
             None,
             legs_decomposed(1.0, 1.0, 60),
             false,
+            &Default::default(),
         )
         .await
         .unwrap()

@@ -153,6 +153,13 @@ pub struct BatchQuery<'a> {
     pub k: usize,
     /// Tie-complete collection for this query (see [`chunked_topk`]).
     pub keep_ties: bool,
+    /// This query's slot allowlist: `allow[slot]` is false for a
+    /// document the request's filters removed, and the slice covers
+    /// every slot of the index. `None` is an unfiltered query, which
+    /// is not the same thing as an all-true allowlist: `None` batches
+    /// with every other unfiltered query, an allowlist batches only
+    /// with itself (see [`chunked_topk_batch`]).
+    pub allow: Option<&'a [bool]>,
 }
 
 /// Scan `index` for the top-`k` of `query` in chunks, adopting external
@@ -168,9 +175,17 @@ pub struct BatchQuery<'a> {
 ///   candidates, with the current k-th best score. It returns whether the
 ///   floor was actually sent, so the scan can report offered and
 ///   published separately.
+/// - `allow`: the request's filters as a slot allowlist covering every
+///   slot of the index, or `None` for an unfiltered scan. A filter only
+///   REMOVES documents, so every floor stays a valid lower bound on the
+///   filtered k-th best and no pruning math changes; what changes is
+///   that the kernel never scores a removed slot, so the result is the
+///   exact top-k OF THE SURVIVORS rather than the top-k narrowed
+///   afterwards.
 ///
 /// Returns the shard's local top-k sorted by [`ranks_before`] plus scan
 /// statistics.
+#[allow(clippy::too_many_arguments)]
 pub fn chunked_topk(
     index: &TurboQuantIndex,
     query: &[f32],
@@ -179,11 +194,13 @@ pub fn chunked_topk(
     external_floor: &mut dyn FnMut() -> Option<f32>,
     publish_floor: &mut dyn FnMut(f32) -> bool,
     keep_ties: bool,
+    allow: Option<&[bool]>,
 ) -> (Vec<ChunkHit>, ScanStats) {
     let queries = [BatchQuery {
         vector: query,
         k,
         keep_ties,
+        allow,
     }];
     chunked_topk_batch(
         index,
@@ -235,90 +252,137 @@ pub fn chunked_topk_batch(
     if n == 0 || nq == 0 || max_k == 0 {
         return out;
     }
+    for q in queries {
+        if let Some(allow) = q.allow {
+            assert_eq!(
+                allow.len(),
+                n,
+                "an allowlist must cover every slot of the index"
+            );
+        }
+    }
     let chunk_size = chunk_blocks.max(1) * BLOCK_VECTORS;
     let mut heaps: Vec<Vec<ChunkHit>> = queries.iter().map(|q| Vec::with_capacity(q.k)).collect();
     let mut mask = vec![false; n];
-    let mut flat: Vec<f32> = Vec::with_capacity(queries.iter().map(|q| q.vector.len()).sum());
-    for q in queries {
-        flat.extend_from_slice(q.vector);
-    }
-    // Any tie-complete query forbids capping the kernel's collection at k
-    // (its boundary tie group must survive whole); the cap costs only
-    // collection, never correctness, so one such query widens the batch.
-    let any_ties = queries.iter().any(|q| q.keep_ties);
-    let chunk_k = if any_ties { usize::MAX } else { max_k };
+    // Queries sharing an allowlist share a kernel call; queries with
+    // DIFFERENT allowlists must not. The floor is safe to share because
+    // a lower floor only collects MORE, but the mask is not: the kernel
+    // returns each query's top `chunk_k` over the masked set, so a query
+    // batched under a union mask could have its whole chunk quota filled
+    // by documents its own filter rejects while its real candidates sit
+    // below the cut. Grouping keeps every kernel call's mask exactly the
+    // allowlist of every query in it, which is the unfiltered exactness
+    // argument unchanged. Unfiltered queries all share the `None` group,
+    // so a fleet that sends no filters batches exactly as before.
+    let groups = group_by_allow(queries);
+    let flats: Vec<Vec<f32>> = groups
+        .iter()
+        .map(|group| {
+            let mut flat: Vec<f32> =
+                Vec::with_capacity(group.iter().map(|&qi| queries[qi].vector.len()).sum());
+            for &qi in group {
+                flat.extend_from_slice(queries[qi].vector);
+            }
+            flat
+        })
+        .collect();
     let mut query_floors = vec![f32::NEG_INFINITY; nq];
 
     let mut start = 0;
     while start < n {
         let end = (start + chunk_size).min(n);
 
-        // Per-query floor: the external (coordinator) floor and the local
-        // heap floor are each valid lower bounds on that query's final
-        // k-th best, so their max is too. The kernel floor is the batch
-        // minimum: valid for every query, prunes least.
-        let mut kernel_floor = f32::INFINITY;
-        for (qi, q) in queries.iter().enumerate() {
-            let mut floor = f32::NEG_INFINITY;
-            if let Some(f) = external_floor(qi) {
-                if !f.is_nan() {
-                    floor = floor.max(f);
-                    if floor != f32::NEG_INFINITY {
-                        out[qi].1.floor_updates_applied += 1;
+        for (group, flat) in groups.iter().zip(&flats) {
+            // Per-query floor: the external (coordinator) floor and the
+            // local heap floor are each valid lower bounds on that query's
+            // final k-th best, so their max is too. The kernel floor is the
+            // group minimum: valid for every query in it, prunes least.
+            let mut kernel_floor = f32::INFINITY;
+            let mut group_k = 0usize;
+            let mut any_ties = false;
+            for &qi in group {
+                let q = &queries[qi];
+                let mut floor = f32::NEG_INFINITY;
+                if let Some(f) = external_floor(qi) {
+                    if !f.is_nan() {
+                        floor = floor.max(f);
+                        if floor != f32::NEG_INFINITY {
+                            out[qi].1.floor_updates_applied += 1;
+                        }
                     }
                 }
+                if q.k > 0 && heaps[qi].len() >= q.k {
+                    floor = floor.max(heaps[qi][q.k - 1].score);
+                }
+                query_floors[qi] = floor;
+                kernel_floor = kernel_floor.min(floor);
+                group_k = group_k.max(q.k);
+                any_ties |= q.keep_ties;
             }
-            if q.k > 0 && heaps[qi].len() >= q.k {
-                floor = floor.max(heaps[qi][q.k - 1].score);
-            }
-            query_floors[qi] = floor;
-            kernel_floor = kernel_floor.min(floor);
-        }
+            // Any tie-complete query forbids capping the kernel's
+            // collection at k (its boundary tie group must survive whole);
+            // the cap costs only collection, never correctness, so one such
+            // query widens the group.
+            let chunk_k = if any_ties { usize::MAX } else { group_k };
 
-        for slot in mask.iter_mut().take(end).skip(start) {
-            *slot = true;
-        }
-        let results = index.search_with_options(
-            &flat,
-            chunk_k,
-            SearchOptions::new()
-                .with_mask(&mask)
-                .with_initial_threshold(kernel_floor),
-        );
-        for slot in mask.iter_mut().take(end).skip(start) {
-            *slot = false;
-        }
-
-        for (qi, q) in queries.iter().enumerate() {
-            out[qi].1.chunk_calls += 1;
-            if q.k == 0 {
-                continue;
+            let allow = queries[group[0]].allow;
+            match allow {
+                None => {
+                    for slot in mask.iter_mut().take(end).skip(start) {
+                        *slot = true;
+                    }
+                }
+                // A chunk in which the filters allow nothing is skipped
+                // outright: no kernel call, no candidates, and nothing to
+                // publish. This is where a selective filter pays for
+                // itself, above the kernel's own all-masked block
+                // short-circuit.
+                Some(a) if !a[start..end].iter().any(|&ok| ok) => continue,
+                Some(a) => mask[start..end].copy_from_slice(&a[start..end]),
             }
-            let mut chunk_hits = Vec::new();
-            for (&score, &slot) in results
-                .scores_for_query(qi)
-                .iter()
-                .zip(results.indices_for_query(qi))
-            {
-                // Floored searches pad short rows with (-inf, -1)
-                // sentinels; candidates below THIS query's floor were
-                // collected only for a lower-floored neighbor (>= keeps
-                // ties at the floor, the same boundary the kernel keeps).
-                if slot < 0 || score < query_floors[qi] {
+            let results = index.search_with_options(
+                flat,
+                chunk_k,
+                SearchOptions::new()
+                    .with_mask(&mask)
+                    .with_initial_threshold(kernel_floor),
+            );
+            for slot in mask.iter_mut().take(end).skip(start) {
+                *slot = false;
+            }
+
+            for (local, &qi) in group.iter().enumerate() {
+                let q = &queries[qi];
+                out[qi].1.chunk_calls += 1;
+                if q.k == 0 {
                     continue;
                 }
-                out[qi].1.candidates_collected += 1;
-                chunk_hits.push(ChunkHit {
-                    slot: slot as u32,
-                    score,
-                });
-            }
-            merge_chunk_hits(&mut heaps[qi], &mut chunk_hits, q.k, q.keep_ties);
+                let mut chunk_hits = Vec::new();
+                for (&score, &slot) in results
+                    .scores_for_query(local)
+                    .iter()
+                    .zip(results.indices_for_query(local))
+                {
+                    // Floored searches pad short rows with (-inf, -1)
+                    // sentinels; candidates below THIS query's floor were
+                    // collected only for a lower-floored neighbor (>= keeps
+                    // ties at the floor, the same boundary the kernel keeps).
+                    if slot < 0 || score < query_floors[qi] {
+                        continue;
+                    }
+                    out[qi].1.candidates_collected += 1;
+                    chunk_hits.push(ChunkHit {
+                        slot: slot as u32,
+                        score,
+                    });
+                }
+                merge_chunk_hits(&mut heaps[qi], &mut chunk_hits, q.k, q.keep_ties);
 
-            if heaps[qi].len() >= q.k {
-                out[qi].1.floors_offered += 1;
-                if publish_floor(qi, heaps[qi][q.k - 1].score) {
-                    out[qi].1.floors_published += 1;
+                if heaps[qi].len() >= q.k {
+                    out[qi].1.floors_offered += 1;
+                    if publish_floor(qi, heaps[qi][q.k - 1].score) {
+                        out[qi].1.floors_published += 1;
+                    }
                 }
             }
         }
@@ -330,6 +394,29 @@ pub fn chunked_topk_batch(
         out[qi].0 = heap;
     }
     out
+}
+
+/// Partition query positions into groups that may share a kernel call:
+/// same allowlist, compared by identity (address and length) rather than
+/// contents. Two callers holding equal-but-distinct allowlists land in
+/// separate groups, which costs a kernel pass and never costs
+/// correctness. Order is preserved so a single-group batch runs exactly
+/// the sequence it ran before allowlists existed.
+fn group_by_allow(queries: &[BatchQuery<'_>]) -> Vec<Vec<usize>> {
+    let key = |a: Option<&[bool]>| a.map(|s| (s.as_ptr() as usize, s.len()));
+    let mut keys: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (qi, q) in queries.iter().enumerate() {
+        let k = key(q.allow);
+        match keys.iter().position(|existing| *existing == k) {
+            Some(gi) => groups[gi].push(qi),
+            None => {
+                keys.push(k);
+                groups.push(vec![qi]);
+            }
+        }
+    }
+    groups
 }
 
 /// One collapsed candidate: a parent document represented by its best
@@ -366,6 +453,7 @@ pub struct CollapsedHit {
 /// until unsaturated; the final call provably returned every slot at or
 /// above the floor in that chunk. Escalations count in
 /// [`ScanStats::chunk_calls`].
+#[allow(clippy::too_many_arguments)]
 pub fn chunked_topk_collapsed(
     index: &TurboQuantIndex,
     query: &[f32],
@@ -374,9 +462,13 @@ pub fn chunked_topk_collapsed(
     parents: &[u64],
     external_floor: &mut dyn FnMut() -> Option<f32>,
     publish_floor: &mut dyn FnMut(f32) -> bool,
+    allow: Option<&[bool]>,
 ) -> (Vec<CollapsedHit>, ScanStats) {
     let n = index.len();
     assert_eq!(parents.len(), n, "parents must map every slot of the index");
+    if let Some(a) = allow {
+        assert_eq!(a.len(), n, "an allowlist must cover every slot of the index");
+    }
     let mut stats = ScanStats::default();
     if n == 0 || k == 0 {
         return (Vec::new(), stats);
@@ -398,11 +490,26 @@ pub fn chunked_topk_collapsed(
             }
         }
 
-        for slot in mask.iter_mut().take(end).skip(start) {
-            *slot = true;
+        match allow {
+            None => {
+                for slot in mask.iter_mut().take(end).skip(start) {
+                    *slot = true;
+                }
+            }
+            // Nothing in this chunk survives the filters: no kernel call,
+            // no candidates, no parent to publish a floor for.
+            Some(a) if !a[start..end].iter().any(|&ok| ok) => {
+                start = end;
+                continue;
+            }
+            Some(a) => mask[start..end].copy_from_slice(&a[start..end]),
         }
         // Escalate until the kernel provably returned everything at or
-        // above the floor in this chunk (an unsaturated call).
+        // above the floor in this chunk (an unsaturated call). The
+        // saturation test compares against the chunk's slot span, which
+        // an allowlist can only shrink: fewer allowed slots than
+        // `chunk_k` means the call came back short, which is exactly the
+        // unsaturated condition, so the test stays sound under filters.
         let mut chunk_k = k.max(1);
         let hits: Vec<ChunkHit> = loop {
             stats.chunk_calls += 1;
@@ -531,6 +638,7 @@ mod tests {
                 &mut || None,
                 &mut |_| false,
                 false,
+                None,
             );
             let got: Vec<(i64, u32)> = hits
                 .iter()
@@ -571,6 +679,7 @@ mod tests {
                 &mut || None,
                 &mut |_| false,
                 false,
+                None,
             );
             assert_eq!(hits.len(), k);
             let got: Vec<(i64, u32)> = hits
@@ -599,7 +708,7 @@ mod tests {
         let true_kth = index.search(&query, k).scores_for_query(0)[k - 1];
 
         let (baseline, base_stats) =
-            chunked_topk(&index, &query, k, 2, &mut || None, &mut |_| false, false);
+            chunked_topk(&index, &query, k, 2, &mut || None, &mut |_| false, false, None);
 
         // Floor becomes visible after the first chunk, like a coordinator
         // update arriving mid-scan.
@@ -615,6 +724,7 @@ mod tests {
             },
             &mut |_| false,
             false,
+            None,
         );
 
         assert_eq!(baseline, floored);
@@ -647,6 +757,7 @@ mod tests {
                 true
             },
             false,
+            None,
         );
 
         assert_eq!(hits.len(), k);
@@ -673,10 +784,10 @@ mod tests {
             index.add(&query);
         }
 
-        let (capped, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, false);
+        let (capped, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, false, None);
         assert_eq!(capped.len(), k, "without keep_ties the heap caps at k");
 
-        let (tied, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, true);
+        let (tied, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, true, None);
         assert_eq!(tied.len(), 6, "whole boundary tie group must survive");
         assert!(tied.iter().all(|h| h.score == tied[0].score));
         assert!(tied.windows(2).all(|w| w[0].slot < w[1].slot));
@@ -709,6 +820,7 @@ mod tests {
                         true
                     },
                     ties,
+                    None,
                 );
                 solo.push((hits, published));
             }
@@ -719,6 +831,7 @@ mod tests {
                     vector: q,
                     k,
                     keep_ties: ties,
+                    allow: None,
                 })
                 .collect();
             let mut published: Vec<Vec<f32>> = vec![Vec::new(); specs.len()];
@@ -739,6 +852,229 @@ mod tests {
         }
     }
 
+    /// The exactness oracle for allowlists: a filtered scan must return
+    /// exactly the top-k OF THE SURVIVORS, which is the unfiltered scan
+    /// narrowed afterwards. Run for every chunking, because the chunk
+    /// boundary is where a mask could silently drop a candidate.
+    #[test]
+    fn an_allowlist_returns_the_top_k_of_the_survivors() {
+        let (n, dim, k) = (5_000, 64, 10);
+        let index = build(n, dim);
+        let query = unit_vectors(1, dim, 0x0A11_0001);
+        // Three selectivities: nearly everything, a third, and a handful.
+        for keep in [1usize, 3, 977] {
+            let allow: Vec<bool> = (0..n).map(|i| i % keep == 0).collect();
+            let survivors = allow.iter().filter(|&&a| a).count();
+            // The oracle: score everything, drop the removed, rank.
+            let full = index.search(&query, n);
+            let mut expected: Vec<ChunkHit> = full
+                .indices_for_query(0)
+                .iter()
+                .zip(full.scores_for_query(0))
+                .filter(|&(&slot, _)| slot >= 0 && allow[slot as usize])
+                .map(|(&slot, &score)| ChunkHit {
+                    slot: slot as u32,
+                    score,
+                })
+                .collect();
+            expected.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.slot.cmp(&b.slot))
+            });
+            expected.truncate(k.min(survivors));
+
+            for chunk_blocks in [1, 2, 7, 64, 10_000] {
+                let (hits, _) = chunked_topk(
+                    &index,
+                    &query,
+                    k,
+                    chunk_blocks,
+                    &mut || None,
+                    &mut |_| false,
+                    false,
+                    Some(&allow),
+                );
+                assert_eq!(
+                    hits, expected,
+                    "keep 1/{keep}, chunk_blocks {chunk_blocks}"
+                );
+            }
+        }
+    }
+
+    /// An all-true allowlist must produce the unfiltered result. It costs
+    /// a kernel mask and forfeits batching, which is why `None` exists,
+    /// but it may never change what comes back.
+    #[test]
+    fn an_all_true_allowlist_changes_nothing() {
+        let (n, dim, k) = (4_096, 64, 10);
+        let index = build(n, dim);
+        let query = unit_vectors(1, dim, 0x0A11_0002);
+        let allow = vec![true; n];
+        let unfiltered =
+            chunked_topk(&index, &query, k, 3, &mut || None, &mut |_| false, false, None).0;
+        let allowed = chunked_topk(
+            &index,
+            &query,
+            k,
+            3,
+            &mut || None,
+            &mut |_| false,
+            false,
+            Some(&allow),
+        )
+        .0;
+        assert_eq!(unfiltered, allowed);
+    }
+
+    /// An allowlist that admits nothing returns nothing and never calls
+    /// the kernel: every chunk is skipped outright.
+    #[test]
+    fn an_empty_allowlist_scans_nothing() {
+        let (n, dim, k) = (2_048, 64, 10);
+        let index = build(n, dim);
+        let query = unit_vectors(1, dim, 0x0A11_0003);
+        let allow = vec![false; n];
+        let (hits, stats) = chunked_topk(
+            &index,
+            &query,
+            k,
+            2,
+            &mut || None,
+            &mut |_| false,
+            false,
+            Some(&allow),
+        );
+        assert!(hits.is_empty());
+        assert_eq!(stats.chunk_calls, 0);
+        assert_eq!(stats.candidates_collected, 0);
+    }
+
+    /// Queries with DIFFERENT allowlists must not share a kernel call:
+    /// each batched result has to equal its solo result exactly. A shared
+    /// union mask would let one query's rejected documents fill another
+    /// query's chunk quota.
+    #[test]
+    fn mixed_allowlists_batch_without_disturbing_each_other() {
+        let (n, dim, k) = (8_192, 64, 10);
+        let index = build(n, dim);
+        let q0 = unit_vectors(1, dim, 0x0A11_1000);
+        let q1 = unit_vectors(1, dim, 0x0A11_1001);
+        let q2 = unit_vectors(1, dim, 0x0A11_1002);
+        // Disjoint halves plus one unfiltered query, so no two members
+        // may share a mask.
+        let even: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
+        let odd: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
+
+        for chunk_blocks in [1, 4, 64] {
+            let solo: Vec<Vec<ChunkHit>> = [
+                (&q0, Some(&even)),
+                (&q1, Some(&odd)),
+                (&q2, None::<&Vec<bool>>),
+            ]
+            .iter()
+            .map(|(q, allow)| {
+                chunked_topk(
+                    &index,
+                    q,
+                    k,
+                    chunk_blocks,
+                    &mut || None,
+                    &mut |_| false,
+                    false,
+                    allow.map(|a| a.as_slice()),
+                )
+                .0
+            })
+            .collect();
+
+            let batch = [
+                BatchQuery {
+                    vector: &q0,
+                    k,
+                    keep_ties: false,
+                    allow: Some(&even),
+                },
+                BatchQuery {
+                    vector: &q1,
+                    k,
+                    keep_ties: false,
+                    allow: Some(&odd),
+                },
+                BatchQuery {
+                    vector: &q2,
+                    k,
+                    keep_ties: false,
+                    allow: None,
+                },
+            ];
+            let batched =
+                chunked_topk_batch(&index, &batch, chunk_blocks, &mut |_| None, &mut |_, _| {
+                    false
+                });
+            for (qi, (batched, solo)) in batched.iter().zip(&solo).enumerate() {
+                assert_eq!(&batched.0, solo, "query {qi}, chunk_blocks {chunk_blocks}");
+            }
+        }
+    }
+
+    /// Collapse-by-parent under an allowlist is the collapse of the
+    /// FILTERED corpus: a parent's representative is its best SURVIVING
+    /// chunk, and a parent all of whose chunks were removed is gone.
+    #[test]
+    fn collapse_under_an_allowlist_collapses_the_survivors() {
+        let (n, dim, k) = (4_096, 64, 8);
+        let index = build(n, dim);
+        let query = unit_vectors(1, dim, 0x0A11_2000);
+        let parents: Vec<u64> = (0..n).map(|i| (i / 7) as u64).collect();
+        let allow: Vec<bool> = (0..n).map(|i| i % 3 != 0).collect();
+
+        // Oracle: score everything, drop removed chunks, take each
+        // parent's best, rank parents.
+        let full = index.search(&query, n);
+        let mut best: std::collections::HashMap<u64, ChunkHit> = std::collections::HashMap::new();
+        for (&slot, &score) in full
+            .indices_for_query(0)
+            .iter()
+            .zip(full.scores_for_query(0))
+        {
+            if slot < 0 || !allow[slot as usize] {
+                continue;
+            }
+            let hit = ChunkHit {
+                slot: slot as u32,
+                score,
+            };
+            let entry = best.entry(parents[slot as usize]).or_insert(hit);
+            if ranks_before(hit, *entry) {
+                *entry = hit;
+            }
+        }
+        let mut expected: Vec<CollapsedHit> = best
+            .into_iter()
+            .map(|(parent, h)| CollapsedHit {
+                parent,
+                slot: h.slot,
+                score: h.score,
+            })
+            .collect();
+        expected.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.slot.cmp(&b.slot)));
+        expected.truncate(k);
+
+        let (hits, _) = chunked_topk_collapsed(
+            &index,
+            &query,
+            k,
+            4,
+            &parents,
+            &mut || None,
+            &mut |_| false,
+            Some(&allow),
+        );
+        assert_eq!(hits, expected);
+    }
+
     /// An external floor on ONE member must prune that member's collection
     /// while leaving every member's results identical to solo — the
     /// batch-minimum kernel floor and the per-query re-filter in action.
@@ -750,19 +1086,21 @@ mod tests {
         let q1 = unit_vectors(1, dim, 0xBA7C_1001);
         let kth0 = index.search(&q0, k).scores_for_query(0)[k - 1];
 
-        let solo1 = chunked_topk(&index, &q1, k, 2, &mut || None, &mut |_| false, false).0;
-        let solo0 = chunked_topk(&index, &q0, k, 2, &mut || Some(kth0), &mut |_| false, false).0;
+        let solo1 = chunked_topk(&index, &q1, k, 2, &mut || None, &mut |_| false, false, None).0;
+        let solo0 = chunked_topk(&index, &q0, k, 2, &mut || Some(kth0), &mut |_| false, false, None).0;
 
         let batch = [
             BatchQuery {
                 vector: &q0,
                 k,
                 keep_ties: false,
+                allow: None,
             },
             BatchQuery {
                 vector: &q1,
                 k,
                 keep_ties: false,
+                allow: None,
             },
         ];
         // The true k-th best floors query 0 from the start; query 1 runs
@@ -802,6 +1140,7 @@ mod tests {
             &mut || Some(top + 1.0),
             &mut |_| false,
             false,
+            None,
         );
         assert!(hits.is_empty());
     }
@@ -887,6 +1226,7 @@ mod tests {
                     &parents,
                     &mut || None,
                     &mut |_| false,
+                    None,
                 );
                 assert_eq!(
                     signature(&hits),
@@ -931,6 +1271,7 @@ mod tests {
                 &parents,
                 &mut || None,
                 &mut |_| false,
+                None,
             );
             assert_eq!(signature(&hits), want, "chunk_blocks={chunk_blocks}");
             assert_eq!(
@@ -956,7 +1297,7 @@ mod tests {
             chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |f| {
                 published.push(f);
                 true
-            });
+            }, None);
         assert!(!published.is_empty());
         assert!(
             published.windows(2).all(|w| w[0] <= w[1]),
@@ -975,14 +1316,14 @@ mod tests {
         // every floor; only the wire count drops. Reporting one number
         // for both is what made those knobs measure as inert.
         let (_, muted) =
-            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false);
+            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false, None);
         assert_eq!(muted.floors_offered, stats.floors_offered);
         assert_eq!(muted.floors_published, 0);
 
         // Seed the true k-th best as an external floor: results identical,
         // strictly fewer candidates collected.
         let (unseeded, base) =
-            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false);
+            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false, None);
         let (seeded, pruned) = chunked_topk_collapsed(
             &index,
             &query,
@@ -991,6 +1332,7 @@ mod tests {
             &parents,
             &mut || Some(kth),
             &mut |_| false,
+            None,
         );
         assert_eq!(signature(&unseeded), signature(&seeded));
         assert!(pruned.candidates_collected < base.candidates_collected);

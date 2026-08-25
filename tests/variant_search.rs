@@ -74,6 +74,8 @@ fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
         integers: Vec::new(),
         timestamps: Vec::new(),
         geo_points: Vec::new(),
+        quality: None,
+        geography: None,
     }
 }
 
@@ -142,6 +144,8 @@ fn body_only(text: &str) -> SearchVariant {
             }],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })),
     }
 }
@@ -177,6 +181,8 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
             ],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })),
     }
 }
@@ -512,6 +518,8 @@ async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
         fields: Vec::new(),
         range_facet_fields: Vec::new(),
         geo_filters: Vec::new(),
+        stats_fields: Vec::new(),
+        cardinality_fields: Vec::new(),
     };
 
     // Omitted k runs at the default cap: deep enough to find every

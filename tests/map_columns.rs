@@ -87,6 +87,8 @@ async fn add_documents_mapped(
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -344,6 +346,8 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
             map_facet_fields: vec![map_field("meta", "color")],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await
@@ -585,6 +589,8 @@ async fn distributed_map_stages_and_ingest_refusals() {
         integers: Vec::new(),
         timestamps: Vec::new(),
         geo_points: Vec::new(),
+        quality: None,
+        geography: None,
     };
     let send = |addr: String, req: AddDocumentsRequest| async move {
         let mut client = NodeServiceClient::connect(addr).await.unwrap();

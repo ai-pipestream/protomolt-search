@@ -214,6 +214,116 @@ type FacetedHits = (
     Vec<crate::pb::RangeFacetCounts>,
 );
 
+/// [`FacetedHits`] plus the column aggregations (docs/facets.md):
+/// merged match-set stats and exact distinct-value counts.
+type AggregatedHits = (
+    Vec<Bm25Hit>,
+    Vec<crate::pb::FacetFieldCounts>,
+    Vec<crate::pb::RangeFacetCounts>,
+    Vec<crate::pb::ColumnStats>,
+    Vec<crate::pb::FacetCardinality>,
+);
+
+/// Merge per-shard column stats: counts and sums add, mins and maxes
+/// fold — additive across shards exactly as facet counts are, so the
+/// coordinator merge is the same positional walk. `mean` is computed
+/// HERE (sum / count) so clients cannot get it wrong; a column NO
+/// shard knows is refused by name, the usual typo rule.
+fn merge_column_stats(
+    requested: &[String],
+    shard_stats: &[Vec<crate::pb::ColumnStats>],
+) -> Result<Vec<crate::pb::ColumnStats>, Status> {
+    let mut out: Vec<crate::pb::ColumnStats> = requested
+        .iter()
+        .map(|name| crate::pb::ColumnStats {
+            field: name.clone(),
+            known: false,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            ..Default::default()
+        })
+        .collect();
+    for shard in shard_stats {
+        if shard.len() != requested.len() {
+            return Err(Status::internal(format!(
+                "shard answered {} stats columns for {} requested",
+                shard.len(),
+                requested.len()
+            )));
+        }
+        for (acc, s) in out.iter_mut().zip(shard) {
+            acc.known |= s.known;
+            if s.count > 0 {
+                acc.count += s.count;
+                acc.sum += s.sum;
+                acc.min = acc.min.min(s.min);
+                acc.max = acc.max.max(s.max);
+            }
+        }
+    }
+    for acc in &mut out {
+        if !acc.known {
+            return Err(Status::invalid_argument(format!(
+                "no shard has stats column {:?}: check the spelling, or the nodes' \
+                 --numeric-fields / --integer-fields",
+                acc.field
+            )));
+        }
+        if acc.count > 0 {
+            acc.mean = acc.sum / acc.count as f64;
+        } else {
+            acc.min = 0.0;
+            acc.max = 0.0;
+        }
+    }
+    Ok(out)
+}
+
+/// Union per-shard distinct facet values into exact global
+/// cardinalities. Values, not ordinals — ordinals are shard-local —
+/// and exact by construction: the union of exact per-shard distinct
+/// sets is the exact global distinct set. Cost is the value strings on
+/// the wire, which is the caller's explicit choice (docs/facets.md).
+fn merge_cardinality(
+    requested: &[String],
+    shard_distinct: &[Vec<crate::pb::FacetDistinct>],
+) -> Result<Vec<crate::pb::FacetCardinality>, Status> {
+    let mut known = vec![false; requested.len()];
+    let mut sets: Vec<std::collections::HashSet<String>> =
+        requested.iter().map(|_| Default::default()).collect();
+    for shard in shard_distinct {
+        if shard.len() != requested.len() {
+            return Err(Status::internal(format!(
+                "shard answered {} cardinality columns for {} requested",
+                shard.len(),
+                requested.len()
+            )));
+        }
+        for ((k, set), d) in known.iter_mut().zip(&mut sets).zip(shard) {
+            *k |= d.known;
+            set.extend(d.values.iter().cloned());
+        }
+    }
+    requested
+        .iter()
+        .zip(known)
+        .zip(sets)
+        .map(|((name, known), set)| {
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "no shard has facet column {:?} for cardinality: check the spelling, \
+                     or the nodes' --facet-fields",
+                    name
+                )));
+            }
+            Ok(crate::pb::FacetCardinality {
+                field: name.clone(),
+                cardinality: set.len() as u64,
+            })
+        })
+        .collect()
+}
+
 /// Merge per-shard facet counts into global counts: the plain per-value
 /// sum (counts are additive — no node's count depends on another's, so
 /// there is no analog of the global-df trap), `known` when at least one
@@ -446,6 +556,113 @@ fn refuse_unknown_filter_leaves(
     Ok(())
 }
 
+/// A request's filters after compilation: the geo family verbatim and
+/// the CEL surface compiled ONCE into the predicate IR
+/// (`docs/cel-filters.md`). Every shard receives this same tree and
+/// none ever sees CEL text. Shared by the lexical and vector legs, so
+/// a fused result cannot mix a filtered half with an unfiltered one
+/// (`docs/vector-filters.md`).
+#[derive(Debug, Clone, Default)]
+pub struct RequestFilters {
+    /// `geo_filters` verbatim.
+    pub geo: Vec<crate::pb::GeoFilter>,
+    /// The compiled tree; `None` when the request sent no CEL.
+    pub tree: Option<crate::pb::FilterExpr>,
+}
+
+/// A browse resume boundary: the last returned id, plus its adjusted
+/// sort-key bits when the browse is column-ordered.
+#[derive(Debug, Clone, Copy)]
+pub struct BrowseAfter {
+    pub id: u64,
+    pub key_bits: u64,
+}
+
+/// One merged browse page.
+#[derive(Debug, Clone)]
+pub struct BrowseRows {
+    /// Global doc ids in final order.
+    pub ids: Vec<u64>,
+    /// Adjusted order-preserving key bits, parallel to `ids` (the ids
+    /// themselves unsorted).
+    pub key_bits: Vec<u64>,
+    /// Reported sort-column values, parallel (0.0 unsorted).
+    pub keys: Vec<f64>,
+    /// Whether a column order was applied.
+    pub sorted: bool,
+}
+
+impl RequestFilters {
+    /// Compile a request's filter surface, validating both families.
+    pub(crate) fn compile(
+        geo: &[crate::pb::GeoFilter],
+        cel: &str,
+    ) -> Result<Self, Status> {
+        crate::node::validate_geo_filters(geo)?;
+        let tree = crate::cel::compile_filter(cel)?;
+        if let Some(f) = tree.as_ref() {
+            crate::filter::validate_filter(f)?;
+        }
+        Ok(Self {
+            geo: geo.to_vec(),
+            tree,
+        })
+    }
+
+}
+
+/// Accumulates the per-shard known-column handshakes for one request:
+/// a column or leaf counts as known when ANY shard resolves it, and
+/// the request is refused when NO shard does. A shard that answers the
+/// wrong number of flags is a protocol break, not a partial answer.
+struct FilterKnown {
+    geo: Vec<bool>,
+    tree: Vec<bool>,
+    leaves: usize,
+}
+
+impl FilterKnown {
+    fn new(filters: &RequestFilters) -> Self {
+        let leaves = filters.tree.as_ref().map_or(0, crate::filter::leaf_count);
+        Self {
+            geo: vec![false; filters.geo.len()],
+            tree: vec![false; leaves],
+            leaves,
+        }
+    }
+
+    /// Fold one shard's answer in.
+    fn merge(&mut self, geo: &[bool], tree: &[bool]) -> Result<(), Status> {
+        if geo.len() != self.geo.len() {
+            return Err(Status::internal(format!(
+                "shard answered {} geo-column flags for {} filters",
+                geo.len(),
+                self.geo.len()
+            )));
+        }
+        if tree.len() != self.leaves {
+            return Err(Status::internal(format!(
+                "shard answered {} filter-leaf flags for {} leaves",
+                tree.len(),
+                self.leaves
+            )));
+        }
+        for (acc, k) in self.geo.iter_mut().zip(geo) {
+            *acc |= *k;
+        }
+        for (acc, k) in self.tree.iter_mut().zip(tree) {
+            *acc |= *k;
+        }
+        Ok(())
+    }
+
+    /// Refuse a name NO shard resolved.
+    fn refuse_unknown(&self, filters: &RequestFilters) -> Result<(), Status> {
+        refuse_unknown_geo_columns(&filters.geo, &self.geo)?;
+        refuse_unknown_filter_leaves(filters.tree.as_ref(), &self.tree)
+    }
+}
+
 /// Merged global stats for a fused multi-field query, with the per-node
 /// epochs the shares were valid at (parallel to the node list).
 struct FusedGlobals {
@@ -676,6 +893,44 @@ impl CoordinatorServiceImpl {
         geo_filters: &[crate::pb::GeoFilter],
         filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
+        self.fanout_bm25_aggregated(
+            text,
+            k,
+            spec,
+            min_score,
+            facet_fields,
+            map_facet_fields,
+            range_facet_fields,
+            score_stages,
+            geo_filters,
+            filter,
+            &[],
+            &[],
+        )
+        .await
+        .map(|r| (r.0, r.1, r.2))
+    }
+
+    /// [`Self::fanout_bm25_faceted`] plus column aggregations: match-set
+    /// stats over numeric / integer columns and exact distinct-value
+    /// counts over facet columns (docs/facets.md). Returns
+    /// `(hits, facets, ranges, stats, cardinality)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fanout_bm25_aggregated(
+        &self,
+        text: &str,
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        min_score: f32,
+        facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
+        range_facet_fields: &[crate::pb::RangeFacetField],
+        score_stages: &[crate::pb::ScoreStage],
+        geo_filters: &[crate::pb::GeoFilter],
+        filter: Option<&crate::pb::FilterExpr>,
+        stats_fields: &[String],
+        cardinality_fields: &[String],
+    ) -> Result<AggregatedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
         // refuses even when there is no match set to count. (The nodes
@@ -704,7 +959,13 @@ impl CoordinatorServiceImpl {
             }
         }
         if terms.is_empty() || k == 0 {
-            return Ok((Vec::new(), Vec::new(), Vec::new()));
+            return Ok((
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
         }
 
         // (b) each shard's share of the corpus stats, cached per node;
@@ -727,6 +988,8 @@ impl CoordinatorServiceImpl {
                     score_stages,
                     geo_filters,
                     filter,
+                    stats_fields,
+                    cardinality_fields,
                 )
                 .await
             {
@@ -759,7 +1022,9 @@ impl CoordinatorServiceImpl {
         score_stages: &[crate::pb::ScoreStage],
         geo_filters: &[crate::pb::GeoFilter],
         filter: Option<&crate::pb::FilterExpr>,
-    ) -> Result<FacetedHits, Status> {
+        stats_fields: &[String],
+        cardinality_fields: &[String],
+    ) -> Result<AggregatedHits, Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         // The streaming route's relay state: one conflated global floor
         // cell per query, seeded with the client floor. Shards' published
@@ -788,6 +1053,8 @@ impl CoordinatorServiceImpl {
                 score_stages: score_stages.to_vec(),
                 geo_filters: geo_filters.to_vec(),
                 filter: filter.cloned(),
+                stats_fields: stats_fields.to_vec(),
+                cardinality_fields: cardinality_fields.to_vec(),
             };
             let mut client = self.node_client(node)?;
             if let Some((floor_tx, floor_rx)) = relay.clone() {
@@ -803,6 +1070,8 @@ impl CoordinatorServiceImpl {
                                 r.stage_columns_known,
                                 r.geo_columns_known,
                                 r.filter_columns_known,
+                                r.stats,
+                                r.distinct,
                             )
                         })
                 }));
@@ -819,6 +1088,8 @@ impl CoordinatorServiceImpl {
                         r.stage_columns_known,
                         r.geo_columns_known,
                         r.filter_columns_known,
+                        r.stats,
+                        r.distinct,
                     )
                 })
             }));
@@ -830,13 +1101,17 @@ impl CoordinatorServiceImpl {
         let mut geo_known = vec![false; geo_filters.len()];
         let filter_leaves = filter.map_or(0, crate::filter::leaf_count);
         let mut filter_known = vec![false; filter_leaves];
+        let mut shard_stats: Vec<Vec<crate::pb::ColumnStats>> = Vec::new();
+        let mut shard_distinct: Vec<Vec<crate::pb::FacetDistinct>> = Vec::new();
         for task in query_tasks {
-            let (shard, hits, facets, ranges, known, geo, fknown) = task
+            let (shard, hits, facets, ranges, known, geo, fknown, sstats, sdistinct) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
             shard_ranges.push(ranges);
+            shard_stats.push(sstats);
+            shard_distinct.push(sdistinct);
             if geo.len() != geo_filters.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} geo-column flags for {} filters",
@@ -911,6 +1186,8 @@ impl CoordinatorServiceImpl {
         refuse_unknown_filter_leaves(filter, &filter_known)?;
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
+        let stats = merge_column_stats(stats_fields, &shard_stats)?;
+        let cardinality = merge_cardinality(cardinality_fields, &shard_distinct)?;
         all.sort_by(|(sa, a), (sb, b)| {
             b.score
                 .total_cmp(&a.score)
@@ -918,7 +1195,13 @@ impl CoordinatorServiceImpl {
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         all.truncate(k as usize);
-        Ok((all.into_iter().map(|(_, h)| h).collect(), facets, ranges))
+        Ok((
+            all.into_iter().map(|(_, h)| h).collect(),
+            facets,
+            ranges,
+            stats,
+            cardinality,
+        ))
     }
 
     /// Fused multi-field Bm25Search (`docs/multi-field.md`): `text` is
@@ -1264,6 +1547,8 @@ impl CoordinatorServiceImpl {
                 score_stages: Vec::new(),
                 geo_filters: geo_filters.to_vec(),
                 filter: filter.cloned(),
+                stats_fields: Vec::new(),
+                cardinality_fields: Vec::new(),
             };
             let mut client = self.node_client(node)?;
             query_tasks.push(tokio::spawn(async move {
@@ -1366,6 +1651,7 @@ impl CoordinatorServiceImpl {
     ///    global ranks, or normalize-and-combine over global scores);
     ///    TWO_LEVEL lets each shard RRF-fuse locally and RRF-merges the
     ///    shard lists (the fallback for incomparable scores).
+    #[allow(clippy::too_many_arguments)]
     pub async fn fanout_hybrid(
         &self,
         request_id: &str,
@@ -1375,6 +1661,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         legs: HybridLegs,
         debug: bool,
+        filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         if k == 0 || vector.is_empty() {
             return Ok((Vec::new(), None));
@@ -1405,19 +1692,21 @@ impl CoordinatorServiceImpl {
             let round = match legs.fusion_mode {
                 FusionMode::TwoLevel => {
                     self.fanout_hybrid_two_level(
-                        request_id, vector, k, &terms, &global, &claims, legs, debug,
+                        request_id, vector, k, &terms, &global, &claims, legs, debug, filters,
                     )
                     .await
                 }
                 FusionMode::Decomposed => {
                     self.fanout_hybrid_decomposed(
-                        request_id, vector, k, &terms, &global, &claims, legs, debug,
+                        request_id, vector, k, &terms, &global, &claims, legs, debug, filters,
                     )
                     .await
                 }
                 _ => {
-                    self.fanout_hybrid_global_rank(vector, k, &terms, &global, &claims, legs, debug)
-                        .await
+                    self.fanout_hybrid_global_rank(
+                        vector, k, &terms, &global, &claims, legs, debug, filters,
+                    )
+                    .await
                 }
             };
             match round {
@@ -1528,6 +1817,7 @@ impl CoordinatorServiceImpl {
         claims: &[u64],
         legs: HybridLegs,
         debug: bool,
+        filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let t_legs = std::time::Instant::now();
         let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
@@ -1544,6 +1834,8 @@ impl CoordinatorServiceImpl {
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
                 expected_stats_epoch: claims[shard],
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -1561,10 +1853,12 @@ impl CoordinatorServiceImpl {
         let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
         let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
         let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut known = FilterKnown::new(filters);
         for task in shard_tasks {
             let (shard, rpc_ms, response) = task
                 .await
                 .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
             if debug {
                 shard_debug.push(HybridShardDebug {
                     shard,
@@ -1597,6 +1891,10 @@ impl CoordinatorServiceImpl {
                     .collect::<Vec<_>>(),
             ));
         }
+
+        // A filter name NO shard resolves is a typo, and it would read
+        // as an honest empty result set on both legs at once.
+        known.refuse_unknown(filters)?;
 
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         // Merge each leg into a GLOBAL ranking by raw score (deterministic
@@ -1702,6 +2000,7 @@ impl CoordinatorServiceImpl {
         claims: &[u64],
         legs: HybridLegs,
         debug: bool,
+        filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let t_legs = std::time::Instant::now();
         // Level one: per-shard local fusion.
@@ -1722,25 +2021,32 @@ impl CoordinatorServiceImpl {
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
                 expected_stats_epoch: claims[shard],
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
                 client.hybrid_shard(request).await.map(|r| {
+                    let r = r.into_inner();
                     (
                         shard as u32,
                         t0.elapsed().as_secs_f32() * 1e3,
-                        r.into_inner().hits,
+                        r.hits,
+                        r.geo_columns_known,
+                        r.filter_columns_known,
                     )
                 })
             }));
         }
         let mut shard_lists: Vec<(u32, Vec<crate::pb::HybridLegHit>)> = Vec::new();
         let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
+        let mut known = FilterKnown::new(filters);
         for task in shard_tasks {
-            let (shard, rpc_ms, mut hits) = task
+            let (shard, rpc_ms, mut hits, geo_known, filter_known) = task
                 .await
                 .map_err(|e| Status::internal(format!("hybrid shard task failed: {e}")))??;
+            known.merge(&geo_known, &filter_known)?;
             // Vector-score floor: drop non-qualifying docs from the
             // shard's fused list before level-two fusion.
             if legs.min_vector_score > 0.0 {
@@ -1759,6 +2065,7 @@ impl CoordinatorServiceImpl {
             }
             shard_lists.push((shard, hits));
         }
+        known.refuse_unknown(filters)?;
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         let t_fusion = std::time::Instant::now();
 
@@ -1854,11 +2161,17 @@ impl CoordinatorServiceImpl {
         claims: &[u64],
         legs: HybridLegs,
         debug: bool,
+        filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
+        // Both legs carry the same filters. The decomposed floor algebra
+        // is untouched by them: a filter only REMOVES documents, so
+        // every bound that dominated the unfiltered corpus still
+        // dominates the survivors (docs/vector-filters.md).
+        let mut known = FilterKnown::new(filters);
         let w_v = f64::from(legs.vector_weight);
         let w_b = f64::from(legs.bm25_weight);
         let fused_of = |v: f32, b: f32| w_v * f64::from(v) + w_b * f64::from(b);
@@ -1894,24 +2207,32 @@ impl CoordinatorServiceImpl {
                     map_facet_fields: Vec::new(),
                     range_facet_fields: Vec::new(),
                     score_stages: Vec::new(),
-                    // Hybrid refuses geo filters upstream: the vector
-                    // leg has no filter machinery, and filtering only
-                    // the lexical half would misdescribe the result set.
-                    geo_filters: Vec::new(),
-                    filter: None,
+                    // The SAME filters the vector stream runs under, so
+                    // neither leg can contribute a document the other
+                    // would have removed.
+                    geo_filters: filters.geo.clone(),
+                    filter: filters.tree.clone(),
+                    stats_fields: Vec::new(),
+                    cardinality_fields: Vec::new(),
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
-                    client
-                        .bm25_query(request)
-                        .await
-                        .map(|r| (shard as u32, r.into_inner().hits))
+                    client.bm25_query(request).await.map(|r| {
+                        let r = r.into_inner();
+                        (
+                            shard as u32,
+                            r.hits,
+                            r.geo_columns_known,
+                            r.filter_columns_known,
+                        )
+                    })
                 }));
             }
             for task in leg_tasks {
-                let (shard, hits) = task
+                let (shard, hits, geo_known, filter_known) = task
                     .await
                     .map_err(|e| Status::internal(format!("bm25 leg task failed: {e}")))??;
+                known.merge(&geo_known, &filter_known)?;
                 leg_counts.insert(shard, hits.len() as u32);
                 for h in &hits {
                     bm25_of.insert(h.doc_id, (h.score, shard));
@@ -1994,7 +2315,7 @@ impl CoordinatorServiceImpl {
         // Phase 3: the streaming vector scan, floored from the first
         // block, with re-decomposed floors chasing the rising k-th
         // best known bound.
-        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false)?;
+        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
@@ -2047,6 +2368,14 @@ impl CoordinatorServiceImpl {
                         ));
                         return fanout.cancel_with(status).await;
                     }
+                    // The vector leg's half of the typo handshake: a
+                    // filter column no shard resolves must refuse even
+                    // when the stream completed cleanly.
+                    if let Err(e) =
+                        known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
+                    {
+                        return fanout.cancel_with(e).await;
+                    }
                     summaries[shard] = Some(summary);
                     fanout.mark_completed(shard);
                     remaining -= 1;
@@ -2054,6 +2383,7 @@ impl CoordinatorServiceImpl {
                 None => {}
             }
         }
+        known.refuse_unknown(filters)?;
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
 
         // Close-out. Candidates with a leg score (or proven-zero b)
@@ -2319,6 +2649,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         tie_complete: bool,
+        filters: &RequestFilters,
     ) -> Result<FanoutResult, Status> {
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
@@ -2331,12 +2662,14 @@ impl CoordinatorServiceImpl {
             k,
             tie_complete,
             collapse: false,
+            filters: Arc::new(filters.clone()),
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
             hedges: Arc::new(AtomicU64::new(0)),
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
+        let mut known = FilterKnown::new(filters);
 
         let (done_tx, mut done_rx) =
             mpsc::channel::<(u32, f32, Result<SearchShardDone, Status>)>(n_nodes);
@@ -2365,6 +2698,7 @@ impl CoordinatorServiceImpl {
         for _ in 0..n_nodes {
             match done_rx.recv().await {
                 Some((shard, wall_ms, Ok(done))) => {
+                    known.merge(&done.geo_columns_known, &done.filter_columns_known)?;
                     shard_hits.push((
                         shard,
                         done.hits
@@ -2383,6 +2717,8 @@ impl CoordinatorServiceImpl {
                 }
             }
         }
+
+        known.refuse_unknown(filters)?;
 
         let hits = merge_topk(shard_hits.iter().cloned(), k as usize)
             .into_iter()
@@ -2412,6 +2748,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         initial_floor: Option<f32>,
         collapse_parents: bool,
+        filters: &RequestFilters,
     ) -> Result<StreamFanout, Status> {
         let n_nodes = self.node_addrs.len();
         let udp_socket = self.floor_socket().cloned();
@@ -2434,6 +2771,8 @@ impl CoordinatorServiceImpl {
                         initial_floor,
                         floor_token: lane.map_or(0, |(token, _)| token),
                         collapse_parents,
+                        geo_filters: filters.geo.clone(),
+                        filter: filters.tree.clone(),
                     })),
                 })
                 .expect("fresh channel accepts the Start message");
@@ -2527,6 +2866,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         initial_floor: Option<f32>,
+        filters: &RequestFilters,
     ) -> Result<StreamFanoutResult, Status> {
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
@@ -2545,7 +2885,8 @@ impl CoordinatorServiceImpl {
             });
         }
 
-        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false)?;
+        let mut known = FilterKnown::new(filters);
+        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
 
         // The global top-k: a max-heap whose top is the WORST survivor
         // under the merge's total order, so peek() is the k-th best.
@@ -2611,6 +2952,14 @@ impl CoordinatorServiceImpl {
                         ));
                         return fanout.cancel_with(status).await;
                     }
+                    // The vector leg's half of the typo handshake: a
+                    // filter column no shard resolves must refuse even
+                    // when the stream completed cleanly.
+                    if let Err(e) =
+                        known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
+                    {
+                        return fanout.cancel_with(e).await;
+                    }
                     summaries[shard] = Some(summary);
                     fanout.mark_completed(shard);
                     remaining -= 1;
@@ -2618,6 +2967,8 @@ impl CoordinatorServiceImpl {
                 None => {}
             }
         }
+
+        known.refuse_unknown(filters)?;
 
         let mut all: Vec<MergedHit> = heap.into_iter().map(|e| e.0).collect();
         all.sort_by(cmp_hits);
@@ -2659,6 +3010,7 @@ impl CoordinatorServiceImpl {
         request_id: &str,
         vector: &[f32],
         k: u32,
+        filters: &RequestFilters,
     ) -> Result<CollapseStreamResult, Status> {
         struct ParentAgg {
             best_score: f32,
@@ -2678,7 +3030,8 @@ impl CoordinatorServiceImpl {
                 floors_sent: 0,
             });
         }
-        let mut fanout = self.open_stream_fanout(request_id, vector, None, true)?;
+        let mut known = FilterKnown::new(filters);
+        let mut fanout = self.open_stream_fanout(request_id, vector, None, true, filters)?;
         let mut parents: HashMap<u64, ParentAgg> = HashMap::new();
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;
@@ -2754,6 +3107,14 @@ impl CoordinatorServiceImpl {
                         ));
                         return fanout.cancel_with(status).await;
                     }
+                    // The vector leg's half of the typo handshake: a
+                    // filter column no shard resolves must refuse even
+                    // when the stream completed cleanly.
+                    if let Err(e) =
+                        known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
+                    {
+                        return fanout.cancel_with(e).await;
+                    }
                     summaries[shard] = Some(summary);
                     fanout.mark_completed(shard);
                     remaining -= 1;
@@ -2761,6 +3122,8 @@ impl CoordinatorServiceImpl {
                 None => {}
             }
         }
+
+        known.refuse_unknown(filters)?;
 
         // Rank parents (best desc, best chunk id asc — the collapse
         // fan-out's order), keep k, and filter each kept parent's
@@ -2829,6 +3192,7 @@ impl CoordinatorServiceImpl {
         request_id: &str,
         vector: &[f32],
         k: u32,
+        filters: &RequestFilters,
     ) -> Result<FanoutResult, Status> {
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
@@ -2840,12 +3204,14 @@ impl CoordinatorServiceImpl {
             k,
             tie_complete: false,
             collapse: true,
+            filters: Arc::new(filters.clone()),
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
             hedges: Arc::new(AtomicU64::new(0)),
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
+        let mut known = FilterKnown::new(filters);
 
         let (done_tx, mut done_rx) =
             mpsc::channel::<(u32, f32, Result<SearchShardDone, Status>)>(n_nodes);
@@ -2878,12 +3244,13 @@ impl CoordinatorServiceImpl {
         for _ in 0..n_nodes {
             match done_rx.recv().await {
                 Some((shard, wall_ms, Ok(done))) => {
+                    known.merge(&done.geo_columns_known, &done.filter_columns_known)?;
                     shard_hits.push((
                         shard,
                         done.hits.iter().map(|h| (h.vector_id, h.score)).collect(),
                     ));
                     for hit in done.hits {
-                        let entry = best.entry(hit.parent_id).or_insert_with(|| hit.clone());
+                        let entry = best.entry(hit.parent_id).or_insert(hit);
                         if hit.score > entry.score
                             || (hit.score == entry.score && hit.vector_id < entry.vector_id)
                         {
@@ -2901,6 +3268,8 @@ impl CoordinatorServiceImpl {
                 }
             }
         }
+
+        known.refuse_unknown(filters)?;
 
         let mut hits: Vec<ScoredHit> = best.into_values().collect();
         hits.sort_by(|a, b| {
@@ -2934,6 +3303,7 @@ impl CoordinatorServiceImpl {
     /// global stats), then rerank the pool by BM25 desc, vector desc,
     /// doc id asc, and return the top `k`. More rankers plug in behind
     /// this same seam later (one stage, no framework).
+    #[allow(clippy::too_many_arguments)]
     pub async fn fanout_cascade(
         &self,
         request_id: &str,
@@ -2943,6 +3313,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_vector_score: f32,
         debug: bool,
+        filters: &RequestFilters,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
         if k == 0 || vector.is_empty() {
             return Ok((Vec::new(), None));
@@ -2950,7 +3321,12 @@ impl CoordinatorServiceImpl {
         let t_total = std::time::Instant::now();
         // Phase 1: floor-shared, tie-complete vector candidates.
         let t_legs = std::time::Instant::now();
-        let phase1 = self.fanout_search(request_id, vector, k, true).await?;
+        // Phase 1 carries the filters, so the candidate gate is the
+        // filtered corpus; phase 2 reranks that pool and never widens
+        // it, so no unfiltered document can reappear.
+        let phase1 = self
+            .fanout_search(request_id, vector, k, true, filters)
+            .await?;
         let phase1_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         let mut all: Vec<(u64, u32, f64)> = Vec::new(); // (doc_id, shard, score)
         for (shard, hits) in &phase1.shard_hits {
@@ -3220,6 +3596,86 @@ impl CoordinatorServiceImpl {
     /// non-empty shard legitimately refuses (calibration is locked for
     /// the index lifetime), and the caller needs to know which nodes
     /// diverged.
+    /// Filter-only browse fan-out (docs/query-api.md): each shard's
+    /// admitted ids above the boundary, merged and truncated to k —
+    /// ascending by id unsorted, by (order-preserving key bits, id)
+    /// under `sort`. The typo rule holds here as on every filtered
+    /// route: a column NO shard knows refuses by name, the sort column
+    /// included.
+    pub async fn fanout_browse(
+        &self,
+        k: u32,
+        after: Option<BrowseAfter>,
+        sort: Option<&crate::pb::BrowseSort>,
+        filters: &RequestFilters,
+    ) -> Result<BrowseRows, Status> {
+        let k = self.resolve_k(k)?;
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::BrowseShardRequest {
+                k,
+                after: after.as_ref().map_or(0, |a| a.id),
+                first_page: after.is_none(),
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
+                sort: sort.cloned(),
+                after_key_bits: after.as_ref().map_or(0, |a| a.key_bits),
+            };
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?.browse_shard(request).await.map(|r| r.into_inner())
+            }));
+        }
+        let mut known = FilterKnown::new(filters);
+        let mut sort_known = sort.is_none();
+        // (merge key, id, reported value): key = adjusted key bits
+        // sorted, or the id itself unsorted — one ascending comparison
+        // either way.
+        let mut rows: Vec<(u64, u64, f64)> = Vec::new();
+        for task in tasks {
+            let response = task
+                .await
+                .map_err(|e| Status::internal(format!("browse task failed: {e}")))??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            sort_known |= response.sort_column_known;
+            if sort.is_some() {
+                if response.sort_key_bits.len() != response.doc_ids.len()
+                    || response.sort_keys.len() != response.doc_ids.len()
+                {
+                    return Err(Status::internal(
+                        "shard answered a sorted browse with mismatched key columns",
+                    ));
+                }
+                for ((&id, &bits), &value) in response
+                    .doc_ids
+                    .iter()
+                    .zip(&response.sort_key_bits)
+                    .zip(&response.sort_keys)
+                {
+                    rows.push((bits, id, value));
+                }
+            } else {
+                rows.extend(response.doc_ids.iter().map(|&id| (id, id, 0.0)));
+            }
+        }
+        known.refuse_unknown(filters)?;
+        if !sort_known {
+            let column = sort.map(|s| s.column.as_str()).unwrap_or_default();
+            return Err(Status::invalid_argument(format!(
+                "sort column {column:?} is not declared on any shard's numeric or integer \
+                 table (--numeric-fields / --integer-fields)"
+            )));
+        }
+        rows.sort_unstable_by_key(|r| (r.0, r.1));
+        rows.truncate(k as usize);
+        Ok(BrowseRows {
+            ids: rows.iter().map(|r| r.1).collect(),
+            key_bits: rows.iter().map(|r| r.0).collect(),
+            keys: rows.iter().map(|r| r.2).collect(),
+            sorted: sort.is_some(),
+        })
+    }
+
     pub async fn fanout_calibration(
         &self,
         req: &BroadcastCalibrationRequest,
@@ -3522,6 +3978,10 @@ struct ShardQueryCtx {
     tie_complete: bool,
     /// Collapse-by-parent mode (see StartShardSearch.collapse_parents).
     collapse: bool,
+    /// The request's filters, compiled once and shipped verbatim to
+    /// every shard (and to a hedge leg, which must run the identical
+    /// query or its result would not be interchangeable).
+    filters: Arc<RequestFilters>,
     /// Merges every shard's published floor into the running global max.
     tracker: Arc<Mutex<FloorTracker>>,
     /// Conflating broadcast cell for the global floor: pumps write raises
@@ -3560,6 +4020,8 @@ async fn run_shard_stream(
                 vector: ctx.vector.as_ref().clone(),
                 tie_complete: ctx.tie_complete,
                 collapse_parents: ctx.collapse,
+                geo_filters: ctx.filters.geo.clone(),
+                filter: ctx.filters.tree.clone(),
             })),
         })
         .await
@@ -3861,6 +4323,9 @@ impl SearchService for CoordinatorServiceImpl {
         } else {
             req.request_id.clone()
         };
+        // CEL text compiles ONCE, here, into the predicate IR the
+        // shards execute; no shard ever sees CEL text.
+        let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
 
         let result = if req.collapse_parents {
             // Document mode on a streaming coordinator: parents
@@ -3870,7 +4335,7 @@ impl SearchService for CoordinatorServiceImpl {
             // only.
             if self.stream_search {
                 let doc = self
-                    .fanout_stream_search_collapse(&request_id, &req.vector, k)
+                    .fanout_stream_search_collapse(&request_id, &req.vector, k, &filters)
                     .await?;
                 return Ok(Response::new(SearchResponse {
                     request_id,
@@ -3879,11 +4344,11 @@ impl SearchService for CoordinatorServiceImpl {
                     chunk_floor: doc.chunk_floor,
                 }));
             }
-            self.fanout_search_collapse(&request_id, &req.vector, k)
+            self.fanout_search_collapse(&request_id, &req.vector, k, &filters)
                 .await?
         } else if self.stream_search {
             let streamed = self
-                .fanout_stream_search(&request_id, &req.vector, k, None)
+                .fanout_stream_search(&request_id, &req.vector, k, None, &filters)
                 .await?;
             return Ok(Response::new(SearchResponse {
                 request_id,
@@ -3892,7 +4357,7 @@ impl SearchService for CoordinatorServiceImpl {
                 chunk_floor: 0.0,
             }));
         } else {
-            self.fanout_search(&request_id, &req.vector, k, false)
+            self.fanout_search(&request_id, &req.vector, k, false, &filters)
                 .await?
         };
         Ok(Response::new(SearchResponse {
@@ -3918,8 +4383,8 @@ impl SearchService for CoordinatorServiceImpl {
         // shards execute (docs/cel-filters.md): every shard sees the
         // same tree, and none ever sees CEL text.
         let filter = crate::cel::compile_filter(&req.filter)?;
-        let (hits, facets, range_facets) = if req.fields.is_empty() {
-            self.fanout_bm25_faceted(
+        let (hits, facets, range_facets, stats, cardinality) = if req.fields.is_empty() {
+            self.fanout_bm25_aggregated(
                 &req.text,
                 k,
                 req.analysis.as_ref(),
@@ -3930,6 +4395,8 @@ impl SearchService for CoordinatorServiceImpl {
                 &req.score_stages,
                 &req.geo_filters,
                 filter.as_ref(),
+                &req.stats_fields,
+                &req.cardinality_fields,
             )
             .await?
         } else {
@@ -3937,6 +4404,12 @@ impl SearchService for CoordinatorServiceImpl {
                 return Err(Status::invalid_argument(
                     "score stages are not yet supported on the fused multi-field route; \
                      drop `fields` to use the flat route, or drop `score_stages`",
+                ));
+            }
+            if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
+                return Err(Status::invalid_argument(
+                    "stats/cardinality are not yet supported on the fused multi-field \
+                     route; drop `fields` to use the flat route, or drop the aggregations",
                 ));
             }
             // `analysis` is documented as ignored once `fields` is set,
@@ -3954,18 +4427,20 @@ impl SearchService for CoordinatorServiceImpl {
                      `fields` to use the single-field route.",
                 ));
             }
-            self.fanout_bm25_fused_faceted(
-                &req.text,
-                k,
-                &req.fields,
-                req.min_score,
-                &req.facet_fields,
-                &req.map_facet_fields,
-                &req.range_facet_fields,
-                &req.geo_filters,
-                filter.as_ref(),
-            )
-            .await?
+            let (hits, facets, ranges) = self
+                .fanout_bm25_fused_faceted(
+                    &req.text,
+                    k,
+                    &req.fields,
+                    req.min_score,
+                    &req.facet_fields,
+                    &req.map_facet_fields,
+                    &req.range_facet_fields,
+                    &req.geo_filters,
+                    filter.as_ref(),
+                )
+                .await?;
+            (hits, facets, ranges, Vec::new(), Vec::new())
         };
         // The merged k-th best: one f32 ULP below the last hit's score
         // when k hits were returned (see `bm25::floor_seed` — a later
@@ -3982,6 +4457,8 @@ impl SearchService for CoordinatorServiceImpl {
             kth_best,
             facets,
             range_facets,
+            stats,
+            cardinality,
         }))
     }
 
@@ -4015,6 +4492,11 @@ impl SearchService for CoordinatorServiceImpl {
         } else {
             req.request_id.clone()
         };
+        // One compilation, both legs. The hybrid route used to refuse
+        // filters outright because the vector leg had no filter
+        // machinery and filtering only the lexical half would have
+        // misdescribed the result set (docs/vector-filters.md).
+        let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
         // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
         // leg's depth; explicit values below k are clamped to k.
         let options = req.legs.unwrap_or_default();
@@ -4099,6 +4581,7 @@ impl SearchService for CoordinatorServiceImpl {
                         req.analysis.as_ref(),
                         legs.min_vector_score,
                         req.debug,
+                        &filters,
                     )
                     .await?;
                 (Vec::new(), cascade_hits, debug)
@@ -4113,6 +4596,7 @@ impl SearchService for CoordinatorServiceImpl {
                         req.analysis.as_ref(),
                         legs,
                         req.debug,
+                        &filters,
                     )
                     .await?;
                 (hits, Vec::new(), debug)
@@ -4134,6 +4618,17 @@ impl SearchService for CoordinatorServiceImpl {
             cascade_hits,
             debug,
         }))
+    }
+
+    /// The public query surface: an adapter over the routes above
+    /// (`docs/query-api.md`, `src/query.rs`). Delegation, never a fork.
+    async fn query(
+        &self,
+        request: Request<crate::pb::QueryRequest>,
+    ) -> Result<Response<crate::pb::QueryResponse>, Status> {
+        crate::query::execute(self, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn cluster_health(

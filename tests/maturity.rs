@@ -105,7 +105,7 @@ async fn replica_failover_returns_identical_results() {
         CoordinatorServiceImpl::new(addrs).with_replicas(vec![None, Some(real), None]);
 
     let result = coordinator
-        .fanout_search("failover-test", &query, K, false)
+        .fanout_search("failover-test", &query, K, false, &Default::default())
         .await
         .expect("failover to the replica must succeed");
     assert_eq!(fanout_hits(&result), expected);
@@ -130,7 +130,7 @@ async fn hedged_query_returns_identical_results() {
 
     for round in 0..5 {
         let result = coordinator
-            .fanout_search(&format!("hedge-{round}"), &query, K, false)
+            .fanout_search(&format!("hedge-{round}"), &query, K, false, &Default::default())
             .await
             .expect("hedged fan-out must succeed");
         assert_eq!(fanout_hits(&result), expected, "round {round}");
@@ -161,7 +161,7 @@ async fn hedge_counters_record_a_fired_leg() {
         });
 
     let result = coordinator
-        .fanout_search("hedge-counter-test", &query, K, false)
+        .fanout_search("hedge-counter-test", &query, K, false, &Default::default())
         .await
         .expect("the hedge must rescue the stalled shard");
     assert_eq!(fanout_hits(&result), expected);
@@ -187,7 +187,7 @@ async fn shard_deadline_fires_on_a_hanging_node() {
 
     let query = unit_vectors(1, DIM, 0xDEAD_11E5);
     let err = coordinator
-        .fanout_search("deadline-test", &query, K, false)
+        .fanout_search("deadline-test", &query, K, false, &Default::default())
         .await
         .expect_err("a hanging shard must trip the deadline");
     assert!(
@@ -232,7 +232,7 @@ async fn pooled_channel_reconnects_after_node_restart() {
     let query = unit_vectors(1, DIM, 0x2EC0_44EC);
     let expected = monolithic_topk(&monolithic, &query, K as usize);
     let before = coordinator
-        .fanout_search("reconnect-before", &query, K, false)
+        .fanout_search("reconnect-before", &query, K, false, &Default::default())
         .await
         .unwrap();
     assert_eq!(fanout_hits(&before), expected);
@@ -263,7 +263,7 @@ async fn pooled_channel_reconnects_after_node_restart() {
     let mut after = None;
     for _ in 0..20 {
         match coordinator
-            .fanout_search("reconnect-after", &query, K, false)
+            .fanout_search("reconnect-after", &query, K, false, &Default::default())
             .await
         {
             Ok(result) => {
@@ -313,7 +313,7 @@ async fn floor_delta_gate_never_changes_results() {
     let query = unit_vectors(1, DIM, 0xDE17_A001);
     let expected = monolithic_topk(&monolithic, &query, K as usize);
     let result = coordinator
-        .fanout_search("delta-test", &query, K, false)
+        .fanout_search("delta-test", &query, K, false, &Default::default())
         .await
         .unwrap();
     assert_eq!(fanout_hits(&result), expected);

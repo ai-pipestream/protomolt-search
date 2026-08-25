@@ -40,6 +40,8 @@ async fn add_documents(addr: &str, texts: &[&str]) {
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();

@@ -239,6 +239,20 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(metrics_addr) = cfg.metrics_listen {
+        let listener = TcpListener::bind(metrics_addr).await?;
+        let bound = listener.local_addr()?;
+        let gauges: Vec<turbovec_search::metrics::GaugeProvider> = node_services
+            .iter()
+            .map(|node| node.metrics_provider())
+            .collect();
+        eprintln!("metrics on http://{bound}/metrics ({} shard gauges)", gauges.len());
+        handles.push(tokio::spawn(async move {
+            turbovec_search::metrics::serve(listener, gauges).await;
+            Ok(())
+        }));
+    }
+
     if matches!(cfg.role, Role::Coordinator | Role::Both) {
         let listener = TcpListener::bind(cfg.coord_listen).await?;
         let addr: SocketAddr = listener.local_addr()?;
@@ -296,6 +310,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 k: 10,
                 vector: query,
                 collapse_parents: false,
+                geo_filters: Vec::new(),
+                filter: String::new(),
             })
             .await?
             .into_inner();

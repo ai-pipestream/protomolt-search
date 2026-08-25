@@ -125,6 +125,8 @@ async fn ingest(
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .unwrap();
@@ -825,6 +827,8 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .unwrap();

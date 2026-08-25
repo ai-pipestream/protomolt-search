@@ -36,6 +36,7 @@ async fn drive_scan(addr: &str, query: &[f32], inject_floor: Option<f32>) -> Sca
             vector: query.to_vec(),
             tie_complete: false,
             collapse_parents: false,
+            ..Default::default()
         })),
     })
     .await

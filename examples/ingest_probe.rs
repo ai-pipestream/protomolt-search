@@ -92,6 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .map_err(|e| format!("feeder send: {e}"))?;

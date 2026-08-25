@@ -87,6 +87,8 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .unwrap();
@@ -261,7 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let global_probe_id = (part * counts[0] + index) as u64;
         println!("\n=== query (doc {global_probe_id}): {text:?}");
         let hits = coordinator
-            .fanout_cascade("shakedown", text, &vector, 5, Some(&spec), 0.0, false)
+            .fanout_cascade("shakedown", text, &vector, 5, Some(&spec), 0.0, false, &Default::default())
             .await?
             .0;
         for hit in &hits {

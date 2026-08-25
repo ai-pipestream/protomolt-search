@@ -1826,6 +1826,8 @@ mod tests {
                         length: 1,
                     },
                 ],
+                quality: None,
+                geography: None,
             },
         );
         // doc1: body "rust vector vector", no name
@@ -1855,6 +1857,8 @@ mod tests {
                         length: 2,
                     },
                 ],
+                quality: None,
+                geography: None,
             },
         );
 
@@ -1954,7 +1958,7 @@ mod tests {
                     length: 2,
                 });
             }
-            AnalyzedDoc { fields }
+            AnalyzedDoc { fields, quality: None, geography: None }
         }
         fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
             let mut store = Bm25Store::with_fields(&["body", "name"]);

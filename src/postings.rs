@@ -576,10 +576,55 @@ pub struct AnalyzedField {
 /// positionally matching the store's field table. Field 0 is the body
 /// (the stored text). A document may carry fewer entries than the
 /// store has fields; missing trailing fields index as empty.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AnalyzedDoc {
     /// Per-field analyzed data, indexed by field id.
     pub fields: Vec<AnalyzedField>,
+    /// Per-document quality scalars from the sidecar's noise and
+    /// artifact layers, when the ingest asked for them
+    /// (`docs/quality-columns.md`). `None` means they were not
+    /// requested, which is deliberately distinct from a clean document
+    /// (all zeros): the ingest writes a column only when it has a real
+    /// measurement for it.
+    pub quality: Option<DocQuality>,
+    /// Per-document geography reduction from the sidecar's geocoding
+    /// layer, when the ingest asked for it
+    /// (`docs/geography-columns.md`). `None` means not requested;
+    /// `Some` with empty fields means measured-and-found-nothing,
+    /// which materializes as column ABSENCE (there is no neutral
+    /// coordinate to write).
+    pub geography: Option<DocGeography>,
+}
+
+/// One document's geography reduction, derived at INGEST and stored
+/// as ordinary typed columns (`docs/geography-columns.md`). Every
+/// field is optional on purpose: a document that mentions no
+/// resolvable place has nothing honest to store.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DocGeography {
+    /// Best resolved location `(lat, lon)`: the highest-confidence
+    /// finding, ties broken by text order.
+    pub point: Option<(f64, f64)>,
+    /// The chosen location's resolution confidence in [0, 1].
+    /// Meaningless without `point`; read it only when `point` is set.
+    pub confidence: f64,
+    /// Top region vote's ISO country code, empty when the document's
+    /// location evidence voted for nothing.
+    pub country: String,
+}
+
+/// One document's quality measurements, all derived at INGEST and
+/// stored as ordinary typed columns (`docs/quality-columns.md`). The
+/// query path never recomputes them and never calls a model.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DocQuality {
+    /// Worst noise finding's score, in [0, 1]; exactly 0 with no
+    /// findings.
+    pub noise: f64,
+    /// Characters covered by the UNION of the noise findings' spans.
+    pub noise_chars: i64,
+    /// Number of flagged text artifacts.
+    pub artifacts: i64,
 }
 
 impl AnalyzedDoc {
@@ -588,6 +633,8 @@ impl AnalyzedDoc {
     pub fn body(terms: DocTerms, length: u32) -> Self {
         Self {
             fields: vec![AnalyzedField { terms, length }],
+            quality: None,
+            geography: None,
         }
     }
 
@@ -8539,7 +8586,7 @@ mod tests {
             docs.push((
                 id,
                 format!("case {i} body"),
-                AnalyzedDoc { fields },
+                AnalyzedDoc { fields, quality: None, geography: None },
                 lineage,
             ));
         }

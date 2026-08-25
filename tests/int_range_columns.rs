@@ -80,6 +80,8 @@ async fn add_documents_integer(
                     value: *value,
                 })
                 .collect(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -475,6 +477,8 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
             map_facet_fields: Vec::new(),
             range_facet_fields: want.clone(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await
@@ -855,6 +859,8 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             value: Some(prost_types::Timestamp { seconds, nanos }),
         }],
         geo_points: Vec::new(),
+        quality: None,
+        geography: None,
     };
     send(
         addr.clone(),
