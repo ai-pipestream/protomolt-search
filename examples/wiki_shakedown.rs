@@ -76,6 +76,7 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
                 eprintln!("  shard {shard}: {i}/{n} documents analyzed");
             }
             tx.send(AddDocumentsRequest {
+                materialize: None,
                 map_numerics: Vec::new(),
                 map_facets: Vec::new(),
                 numerics: Vec::new(),

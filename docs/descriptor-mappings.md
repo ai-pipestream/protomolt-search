@@ -1,12 +1,31 @@
 # Descriptor-derived mappings and the descriptor exchange contract
 
-Status: design note. Nothing here is implemented. Two inputs are
-settled outside this repository and one is not: the ownership move is
-decided (descriptor-derived mappings belong to turbovec-search, not
-turbovec-grpc), the reference implementation is frozen in turbovec-grpc
-git history, and the descriptor exchange contract is still being drafted
-in the protomolt repository. Sections that depend on the draft carry a
-TODO rather than a guess.
+Status: **increment 1 implemented** (2026-08-25) — dry-run derivation.
+`SearchService.PlanIndex` derives the deterministic, fingerprinted plan
+for one message type inside a serialized FileDescriptorSet
+(`src/mapping.rs`, `tests/descriptor_mappings.rs`): kinds inferred with
+protomolt's rules, explicit `(index)` hints read off field options (the
+raw descriptor bytes are walked by hand for the extension payloads,
+because prost drops extensions — the same hand-rolled-parser posture as
+the CEL front-end), each field mapped onto the engine column family it
+would land on (`ColumnFamily` — repeated scalars and OBJECT/NESTED/
+BINARY fields visibly map to FAMILY_NONE, never silently dropped), and
+the whole plan identified by a lowercase-hex SHA-256 over a canonical
+fixed-layout encoding (version tag `turbovec-search.plan.v1`, hash from
+the hand-rolled `src/sha256.rs`, pinned to the NIST vectors). Every
+refusal in section 2 is implemented and pinned by tests: ambiguous or
+missing vector/doc-id candidates, contradictory hints, chunk-scope
+violations, range/TREE_PATH/chunking-policy hints, conflicting
+extension declarations. Binding, protobuf-native ingest, and the stored
+format are later increments; the ingest-time CEL machinery they will
+bind to landed with `docs/cel-values.md`.
+
+The exchange contract is now drafted and vendored (section 5). The
+original framing, kept:
+
+The ownership move is decided (descriptor-derived mappings belong to
+turbovec-search, not turbovec-grpc), and the reference implementation
+is frozen in turbovec-grpc git history.
 
 ## 1. The layering rule
 
@@ -174,11 +193,12 @@ The exchange contract is vendored, never depended on:
   `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`), and it must
   remain **byte-identical** to the source. Copy it from the owning repo;
   never edit the vendored copy independently.
-- Byte identity is enforced by a check, not by convention. This repo
-  currently has no CI workflow, so the first increment lands a check
-  script that diffs the vendored copy against a pinned upstream rev, run
-  locally and wired into CI when CI exists. TODO: the script and the
-  pinned rev land with the vendor commit.
+- Byte identity is enforced by a check, not by convention:
+  `scripts/check-vendored-protos.sh` pins the SHA-256 of each vendored
+  file (descriptor_exchange.proto, its validate.proto import, and
+  indexing_hints.proto) against protomolt rev `74d172d9`, and diffs
+  byte-for-byte against a checkout when `PROTOMOLT_DIR` names one. Run
+  locally today; wire into CI when CI exists.
 - Descriptor bytes are opaque to the ranking path. The engine consumes
   Register/Get/List/Sync as a client; a descriptor set is bytes plus a
   SHA-256 until the mapping layer derives a plan from it.

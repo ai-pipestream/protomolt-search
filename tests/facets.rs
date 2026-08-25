@@ -60,6 +60,7 @@ async fn add_documents_faceted(
     let (tx, rx) = mpsc::channel(8);
     for (text, facets) in docs {
         tx.send(AddDocumentsRequest {
+            materialize: None,
             map_numerics: Vec::new(),
             map_facets: Vec::new(),
             numerics: Vec::new(),
@@ -338,6 +339,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
@@ -364,6 +366,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
@@ -472,6 +475,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     // come from the mmapped ords column.
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            projections: Vec::new(),
             filter: None,
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),

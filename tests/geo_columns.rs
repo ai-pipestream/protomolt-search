@@ -78,6 +78,7 @@ async fn add_documents_geo(
     let (tx, rx) = mpsc::channel(64);
     for (text, points) in docs {
         tx.send(AddDocumentsRequest {
+            materialize: None,
             text: text.to_string(),
             analysis: None,
             lineage: None,
@@ -844,6 +845,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             text: "rust".to_string(),
             k: 10,

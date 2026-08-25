@@ -55,6 +55,7 @@ const OFFSETS: [u64; 2] = [0, 3];
 
 fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
     AddDocumentsRequest {
+        materialize: None,
         map_numerics: Vec::new(),
         map_facets: Vec::new(),
         numerics: Vec::new(),
@@ -127,6 +128,7 @@ fn body_only(text: &str) -> SearchVariant {
     SearchVariant {
         label: "body-only".to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
@@ -155,6 +157,7 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
     SearchVariant {
         label: label.to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            projections: Vec::new(),
             filter: String::new(),
             map_facet_fields: Vec::new(),
             score_stages: Vec::new(),
@@ -507,6 +510,7 @@ async fn a_failing_arm_is_named_in_the_error() {
 async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
     let (coord, _nodes, _mock) = cluster().await;
     let bm25 = |k: u32| Bm25SearchRequest {
+        projections: Vec::new(),
         filter: String::new(),
         map_facet_fields: Vec::new(),
         score_stages: Vec::new(),

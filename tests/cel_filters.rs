@@ -155,6 +155,7 @@ fn timestamp_of(rfc3339: &str) -> prost_types::Timestamp {
 
 fn ingest_request(doc: &Doc) -> AddDocumentsRequest {
     AddDocumentsRequest {
+        materialize: None,
         text: doc.text.to_string(),
         analysis: None,
         lineage: None,

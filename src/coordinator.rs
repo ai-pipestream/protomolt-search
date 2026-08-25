@@ -229,6 +229,37 @@ type AggregatedHits = (
 /// coordinator merge is the same positional walk. `mean` is computed
 /// HERE (sum / count) so clients cannot get it wrong; a column NO
 /// shard knows is refused by name, the usual typo rule.
+/// Compile the public projection list (docs/cel-values.md): names
+/// non-empty and request-unique, expressions through the value
+/// front-end, ONCE, here at the coordinator.
+pub(crate) fn compile_projections(
+    projections: &[crate::pb::NamedProjection],
+) -> Result<Vec<crate::pb::CompiledProjection>, Status> {
+    let mut names = std::collections::HashSet::new();
+    let mut compiled = Vec::with_capacity(projections.len());
+    for p in projections {
+        if p.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "projection: a projection needs a non-empty name",
+            ));
+        }
+        if !names.insert(p.name.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "projection: duplicate projection name {:?}",
+                p.name
+            )));
+        }
+        let expr = crate::cel::compile_value(&p.expression).map_err(|e| {
+            Status::invalid_argument(format!("projection {:?}: {}", p.name, e.message()))
+        })?;
+        compiled.push(crate::pb::CompiledProjection {
+            name: p.name.clone(),
+            expr: Some(expr),
+        });
+    }
+    Ok(compiled)
+}
+
 fn merge_column_stats(
     requested: &[String],
     shard_stats: &[Vec<crate::pb::ColumnStats>],
@@ -906,6 +937,7 @@ impl CoordinatorServiceImpl {
             filter,
             &[],
             &[],
+            &[],
         )
         .await
         .map(|r| (r.0, r.1, r.2))
@@ -930,6 +962,7 @@ impl CoordinatorServiceImpl {
         filter: Option<&crate::pb::FilterExpr>,
         stats_fields: &[String],
         cardinality_fields: &[String],
+        projections: &[crate::pb::CompiledProjection],
     ) -> Result<AggregatedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -990,6 +1023,7 @@ impl CoordinatorServiceImpl {
                     filter,
                     stats_fields,
                     cardinality_fields,
+                    projections,
                 )
                 .await
             {
@@ -1024,6 +1058,7 @@ impl CoordinatorServiceImpl {
         filter: Option<&crate::pb::FilterExpr>,
         stats_fields: &[String],
         cardinality_fields: &[String],
+        projections: &[crate::pb::CompiledProjection],
     ) -> Result<AggregatedHits, Status> {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         // The streaming route's relay state: one conflated global floor
@@ -1037,6 +1072,7 @@ impl CoordinatorServiceImpl {
             .map(|(tx, rx)| (Arc::new(tx), rx));
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
+                projections: projections.to_vec(),
                 terms: terms.to_vec(),
                 k,
                 global_doc_count: global.doc_count,
@@ -1072,6 +1108,7 @@ impl CoordinatorServiceImpl {
                                 r.filter_columns_known,
                                 r.stats,
                                 r.distinct,
+                                r.projection_leaves_known,
                             )
                         })
                 }));
@@ -1090,6 +1127,7 @@ impl CoordinatorServiceImpl {
                         r.filter_columns_known,
                         r.stats,
                         r.distinct,
+                        r.projection_leaves_known,
                     )
                 })
             }));
@@ -1101,12 +1139,34 @@ impl CoordinatorServiceImpl {
         let mut geo_known = vec![false; geo_filters.len()];
         let filter_leaves = filter.map_or(0, crate::filter::leaf_count);
         let mut filter_known = vec![false; filter_leaves];
+        // Projection column-read leaves, in the wire's flag order
+        // (docs/cel-values.md).
+        let projection_leaves: Vec<crate::values::ValueLeaf> = {
+            let mut leaves = Vec::new();
+            for p in projections {
+                if let Some(expr) = p.expr.as_ref() {
+                    crate::values::column_leaves(expr, &mut leaves);
+                }
+            }
+            leaves
+        };
+        let mut projection_known = vec![false; projection_leaves.len()];
         let mut shard_stats: Vec<Vec<crate::pb::ColumnStats>> = Vec::new();
         let mut shard_distinct: Vec<Vec<crate::pb::FacetDistinct>> = Vec::new();
         for task in query_tasks {
-            let (shard, hits, facets, ranges, known, geo, fknown, sstats, sdistinct) = task
-                .await
-                .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            let (shard, hits, facets, ranges, known, geo, fknown, sstats, sdistinct, pknown) =
+                task.await
+                    .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            if pknown.len() != projection_leaves.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} projection-leaf flags for {} leaves",
+                    pknown.len(),
+                    projection_leaves.len()
+                )));
+            }
+            for (acc, k) in projection_known.iter_mut().zip(&pknown) {
+                *acc |= *k;
+            }
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
             shard_ranges.push(ranges);
@@ -1184,6 +1244,24 @@ impl CoordinatorServiceImpl {
         }
         refuse_unknown_geo_columns(geo_filters, &geo_known)?;
         refuse_unknown_filter_leaves(filter, &filter_known)?;
+        // A projection column NO shard knows is a typo answering
+        // all-absent — refuse it by name. A partially-known column is
+        // the heterogeneous fleet and is exact (absent documents hold
+        // nothing).
+        let unknown_projection: Vec<String> = projection_leaves
+            .iter()
+            .zip(&projection_known)
+            .filter(|(_, known)| !**known)
+            .map(|(leaf, _)| leaf.describe())
+            .collect();
+        if !unknown_projection.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "projection: no shard has column {}: every value would be absent. \
+                 Check the spelling, or the nodes' --numeric-fields / --integer-fields \
+                 / --facet-fields / --map-numeric-fields / --map-facet-fields.",
+                unknown_projection.join(", ")
+            )));
+        }
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         let stats = merge_column_stats(stats_fields, &shard_stats)?;
@@ -1529,6 +1607,7 @@ impl CoordinatorServiceImpl {
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
+                projections: Vec::new(),
                 terms: Vec::new(),
                 k,
                 global_doc_count: doc_count,
@@ -2188,6 +2267,7 @@ impl CoordinatorServiceImpl {
             let mut leg_tasks = Vec::with_capacity(n_nodes);
             for (shard, node) in self.node_addrs.iter().enumerate() {
                 let request = Bm25QueryRequest {
+                    projections: Vec::new(),
                     terms: terms.to_vec(),
                     k: legs.leg_k,
                     global_doc_count: global.doc_count,
@@ -4383,6 +4463,9 @@ impl SearchService for CoordinatorServiceImpl {
         // shards execute (docs/cel-filters.md): every shard sees the
         // same tree, and none ever sees CEL text.
         let filter = crate::cel::compile_filter(&req.filter)?;
+        // Projection text compiles ONCE, here, into the ValueExpr IR
+        // the shards resolve and evaluate (docs/cel-values.md).
+        let projections = compile_projections(&req.projections)?;
         let (hits, facets, range_facets, stats, cardinality) = if req.fields.is_empty() {
             self.fanout_bm25_aggregated(
                 &req.text,
@@ -4397,6 +4480,7 @@ impl SearchService for CoordinatorServiceImpl {
                 filter.as_ref(),
                 &req.stats_fields,
                 &req.cardinality_fields,
+                &projections,
             )
             .await?
         } else {
@@ -4410,6 +4494,12 @@ impl SearchService for CoordinatorServiceImpl {
                 return Err(Status::invalid_argument(
                     "stats/cardinality are not yet supported on the fused multi-field \
                      route; drop `fields` to use the flat route, or drop the aggregations",
+                ));
+            }
+            if !req.projections.is_empty() {
+                return Err(Status::invalid_argument(
+                    "projections are not yet supported on the fused multi-field route; \
+                     drop `fields` to use the flat route, or drop the projections",
                 ));
             }
             // `analysis` is documented as ignored once `fields` is set,
@@ -4629,6 +4719,20 @@ impl SearchService for CoordinatorServiceImpl {
         crate::query::execute(self, request.into_inner())
             .await
             .map(Response::new)
+    }
+
+    async fn plan_index(
+        &self,
+        request: Request<crate::pb::PlanIndexRequest>,
+    ) -> Result<Response<crate::pb::PlanIndexResponse>, Status> {
+        // Derivation is local and deterministic (docs/descriptor-mappings.md):
+        // nothing fans out, nothing binds, and the same request returns the
+        // same fingerprint on every coordinator.
+        let req = request.into_inner();
+        let plan = crate::mapping::derive_plan(&req.descriptor_set, &req.message_type)?;
+        Ok(Response::new(crate::pb::PlanIndexResponse {
+            plan: Some(plan),
+        }))
     }
 
     async fn cluster_health(

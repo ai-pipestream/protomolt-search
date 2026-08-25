@@ -211,6 +211,13 @@ pub async fn execute(
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
     let plan = parse_selection(selection)?;
     check_ids(&plan, &req.boosts)?;
+    if !req.projections.is_empty() && !matches!(plan.shape, Shape::Lexical { .. }) {
+        return Err(refuse(
+            "projections are served on single-lexical-leaf selections only in this \
+             increment (the Bm25Search delegate carries them); other shapes refuse \
+             until their ordinary route does",
+        ));
+    }
     if let Some(sort) = &req.sort {
         if sort.column.is_empty() {
             return Err(refuse("sort names no column"));
@@ -341,6 +348,7 @@ pub async fn execute(
                 .iter()
                 .enumerate()
                 .map(|(i, &doc_id)| QueryHit {
+                    projected: Vec::new(),
                     doc_id,
                     // No relevance score exists on this route; the id
                     // (or column) order IS the order, and rank counts
@@ -380,6 +388,7 @@ pub async fn execute(
                     score_stages: query.score_stages.clone(),
                     geo_filters: plan.geo_filters.clone(),
                     filter,
+                    projections: req.projections.clone(),
                     ..Default::default()
                 }))
                 .await?
@@ -388,6 +397,7 @@ pub async fn execute(
                 .hits
                 .iter()
                 .map(|h| QueryHit {
+                    projected: h.projected.clone(),
                     doc_id: h.doc_id,
                     score: h.score,
                     rank: 0,
@@ -418,6 +428,7 @@ pub async fn execute(
                 .hits
                 .iter()
                 .map(|h| QueryHit {
+                    projected: Vec::new(),
                     doc_id: h.vector_id,
                     score: h.score,
                     rank: 0,
@@ -486,6 +497,7 @@ pub async fn execute(
                             }
                         }
                         QueryHit {
+                            projected: Vec::new(),
                             doc_id: h.doc_id,
                             // Cascade's final order is the rerank leg's:
                             // score is the rerank leg's raw relevance
@@ -533,6 +545,7 @@ pub async fn execute(
                             }
                         }
                         QueryHit {
+                            projected: Vec::new(),
                             doc_id: h.doc_id,
                             score: h.fused_score,
                             rank: 0,

@@ -491,7 +491,24 @@ whole cost avoided.
 
 ## F. What makes it a protobuf search engine rather than our corpus's engine
 
-### 19. Descriptor-derived mappings, increment 1
+### 19. Descriptor-derived mappings, increment 1 — LANDED
+
+**Landed 2026-08-25** exactly at the scoped increment: derivation plus
+dry-run planning plus the fingerprint, no ingest.
+`SearchService.PlanIndex` (`src/mapping.rs`) derives the plan, maps
+each field onto its engine column family (repeated scalars and
+OBJECT/NESTED/BINARY visibly land on FAMILY_NONE), reads protomolt's
+`(index)` hints off the raw descriptor bytes (prost drops extensions;
+the walk is hand-rolled), and fingerprints the canonical encoding with
+the new hand-rolled SHA-256 (`src/sha256.rs`, NIST-vector-pinned). The
+refusal table — ambiguous vector, missing id, chunk-scope violations,
+contradictory or unsupported hints, conflicting extension declarations
+— is implemented and pinned in `tests/descriptor_mappings.rs`. The
+exchange contract and hint vocabulary are vendored byte-identical from
+protomolt rev 74d172d9, gated by `scripts/check-vendored-protos.sh`.
+Binding and protobuf-native ingest are the next increments.
+
+The original rationale, kept:
 
 `docs/descriptor-mappings.md` is a finished design note with nothing
 implemented, and it is the item that changes what the project *is*: bring
@@ -514,7 +531,25 @@ fingerprint — no ingest — because that is the part that has to be argued
 about, and refusing to guess (one vector field, one document id, named
 refusal otherwise) is the behavior the whole feature is judged on.
 
-### 20. First-class CEL: ingest materialization and query projections
+### 20. First-class CEL: ingest materialization and query projections — LANDED
+
+**Landed 2026-08-25** (`docs/cel-values.md`): `cel::compile_value` is
+the value front-end of the same hand-rolled compiler (arithmetic,
+literals, column and map reads, `double()`, everything else refused by
+name), `src/values.rs` resolves per shard with stock CEL's no-coercion
+typing and evaluates per RETURNED hit; `Bm25SearchRequest.projections`
+and `QueryRequest.projections` (single-lexical-leaf shape) carry the
+public surface, with the filter rules for missing columns carried over
+(shard-absent = exact, fleet-unknown = refused by name).
+`AddDocumentsRequest.materialize` computes derived columns at ingest —
+explicit target kind, materialize-then-ordinary-path like quality and
+geography, WAL logs post-materialization so replay never re-evaluates.
+The differential oracle (`tests/cel_values.rs`) holds the engine to
+bitwise agreement with `cel-interpreter` wherever stock CEL yields a
+value; the two deviations (absence for missing inputs and for integer
+arithmetic errors) are documented and pinned.
+
+The original rationale, kept:
 
 The last item, and the one that makes the CEL investment compound. Today
 CEL selects and function chains score. Two more uses of the *same*

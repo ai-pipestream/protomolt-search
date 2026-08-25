@@ -888,6 +888,7 @@ mod tests {
         wal_record::Op::AddDocuments(LoggedAddDocuments {
             first_id: id,
             documents: vec![AddDocumentsRequest {
+                materialize: None,
                 map_numerics: Vec::new(),
                 map_facets: Vec::new(),
                 numerics: Vec::new(),

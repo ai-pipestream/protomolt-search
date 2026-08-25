@@ -44,10 +44,13 @@ pub mod postings;
 pub mod query;
 pub mod rankdiff;
 pub mod reshard;
+pub mod mapping;
 pub mod scorefn;
+pub mod sha256;
 pub mod snapshot;
 pub mod stats_cache;
 mod stream_signal;
+pub mod values;
 pub mod vocab;
 pub mod wal;
 
