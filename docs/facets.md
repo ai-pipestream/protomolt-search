@@ -105,10 +105,38 @@ match set is the union over every leg's terms). Facet counting rides
 the scoring RPC, so the stats-epoch refusal-retry covers it with no
 extra machinery.
 
-Hybrid queries do not carry facets yet: the vector leg matches the
-whole corpus, so "counts over the matches" has no single honest answer
-there. When filters land (the public-API item), facets over a filtered
-hybrid result set becomes well-defined; that is the seam to revisit.
+Hybrid queries do not carry facets yet: the vector leg matched the
+whole corpus, so "counts over the matches" had no single honest answer
+there. Vector-leg filters have since landed
+(`docs/vector-filters.md`), so a FILTERED hybrid query's match set is
+a set and counts over it are well-defined — that is the seam to
+revisit, and counting them is the increment nobody has written.
+
+## Aggregations beyond counting (2026-08-24)
+
+`Bm25SearchRequest.stats_fields` aggregates numeric and integer columns
+over the FILTERED match set: per column, the count of documents holding
+a value, min, max, sum, and (computed at the coordinator, so clients
+cannot get it wrong) mean = sum / count. All of it rides the same one
+bitmap every facet kind shares — the traversal is the expensive half
+and a second aggregate must not pay for it twice — and merges the way
+counts do: counts and sums add, mins and maxes fold, no shard's answer
+depends on another's. Absence contributes nothing: `count` is documents
+that HELD a value, which is what keeps the mean honest, and a
+zero-count column reports min = max = 0 with the count saying so.
+
+`Bm25SearchRequest.cardinality_fields` counts DISTINCT facet values
+over the match set — exactly, not estimated. Ordinals are shard-local,
+so value strings are the only union-able currency: each shard reports
+the values present in its match set and the coordinator unions them.
+The cost is those strings on the wire, proportional to per-shard
+distinct counts, and it is the caller's explicit choice per field —
+the same made-visible trade count-then-rank settled.
+
+Both take the flat single-field route only (the fused route refuses
+them by name, like score stages), and both refuse a column no shard
+declares, naming the column and the knob. `tests/aggregations.rs`
+holds all of it, heterogeneous fleet included.
 
 ## What this deliberately does not do
 

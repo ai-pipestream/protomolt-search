@@ -521,7 +521,17 @@ fn build_child(
                     .add_document_with_lineage(
                         *local,
                         text,
-                        crate::postings::AnalyzedDoc { fields },
+                        // Reshard replays LOGGED requests, whose quality
+                        // and geography values were materialized into the
+                        // ordinary column lists at first ingest, so there
+                        // is nothing to derive here
+                        // (docs/quality-columns.md,
+                        // docs/geography-columns.md).
+                        crate::postings::AnalyzedDoc {
+                            fields,
+                            quality: None,
+                            geography: None,
+                        },
                         doc.lineage.map(|l| crate::postings::DocLineage {
                             opinion_id: l.opinion_id,
                             cluster_id: l.cluster_id,

@@ -278,14 +278,14 @@ pub async fn analyze_document(
     }
     let request = AnalyzeRequest {
         text: text.to_string(),
-        options: Some(analysis_options(spec)),
+        options: Some(analysis_options(spec, SessionLayers::default())),
     };
     let mut client = client(addr)?;
     // Raw Status passthrough: transport failures keep tonic's Unavailable
     // (the channel connects lazily, so "sidecar down" surfaces HERE, not
     // at client construction), server errors keep their own codes.
     let response = client.analyze(request).await?.into_inner();
-    Ok(analyzed_from(response))
+    Ok(analyzed_from(response, SessionLayers::default()))
 }
 
 fn client(addr: &str) -> Result<AnalysisServiceClient<Channel>, Status> {
@@ -343,10 +343,23 @@ pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
     Ok(pooled.iter().map(|v| ((v / n) / norm) as f32).collect())
 }
 
+/// Which optional sidecar layers an analysis SESSION requests beyond
+/// term identity. A property of the session, not of a document: the
+/// layers ride the options message a stream opens with, so a change
+/// reopens the session exactly as a spec change does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionLayers {
+    /// The noise and artifact scanners (`docs/quality-columns.md`).
+    pub quality: bool,
+    /// The geocoding layer (`docs/geography-columns.md`). Requires the
+    /// sidecar to serve NER; opening preflights that capability.
+    pub geography: bool,
+}
+
 /// Maps `spec` straight onto the sidecar's `AnalysisOptions`: term vectors
 /// are always requested (FULL mode with occurrence offsets unless the spec
 /// overrides), everything else defaults.
-fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
+fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> AnalysisOptions {
     let (mode, source, char_filters, tokenizer, stemmer) = match spec {
         Some(s) => (
             s.term_vector_mode,
@@ -375,6 +388,17 @@ fn analysis_options(spec: Option<&AnalysisSpec>) -> AnalysisOptions {
             // a single analysis pass.
             dual_cased: false,
         }),
+        // The quality layers ride the SAME analysis pass as the terms
+        // (docs/quality-columns.md). Both are model-free structural
+        // scanners, so asking for them costs one traversal of text the
+        // sidecar is already holding — and the query path gains nothing
+        // to do, because what comes back becomes an ordinary column.
+        noise: layers.quality,
+        artifacts: layers.quality,
+        // Geocoding consumes the entity layer; setting `geo` implies
+        // `ner` on the sidecar side. Availability was preflighted at
+        // session open (see [`AnalyzeStream::open_with_vocab`]).
+        geo: layers.geography,
         ..Default::default()
     }
 }
@@ -400,7 +424,9 @@ static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// have produced; the dropped token contributes nothing to the
 /// document length either, exactly as if the analyzer had never
 /// emitted it.
-fn analyzed_from(response: AnalyzeResponse) -> AnalyzedDoc {
+fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> AnalyzedDoc {
+    let quality = layers.quality.then(|| doc_quality(&response));
+    let geography = layers.geography.then(|| doc_geography(&response));
     let mut terms = crate::postings::DocTerms::new();
     let mut length = 0u32;
     for tv in response.term_vectors {
@@ -426,7 +452,87 @@ fn analyzed_from(response: AnalyzeResponse) -> AnalyzedDoc {
         length += tv.frequency as u32;
         terms.push((tv.term, tv.frequency as u32, offsets));
     }
-    AnalyzedDoc::body(terms, length)
+    AnalyzedDoc {
+        quality,
+        geography,
+        ..AnalyzedDoc::body(terms, length)
+    }
+}
+
+/// Fold a response's noise and artifact layers into the per-document
+/// scalars the quality columns hold (`docs/quality-columns.md`).
+///
+/// `noise` is the worst finding's score, which the sidecar defines in
+/// (0, 1]; a document with no findings scores exactly 0. `noise_chars`
+/// is the length of the UNION of the findings' spans, computed by a
+/// sweep over the spans sorted by start, so overlapping findings are
+/// counted once and the answer does not depend on the order the
+/// sidecar happened to emit them in. `artifacts` is a count, which is
+/// exact by construction.
+fn doc_quality(response: &AnalyzeResponse) -> crate::postings::DocQuality {
+    let mut worst = 0.0f64;
+    let mut spans: Vec<(i64, i64)> = Vec::with_capacity(response.noise.len());
+    for finding in &response.noise {
+        // A non-finite score would poison the f64 column's min/max
+        // metadata, which score-chain bounds read. Treat it as no
+        // signal rather than propagating a NaN into the ranking.
+        if finding.score.is_finite() && finding.score > worst {
+            worst = finding.score;
+        }
+        if let Some(span) = finding.span.as_ref() {
+            let (start, end) = (i64::from(span.start), i64::from(span.end));
+            if end > start {
+                spans.push((start, end));
+            }
+        }
+    }
+    spans.sort_unstable();
+    let mut covered = 0i64;
+    let mut reach = i64::MIN;
+    for (start, end) in spans {
+        let start = start.max(reach);
+        if end > start {
+            covered += end - start;
+        }
+        reach = reach.max(end);
+    }
+    crate::postings::DocQuality {
+        noise: worst,
+        noise_chars: covered,
+        artifacts: response.artifacts.len() as i64,
+    }
+}
+
+/// Reduce a response's geocoding layer to the per-document scalars the
+/// geography columns hold (`docs/geography-columns.md`).
+///
+/// The point is the highest-confidence location, ties broken by text
+/// order (the sidecar emits locations in text order, and a stable
+/// `>` scan keeps the first). A non-finite confidence is no signal and
+/// cannot be chosen. The country is the top region vote's — the
+/// sidecar ranks votes by share — independent of which location won,
+/// because the vote aggregates ALL the document's evidence while the
+/// point is one best mention. A document with no locations reduces to
+/// an all-absent value, which materializes as no columns at all.
+fn doc_geography(response: &AnalyzeResponse) -> crate::postings::DocGeography {
+    let mut best: Option<&crate::pb::analysis::GeoLocation> = None;
+    for location in &response.locations {
+        if !location.confidence.is_finite() {
+            continue;
+        }
+        if best.is_none_or(|b| location.confidence > b.confidence) {
+            best = Some(location);
+        }
+    }
+    crate::postings::DocGeography {
+        point: best.map(|b| (b.latitude, b.longitude)),
+        confidence: best.map_or(0.0, |b| b.confidence),
+        country: response
+            .regions
+            .first()
+            .map(|r| r.country_code.clone())
+            .unwrap_or_default(),
+    }
 }
 
 /// Client-side submission buffer of an [`AnalyzeStream`]. Pacing is the
@@ -472,6 +578,11 @@ pub struct AnalyzeStream {
     /// exist — and only on this bulk path: unary `Analyze` is the query
     /// path, and query text never enters corpus statistics.
     vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
+    /// Which optional layers this session asked for, which decides
+    /// whether a response's empty `noise` or `locations` list means
+    /// "measured, found nothing" or "not requested". Fixed for the
+    /// session's lifetime, like the options message that set it.
+    layers: SessionLayers,
 }
 
 impl AnalyzeStream {
@@ -485,23 +596,49 @@ impl AnalyzeStream {
     /// open-then-submit cannot deadlock on a first result that would
     /// only exist after the first submission.
     pub async fn open(addr: &str, spec: Option<&AnalysisSpec>) -> Result<Self, Status> {
-        Self::open_with_vocab(addr, spec, None).await
+        Self::open_with_vocab(addr, spec, None, SessionLayers::default()).await
     }
 
     /// [`open`](Self::open) with the shard's vocabulary listener attached:
     /// every successfully analyzed response feeds its term vectors (TERMS
     /// channel) and raw token texts (TOKENS channel) before the response
     /// is folded into an [`AnalyzedDoc`].
+    /// `layers` asks the sidecar for its optional layers on the same
+    /// pass (`docs/quality-columns.md`, `docs/geography-columns.md`).
+    /// They are a property of the SESSION, not of a document, because
+    /// they are requested in the options message a stream opens with —
+    /// which is why a mid-stream change reopens the session, exactly
+    /// as a spec change does.
+    ///
+    /// A session asking for geography preflights the sidecar's NER
+    /// capability and REFUSES when it has none: the sidecar's own
+    /// behavior on that state — empty layers plus a free-form warning
+    /// per response — is indistinguishable from "no locations found",
+    /// and would silently ingest an entire corpus as place-less.
     pub async fn open_with_vocab(
         addr: &str,
         spec: Option<&AnalysisSpec>,
         vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
+        layers: SessionLayers,
     ) -> Result<Self, Status> {
         let mut client = client(addr)?;
+        if layers.geography {
+            let capabilities = client
+                .get_capabilities(crate::pb::analysis::GetCapabilitiesRequest {})
+                .await?
+                .into_inner();
+            if !capabilities.ner_available {
+                return Err(Status::failed_precondition(
+                    "geography columns were requested but this sidecar has no NER model                      configured (GetCapabilities.ner_available = false); the geocoding                      layer consumes the entity layer, so it cannot be served — configure                      an NER model or drop the GeographySpec",
+                ));
+            }
+        }
         let (requests, feed) = tokio::sync::mpsc::channel(SUBMIT_BUFFER);
         requests
             .try_send(AnalyzeStreamRequest {
-                msg: Some(analyze_stream_request::Msg::Options(analysis_options(spec))),
+                msg: Some(analyze_stream_request::Msg::Options(analysis_options(
+                    spec, layers,
+                ))),
             })
             .expect("fresh channel has capacity");
         let responses = client
@@ -512,6 +649,7 @@ impl AnalyzeStream {
             submit: Some(AnalyzeSubmit { requests }),
             responses,
             vocab,
+            layers,
         })
     }
 
@@ -600,7 +738,7 @@ impl AnalyzeStream {
                                 ok.tokens.iter().map(|t| t.text.as_str()),
                             );
                         }
-                        Ok(analyzed_from(ok))
+                        Ok(analyzed_from(ok, self.layers))
                     }
                     Some(analyze_stream_response::Result::Error(error)) => {
                         Err(Status::new(tonic::Code::from(error.code), error.message))
@@ -769,6 +907,137 @@ async fn join_all<F: std::future::Future>(futures: &mut [std::pin::Pin<Box<F>>])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn noise_span(start: i32, end: i32, score: f64) -> crate::pb::analysis::NoiseSpan {
+        crate::pb::analysis::NoiseSpan {
+            span: Some(crate::pb::analysis::Span { start, end }),
+            severity: "gibberish".to_string(),
+            score,
+        }
+    }
+
+    /// Overlapping and duplicate findings must count each damaged
+    /// character once, in any emission order: `noise_chars` is the
+    /// union's length, not the sum of the spans.
+    #[test]
+    fn noise_chars_is_the_union_not_the_sum() {
+        let response = AnalyzeResponse {
+            // [10,20) and [15,25) overlap; [15,25) repeats; [30,32) is
+            // disjoint; [5,5) is empty and contributes nothing. Emitted
+            // deliberately out of start order.
+            noise: vec![
+                noise_span(30, 32, 0.2),
+                noise_span(15, 25, 0.4),
+                noise_span(10, 20, 0.3),
+                noise_span(15, 25, 0.4),
+                noise_span(5, 5, 0.9),
+            ],
+            ..Default::default()
+        };
+        let q = doc_quality(&response);
+        assert_eq!(q.noise_chars, 17, "union of [10,25) and [30,32)");
+        assert_eq!(q.noise, 0.9, "worst score wins even from an empty span");
+        assert_eq!(q.artifacts, 0);
+    }
+
+    /// A non-finite score is no signal, not the worst signal: it must
+    /// not become the column value and poison min/max metadata.
+    #[test]
+    fn non_finite_noise_scores_are_ignored() {
+        let response = AnalyzeResponse {
+            noise: vec![noise_span(0, 4, f64::NAN), noise_span(4, 8, 0.5)],
+            ..Default::default()
+        };
+        let q = doc_quality(&response);
+        assert_eq!(q.noise, 0.5);
+        assert_eq!(q.noise_chars, 8, "the NaN finding's SPAN still counts");
+    }
+
+    fn location(start: i32, confidence: f64, country: &str) -> crate::pb::analysis::GeoLocation {
+        crate::pb::analysis::GeoLocation {
+            span: Some(crate::pb::analysis::Span {
+                start,
+                end: start + 5,
+            }),
+            name: "Somewhere".to_string(),
+            country_code: country.to_string(),
+            latitude: f64::from(start),
+            longitude: -f64::from(start),
+            confidence,
+        }
+    }
+
+    /// The point is the highest-confidence location; a tie keeps the
+    /// FIRST in text order, so the reduction cannot depend on how the
+    /// scan iterates. The country comes from the top region vote, not
+    /// from the winning location.
+    #[test]
+    fn geography_picks_best_confidence_first_on_ties() {
+        let response = AnalyzeResponse {
+            locations: vec![
+                location(0, 0.9, "FR"),
+                location(10, 0.9, "DE"),
+                location(20, 0.4, "US"),
+            ],
+            regions: vec![
+                crate::pb::analysis::RegionVote {
+                    country_code: "DE".to_string(),
+                    share: 0.6,
+                },
+                crate::pb::analysis::RegionVote {
+                    country_code: "FR".to_string(),
+                    share: 0.4,
+                },
+            ],
+            ..Default::default()
+        };
+        let g = doc_geography(&response);
+        assert_eq!(g.point, Some((0.0, 0.0)), "tie keeps the first mention");
+        assert_eq!(g.confidence, 0.9);
+        assert_eq!(
+            g.country, "DE",
+            "the country is the aggregate vote, not the winning mention's"
+        );
+    }
+
+    /// A non-finite confidence is no signal and cannot be chosen; a
+    /// layer with ONLY such findings reduces to no point at all.
+    #[test]
+    fn non_finite_confidence_cannot_win() {
+        let response = AnalyzeResponse {
+            locations: vec![location(0, f64::NAN, "FR"), location(10, 0.3, "DE")],
+            ..Default::default()
+        };
+        assert_eq!(doc_geography(&response).point, Some((10.0, -10.0)));
+
+        let only_nan = AnalyzeResponse {
+            locations: vec![location(0, f64::NAN, "FR")],
+            ..Default::default()
+        };
+        assert_eq!(doc_geography(&only_nan).point, None);
+    }
+
+    /// No locations reduces to the all-absent value: no point, no
+    /// country, confidence meaningless — the caller writes NOTHING,
+    /// never a fabricated (0,0).
+    #[test]
+    fn no_locations_reduce_to_absence() {
+        let g = doc_geography(&AnalyzeResponse::default());
+        assert_eq!(g.point, None);
+        assert_eq!(g.country, "");
+    }
+
+    /// A response with no findings measures exactly zero on every
+    /// axis: "clean" is a measurement, distinct from "not measured"
+    /// (which is `AnalyzedDoc::quality == None` and never reaches
+    /// here).
+    #[test]
+    fn a_clean_response_measures_zero() {
+        let q = doc_quality(&AnalyzeResponse::default());
+        assert_eq!(q.noise, 0.0);
+        assert_eq!(q.noise_chars, 0);
+        assert_eq!(q.artifacts, 0);
+    }
 
     /// The two named body analyzers must differ in TERM IDENTITY, not
     /// merely in name. If they ever resolved to the same spec the A/B
@@ -956,12 +1225,7 @@ mod tests {
         let tv = |term: &str, tf: i32| TermVector {
             term: term.to_string(),
             frequency: tf,
-            occurrences: vec![Span {
-                start: 0,
-                end: 5,
-                ..Default::default()
-            }],
-            ..Default::default()
+            occurrences: vec![Span { start: 0, end: 5 }],
         };
         let with_empty = AnalyzeResponse {
             term_vectors: vec![tv("court", 2), tv("", 3), tv("appeal", 1)],
@@ -972,8 +1236,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            analyzed_from(with_empty),
-            analyzed_from(without),
+            analyzed_from(with_empty, SessionLayers::default()),
+            analyzed_from(without, SessionLayers::default()),
             "the empty term must vanish as if the analyzer never emitted it"
         );
     }

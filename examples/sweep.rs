@@ -108,7 +108,7 @@ async fn run_mode(node_addrs: &[String], queries: &[Vec<f32>], k: u32, sharing: 
     for (qi, query) in queries.iter().enumerate() {
         let start = Instant::now();
         let result = coordinator
-            .fanout_search(&format!("sweep-{sharing}-{k}-{qi}"), query, k, false)
+            .fanout_search(&format!("sweep-{sharing}-{k}-{qi}"), query, k, false, &Default::default())
             .await
             .expect("fanout search");
         walls.push(start.elapsed().as_secs_f64() * 1e3);

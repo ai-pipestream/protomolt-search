@@ -97,14 +97,16 @@ Rules, stated once and pinned in tests:
   filter tree and for these standalone geo filters alike.
 - **Routes.** Flat and fused both carry filters (a fused query's match
   set is the union over every leg's terms, and a filter narrows that
-  union exactly as it narrows a single leg's). Hybrid cannot carry them
-  at all — `HybridSearchRequest` has no filter field, and the internal
-  BM25 leg it builds sets an empty list — because the vector leg has no
-  filter machinery and filtering only the lexical half would
-  misdescribe the result set, the same reason hybrid carries no facets.
-  Making the combination unrepresentable is stronger than refusing it
-  at runtime, and it is available here only because hybrid takes its
-  own request type rather than embedding a `Bm25SearchRequest`.
+  union exactly as it narrows a single leg's). Hybrid could not carry
+  them when this was written — `HybridSearchRequest` had no filter
+  field at all, because the vector leg had no filter machinery and
+  filtering only the lexical half would have misdescribed the result
+  set. Making the combination unrepresentable was stronger than
+  refusing it at runtime. That gap is now closed
+  (`docs/vector-filters.md`): `HybridSearchRequest` carries
+  `geo_filters` and `filter`, and both legs resolve the same predicate,
+  so the combination is representable precisely because it is no longer
+  a half-truth. Hybrid still carries no facets.
 
 ## The antimeridian is refused, not guessed
 

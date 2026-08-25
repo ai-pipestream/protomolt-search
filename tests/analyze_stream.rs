@@ -152,7 +152,7 @@ async fn start_no_stream_mock() -> (
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(AnalysisServiceServer::new(NoStreamMock(MockAnalysis)))
+            .add_service(AnalysisServiceServer::new(NoStreamMock(MockAnalysis::default())))
             .serve_with_incoming(nodelay_incoming(listener)),
     );
     (format!("http://{addr}"), handle)
@@ -197,6 +197,8 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();

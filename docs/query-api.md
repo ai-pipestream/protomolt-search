@@ -1,8 +1,12 @@
 # Public query contract
 
-Status: design contract for the future public `Query` RPC. The existing
-`Search`, `Bm25Search`, and `HybridSearch` RPCs remain the implemented surface
-until this contract can delegate to them without weakening their semantics.
+Status: increment 1 is IMPLEMENTED (2026-08-24): `SearchService.Query`
+executes the shapes in the mapping table below by delegating to `Search`,
+`Bm25Search`, and `HybridSearch` (`src/query.rs`, `tests/query_api.rs`),
+with per-signal provenance and by-name refusal of everything else. The
+phase split, the boost contract, and the refusal rules in this document
+are the binding contract; the sections on the generic composite scorer
+remain design-ahead-of-implementation.
 
 The public model separates three things that are easy to conflate:
 
@@ -238,24 +242,70 @@ score provenance and validation unambiguous.
 
 ## Mapping to the current engine
 
-The current implementation proves these lower-level routes:
+Increment 1 of the adapter executes exactly these shapes (each delegating
+to the route named, bitwise — `tests/query_api.rs` holds it to that):
+
+| Public shape | Route |
+|---|---|
+| one lexical leaf (+ AND filters, + score stages) | `Bm25Search` |
+| one dense leaf (+ AND filters) | `Search` |
+| `OR(dense, lexical)` + rrf | `HybridSearch` GLOBAL_RANK |
+| `OR(dense, lexical)` + score_blend | `HybridSearch` SCORE_BLEND |
+| `OR(dense, lexical)` + decomposed | `HybridSearch` DECOMPOSED |
+| cascade(gate = dense) over {dense, lexical} | `HybridSearch` CASCADE |
+| one lexical boost on a composite selection | `BoostRescore` |
+| filters only (browse, id order, `after`-floor paging) | `BrowseShard` fan-out |
+| browse + `sort` by i64/f64 column (asc/desc) | `BrowseShard` column-keyed heap |
+
+`selection_k` maps to the hybrid leg depth; the response is the best `k`
+of that candidate set (`k <= selection_k` enforced; a `selection_k` that
+no candidate-scoped phase uses is refused as a silent no-op). Cascade
+requires the composite operator UNSPECIFIED — membership is the gate's,
+and neither AND nor OR describes it.
+
+The underlying routes:
 
 | Public concept | Existing implementation |
 |---|---|
 | One dense search | `Search` |
 | One lexical search plus CEL/geo filters | `Bm25Search` |
+| One dense search plus CEL/geo filters | `Search` (`docs/vector-filters.md`) |
 | Dense plus lexical composite scoring | `HybridSearch` and `FusionMode` |
 | One candidate-scoped lexical boost | `BoostRescore` |
 | Bounded value functions during lexical selection | `ScoreStage` |
 | Named raw leg provenance | `HybridHit.vector_score`, `bm25_score`, and `boost_score` |
 
 The adapter must execute those ordinary paths rather than fork their scoring
-logic. Shapes not represented by the table, including vector-plus-CEL,
-filter-only browse, arbitrary nested boolean search, multiple boost queries,
-and the generic named-dimension response, remain unsupported until their
-ordinary engine paths exist. The public RPC must return `INVALID_ARGUMENT` or
+logic. Vector-plus-CEL has since acquired its ordinary path
+(`docs/vector-filters.md`): `SearchRequest` and `HybridSearchRequest` both
+carry `geo_filters` and a CEL `filter`, and every fusion mode applies them to
+both legs. Shapes still not represented by the table — filter-only browse,
+arbitrary nested boolean search, multiple boost queries, and the generic
+named-dimension response — remain unsupported until their ordinary engine
+paths exist. The public RPC must return `INVALID_ARGUMENT` or
 `FAILED_PRECONDITION` for such a shape; compatibility never authorizes a
 heuristic substitute.
+
+## Paging
+
+`QueryRequest.cursor` / `QueryResponse.next_cursor` implement
+search-after paging (landed with increment 1). The token embeds the
+boundary hit's (absolute rank, exact score bits, doc id); the rest of
+the request must repeat the original query verbatim. Resumption
+re-finds the boundary hit bitwise — search here is deterministic, so
+exact equality is the corpus-state check — and refuses with
+FAILED_PRECONDITION when the boundary is gone or its score moved.
+Documents ingested after a page that rank before the boundary are
+skipped, as search-after semantics require.
+
+Depth: a single-leaf query pages by fetching deeper (its order is
+depth-independent by the exact top-k prefix property), capped by
+`max_k`. A composite pages within its fixed `selection_k` pool — the
+fusion strategies' orders are depth-dependent (RRF ranks, blend
+normalization, the cascade gate), so the pool is never silently
+deepened; exhaustion refuses and names `selection_k`. A full page
+always mints `next_cursor`; a short page provably has nothing after it
+at the served depth and mints none.
 
 ## Response requirements
 

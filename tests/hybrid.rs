@@ -67,6 +67,8 @@ async fn add_documents(addr: &str, texts: &[String]) {
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .unwrap();
@@ -185,12 +187,12 @@ async fn hybrid_is_deterministic_and_carries_provenance() {
     let query = corpus[..DIM].to_vec();
 
     let first = coordinator
-        .fanout_hybrid("h1", "zebra", &query, 8, None, legs_default(), false)
+        .fanout_hybrid("h1", "zebra", &query, 8, None, legs_default(), false, &Default::default())
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_hybrid("h2", "zebra", &query, 8, None, legs_default(), false)
+        .fanout_hybrid("h2", "zebra", &query, 8, None, legs_default(), false, &Default::default())
         .await
         .unwrap()
         .0;
@@ -301,6 +303,7 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
             None,
             legs_default(),
             false,
+            &Default::default(),
         )
         .await
         .unwrap()
@@ -314,6 +317,7 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
             None,
             legs_default(),
             false,
+            &Default::default(),
         )
         .await
         .unwrap()
@@ -440,12 +444,12 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
         legs_blend(Normalization::None, Combination::Harmonic),
     ] {
         let got = distributed
-            .fanout_hybrid("adv", "zebra", &query, N_DOCS as u32, None, legs, false)
+            .fanout_hybrid("adv", "zebra", &query, N_DOCS as u32, None, legs, false, &Default::default())
             .await
             .unwrap()
             .0;
         let want = monolithic
-            .fanout_hybrid("adv-m", "zebra", &query, N_DOCS as u32, None, legs, false)
+            .fanout_hybrid("adv-m", "zebra", &query, N_DOCS as u32, None, legs, false, &Default::default())
             .await
             .unwrap()
             .0;
@@ -533,12 +537,12 @@ async fn score_blend_follows_documented_arithmetic() {
     let blend = legs_blend(Normalization::MinMax, Combination::Arithmetic);
 
     let first = coordinator
-        .fanout_hybrid("b1", "zebra", &query, 8, None, blend, false)
+        .fanout_hybrid("b1", "zebra", &query, 8, None, blend, false, &Default::default())
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_hybrid("b2", "zebra", &query, 8, None, blend, false)
+        .fanout_hybrid("b2", "zebra", &query, 8, None, blend, false, &Default::default())
         .await
         .unwrap()
         .0;
@@ -580,7 +584,7 @@ async fn score_blend_follows_documented_arithmetic() {
         ..blend
     };
     let boosted = coordinator
-        .fanout_hybrid("b3", "zebra", &query, 8, None, weighted, false)
+        .fanout_hybrid("b3", "zebra", &query, 8, None, weighted, false, &Default::default())
         .await
         .unwrap()
         .0;
@@ -599,12 +603,12 @@ async fn score_blend_follows_documented_arithmetic() {
         legs_blend(Normalization::MinMax, Combination::Harmonic),
     ] {
         let hits = coordinator
-            .fanout_hybrid("bx", "zebra", &query, 8, None, legs, false)
+            .fanout_hybrid("bx", "zebra", &query, 8, None, legs, false, &Default::default())
             .await
             .unwrap()
             .0;
         let again = coordinator
-            .fanout_hybrid("by", "zebra", &query, 8, None, legs, false)
+            .fanout_hybrid("by", "zebra", &query, 8, None, legs, false, &Default::default())
             .await
             .unwrap()
             .0;
@@ -672,6 +676,7 @@ async fn boost_rescore_reorders_the_window() {
             legs,
             debug,
             boost,
+            ..Default::default()
         })
     };
     let global_rank = || {
@@ -824,6 +829,7 @@ async fn leg_disabling_and_vector_floor() {
             legs: Some(legs),
             debug: false,
             boost: None,
+            ..Default::default()
         })
     };
     let global_rank = HybridLegOptions {
@@ -846,6 +852,7 @@ async fn leg_disabling_and_vector_floor() {
             k: 8,
             vector: query.clone(),
             collapse_parents: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -994,12 +1001,12 @@ async fn two_level_fallback_is_reachable_and_deterministic() {
     let query = corpus[..DIM].to_vec();
 
     let first = coordinator
-        .fanout_hybrid("t1", "zebra", &query, 8, None, legs_two_level(), false)
+        .fanout_hybrid("t1", "zebra", &query, 8, None, legs_two_level(), false, &Default::default())
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_hybrid("t2", "zebra", &query, 8, None, legs_two_level(), false)
+        .fanout_hybrid("t2", "zebra", &query, 8, None, legs_two_level(), false, &Default::default())
         .await
         .unwrap()
         .0;
@@ -1125,7 +1132,7 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
             .with_bm25(Some(analysis.clone()), Default::default());
         runs.push(
             coordinator
-                .fanout_hybrid("h", "zebra", &query, 8, None, legs_default(), false)
+                .fanout_hybrid("h", "zebra", &query, 8, None, legs_default(), false, &Default::default())
                 .await
                 .unwrap()
                 .0,
@@ -1201,12 +1208,12 @@ async fn debug_block_profiles_every_fusion_mode() {
         legs_blend(Normalization::MinMax, Combination::Arithmetic),
     ] {
         let (plain, no_debug) = coordinator
-            .fanout_hybrid("p", "zebra", &query, 8, None, legs, false)
+            .fanout_hybrid("p", "zebra", &query, 8, None, legs, false, &Default::default())
             .await
             .unwrap();
         assert!(no_debug.is_none(), "debug=false must not build a profile");
         let (hits, debug) = coordinator
-            .fanout_hybrid("d", "zebra", &query, 8, None, legs, true)
+            .fanout_hybrid("d", "zebra", &query, 8, None, legs, true, &Default::default())
             .await
             .unwrap();
         assert_eq!(ids(&plain), ids(&hits), "debug changed the results");
@@ -1230,12 +1237,12 @@ async fn debug_block_profiles_every_fusion_mode() {
     }
 
     let (plain, no_debug) = coordinator
-        .fanout_cascade("cp", "zebra", &query, 4, None, 0.0, false)
+        .fanout_cascade("cp", "zebra", &query, 4, None, 0.0, false, &Default::default())
         .await
         .unwrap();
     assert!(no_debug.is_none());
     let (hits, debug) = coordinator
-        .fanout_cascade("cd", "zebra", &query, 4, None, 0.0, true)
+        .fanout_cascade("cd", "zebra", &query, 4, None, 0.0, true, &Default::default())
         .await
         .unwrap();
     let cascade_sig = |hits: &[turbovec_search::pb::CascadeHit]| {
@@ -1313,7 +1320,7 @@ async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
 
     // Control: both legs on, both legs report work.
     let (_, debug) = coordinator
-        .fanout_hybrid("both", "zebra", &query, 8, None, legs_default(), true)
+        .fanout_hybrid("both", "zebra", &query, 8, None, legs_default(), true, &Default::default())
         .await
         .unwrap();
     let debug = debug.unwrap();
@@ -1339,6 +1346,7 @@ async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
                 ..legs_default()
             },
             true,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1370,6 +1378,7 @@ async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
                 ..legs_default()
             },
             true,
+            &Default::default(),
         )
         .await
         .unwrap();

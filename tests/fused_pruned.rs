@@ -122,7 +122,7 @@ fn random_two_field_corpus(
                 length: name_len,
             });
         }
-        docs.push((id, format!("doc {id}"), AnalyzedDoc { fields }));
+        docs.push((id, format!("doc {id}"), AnalyzedDoc { fields, quality: None, geography: None }));
     }
     docs
 }
@@ -394,6 +394,8 @@ fn fused_ties_at_floor_and_kth_slot() {
                         length: 1,
                     },
                 ],
+                quality: None,
+                geography: None,
             },
         );
     }
@@ -481,7 +483,7 @@ fn fused_ties_at_floor_and_kth_slot() {
                 length: 1,
             });
         }
-        store.add_document(i, format!("doc {i}"), AnalyzedDoc { fields });
+        store.add_document(i, format!("doc {i}"), AnalyzedDoc { fields, quality: None, geography: None });
     }
     let path = dir.join("b.bm25");
     store.save(&path).unwrap();
@@ -565,7 +567,7 @@ fn fused_blocks_actually_skip() {
                 length: 10 + i % 5,
             },
         ];
-        store.add_document(i, format!("doc {i}"), AnalyzedDoc { fields });
+        store.add_document(i, format!("doc {i}"), AnalyzedDoc { fields, quality: None, geography: None });
     }
     let path = dir.join("s.bm25");
     store.save(&path).unwrap();
@@ -810,7 +812,7 @@ fn fused_pruned_distributed_equals_monolithic() {
                 length: 2,
             });
         }
-        AnalyzedDoc { fields }
+        AnalyzedDoc { fields, quality: None, geography: None }
     }
     fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
         let mut store = Bm25Store::with_fields(&["body", "name"]);
@@ -978,6 +980,8 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
                         length: 1,
                     },
                 ],
+                quality: None,
+                geography: None,
             },
         );
     }

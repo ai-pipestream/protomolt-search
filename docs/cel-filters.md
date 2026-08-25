@@ -160,17 +160,21 @@ filter kind was the reason geo waited.
 
 Flat and fused Bm25 both carry `filter` (forwarded verbatim, ANDed
 with `geo_filters` when both are set). `VariantSearch` carries whole
-requests, so A/B over filters works for free. The HYBRID route still
-refuses filters structurally — its vector leg has no filter machinery,
-and silently filtering only the lexical half would lie about the
-result set. That is the next increment ("semantic options"): an
-allowlist gating vector-candidate insertion, which by the same
-removal-only argument needs no new bounds math and finally makes
-hybrid facets well-defined.
+requests, so A/B over filters works for free.
 
-The debug console mirrors the engine's honesty: a CEL filter runs the
-lexical Bm25Search route, and combining it with the vector leg is
-refused with the reason, never silently degraded.
+The HYBRID route carried no filters when this document was written,
+because its vector leg had no filter machinery and silently filtering
+only the lexical half would have lied about the result set. That
+increment has since landed (`docs/vector-filters.md`): the vector scan
+takes the same resolved predicate as a slot allowlist, so
+`SearchRequest` and `HybridSearchRequest` both carry `geo_filters` and
+`filter`, every fusion mode filters both legs, and — by the same
+removal-only argument, with no new bounds math — hybrid facets are now
+well-defined (though counting them is still its own increment).
+
+The debug console follows: with the vector leg on, a filter rides the
+hybrid route; with it off, the lexical route still wins, because it
+also carries facet counts.
 
 ## Tests
 
@@ -195,8 +199,8 @@ refused with the reason, never silently degraded.
 
 ## What this increment deliberately does not do
 
-- **Hybrid filters** — the vector-leg allowlist is its own increment,
-  and the refusal stands until it exists.
+- **Hybrid filters** — the vector-leg allowlist was its own increment
+  and has since landed (`docs/vector-filters.md`).
 - **Filter-only browse** — the BM25 routes still require query terms;
   a match-all + filter route is public-API work.
 - **String ranges** (`court < "b"`) — wait for the sorted dictionary

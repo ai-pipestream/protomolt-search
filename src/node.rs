@@ -196,6 +196,26 @@ impl Default for NodeConfig {
 /// Raw leg hits as `(global_doc_id, raw_score)`, score-descending.
 type RawLeg = Vec<(u64, f64)>;
 
+/// The filter half of a leg request: the wire filters plus the geo
+/// regions already validated at the RPC boundary. Bundled because both
+/// leg routes carry the identical trio and `compute_legs` was already
+/// at the argument limit.
+struct LegFilters<'a> {
+    geo: &'a [crate::pb::GeoFilter],
+    regions: Vec<crate::geo::GeoRegion>,
+    tree: Option<&'a crate::pb::FilterExpr>,
+}
+
+/// What one shard's leg computation produced: the two raw legs plus
+/// the known-column handshakes, which travel with every filtered
+/// response so the coordinator can refuse a name no shard resolves.
+struct LegResults {
+    vector: RawLeg,
+    bm25: RawLeg,
+    geo_columns_known: Vec<bool>,
+    filter_columns_known: Vec<bool>,
+}
+
 /// The BM25 half's two storage shapes: the heap builder used during
 /// ingest, and the disk-resident mmap reader used after Flush and on
 /// startup. Once resident, a shard holds no postings or document texts
@@ -719,16 +739,21 @@ impl Bm25Shard {
     /// the traversal is the expensive half, and asking for two kinds
     /// must not pay for it twice. Range edges are validated by
     /// [`validate_range_facet_fields`] before this runs.
+    #[allow(clippy::too_many_arguments)]
     fn count_facets(
         &self,
         views: &[(&dyn Bm25Index, &[String])],
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
+        stats_fields: &[String],
+        cardinality_fields: &[String],
         filter: crate::bm25::FilterCtx,
     ) -> (
         Vec<crate::pb::FacetFieldCounts>,
         Vec<crate::pb::RangeFacetCounts>,
+        Vec<crate::pb::ColumnStats>,
+        Vec<crate::pb::FacetDistinct>,
     ) {
         let n_slots = self.next_doc_id() as usize;
         let mut bits = vec![0u64; n_slots.div_ceil(64)];
@@ -884,7 +909,90 @@ impl Bm25Shard {
                 }
             })
             .collect();
-        (out, ranges)
+        // Column stats: one value read per matched document per field,
+        // over the same bitmap. Absence contributes nothing — `count`
+        // is the number of documents that HELD a value, which is what
+        // makes mean = sum / count honest.
+        let stats = stats_fields
+            .iter()
+            .map(|name| {
+                let value_of: Box<dyn Fn(u32) -> Option<f64>> =
+                    if let Some(ni) = self.numeric_index(name) {
+                        Box::new(move |doc| self.numeric_value(ni, doc))
+                    } else if let Some(ii) = self.integer_index(name) {
+                        Box::new(move |doc| self.integer_value(ii, doc).map(|v| v as f64))
+                    } else {
+                        return crate::pb::ColumnStats {
+                            field: name.clone(),
+                            known: false,
+                            ..Default::default()
+                        };
+                    };
+                let mut out = crate::pb::ColumnStats {
+                    field: name.clone(),
+                    known: true,
+                    min: f64::INFINITY,
+                    max: f64::NEG_INFINITY,
+                    ..Default::default()
+                };
+                for (wi, &word) in bits.iter().enumerate() {
+                    let mut w = word;
+                    while w != 0 {
+                        let doc = (wi * 64) as u32 + w.trailing_zeros();
+                        if let Some(v) = value_of(doc) {
+                            out.count += 1;
+                            out.sum += v;
+                            out.min = out.min.min(v);
+                            out.max = out.max.max(v);
+                        }
+                        w &= w - 1;
+                    }
+                }
+                if out.count == 0 {
+                    out.min = 0.0;
+                    out.max = 0.0;
+                }
+                out
+            })
+            .collect();
+        // Distinct facet values in the match set: an ordinal bitset
+        // over this shard's dictionary, then the VALUES — ordinals are
+        // shard-local, so strings are the only union-able currency the
+        // coordinator can merge.
+        let distinct = cardinality_fields
+            .iter()
+            .map(|name| {
+                let Some(fi) = self.facet_index(name) else {
+                    return crate::pb::FacetDistinct {
+                        field: name.clone(),
+                        known: false,
+                        values: Vec::new(),
+                    };
+                };
+                let n_values = self.facet_value_count(fi);
+                let mut present = vec![0u64; n_values.div_ceil(64)];
+                for (wi, &word) in bits.iter().enumerate() {
+                    let mut w = word;
+                    while w != 0 {
+                        let doc = (wi * 64) as u32 + w.trailing_zeros();
+                        if let Some(ord) = self.facet_ord(fi, doc) {
+                            present[ord as usize / 64] |= 1u64 << (ord % 64);
+                        }
+                        w &= w - 1;
+                    }
+                }
+                let values = (0..n_values as u32)
+                    .filter(|&ord| present[ord as usize / 64] >> (ord % 64) & 1 == 1)
+                    .map(|ord| self.facet_value(fi, ord).to_string())
+                    .collect();
+                crate::pb::FacetDistinct {
+                    field: name.clone(),
+                    known: true,
+                    values,
+                }
+            })
+            .collect();
+        (out, ranges, stats, distinct)
     }
 
     /// Resolve a range facet's column against THIS shard's tables:
@@ -1266,6 +1374,101 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     }
     fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
         self.0.map_facet_value_ord(ci, key_ord, doc_id)
+    }
+}
+
+/// Resolve one request's filters against one shard: the predicate the
+/// lexical heap gate uses, and the slot allowlist the vector scan uses
+/// (`docs/vector-filters.md`). Both come from the SAME resolved
+/// [`crate::filter::DocFilter`], which is the point — a fused result
+/// cannot mix a filtered half with an unfiltered one when there is one
+/// resolution and one truth.
+///
+/// The rules are the lexical leg's rules, unchanged: absence fails, a
+/// name this shard lacks resolves to absent for every document, and the
+/// coordinator refuses a name NO shard resolves. A shard with no
+/// lexical half therefore has no columns and admits nothing — exact,
+/// since its documents genuinely hold no value — while a shard still
+/// bulk-building refuses, because "no columns yet" is a transient state
+/// and answering it as an empty result would be a silent lie.
+///
+/// `None` allowlist means the request carried no filters, which every
+/// scan path reads as "scan everything". That is deliberately not the
+/// same as an all-true allowlist: an unfiltered scan batches with every
+/// other unfiltered scan and takes a path bit-identical to the one it
+/// took before filters existed.
+fn resolve_shard_filters(
+    bm25: Option<&Bm25Shard>,
+    n: usize,
+    geo_filters: &[crate::pb::GeoFilter],
+    geo_regions: &[crate::geo::GeoRegion],
+    filter: Option<&crate::pb::FilterExpr>,
+) -> Result<(Option<crate::filter::DocFilter>, Option<Vec<bool>>), Status> {
+    if geo_filters.is_empty() && filter.is_none() {
+        return Ok((None, None));
+    }
+    let Some(store) = bm25 else {
+        return Ok((None, Some(vec![false; n])));
+    };
+    if store.as_index().is_none() {
+        return Err(Status::failed_precondition(
+            "bm25 bulk build in progress; Flush before filtering the vector leg",
+        ));
+    }
+    let doc_filter = crate::filter::DocFilter {
+        geo: store.resolve_geo_filters(geo_filters, geo_regions),
+        pred: filter.map(|f| store.resolve_filter(f)),
+    };
+    let allow = {
+        let cols = ShardNumericRead(store);
+        (0..n as u32)
+            .map(|slot| doc_filter.passes(slot, &cols))
+            .collect()
+    };
+    Ok((Some(doc_filter), Some(allow)))
+}
+
+/// The two known-column handshakes for one request, in the shape every
+/// response carries them: which requested geo columns this shard's
+/// table has, and which leaves of the filter tree it can resolve
+/// ([`crate::filter::walk_leaves`] order). Computed regardless of `k`
+/// and regardless of whether the shard scores, so a typo refuses even
+/// on a query that would legitimately return nothing.
+fn filter_known_flags(
+    bm25: Option<&Bm25Shard>,
+    geo_filters: &[crate::pb::GeoFilter],
+    filter: Option<&crate::pb::FilterExpr>,
+) -> (Vec<bool>, Vec<bool>) {
+    let geo = match bm25 {
+        Some(store) => store.geo_columns_known(geo_filters),
+        None => vec![false; geo_filters.len()],
+    };
+    let tree = match (bm25, filter) {
+        (Some(store), Some(f)) => store.filter_columns_known(f),
+        (None, Some(f)) => vec![false; crate::filter::leaf_count(f)],
+        (_, None) => Vec::new(),
+    };
+    (geo, tree)
+}
+
+/// Order-preserving u64 key for an i64 value: offset binary, so the
+/// unsigned comparison of the results matches the signed comparison of
+/// the inputs (docs/query-api.md, sorted browse).
+fn i64_order_bits(x: i64) -> u64 {
+    (x as u64) ^ (1u64 << 63)
+}
+
+/// Order-preserving u64 key for a (finite) f64 value: the sign-flip
+/// trick — negatives flip every bit, positives set the sign bit — so
+/// unsigned comparison matches numeric order. NaN never reaches this
+/// (NaN is the f64 column's absence sentinel and absent values are
+/// excluded before keying).
+fn f64_order_bits(x: f64) -> u64 {
+    let bits = x.to_bits();
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1u64 << 63)
     }
 }
 
@@ -1853,17 +2056,32 @@ pub fn scan_batch_counters() -> (u64, u64) {
 }
 
 /// One shard scan queued for a batched kernel pass.
+/// One completed shard scan, with the handshake flags that let the
+/// coordinator refuse a filter column no shard resolves.
+struct ScanOutcome {
+    hits: Vec<ChunkHit>,
+    stats: ScanStats,
+    geo_columns_known: Vec<bool>,
+    filter_columns_known: Vec<bool>,
+}
+
 struct ScanJob {
     vector: Vec<f32>,
     k: usize,
     tie_complete: bool,
+    /// The request's filters, resolved into an allowlist by the batch
+    /// runner under the SAME read guard the scan holds, so the columns
+    /// and the index a scan sees are one snapshot.
+    geo_filters: Vec<crate::pb::GeoFilter>,
+    geo_regions: Vec<crate::geo::GeoRegion>,
+    filter: Option<crate::pb::FilterExpr>,
     /// Polled between chunks for the best coordinator-pushed floor
     /// (returns `None` when floor sharing is off or no floor arrived).
     external: Box<dyn FnMut() -> Option<f32> + Send>,
     /// Receives this query's k-th-best raises (the caller bakes in the
     /// share gate and delta filter).
     publish: Box<dyn FnMut(f32) -> bool + Send>,
-    done: tokio::sync::oneshot::Sender<Result<(Vec<ChunkHit>, ScanStats), Status>>,
+    done: tokio::sync::oneshot::Sender<Result<ScanOutcome, Status>>,
 }
 
 /// Batch former: one scan slot at a time per permit, and every job that
@@ -1925,7 +2143,10 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
     // been swapped (InstallSnapshot) between the RPC's validation and this
     // batch winning a slot.
     let dim = index.dim_opt();
+    let slots = index.len();
     let mut specs: Vec<(Vec<f32>, usize, bool)> = Vec::with_capacity(batch.len());
+    let mut allows: Vec<Option<Vec<bool>>> = Vec::with_capacity(batch.len());
+    let mut knowns: Vec<(Vec<bool>, Vec<bool>)> = Vec::with_capacity(batch.len());
     let mut externals: Vec<Box<dyn FnMut() -> Option<f32> + Send>> = Vec::new();
     let mut publishers: Vec<Box<dyn FnMut(f32) -> bool + Send>> = Vec::new();
     let mut dones = Vec::new();
@@ -1937,6 +2158,26 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
             ))));
             continue;
         }
+        let resolved = resolve_shard_filters(
+            guard.bm25.as_ref(),
+            slots,
+            &job.geo_filters,
+            &job.geo_regions,
+            job.filter.as_ref(),
+        );
+        let allow = match resolved {
+            Ok((_, allow)) => allow,
+            Err(e) => {
+                let _ = job.done.send(Err(e));
+                continue;
+            }
+        };
+        knowns.push(filter_known_flags(
+            guard.bm25.as_ref(),
+            &job.geo_filters,
+            job.filter.as_ref(),
+        ));
+        allows.push(allow);
         specs.push((job.vector, job.k, job.tie_complete));
         externals.push(job.external);
         publishers.push(job.publish);
@@ -1947,10 +2188,12 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
     }
     let queries: Vec<BatchQuery> = specs
         .iter()
-        .map(|(vector, k, keep_ties)| BatchQuery {
+        .zip(&allows)
+        .map(|((vector, k, keep_ties), allow)| BatchQuery {
             vector,
             k: *k,
             keep_ties: *keep_ties,
+            allow: allow.as_deref(),
         })
         .collect();
     let results = chunked_topk_batch(
@@ -1960,8 +2203,16 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
         &mut |qi| (externals[qi])(),
         &mut |qi, floor| (publishers[qi])(floor),
     );
-    for (done, result) in dones.into_iter().zip(results) {
-        let _ = done.send(Ok(result));
+    for ((done, (hits, stats)), (geo_columns_known, filter_columns_known)) in
+        dones.into_iter().zip(results).zip(knowns)
+    {
+        crate::metrics::record_scan(&stats);
+        let _ = done.send(Ok(ScanOutcome {
+            hits,
+            stats,
+            geo_columns_known,
+            filter_columns_known,
+        }));
     }
 }
 
@@ -2168,6 +2419,23 @@ impl NodeServiceImpl {
     /// (~160 KiB), but the limit is set explicitly so it never silently
     /// depends on a library default. NOTE: the cap also bounds AddVectors
     /// batch messages; clients should keep batches well under it.
+    /// A metrics gauge sampler over this shard's live state
+    /// (`docs/metrics.md`): called at scrape time, reads under the
+    /// state lock, and so can never go stale.
+    pub fn metrics_provider(&self) -> crate::metrics::GaugeProvider {
+        let state = Arc::clone(&self.state);
+        let slot_offset = self.config.slot_offset;
+        Box::new(move || {
+            let guard = state.read().expect("shard state lock poisoned");
+            crate::metrics::ShardGauges {
+                slot_offset,
+                vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
+                documents: guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
+                stats_epoch: guard.stats_epoch,
+            }
+        })
+    }
+
     pub fn into_server(self, max_message_bytes: usize) -> NodeServiceServer<Self> {
         NodeServiceServer::new(self)
             .max_decoding_message_size(max_message_bytes)
@@ -2800,11 +3068,15 @@ impl NodeServiceImpl {
                         .zip(&leg_of_view)
                         .map(|(view, &li)| (view.as_ref(), req.fields[li].terms.as_slice()))
                         .collect();
-                    (facets, range_facets) = store.count_facets(
+                    // The fused route refuses stats/cardinality
+                    // upstream, like score stages.
+                    (facets, range_facets, _, _) = store.count_facets(
                         &pairs,
                         &req.facet_fields,
                         &req.map_facet_fields,
                         &req.range_facet_fields,
+                        &[],
+                        &[],
                         filter_ctx,
                     );
                 }
@@ -2929,14 +3201,18 @@ impl NodeServiceImpl {
             hits,
             kth_best,
             facets,
-            // The fused route refuses score stages upstream.
+            // The fused route refuses score stages upstream, and
+            // stats/cardinality with them.
             stage_columns_known: Vec::new(),
+            stats: Vec::new(),
+            distinct: Vec::new(),
             range_facets,
             geo_columns_known,
             filter_columns_known,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compute_legs(
         &self,
         vector: &[f32],
@@ -2947,9 +3223,24 @@ impl NodeServiceImpl {
         params: Bm25Params,
         k: usize,
         expected_stats_epoch: u64,
-    ) -> Result<(RawLeg, RawLeg), Status> {
+        filters: &LegFilters<'_>,
+    ) -> Result<LegResults, Status> {
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(expected_stats_epoch)?;
+        // One resolution for both legs (docs/vector-filters.md): the
+        // allowlist the vector kernel scans under and the predicate the
+        // lexical heap gate applies are the same DocFilter, so the two
+        // halves of a fused list cannot disagree about what matched.
+        let (geo_columns_known, filter_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), filters.geo, filters.tree);
+        let slots = guard.index.as_ref().map_or(0, |index| index.len());
+        let (doc_filter, allow) = resolve_shard_filters(
+            guard.bm25.as_ref(),
+            slots,
+            filters.geo,
+            &filters.regions,
+            filters.tree,
+        )?;
 
         let mut vector_leg: Vec<(u64, f64)> = Vec::new();
         if k > 0 && !vector.is_empty() {
@@ -2974,6 +3265,7 @@ impl NodeServiceImpl {
                     &mut || None,
                     &mut |_| false,
                     false,
+                    allow.as_deref(),
                 );
                 vector_leg = hits
                     .into_iter()
@@ -3012,10 +3304,25 @@ impl NodeServiceImpl {
                         .all(|(ti, t)| {
                             stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
                         });
+                let numeric_read = ShardNumericRead(store);
+                let filter_ctx: bm25::FilterCtx = doc_filter
+                    .as_ref()
+                    .map(|f| (f, &numeric_read as &dyn crate::scorefn::NumericRead));
                 let docs = if prunable {
-                    bm25::top_k_pruned(index, terms, &stats, params, k, f64::NEG_INFINITY)
+                    let mut prune = bm25::PruneStats::default();
+                    bm25::top_k_pruned_chained_filtered_stats(
+                        index,
+                        terms,
+                        &stats,
+                        params,
+                        k,
+                        f64::NEG_INFINITY,
+                        None,
+                        filter_ctx,
+                        &mut prune,
+                    )
                 } else {
-                    bm25::top_k(index, terms, &stats, params, k)
+                    bm25::top_k_chained_filtered(index, terms, &stats, params, k, None, filter_ctx)
                 };
                 bm25_leg = docs
                     .into_iter()
@@ -3024,7 +3331,12 @@ impl NodeServiceImpl {
             }
         }
 
-        Ok((vector_leg, bm25_leg))
+        Ok(LegResults {
+            vector: vector_leg,
+            bm25: bm25_leg,
+            geo_columns_known,
+            filter_columns_known,
+        })
     }
 
     /// Level one of the two-level hybrid fusion: run both legs locally
@@ -3047,7 +3359,11 @@ impl NodeServiceImpl {
             return Err(Status::invalid_argument("rrf_k must be positive"));
         }
 
-        let (vector_leg, bm25_leg) = self.compute_legs(
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        if let Some(f) = req.filter.as_ref() {
+            crate::filter::validate_filter(f)?;
+        }
+        let legs = self.compute_legs(
             &req.vector,
             &req.terms,
             req.global_doc_count,
@@ -3056,16 +3372,23 @@ impl NodeServiceImpl {
             params_from(req.k1, req.b)?,
             k,
             req.expected_stats_epoch,
+            &LegFilters {
+                geo: &req.geo_filters,
+                regions: geo_regions,
+                tree: req.filter.as_ref(),
+            },
         )?;
+        let geo_columns_known = legs.geo_columns_known;
+        let filter_columns_known = legs.filter_columns_known;
 
         let fused = fusion::rrf_fuse(
             &[
                 Leg {
-                    hits: vector_leg,
+                    hits: legs.vector,
                     weight: vector_weight,
                 },
                 Leg {
-                    hits: bm25_leg,
+                    hits: legs.bm25,
                     weight: bm25_weight,
                 },
             ],
@@ -3084,6 +3407,8 @@ impl NodeServiceImpl {
                     bm25_score: h.leg_scores[1].unwrap_or(0.0) as f32,
                 })
                 .collect(),
+            geo_columns_known,
+            filter_columns_known,
         })
     }
 }
@@ -3338,6 +3663,8 @@ fn join_fields(
     }
     let n = extras.iter().map(|&(fi, _)| fi + 1).max().unwrap_or(1);
     let mut fields = vec![crate::postings::AnalyzedField::default(); n];
+    let quality = body.quality;
+    let geography = body.geography.clone();
     fields[0] = body.into_body();
     for (fi, analyzed) in extras {
         fields[fi] = analyzed.ok_or_else(|| {
@@ -3347,7 +3674,137 @@ fn join_fields(
             ))
         })?;
     }
-    Ok(crate::postings::AnalyzedDoc { fields })
+    Ok(crate::postings::AnalyzedDoc {
+        fields,
+        quality,
+        geography,
+    })
+}
+
+/// Whether an ingest asked for any quality column at all. An empty
+/// spec (every column name blank) asks for nothing, and must not make
+/// the node request layers the caller will not store.
+fn quality_wanted(spec: Option<&crate::pb::QualitySpec>) -> bool {
+    spec.is_some_and(|q| {
+        !q.noise_column.is_empty()
+            || !q.noise_chars_column.is_empty()
+            || !q.artifact_column.is_empty()
+    })
+}
+
+/// Whether an ingest asked for any geography column at all. Same
+/// blank-spec rule as [`quality_wanted`]: a spec with every column
+/// name empty asks for nothing and must not make the session request
+/// (and pay for) the geocoding layer.
+fn geography_wanted(spec: Option<&crate::pb::GeographySpec>) -> bool {
+    spec.is_some_and(|g| {
+        !g.point_column.is_empty()
+            || !g.country_column.is_empty()
+            || !g.confidence_column.is_empty()
+    })
+}
+
+/// The optional sidecar layers a document's specs ask its analysis
+/// session for — the session-identity companion to the reopen
+/// condition (a change to either spec reopens the session).
+fn session_layers(doc: &AddDocumentsRequest) -> crate::analyzer::SessionLayers {
+    crate::analyzer::SessionLayers {
+        quality: quality_wanted(doc.quality.as_ref()),
+        geography: geography_wanted(doc.geography.as_ref()),
+    }
+}
+
+/// Fold a document's derived quality scalars into its own `numerics` /
+/// `integers` lists and clear the spec (`docs/quality-columns.md`).
+///
+/// A spec that names columns but whose analysis produced no measurement
+/// is a contract break between the session's options and its responses,
+/// not a document that happens to be clean: a clean document measures
+/// `noise = 0`. It refuses rather than silently writing zeros.
+fn materialize_quality(
+    mut doc: AddDocumentsRequest,
+    analyzed: &crate::postings::AnalyzedDoc,
+) -> Result<AddDocumentsRequest, Status> {
+    let Some(spec) = doc.quality.take() else {
+        return Ok(doc);
+    };
+    if !quality_wanted(Some(&spec)) {
+        return Ok(doc);
+    }
+    let Some(quality) = analyzed.quality else {
+        return Err(Status::internal(
+            "quality columns were requested but the analysis session returned no quality layers; \
+             the sidecar's options and its responses disagree",
+        ));
+    };
+    if !spec.noise_column.is_empty() {
+        doc.numerics.push(crate::pb::NumericValue {
+            field: spec.noise_column,
+            value: quality.noise,
+        });
+    }
+    if !spec.noise_chars_column.is_empty() {
+        doc.integers.push(crate::pb::IntegerValue {
+            field: spec.noise_chars_column,
+            value: quality.noise_chars,
+        });
+    }
+    if !spec.artifact_column.is_empty() {
+        doc.integers.push(crate::pb::IntegerValue {
+            field: spec.artifact_column,
+            value: quality.artifacts,
+        });
+    }
+    Ok(doc)
+}
+
+/// Fold a document's geography reduction into its own `geo_points` /
+/// `facets` / `numerics` lists and clear the spec
+/// (`docs/geography-columns.md`) — [`materialize_quality`]'s shape
+/// over the geocoding layer, with one deliberate difference: absence
+/// is a legitimate measurement here. A document that mentions no
+/// resolvable place writes NO point and NO confidence (there is no
+/// neutral coordinate; (0,0) is a real place), and no top region vote
+/// writes no country. Filters then treat it by the documented absence
+/// rules instead of finding it "at" a fabricated location.
+fn materialize_geography(
+    mut doc: AddDocumentsRequest,
+    analyzed: &crate::postings::AnalyzedDoc,
+) -> Result<AddDocumentsRequest, Status> {
+    let Some(spec) = doc.geography.take() else {
+        return Ok(doc);
+    };
+    if !geography_wanted(Some(&spec)) {
+        return Ok(doc);
+    }
+    let Some(geography) = analyzed.geography.as_ref() else {
+        return Err(Status::internal(
+            "geography columns were requested but the analysis session returned no \
+             geocoding layer; the sidecar's options and its responses disagree",
+        ));
+    };
+    if let Some((lat, lon)) = geography.point {
+        if !spec.point_column.is_empty() {
+            doc.geo_points.push(crate::pb::GeoPointValue {
+                field: spec.point_column,
+                lat,
+                lon,
+            });
+        }
+        if !spec.confidence_column.is_empty() {
+            doc.numerics.push(crate::pb::NumericValue {
+                field: spec.confidence_column,
+                value: geography.confidence,
+            });
+        }
+    }
+    if !geography.country.is_empty() && !spec.country_column.is_empty() {
+        doc.facets.push(crate::pb::FacetValue {
+            field: spec.country_column,
+            value: geography.country.clone(),
+        });
+    }
+    Ok(doc)
 }
 
 /// Bulk-ingest internals: the two analysis transports and the shared
@@ -3427,6 +3884,15 @@ impl NodeServiceImpl {
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
+        // Quality columns are materialized BEFORE anything else looks at
+        // the request (docs/quality-columns.md): the derived values join
+        // the ordinary `numerics` / `integers` lists, so name resolution,
+        // the duplicate-column refusal, the apply, and the WAL record all
+        // take the one path they already took. Clearing the spec is what
+        // makes replay exact — the logged request carries the values, so
+        // replay never calls the sidecar and never derives twice.
+        let doc = materialize_quality(doc, &analyzed)?;
+        let doc = materialize_geography(doc, &analyzed)?;
         let mut guard = self.state.write().expect("shard state lock poisoned");
         // A disk-resident shard that receives more documents is first
         // reloaded into the heap builder (the append path is
@@ -3867,6 +4333,10 @@ impl NodeServiceImpl {
                 )),
             }
         }
+        // One Step lives at a time, on the stack of this loop; boxing
+        // the request to shrink the enum would cost an allocation per
+        // ingested document for no held memory.
+        #[allow(clippy::large_enum_variant)]
         enum Step {
             Doc(AddDocumentsRequest),
             InboundClosed,
@@ -3874,6 +4344,8 @@ impl NodeServiceImpl {
             Field(Option<FieldEvent>),
         }
         let mut spec = first.analysis.clone();
+        let mut quality = first.quality.clone();
+        let mut geography = first.geography.clone();
         let mut submit = Some(session.submitter());
         // The body session covers the BODY only; extra fields ride their
         // own per-spec sessions, and a document applies once its body and
@@ -3936,7 +4408,13 @@ impl NodeServiceImpl {
                     let extras = self
                         .submit_field_analyses(&doc, next_seq, &mut fields, &mut route)
                         .await?;
-                    if doc.analysis != spec {
+                    // The quality layers are requested in the session's
+                    // options message, so a change to them reopens the
+                    // session for the same reason a spec change does.
+                    if doc.analysis != spec
+                        || doc.quality != quality
+                        || doc.geography != geography
+                    {
                         // A mid-stream BODY spec change (rare): collect
                         // what the current session still owes so nothing
                         // is lost when it is replaced, then open a new
@@ -3966,9 +4444,12 @@ impl NodeServiceImpl {
                             addr,
                             doc.analysis.as_ref(),
                             self.vocab.clone(),
+                            session_layers(&doc),
                         )
                         .await?;
                         spec = doc.analysis.clone();
+                        quality = doc.quality.clone();
+                        geography = doc.geography.clone();
                         submit = Some(session.submitter());
                     }
                     submit
@@ -4039,6 +4520,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<SearchShardRequest>>,
     ) -> Result<Response<Self::SearchShardStream>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::SearchShard);
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
         let state = self.state.clone();
@@ -4064,6 +4546,23 @@ impl NodeService for NodeServiceImpl {
                     return;
                 }
             };
+            // Filter validation is shape-only and shard-independent, so
+            // it happens once here rather than inside the scan: a
+            // malformed tree must refuse before any work, exactly as on
+            // the lexical routes.
+            let geo_regions = match validate_geo_filters(&start.geo_filters) {
+                Ok(regions) => regions,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            if let Some(f) = start.filter.as_ref() {
+                if let Err(e) = crate::filter::validate_filter(f) {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
 
             // Floor updates arrive on the same stream; a pump task folds
             // them into a watch cell the blocking scan polls between chunks.
@@ -4167,6 +4666,7 @@ impl NodeService for NodeServiceImpl {
                 }
                 let mut external_floor = external_floor;
                 let mut publish_floor = publish_floor;
+                let geo_regions = geo_regions.clone();
                 let scan = tokio::task::spawn_blocking(move || {
                     let n = {
                         let guard = state.read().expect("shard state lock poisoned");
@@ -4188,7 +4688,21 @@ impl NodeService for NodeServiceImpl {
                     if index.len() != parents.len() {
                         return Err(Status::aborted("shard grew between setup and scan; retry"));
                     }
-                    Ok(chunked_topk_collapsed(
+                    // Filters remove chunks, and a parent's score is the
+                    // max over its SURVIVING chunks, so collapse under a
+                    // filter is the collapse of the filtered corpus —
+                    // still every floor a valid lower bound, still no new
+                    // pruning math.
+                    let (_, allow) = resolve_shard_filters(
+                        guard.bm25.as_ref(),
+                        index.len(),
+                        &start.geo_filters,
+                        &geo_regions,
+                        start.filter.as_ref(),
+                    )?;
+                    let known =
+                        filter_known_flags(guard.bm25.as_ref(), &start.geo_filters, start.filter.as_ref());
+                    let (hits, stats) = chunked_topk_collapsed(
                         index,
                         &start.vector,
                         start.k as usize,
@@ -4196,14 +4710,16 @@ impl NodeService for NodeServiceImpl {
                         &parents,
                         &mut external_floor,
                         &mut publish_floor,
-                    ))
+                        allow.as_deref(),
+                    );
+                    Ok((hits, stats, known))
                 });
                 let outcome = match scan.await {
                     Ok(result) => result,
                     Err(e) => Err(Status::internal(format!("collapse scan task failed: {e}"))),
                 };
                 match outcome {
-                    Ok((hits, stats)) => {
+                    Ok((hits, stats, (geo_columns_known, filter_columns_known))) => {
                         let done = SearchShardDone {
                             hits: hits
                                 .into_iter()
@@ -4220,6 +4736,8 @@ impl NodeService for NodeServiceImpl {
                                 floor_updates_applied: stats.floor_updates_applied,
                                 floors_offered: stats.floors_offered,
                             }),
+                            geo_columns_known,
+                            filter_columns_known,
                         };
                         let _ = tx
                             .send(Ok(SearchShardResponse {
@@ -4234,7 +4752,7 @@ impl NodeService for NodeServiceImpl {
                 return;
             }
 
-            let outcome: Result<(Vec<ChunkHit>, ScanStats), Status> = match scan_queue {
+            let outcome: Result<ScanOutcome, Status> = match scan_queue {
                 Some(jobs) => {
                     // Coalesced path: validate against the current index
                     // cheaply, then queue for a batched kernel pass. The
@@ -4256,6 +4774,9 @@ impl NodeService for NodeServiceImpl {
                                 vector: start.vector.clone(),
                                 k: start.k as usize,
                                 tie_complete: start.tie_complete,
+                                geo_filters: start.geo_filters.clone(),
+                                geo_regions: geo_regions.clone(),
+                                filter: start.filter.clone(),
                                 external: Box::new(external_floor),
                                 publish: Box::new(publish_floor),
                                 done: done_tx,
@@ -4292,7 +4813,19 @@ impl NodeService for NodeServiceImpl {
                             )
                         })?;
                         Self::validate_start(index, &start)?;
-                        Ok(chunked_topk(
+                        let (_, allow) = resolve_shard_filters(
+                            guard.bm25.as_ref(),
+                            index.len(),
+                            &start.geo_filters,
+                            &geo_regions,
+                            start.filter.as_ref(),
+                        )?;
+                        let (geo_columns_known, filter_columns_known) = filter_known_flags(
+                            guard.bm25.as_ref(),
+                            &start.geo_filters,
+                            start.filter.as_ref(),
+                        );
+                        let (hits, stats) = chunked_topk(
                             index,
                             &start.vector,
                             start.k as usize,
@@ -4300,7 +4833,15 @@ impl NodeService for NodeServiceImpl {
                             &mut external_floor,
                             &mut publish_floor,
                             start.tie_complete,
-                        ))
+                            allow.as_deref(),
+                        );
+                        crate::metrics::record_scan(&stats);
+                        Ok(ScanOutcome {
+                            hits,
+                            stats,
+                            geo_columns_known,
+                            filter_columns_known,
+                        })
                     });
                     match scan.await {
                         Ok(result) => result,
@@ -4310,7 +4851,12 @@ impl NodeService for NodeServiceImpl {
             };
 
             match outcome {
-                Ok((hits, stats)) => {
+                Ok(ScanOutcome {
+                    hits,
+                    stats,
+                    geo_columns_known,
+                    filter_columns_known,
+                }) => {
                     let done = SearchShardDone {
                         hits: hits
                             .into_iter()
@@ -4327,6 +4873,8 @@ impl NodeService for NodeServiceImpl {
                             floor_updates_applied: stats.floor_updates_applied,
                             floors_offered: stats.floors_offered,
                         }),
+                        geo_columns_known,
+                        filter_columns_known,
                     };
                     let _ = tx
                         .send(Ok(SearchShardResponse {
@@ -4341,6 +4889,150 @@ impl NodeService for NodeServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    /// Filter-only browse: admitted ids above the floor, ascending, at
+    /// most k, or ordered by a column under `sort`. Match-all over the DOCUMENT space (bm25 postings), gated
+    /// by the same resolved filter every scored route admits through;
+    /// no scoring, no heap — the order is the id order.
+    async fn browse_shard(
+        &self,
+        request: Request<crate::pb::BrowseShardRequest>,
+    ) -> Result<Response<crate::pb::BrowseShardResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::BrowseShard);
+        let req = request.into_inner();
+        if req.k == 0 {
+            return Err(Status::invalid_argument("browse requires k > 0"));
+        }
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let (geo_columns_known, filter_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+        let slot_offset = self.config.slot_offset;
+        let Some(store) = guard.bm25.as_ref() else {
+            // A document-less shard admits nothing; its all-false known
+            // flags feed the coordinator's typo rule like everywhere.
+            return Ok(Response::new(crate::pb::BrowseShardResponse {
+                doc_ids: Vec::new(),
+                geo_columns_known,
+                filter_columns_known,
+                sort_key_bits: Vec::new(),
+                sort_keys: Vec::new(),
+                sort_column_known: false,
+            }));
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush before browsing",
+            ));
+        }
+        let n = store.doc_count();
+        // The exclusive floor in local id space. The first page carries
+        // no floor at all (proto3 cannot distinguish after = 0 from
+        // unset, so the request says which it is).
+        let start = if req.first_page || req.after < slot_offset {
+            0
+        } else {
+            (req.after - slot_offset + 1).min(n)
+        };
+        let doc_filter = crate::filter::DocFilter {
+            geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+            pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+        };
+        let cols = ShardNumericRead(store);
+        if let Some(sort) = &req.sort {
+            // Column-ordered browse: walk the FULL admitted set with a
+            // k-bounded heap. Exhaustive by construction, so the
+            // exactness certificate is trivial; per-shard exact top-k
+            // by key means the coordinator's merged union contains the
+            // global top-k (local rank <= global rank).
+            let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> =
+                if let Some(ni) = store.numeric_index(&sort.column) {
+                    Box::new(move |doc| {
+                        store
+                            .numeric_value(ni, doc)
+                            .map(|v| (f64_order_bits(v), v))
+                    })
+                } else if let Some(ii) = store.integer_index(&sort.column) {
+                    Box::new(move |doc| {
+                        store
+                            .integer_value(ii, doc)
+                            .map(|v| (i64_order_bits(v), v as f64))
+                    })
+                } else {
+                    // Unknown here; the coordinator's typo rule refuses
+                    // only when NO shard knows it.
+                    return Ok(Response::new(crate::pb::BrowseShardResponse {
+                        doc_ids: Vec::new(),
+                        geo_columns_known,
+                        filter_columns_known,
+                        sort_key_bits: Vec::new(),
+                        sort_keys: Vec::new(),
+                        sort_column_known: false,
+                    }));
+                };
+            let boundary = (!req.first_page).then_some((req.after_key_bits, req.after));
+            // Max-heap keeping the k SMALLEST (adjusted-bits, id) pairs.
+            let mut heap: std::collections::BinaryHeap<(u64, u64, u64)> =
+                std::collections::BinaryHeap::with_capacity(req.k as usize + 1);
+            for local in 0..n {
+                let doc = local as u32;
+                if !doc_filter.passes(doc, &cols) {
+                    continue;
+                }
+                // A document without a value has no honest position in
+                // a column order: excluded, same stance as the filters.
+                let Some((bits, value)) = key_of(doc) else {
+                    continue;
+                };
+                let adjusted = if sort.descending { !bits } else { bits };
+                let id = slot_offset + local;
+                if let Some(b) = boundary {
+                    if (adjusted, id) <= b {
+                        continue;
+                    }
+                }
+                heap.push((adjusted, id, value.to_bits()));
+                if heap.len() > req.k as usize {
+                    heap.pop();
+                }
+            }
+            let mut rows = heap.into_vec();
+            rows.sort_unstable();
+            let mut doc_ids = Vec::with_capacity(rows.len());
+            let mut sort_key_bits = Vec::with_capacity(rows.len());
+            let mut sort_keys = Vec::with_capacity(rows.len());
+            for (adjusted, id, value_bits) in rows {
+                doc_ids.push(id);
+                sort_key_bits.push(adjusted);
+                sort_keys.push(f64::from_bits(value_bits));
+            }
+            return Ok(Response::new(crate::pb::BrowseShardResponse {
+                doc_ids,
+                geo_columns_known,
+                filter_columns_known,
+                sort_key_bits,
+                sort_keys,
+                sort_column_known: true,
+            }));
+        }
+        let mut doc_ids = Vec::new();
+        for local in start..n {
+            if doc_filter.passes(local as u32, &cols) {
+                doc_ids.push(slot_offset + local);
+                if doc_ids.len() == req.k as usize {
+                    break;
+                }
+            }
+        }
+        Ok(Response::new(crate::pb::BrowseShardResponse {
+            doc_ids,
+            geo_columns_known,
+            filter_columns_known,
+            sort_key_bits: Vec::new(),
+            sort_keys: Vec::new(),
+            sort_column_known: req.sort.is_none(),
+        }))
     }
 
     async fn health(
@@ -4375,6 +5067,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<StreamSearchRequest>>,
     ) -> Result<Response<Self::StreamSearchStream>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::StreamSearch);
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
         let state = self.state.clone();
@@ -4407,6 +5100,21 @@ impl NodeService for NodeServiceImpl {
                     )))
                     .await;
                 return;
+            }
+            // Shape-only filter validation before any scan work, the
+            // same order the lexical routes use.
+            let geo_regions = match validate_geo_filters(&start.geo_filters) {
+                Ok(regions) => regions,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            if let Some(f) = start.filter.as_ref() {
+                if let Err(e) = crate::filter::validate_filter(f) {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             }
 
             // Floor raises and cancellation fold into one stream state that
@@ -4495,7 +5203,30 @@ impl NodeService for NodeServiceImpl {
                         }
                     }
 
+                    // The request's filters as a slot allowlist, resolved
+                    // under this scan's read guard so columns and index
+                    // are one snapshot. The streaming engine emits every
+                    // live slot at or above the floor; with an allowlist
+                    // "live" means "survived the filters", so the
+                    // completion certificate covers the filtered corpus
+                    // and means exactly what it meant before.
+                    let (_, allow) = resolve_shard_filters(
+                        guard.bm25.as_ref(),
+                        index.len(),
+                        &start.geo_filters,
+                        &geo_regions,
+                        start.filter.as_ref(),
+                    )?;
+                    let (geo_columns_known, filter_columns_known) = filter_known_flags(
+                        guard.bm25.as_ref(),
+                        &start.geo_filters,
+                        start.filter.as_ref(),
+                    );
+
                     let mut options = turbovec::SearchOptions::new();
+                    if let Some(a) = allow.as_deref() {
+                        options = options.with_mask(a);
+                    }
                     let mut floor_now = f32::NEG_INFINITY;
                     if let Some(f) = start.initial_floor {
                         options = options.with_initial_threshold(f);
@@ -4571,6 +5302,8 @@ impl NodeService for NodeServiceImpl {
                         emitted: summary.emitted as u64,
                         blocks_scanned: summary.blocks_scanned as u64,
                         floor_raises_applied: raises,
+                        geo_columns_known,
+                        filter_columns_known,
                     })
                 });
             let outcome = scan.await;
@@ -4643,6 +5376,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<AddVectorsRequest>>,
     ) -> Result<Response<AddVectorsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::AddVectors);
         let _ingest = self.claim_ingest()?;
         let mut inbound = request.into_inner();
         let mut added = 0u64;
@@ -4665,6 +5399,7 @@ impl NodeService for NodeServiceImpl {
             .index
             .as_ref()
             .map_or(0, |i| i.len() as u64);
+        crate::metrics::add_ingested(0, added);
         Ok(Response::new(AddVectorsResponse {
             added,
             total,
@@ -4731,6 +5466,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<AddDocumentsRequest>>,
     ) -> Result<Response<AddDocumentsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::AddDocuments);
         let _ingest = self.claim_ingest()?;
         let addr = self.config.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
@@ -4756,6 +5492,7 @@ impl NodeService for NodeServiceImpl {
                 &addr,
                 first.analysis.as_ref(),
                 self.vocab.clone(),
+                session_layers(&first),
             )
             .await
             {
@@ -4788,6 +5525,7 @@ impl NodeService for NodeServiceImpl {
             .bm25
             .as_ref()
             .map_or(0, |b| b.doc_count());
+        crate::metrics::add_ingested(added, 0);
         Ok(Response::new(AddDocumentsResponse {
             added,
             total,
@@ -4799,6 +5537,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<TermStatsRequest>,
     ) -> Result<Response<TermStatsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::TermStats);
         let req = request.into_inner();
         let guard = self.state.read().expect("shard state lock poisoned");
         let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard.bm25.as_ref()
@@ -4866,6 +5605,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Bm25QueryRequest>,
     ) -> Result<Response<Bm25QueryResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::Bm25Query);
         let service = self.clone();
         let req = request.into_inner();
         tokio::task::spawn_blocking(move || service.run_bm25_query(req))
@@ -4878,6 +5618,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<Bm25QueryStreamRequest>>,
     ) -> Result<Response<Self::Bm25QueryStreamStream>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::Bm25Query);
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<Bm25QueryStreamResponse, Status>>(64);
         let service = self.clone();
@@ -4988,6 +5729,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Bm25RescoreRequest>,
     ) -> Result<Response<Bm25RescoreResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::Bm25Rescore);
         let service = self.clone();
         let req = request.into_inner();
         tokio::task::spawn_blocking(move || service.run_bm25_rescore(req))
@@ -5000,6 +5742,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<VectorRescoreRequest>,
     ) -> Result<Response<VectorRescoreResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::VectorRescore);
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let state = self.state.clone();
@@ -5067,6 +5810,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<GetDocumentsRequest>,
     ) -> Result<Response<GetDocumentsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::GetDocuments);
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let guard = self.state.read().expect("shard state lock poisoned");
@@ -5101,6 +5845,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<HybridShardRequest>,
     ) -> Result<Response<HybridShardResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::HybridShard);
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.run_hybrid(request.into_inner()))
             .await
@@ -5112,15 +5857,20 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<ShardLegsRequest>,
     ) -> Result<Response<ShardLegsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::ShardLegs);
         let req = request.into_inner();
         if req.terms.len() != req.global_doc_frequencies.len() {
             return Err(Status::invalid_argument(
                 "terms and global_doc_frequencies must have the same length",
             ));
         }
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        if let Some(f) = req.filter.as_ref() {
+            crate::filter::validate_filter(f)?;
+        }
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
-            let (vector_hits, bm25_hits) = service.compute_legs(
+            let legs = service.compute_legs(
                 &req.vector,
                 &req.terms,
                 req.global_doc_count,
@@ -5129,22 +5879,31 @@ impl NodeService for NodeServiceImpl {
                 params_from(req.k1, req.b)?,
                 req.k as usize,
                 req.expected_stats_epoch,
+                &LegFilters {
+                    geo: &req.geo_filters,
+                    regions: geo_regions,
+                    tree: req.filter.as_ref(),
+                },
             )?;
             Ok(ShardLegsResponse {
-                vector_hits: vector_hits
+                vector_hits: legs
+                    .vector
                     .into_iter()
                     .map(|(doc_id, score)| RawLegHit {
                         doc_id,
                         score: score as f32,
                     })
                     .collect(),
-                bm25_hits: bm25_hits
+                bm25_hits: legs
+                    .bm25
                     .into_iter()
                     .map(|(doc_id, score)| RawLegHit {
                         doc_id,
                         score: score as f32,
                     })
                     .collect(),
+                geo_columns_known: legs.geo_columns_known,
+                filter_columns_known: legs.filter_columns_known,
             })
         })
         .await
@@ -5226,11 +5985,13 @@ impl NodeServiceImpl {
         // (see count_facets). A shard with no lexical half has no
         // facet table: every requested field is legitimately unknown
         // here.
-        let (facets, range_facets) = match guard.bm25.as_ref() {
+        let (facets, range_facets, column_stats, distinct) = match guard.bm25.as_ref() {
             Some(store)
                 if !req.facet_fields.is_empty()
                     || !req.map_facet_fields.is_empty()
-                    || !req.range_facet_fields.is_empty() =>
+                    || !req.range_facet_fields.is_empty()
+                    || !req.stats_fields.is_empty()
+                    || !req.cardinality_fields.is_empty() =>
             {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
@@ -5244,6 +6005,8 @@ impl NodeServiceImpl {
                     &req.facet_fields,
                     &req.map_facet_fields,
                     &req.range_facet_fields,
+                    &req.stats_fields,
+                    &req.cardinality_fields,
                     filter_ctx,
                 )
             }
@@ -5264,6 +6027,22 @@ impl NodeServiceImpl {
                     })
                     .collect(),
                 unknown_range_counts(&req.range_facet_fields),
+                req.stats_fields
+                    .iter()
+                    .map(|name| crate::pb::ColumnStats {
+                        field: name.clone(),
+                        known: false,
+                        ..Default::default()
+                    })
+                    .collect(),
+                req.cardinality_fields
+                    .iter()
+                    .map(|name| crate::pb::FacetDistinct {
+                        field: name.clone(),
+                        known: false,
+                        values: Vec::new(),
+                    })
+                    .collect(),
             ),
         };
         // Which stage columns this shard's numeric table has —
@@ -5415,6 +6194,8 @@ impl NodeServiceImpl {
             kth_best,
             facets,
             stage_columns_known,
+            stats: column_stats,
+            distinct,
             range_facets,
             geo_columns_known,
             filter_columns_known,

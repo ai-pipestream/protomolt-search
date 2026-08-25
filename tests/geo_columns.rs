@@ -96,6 +96,8 @@ async fn add_documents_geo(
                     lon: *lon,
                 })
                 .collect(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -853,6 +855,8 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
             map_facet_fields: Vec::new(),
             range_facet_fields: Vec::new(),
             geo_filters: vec![bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await

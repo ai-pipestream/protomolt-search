@@ -14,6 +14,7 @@
 //! ```toml
 //! role = "both"                        # node | coordinator | both
 //! coord_listen = "0.0.0.0:50050"
+//! metrics_listen = "127.0.0.1:9100"    # optional Prometheus page (docs/metrics.md)
 //! nodes = ["host-a:50051", "host-b:50051"]  # fan-out order = tie-break order
 //! chunk_blocks = 64
 //! floor_sharing = true
@@ -120,6 +121,10 @@ pub struct Config {
     pub role: Role,
     /// Listen address for `SearchService` (roles coordinator/both).
     pub coord_listen: SocketAddr,
+    /// Listen address for the Prometheus metrics page
+    /// (`docs/metrics.md`). `None` (the default) serves no metrics.
+    /// There is no auth on the page; bind a trusted interface.
+    pub metrics_listen: Option<SocketAddr>,
     /// Shard node addresses (`http://host:port`) for the coordinator, in
     /// fan-out order (= shard index for merge tie-breaks).
     pub node_addrs: Vec<String>,
@@ -254,6 +259,7 @@ struct FileConfig {
     role: Option<String>,
     node_listen: Option<String>,
     coord_listen: Option<String>,
+    metrics_listen: Option<String>,
     nodes: Option<Vec<String>>,
     index: Option<String>,
     slot_offset: Option<u64>,
@@ -385,6 +391,18 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     .unwrap_or_else(|| "0.0.0.0:50050".to_string())
     .parse::<SocketAddr>()
     .map_err(|e| format!("invalid coordinator listen address: {e}"))?;
+
+    let metrics_listen = opt(
+        args,
+        "metrics-listen",
+        "TURBOVEC_METRICS_LISTEN",
+        file.metrics_listen.as_deref(),
+    )
+    .map(|a| {
+        a.parse::<SocketAddr>()
+            .map_err(|e| format!("invalid metrics listen address: {e}"))
+    })
+    .transpose()?;
 
     // Coordinator fan-out list. A shard map (--shard-map) REPLACES
     // --nodes: it carries the same addresses plus topology metadata.
@@ -954,6 +972,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     Ok(Config {
         role,
         coord_listen,
+        metrics_listen,
         node_addrs,
         shards,
         chunk_blocks,

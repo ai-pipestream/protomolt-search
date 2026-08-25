@@ -44,6 +44,8 @@ async fn add_documents(addr: &str, texts: &[&str]) {
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -165,6 +167,8 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         expected_stats_epoch: claim,
         range_facet_fields: Vec::new(),
         geo_filters: Vec::new(),
+        stats_fields: Vec::new(),
+        cardinality_fields: Vec::new(),
     };
 
     let with_claim = client
@@ -332,6 +336,8 @@ async fn fused_repeated_query_reuses_cached_stats() {
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .unwrap();

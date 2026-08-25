@@ -97,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
                 debug: true,
                 boost: None,
+                ..Default::default()
             })
             .await?
             .into_inner();

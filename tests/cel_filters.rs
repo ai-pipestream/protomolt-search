@@ -218,6 +218,8 @@ fn ingest_request(doc: &Doc) -> AddDocumentsRequest {
                 lon: *lon,
             })
             .collect(),
+        quality: None,
+        geography: None,
     }
 }
 

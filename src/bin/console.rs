@@ -278,9 +278,10 @@ struct SearchBody {
     vector_leg: bool,
     bm25_leg: bool,
     min_vector_score: f32,
-    /// CEL filter (docs/cel-filters.md). Empty = off. Runs the LEXICAL
-    /// Bm25Search route; combining it with the vector leg is refused,
-    /// exactly as the engine refuses hybrid filters.
+    /// CEL filter (docs/cel-filters.md). Empty = off. With the vector
+    /// leg on it rides the hybrid route, which filters BOTH legs
+    /// (docs/vector-filters.md); with the vector leg off it takes the
+    /// lexical Bm25Search route, which also carries facet counts.
     filter: String,
     fetch_docs: bool,
 }
@@ -404,27 +405,11 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         boost_weight: req.boost_weight,
     });
 
-    // A CEL filter runs the LEXICAL route: the hybrid route refuses
-    // filters, because its vector leg has no filter machinery yet and
-    // silently filtering only the lexical half would lie about the
-    // result set. The console mirrors that honesty instead of quietly
-    // dropping a leg.
-    if !req.filter.is_empty() {
-        if req.vector_leg {
-            return Err(
-                "a CEL filter runs the lexical Bm25Search route; uncheck the vector leg \
-                 to filter (the hybrid route refuses filters until the vector leg has \
-                 filter machinery)"
-                    .to_string(),
-            );
-        }
-        if boost.is_some() {
-            return Err(
-                "boost rescore rides the hybrid route; clear the boost text to use a \
-                 CEL filter"
-                    .to_string(),
-            );
-        }
+    // A filtered query with the vector leg off has no vector work to
+    // do, and the lexical route carries facet counts the hybrid route
+    // does not, so it stays the better answer there. With the vector
+    // leg on, the hybrid route now filters BOTH legs.
+    if !req.filter.is_empty() && !req.vector_leg && boost.is_none() {
         return bm25_filtered_search(ctx, &req, analysis).await;
     }
 
@@ -450,6 +435,8 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         vector,
         k: if req.k == 0 { 10 } else { req.k },
         analysis,
+        geo_filters: Vec::new(),
+        filter: req.filter.clone(),
         legs: Some(HybridLegOptions {
             fusion_mode: fusion_mode as i32,
             leg_k: req.leg_k,

@@ -270,7 +270,8 @@ pub mod mock_analysis {
     use crate::pb::analysis::{
         analyze_stream_request, analyze_stream_response, AnalysisOptions, AnalyzeRequest,
         AnalyzeResponse, AnalyzeStreamError, AnalyzeStreamRequest, AnalyzeStreamResponse,
-        GetCapabilitiesRequest, GetCapabilitiesResponse, Span, TermVector, Token,
+        GeoLocation, GetCapabilitiesRequest, GetCapabilitiesResponse, NoiseSpan, RegionVote, Span,
+        TermVector, TextArtifact, Token,
     };
     use crate::MAX_MESSAGE_BYTES;
 
@@ -295,12 +296,33 @@ pub mod mock_analysis {
     }
 
     /// The mock service: canned-but-faithful analysis.
-    #[derive(Default)]
-    pub struct MockAnalysis;
+    pub struct MockAnalysis {
+        /// Whether this mock models a sidecar with an NER model
+        /// configured — the capability the geography preflight checks.
+        /// Defaults to true; [`start_mock_analysis_without_ner`] models
+        /// the bare sidecar.
+        pub ner: bool,
+    }
+
+    impl Default for MockAnalysis {
+        fn default() -> Self {
+            MockAnalysis { ner: true }
+        }
+    }
+
+    /// The mock's toy gazetteer: a lowercased token matching an entry
+    /// is a location mention. Deterministic, so tests compute expected
+    /// column values. Springfield's low confidence models gazetteer
+    /// ambiguity (the United States has dozens).
+    const GAZETTEER: [(&str, &str, &str, f64, f64, f64); 3] = [
+        ("paris", "Paris", "FR", 48.8566, 2.3522, 0.9),
+        ("berlin", "Berlin", "DE", 52.52, 13.405, 0.9),
+        ("springfield", "Springfield", "US", 39.7817, -89.6501, 0.4),
+    ];
 
     /// The analysis itself, shared verbatim by the unary and streaming
     /// paths — the same guarantee the real sidecar tests prove.
-    fn analyze_text(text: &str, options: &AnalysisOptions) -> Result<AnalyzeResponse, Status> {
+    fn analyze_text(text: &str, options: &AnalysisOptions, ner: bool) -> Result<AnalyzeResponse, Status> {
         if text.is_empty() {
             return Err(Status::invalid_argument("empty text"));
         }
@@ -364,6 +386,94 @@ pub mod mock_analysis {
             }
         }
 
+        // Quality layers, emitted only when requested (the real
+        // sidecar's contract: "empty unless noise was requested" would
+        // otherwise be indistinguishable from "clean"). The rules are
+        // deterministic so tests can compute expected column values:
+        // a token made entirely of '#' is a noise finding scored
+        // len/10 capped at 1.0, and every U+FFFD in the text is a
+        // "replacement" artifact.
+        let noise = if options.noise {
+            tokens
+                .iter()
+                .filter(|t| !t.text.is_empty() && t.text.bytes().all(|b| b == b'#'))
+                .map(|t| NoiseSpan {
+                    span: t.span,
+                    severity: "gibberish".to_string(),
+                    score: (t.text.len() as f64 / 10.0).min(1.0),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let artifacts = if options.artifacts {
+            text.char_indices()
+                .filter(|&(_, c)| c == '\u{FFFD}')
+                .map(|(i, c)| TextArtifact {
+                    span: Some(Span {
+                        start: i as i32,
+                        end: (i + c.len_utf8()) as i32,
+                    }),
+                    r#type: "replacement".to_string(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // The geocoding layer, emitted only when requested AND the mock
+        // models an NER-configured sidecar (the real one returns empty
+        // layers plus a warning without a model — the state the
+        // engine's preflight exists to refuse). Locations in text
+        // order; region votes are per-country evidence shares, ranked
+        // by share descending, country code ascending on ties.
+        let locations: Vec<GeoLocation> = if options.geo && ner {
+            tokens
+                .iter()
+                .filter_map(|t| {
+                    let lower = t.text.to_lowercase();
+                    GAZETTEER
+                        .iter()
+                        .find(|(key, ..)| *key == lower)
+                        .map(|&(_, name, country, lat, lon, confidence)| GeoLocation {
+                            span: t.span,
+                            name: name.to_string(),
+                            country_code: country.to_string(),
+                            latitude: lat,
+                            longitude: lon,
+                            confidence,
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let regions: Vec<RegionVote> = {
+            let mut votes: Vec<RegionVote> = Vec::new();
+            for location in &locations {
+                match votes
+                    .iter_mut()
+                    .find(|v| v.country_code == location.country_code)
+                {
+                    Some(vote) => vote.share += 1.0,
+                    None => votes.push(RegionVote {
+                        country_code: location.country_code.clone(),
+                        share: 1.0,
+                    }),
+                }
+            }
+            let total = locations.len() as f64;
+            for vote in &mut votes {
+                vote.share /= total;
+            }
+            votes.sort_by(|a, b| {
+                b.share
+                    .total_cmp(&a.share)
+                    .then_with(|| a.country_code.cmp(&b.country_code))
+            });
+            votes
+        };
+
         Ok(AnalyzeResponse {
             sentences: Vec::new(),
             tokens,
@@ -373,10 +483,14 @@ pub mod mock_analysis {
             embeddings: Vec::new(),
             warnings: Vec::new(),
             lemmas: Vec::new(),
-            // The sidecar's tier-1 surface (noise, artifacts, glossary,
-            // pii, coref, dependencies, relations, geo). The mock models
-            // term identity only, so it returns none of it rather than
-            // inventing plausible-looking annotations.
+            noise,
+            artifacts,
+            locations,
+            regions,
+            // The rest of the sidecar's tier-1 surface (glossary, pii,
+            // coref, dependencies, relations, geo). The mock models term
+            // identity and the quality layers only, so it returns none
+            // of it rather than inventing plausible-looking annotations.
             ..Default::default()
         })
     }
@@ -389,7 +503,7 @@ pub mod mock_analysis {
         ) -> Result<Response<AnalyzeResponse>, Status> {
             let req = request.into_inner();
             let options = req.options.unwrap_or_default();
-            Ok(Response::new(analyze_text(&req.text, &options)?))
+            Ok(Response::new(analyze_text(&req.text, &options, self.ner)?))
         }
 
         type AnalyzeStreamStream =
@@ -405,6 +519,7 @@ pub mod mock_analysis {
             request: Request<Streaming<AnalyzeStreamRequest>>,
         ) -> Result<Response<Self::AnalyzeStreamStream>, Status> {
             let mut inbound = request.into_inner();
+            let ner = self.ner;
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AnalyzeStreamResponse, Status>>(16);
             tokio::spawn(async move {
                 let mut options: Option<AnalysisOptions> = None;
@@ -436,7 +551,7 @@ pub mod mock_analysis {
                                     .await;
                                 return;
                             };
-                            let result = match analyze_text(&doc.text, options) {
+                            let result = match analyze_text(&doc.text, options, ner) {
                                 Ok(ok) => analyze_stream_response::Result::Ok(ok),
                                 Err(status) => {
                                     analyze_stream_response::Result::Error(AnalyzeStreamError {
@@ -481,12 +596,28 @@ pub mod mock_analysis {
             &self,
             _request: Request<GetCapabilitiesRequest>,
         ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-            Ok(Response::new(GetCapabilitiesResponse::default()))
+            Ok(Response::new(GetCapabilitiesResponse {
+                ner_available: self.ner,
+                ..Default::default()
+            }))
         }
     }
 
     /// Start the mock on 127.0.0.1:0; returns its `http://` address.
     pub async fn start_mock_analysis() -> (String, JoinHandle<Result<(), TransportError>>) {
+        start_mock(MockAnalysis::default()).await
+    }
+
+    /// [`start_mock_analysis`] modeling a sidecar with NO NER model
+    /// configured: `GetCapabilities.ner_available` is false, and the
+    /// geocoding layer stays empty even when requested — the state the
+    /// engine's geography preflight exists to refuse.
+    pub async fn start_mock_analysis_without_ner(
+    ) -> (String, JoinHandle<Result<(), TransportError>>) {
+        start_mock(MockAnalysis { ner: false }).await
+    }
+
+    async fn start_mock(mock: MockAnalysis) -> (String, JoinHandle<Result<(), TransportError>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(
@@ -494,7 +625,7 @@ pub mod mock_analysis {
                 .initial_stream_window_size(crate::H2_STREAM_WINDOW)
                 .initial_connection_window_size(crate::H2_CONN_WINDOW)
                 .add_service(
-                    AnalysisServiceServer::new(MockAnalysis)
+                    AnalysisServiceServer::new(mock)
                         .max_decoding_message_size(MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(MAX_MESSAGE_BYTES),
                 )

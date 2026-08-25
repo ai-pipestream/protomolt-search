@@ -436,6 +436,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         integers: Vec::new(),
                         timestamps: Vec::new(),
                         geo_points: Vec::new(),
+                        quality: None,
+                        geography: None,
                     })
                     .await
                     .unwrap();
@@ -501,7 +503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &chunk.text[..chunk.text.len().min(120)]
         );
         let hits = coordinator
-            .fanout_cascade("court", &chunk.text, vector, 5, Some(&spec), 0.0, false)
+            .fanout_cascade("court", &chunk.text, vector, 5, Some(&spec), 0.0, false, &Default::default())
             .await?
             .0;
         for hit in &hits {
@@ -775,6 +777,8 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                         integers: Vec::new(),
                         timestamps: Vec::new(),
                         geo_points: Vec::new(),
+                        quality: None,
+                        geography: None,
                     })
                     .map_err(|e| e.to_string())?;
                     sent += 1;

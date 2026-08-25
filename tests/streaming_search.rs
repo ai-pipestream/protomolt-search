@@ -73,7 +73,7 @@ async fn streaming_matches_monolithic_and_fanout_exactly() {
     for qi in 0..6u64 {
         let query = unit_vectors(1, DIM, 0x57AE_0000 + qi);
         let streamed = coordinator
-            .fanout_stream_search(&format!("stream-{qi}"), &query, K, None)
+            .fanout_stream_search(&format!("stream-{qi}"), &query, K, None, &Default::default())
             .await
             .expect("stream fanout");
         let got = bits(&streamed.hits);
@@ -82,7 +82,7 @@ async fn streaming_matches_monolithic_and_fanout_exactly() {
         assert_eq!(got, want, "query {qi}: streaming != monolithic");
 
         let fanout = coordinator
-            .fanout_search(&format!("classic-{qi}"), &query, K, false)
+            .fanout_search(&format!("classic-{qi}"), &query, K, false, &Default::default())
             .await
             .expect("classic fanout");
         assert_eq!(
@@ -117,7 +117,7 @@ async fn streaming_matches_on_seeded_default_cluster() {
     for qi in 0..3u64 {
         let query = unit_vectors(1, DIM, 0x5EED_57AE + qi);
         let streamed = coordinator
-            .fanout_stream_search(&format!("dstream-{qi}"), &query, K, None)
+            .fanout_stream_search(&format!("dstream-{qi}"), &query, K, None, &Default::default())
             .await
             .expect("stream fanout");
         let got = bits(&streamed.hits);
@@ -127,7 +127,7 @@ async fn streaming_matches_on_seeded_default_cluster() {
             "query {qi}: streaming != monolithic"
         );
         let fanout = coordinator
-            .fanout_search(&format!("dclassic-{qi}"), &query, K, false)
+            .fanout_search(&format!("dclassic-{qi}"), &query, K, false, &Default::default())
             .await
             .expect("classic fanout");
         assert_eq!(got, bits(&fanout.hits), "query {qi}: streaming != fan-out");
@@ -147,7 +147,7 @@ async fn initial_floor_is_deterministic_and_lossless() {
     let query = unit_vectors(1, DIM, 0xF100_0001);
 
     let unfloored = coordinator
-        .fanout_stream_search("floor-base", &query, K, None)
+        .fanout_stream_search("floor-base", &query, K, None, &Default::default())
         .await
         .expect("unfloored stream");
     let kth = unfloored
@@ -157,7 +157,7 @@ async fn initial_floor_is_deterministic_and_lossless() {
         .score;
 
     let floored = coordinator
-        .fanout_stream_search("floor-seeded", &query, K, Some(kth))
+        .fanout_stream_search("floor-seeded", &query, K, Some(kth), &Default::default())
         .await
         .expect("floored stream");
     assert_eq!(
@@ -223,6 +223,7 @@ async fn grpc_stop_returns_an_incomplete_node_certificate() {
             initial_floor: None,
             floor_token: 0,
             collapse_parents: false,
+            ..Default::default()
         })),
     })
     .await

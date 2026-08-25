@@ -899,6 +899,8 @@ mod tests {
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             }],
         })
     }

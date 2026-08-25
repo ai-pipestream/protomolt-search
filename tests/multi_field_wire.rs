@@ -72,6 +72,8 @@ fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
         integers: Vec::new(),
         timestamps: Vec::new(),
         geo_points: Vec::new(),
+        quality: None,
+        geography: None,
     }
 }
 
@@ -361,6 +363,8 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
         integers: Vec::new(),
         timestamps: Vec::new(),
         geo_points: Vec::new(),
+        quality: None,
+        geography: None,
     };
     for (req, why) in [
         (bad("docket", "x"), "unknown field"),
@@ -479,6 +483,8 @@ async fn shard_legs_bm25_params_reach_scoring() {
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -501,6 +507,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
                     global_doc_frequencies: vec![3],
                     k1,
                     b,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -640,6 +647,8 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             fields: per_field,
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await
@@ -661,6 +670,8 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             fields: query_fields(2.0),
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await
@@ -765,7 +776,7 @@ async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
             .add_service(
                 turbovec_search::pb::analysis::analysis_service_server::AnalysisServiceServer::new(
                     CountingMock {
-                        inner: turbovec_search::harness::mock_analysis::MockAnalysis,
+                        inner: turbovec_search::harness::mock_analysis::MockAnalysis::default(),
                         unary: unary.clone(),
                         streams: streams.clone(),
                     },
@@ -902,6 +913,8 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
         }],
         range_facet_fields: Vec::new(),
         geo_filters: Vec::new(),
+        stats_fields: Vec::new(),
+        cardinality_fields: Vec::new(),
     };
 
     // The analyzer it was built with: answered.

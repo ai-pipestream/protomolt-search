@@ -46,6 +46,8 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
                 integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
+                quality: None,
+                geography: None,
             })
             .await
             .unwrap();
@@ -137,7 +139,7 @@ async fn collapse_returns_distinct_parents_and_matches_reference() {
     // Reference: deep plain search over everything, grouped by parent
     // client-side (max aggregation, ties to the lower global id).
     let deep = coordinator
-        .fanout_search("ref", &query, 2 * SHARD_DOCS as u32, false)
+        .fanout_search("ref", &query, 2 * SHARD_DOCS as u32, false, &Default::default())
         .await
         .unwrap();
     let mut best: std::collections::HashMap<u64, (u64, f32)> = std::collections::HashMap::new();
@@ -166,6 +168,7 @@ async fn collapse_returns_distinct_parents_and_matches_reference() {
             k,
             vector: query.clone(),
             collapse_parents: true,
+            ..Default::default()
         })
     };
     let first = coordinator.search(request()).await.unwrap().into_inner();
@@ -211,6 +214,7 @@ async fn collapse_returns_distinct_parents_and_matches_reference() {
             k: 6,
             vector: query.clone(),
             collapse_parents: true,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -229,6 +233,7 @@ async fn collapse_returns_distinct_parents_and_matches_reference() {
             k,
             vector: query.clone(),
             collapse_parents: false,
+            ..Default::default()
         }))
         .await
         .unwrap()

@@ -223,6 +223,16 @@ service NodeService {
   // Liveness + shape of this shard: vector count, dim, bit width, BM25
   // doc count, and whether an ingest stream currently holds the shard's
   // single-writer slot. Cheap enough to poll.
+  // Filter-only browse (docs/query-api.md): the shard's admitted doc
+  // ids strictly above `after`, ascending, at most k — a match-all
+  // iterator over the slot space gated by the resolved filter at the
+  // same admission rule every scored route uses (Kleene: UNKNOWN never
+  // admits). No scoring runs; global id ascending is the deterministic
+  // order the absence of a relevance score requires. The `after` floor
+  // makes deep paging cost one page, and it is inherently stable: the
+  // engine is append-only, so ids never move or vanish.
+  rpc BrowseShard(BrowseShardRequest) returns (BrowseShardResponse);
+
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
@@ -289,6 +299,133 @@ service SearchService {
   // is the thing served. A variant-only scoring path would eventually
   // drift from production and the A/B would then be measuring the drift.
   rpc VariantSearch(VariantSearchRequest) returns (VariantSearchResponse);
+
+  // The public query surface (docs/query-api.md): selection tree,
+  // candidate-scoped boosts, and per-signal score provenance, executed
+  // by DELEGATING to the ordinary routes above — the adapter maps a
+  // supported shape onto Search / Bm25Search / HybridSearch and never
+  // forks their scoring logic. A shape outside the supported table is
+  // refused by name (INVALID_ARGUMENT / FAILED_PRECONDITION);
+  // compatibility never authorizes a heuristic substitute (no AND
+  // reinterpreted as a union, no filter applied to one leg, no silent
+  // strategy swap). Increment 1 executes:
+  //
+  //   - one lexical leaf (+ filters)              -> Bm25Search
+  //   - one dense leaf (+ filters)                -> Search
+  //   - filters only (browse, id order)           -> BrowseShard fan-out
+  //   - OR(dense, lexical) + rrf                  -> HybridSearch GLOBAL_RANK
+  //   - OR(dense, lexical) + score_blend          -> HybridSearch SCORE_BLEND
+  //   - OR(dense, lexical) + decomposed           -> HybridSearch DECOMPOSED
+  //   - cascade(gate = dense, rerank = lexical)   -> HybridSearch CASCADE
+  //   - one lexical boost on any composite shape  -> BoostRescore
+  //
+  // Filters attach through an AND composite wrapping the search
+  // structure (or stand alone as a browse). Everything else — nested
+  // booleans, AND over scoring leaves, multiple boosts, the generic
+  // composite scorer, profile timings — is refused by name until its
+  // ordinary engine path exists.
+  rpc Query(QueryRequest) returns (QueryResponse);
+}
+
+// One shard's slice of a filter-only browse.
+message BrowseShardRequest {
+  // Maximum ids returned. Must be positive.
+  uint32 k = 1;
+  // Exclusive global-id floor: only ids strictly above this are
+  // considered. 0 starts from the beginning (id 0 is never skipped
+  // because ids are compared strictly against after = 0 only when a
+  // previous page ended at 0 — the first page passes no floor, see
+  // `first_page`).
+  uint64 after = 2;
+  // Whether `after` carries a floor at all: proto3 cannot distinguish
+  // "after = 0" (resume past doc 0) from unset. True on the first
+  // page; false resumes strictly after `after`.
+  bool first_page = 3;
+  // Geo filters, AND semantics, same rules as every scored route.
+  repeated GeoFilter geo_filters = 4;
+  // Compiled filter IR (the coordinator compiles CEL once), resolved
+  // against this shard's dictionaries. Absent = no tree filter.
+  FilterExpr filter = 5;
+  // Order by a column instead of by id (docs/query-api.md). The shard
+  // walks its full admitted set with a column-keyed heap — exhaustive
+  // traversal, so the exactness certificate is trivial rather than
+  // inherited from pruning bounds it would otherwise invalidate. A
+  // document WITHOUT a value in the sort column is excluded: absence
+  // has no honest position in a column order (the same stance the
+  // filter rules take — absence is not a value).
+  BrowseSort sort = 6;
+  // Sorted resume only: the boundary's order-preserving key bits (see
+  // BrowseShardResponse.sort_key_bits); pairs with `after` (the
+  // boundary doc id) when `first_page` is false and `sort` is set.
+  uint64 after_key_bits = 7;
+}
+
+// One browse sort order: an i64 or f64 column, ascending or
+// descending. Other families refuse by name (facet/string order needs
+// the sorted term dictionary that does not exist yet).
+message BrowseSort {
+  string column = 1;
+  bool descending = 2;
+}
+
+message BrowseShardResponse {
+  // Admitted global doc ids, at most k: ascending by id unsorted, or
+  // by (sort key, id) under `sort`.
+  repeated uint64 doc_ids = 1;
+  // Per-filter / per-leaf column-known flags, same typo rule as every
+  // filtered route: a column NO shard resolves refuses by name at the
+  // coordinator.
+  repeated bool geo_columns_known = 2;
+  repeated bool filter_columns_known = 3;
+  // Sorted only, parallel to doc_ids: ORDER-PRESERVING u64 key bits.
+  // i64 values map through offset-binary (x XOR i64::MIN); f64 values
+  // through the sign-flip trick (negative: all bits flipped; positive:
+  // sign bit set); a DESCENDING sort then complements the result — so
+  // the merged order, the heap order, and the cursor boundary are all
+  // one ascending u64 comparison regardless of kind or direction.
+  repeated uint64 sort_key_bits = 4;
+  // Sorted only, parallel to doc_ids: the actual column values for
+  // reporting (i64 values pass through the same monotone cast the
+  // column metadata uses).
+  repeated double sort_keys = 5;
+  // Whether this shard resolves the sort column (typo rule: refused at
+  // the coordinator only when NO shard does; a shard without the
+  // column contributes nothing, exactly as its documents hold no
+  // value).
+  bool sort_column_known = 6;
+}
+
+// One column's aggregate over a filtered match set (docs/facets.md).
+// i64 columns aggregate through the same monotone f64 cast the column
+// metadata uses; sums are f64 by contract (an i64 sum can overflow any
+// integer width the wire offers, and the cast is the documented one).
+message ColumnStats {
+  string field = 1;
+  // Whether this shard (node response) or ANY shard (public response)
+  // resolves the column — the usual typo rule.
+  bool known = 2;
+  // Documents in the match set holding a value. min/max/sum/mean are
+  // meaningful only when this is nonzero.
+  uint64 count = 3;
+  double min = 4;
+  double max = 5;
+  double sum = 6;
+  // Public response only: sum / count (0 when count is 0).
+  double mean = 7;
+}
+
+// One shard's distinct facet VALUES over its filtered match set
+// (internal: the coordinator unions these by string).
+message FacetDistinct {
+  string field = 1;
+  bool known = 2;
+  repeated string values = 3;
+}
+
+// The public exact distinct-value count for one facet column.
+message FacetCardinality {
+  string field = 1;
+  uint64 cardinality = 2;
 }
 
 message HealthRequest {}
@@ -381,6 +518,18 @@ message StartShardSearch {
   // store on shards that should map real parents; a vector-only shard
   // degrades to self-parents (no collapse effect, still correct).
   bool collapse_parents = 5;
+  // Filters applied to the VECTOR leg, resolved on the node against
+  // this shard's columns and applied as a slot allowlist BEFORE the
+  // scan kernel scores anything (docs/vector-filters.md). A filter only
+  // REMOVES documents, so every floor stays a valid lower bound on the
+  // filtered k-th best and no pruning math changes; what the allowlist
+  // buys is that a chunk in which nothing survives is skipped outright.
+  // A document with no value for a filtered column fails the filter,
+  // the same absence rule the lexical leg documents.
+  repeated GeoFilter geo_filters = 6;
+  // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
+  // when both are set. Absent = no filter.
+  FilterExpr filter = 7;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -414,6 +563,14 @@ message SearchShardDone {
   repeated ScoredHit hits = 1;
   // Instrumentation for benchmarking the floor-sharing mechanism.
   ShardScanStats stats = 2;
+  // Whether this shard's geo table has each requested filter's column,
+  // parallel to the request's `geo_filters` (empty when none were
+  // sent), and whether it can resolve each leaf of the request's
+  // `filter` in `walk_leaves` order (empty when none was sent). The
+  // coordinator refuses a column NO shard knows: filtering on a typo
+  // would otherwise read as an honest empty result set.
+  repeated bool geo_columns_known = 3;
+  repeated bool filter_columns_known = 4;
 }
 
 // Per-scan counters a node reports in `SearchShardDone`. These exist so the
@@ -502,6 +659,18 @@ message StartStreamSearch {
   // qualifying chunks flow to the coordinator, which aggregates by
   // parent id — document collapse without Lucene-style colocation.
   bool collapse_parents = 5;
+  // Filters applied to the VECTOR leg, resolved on the node against
+  // this shard's columns and applied as a slot allowlist BEFORE the
+  // scan kernel scores anything (docs/vector-filters.md). A filter only
+  // REMOVES documents, so every floor stays a valid lower bound on the
+  // filtered k-th best and no pruning math changes; what the allowlist
+  // buys is that a chunk in which nothing survives is skipped outright.
+  // A document with no value for a filtered column fails the filter,
+  // the same absence rule the lexical leg documents.
+  repeated GeoFilter geo_filters = 6;
+  // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
+  // when both are set. Absent = no filter.
+  FilterExpr filter = 7;
 }
 
 // Authoritative abandon request for a streaming scan. The coordinator may
@@ -558,6 +727,14 @@ message StreamSearchSummary {
   uint64 blocks_scanned = 3;
   // Floor raises that took effect between blocks.
   uint64 floor_raises_applied = 4;
+  // Whether this shard's geo table has each requested filter's column,
+  // parallel to the request's `geo_filters` (empty when none were
+  // sent), and whether it can resolve each leaf of the request's
+  // `filter` in `walk_leaves` order (empty when none was sent). The
+  // coordinator refuses a column NO shard knows: filtering on a typo
+  // would otherwise read as an honest empty result set.
+  repeated bool geo_columns_known = 5;
+  repeated bool filter_columns_known = 6;
 }
 
 // Empty: the node reports whatever its loaded index holds.
@@ -690,6 +867,17 @@ message SearchRequest {
   // means k distinct parents, each hit is a parent's best chunk and
   // carries `parent_id`. See StartShardSearch.collapse_parents.
   bool collapse_parents = 4;
+  // Geo filters (docs/geo-columns.md), forwarded verbatim to every
+  // shard and applied to the vector scan as a slot allowlist before
+  // the kernel scores anything (docs/vector-filters.md). ALL filters
+  // must pass (AND semantics), and they AND with `filter`.
+  repeated GeoFilter geo_filters = 5;
+  // Filter expression in CEL surface syntax (docs/cel-filters.md),
+  // compiled ONCE at the coordinator into the FilterExpr IR and
+  // resolved per shard. Empty = no filter. A syntax error, an
+  // unsupported construct, or a column no shard knows is refused by
+  // name; a filter is never reinterpreted into something that runs.
+  string filter = 6;
 }
 
 // Client-facing search response.
@@ -946,6 +1134,98 @@ message AddDocumentsRequest {
   // the WAL keeps the request verbatim, so durability and reshard
   // replay come free.
   repeated GeoPointValue geo_points = 11;
+  // Ingest-time quality annotation (docs/quality-columns.md). When set,
+  // the node asks the sidecar for its noise and artifact layers in the
+  // SAME analysis pass that produces this document's terms, derives one
+  // scalar per named column, and appends them to `numerics` /
+  // `integers` before applying. Two consequences follow from that
+  // "append, then take the ordinary path" shape: the columns are
+  // ordinary columns, so filters, facets, and score chains read them
+  // with no new machinery and no new bounds math; and the WAL record
+  // carries the DERIVED values with the spec cleared, so replay
+  // reproduces them exactly without calling the sidecar again.
+  //
+  // The spec must be constant for a stream, like `analysis`: a change
+  // mid-stream reopens the analysis session, since the layers are
+  // requested in the session's options message.
+  //
+  // These layers are NOT part of `analysis` and do not enter the
+  // analysis fingerprint. The fingerprint pins TERM IDENTITY; noise
+  // scoring does not change a single term, and folding it in would
+  // invalidate every shard ever built for a change that cannot affect
+  // what matches.
+  QualitySpec quality = 12;
+  // Ingest-time geography annotation (docs/geography-columns.md). When
+  // set, the node asks the sidecar to geocode location mentions in the
+  // SAME analysis pass that produces this document's terms, reduces
+  // the layer to one point / one country / one confidence, and appends
+  // them to `geo_points` / `facets` / `numerics` before applying —
+  // the same materialize-then-take-the-ordinary-path shape as
+  // `quality`, with the same two consequences (ordinary columns;
+  // replay-exact WAL records with the spec cleared).
+  //
+  // Unlike quality, ABSENCE is a legitimate measurement here: a
+  // document that mentions no resolvable place writes NO point (there
+  // is no neutral coordinate — (0,0) is a real place in the Gulf of
+  // Guinea), so geo filters skip it and CEL over its columns reads
+  // UNKNOWN, per the documented absence rules.
+  //
+  // Requires the sidecar to serve the entity layer: a session that
+  // asks for geography preflights `GetCapabilities.ner_available` and
+  // REFUSES when no NER model is configured, because the sidecar's own
+  // contract on that state (empty layers plus a free-form warning) is
+  // indistinguishable from "no locations found" and would silently
+  // ingest an entire corpus as place-less.
+  GeographySpec geography = 13;
+}
+
+// Which quality columns to derive from the sidecar's model-free noise
+// and artifact layers (docs/quality-columns.md). Every column named
+// must already be declared on the node (--numeric-fields /
+// --integer-fields); an unknown name is refused like any other. A
+// column left empty is not written at all, so a caller pays only for
+// what it asks for.
+message QualitySpec {
+  // f64 column receiving the WORST noise score over the document's
+  // findings — the sidecar scores each finding in (0, 1], higher is
+  // noisier — or exactly 0.0 when it found none. Bounded in [0, 1] by
+  // construction, which is what makes it a drop-in for
+  // SCORE_OP_MULT_EXP_DECAY with origin 0 (score *= exp(-noise/scale),
+  // a quality decay whose multiplier lies in (0, 1], so the stage is
+  // monotone and its bound lift is identity — no new bounds math).
+  string noise_column = 1;
+  // i64 column receiving the number of characters the document's noise
+  // findings cover: the length of their UNION, so overlapping findings
+  // are counted once. Exact and denominator-free; a caller that wants
+  // a fraction divides by a length it knows.
+  string noise_chars_column = 2;
+  // i64 column receiving the number of flagged text artifacts
+  // (replacement characters, control characters, mojibake, unpaired
+  // surrogates, and the like). Detection only flags; nothing in the
+  // stored text is modified.
+  string artifact_column = 3;
+}
+
+// Which geography columns to derive from the sidecar's geocoding layer
+// (docs/geography-columns.md). Every column named must already be
+// declared on the node (--geo-fields / --facet-fields /
+// --numeric-fields); an unknown name is refused like any other. A
+// column left empty is not written at all.
+message GeographySpec {
+  // GEO-POINT column receiving the document's best resolved location:
+  // the highest-confidence `GeoLocation`, ties broken by text order
+  // (first mention wins). Not written when the document has no
+  // resolved locations.
+  string point_column = 1;
+  // Facet column receiving the top `RegionVote`'s ISO country code —
+  // the country the document's location evidence points at, by share.
+  // Not written when there are no votes.
+  string country_column = 2;
+  // f64 column receiving the chosen location's resolution confidence
+  // in [0, 1]. Not written when there is no chosen location, so a
+  // confidence threshold filter (`geo_confidence >= 0.7`) reads
+  // UNKNOWN — not "confidently nowhere" — on place-less documents.
+  string confidence_column = 3;
 }
 
 // Terminal response of an `AddDocuments` stream.
@@ -1120,6 +1400,20 @@ message Bm25QueryRequest {
   // `filter_columns_known`, positionally over the tree's leaves in
   // depth-first order.
   FilterExpr filter = 16;
+  // Numeric / integer columns to aggregate over the FILTERED match
+  // set (docs/facets.md): per column, the count of documents holding
+  // a value plus min / max / sum — all additive across shards, merged
+  // like facet counts, over the same one bitmap the facet kinds share.
+  // A column no shard knows is refused at the coordinator.
+  repeated string stats_fields = 17;
+  // Facet columns to count DISTINCT VALUES over the filtered match
+  // set. Exact, not estimated: each shard reports the value strings
+  // present in its match set (ordinals are shard-local, so values are
+  // the only union-able currency) and the coordinator unions them.
+  // The cost is proportional to the per-shard distinct counts and is
+  // the caller's explicit choice — the same made-visible trade
+  // count-then-rank settled on.
+  repeated string cardinality_fields = 18;
 }
 
 // One geo filter: a geo-point column plus the region a document's point
@@ -1588,6 +1882,11 @@ message Bm25QueryResponse {
   // coordinator refuses a leaf NO shard can resolve, the same typo
   // rule as every other named column on this response.
   repeated bool filter_columns_known = 7;
+  // One entry per requested stats field, in request order.
+  repeated ColumnStats stats = 8;
+  // One entry per requested cardinality field, in request order, with
+  // the shard's distinct VALUES (the coordinator unions and counts).
+  repeated FacetDistinct distinct = 9;
 }
 
 // One message on the client-to-shard leg of `Bm25QueryStream`.
@@ -1727,10 +2026,10 @@ message Bm25SearchRequest {
   // Geo filters (docs/geo-columns.md), forwarded verbatim to every
   // shard: ALL must pass, a document without a value fails every one,
   // and a column no shard knows is refused (INVALID_ARGUMENT). Carried
-  // by the flat and the fused route; the hybrid route REFUSES them,
-  // because its vector leg has no filter machinery yet and silently
-  // filtering only the lexical half would be a lie about the result
-  // set. Facet counting (plain, map, and range) counts only documents
+  // by the flat and the fused route, and by the hybrid route, whose
+  // vector leg applies the same filters as a slot allowlist
+  // (docs/vector-filters.md). Facet counting (plain, map, and range)
+  // counts only documents
   // that pass every filter (these and `filter` alike): a filtered-out
   // document is not in the result set, so counting it would misstate
   // the drill-down.
@@ -1746,8 +2045,17 @@ message Bm25SearchRequest {
   // Column names no shard knows refuse under the typo rule. ANDed with
   // `geo_filters` when both are set; same absence semantics and facet
   // narrowing as FilterExpr documents. Empty = no filter. The hybrid
-  // route refuses it for the same reason it refuses `geo_filters`.
+  // route carries it too (HybridSearchRequest.filter), where it gates
+  // BOTH legs from one resolved predicate.
   string filter = 11;
+  // Column aggregations over the filtered match set; forwarded to
+  // every shard's Bm25QueryRequest.stats_fields and merged (counts
+  // and sums add; mins and maxes fold). See that field for the rules.
+  repeated string stats_fields = 12;
+  // Exact distinct-value counts over the filtered match set;
+  // forwarded to every shard and unioned by VALUE. See
+  // Bm25QueryRequest.cardinality_fields for the cost contract.
+  repeated string cardinality_fields = 13;
 }
 
 // One field of a fused multi-field search.
@@ -1790,6 +2098,16 @@ message Bm25SearchResponse {
   // buckets in edge order. EXACT over the full match set, like
   // `facets`, and empty under the same conditions.
   repeated RangeFacetCounts range_facets = 4;
+  // One entry per requested stats field, in request order: the merged
+  // aggregate over every shard's filtered match set. `mean` is
+  // sum / count, computed here so clients cannot get it wrong; it is
+  // 0 when count is 0 (no document held a value).
+  repeated ColumnStats stats = 5;
+  // One entry per requested cardinality field, in request order, with
+  // the exact distinct-value count over the global filtered match set
+  // (values unioned across shards). The per-shard value lists are not
+  // echoed.
+  repeated FacetCardinality cardinality = 6;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.
@@ -2000,6 +2318,15 @@ message HybridShardRequest {
   // Stats-epoch claim for the BM25 leg's global stats; see
   // Bm25QueryRequest.expected_stats_epoch. 0 = no claim.
   uint64 expected_stats_epoch = 13;
+  // Filters applied to BOTH legs of this shard's hybrid work: the same
+  // allowlist gates the vector scan and the lexical heap, so the fused
+  // list cannot mix a filtered half with an unfiltered one. A document
+  // with no value for a filtered column fails the filter, the same
+  // absence rule the lexical leg documents.
+  repeated GeoFilter geo_filters = 14;
+  // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
+  // when both are set. Absent = no filter.
+  FilterExpr filter = 15;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -2024,6 +2351,14 @@ message HybridLegHit {
 message HybridShardResponse {
   // Fused hits, shard-level RRF score descending.
   repeated HybridLegHit hits = 1;
+  // Whether this shard's geo table has each requested filter's column,
+  // parallel to the request's `geo_filters` (empty when none were
+  // sent), and whether it can resolve each leaf of the request's
+  // `filter` in `walk_leaves` order (empty when none was sent). The
+  // coordinator refuses a column NO shard knows: filtering on a typo
+  // would otherwise read as an honest empty result set.
+  repeated bool geo_columns_known = 2;
+  repeated bool filter_columns_known = 3;
 }
 
 // A second-pass lexical boost applied AFTER fusion (the rescore-window
@@ -2078,6 +2413,22 @@ message HybridSearchRequest {
   bool debug = 7;
   // Optional second-pass boost over the top hits (any fusion mode).
   BoostRescore boost = 8;
+  // Geo filters (docs/geo-columns.md), forwarded verbatim to every
+  // shard and applied to the vector scan as a slot allowlist before
+  // the kernel scores anything (docs/vector-filters.md). ALL filters
+  // must pass (AND semantics), and they AND with `filter`.
+  repeated GeoFilter geo_filters = 9;
+  // Filter expression in CEL surface syntax (docs/cel-filters.md),
+  // compiled ONCE at the coordinator into the FilterExpr IR and
+  // resolved per shard. Empty = no filter. A syntax error, an
+  // unsupported construct, or a column no shard knows is refused by
+  // name; a filter is never reinterpreted into something that runs.
+  string filter = 10;
+  // Both filters gate BOTH legs. The hybrid route used to refuse them
+  // outright, because filtering only the lexical half would have been
+  // a lie about the result set; the vector leg now applies the same
+  // allowlist, so a fused hit is a document that passed every filter
+  // on whichever leg found it.
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -2190,6 +2541,12 @@ message ShardLegsRequest {
   // Stats-epoch claim for the BM25 leg's global stats; see
   // Bm25QueryRequest.expected_stats_epoch. 0 = no claim.
   uint64 expected_stats_epoch = 10;
+  // Filters applied to BOTH legs of this shard's leg work; see
+  // HybridShardRequest.
+  repeated GeoFilter geo_filters = 11;
+  // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
+  // when both are set. Absent = no filter.
+  FilterExpr filter = 12;
 }
 
 // One raw leg hit.
@@ -2207,6 +2564,14 @@ message ShardLegsResponse {
   repeated RawLegHit vector_hits = 1;
   // BM25 leg top-k, raw scores (global stats).
   repeated RawLegHit bm25_hits = 2;
+  // Whether this shard's geo table has each requested filter's column,
+  // parallel to the request's `geo_filters` (empty when none were
+  // sent), and whether it can resolve each leaf of the request's
+  // `filter` in `walk_leaves` order (empty when none was sent). The
+  // coordinator refuses a column NO shard knows: filtering on a typo
+  // would otherwise read as an honest empty result set.
+  repeated bool geo_columns_known = 3;
+  repeated bool filter_columns_known = 4;
 }
 
 // Pushes one TQ+ calibration to every shard (see
@@ -2482,4 +2847,320 @@ message VariantSearchResponse {
   repeated RankingDiff diffs = 3;
   // Present only when the request asked to interleave.
   Interleaving interleaving = 4;
+}
+
+// ---------------------------------------------------------------------------
+// The public Query surface (docs/query-api.md). The contract separates
+// three things that are easy to conflate: SELECTION decides membership
+// and produces base relevance signals; a BOOST scores only the fixed
+// candidate set and never admits a document; the strategy defines how
+// selection signals establish the base order. Increment 1 implements
+// the adapter over the routes that already exist (see rpc Query).
+
+// The public query request.
+message QueryRequest {
+  // Optional caller id; assigned when empty and echoed back.
+  string request_id = 1;
+  // Final hits returned. Same guardrail as every route: 0 selects the
+  // coordinator's max_k; above max_k is refused, never clamped.
+  uint32 k = 2;
+  // Candidate-set depth for the selection phase: leg depth for the
+  // composite strategies, gate depth for cascade, and the pool a boost
+  // rescoring runs over. 0 = k. Must satisfy k <= selection_k; the
+  // response is the best k of the selection_k candidates under the
+  // final order (docs/query-api.md, the honest form of the
+  // rescore-window behavior).
+  uint32 selection_k = 3;
+  // The selection tree. Required.
+  SelectionQuery selection = 4;
+  // Candidate-scoped boosts. Increment 1: at most ONE, lexical only,
+  // and only on a composite selection (it maps to the hybrid route's
+  // BoostRescore). A boost never admits a document.
+  repeated BoostQuery boosts = 5;
+  // The generic named-dimension composite scorer. Increment 1: must be
+  // absent — refused by name until its ordinary engine path exists.
+  CompositeScorer scorer = 6;
+  // Profile timings. Increment 1: must be false (the response carries
+  // no profile surface yet; accepting the flag and ignoring it would
+  // be a lie).
+  bool profile = 7;
+  // Resume token from a previous response's `next_cursor`
+  // (docs/query-api.md): search-after paging. The rest of the request
+  // must repeat the original query verbatim; the page returned is the
+  // k hits strictly after the cursor's boundary in the current order.
+  //
+  // The token embeds the boundary hit's (rank, score bits, doc id).
+  // Resumption re-finds that exact hit — bitwise — and refuses with
+  // FAILED_PRECONDITION when it is gone or its score moved: search is
+  // bitwise deterministic here, so an exact match is the corpus-state
+  // check, and a mismatch means the corpus changed under the cursor.
+  // Documents ingested after the first page that rank before the
+  // boundary are skipped (standard search-after semantics).
+  //
+  // Depth rules: a single-leaf query pages by fetching deeper (its
+  // order is depth-independent by the exact top-k prefix property),
+  // capped by max_k. A composite pages WITHIN its fixed selection_k
+  // candidate set — the fusion strategies' orders are depth-dependent
+  // (RRF ranks, blend normalization, the cascade gate), so the pool is
+  // never silently deepened; an exhausted pool refuses and names
+  // selection_k as the knob.
+  string cursor = 8;
+  // Order the result by a column instead of by relevance
+  // (docs/query-api.md). Increment 1: browse selections only — a
+  // column order over a SCORED selection must re-argue the pruning
+  // certificate (block-max bounds the score, not the column) and is
+  // refused by name until that path exists. The column must be an i64
+  // or f64 column; documents without a value are excluded, because
+  // absence has no honest position in a column order.
+  QuerySort sort = 9;
+}
+
+// A column sort order for browse.
+message QuerySort {
+  string column = 1;
+  bool descending = 2;
+}
+
+// One node of the selection tree.
+message SelectionQuery {
+  oneof node {
+    SearchQuery search = 1;
+    FilterQuery filter = 2;
+    CompositeSearchStrategy composite = 3;
+  }
+}
+
+// A scoring leaf. Its raw relevance is a named signal, reported per
+// hit under `id`.
+message SearchQuery {
+  // Request-unique id, required. Names this leaf's signal in hit
+  // provenance and in strategy references (CascadeScore.gate_id).
+  string id = 1;
+  oneof query {
+    LexicalQuery lexical = 2;
+    DenseQuery dense = 3;
+  }
+}
+
+// BM25 relevance over analyzed terms (the Bm25Search leg).
+message LexicalQuery {
+  // Query text, analyzed with `analysis`.
+  string text = 1;
+  // Analysis options; MUST match ingest term identity, as everywhere.
+  AnalysisSpec analysis = 2;
+  // Bounded score-function chain over stored columns
+  // (docs/score-functions.md). Single-lexical-leaf selections only;
+  // a composite selection refuses it by name (stages do not ride the
+  // hybrid legs today).
+  repeated ScoreStage score_stages = 3;
+}
+
+// Dense vector relevance (the Search leg).
+message DenseQuery {
+  // The query vector; length must equal the shard dimension.
+  repeated float vector = 1;
+}
+
+// A membership-only leaf: never contributes a relevance score and
+// never appears as a score signal. It stands alone (or ANDs with other
+// filters) as a filter-only BROWSE — the admitted documents in global
+// id order, the deterministic order the absence of a relevance score
+// requires — or attaches to a search structure through an AND wrapper.
+// Under OR it is refused: a filter-only admission inside a SCORED
+// result has no honest place in that ranking.
+message FilterQuery {
+  // Request-unique id, required; reported in matched-clause provenance.
+  string id = 1;
+  oneof predicate {
+    // CEL surface syntax (docs/cel-filters.md), compiled once,
+    // resolved per shard, three-valued.
+    string cel = 2;
+    // One typed geo predicate (docs/geo-columns.md).
+    GeoFilter geo = 3;
+  }
+}
+
+// AND/OR over child nodes plus an explicit strategy for how the
+// scoring leaves establish the base order. The boolean tree and the
+// scoring strategy are distinct on purpose: AND says a document must
+// pass both gates; it does not say how two relevance scores combine.
+message CompositeSearchStrategy {
+  SelectionOperator operator = 1;
+  repeated SelectionQuery clauses = 2;
+  // Required when this composite holds more than one scoring leaf.
+  SelectionScoreStrategy scoring = 3;
+}
+
+enum SelectionOperator {
+  // Left unset when the strategy itself defines membership (cascade:
+  // the gate's admissions are the membership). Naming an operator a
+  // cascade contradicts is refused.
+  SELECTION_OPERATOR_UNSPECIFIED = 0;
+  // Every child must admit. Increment 1: filters-around-a-search-
+  // structure only; AND over two scoring leaves has no certifiable
+  // engine path yet and is refused by name.
+  SELECTION_OPERATOR_AND = 1;
+  // Any child admits. Increment 1: exactly one dense and one lexical
+  // leaf (the hybrid union), no filter children.
+  SELECTION_OPERATOR_OR = 2;
+}
+
+// How the scoring leaves of one composite establish the base order.
+// Every strategy names its exactness domain in the mode it maps to
+// (see FusionMode); a shape the engine cannot certify is refused.
+message SelectionScoreStrategy {
+  oneof strategy {
+    SingleScore single = 1;
+    RrfScore rrf = 2;
+    BlendScore score_blend = 3;
+    DecomposedScore decomposed = 4;
+    CascadeScore cascade = 5;
+  }
+}
+
+// Exactly one scoring leaf; its raw relevance is the base order.
+message SingleScore {}
+
+// Global-rank RRF over the leaves (FUSION_MODE_GLOBAL_RANK).
+message RrfScore {
+  // The RRF constant. 0 = default 60.
+  float rrf_k = 1;
+  // Per-leaf RRF weights (HybridLegOptions semantics: absent = 1.0,
+  // explicit 0 disables the leaf).
+  optional float dense_weight = 2;
+  optional float lexical_weight = 3;
+}
+
+// Retained-set score blend (FUSION_MODE_SCORE_BLEND).
+message BlendScore {
+  // Per-leg normalization before combining. Absent = MIN_MAX.
+  ScoreNormalization normalization = 1;
+  // How normalized leg scores combine. Absent = ARITHMETIC.
+  ScoreCombination combination = 2;
+  optional float dense_weight = 3;
+  optional float lexical_weight = 4;
+}
+
+// Exact decomposed weighted sum (FUSION_MODE_DECOMPOSED). Both
+// weights must be positive; every document in the corpus is
+// accounted for.
+message DecomposedScore {
+  optional float dense_weight = 1;
+  optional float lexical_weight = 2;
+}
+
+// Gate-and-rerank (FUSION_MODE_CASCADE): the gate leaf's tie-complete
+// top selection_k admissions are the membership; the other leaf
+// reranks that pool and its score is the base order. The composite's
+// operator must be left UNSPECIFIED — membership is the gate's, and
+// neither AND nor OR describes it.
+message CascadeScore {
+  // Which leaf gates. Increment 1: must name the dense leaf (the
+  // engine's cascade is vector-gate, BM25-rerank).
+  string gate_id = 1;
+}
+
+// A candidate-scoped scoring query: runs against the selection's top
+// selection_k documents, never the corpus. Its relevance is another
+// named signal (under its query's id).
+message BoostQuery {
+  // The boost's scoring query. Increment 1: lexical only.
+  SearchQuery query = 1;
+  // How many top candidates are rescored. 0 = all selection_k.
+  uint32 window = 2;
+  // Weight of the base (selection) score in the reorder. 0 = 1.0.
+  float base_weight = 3;
+  // Weight of the boost relevance in the reorder. 0 = 1.0.
+  float boost_weight = 4;
+}
+
+// The generic named-dimension scorer (docs/query-api.md). Declared so
+// the shape is stable; increment 1 refuses a request that sets it.
+message CompositeScorer {
+  CompositeScoreOperation operation = 1;
+  repeated ScoreDimension dimensions = 2;
+}
+
+enum CompositeScoreOperation {
+  COMPOSITE_SCORE_OPERATION_UNSPECIFIED = 0;
+  COMPOSITE_SCORE_OPERATION_WEIGHTED_SUM = 1;
+  COMPOSITE_SCORE_OPERATION_WEIGHTED_MEAN = 2;
+  COMPOSITE_SCORE_OPERATION_MAXIMUM = 3;
+  COMPOSITE_SCORE_OPERATION_PRODUCT = 4;
+  COMPOSITE_SCORE_OPERATION_GEOMETRIC_MEAN = 5;
+  COMPOSITE_SCORE_OPERATION_HARMONIC_MEAN = 6;
+}
+
+message ScoreDimension {
+  string id = 1;
+  optional double weight = 2;
+  ScoreSignal source = 3;
+  ScoreNormalization normalization = 4;
+  MissingScorePolicy missing = 5;
+}
+
+message ScoreSignal {
+  oneof source {
+    // The first-stage composite base score.
+    bool base = 1;
+    // A search or boost query's raw relevance, by id. Never a filter.
+    string query_relevance_id = 2;
+    // A bounded stored-value score function.
+    ScoreStage bounded_value = 3;
+  }
+}
+
+enum MissingScorePolicy {
+  MISSING_SCORE_POLICY_UNSPECIFIED = 0;
+  MISSING_SCORE_POLICY_ZERO = 1;
+  MISSING_SCORE_POLICY_SKIP = 2;
+  MISSING_SCORE_POLICY_ERROR = 3;
+}
+
+// The public query response.
+message QueryResponse {
+  // Echoes `QueryRequest.request_id` (or the assigned one).
+  string request_id = 1;
+  // The best k documents under the final order: score descending,
+  // deterministic tie-break (score desc, doc id asc).
+  repeated QueryHit hits = 2;
+  // The route and strategy that actually ran, e.g. "bm25_search",
+  // "search", "hybrid_search:global_rank" — the strategy-and-defaults
+  // echo the contract requires, in executable terms.
+  string executed = 3;
+  // Resume token for the next page (QueryRequest.cursor). Empty when
+  // this page was short of k — there is provably nothing after it at
+  // the served depth.
+  string next_cursor = 4;
+}
+
+// One public hit with score provenance.
+message QueryHit {
+  // Global doc id (stable across identical corpus layouts; lineage
+  // identity arrives with the document store).
+  uint64 doc_id = 1;
+  // Final score under the executed strategy.
+  float score = 2;
+  // 1-based deterministic rank.
+  uint32 rank = 3;
+  // Raw relevance per matched search/boost query id. A filter never
+  // appears here.
+  repeated QuerySignal signals = 4;
+  // Ids of the clauses this document matched: every search leaf that
+  // scored it, and every filter (a returned hit passed all filters by
+  // construction).
+  repeated string matched = 5;
+  // Sorted browse only: this document's sort-column value (i64 values
+  // through the monotone f64 cast). 0 elsewhere.
+  double sort_key = 6;
+}
+
+// One named raw relevance signal.
+message QuerySignal {
+  // The search or boost query id.
+  string id = 1;
+  // Raw relevance on that query's own scale (BM25 for lexical,
+  // calibrated dot product for dense, boost BM25 for a boost). Scales
+  // are per-signal; the contract never pretends they share one.
+  float score = 2;
 }

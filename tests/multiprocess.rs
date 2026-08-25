@@ -139,6 +139,7 @@ async fn coordinator_topk(coord: &str, query: &[f32], k: u32) -> Vec<(u64, u32)>
             k,
             vector: query.to_vec(),
             collapse_parents: false,
+            ..Default::default()
         })
         .await
         .unwrap()

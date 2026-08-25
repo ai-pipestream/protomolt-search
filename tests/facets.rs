@@ -77,6 +77,8 @@ async fn add_documents_faceted(
             integers: Vec::new(),
             timestamps: Vec::new(),
             geo_points: Vec::new(),
+            quality: None,
+            geography: None,
         })
         .await
         .unwrap();
@@ -347,6 +349,8 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             facet_fields: vec!["court".to_string()],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await
@@ -371,6 +375,8 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             facet_fields: vec!["cuort".to_string()],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         }),
     )
     .await
@@ -482,6 +488,8 @@ async fn spilled_shard_serves_facets_after_flush() {
             facet_fields: vec!["court".to_string()],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
+            stats_fields: Vec::new(),
+            cardinality_fields: Vec::new(),
         })
         .await
         .unwrap()
