@@ -68,6 +68,12 @@ message WalRecord {
     LoggedAddDocuments add_documents = 3;
     FlushMarker flush = 4;
     SnapshotMarker snapshot = 5;
+    // The shard's mapped-plan binding (docs/descriptor-mappings.md
+    // section 4a), appended to markers.wal when the shard first binds.
+    // Replay tooling restores it onto rebuilt shards and refuses a log
+    // that carries contradictory bindings; the serving node's durable
+    // copy is the store's kind-6 column-table entry, written at flush.
+    LoggedBinding bind = 8;
   }
   // Reserved for multi-writer recovery: 6 for a clock tag (writer id +
   // logical tick per record, the generalization of per-file `seq` that
@@ -77,4 +83,15 @@ message WalRecord {
   // today; reserving the numbers keeps old logs readable when clocks
   // arrive.
   reserved 6, 7;
+}
+
+// The mapped-plan binding as logged (see WalRecord.bind).
+message LoggedBinding {
+  // The bound plan fingerprint (MappedPlan.fingerprint, lowercase hex).
+  string plan_fingerprint = 1;
+  // The TEXT field bound as the document body.
+  string body_path = 2;
+  // SHA-256 over the canonical encoding of the bind's materialize
+  // spec; empty when the bind carried none.
+  string materialize_sha = 3;
 }

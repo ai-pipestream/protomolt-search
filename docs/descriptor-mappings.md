@@ -25,9 +25,9 @@ The exchange contract is now drafted and vendored (section 5). Increment 2 lande
 protobuf-native ingest (`NodeService.IngestMapped`, section 4a) — the
 documents stream as the serialized protobuf messages they already are
 and reduce, by walking their wire bytes against the plan, onto the
-ORDINARY ingest path. Still later increments: chunked plans, and the
-durable shard-level binding (the stored-format work). The original
-framing, kept:
+ORDINARY ingest path. The durable shard-level binding landed with it:
+the first bind pins a shard to its plan across restarts (section 4a).
+Still later: chunked plans. The original framing, kept:
 
 The ownership move is decided (descriptor-derived mappings belong to
 turbovec-search, not turbovec-grpc), and the reference implementation
@@ -244,13 +244,30 @@ of the bound type. The contract, piece by piece:
   joins) when an increment needs one, but storing the exact value
   loses nothing today.
 
+- **The binding is durable: an index only ever pairs with the plan it
+  was written under.** The FIRST bind pins the shard to the triple
+  (plan fingerprint, body path, materialize-spec hash — the spec is
+  part of the identity because changing a materialization expression
+  changes what an index means). Every later bind must match exactly or
+  refuses naming what differs; changing the mapping is a rebuild,
+  never a rebind. Durability follows the store: the binding persists
+  as the kind-6 entry of the kinded column table — inside the v8
+  integrity envelope, so it lives and dies with the columns it
+  describes and cannot vanish separately — written at flush, adopted
+  from the file at startup. The bind is also a WAL record (in
+  `markers.wal`), so reshard replay carries the binding onto rebuilt
+  children and refuses inputs bound to different plans. A snapshot
+  install replaces the binding along with everything else (the image's
+  own, usually none): a wholesale replace replaces the plan identity
+  too. A bind that never flushed evaporates with the columns it never
+  wrote — consistency with the store is the invariant, not the bind
+  ceremony.
+
 What this increment deliberately leaves out: chunked plans (refused at
-bind), a durable shard-level binding — today the fingerprint is
-enforced per stream, and pinning an index to its plan across restarts
-is the stored-format increment — and per-field analyzer resolution
-(the plan records analyzer NAMES; non-body text fields analyze under
-sidecar defaults, and analysis identity is enforced by the analysis
-fingerprint as everywhere).
+bind) and per-field analyzer resolution (the plan records analyzer
+NAMES; non-body text fields analyze under sidecar defaults, and
+analysis identity is enforced by the analysis fingerprint as
+everywhere).
 
 ## 5. Vendoring and the BYO-descriptor flow
 

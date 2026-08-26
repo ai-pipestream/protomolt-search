@@ -702,3 +702,192 @@ async fn materialized_columns_ride_the_bind() {
         .collect();
     assert_eq!(selected, expected);
 }
+
+// ---------------------------------------------------------------------
+// The durable shard-level binding
+// ---------------------------------------------------------------------
+
+/// The same schema minus the (FAMILY_NONE) `tags` field: lands on the
+/// same declared columns but derives a different plan fingerprint.
+fn case_set_without_tags() -> Vec<u8> {
+    let mut set = FileDescriptorSet::decode(&case_set()[..]).unwrap();
+    set.file[1].message_type[0]
+        .field
+        .retain(|f| f.name() != "tags");
+    set.encode_to_vec()
+}
+
+fn expected_binding() -> turbovec_search::postings::StoredBinding {
+    turbovec_search::postings::StoredBinding {
+        plan_fingerprint: derive_plan(&case_set(), "law.v1.Case").unwrap().fingerprint,
+        body_path: "title".into(),
+        materialize_sha: String::new(),
+    }
+}
+
+/// The first bind pins the shard to its plan durably: the flushed store
+/// carries the binding (the kind-6 column-table entry inside the v8
+/// integrity envelope), a restarted node adopts it from the file, and a
+/// bind under a different plan, a different body, or a different
+/// materialize spec refuses by name. Same-plan binds keep ingesting.
+#[tokio::test]
+async fn binding_survives_restart_and_refuses_a_different_plan() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvmapped_bind_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let index_path = dir.join("shard.tv");
+
+    let (addr, node) = start_empty_node(NodeConfig {
+        index_path: Some(index_path.clone()),
+        ..case_node_config(analysis.clone())
+    })
+    .await;
+    seed_calibration(&addr).await;
+    let response = ingest(&addr, bind(), (0..3).map(|i| doc(i).encode()).collect())
+        .await
+        .expect("mapped ingest succeeds");
+    assert_eq!(response.added, 3);
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client
+        .flush(turbovec_search::pb::FlushRequest {})
+        .await
+        .unwrap();
+    node.abort();
+
+    // The flushed file itself carries the binding.
+    let bm25_path = turbovec_search::node::bm25_sidecar_path(&index_path);
+    let store = turbovec_search::postings::Bm25Store::load(&bm25_path).unwrap();
+    assert_eq!(store.binding(), Some(&expected_binding()));
+
+    // Restart from disk, no in-memory state carried over. The wider
+    // bm25_fields table (title added) is only there to let the
+    // body-path probe below reach the BINDING check instead of the
+    // declared-columns check.
+    let index = turbovec::TurboQuantIndex::load(&index_path).unwrap();
+    index.prepare();
+    let bm25 = turbovec_search::node::Bm25Shard::open(&bm25_path).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = format!("http://{}", listener.local_addr().unwrap());
+    let mut config = case_node_config(analysis);
+    config.index_path = Some(index_path.clone());
+    config.bm25_fields.push("title".into());
+    let service = turbovec_search::node::NodeServiceImpl::new(Some(index), config)
+        .with_bm25(Some(bm25));
+    let _node2 = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(service.into_server(turbovec_search::MAX_MESSAGE_BYTES))
+            .serve_with_incoming(turbovec_search::harness::nodelay_incoming(listener)),
+    );
+
+    // Same plan: still bound, ids continue.
+    let more = ingest(&addr2, bind(), vec![doc(3).encode()])
+        .await
+        .expect("the same plan keeps ingesting after restart");
+    assert_eq!(more.added, 1);
+    assert_eq!(more.first_id, 3);
+
+    // A different plan (same landing columns, different fingerprint).
+    let variant = derive_plan(&case_set_without_tags(), "law.v1.Case").unwrap();
+    assert_ne!(variant.fingerprint, expected_binding().plan_fingerprint);
+    let mut other_plan = bind();
+    other_plan.descriptor_set = case_set_without_tags();
+    other_plan.expected_fingerprint = variant.fingerprint;
+    expect_refusal(
+        ingest(&addr2, other_plan, vec![]).await,
+        "durably bound",
+    );
+
+    // Same plan, different body.
+    let mut other_body = bind();
+    other_body.body_path = "meta.author".into();
+    expect_refusal(ingest(&addr2, other_body, vec![]).await, "the body");
+
+    // Same plan, a materialize spec the binding does not carry.
+    let mut other_spec = bind();
+    other_spec.materialize = Some(MaterializeSpec {
+        columns: vec![MaterializedColumn {
+            name: "price2".into(),
+            expression: "price * 2.0".into(),
+            kind: MaterializeKind::F64 as i32,
+        }],
+    });
+    expect_refusal(
+        ingest(&addr2, other_spec, vec![]).await,
+        "materialize spec",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Replay must not launder a binding away: the bind rides the WAL
+/// (markers), and resharded children come out bound to the same plan
+/// their parent was written under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reshard_replay_carries_the_binding() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvmapped_reshard_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let index_path = dir.join("shard.tv");
+
+    let (addr, _node) = start_empty_node(NodeConfig {
+        index_path: Some(index_path.clone()),
+        wal: true,
+        wal_buckets: 8,
+        ..case_node_config(analysis.clone())
+    })
+    .await;
+    seed_calibration(&addr).await;
+    ingest(&addr, bind(), (0..4).map(|i| doc(i).encode()).collect())
+        .await
+        .expect("mapped ingest succeeds");
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client
+        .flush(turbovec_search::pb::FlushRequest {})
+        .await
+        .unwrap();
+
+    let handle = tokio::runtime::Handle::current();
+    let analysis_addr = analysis.clone();
+    let mut analyze = move |docs: &[(&str, Option<&turbovec_search::pb::AnalysisSpec>)]| {
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut out = Vec::with_capacity(docs.len());
+                for (text, spec) in docs {
+                    out.push(
+                        turbovec_search::analyzer::analyze_document(&analysis_addr, text, *spec)
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                Ok(out)
+            })
+        })
+    };
+    let fields: Vec<String> = vec!["body".into(), "meta_author".into()];
+    let gen = turbovec_search::reshard::resolve_gen(&turbovec_search::wal::wal_dir(&index_path))
+        .unwrap();
+    let out_dir = dir.join("out");
+    let output = turbovec_search::reshard::merge(
+        &[gen],
+        &out_dir,
+        None,
+        false,
+        Some(&fields),
+        &mut analyze,
+    )
+    .unwrap();
+    assert_eq!(output.children.len(), 1);
+    let child_bm25 = output.children[0]
+        .bm25_path
+        .as_ref()
+        .expect("documents were replayed");
+    let child = turbovec_search::postings::Bm25Store::load(child_bm25).unwrap();
+    assert_eq!(child.doc_count(), 4);
+    assert_eq!(child.binding(), Some(&expected_binding()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

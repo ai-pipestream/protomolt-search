@@ -66,6 +66,9 @@ fn inspect_file(path: &Path, records: bool) -> Result<(u64, u64), String> {
                 id_hi = id_hi.max(a.first_id);
                 format!("add_documents id={} n={}", a.first_id, a.documents.len())
             }
+            Some(wal_record::Op::Bind(b)) => {
+                format!("bind plan={} body={:?}", b.plan_fingerprint, b.body_path)
+            }
             Some(wal_record::Op::Flush(_)) => "flush".to_string(),
             Some(wal_record::Op::Snapshot(s)) => {
                 format!("snapshot source_generation={}", s.source_generation)

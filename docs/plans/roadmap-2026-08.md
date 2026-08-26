@@ -508,10 +508,15 @@ session, the column validation, the CEL materialization from the bind,
 and the WAL records are the ones ordinary ingest already has — replay
 never needs the descriptor. Each document's vector applies in LOCKSTEP
 at the same id under the same lock (its own AddVectors WAL record); a
-shard whose document leg ran ahead refuses by name. Deliberately
-deferred: chunked plans, a durable shard-level binding (the stored
-format increment), per-field analyzer resolution. Pinned in
-`tests/mapped_ingest.rs`.
+shard whose document leg ran ahead refuses by name. The durable
+shard-level binding landed the same day: the first bind pins the shard
+to (plan fingerprint, body path, materialize hash) as the kind-6 entry
+of the kinded column table inside the v8 integrity envelope, plus a
+WAL marker record — restarts adopt it from the file, rebinds under a
+different mapping refuse by name, reshard replay carries it onto
+children and refuses mixed-plan inputs, snapshot installs replace it.
+Deliberately deferred: chunked plans, per-field analyzer resolution.
+Pinned in `tests/mapped_ingest.rs`.
 
 **Increment 1 landed 2026-08-25** exactly at the scoped increment:
 derivation plus dry-run planning plus the fingerprint, no ingest.

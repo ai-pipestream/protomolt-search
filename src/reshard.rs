@@ -225,6 +225,13 @@ fn replay_buckets(
                         }
                     }
                 }
+                Some(wal_record::Op::Bind(_)) => {
+                    return Err(format!(
+                        "replay {}: a binding record in a bucket file — binds route to \
+                         markers.wal, so this log is corrupt or foreign",
+                        path.display()
+                    ));
+                }
                 Some(wal_record::Op::Flush(_)) | Some(wal_record::Op::Snapshot(_)) | None => {}
             }
         }
@@ -272,6 +279,54 @@ fn require_complete_history(manifest: &WalManifest, what: &Path) -> Result<(), S
     Ok(())
 }
 
+/// The mapped-plan binding carried by the input generations' markers
+/// files (`docs/descriptor-mappings.md` section 4a): every Bind record
+/// across every input must agree, because the children are ONE corpus
+/// under ONE plan — contradictory bindings mean the inputs were mapped
+/// under different plans and their columns must not merge. `None` when
+/// no input was ever bound (hand-built columns bind nothing).
+fn read_gens_binding(
+    gens: &[PathBuf],
+) -> Result<Option<crate::postings::StoredBinding>, String> {
+    let mut bound: Option<(crate::postings::StoredBinding, PathBuf)> = None;
+    for gen in gens {
+        let path = wal::markers_path(gen);
+        if !path.exists() {
+            continue;
+        }
+        let mut reader =
+            RecordReader::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        while let Some(record) = reader
+            .next_record()
+            .map_err(|e| format!("replay {}: {e}", path.display()))?
+        {
+            let Some(wal_record::Op::Bind(bind)) = record.op else {
+                continue;
+            };
+            let binding = crate::postings::StoredBinding {
+                plan_fingerprint: bind.plan_fingerprint,
+                body_path: bind.body_path,
+                materialize_sha: bind.materialize_sha,
+            };
+            match &bound {
+                Some((first, first_gen)) if *first != binding => {
+                    return Err(format!(
+                        "{}: bound to plan {} but {} is bound to plan {}; the inputs were \
+                         mapped under different plans and their columns must not combine",
+                        path.display(),
+                        binding.plan_fingerprint,
+                        first_gen.display(),
+                        first.plan_fingerprint
+                    ));
+                }
+                Some(_) => {}
+                None => bound = Some((binding, gen.clone())),
+            }
+        }
+    }
+    Ok(bound.map(|(binding, _)| binding))
+}
+
 /// Calibration identity for the merge check (slot offset and generation
 /// legitimately differ between inputs; the shape and calibration must not).
 fn same_calibration(a: &WalManifest, b: &WalManifest) -> bool {
@@ -295,6 +350,7 @@ fn build_child(
     documents: Vec<(u64, AddDocumentsRequest)>,
     tv_path: &Path,
     bm25_fields: Option<&[String]>,
+    binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let dim = manifest.dim as usize;
@@ -604,6 +660,9 @@ fn build_child(
             }
             i = end;
         }
+        // The children stay bound to the plan the parents were written
+        // under; replay must not launder a binding away.
+        builder.set_binding(binding.cloned());
         builder
             .finish(&path)
             .map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -633,6 +692,7 @@ fn finish_child(
     hash_lo: u64,
     hash_hi: u64,
     bm25_fields: Option<&[String]>,
+    binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let tv_path = out_dir.join(format!("shard-{ordinal}.tv"));
@@ -648,6 +708,7 @@ fn finish_child(
         replay.documents.into_iter().collect(),
         &tv_path,
         bm25_fields,
+        binding,
         analyze,
     )?;
     child.slot_offset = slot_offset;
@@ -742,6 +803,7 @@ pub fn split_logs(
         }
         top_generation = top_generation.max(m.generation);
     }
+    let binding = read_gens_binding(gens)?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
 
     let bucket_count = manifest.bucket_count as usize;
@@ -781,6 +843,7 @@ pub fn split_logs(
                 hash_lo,
                 hash_hi,
                 bm25_fields,
+                binding.as_ref(),
                 analyze,
             )?);
         }
@@ -828,6 +891,7 @@ pub fn split_logs(
                 hash_lo,
                 hash_hi,
                 bm25_fields,
+                binding.as_ref(),
                 analyze,
             )?);
         }
@@ -884,6 +948,7 @@ pub fn merge(
     }
     let bucket_count = manifests[0].bucket_count;
     let dim = manifests[0].dim as usize;
+    let binding = read_gens_binding(gens)?;
     let max_generation = manifests.iter().map(|m| m.generation).max().unwrap_or(0);
     let min_slot_offset = manifests.iter().map(|m| m.slot_offset).min().unwrap_or(0);
 
@@ -917,6 +982,7 @@ pub fn merge(
         0,
         u64::MAX,
         bm25_fields,
+        binding.as_ref(),
         analyze,
     )?;
     Ok(ReshardOutput {
