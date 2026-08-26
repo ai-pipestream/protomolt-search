@@ -25,9 +25,12 @@ The exchange contract is now drafted and vendored (section 5). Increment 2 lande
 protobuf-native ingest (`NodeService.IngestMapped`, section 4a) — the
 documents stream as the serialized protobuf messages they already are
 and reduce, by walking their wire bytes against the plan, onto the
-ORDINARY ingest path. The durable shard-level binding landed with it:
-the first bind pins a shard to its plan across restarts (section 4a).
-Still later: chunked plans. The original framing, kept:
+ORDINARY ingest path. The durable shard-level binding landed with it
+(the first bind pins a shard to its plan across restarts), and chunk
+scopes followed: a chunked plan ingests one engine row per chunk, with
+parent fields denormalized and the engine's existing parent-collapse
+keyed by the reduced parent id (section 4a). The original framing,
+kept:
 
 The ownership move is decided (descriptor-derived mappings belong to
 turbovec-search, not turbovec-grpc), and the reference implementation
@@ -147,11 +150,13 @@ deliberate:
   the pruned-versus-exhaustive bitwise equivalence all stand, by the
   same removal-only argument the geo increment used.
 
-Chunk scopes wait (resolved with increment 2): a chunked plan derives
-and fingerprints, but binding one for ingest refuses by name. The
-engine already has lineage records and a parent-collapse mode in
-hybrid fusion; the chunk increment should reuse those rather than
-import the reference's parent tables unchanged.
+Chunk scopes landed by reusing what the engine had (resolved as the
+design note wanted): chunk rows carry ordinary lineage records whose
+`opinion_id` is the REDUCED parent id, so the existing parent-collapse
+scans group mapped chunks with no new machinery and no imported parent
+tables. The reference's id-reduction contract (integer verbatim;
+string reduced to the first 8 bytes of SHA-256, big-endian) is what
+makes the parent key computable by any client.
 
 ## 4. First-class CEL: the extension surface
 
@@ -231,6 +236,26 @@ of the bound type. The contract, piece by piece:
   same streaming analysis session, the same column validation, the
   same apply, the same WAL record. Replay never needs the descriptor:
   the log carries the reduced values.
+- **A chunked plan ingests one engine row per chunk.** The searchable
+  rows are the chunks: the body must be a TEXT field inside the CHUNKS
+  scope (`body_path` picks it when the scope has several), each chunk
+  carries its own vector, and chunk-scope scalars land under their
+  unprefixed plan names. Parent scalars AND parent TEXT fields
+  denormalize onto every chunk row — parent text as ordinary
+  multi-field columns, the same shape the production corpus uses for
+  case names — so a filter sees parent and chunk fields together with
+  no query-time join. A declared CHUNK_ID is required per chunk; a
+  document with ZERO chunks is a legitimate empty document and yields
+  zero rows (the response's `parents` count keeps it visible). Each
+  row's lineage carries the reduced parent id as `opinion_id`, which
+  is exactly the key the engine's parent-collapse scans group by:
+  `collapse_parents` works over mapped chunks unchanged. (One caveat,
+  inherited from the self-parent tag: rows ingested WITHOUT lineage
+  are their own parents under a high-bit-tagged id, so mixing mapped
+  chunk rows and lineage-less rows in one shard can collide parent
+  keys in the tagged range; mapped corpora carry lineage on every row
+  and never meet it.) Chunk refusals name the document position, the
+  chunk ordinal, and the field.
 - **Ids stay positional; the two legs append in lockstep.** This
   engine's ids are server-assigned slots shared by both legs, so the
   mapped document takes the next id and its vector applies at the SAME
@@ -263,11 +288,10 @@ of the bound type. The contract, piece by piece:
   wrote — consistency with the store is the invariant, not the bind
   ceremony.
 
-What this increment deliberately leaves out: chunked plans (refused at
-bind) and per-field analyzer resolution (the plan records analyzer
-NAMES; non-body text fields analyze under sidecar defaults, and
-analysis identity is enforced by the analysis fingerprint as
-everywhere).
+What remains deliberately left out: per-field analyzer resolution
+(the plan records analyzer NAMES; non-body text fields analyze under
+sidecar defaults, and analysis identity is enforced by the analysis
+fingerprint as everywhere).
 
 ## 5. Vendoring and the BYO-descriptor flow
 

@@ -3777,9 +3777,16 @@ struct MappedSource<'a> {
     /// document.
     analysis: Option<crate::pb::AnalysisSpec>,
     materialize: Option<crate::pb::MaterializeSpec>,
-    /// Documents decoded so far; extraction errors name the failing
-    /// position.
+    /// Source documents decoded so far; extraction errors name the
+    /// failing position.
     position: u64,
+    /// Source documents consumed (== position, kept for the response's
+    /// accounting: a chunked document yields as many rows as it has
+    /// chunks, including zero).
+    parents: u64,
+    /// Rows decoded but not yet handed to the pipeline: a chunked
+    /// document explodes into one row per chunk.
+    rows: std::collections::VecDeque<IngestDoc>,
 }
 
 impl IngestSource<'_> {
@@ -3797,36 +3804,53 @@ impl IngestSource<'_> {
 impl MappedSource<'_> {
     async fn next(&mut self) -> Result<Option<IngestDoc>, Status> {
         use crate::pb::ingest_mapped_request::Payload;
-        match self.stream.message().await? {
-            None => Ok(None),
-            Some(message) => match message.payload {
-                Some(Payload::Document(bytes)) => Ok(Some(self.decode(&bytes)?)),
-                Some(Payload::Bind(_)) => Err(Status::invalid_argument(
-                    "bind repeats mid-stream; a mapped stream binds exactly once, first",
-                )),
-                None => Err(Status::invalid_argument(
-                    "empty IngestMappedRequest payload",
-                )),
-            },
+        loop {
+            if let Some(row) = self.rows.pop_front() {
+                return Ok(Some(row));
+            }
+            match self.stream.message().await? {
+                None => return Ok(None),
+                Some(message) => match message.payload {
+                    // A zero-chunk document decodes to zero rows; loop
+                    // for the next message rather than ending the
+                    // stream.
+                    Some(Payload::Document(bytes)) => self.decode(&bytes)?,
+                    Some(Payload::Bind(_)) => {
+                        return Err(Status::invalid_argument(
+                            "bind repeats mid-stream; a mapped stream binds exactly once, \
+                             first",
+                        ))
+                    }
+                    None => {
+                        return Err(Status::invalid_argument(
+                            "empty IngestMappedRequest payload",
+                        ))
+                    }
+                },
+            }
         }
     }
 
-    fn decode(&mut self, bytes: &[u8]) -> Result<IngestDoc, Status> {
+    fn decode(&mut self, bytes: &[u8]) -> Result<(), Status> {
         let position = self.position;
         self.position += 1;
-        let extracted = self.extractor.extract(bytes).map_err(|status| {
+        let rows = self.extractor.extract(bytes).map_err(|status| {
             Status::new(
                 status.code(),
                 format!("document {position}: {}", status.message()),
             )
         })?;
-        let mut req = extracted.request;
-        req.analysis = self.analysis.clone();
-        req.materialize = self.materialize.clone();
-        Ok(IngestDoc {
-            req,
-            vector: Some(extracted.vector),
-        })
+        self.parents += 1;
+        for extracted in rows {
+            let mut req = extracted.request;
+            req.analysis = self.analysis.clone();
+            req.materialize = self.materialize.clone();
+            self.rows.push_back(IngestDoc {
+                req,
+                vector: Some(extracted.vector),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -6127,6 +6151,8 @@ impl NodeService for NodeServiceImpl {
             analysis: bind.analysis.clone(),
             materialize: bind.materialize.clone(),
             position: 0,
+            parents: 0,
+            rows: std::collections::VecDeque::new(),
         }));
         if let Some(first) = source.next().await? {
             match crate::analyzer::AnalyzeStream::open_with_vocab(
@@ -6166,13 +6192,18 @@ impl NodeService for NodeServiceImpl {
             .bm25
             .as_ref()
             .map_or(0, |b| b.doc_count());
-        // Each mapped document carries exactly one vector.
+        // Each mapped row carries exactly one vector.
         crate::metrics::add_ingested(added, added);
+        let parents = match &source {
+            IngestSource::Mapped(mapped) => mapped.parents,
+            IngestSource::Plain(_) => unreachable!("this handler built a mapped source"),
+        };
         Ok(Response::new(IngestMappedResponse {
             added,
             total,
             first_id,
             fingerprint,
+            parents,
         }))
     }
 

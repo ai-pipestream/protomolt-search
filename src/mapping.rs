@@ -1194,6 +1194,19 @@ pub struct Extractor {
     vector: usize,
     /// Leaf index of the document id field.
     doc_id: usize,
+    /// Chunked plans: which leaves live inside the CHUNKS scope and
+    /// carry per-chunk values. `None` for a flat plan.
+    chunked: Option<ChunkShape>,
+}
+
+/// The chunk scope's shape, compiled at bind.
+struct ChunkShape {
+    /// Parallel to `Extractor::leaves`: true for leaves inside the
+    /// CHUNKS scope.
+    in_chunk: Vec<bool>,
+    /// The CHUNK_ID leaf, when the plan declares one; required per
+    /// chunk then.
+    chunk_id: Option<usize>,
 }
 
 #[derive(Default)]
@@ -1207,6 +1220,9 @@ enum Child {
     Descend(TrieNode),
     /// A landing field; the payload is the leaf's slot index.
     Leaf(usize),
+    /// The CHUNKS container: each wire occurrence is ONE chunk, walked
+    /// against the inner trie into its own slot set.
+    Chunks(TrieNode),
 }
 
 struct Leaf {
@@ -1273,6 +1289,7 @@ pub struct ExtractedDoc {
 }
 
 /// A value accumulating during one document's walk.
+#[derive(Clone)]
 enum Slot {
     Str(String),
     Int(i64),
@@ -1292,25 +1309,32 @@ impl Extractor {
         body_path: &str,
     ) -> Result<Extractor, Status> {
         let plan = derive_plan(descriptor_set, message_type)?;
-        if !plan.chunks_path.is_empty() {
-            return Err(refuse_at(
-                &plan.chunks_path.clone(),
-                "chunked plans do not ingest yet; this increment binds flat documents only",
-            ));
-        }
+        // The searchable rows of a chunked plan are its CHUNKS, so the
+        // body — the stored, highlighted text of a row — must live
+        // inside the scope; parent TEXT fields denormalize as ordinary
+        // multi-field columns on every chunk row instead.
+        let chunk_prefix =
+            (!plan.chunks_path.is_empty()).then(|| format!("{}.", plan.chunks_path));
+        let in_scope = |path: &str| -> bool {
+            chunk_prefix.as_deref().is_none_or(|prefix| path.starts_with(prefix))
+        };
         let text_paths: Vec<&str> = plan
             .fields
             .iter()
             .filter(|f| f.family == pb::ColumnFamily::TextField as i32)
+            .filter(|f| in_scope(&f.path))
             .map(|f| f.path.as_str())
             .collect();
         let body_path = if body_path.is_empty() {
             match text_paths.as_slice() {
                 [] => {
-                    return Err(refuse(
+                    return Err(refuse(if chunk_prefix.is_some() {
+                        "the plan's CHUNKS scope has no TEXT field; each chunk is the \
+                         searchable row and stores one text body"
+                    } else {
                         "the plan has no TEXT field; mapped ingest stores one text body \
-                         per document",
-                    ))
+                         per document"
+                    }))
                 }
                 [only] => (*only).to_string(),
                 several => {
@@ -1326,7 +1350,12 @@ impl Extractor {
                 return Err(refuse_at(
                     body_path,
                     format!(
-                        "body_path must name one of the plan's TEXT fields ({})",
+                        "body_path must name one of the plan's{} TEXT fields ({})",
+                        if chunk_prefix.is_some() {
+                            " CHUNKS-scope"
+                        } else {
+                            ""
+                        },
                         if text_paths.is_empty() {
                             "the plan has none".to_string()
                         } else {
@@ -1358,21 +1387,50 @@ impl Extractor {
             .get(message_type)
             .expect("derive_plan resolved the root type");
 
+        // The chunk message's own descriptor entry, for navigating
+        // scope-relative paths (the container is repeated, so paths
+        // through it cannot navigate from the root).
+        let chunk_entry = match &chunk_prefix {
+            Some(_) => {
+                let container = index.navigate(root_entry, &plan.chunks_path)?;
+                Some(index.message_by_type_name(container.type_name(), &plan.chunks_path)?)
+            }
+            None => None,
+        };
         let mut leaves: Vec<Leaf> = Vec::new();
+        let mut in_chunk: Vec<bool> = Vec::new();
         let mut root = TrieNode::default();
+        let mut chunk_root = TrieNode::default();
         let mut body = None;
         let mut vector = None;
         let mut doc_id = None;
+        let mut chunk_id = None;
         for field in &plan.fields {
             let is_vector = field.path == plan.vector_path;
             if !is_vector && field.family == pb::ColumnFamily::None as i32 {
                 // Visible in the plan as FAMILY_NONE; nothing to land.
+                // (The CHUNKS container itself lands here too — it is
+                // the scope, not a value.)
                 continue;
             }
-            let leaf_desc = index.navigate(root_entry, &field.path)?;
-            let land = land_for(field, is_vector, leaf_desc, &enums)?;
+            let scoped = chunk_prefix
+                .as_deref()
+                .and_then(|prefix| field.path.strip_prefix(prefix));
             let slot = leaves.len();
-            insert_path(&mut root, root_entry, &index, &field.path, slot)?;
+            let land = match (scoped, &chunk_entry) {
+                (Some(relative), Some(entry)) => {
+                    let leaf_desc = index.navigate(entry, relative)?;
+                    let land = land_for(field, is_vector, leaf_desc, &enums)?;
+                    insert_path(&mut chunk_root, entry, &index, relative, Child::Leaf(slot))?;
+                    land
+                }
+                _ => {
+                    let leaf_desc = index.navigate(root_entry, &field.path)?;
+                    let land = land_for(field, is_vector, leaf_desc, &enums)?;
+                    insert_path(&mut root, root_entry, &index, &field.path, Child::Leaf(slot))?;
+                    land
+                }
+            };
             if field.path == body_path {
                 body = Some(slot);
             }
@@ -1382,12 +1440,29 @@ impl Extractor {
             if field.path == plan.doc_id_path {
                 doc_id = Some(slot);
             }
+            if !plan.chunk_id_path.is_empty() && field.path == plan.chunk_id_path {
+                chunk_id = Some(slot);
+            }
+            in_chunk.push(scoped.is_some());
             leaves.push(Leaf {
                 path: field.path.clone(),
                 name: field.name.clone(),
                 land,
             });
         }
+        let chunked = match chunk_prefix {
+            Some(_) => {
+                insert_path(
+                    &mut root,
+                    root_entry,
+                    &index,
+                    &plan.chunks_path,
+                    Child::Chunks(chunk_root),
+                )?;
+                Some(ChunkShape { in_chunk, chunk_id })
+            }
+            None => None,
+        };
         Ok(Extractor {
             plan,
             root,
@@ -1395,6 +1470,7 @@ impl Extractor {
             body: body.expect("body_path came from the plan's TEXT fields"),
             vector: vector.expect("derive_plan resolved the vector"),
             doc_id: doc_id.expect("derive_plan resolved the id"),
+            chunked,
         })
     }
 
@@ -1407,20 +1483,64 @@ impl Extractor {
         &self.leaves[self.body].path
     }
 
-    /// Decode one serialized message of the bound type into the
-    /// ordinary request pieces plus its vector. Refuses malformed
-    /// bytes, an absent body, an absent id, and an absent or
-    /// wrong-dimension vector — each naming the field.
-    pub fn extract(&self, bytes: &[u8]) -> Result<ExtractedDoc, Status> {
+    /// Decode one serialized message of the bound type into engine
+    /// rows: one row for a flat plan, one row PER CHUNK for a chunked
+    /// plan (zero chunks is a legitimate empty document and yields
+    /// zero rows). Refuses malformed bytes and absent required values
+    /// — body, id, vector, declared chunk id — each naming the field,
+    /// chunk refusals naming the chunk ordinal.
+    pub fn extract(&self, bytes: &[u8]) -> Result<Vec<ExtractedDoc>, Status> {
         let mut slots: Vec<Option<Slot>> = (0..self.leaves.len()).map(|_| None).collect();
-        self.walk_bytes(bytes, &self.root, &mut slots)?;
+        let mut chunks: Vec<Vec<Option<Slot>>> = Vec::new();
+        self.walk_bytes(bytes, &self.root, &mut slots, &mut chunks)?;
+        if self.chunked.is_none() {
+            return Ok(vec![self.assemble(&slots, None)?]);
+        }
+        let mut rows = Vec::with_capacity(chunks.len());
+        for (ordinal, chunk_slots) in chunks.iter().enumerate() {
+            let row = self.assemble(&slots, Some(chunk_slots)).map_err(|status| {
+                Status::new(
+                    status.code(),
+                    format!("chunk {ordinal}: {}", status.message()),
+                )
+            })?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Build one engine row from the parent slots plus, for chunked
+    /// plans, one chunk's slots. Parent values denormalize onto every
+    /// chunk row — a filter sees parent and chunk fields together with
+    /// no query-time join — and the row's lineage carries the REDUCED
+    /// parent id as `opinion_id`, the key the engine's parent-collapse
+    /// scans already group by.
+    fn assemble(
+        &self,
+        parent: &[Option<Slot>],
+        chunk: Option<&Vec<Option<Slot>>>,
+    ) -> Result<ExtractedDoc, Status> {
         let mut request = pb::AddDocumentsRequest::default();
         let mut vector = Vec::new();
-        for (index, (leaf, slot)) in self.leaves.iter().zip(slots).enumerate() {
+        let mut reduced_id = None;
+        for (index, leaf) in self.leaves.iter().enumerate() {
+            let from_chunk = self
+                .chunked
+                .as_ref()
+                .is_some_and(|shape| shape.in_chunk[index]);
+            let raw = if from_chunk {
+                chunk.expect("chunk rows pass their slots")[index].as_ref()
+            } else {
+                parent[index].as_ref()
+            };
             // An empty wire string is proto3 absence, so both arms of
             // this check speak the same rule: required leaves refuse,
             // ordinary leaves simply do not land.
-            let absent = |what: &str| -> Result<(), Status> {
+            let present = match raw {
+                Some(Slot::Str(value)) if value.is_empty() => None,
+                other => other,
+            };
+            let Some(slot) = present else {
                 if index == self.body {
                     return Err(refuse_at(&leaf.path, "the document has no body text"));
                 }
@@ -1430,21 +1550,27 @@ impl Extractor {
                 if index == self.doc_id {
                     return Err(refuse_at(
                         &leaf.path,
-                        format!("the document has no id ({what}); identity is required"),
+                        "the document has no id; identity is required",
                     ));
                 }
-                Ok(())
-            };
-            let Some(slot) = slot else {
-                absent("the field is not on the wire")?;
+                let declared_chunk_id = self
+                    .chunked
+                    .as_ref()
+                    .is_some_and(|shape| shape.chunk_id == Some(index));
+                if declared_chunk_id {
+                    return Err(refuse_at(
+                        &leaf.path,
+                        "the chunk has no id; the plan declares CHUNK_ID, so every chunk \
+                         carries one",
+                    ));
+                }
                 continue;
             };
-            match slot {
+            if index == self.doc_id {
+                reduced_id = Some(reduce_id(&leaf.land, slot, &leaf.path)?);
+            }
+            match slot.clone() {
                 Slot::Str(value) => {
-                    if value.is_empty() {
-                        absent("the value is empty")?;
-                        continue;
-                    }
                     if matches!(leaf.land, Land::Text) {
                         if index == self.body {
                             request.text = value;
@@ -1493,6 +1619,15 @@ impl Extractor {
                 ),
             ));
         }
+        if self.chunked.is_some() {
+            let parent_key = reduced_id.expect("an absent doc id refused above");
+            request.lineage = Some(pb::DocLineage {
+                opinion_id: parent_key,
+                cluster_id: 0,
+                span_start: 0,
+                span_end: 0,
+            });
+        }
         Ok(ExtractedDoc { request, vector })
     }
 
@@ -1501,6 +1636,7 @@ impl Extractor {
         bytes: &[u8],
         node: &TrieNode,
         slots: &mut [Option<Slot>],
+        chunks: &mut Vec<Vec<Option<Slot>>>,
     ) -> Result<(), Status> {
         let mut i = 0usize;
         while i < bytes.len() {
@@ -1524,7 +1660,25 @@ impl Extractor {
                         )));
                     }
                     let sub = read_len(bytes, &mut i)?;
-                    self.walk_bytes(sub, inner, slots)?;
+                    self.walk_bytes(sub, inner, slots, chunks)?;
+                }
+                Some(Child::Chunks(inner)) => {
+                    // Each occurrence of the container is ONE chunk,
+                    // walked into its own slot set.
+                    if wire != 2 {
+                        return Err(refuse(format!(
+                            "malformed document: the chunks container arrived with wire \
+                             type {wire}"
+                        )));
+                    }
+                    let sub = read_len(bytes, &mut i)?;
+                    let mut chunk_slots: Vec<Option<Slot>> =
+                        (0..self.leaves.len()).map(|_| None).collect();
+                    // The chunk trie holds no nested Chunks child by
+                    // construction, so this stays empty.
+                    let mut nested = Vec::new();
+                    self.walk_bytes(sub, inner, &mut chunk_slots, &mut nested)?;
+                    chunks.push(chunk_slots);
                 }
                 Some(Child::Leaf(slot)) => {
                     decode_leaf(&self.leaves[*slot], bytes, &mut i, wire, &mut slots[*slot])?;
@@ -1533,6 +1687,34 @@ impl Extractor {
             }
         }
         Ok(())
+    }
+}
+
+/// The document-id reduction — part of the contract, so any client can
+/// compute the same parent key: an integer id is its 64-bit two's
+/// complement pattern verbatim; a string id reduces to the first 8
+/// bytes of SHA-256 over its UTF-8 bytes, big-endian. Keyed on the
+/// DESCRIPTOR type (a KEYWORD hint on an integer field renders as a
+/// facet string but still reduces as the integer it is).
+fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
+    match (land, slot) {
+        (Land::Int(_), Slot::Int(value)) => Ok(*value as u64),
+        (Land::FacetInt(_), Slot::Str(rendered)) => rendered
+            .parse::<i64>()
+            .map(|value| value as u64)
+            .map_err(|_| {
+                Status::internal(format!(
+                    "plan: doc id {path}: non-decimal own rendering {rendered:?}"
+                ))
+            }),
+        (_, Slot::Str(value)) => Ok(u64::from_be_bytes(
+            sha256::digest(value.as_bytes())[..8]
+                .try_into()
+                .expect("32 bytes hold 8"),
+        )),
+        _ => Err(Status::internal(format!(
+            "plan: doc id {path} landed a non-identity slot"
+        ))),
     }
 }
 
@@ -1647,7 +1829,7 @@ fn insert_path(
     entry: &MsgEntry<'_>,
     index: &TypeIndex<'_>,
     path: &str,
-    slot: usize,
+    terminal: Child,
 ) -> Result<(), Status> {
     let mut node = root;
     let mut current = entry.desc;
@@ -1660,7 +1842,7 @@ fn insert_path(
             .expect("navigate resolved this path already");
         let number = field.number();
         if position + 1 == segments.len() {
-            node.children.push((number, Child::Leaf(slot)));
+            node.children.push((number, terminal));
             return Ok(());
         }
         current = index.message_by_type_name(field.type_name(), path)?.desc;
@@ -1674,7 +1856,7 @@ fn insert_path(
         };
         node = match &mut children[at].1 {
             Child::Descend(inner) => inner,
-            Child::Leaf(_) => {
+            Child::Leaf(_) | Child::Chunks(_) => {
                 return Err(Status::internal(format!(
                     "plan: path {path} descends through a field already planned as a leaf"
                 )))

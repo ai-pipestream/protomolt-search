@@ -515,7 +515,13 @@ of the kinded column table inside the v8 integrity envelope, plus a
 WAL marker record — restarts adopt it from the file, rebinds under a
 different mapping refuse by name, reshard replay carries it onto
 children and refuses mixed-plan inputs, snapshot installs replace it.
-Deliberately deferred: chunked plans, per-field analyzer resolution.
+Chunk scopes landed the same
+day: one engine row per chunk, parent scalars and parent TEXT
+denormalized onto every row, a chunk-scope body, per-chunk vectors,
+required CHUNK_IDs, zero-chunk documents legitimate (the response
+counts parents and rows separately), and lineage carrying the reduced
+parent id so the existing parent-collapse groups mapped chunks with no
+new machinery. Deliberately deferred: per-field analyzer resolution.
 Pinned in `tests/mapped_ingest.rs`.
 
 **Increment 1 landed 2026-08-25** exactly at the scoped increment:
