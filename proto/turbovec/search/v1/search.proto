@@ -3515,6 +3515,13 @@ message IngestMappedResponse {
 
   // The bound plan fingerprint, echoed for provenance.
   string fingerprint = 4;
+
+  // Source documents consumed. Equal to `added` on a flat plan; on a
+  // chunked plan each source document yields one row per chunk
+  // (including zero — a chunkless document is a legitimate empty
+  // document and adds nothing), so `added` counts rows and this counts
+  // documents.
+  uint64 parents = 5;
 }
 
 // ---------------------------------------------------------------------------
