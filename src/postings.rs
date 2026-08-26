@@ -95,6 +95,19 @@ const COLUMN_KIND_I64: u8 = 4;
 /// carries the column's bounding box (min/max lat and lon), validated
 /// against a full scan at open like every other kind's metadata.
 const COLUMN_KIND_GEO: u8 = 5;
+/// Kind 6 is the shard-level mapped-plan BINDING record
+/// (`docs/descriptor-mappings.md` section 4a) — not a column: at most
+/// one entry, a pinned name, an inline payload (three length-prefixed
+/// strings: plan fingerprint, bound body path, materialize-spec hash),
+/// and NO sections. Riding the kinded table keeps the binding inside
+/// the v8 integrity envelope with zero new format machinery, so it
+/// lives and dies with the columns it describes — a binding that could
+/// vanish separately from them would protect nothing. A user column
+/// declared under the reserved name collides with the table's
+/// name-uniqueness rule and refuses at save, loudly.
+const COLUMN_KIND_BINDING: u8 = 6;
+/// The binding record's reserved entry name.
+const BINDING_ENTRY_NAME: &str = "plan-binding";
 
 /// v8 layout: a v6 or v7 payload, byte-identical, wearing integrity.
 /// The leading magic becomes `TVBM2508`; after the last payload byte
@@ -365,6 +378,17 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                 COLUMN_KIND_GEO => {
                     starts.push((format!("column:{name}:vals"), u64_at(base + 32)));
                     cursor = base + 40;
+                }
+                COLUMN_KIND_BINDING => {
+                    // Inline payload only: three length-prefixed
+                    // strings, no sections to name.
+                    let mut skip = base;
+                    for _ in 0..3 {
+                        let len =
+                            u16::from_le_bytes(map[skip..skip + 2].try_into().unwrap()) as usize;
+                        skip += 2 + len;
+                    }
+                    cursor = skip;
                 }
                 other => {
                     return Err(io::Error::new(
@@ -1191,6 +1215,51 @@ fn intern(dict: &mut Vec<String>, index: &mut HashMap<String, u32>, value: &str,
     }
 }
 
+/// The shard-level mapped-plan binding: the identity of the plan this
+/// store's mapped columns were written under (`docs/descriptor-mappings.md`
+/// section 4a). Persisted as the kind-6 entry of the kinded column
+/// table; an index only ever pairs with the plan it was written under,
+/// and a contradiction at bind time is an index compatibility event.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoredBinding {
+    /// The plan fingerprint (`MappedPlan.fingerprint`, lowercase hex).
+    pub plan_fingerprint: String,
+    /// The TEXT field bound as the document body.
+    pub body_path: String,
+    /// SHA-256 over the canonical encoding of the bind's materialize
+    /// spec, empty when the bind carried none. Changing materialization
+    /// changes what an index means (`docs/cel-values.md`), so it is
+    /// part of the bound identity.
+    pub materialize_sha: String,
+}
+
+/// Header bytes of the binding's column-table entry, 0 when unbound.
+fn binding_entry_size(binding: Option<&StoredBinding>) -> u64 {
+    binding.map_or(0, |b| {
+        2 + BINDING_ENTRY_NAME.len() as u64
+            + 1
+            + 2
+            + b.plan_fingerprint.len() as u64
+            + 2
+            + b.body_path.len() as u64
+            + 2
+            + b.materialize_sha.len() as u64
+    })
+}
+
+/// Emit the binding's column-table entry (a no-op when unbound).
+fn write_binding_entry<W: Write>(w: &mut W, binding: Option<&StoredBinding>) -> io::Result<()> {
+    let Some(b) = binding else { return Ok(()) };
+    write_u16(w, BINDING_ENTRY_NAME.len() as u16)?;
+    w.write_all(BINDING_ENTRY_NAME.as_bytes())?;
+    w.write_all(&[COLUMN_KIND_BINDING])?;
+    for value in [&b.plan_fingerprint, &b.body_path, &b.materialize_sha] {
+        write_u16(w, value.len() as u16)?;
+        w.write_all(value.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// The shard's lexical half: per-field postings and corpus stats over a
 /// shared slot space, plus the raw texts.
 #[derive(Debug)]
@@ -1216,6 +1285,9 @@ pub struct Bm25Store {
     /// Geo-point columns in geo-id order (`docs/geo-columns.md`). A
     /// store with no columns of any kind persists as v6.
     geos: Vec<GeoStore>,
+    /// The mapped-plan binding, persisted as the kind-6 table entry.
+    /// `Some` forces v7 even with no columns.
+    binding: Option<StoredBinding>,
 }
 
 impl Default for Bm25Store {
@@ -1230,11 +1302,24 @@ impl Default for Bm25Store {
             map_numerics: Vec::new(),
             integers: Vec::new(),
             geos: Vec::new(),
+            binding: None,
         }
     }
 }
 
 impl Bm25Store {
+    /// The mapped-plan binding this store was written under, if any.
+    pub fn binding(&self) -> Option<&StoredBinding> {
+        self.binding.as_ref()
+    }
+
+    /// Set the binding persisted by the next save. The caller (the
+    /// shard's flush path) owns the no-contradiction rule; this is
+    /// plain storage.
+    pub fn set_binding(&mut self, binding: Option<StoredBinding>) {
+        self.binding = binding;
+    }
+
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
@@ -1264,6 +1349,7 @@ impl Bm25Store {
             map_numerics: Vec::new(),
             integers: Vec::new(),
             geos: Vec::new(),
+            binding: None,
         }
     }
 
@@ -2057,7 +2143,8 @@ impl Bm25Store {
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
             || !self.integers.is_empty()
-            || !self.geos.is_empty();
+            || !self.geos.is_empty()
+            || self.binding.is_some();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -2091,6 +2178,7 @@ impl Bm25Store {
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 5)
                     .sum::<u64>()
+                + binding_entry_size(self.binding.as_ref())
         };
         let header_size: u64 = 8
             + 4
@@ -2208,7 +2296,8 @@ impl Bm25Store {
                     + self.map_facets.len()
                     + self.map_numerics.len()
                     + self.integers.len()
-                    + self.geos.len()) as u32,
+                    + self.geos.len()
+                    + usize::from(self.binding.is_some())) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                 write_u16(w, facet.name.len() as u16)?;
@@ -2271,6 +2360,7 @@ impl Bm25Store {
                 write_u64(w, max_lon.to_bits())?;
                 write_u64(w, vals_off)?;
             }
+            write_binding_entry(w, self.binding.as_ref())?;
         }
         self.write_shared_sections(w, 0)?;
         for (fi, field) in self.fields.iter().enumerate() {
@@ -2478,6 +2568,7 @@ impl Bm25Store {
             map_numerics: Vec::new(),
             integers: Vec::new(),
             geos: Vec::new(),
+            binding: None,
         }
     }
 
@@ -3217,6 +3308,7 @@ impl Bm25Store {
         let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
         let mut integer_metas: Vec<(String, u64)> = Vec::new();
         let mut geo_metas: Vec<(String, u64)> = Vec::new();
+        let mut binding_meta: Option<StoredBinding> = None;
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
             cursor += 4;
@@ -3269,6 +3361,25 @@ impl Bm25Store {
                     COLUMN_KIND_GEO => {
                         geo_metas.push((name, u64_at(base + 32)?));
                         cursor = base + 40;
+                    }
+                    COLUMN_KIND_BINDING => {
+                        let mut vals: Vec<String> = Vec::with_capacity(3);
+                        let mut cur = base;
+                        for _ in 0..3 {
+                            let len = u64::from(u16_at(at(cur, 2)?));
+                            vals.push(
+                                String::from_utf8(at(cur + 2, len)?.to_vec())
+                                    .map_err(|_| invalid("invalid utf-8 in binding record"))?,
+                            );
+                            cur += 2 + len;
+                        }
+                        let mut it = vals.into_iter();
+                        binding_meta = Some(StoredBinding {
+                            plan_fingerprint: it.next().expect("three strings"),
+                            body_path: it.next().expect("three strings"),
+                            materialize_sha: it.next().expect("three strings"),
+                        });
+                        cursor = cur;
                     }
                     k => {
                         return Err(io::Error::new(
@@ -3480,6 +3591,7 @@ impl Bm25Store {
             map_numerics,
             integers,
             geos,
+            binding: binding_meta,
         })
     }
 }
@@ -3568,6 +3680,10 @@ pub struct SpillBuilder {
     /// Geo-point columns (16 B per slot in heap). Non-empty makes
     /// `finish` write v7.
     geos: Vec<GeoStore>,
+    /// The mapped-plan binding, persisted as the kind-6 table entry
+    /// when `finish` writes v7 (`Some` forces v7). The v4 oracle
+    /// format cannot carry it and refuses.
+    binding: Option<StoredBinding>,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
@@ -3624,6 +3740,7 @@ impl SpillBuilder {
             map_numerics: Vec::new(),
             integers: Vec::new(),
             geos: Vec::new(),
+            binding: None,
             v4_only,
         })
     }
@@ -3986,10 +4103,26 @@ impl SpillBuilder {
     /// corpus, unless built with [`Self::create_v4_for_bench`].
     pub fn finish(&mut self, path: &Path) -> io::Result<()> {
         if self.v4_only {
+            if self.binding.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the v4 oracle format cannot carry a mapped-plan binding",
+                ));
+            }
             self.finish_v4(path)
         } else {
             self.finish_v6(path)
         }
+    }
+
+    /// The mapped-plan binding the finish will persist, if any.
+    pub fn binding(&self) -> Option<&StoredBinding> {
+        self.binding.as_ref()
+    }
+
+    /// Set the binding `finish` persists (see [`Bm25Store::set_binding`]).
+    pub fn set_binding(&mut self, binding: Option<StoredBinding>) {
+        self.binding = binding;
     }
 
     /// Merge one field's runs into a postings-section body file at
@@ -4111,7 +4244,8 @@ impl SpillBuilder {
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
             || !self.integers.is_empty()
-            || !self.geos.is_empty();
+            || !self.geos.is_empty()
+            || self.binding.is_some();
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -4145,6 +4279,7 @@ impl SpillBuilder {
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 5)
                     .sum::<u64>()
+                + binding_entry_size(self.binding.as_ref())
         };
         let header_size: u64 = 8
             + 4
@@ -4261,7 +4396,8 @@ impl SpillBuilder {
                         + self.map_facets.len()
                         + self.map_numerics.len()
                         + self.integers.len()
-                        + self.geos.len()) as u32,
+                        + self.geos.len()
+                        + usize::from(self.binding.is_some())) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                     write_u16(&mut w, facet.name.len() as u16)?;
@@ -4324,6 +4460,7 @@ impl SpillBuilder {
                     write_u64(&mut w, max_lon.to_bits())?;
                     write_u64(&mut w, vals_off)?;
                 }
+                write_binding_entry(&mut w, self.binding.as_ref())?;
             }
             // texts: byte-copy of the spill (already section-encoded).
             let mut spill = std::fs::File::open(self.dir.join("texts.spill"))?;
@@ -5324,6 +5461,26 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     ));
                     cursor = base + 40;
                 }
+                COLUMN_KIND_BINDING => {
+                    // The reserved binding record: pinned name, inline
+                    // payload, no sections. Duplicates fall to the
+                    // table's name-uniqueness rule above.
+                    if column_names.last().map(Vec::as_slice)
+                        != Some(BINDING_ENTRY_NAME.as_bytes())
+                    {
+                        return Err(invalid(format!(
+                            "column {i}: kind {COLUMN_KIND_BINDING} must be named \
+                             {BINDING_ENTRY_NAME:?}"
+                        )));
+                    }
+                    let mut cur = base;
+                    for _ in 0..3 {
+                        let len = u64::from(u16_at(bytes_at(cur, 2)?));
+                        bytes_at(cur + 2, len)?;
+                        cur += 2 + len;
+                    }
+                    cursor = cur;
+                }
                 k => {
                     return Err(invalid(format!(
                         "column {i}: kind {k} unknown to this binary"
@@ -5936,12 +6093,19 @@ pub struct Bm25Reader {
     lineage_index: std::sync::OnceLock<Vec<u32>>,
     /// The v8 integrity table (None for pre-v8 files, which have
     /// nothing to verify). Open has already checked the table itself
+    /// The mapped-plan binding read from the kind-6 table entry.
+    binding: Option<StoredBinding>,
     /// and the eagerly-read sections; [`Self::verify_integrity`]
     /// checks everything.
     integrity: Option<IntegrityTable>,
 }
 
 impl Bm25Reader {
+    /// The mapped-plan binding this file was written under, if any.
+    pub fn binding(&self) -> Option<&StoredBinding> {
+        self.binding.as_ref()
+    }
+
     /// The next local doc id (number of document slots).
     pub fn next_doc_id(&self) -> u32 {
         self.n_slots() as u32
@@ -6434,6 +6598,7 @@ impl Bm25Reader {
             }],
             facets: Vec::new(),
             numerics: Vec::new(),
+            binding: None,
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
@@ -6513,6 +6678,7 @@ impl Bm25Reader {
         let mut map_numerics = Vec::new();
         let mut integers = Vec::new();
         let mut geos = Vec::new();
+        let mut binding = None;
         if v7 {
             // Decode a length-prefixed dictionary of `n` entries
             // starting at `off`, returning (entries, end offset).
@@ -6629,6 +6795,25 @@ impl Bm25Reader {
                         });
                         cursor = base + 40;
                     }
+                    COLUMN_KIND_BINDING => {
+                        let mut vals: Vec<String> = Vec::with_capacity(3);
+                        let mut cur = base;
+                        for _ in 0..3 {
+                            let len =
+                                u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
+                            vals.push(
+                                String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned(),
+                            );
+                            cur += 2 + len;
+                        }
+                        let mut it = vals.into_iter();
+                        binding = Some(StoredBinding {
+                            plan_fingerprint: it.next().expect("three strings"),
+                            body_path: it.next().expect("three strings"),
+                            materialize_sha: it.next().expect("three strings"),
+                        });
+                        cursor = cur;
+                    }
                     k => unreachable!("validation refused unknown column kind {k}"),
                 }
             }
@@ -6651,6 +6836,7 @@ impl Bm25Reader {
             text_base: texts_off,
             v5_runs: true,
             blob_relative: true,
+            binding,
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
         })

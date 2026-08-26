@@ -278,6 +278,15 @@ impl Bm25Shard {
 
     /// Field `f`'s analyzer fingerprint in the active table (0 =
     /// unknown, which never enforces).
+    /// The mapped-plan binding persisted with this shard, if any.
+    fn binding(&self) -> Option<&crate::postings::StoredBinding> {
+        match self {
+            Bm25Shard::Building(s) => s.binding(),
+            Bm25Shard::Spilling(s) => s.binding(),
+            Bm25Shard::Resident(r) => r.binding(),
+        }
+    }
+
     fn analysis_fingerprint(&self, f: usize) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
@@ -1649,6 +1658,12 @@ struct ShardState {
     /// per slot). Self-validating: rebuilt whenever its length disagrees
     /// with the index, cleared on snapshot install.
     parents: Option<std::sync::Arc<Vec<u64>>>,
+    /// The shard's mapped-plan binding (`docs/descriptor-mappings.md`
+    /// section 4a): RAM authority for the identity every mapped stream
+    /// must match. Loaded from the store's kind-6 entry on attach,
+    /// recorded to the WAL (markers) on first bind, written back into
+    /// the store at flush. `None` = never bound.
+    mapped_binding: Option<crate::postings::StoredBinding>,
     /// Advances on every mutation of `bm25` (ingest, flush, snapshot
     /// install, startup attach). `TermStats` reports it and the scoring
     /// RPCs enforce a caller's claim against it, which is what lets a
@@ -2299,6 +2314,7 @@ impl NodeServiceImpl {
                 generation: None,
                 wal,
                 parents: None,
+                mapped_binding: None,
                 stats_epoch: 1,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2455,10 +2471,14 @@ impl NodeServiceImpl {
         Ok(IngestGuard(self.ingest_busy.clone()))
     }
 
-    /// Attach a preloaded BM25 shard (from `<index path>.bm25`).
+    /// Attach a preloaded BM25 shard (from `<index path>.bm25`). The
+    /// store's persisted mapped-plan binding becomes the shard's: the
+    /// file IS the durable record of what its columns were written
+    /// under.
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         {
             let mut guard = self.state.write().expect("shard state lock poisoned");
+            guard.mapped_binding = store.as_ref().and_then(|s| s.binding().cloned());
             guard.bm25 = store;
             guard.stats_epoch += 1;
         }
@@ -2597,14 +2617,20 @@ impl NodeServiceImpl {
         // Save the builder as v3 and immediately reopen it disk-resident:
         // after Flush a shard holds no postings or texts in heap.
         // Already-resident shards have nothing to write.
+        // The binding persists with the store bytes (the kind-6 table
+        // entry), so the flushed file carries exactly what the shard is
+        // bound to.
+        let binding = guard.mapped_binding.clone();
         let built = match guard.bm25.as_mut() {
             Some(Bm25Shard::Building(store)) => {
+                store.set_binding(binding);
                 store
                     .save(&bm25_path)
                     .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
                 true
             }
             Some(Bm25Shard::Spilling(builder)) => {
+                builder.set_binding(binding);
                 builder
                     .finish(&bm25_path)
                     .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
@@ -2816,6 +2842,10 @@ impl NodeServiceImpl {
         };
         let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let num_vectors = loaded.len() as u64;
+        // Wholesale replace: the image's binding (usually none) is now
+        // the shard's. A stale binding describing replaced columns
+        // would lie.
+        guard.mapped_binding = guard.bm25.as_ref().and_then(|b| b.binding().cloned());
         guard.index = Some(loaded);
         guard.generation = Some(snap.clone());
         guard.stats_epoch += 1;
@@ -3859,6 +3889,29 @@ fn geography_wanted(spec: Option<&crate::pb::GeographySpec>) -> bool {
     })
 }
 
+/// Canonical content hash of a materialize spec — the piece of the
+/// mapped-plan binding covering derived columns, because changing a
+/// materialization expression changes what an index means
+/// (`docs/cel-values.md`). Empty for no spec (and for an empty one,
+/// which asks for nothing).
+pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> String {
+    let Some(spec) = spec else {
+        return String::new();
+    };
+    if spec.columns.is_empty() {
+        return String::new();
+    }
+    let mut hasher = crate::sha256::Sha256::new();
+    for column in &spec.columns {
+        for part in [column.name.as_str(), column.expression.as_str()] {
+            hasher.update(&(part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hasher.update(&column.kind.to_be_bytes());
+    }
+    crate::sha256::to_hex(&hasher.finalize())
+}
+
 /// The optional sidecar layers a document's specs ask its analysis
 /// session for — the session-identity companion to the reopen
 /// condition (a change to either spec reopens the session).
@@ -4713,7 +4766,58 @@ impl NodeServiceImpl {
                 missing.join(", ")
             )));
         }
-        Ok(extractor)
+        // The durable shard-level binding: the FIRST bind pins the
+        // shard to this plan identity (recorded to the WAL now, to the
+        // store's kind-6 entry at flush), and every later bind must
+        // match it exactly. An index only ever pairs with the plan it
+        // was written under; changing the mapping is a rebuild, never a
+        // rebind.
+        let incoming = crate::postings::StoredBinding {
+            plan_fingerprint: plan.fingerprint.clone(),
+            body_path: extractor.body_path().to_string(),
+            materialize_sha: materialize_sha(bind.materialize.as_ref()),
+        };
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        match &guard.mapped_binding {
+            Some(bound) if *bound != incoming => {
+                let mut differs = Vec::new();
+                if bound.plan_fingerprint != incoming.plan_fingerprint {
+                    differs.push(format!(
+                        "the plan (bound {}, offered {})",
+                        bound.plan_fingerprint, incoming.plan_fingerprint
+                    ));
+                }
+                if bound.body_path != incoming.body_path {
+                    differs.push(format!(
+                        "the body (bound {:?}, offered {:?})",
+                        bound.body_path, incoming.body_path
+                    ));
+                }
+                if bound.materialize_sha != incoming.materialize_sha {
+                    differs.push("the materialize spec".to_string());
+                }
+                Err(Status::failed_precondition(format!(
+                    "this shard is durably bound to another mapping; {} differ{}. An index \
+                     only ever pairs with the plan it was written under — rebuild or \
+                     reshard to change the mapping",
+                    differs.join(" and "),
+                    if differs.len() == 1 { "s" } else { "" }
+                )))
+            }
+            Some(_) => Ok(extractor),
+            None => {
+                wal_append_or_degrade(
+                    &mut guard.wal,
+                    wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
+                        plan_fingerprint: incoming.plan_fingerprint.clone(),
+                        body_path: incoming.body_path.clone(),
+                        materialize_sha: incoming.materialize_sha.clone(),
+                    }),
+                );
+                guard.mapped_binding = Some(incoming);
+                Ok(extractor)
+            }
+        }
     }
 
     /// Bulk ingest over one AnalyzeStream: submissions run ahead of the

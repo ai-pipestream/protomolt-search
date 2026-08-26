@@ -14,7 +14,7 @@
 //!   exact partition function the reshard tool splits by, so each bucket
 //!   file is a pre-partitioned log slice a cheap split can consume
 //!   without re-hashing a single record.
-//! - `markers.wal` — FlushMarker / SnapshotMarker records (they carry no
+//! - `markers.wal` — FlushMarker / SnapshotMarker / LoggedBinding records (the first two carry no
 //!   id, so they get their own small file instead of fanning out to every
 //!   bucket).
 //!
@@ -813,7 +813,9 @@ impl WalWriter {
             wal_record::Op::AddDocuments(a) => {
                 Some(bucket_of(a.first_id, self.manifest.bucket_count as usize) as u32)
             }
-            wal_record::Op::Flush(_) | wal_record::Op::Snapshot(_) => None,
+            wal_record::Op::Flush(_) | wal_record::Op::Snapshot(_) | wal_record::Op::Bind(_) => {
+                None
+            }
         };
         match bucket {
             Some(b) => {
