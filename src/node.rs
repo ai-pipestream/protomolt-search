@@ -1654,7 +1654,7 @@ struct ShardState {
     /// The write-ahead log (`<index path>.wal/`), behind the same lock as
     /// the index it precedes. `None` when the shard runs without one.
     wal: Option<WalWriter>,
-    /// Cached slot -> parent map for collapse scans (lineage opinion_id
+    /// Cached slot -> parent map for collapse scans (lineage parent_id
     /// per slot). Self-validating: rebuilt whenever its length disagrees
     /// with the index, cleared on snapshot install.
     parents: Option<std::sync::Arc<Vec<u64>>>,
@@ -2528,7 +2528,7 @@ impl NodeServiceImpl {
     /// Validate an incoming `StartShardSearch` against the index shape.
     /// turbovec panics on wrong-dim or non-finite queries; the service
     /// turns both into `INVALID_ARGUMENT` before the scan starts.
-    /// The slot -> parent map for collapse scans: lineage `opinion_id`
+    /// The slot -> parent map for collapse scans: lineage `parent_id`
     /// per slot, or a high-bit-tagged global id for slots without
     /// lineage (self-parents; the tag keeps them disjoint from real
     /// opinion ids). Cached on the shard and rebuilt whenever the index
@@ -2555,7 +2555,7 @@ impl NodeServiceImpl {
             for slot in 0..n {
                 let parent = store
                     .and_then(|s| s.lineage(slot as u32))
-                    .map(|l| l.opinion_id)
+                    .map(|l| l.parent_id)
                     .unwrap_or(SELF_PARENT_TAG | (slot_offset + slot as u64));
                 parents.push(parent);
             }
@@ -4623,8 +4623,8 @@ impl NodeServiceImpl {
         // fails to enter the store must never reach the log, or its
         // id would be reassigned and poison the replay.
         let lineage = doc.lineage.map(|l| crate::postings::DocLineage {
-            opinion_id: l.opinion_id,
-            cluster_id: l.cluster_id,
+            parent_id: l.parent_id,
+            group_id: l.group_id,
             span_start: l.span_start,
             span_end: l.span_end,
         });
@@ -6503,8 +6503,8 @@ impl NodeService for NodeServiceImpl {
                         doc_id: id,
                         text,
                         lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
-                            opinion_id: l.opinion_id,
-                            cluster_id: l.cluster_id,
+                            parent_id: l.parent_id,
+                            group_id: l.group_id,
                             span_start: l.span_start,
                             span_end: l.span_end,
                         }),

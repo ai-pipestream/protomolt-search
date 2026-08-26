@@ -589,8 +589,8 @@ fn build_child(
                             geography: None,
                         },
                         doc.lineage.map(|l| crate::postings::DocLineage {
-                            opinion_id: l.opinion_id,
-                            cluster_id: l.cluster_id,
+                            parent_id: l.parent_id,
+                            group_id: l.group_id,
                             span_start: l.span_start,
                             span_end: l.span_end,
                         }),

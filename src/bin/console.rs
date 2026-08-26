@@ -520,8 +520,8 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
                     json!({
                         "text": doc.text,
                         "lineage": doc.lineage.map(|l| json!({
-                            "opinion_id": l.opinion_id,
-                            "cluster_id": l.cluster_id,
+                            "parent_id": l.parent_id,
+                            "group_id": l.group_id,
                             "span_start": l.span_start,
                             "span_end": l.span_end,
                         })),
@@ -605,8 +605,8 @@ async fn bm25_filtered_search(
                             .as_ref()
                             .map(|l| {
                                 json!({
-                                    "opinion_id": l.opinion_id,
-                                    "cluster_id": l.cluster_id,
+                                    "parent_id": l.parent_id,
+                                    "group_id": l.group_id,
                                     "span_start": l.span_start,
                                     "span_end": l.span_end,
                                 })

@@ -1513,7 +1513,7 @@ impl Extractor {
     /// plans, one chunk's slots. Parent values denormalize onto every
     /// chunk row — a filter sees parent and chunk fields together with
     /// no query-time join — and the row's lineage carries the REDUCED
-    /// parent id as `opinion_id`, the key the engine's parent-collapse
+    /// parent id as `parent_id`, the key the engine's parent-collapse
     /// scans already group by.
     fn assemble(
         &self,
@@ -1622,8 +1622,8 @@ impl Extractor {
         if self.chunked.is_some() {
             let parent_key = reduced_id.expect("an absent doc id refused above");
             request.lineage = Some(pb::DocLineage {
-                opinion_id: parent_key,
-                cluster_id: 0,
+                parent_id: parent_key,
+                group_id: 0,
                 span_start: 0,
                 span_end: 0,
             });

@@ -3071,7 +3071,7 @@ impl CoordinatorServiceImpl {
 
     /// Document-mode streaming: [`Self::fanout_stream_search`] with
     /// `k` meaning k distinct PARENT documents. Shards emit chunks
-    /// tagged with their parents (lineage `opinion_id`, or tagged
+    /// tagged with their parents (lineage `parent_id`, or tagged
     /// self-parents); the coordinator owns the whole document
     /// aggregation — a parent's score is its best chunk's, the floor
     /// is one ULP below the k-th best parent score, and each returned

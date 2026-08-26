@@ -282,8 +282,8 @@ function hitCard(h, i, terms, boostTerms, movement) {
     '<span class="s-lex">bm25 <b>' + fmt(h.bm25_score) + "</b>" + (h.bm25_rank ? " #" + h.bm25_rank : "") + "</span>",
     h.boost_score ? '<span class="s-boost">boost <b>' + fmt(h.boost_score) + "</b></span>" : "",
   ].filter(Boolean).join(" ");
-  const lin = h.lineage ? '<div class="lineage">opinion ' + h.lineage.opinion_id +
-    " · cluster " + h.lineage.cluster_id + " · span " + h.lineage.span_start + ".." + h.lineage.span_end + "</div>" : "";
+  const lin = h.lineage ? '<div class="lineage">parent ' + h.lineage.parent_id +
+    " · group " + h.lineage.group_id + " · span " + h.lineage.span_start + ".." + h.lineage.span_end + "</div>" : "";
   const snip = h.text ? '<div class="snippet">' + snippet(h.text, terms, boostTerms) + "</div>" : "";
   return '<div class="hit"><div class="top"><span class="rank">#' + rank + "</span>" +
     '<span class="id">doc ' + h.doc_id + "</span>" +

@@ -79,8 +79,8 @@ async fn start_shard(
                 text: format!("chunk {i} of opinion {opinion} with some plain words"),
                 analysis: None,
                 lineage: Some(DocLineage {
-                    opinion_id: opinion,
-                    cluster_id: opinion,
+                    parent_id: opinion,
+                    group_id: opinion,
                     span_start: 0,
                     span_end: 10,
                 }),

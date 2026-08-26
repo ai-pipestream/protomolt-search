@@ -555,7 +555,7 @@ message StartShardSearch {
   // When true, the shard collapses by PARENT DOCUMENT: k means k
   // distinct parents, each represented by its best-scoring chunk (the
   // entry point c'), and `SearchShardDone.hits` carry `parent_id`. The
-  // parent of a slot is its doc-store lineage `opinion_id`; slots
+  // parent of a slot is its doc-store lineage `parent_id`; slots
   // without lineage parent themselves (high-bit-tagged global id).
   // Published floors become k-th best PARENT scores, which are >= the
   // plain chunk floors, so collaborative pruning only strengthens; the
@@ -652,7 +652,7 @@ message ScoredHit {
   // every shard shares the same TQ+ calibration.
   float score = 2;
   // Collapse mode only: the parent document this hit represents
-  // (lineage opinion_id, or a high-bit-tagged global id for slots
+  // (lineage parent_id, or a high-bit-tagged global id for slots
   // without lineage). 0 outside collapse mode.
   uint64 parent_id = 3;
 }
@@ -695,7 +695,7 @@ message StartStreamSearch {
   uint64 floor_token = 4;
   // Document-mode streaming: when true, every batch record carries the
   // emitted slot's PARENT (20-byte records, see StreamSearchBatch) —
-  // the doc-store lineage opinion_id, or a high-bit-tagged global id
+  // the doc-store lineage parent_id, or a high-bit-tagged global id
   // for slots without lineage. The scan itself is unchanged; what
   // changes is the floor's MEANING: the coordinator relays k-th best
   // PARENT scores (a parent's score is its best chunk's score), which
@@ -751,7 +751,7 @@ message StreamSearchResponse {
 //   f32 score
 // When the stream's `StartStreamSearch.collapse_parents` is true the
 // stride is 20 bytes (`hits.len() % 20 == 0`) with a third field:
-//   u64 parent id (lineage opinion_id, or high-bit-tagged global id)
+//   u64 parent id (lineage parent_id, or high-bit-tagged global id)
 // Records are score-descending within a batch. Empty batches are never
 // sent.
 message StreamSearchBatch {
@@ -953,7 +953,7 @@ message SearchResponse {
 
 // One parent document's chunks in a document-mode search response.
 message ParentGroup {
-  // The parent (lineage opinion_id, or a high-bit-tagged global id for
+  // The parent (lineage parent_id, or a high-bit-tagged global id for
   // chunks ingested without lineage).
   uint64 parent_id = 1;
   // Every emitted chunk of this parent scoring at or above
@@ -989,10 +989,17 @@ message AnalysisSpec {
 // corpus. Optional and purely additive; documents ingested without it
 // behave exactly as before.
 message DocLineage {
-  // Source opinion id.
-  uint64 opinion_id = 1;
-  // Source cluster id.
-  uint64 cluster_id = 2;
+  // The row's PARENT document key: the identity chunks of one source
+  // document share, and the key `collapse_parents` groups by. Domain
+  // pipelines map their own ids here (the court examples put the
+  // opinion id); mapped chunk ingest puts the REDUCED document id.
+  // Field numbers are the wire contract; this field was once named
+  // opinion_id.
+  uint64 parent_id = 1;
+  // An optional higher-level grouping key above the parent (the court
+  // examples put the cluster id). The engine stores and returns it;
+  // nothing scores or groups by it today. Once named cluster_id.
+  uint64 group_id = 2;
   // Chunk span start in original-text (char) coordinates.
   uint32 span_start = 3;
   // Chunk span end (exclusive).

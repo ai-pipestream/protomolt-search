@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{mpsc, Mutex};
-use turbovec_search::court::{self, EmbeddingWriter};
+use turbovec_search::demo::court::{self, EmbeddingWriter};
 use turbovec_search::pb::tei::embed_client::EmbedClient;
 use turbovec_search::pb::tei::EmbedRequest;
 

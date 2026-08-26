@@ -129,7 +129,7 @@ generation 0.
 2. **Ids are generation-scoped.** A reshard reassigns contiguous slot
    ranges per child. Global vector ids are internal addressing, valid
    within one map generation; external identity lives in the documents
-   themselves (e.g. court opinion_id + ordinal).
+   themselves (e.g. the court pipeline's opinion id + ordinal).
 3. **The shard map is the id→shard authority.** Queries and snapshots
    are stamped with a generation; a flip is a metadata change, never a
    data move.

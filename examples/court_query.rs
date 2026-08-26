@@ -9,7 +9,7 @@
 //! ```
 
 use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::court;
+use turbovec_search::demo::court;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::{AnalysisSpec, GetDocumentsRequest};
 
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut vector = None;
         for record in reader {
             let record = record?;
-            if record.opinion_id == lineage.opinion_id {
+            if record.opinion_id == lineage.parent_id {
                 // The lineage has no ordinal field; take the first
                 // embedding record of the probe's opinion (eyeball
                 // probes only — the vector leg is self-matching either
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "\n=== query doc {probe_id} (opinion {} cluster {} span {}..{}):",
-            lineage.opinion_id, lineage.cluster_id, lineage.span_start, lineage.span_end
+            lineage.parent_id, lineage.group_id, lineage.span_start, lineage.span_end
         );
         println!("text: {:?}", prefix(&doc.text, 140));
         let hits = coordinator
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let l = top_doc.lineage.as_ref().expect("lineage");
                 println!(
                     "  top doc {}: opinion {} cluster {} span {}..{}",
-                    top.doc_id, l.opinion_id, l.cluster_id, l.span_start, l.span_end
+                    top.doc_id, l.parent_id, l.group_id, l.span_start, l.span_end
                 );
                 println!("  top text: {:?}", prefix(&top_doc.text, 200));
             }

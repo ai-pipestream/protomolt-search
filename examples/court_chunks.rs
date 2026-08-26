@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{mpsc, Mutex};
-use turbovec_search::court::{self, ChunkSource, ChunkWriter, EmbeddingWriter};
+use turbovec_search::demo::court::{self, ChunkSource, ChunkWriter, EmbeddingWriter};
 use turbovec_search::harness::start_sidecar_with_env;
 use turbovec_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
 use turbovec_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, EmbeddingOptions};

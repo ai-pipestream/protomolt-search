@@ -34,7 +34,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::dataset;
+use turbovec_search::demo::dataset;
 use turbovec_search::harness::{self, mock_analysis};
 use turbovec_search::node::NodeConfig;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
