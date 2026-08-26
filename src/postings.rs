@@ -576,9 +576,9 @@ pub type DocTerms = Vec<(String, u32, Vec<(u32, u32)>)>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocLineage {
     /// Source opinion id.
-    pub opinion_id: u64,
+    pub parent_id: u64,
     /// Source cluster id.
-    pub cluster_id: u64,
+    pub group_id: u64,
     /// Chunk span start in original-text (char) coordinates.
     pub span_start: u32,
     /// Chunk span end (exclusive).
@@ -1940,8 +1940,8 @@ impl Bm25Store {
             match lineage {
                 Some(l) => {
                     w.write_all(&[1u8])?;
-                    write_u64(w, l.opinion_id)?;
-                    write_u64(w, l.cluster_id)?;
+                    write_u64(w, l.parent_id)?;
+                    write_u64(w, l.group_id)?;
                     write_u32(w, l.span_start)?;
                     write_u32(w, l.span_end)?;
                 }
@@ -2643,13 +2643,13 @@ impl Bm25Store {
             for lineage in lineages.iter_mut() {
                 let present = take(r, 1)?[0];
                 if present != 0 {
-                    let opinion_id = read_u64(r)?;
-                    let cluster_id = read_u64(r)?;
+                    let parent_id = read_u64(r)?;
+                    let group_id = read_u64(r)?;
                     let span_start = read_u32(r)?;
                     let span_end = read_u32(r)?;
                     *lineage = Some(DocLineage {
-                        opinion_id,
-                        cluster_id,
+                        parent_id,
+                        group_id,
                         span_start,
                         span_end,
                     });
@@ -3075,13 +3075,13 @@ impl Bm25Store {
         for lineage in lineages.iter_mut() {
             let present = take(r, 1)?[0];
             if present != 0 {
-                let opinion_id = read_u64(r)?;
-                let cluster_id = read_u64(r)?;
+                let parent_id = read_u64(r)?;
+                let group_id = read_u64(r)?;
                 let span_start = read_u32(r)?;
                 let span_end = read_u32(r)?;
                 *lineage = Some(DocLineage {
-                    opinion_id,
-                    cluster_id,
+                    parent_id,
+                    group_id,
                     span_start,
                     span_end,
                 });
@@ -3228,13 +3228,13 @@ impl Bm25Store {
         for lineage in lineages.iter_mut() {
             let present = take(r, 1)?[0];
             if present != 0 {
-                let opinion_id = read_u64(r)?;
-                let cluster_id = read_u64(r)?;
+                let parent_id = read_u64(r)?;
+                let group_id = read_u64(r)?;
                 let span_start = read_u32(r)?;
                 let span_end = read_u32(r)?;
                 *lineage = Some(DocLineage {
-                    opinion_id,
-                    cluster_id,
+                    parent_id,
+                    group_id,
                     span_start,
                     span_end,
                 });
@@ -3415,8 +3415,8 @@ impl Bm25Store {
                 lcur += 1;
             } else {
                 lineages.push(Some(DocLineage {
-                    opinion_id: u64_at(lcur + 1)?,
-                    cluster_id: u64_at(lcur + 9)?,
+                    parent_id: u64_at(lcur + 1)?,
+                    group_id: u64_at(lcur + 9)?,
                     span_start: u32_at(lcur + 17)?,
                     span_end: u32_at(lcur + 21)?,
                 }));
@@ -4483,8 +4483,8 @@ impl SpillBuilder {
                 match lineage {
                     Some(l) => {
                         w.write_all(&[1u8])?;
-                        write_u64(&mut w, l.opinion_id)?;
-                        write_u64(&mut w, l.cluster_id)?;
+                        write_u64(&mut w, l.parent_id)?;
+                        write_u64(&mut w, l.group_id)?;
                         write_u32(&mut w, l.span_start)?;
                         write_u32(&mut w, l.span_end)?;
                     }
@@ -4696,8 +4696,8 @@ impl SpillBuilder {
                 match lineage {
                     Some(l) => {
                         w.write_all(&[1u8])?;
-                        write_u64(&mut w, l.opinion_id)?;
-                        write_u64(&mut w, l.cluster_id)?;
+                        write_u64(&mut w, l.parent_id)?;
+                        write_u64(&mut w, l.group_id)?;
                         write_u32(&mut w, l.span_start)?;
                         write_u32(&mut w, l.span_end)?;
                     }
@@ -7363,13 +7363,13 @@ impl Bm25Reader {
         if self.map[e] == 0 {
             return None;
         }
-        let opinion_id = u64::from_le_bytes(self.map[e + 1..e + 9].try_into().unwrap());
-        let cluster_id = u64::from_le_bytes(self.map[e + 9..e + 17].try_into().unwrap());
+        let parent_id = u64::from_le_bytes(self.map[e + 1..e + 9].try_into().unwrap());
+        let group_id = u64::from_le_bytes(self.map[e + 9..e + 17].try_into().unwrap());
         let span_start = u32::from_le_bytes(self.map[e + 17..e + 21].try_into().unwrap());
         let span_end = u32::from_le_bytes(self.map[e + 21..e + 25].try_into().unwrap());
         Some(DocLineage {
-            opinion_id,
-            cluster_id,
+            parent_id,
+            group_id,
             span_start,
             span_end,
         })
@@ -7603,8 +7603,8 @@ mod tests {
                 }
             }
             let lineage = (i % 3 == 0).then_some(DocLineage {
-                opinion_id: u64::from(i) * 17,
-                cluster_id: u64::from(i) * 31,
+                parent_id: u64::from(i) * 17,
+                group_id: u64::from(i) * 31,
                 span_start: i,
                 span_end: i + 100,
             });
@@ -8002,8 +8002,8 @@ mod tests {
         let path = dir.join("shard.bm25");
         let mut store = Bm25Store::new();
         let lineage = |i: u32| DocLineage {
-            opinion_id: 1000 + u64::from(i),
-            cluster_id: 2000 + u64::from(i),
+            parent_id: 1000 + u64::from(i),
+            group_id: 2000 + u64::from(i),
             span_start: i * 7,
             span_end: i * 7 + 90,
         };
@@ -8764,8 +8764,8 @@ mod tests {
                 });
             }
             let lineage = (i % 4 == 0).then_some(DocLineage {
-                opinion_id: u64::from(i) * 11,
-                cluster_id: u64::from(i) * 13,
+                parent_id: u64::from(i) * 11,
+                group_id: u64::from(i) * 13,
                 span_start: i,
                 span_end: i + 40,
             });
@@ -9047,8 +9047,8 @@ mod malformed_tests {
         for i in 0..4300u32 {
             let id = i * 2; // gap slots
             let lineage = (i % 3 == 0).then_some(DocLineage {
-                opinion_id: u64::from(i),
-                cluster_id: u64::from(i) * 7,
+                parent_id: u64::from(i),
+                group_id: u64::from(i) * 7,
                 span_start: i,
                 span_end: i + 10,
             });
@@ -9083,8 +9083,8 @@ mod malformed_tests {
         for i in 0..140u32 {
             let id = i * 2;
             let lineage = (i % 3 == 0).then_some(DocLineage {
-                opinion_id: u64::from(i),
-                cluster_id: u64::from(i) * 7,
+                parent_id: u64::from(i),
+                group_id: u64::from(i) * 7,
                 span_start: i,
                 span_end: i + 10,
             });

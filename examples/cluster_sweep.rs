@@ -74,7 +74,7 @@ fn load_probes(probes_from: &str, data_dir: &str, n_queries: usize) -> Vec<Probe
         (0..n_queries)
             .map(|qi| {
                 let (part, index) = (qi % 4, 1_000 + (qi / 4) * 9_000 % PART_COUNT);
-                let (vector, _) = turbovec_search::dataset::read_embedding_at(
+                let (vector, _) = turbovec_search::demo::dataset::read_embedding_at(
                     &std::path::PathBuf::from(format!("{data_dir}/embeddings_part_{part}.bin")),
                     index,
                 )
@@ -83,7 +83,7 @@ fn load_probes(probes_from: &str, data_dir: &str, n_queries: usize) -> Vec<Probe
             })
             .collect()
     } else {
-        let (_, reader) = turbovec_search::court::EmbeddingReader::open(probes_from.as_ref())
+        let (_, reader) = turbovec_search::demo::court::EmbeddingReader::open(probes_from.as_ref())
             .expect("open probes file");
         let mut probes = Vec::new();
         for record in reader {

@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use turbovec_search::court;
+use turbovec_search::demo::court;
 use turbovec_search::pb::search_service_client::SearchServiceClient;
 use turbovec_search::pb::{Bm25SearchRequest, SearchRequest};
 

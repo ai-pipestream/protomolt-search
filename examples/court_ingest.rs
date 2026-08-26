@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::court::{self, Chunk};
+use turbovec_search::demo::court::{self, Chunk};
 use turbovec_search::harness::{self, mock_analysis, start_sidecar};
 use turbovec_search::node::NodeConfig;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
@@ -423,8 +423,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         text: chunk.text.clone(),
                         analysis: Some(spec.clone()),
                         lineage: Some(DocLineage {
-                            opinion_id: chunk.opinion_id,
-                            cluster_id: chunk.cluster_id,
+                            parent_id: chunk.opinion_id,
+                            group_id: chunk.cluster_id,
                             span_start: chunk.span_start,
                             span_end: chunk.span_end,
                         }),
@@ -529,7 +529,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|l| {
                         format!(
                             "opinion {} cluster {} span {}..{}",
-                            l.opinion_id, l.cluster_id, l.span_start, l.span_end
+                            l.parent_id, l.group_id, l.span_start, l.span_end
                         )
                     })
                     .unwrap_or_default();
@@ -770,8 +770,8 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                         text: chunk.text,
                         analysis: Some(spec2.clone()),
                         lineage: Some(DocLineage {
-                            opinion_id: chunk.opinion_id,
-                            cluster_id: chunk.cluster_id,
+                            parent_id: chunk.opinion_id,
+                            group_id: chunk.cluster_id,
                             span_start: chunk.span_start,
                             span_end: chunk.span_end,
                         }),

@@ -152,7 +152,7 @@ deliberate:
 
 Chunk scopes landed by reusing what the engine had (resolved as the
 design note wanted): chunk rows carry ordinary lineage records whose
-`opinion_id` is the REDUCED parent id, so the existing parent-collapse
+`parent_id` is the REDUCED parent id, so the existing parent-collapse
 scans group mapped chunks with no new machinery and no imported parent
 tables. The reference's id-reduction contract (integer verbatim;
 string reduced to the first 8 bytes of SHA-256, big-endian) is what
@@ -247,7 +247,8 @@ of the bound type. The contract, piece by piece:
   no query-time join. A declared CHUNK_ID is required per chunk; a
   document with ZERO chunks is a legitimate empty document and yields
   zero rows (the response's `parents` count keeps it visible). Each
-  row's lineage carries the reduced parent id as `opinion_id`, which
+  row's lineage carries the reduced parent id as `DocLineage.parent_id`
+  (the field once named for court opinions, now generic), which
   is exactly the key the engine's parent-collapse scans group by:
   `collapse_parents` works over mapped chunks unchanged. (One caveat,
   inherited from the self-parent tag: rows ingested WITHOUT lineage

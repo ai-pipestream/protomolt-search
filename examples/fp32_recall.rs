@@ -14,7 +14,7 @@
 //! ```
 
 use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::court;
+use turbovec_search::demo::court;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");

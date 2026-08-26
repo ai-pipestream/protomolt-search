@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use turbovec::TurboQuantIndex;
-use turbovec_search::court;
+use turbovec_search::demo::court;
 use turbovec_search::pb::AnalysisSpec;
 use turbovec_search::postings::AnalyzedDoc;
 use turbovec_search::{analyzer, reshard};

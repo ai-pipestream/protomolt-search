@@ -26,8 +26,8 @@ fn build_store(n_docs: usize, text_len: usize) -> Bm25Store {
             text,
             AnalyzedDoc::body(terms, length),
             Some(DocLineage {
-                opinion_id: 1000 + u64::from(i),
-                cluster_id: 2000 + u64::from(i % 50),
+                parent_id: 1000 + u64::from(i),
+                group_id: 2000 + u64::from(i % 50),
                 span_start: i * 7,
                 span_end: i * 7 + 100,
             }),

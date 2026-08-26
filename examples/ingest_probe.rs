@@ -70,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
                 analysis: Some(spec_feed.clone()),
                 lineage: Some(DocLineage {
-                    opinion_id: 1000 + i as u64,
-                    cluster_id: 1,
+                    parent_id: 1000 + i as u64,
+                    group_id: 1,
                     span_start: 0,
                     span_end: 40,
                 }),
