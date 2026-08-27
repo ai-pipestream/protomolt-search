@@ -1,11 +1,14 @@
-//! The public `Query` adapter (`docs/query-api.md`), increment 1.
+//! The public `Query` adapter (`docs/query-api.md`).
 //!
 //! This module is deliberately an ADAPTER and nothing more: it
 //! validates the public shape, maps a supported request onto the
 //! ordinary routes that already exist (`Search`, `Bm25Search`,
 //! `HybridSearch` with its fusion modes and `BoostRescore`), executes
 //! that route through the same handler every direct caller uses, and
-//! translates the response into per-signal provenance. It never forks
+//! translates the response into per-signal provenance. The one piece
+//! of scoring that lives ABOVE the routes is the composite scorer
+//! (`src/ltr.rs`), which reorders the already-selected candidate pool
+//! and so never touches a pruning certificate. It never forks route
 //! scoring logic, and it refuses every shape outside the mapping table
 //! BY NAME — compatibility never authorizes a heuristic substitute (no
 //! `AND` reinterpreted as a union, no filter applied to one leg, no
@@ -196,21 +199,27 @@ pub async fn execute(
              accepting the flag while ignoring it would misreport what ran",
         ));
     }
-    if let Some(scorer) = &req.scorer {
-        if scorer.operation != 0 || !scorer.dimensions.is_empty() {
-            return Err(refuse(
-                "the generic composite scorer is not served yet; the selection strategies \
-                 (single, rrf, score_blend, decomposed, cascade) are the supported ways to \
-                 combine signals",
-            ));
-        }
-    }
     let selection = req
         .selection
         .as_ref()
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
     let plan = parse_selection(selection)?;
     check_ids(&plan, &req.boosts)?;
+    // An empty scorer message is treated as absent (a set-but-empty
+    // one names neither operation nor dimensions).
+    let scorer = match &req.scorer {
+        Some(s) if s.operation != 0 || !s.dimensions.is_empty() => {
+            if matches!(plan.shape, Shape::Browse) {
+                return Err(refuse(
+                    "the composite scorer requires a SCORED selection: a browse has no \
+                     relevance signals to combine, and its deterministic id (or column) \
+                     order is the whole contract of the route",
+                ));
+            }
+            Some(crate::ltr::Scorer::validate(s, &signal_ids(&plan, &req.boosts))?)
+        }
+        _ => None,
+    };
     if !req.projections.is_empty() && !matches!(plan.shape, Shape::Lexical { .. }) {
         return Err(refuse(
             "projections are served on single-lexical-leaf selections only in this \
@@ -230,6 +239,9 @@ pub async fn execute(
             ));
         }
     }
+    // Sort and the scorer can never collide: sort is served on browse
+    // alone, and the scorer refuses a browse — the two existing
+    // refusals partition every request naming both.
 
     // selection_k: the candidate-set depth. 0 = k. The response is the
     // best k of the selection_k candidates under the final order.
@@ -252,10 +264,13 @@ pub async fn execute(
         )));
     }
 
-    let boost = parse_boost(&req.boosts, &plan.shape)?;
-    // On a single-leaf shape no phase uses extra selection depth; on a
-    // composite it is the leg/gate depth (and the paging pool).
-    if !matches!(plan.shape, Shape::Composite { .. }) && selection_k != req.k {
+    let boost = parse_boost(&req.boosts, &plan.shape, scorer.is_some())?;
+    // On a single-leaf shape without a scorer no phase uses extra
+    // selection depth; on a composite it is the leg/gate depth (and
+    // the paging pool), and with a scorer it is the pool the scorer
+    // reorders.
+    let pooled = matches!(plan.shape, Shape::Composite { .. }) || scorer.is_some();
+    if !pooled && selection_k != req.k {
         return Err(refuse(
             "selection_k differs from k but nothing on a single-leaf shape uses the \
              extra depth; naming it would be a silent no-op",
@@ -271,25 +286,27 @@ pub async fn execute(
     };
     // How deep the underlying route runs. A single-leaf order is
     // depth-independent (exact top-k prefix property), so paging
-    // fetches past the boundary; a composite's order is NOT (RRF
-    // ranks, blend normalization, the cascade gate all move with
-    // depth), so paging stays inside the fixed selection_k pool.
+    // fetches past the boundary; a POOLED order is NOT — a composite's
+    // strategy moves with depth (RRF ranks, blend normalization, the
+    // cascade gate), and a scorer's normalization statistics move with
+    // the pool — so paging stays inside the fixed selection_k pool.
     let fetch_k = match (&plan.shape, &cursor) {
         // Browse pages by an id floor (append-only ids are stable), so
         // every page fetches exactly k.
         (Shape::Browse, _) => req.k,
-        (Shape::Composite { .. }, Some(c)) => {
-            if u64::from(c.rank) + u64::from(req.k) > u64::from(selection_k) {
-                return Err(Status::failed_precondition(format!(
-                    "the selection_k = {selection_k} candidate set is exhausted at rank {}; \
-                     deepening it would change the composite's ranking under the cursor; \
-                     re-run from the first page with a larger selection_k",
-                    c.rank
-                )));
+        _ if pooled => {
+            if let Some(c) = &cursor {
+                if u64::from(c.rank) + u64::from(req.k) > u64::from(selection_k) {
+                    return Err(Status::failed_precondition(format!(
+                        "the selection_k = {selection_k} candidate set is exhausted at rank {}; \
+                         deepening it would change the ranking under the cursor; \
+                         re-run from the first page with a larger selection_k",
+                        c.rank
+                    )));
+                }
             }
             selection_k
         }
-        (Shape::Composite { .. }, None) => selection_k,
         (_, Some(c)) => c.rank + req.k,
         (_, None) => req.k,
     };
@@ -358,6 +375,7 @@ pub async fn execute(
                     signals: Vec::new(),
                     matched: matched(Vec::new(), &plan.filter_ids),
                     sort_key: if rows.sorted { rows.keys[i] } else { 0.0 },
+                    dimensions: Vec::new(),
                 })
                 .collect();
             let next = if req.k != 0 && hits.len() == req.k as usize {
@@ -393,7 +411,7 @@ pub async fn execute(
                 }))
                 .await?
                 .into_inner();
-            let hits = response
+            let mut hits: Vec<QueryHit> = response
                 .hits
                 .iter()
                 .map(|h| QueryHit {
@@ -407,10 +425,12 @@ pub async fn execute(
                     }],
                     matched: matched(vec![id.to_string()], &plan.filter_ids),
                     sort_key: 0.0,
+                    dimensions: Vec::new(),
                 })
                 .collect();
+            let executed = apply_scorer(&scorer, &mut hits, "bm25_search")?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
-            Ok(done(req.request_id, hits, "bm25_search", next))
+            Ok(done(req.request_id, hits, &executed, next))
         }
         Shape::Dense { id, query } => {
             let response = coordinator
@@ -424,7 +444,7 @@ pub async fn execute(
                 }))
                 .await?
                 .into_inner();
-            let hits = response
+            let mut hits: Vec<QueryHit> = response
                 .hits
                 .iter()
                 .map(|h| QueryHit {
@@ -438,10 +458,12 @@ pub async fn execute(
                     }],
                     matched: matched(vec![id.to_string()], &plan.filter_ids),
                     sort_key: 0.0,
+                    dimensions: Vec::new(),
                 })
                 .collect();
+            let executed = apply_scorer(&scorer, &mut hits, "search")?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
-            Ok(done(response.request_id, hits, "search", next))
+            Ok(done(response.request_id, hits, &executed, next))
         }
         Shape::Composite {
             dense_id,
@@ -471,7 +493,7 @@ pub async fn execute(
                 }))
                 .await?
                 .into_inner();
-            let hits = if matches!(strategy, Strategy::Cascade) {
+            let mut hits: Vec<QueryHit> = if matches!(strategy, Strategy::Cascade) {
                 response
                     .cascade_hits
                     .iter()
@@ -507,6 +529,7 @@ pub async fn execute(
                             signals,
                             matched: matched(m, &plan.filter_ids),
                             sort_key: 0.0,
+                            dimensions: Vec::new(),
                         }
                     })
                     .collect()
@@ -552,20 +575,69 @@ pub async fn execute(
                             signals,
                             matched: matched(m, &plan.filter_ids),
                             sort_key: 0.0,
+                            dimensions: Vec::new(),
                         }
                     })
                     .collect()
             };
-            let executed = match mode {
+            let route = match mode {
                 FusionMode::GlobalRank => "hybrid_search:global_rank",
                 FusionMode::ScoreBlend => "hybrid_search:score_blend",
                 FusionMode::Decomposed => "hybrid_search:decomposed",
                 _ => "hybrid_search:cascade",
             };
+            let executed = apply_scorer(&scorer, &mut hits, route)?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
-            Ok(done(response.request_id, hits, executed, next))
+            Ok(done(response.request_id, hits, &executed, next))
         }
     }
+}
+
+/// Apply the composite scorer (when present) to the candidate pool and
+/// return the `executed` echo: the route name, suffixed with the
+/// operation that reordered it.
+fn apply_scorer(
+    scorer: &Option<crate::ltr::Scorer>,
+    hits: &mut [QueryHit],
+    route: &str,
+) -> Result<String, Status> {
+    match scorer {
+        None => Ok(route.to_string()),
+        Some(s) => {
+            s.apply(hits)?;
+            Ok(format!("{route}{}", s.executed_suffix()))
+        }
+    }
+}
+
+/// Every request id and what it names, for scorer source validation.
+fn signal_ids<'a>(
+    plan: &'a Plan<'a>,
+    boosts: &'a [crate::pb::BoostQuery],
+) -> Vec<(&'a str, crate::ltr::SignalKind)> {
+    use crate::ltr::SignalKind;
+    let mut ids: Vec<(&str, SignalKind)> = Vec::new();
+    match &plan.shape {
+        Shape::Browse => {}
+        Shape::Lexical { id, .. } | Shape::Dense { id, .. } => ids.push((id, SignalKind::Search)),
+        Shape::Composite {
+            dense_id,
+            lexical_id,
+            ..
+        } => {
+            ids.push((dense_id, SignalKind::Search));
+            ids.push((lexical_id, SignalKind::Search));
+        }
+    }
+    for f in &plan.filter_ids {
+        ids.push((f, SignalKind::Filter));
+    }
+    for b in boosts {
+        if let Some(q) = &b.query {
+            ids.push((&q.id, SignalKind::Boost));
+        }
+    }
+    ids
 }
 
 fn done(
@@ -850,10 +922,15 @@ fn leg_options(strategy: &Strategy<'_>, selection_k: u32) -> (FusionMode, Hybrid
 }
 
 /// Boost validation: at most one, lexical, composite selections only
-/// (it maps to the hybrid route's BoostRescore).
+/// (it maps to the hybrid route's BoostRescore). With a composite
+/// scorer present the boost is signal-only: the scorer owns
+/// combination, so the reorder knobs (window, base_weight,
+/// boost_weight) are refused — each would be a silent no-op — and the
+/// whole candidate set is scored.
 fn parse_boost<'a>(
     boosts: &'a [crate::pb::BoostQuery],
     shape: &Shape<'_>,
+    scorer_present: bool,
 ) -> Result<Option<(&'a str, BoostRescore)>, Status> {
     let boost = match boosts {
         [] => return Ok(None),
@@ -895,6 +972,15 @@ fn parse_boost<'a>(
             "a boost query carries no analysis of its own: BoostRescore analyzes the \
              boost text under the REQUEST's analysis options, so a differing spec here \
              would be silently ignored",
+        ));
+    }
+    if scorer_present && (boost.window != 0 || boost.base_weight != 0.0 || boost.boost_weight != 0.0)
+    {
+        return Err(refuse(
+            "window, base_weight, and boost_weight belong to the boost's own reorder; \
+             with a composite scorer present the boost is signal-only (the scorer owns \
+             combination and the whole candidate set is scored), so naming them would \
+             be a silent no-op",
         ));
     }
     Ok(Some((

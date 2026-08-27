@@ -2974,8 +2974,18 @@ message QueryRequest {
   // and only on a composite selection (it maps to the hybrid route's
   // BoostRescore). A boost never admits a document.
   repeated BoostQuery boosts = 5;
-  // The generic named-dimension composite scorer. Increment 1: must be
-  // absent — refused by name until its ordinary engine path exists.
+  // The generic named-dimension composite scorer (docs/query-api.md):
+  // combines the base order and the named raw signals into the FINAL
+  // order, with per-dimension provenance on every hit
+  // (QueryHit.dimensions). Runs after selection (and after boost
+  // signals are computed) over the fixed selection_k candidate set, so
+  // it can never invalidate a first-stage pruning certificate.
+  // Requires a SCORED selection: a browse has no relevance signals to
+  // combine. Because normalization statistics depend on the candidate
+  // pool, a scored query pages WITHIN its fixed selection_k pool,
+  // exactly like a composite; selection_k is therefore meaningful on
+  // single-leaf shapes when a scorer is present (the pool the scorer
+  // reorders).
   CompositeScorer scorer = 6;
   // Profile timings. Increment 1: must be false (the response carries
   // no profile surface yet; accepting the flag and ignoring it would
@@ -3166,6 +3176,12 @@ message CascadeScore {
 // A candidate-scoped scoring query: runs against the selection's top
 // selection_k documents, never the corpus. Its relevance is another
 // named signal (under its query's id).
+//
+// With a composite scorer present the boost is SIGNAL-ONLY: the scorer
+// owns combination, so `window`, `base_weight`, and `boost_weight`
+// must be left unset (each would be a silent no-op) and the whole
+// candidate set is scored — a window would manufacture missing signals
+// out of rescore cost, and the pool is already bounded by selection_k.
 message BoostQuery {
   // The boost's scoring query. Increment 1: lexical only.
   SearchQuery query = 1;
@@ -3177,46 +3193,112 @@ message BoostQuery {
   float boost_weight = 4;
 }
 
-// The generic named-dimension scorer (docs/query-api.md). Declared so
-// the shape is stable; increment 1 refuses a request that sets it.
+// The generic named-dimension scorer (docs/query-api.md): explicit
+// weights, per-dimension normalization over the candidate pool, an
+// explicit missing-signal policy, and per-dimension reporting
+// (QueryHit.dimensions) precise enough to recompute the final score
+// client-side without reimplementing server arithmetic. All scorer
+// arithmetic is f64, evaluated in dimension list order (IEEE ops are
+// not associative across reorderings), and the final order is
+// composite score descending, doc id ascending.
+//
+// A dimension is ACTIVE on a hit when it is not disabled (explicit
+// zero weight), not skipped by its missing policy, and not skipped by
+// the positive-value rule of the geometric/harmonic operations. A
+// document with NO active dimension scores 0 under every operation.
 message CompositeScorer {
+  // Required: an unspecified operation would have to be defaulted
+  // silently, which would misreport what ran.
   CompositeScoreOperation operation = 1;
+  // At least one dimension, and at least one must not be disabled — an
+  // all-disabled scorer would order every document at 0, silently.
   repeated ScoreDimension dimensions = 2;
 }
 
 enum CompositeScoreOperation {
   COMPOSITE_SCORE_OPERATION_UNSPECIFIED = 0;
+  // S = sum(w_i * n_i) over active dimensions. The one operation that
+  // admits a NEGATIVE weight (a penalty term).
   COMPOSITE_SCORE_OPERATION_WEIGHTED_SUM = 1;
+  // S = sum(w_i * n_i) / sum(w_i), both over active dimensions.
   COMPOSITE_SCORE_OPERATION_WEIGHTED_MEAN = 2;
+  // S = max(w_i * n_i) over active dimensions.
   COMPOSITE_SCORE_OPERATION_MAXIMUM = 3;
+  // S = product(w_i * n_i) over active dimensions. Signs multiply;
+  // dimensions kept positive keep the product monotone.
   COMPOSITE_SCORE_OPERATION_PRODUCT = 4;
+  // Weighted geometric mean over the active dimensions with POSITIVE
+  // normalized values, weights renormalized over those (the blend
+  // rule, ScoreCombination): S = product(n_i ^ (w_i / W)) with W the
+  // positive dimensions' weight sum.
   COMPOSITE_SCORE_OPERATION_GEOMETRIC_MEAN = 5;
+  // Weighted harmonic mean over the positive values (same skip rule):
+  // S = W / sum(w_i / n_i). The most AND-flavored: dominated by the
+  // document's weakest dimension.
   COMPOSITE_SCORE_OPERATION_HARMONIC_MEAN = 6;
 }
 
+// One named scoring dimension.
 message ScoreDimension {
+  // Names this dimension in QueryHit.dimensions. Non-empty, unique
+  // among the scorer's dimensions; it MAY deliberately equal the query
+  // id it sources (the natural spelling), because the two provenance
+  // surfaces are separate.
   string id = 1;
+  // Absent = 1.0. An explicit 0 is an explicit disable: the dimension
+  // is still evaluated and reported, but excluded from the
+  // combination. Must be finite; negative admitted only under
+  // WEIGHTED_SUM.
   optional double weight = 2;
+  // Where the raw value comes from. Required.
   ScoreSignal source = 3;
+  // Normalization over the candidate pool's PRESENT raw values for
+  // this dimension. UNSPECIFIED resolves to MIN_MAX, the engine-wide
+  // default; NONE is the explicit raw identity. Degenerate pools
+  // follow the blend rules: every present value equal (or a single
+  // present value) maps to 1.0 under MIN_MAX and 0.0 under Z_SCORE.
   ScoreNormalization normalization = 4;
+  // What a candidate without this signal scores. UNSPECIFIED resolves
+  // to ZERO (the union-flavored default, matching the blend's
+  // absent-leg rule). Policies apply to disabled dimensions too: they
+  // are evaluated for reporting, so ERROR still refuses.
   MissingScorePolicy missing = 5;
 }
 
 message ScoreSignal {
   oneof source {
-    // The first-stage composite base score.
+    // The first-stage composite base score: the selection strategy's
+    // own order (the fused score, a single leaf's raw relevance, or
+    // cascade's rerank-leg score). Never missing on a scored
+    // selection.
     bool base = 1;
-    // A search or boost query's raw relevance, by id. Never a filter.
+    // A search or boost query's raw relevance, by id. Never a filter
+    // (a filter never contributes a relevance score). Missing exactly
+    // when the hit's `signals` provenance omits the id.
     string query_relevance_id = 2;
-    // A bounded stored-value score function.
+    // A bounded stored-value score function evaluated at its identity
+    // score. Not served yet: stored-value dimensions arrive with the
+    // candidate-scoped value fetch; until then this source is refused
+    // by name.
     ScoreStage bounded_value = 3;
   }
 }
 
 enum MissingScorePolicy {
   MISSING_SCORE_POLICY_UNSPECIFIED = 0;
+  // The dimension contributes a NORMALIZED zero (not min-max of some
+  // raw zero) with its weight still active — under WEIGHTED_MEAN the
+  // weight stays in the denominator, proportionally penalizing the
+  // document, exactly like the blend's absent-leg rule. The resolved
+  // default.
   MISSING_SCORE_POLICY_ZERO = 1;
+  // The dimension is excluded from the combination entirely: its
+  // weight leaves every sum and renormalization.
   MISSING_SCORE_POLICY_SKIP = 2;
+  // A missing signal refuses the whole request with
+  // FAILED_PRECONDITION naming the document and the dimension: the
+  // caller asserted every candidate carries this signal, and a
+  // candidate without it is evidence the assertion is wrong.
   MISSING_SCORE_POLICY_ERROR = 3;
 }
 
@@ -3260,6 +3342,11 @@ message QueryHit {
   // Projected values, aligned with QueryRequest.projections in request
   // order. Empty when the request carried none.
   repeated ProjectedValue projected = 7;
+
+  // Per-dimension scorer provenance, aligned with the request's scorer
+  // dimensions in request order (every dimension is reported, skipped
+  // ones included). Empty when the request carried no scorer.
+  repeated DimensionScore dimensions = 8;
 }
 
 // One named raw relevance signal.
@@ -3270,6 +3357,33 @@ message QuerySignal {
   // calibrated dot product for dense, boost BM25 for a boost). Scales
   // are per-signal; the contract never pretends they share one.
   float score = 2;
+}
+
+// One scorer dimension's evaluation on one hit, precise enough to
+// recompute the final score client-side: the reported doubles are the
+// exact f64 terms the combination consumed, and QueryHit.score is
+// their combination cast to f32.
+message DimensionScore {
+  // ScoreDimension.id.
+  string id = 1;
+  // The raw signal value. Absent exactly when the signal was missing
+  // for this document (the dimension's missing policy then applied).
+  optional double raw = 2;
+  // The value after the dimension's normalization; 0 when the signal
+  // was missing under the ZERO policy.
+  double normalized = 3;
+  // This dimension's term in the combination, by operation: the
+  // additive term w*n (already divided by the active weight sum under
+  // WEIGHTED_MEAN), the candidate value w*n for MAXIMUM, the factor
+  // w*n for PRODUCT, the renormalized-exponent factor n^(w/W) for
+  // GEOMETRIC_MEAN, and the reciprocal term w/n for HARMONIC_MEAN
+  // (whose score is the active weight sum divided by the term sum).
+  // 0 when skipped.
+  double contribution = 4;
+  // True when this dimension was excluded from the combination on
+  // this hit: an explicit zero weight, SKIP on a missing signal, or
+  // the geometric/harmonic positive-value rule.
+  bool skipped = 5;
 }
 
 // ---------------------------------------------------------------------------
