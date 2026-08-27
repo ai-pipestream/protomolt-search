@@ -237,6 +237,14 @@ service NodeService {
   // projection leaves.
   rpc AggregateShard(AggregateShardRequest) returns (AggregateShardResponse);
 
+  // One round of the exact-percentile binary search
+  // (docs/aggregations.md): for each target (an expression index and
+  // an order-bits threshold), the count of this shard's rankable
+  // values with order bits at or below the threshold, over the same
+  // admitted set AggregateShard walks. The coordinator drives at most
+  // 64 rounds per request; each is one admitted-set pass here.
+  rpc QuantileCounts(QuantileCountsRequest) returns (QuantileCountsResponse);
+
   // Candidate-scoped VECTOR scoring: the vector twin of Bm25Rescore.
   // Scores just `candidate_ids` against this shard's index through a
   // masked scan; the kernel short-circuits fully-masked SIMD blocks, so
@@ -3952,6 +3960,31 @@ message AggregateRequest {
 
   // Fixed-interval histograms, at most 8.
   repeated HistogramSpec histograms = 6;
+
+  // Exact percentiles, at most 8 specs. EXACT: the answer to every
+  // requested percentile is the nearest-rank order statistic — a
+  // value some admitted document actually holds — found by a
+  // coordinator-driven binary search over the order-bits domain with
+  // count-below rounds (at most 64), never a sketch, never an
+  // interpolation. Fleet-wide only: percentiles ignore group_by.
+  repeated PercentileSpec percentiles = 7;
+}
+
+// One requested percentile set over one expression.
+message PercentileSpec {
+  // Name the result is returned under; one namespace with the
+  // aggregations and histograms.
+  string name = 1;
+
+  // CEL value expression, int or double typed. The answer's type is
+  // the expression's.
+  string expression = 2;
+
+  // The requested percentiles, 1 to 16 values, each finite in
+  // [0, 100]. Nearest-rank: percentile p answers the k-th smallest
+  // present value with k = max(1, ceil(p/100 * n)); 0 is the
+  // minimum, 100 the maximum, 50 the lower median on even counts.
+  repeated double percentiles = 3;
 }
 
 // One requested histogram: counts of a double expression's present
@@ -4034,6 +4067,46 @@ message AggregateResponse {
 
   // One result per requested histogram, in request order.
   repeated HistogramResult histograms = 5;
+
+  // One result per requested percentile spec, in request order.
+  repeated PercentileResult percentiles = 6;
+}
+
+// One percentile spec's answers.
+message PercentileResult {
+  // The request's name, echoed.
+  string name = 1;
+
+  // Rankable present values (a computed NaN is present but has no
+  // honest rank; see unrankable).
+  uint64 present = 2;
+
+  // Present values excluded from ranking: computed NaN. Reported,
+  // never silently dropped. Infinities rank (at the ends).
+  uint64 unrankable = 3;
+
+  // One answer per requested percentile, request order.
+  repeated PercentileValue values = 4;
+}
+
+// One percentile answer: an exact order statistic.
+message PercentileValue {
+  // The requested percentile, echoed.
+  double percentile = 1;
+
+  // The 1-based rank answered: k = max(1, ceil(p/100 * present)).
+  // 0 when present = 0 (no value).
+  uint64 rank = 2;
+
+  // The k-th smallest value, in the expression's type. Unset when no
+  // rankable value exists.
+  oneof value {
+    // Double-typed answer.
+    double double_value = 3;
+
+    // Int-typed answer.
+    sint64 int_value = 4;
+  }
 }
 
 // One group's results.
@@ -4117,6 +4190,18 @@ message AggregateShardRequest {
 
   // Compiled histograms, request order.
   repeated CompiledHistogram histograms = 6;
+
+  // Compiled percentile expressions, request order.
+  repeated CompiledPercentile percentiles = 7;
+}
+
+// One compiled percentile expression.
+message CompiledPercentile {
+  // The compiled expression.
+  ValueExpr expr = 1;
+
+  // The request's name, so shard-side refusals name the spec.
+  string name = 2;
 }
 
 // One compiled histogram.
@@ -4178,6 +4263,59 @@ message AggregateShardResponse {
 
   // One sparse histogram per compiled histogram, request order.
   repeated ShardHistogram histograms = 9;
+
+  // One partial per compiled percentile expression, request order:
+  // the phase-1 statistics the binary search starts from.
+  repeated PercentilePartial percentile_partials = 10;
+}
+
+// One shard's phase-1 percentile statistics.
+message PercentilePartial {
+  // The type this shard resolved the expression to (INT or DOUBLE;
+  // ABSENT when it can never hold a value here).
+  AggregateValueType vtype = 1;
+
+  // Rankable values on this shard.
+  uint64 present = 2;
+
+  // Computed-NaN values, excluded from ranking.
+  uint64 unrankable = 3;
+
+  // Order bits of the smallest and largest rankable values here;
+  // meaningful only when present > 0.
+  fixed64 min_bits = 4;
+  fixed64 max_bits = 5;
+}
+
+// One binary-search round.
+message QuantileCountsRequest {
+  // Compiled filter IR; absent = no tree filter.
+  FilterExpr filter = 1;
+
+  // Geo filters, verbatim.
+  repeated GeoFilter geo_filters = 2;
+
+  // The percentile expressions, request order (indexes in targets
+  // refer here).
+  repeated CompiledPercentile exprs = 3;
+
+  // The still-unconverged targets this round probes.
+  repeated QuantileTarget targets = 4;
+}
+
+// One probe: an expression and a threshold in its order-bits domain.
+message QuantileTarget {
+  // Index into QuantileCountsRequest.exprs.
+  uint32 expr_index = 1;
+
+  // The order-bits threshold.
+  fixed64 threshold_bits = 2;
+}
+
+message QuantileCountsResponse {
+  // Per target, in request order: this shard's rankable values whose
+  // order bits are at or below the threshold.
+  repeated uint64 counts = 1;
 }
 
 // One shard's partials for one facet value.
