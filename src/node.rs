@@ -1549,7 +1549,7 @@ fn int_min_max_as_f64((min, max): (i64, i64)) -> (f64, f64) {
 /// (`docs/score-functions.md`). Refuses unknown ops, empty column
 /// names, and parameters outside each op's admission rule: every
 /// refusal here is a stage whose monotonicity or bound would not hold.
-fn parse_score_stages(
+pub(crate) fn parse_score_stages(
     stages: &[crate::pb::ScoreStage],
 ) -> Result<Vec<(crate::scorefn::StageOp, String, String)>, Status> {
     use crate::scorefn::StageOp;
@@ -6410,6 +6410,107 @@ impl NodeService for NodeServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))?
             .map(Response::new)
+    }
+
+    async fn fetch_values(
+        &self,
+        request: Request<crate::pb::FetchValuesRequest>,
+    ) -> Result<Response<crate::pb::FetchValuesResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::FetchValues);
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let state = self.state.clone();
+        let resp = tokio::task::spawn_blocking(
+            move || -> Result<crate::pb::FetchValuesResponse, Status> {
+                // Stage parameters validate everywhere they arrive; a
+                // malformed stage is a request error, not a shard gap.
+                let specs = parse_score_stages(&req.stages)?;
+                let guard = state.read().expect("shard state lock poisoned");
+                let projection_leaves = {
+                    let mut leaves = Vec::new();
+                    for p in &req.projections {
+                        if let Some(expr) = p.expr.as_ref() {
+                            crate::values::column_leaves(expr, &mut leaves);
+                        }
+                    }
+                    leaves
+                };
+                // No column tables at all: this shard holds none of the
+                // candidates' values and resolves no column.
+                let Some(store) = guard.bm25.as_ref() else {
+                    return Ok(crate::pb::FetchValuesResponse {
+                        rows: Vec::new(),
+                        stage_columns_known: vec![false; req.stages.len()],
+                        projection_leaves_known: vec![false; projection_leaves.len()],
+                    });
+                };
+                let projection_leaves_known: Vec<bool> = projection_leaves
+                    .iter()
+                    .map(|leaf| crate::values::leaf_known(leaf, store))
+                    .collect();
+                // Projections resolve against this shard's tables once
+                // per request; type conflicts refuse here, by name —
+                // the same rule as the lexical route.
+                let resolved: Vec<crate::values::ResolvedValue> = req
+                    .projections
+                    .iter()
+                    .map(|p| {
+                        let expr = p.expr.as_ref().ok_or_else(|| {
+                            Status::invalid_argument("projection: empty compiled expression")
+                        })?;
+                        crate::values::resolve(expr, store).map(|(rv, _)| rv)
+                    })
+                    .collect::<Result<_, Status>>()?;
+                let chain = store.resolve_chain(&specs);
+                let stage_columns_known =
+                    chain.stages.iter().map(|s| s.column.is_some()).collect();
+                let numeric_read = ShardNumericRead(store);
+                let n = store.doc_count();
+                let mut ids: Vec<u64> = req
+                    .candidate_ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| id >= offset && id - offset < n)
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                let rows = ids
+                    .into_iter()
+                    .map(|id| {
+                        let local = (id - offset) as u32;
+                        crate::pb::FetchedRow {
+                            doc_id: id,
+                            values: resolved
+                                .iter()
+                                .map(|rv| {
+                                    projected_value(
+                                        crate::values::eval(rv, local, &numeric_read),
+                                        store,
+                                    )
+                                })
+                                .collect(),
+                            stage_values: chain
+                                .stages
+                                .iter()
+                                .map(|s| crate::pb::ProjectedValue {
+                                    value: s
+                                        .contribution(local, &numeric_read)
+                                        .map(crate::pb::projected_value::Value::DoubleValue),
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect();
+                Ok(crate::pb::FetchValuesResponse {
+                    rows,
+                    stage_columns_known,
+                    projection_leaves_known,
+                })
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(format!("fetch values task failed: {e}")))??;
+        Ok(Response::new(resp))
     }
 
     async fn vector_rescore(

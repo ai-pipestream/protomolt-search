@@ -17,9 +17,9 @@ use turbovec_search::pb::{
     score_signal, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     AddVectorsRequest, BoostQuery, CompositeScoreOperation, CompositeScorer,
     CompositeSearchStrategy, DenseQuery, FilterQuery, IntegerValue, LexicalQuery,
-    MissingScorePolicy, QueryRequest, QueryResponse, QuerySort, RrfScore, ScoreDimension,
-    ScoreNormalization, ScoreSignal, SearchQuery, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, SetCalibrationRequest,
+    MissingScorePolicy, NamedProjection, NumericValue, QueryRequest, QueryResponse, QuerySort,
+    RrfScore, ScoreDimension, ScoreNormalization, ScoreOp, ScoreSignal, ScoreStage, SearchQuery,
+    SelectionOperator, SelectionQuery, SelectionScoreStrategy, SetCalibrationRequest,
 };
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
@@ -46,6 +46,7 @@ async fn start_cluster() -> (
             slot_offset: (shard * SHARD_DOCS) as u64,
             analysis_addr: Some(analysis.clone()),
             integer_fields: vec!["year".into()],
+            numeric_fields: vec!["quality".into()],
             ..Default::default()
         })
         .await;
@@ -73,6 +74,16 @@ async fn start_cluster() -> (
                     field: "year".into(),
                     value: id as i64,
                 }],
+                // "quality" lands on EVEN docs only: the corpus's
+                // honestly-partial column, for missing-policy tests.
+                numerics: if id.is_multiple_of(2) {
+                    vec![NumericValue {
+                        field: "quality".into(),
+                        value: id as f64 + 1.0,
+                    }]
+                } else {
+                    Vec::new()
+                },
                 ..Default::default()
             })
             .await
@@ -577,7 +588,8 @@ async fn scorer_interplays_refuse_by_name() {
             "names no search or boost query",
         ),
         (
-            // Stored-value dimensions wait for the value fetch.
+            // A stored-value dimension's stage obeys the stage
+            // admission rules: the default stage names no column.
             QueryRequest {
                 k: 5,
                 selection: Some(lexical_leaf("lex", "zebra")),
@@ -590,7 +602,7 @@ async fn scorer_interplays_refuse_by_name() {
                 )),
                 ..Default::default()
             },
-            "stored-value",
+            "names the numeric column",
         ),
     ];
     for (req, needle) in cases {
@@ -857,4 +869,204 @@ async fn boost_shapes_refuse_by_name() {
             err.message()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stored-value dimensions and projections on every shape (the
+// FetchValues seam).
+
+fn add_linear(column: &str, weight: f64) -> ScoreStage {
+    ScoreStage {
+        op: ScoreOp::AddLinear as i32,
+        column: column.to_string(),
+        weight,
+        ..Default::default()
+    }
+}
+
+fn stored_dim(id: &str, stage: ScoreStage) -> ScoreDimension {
+    let mut d = dim(id, score_signal::Source::BoundedValue(stage));
+    d.normalization = ScoreNormalization::None as i32;
+    d
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stored_value_dimension_orders_by_the_column() {
+    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let response = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            scorer: Some(scorer(
+                CompositeScoreOperation::WeightedSum,
+                vec![stored_dim("recency", add_linear("year", 1.0))],
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.executed, "bm25_search+scorer:weighted_sum");
+    // The dimension IS the year value: newest first, and provenance
+    // reports the exact column value as the raw.
+    let ids: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(ids, vec![7, 6, 5, 4, 3, 2, 1, 0]);
+    for h in &response.hits {
+        assert_eq!(h.dimensions[0].raw, Some(h.doc_id as f64));
+        assert_eq!(h.score, h.doc_id as f32);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stored_value_missing_policies_on_a_partial_column() {
+    let (coordinator, _qvec, _handles) = start_cluster().await;
+    // "quality" lives on even docs only (value id + 1). Under the ZERO
+    // default the odd docs score 0 and tie in id order behind every
+    // even doc.
+    let response = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            scorer: Some(scorer(
+                CompositeScoreOperation::WeightedSum,
+                vec![stored_dim("q", add_linear("quality", 1.0))],
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ids: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(ids, vec![6, 4, 2, 0, 1, 3, 5, 7]);
+    for h in &response.hits {
+        assert_eq!(h.dimensions[0].raw.is_some(), h.doc_id % 2 == 0);
+    }
+
+    // ERROR: the caller asserted every candidate carries the value,
+    // and doc 1 is the first (in pool order) that does not.
+    let mut d = stored_dim("q", add_linear("quality", 1.0));
+    d.missing = MissingScorePolicy::Error as i32;
+    let err = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            scorer: Some(scorer(CompositeScoreOperation::WeightedSum, vec![d])),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("dimension \"q\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stored_value_typo_refuses_by_name() {
+    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let err = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            scorer: Some(scorer(
+                CompositeScoreOperation::WeightedSum,
+                vec![stored_dim("d", add_linear("yeer", 1.0))],
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("no shard has numeric column yeer"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn projections_ride_every_shape() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+    let projections = vec![
+        NamedProjection {
+            name: "year".into(),
+            expression: "year".into(),
+        },
+        NamedProjection {
+            name: "doubled".into(),
+            expression: "year * 2".into(),
+        },
+    ];
+    // Dense leaf, composite, and browse all carry the same projected
+    // values per hit; the lexical route always did.
+    let dense_req = QueryRequest {
+        k: 8,
+        selection: Some(dense_leaf("vec", &qvec)),
+        projections: projections.clone(),
+        ..Default::default()
+    };
+    let composite_req = QueryRequest {
+        k: 8,
+        selection_k: 8,
+        selection: Some(rrf_union(&qvec, "zebra")),
+        projections: projections.clone(),
+        ..Default::default()
+    };
+    let browse_req = QueryRequest {
+        k: 8,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Filter(FilterQuery {
+                id: "f".into(),
+                predicate: Some(turbovec_search::pb::filter_query::Predicate::Cel(
+                    "year >= 0".into(),
+                )),
+            })),
+        }),
+        projections: projections.clone(),
+        ..Default::default()
+    };
+    for req in [dense_req, composite_req, browse_req] {
+        let response = query(&coordinator, req).await.unwrap();
+        assert_eq!(response.hits.len(), N_DOCS);
+        for h in &response.hits {
+            assert_eq!(h.projected.len(), 2, "{}", response.executed);
+            assert_eq!(
+                h.projected[0].value,
+                Some(turbovec_search::pb::projected_value::Value::IntValue(
+                    h.doc_id as i64
+                )),
+                "{}",
+                response.executed
+            );
+            assert_eq!(
+                h.projected[1].value,
+                Some(turbovec_search::pb::projected_value::Value::IntValue(
+                    2 * h.doc_id as i64
+                )),
+                "{}",
+                response.executed
+            );
+        }
+    }
+
+    // The typo rule holds on the fetched path too.
+    let err = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection: Some(dense_leaf("vec", &qvec)),
+            projections: vec![NamedProjection {
+                name: "y".into(),
+                expression: "yeer".into(),
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("no shard has column"));
 }

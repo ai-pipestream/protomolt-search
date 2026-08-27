@@ -451,7 +451,7 @@ async fn materialize_kind_mismatch_refuses_loudly() {
 /// bit-identically to the Bm25Search route, and refuses them by name
 /// on shapes whose route does not serve them yet.
 #[tokio::test]
-async fn query_projections_ride_the_lexical_shape_only() {
+async fn query_projections_agree_across_shapes() {
     let (coordinator, handles) = start_cluster(None, &[], &[]).await;
     let leaf = SelectionQuery {
         node: Some(selection_query::Node::Search(SearchQuery {
@@ -490,7 +490,8 @@ async fn query_projections_ride_the_lexical_shape_only() {
         .collect();
     assert_eq!(via_query, direct, "the adapter must not fork the values");
 
-    // A browse selection refuses projections by name.
+    // A browse selection serves projections through the post-selection
+    // value fetch, and the values agree with the lexical route's.
     let browse = SelectionQuery {
         node: Some(selection_query::Node::Filter(
             turbovec_search::pb::FilterQuery {
@@ -501,21 +502,25 @@ async fn query_projections_ride_the_lexical_shape_only() {
             },
         )),
     };
-    let status = coordinator
+    let browsed = coordinator
         .query(Request::new(QueryRequest {
-            k: 4,
+            k: N_DOCS as u32,
             selection: Some(browse),
-            projections: vec![projection("p", "price")],
+            projections: vec![projection("p2", "price * 2.0"), projection("c", "court")],
             ..Default::default()
         }))
         .await
-        .expect_err("projections on a browse must refuse");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status.message().contains("single-lexical-leaf"),
-        "the refusal must name the supported shape: {}",
-        status.message()
-    );
+        .unwrap()
+        .into_inner();
+    for h in browsed.hits {
+        let values: Vec<Option<projected_value::Value>> =
+            h.projected.into_iter().map(|p| p.value).collect();
+        let reference = direct
+            .iter()
+            .find(|(id, _)| *id == h.doc_id)
+            .expect("browsed doc missing from the lexical reference");
+        assert_eq!(values, reference.1, "doc {}", h.doc_id);
+    }
     for h in handles {
         h.abort();
     }

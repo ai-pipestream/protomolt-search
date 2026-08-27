@@ -229,6 +229,15 @@ type AggregatedHits = (
 /// coordinator merge is the same positional walk. `mean` is computed
 /// HERE (sum / count) so clients cannot get it wrong; a column NO
 /// shard knows is refused by name, the usual typo rule.
+/// The evaluated values for one candidate set (`fetch_values`).
+pub struct FetchedValues {
+    /// doc -> projected values, aligned with the request projections.
+    pub rows: HashMap<u64, Vec<crate::pb::ProjectedValue>>,
+    /// Per stage: doc -> identity-score contribution. A doc absent
+    /// from a map has no value for that stage's column.
+    pub stage_rows: Vec<HashMap<u64, f64>>,
+}
+
 /// Compile the public projection list (docs/cel-values.md): names
 /// non-empty and request-unique, expressions through the value
 /// front-end, ONCE, here at the coordinator.
@@ -3619,6 +3628,105 @@ impl CoordinatorServiceImpl {
             .map(|s| (s as u32, ids.to_vec()))
             .collect();
         self.fanout_vector_rescore(vector, by_shard).await
+    }
+
+    /// Candidate-scoped value fan-out (the `FetchValues` seam),
+    /// broadcast — shards ignore ids they do not own. Projections keep
+    /// the ordinary value semantics (absence in, absence out) and the
+    /// ordinary typo rule (a column-read leaf NO shard resolves is
+    /// refused by name); stages evaluate at their identity score with
+    /// the same typo rule as the lexical route's chain.
+    pub async fn fetch_values(
+        &self,
+        ids: &[u64],
+        projections: &[crate::pb::CompiledProjection],
+        stages: &[crate::pb::ScoreStage],
+    ) -> Result<FetchedValues, Status> {
+        // Stage parameters validate here too, so a malformed stage is
+        // refused by name before any fan-out.
+        crate::node::parse_score_stages(stages)?;
+        let mut out = FetchedValues {
+            rows: HashMap::new(),
+            stage_rows: vec![HashMap::new(); stages.len()],
+        };
+        // An empty candidate list still fans out when anything was
+        // named: the typo rules run on the flags, not the rows.
+        if projections.is_empty() && stages.is_empty() {
+            return Ok(out);
+        }
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::FetchValuesRequest {
+                candidate_ids: ids.to_vec(),
+                projections: projections.to_vec(),
+                stages: stages.to_vec(),
+            };
+            let mut client = self.node_client(node)?;
+            tasks.push(tokio::spawn(async move {
+                client
+                    .fetch_values(request)
+                    .await
+                    .map(|r| r.into_inner())
+            }));
+        }
+        let projection_leaves: Vec<crate::values::ValueLeaf> = {
+            let mut leaves = Vec::new();
+            for p in projections {
+                if let Some(expr) = p.expr.as_ref() {
+                    crate::values::column_leaves(expr, &mut leaves);
+                }
+            }
+            leaves
+        };
+        let mut stage_known = vec![false; stages.len()];
+        let mut projection_known = vec![false; projection_leaves.len()];
+        for task in tasks {
+            let resp = task
+                .await
+                .map_err(|e| Status::internal(format!("fetch values task failed: {e}")))??;
+            for (known, shard) in stage_known.iter_mut().zip(&resp.stage_columns_known) {
+                *known |= shard;
+            }
+            for (known, shard) in projection_known
+                .iter_mut()
+                .zip(&resp.projection_leaves_known)
+            {
+                *known |= shard;
+            }
+            for row in resp.rows {
+                for (i, sv) in row.stage_values.iter().enumerate() {
+                    if let Some(crate::pb::projected_value::Value::DoubleValue(v)) = sv.value {
+                        out.stage_rows[i].insert(row.doc_id, v);
+                    }
+                }
+                out.rows.insert(row.doc_id, row.values);
+            }
+        }
+        for (stage, known) in stages.iter().zip(&stage_known) {
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "no shard has numeric column {}: the stored-value dimension would be \
+                     a silent no-op. Check the spelling, or the nodes' --numeric-fields / \
+                     --integer-fields / --map-numeric-fields / --geo-fields.",
+                    stage.column
+                )));
+            }
+        }
+        let unknown_projection: Vec<String> = projection_leaves
+            .iter()
+            .zip(&projection_known)
+            .filter(|(_, known)| !**known)
+            .map(|(leaf, _)| leaf.describe())
+            .collect();
+        if !unknown_projection.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "projection: no shard has column {}: every value would be absent. \
+                 Check the spelling, or the nodes' --numeric-fields / --integer-fields \
+                 / --facet-fields / --map-numeric-fields / --map-facet-fields.",
+                unknown_projection.join(", ")
+            )));
+        }
+        Ok(out)
     }
 
     /// Second-pass lexical boost (see the proto's `BoostRescore`): score

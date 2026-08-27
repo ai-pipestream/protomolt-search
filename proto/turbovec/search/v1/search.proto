@@ -221,6 +221,15 @@ service NodeService {
   // supplied global stats.
   rpc Bm25Rescore(Bm25RescoreRequest) returns (Bm25RescoreResponse);
 
+  // Candidate-scoped VALUE evaluation: evaluate compiled projections
+  // and score-stage contributions for just `candidate_ids`, by global
+  // id. Ids outside this shard's range are absent from the response.
+  // This is the post-selection value seam: the candidate set is
+  // already fixed when it runs, so no pruning certificate is involved
+  // — which is exactly why the public route can serve projections on
+  // every shape and stored-value scorer dimensions through it.
+  rpc FetchValues(FetchValuesRequest) returns (FetchValuesResponse);
+
   // Candidate-scoped VECTOR scoring: the vector twin of Bm25Rescore.
   // Scores just `candidate_ids` against this shard's index through a
   // masked scan; the kernel short-circuits fully-masked SIMD blocks, so
@@ -2734,6 +2743,50 @@ message Bm25RescoreRequest {
 message Bm25RescoreResponse {
   // One hit per candidate that scored above zero.
   repeated Bm25Hit hits = 1;
+}
+
+// Candidate-scoped value evaluation (see NodeService.FetchValues).
+message FetchValuesRequest {
+  // Global candidate doc ids. Ids outside this shard's range are
+  // ignored; duplicates collapse.
+  repeated uint64 candidate_ids = 1;
+  // Compiled projections (the internal fan-out form, compiled once at
+  // the coordinator), evaluated per candidate with the ordinary value
+  // semantics: absence in, absence out.
+  repeated CompiledProjection projections = 2;
+  // Score stages, each evaluated at its IDENTITY score per candidate:
+  // the factor for the multiplicative ops (exp decay, log boost, geo
+  // decay), the addend for ADD_LINEAR. A candidate without the value
+  // is absent — identity, which a stored-value scorer dimension reads
+  // as a missing signal. Parameters follow the stage admission rules.
+  repeated ScoreStage stages = 3;
+}
+
+// One candidate's evaluated values.
+message FetchedRow {
+  // Global doc id.
+  uint64 doc_id = 1;
+  // Aligned with the request's projections. Unset oneof = absence.
+  repeated ProjectedValue values = 2;
+  // Aligned with the request's stages: the identity-score
+  // contribution as a double, or absent.
+  repeated ProjectedValue stage_values = 3;
+}
+
+// The candidates this shard owns, doc id ascending.
+message FetchValuesResponse {
+  repeated FetchedRow rows = 1;
+  // Whether this shard resolved each stage's column, parallel to
+  // `stages` (empty when none were sent). A shard without the column
+  // answered absence for all its documents — exact — but the
+  // coordinator refuses a column NO shard knows (the typo rule, as
+  // everywhere).
+  repeated bool stage_columns_known = 2;
+  // Whether this shard resolved each projection column-read leaf, in
+  // the same depth-first wire order as
+  // Bm25QueryResponse.projection_leaves_known; the coordinator applies
+  // the same typo rule.
+  repeated bool projection_leaves_known = 3;
 }
 
 // Candidate-scoped vector scoring (see NodeService.VectorRescore).
