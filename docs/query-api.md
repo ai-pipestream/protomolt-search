@@ -4,9 +4,15 @@ Status: increment 1 is IMPLEMENTED (2026-08-24): `SearchService.Query`
 executes the shapes in the mapping table below by delegating to `Search`,
 `Bm25Search`, and `HybridSearch` (`src/query.rs`, `tests/query_api.rs`),
 with per-signal provenance and by-name refusal of everything else. The
-phase split, the boost contract, and the refusal rules in this document
-are the binding contract; the sections on the generic composite scorer
-remain design-ahead-of-implementation.
+generic composite scorer is IMPLEMENTED (2026-08-26, `src/ltr.rs`,
+`tests/ltr.rs`): all six operations, per-dimension normalization and
+missing policies, and per-dimension provenance (`QueryHit.dimensions`)
+precise enough to recompute every final score client-side — the
+reconstruction guarantee is a test, not a promise. Stored-value
+dimensions (`ScoreSignal.bounded_value`) and multiple boost queries
+remain refused by name until their increments land. The phase split,
+the boost contract, and the refusal rules in this document are the
+binding contract.
 
 The public model separates three things that are easy to conflate:
 
@@ -109,6 +115,33 @@ needs more recall under a strong boost increases `selection_k`; the server does
 not silently over-fetch by an undocumented factor.
 
 ## Composite scorer
+
+Implemented 2026-08-26 (`src/ltr.rs`): the scorer runs on the
+coordinator over the fixed `selection_k` candidate pool, after the
+selection strategy and after boost signals are computed. Decisions
+pinned at implementation time:
+
+- `UNSPECIFIED` normalization resolves to `MIN_MAX` and `UNSPECIFIED`
+  missing policy to `ZERO` (the engine-wide defaults, matching the
+  blend); the operation itself has no default and refuses unset.
+- Normalization statistics are fitted over the pool's PRESENT values;
+  a `ZERO`-policy miss contributes a normalized zero, not the
+  normalization of a raw zero. Degenerate pools follow the blend
+  rules (min-max 1.0, z-score 0.0).
+- A negative weight is admitted under `weighted_sum` alone (a penalty
+  term); an explicit zero weight is evaluated and reported but
+  excluded from combination. Geometric and harmonic means keep the
+  blend's positive-value skip rule.
+- Scorer arithmetic is f64 in dimension list order; ties in the final
+  order break on the f32 wire score, then doc id — exactly what the
+  client sees, never hidden f64 residue.
+- Because normalization statistics move with the pool, a scored query
+  pages WITHIN its fixed `selection_k` pool (the composite rule);
+  `selection_k` is therefore meaningful on single-leaf shapes when a
+  scorer is present.
+- With a scorer present a boost is signal-only: `window`,
+  `base_weight`, and `boost_weight` refuse by name, and the whole
+  pool is scored.
 
 The scorer follows ProtoMolt quality scoring's useful shape: stable dimension
 ids, explicit weights, deterministic combination, and per-dimension reporting.
@@ -257,6 +290,7 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | filters only (browse, id order, `after`-floor paging) | `BrowseShard` fan-out |
 | browse + `sort` by i64/f64 column (asc/desc) | `BrowseShard` column-keyed heap |
 | projections on one lexical leaf | `Bm25Search.projections` (`docs/cel-values.md`) |
+| any scored shape + composite scorer | the route above, then the coordinator-side scorer (`src/ltr.rs`) |
 
 `selection_k` maps to the hybrid leg depth; the response is the best `k`
 of that candidate set (`k <= selection_k` enforced; a `selection_k` that
@@ -280,10 +314,10 @@ The adapter must execute those ordinary paths rather than fork their scoring
 logic. Vector-plus-CEL has since acquired its ordinary path
 (`docs/vector-filters.md`): `SearchRequest` and `HybridSearchRequest` both
 carry `geo_filters` and a CEL `filter`, and every fusion mode applies them to
-both legs. Shapes still not represented by the table — filter-only browse,
-arbitrary nested boolean search, multiple boost queries, and the generic
-named-dimension response — remain unsupported until their ordinary engine
-paths exist. The public RPC must return `INVALID_ARGUMENT` or
+both legs. Shapes still not represented by the table — arbitrary nested
+boolean search, multiple boost queries, boosts on single-leaf shapes,
+and stored-value scorer dimensions — remain unsupported until their
+ordinary engine paths exist. The public RPC must return `INVALID_ARGUMENT` or
 `FAILED_PRECONDITION` for such a shape; compatibility never authorizes a
 heuristic substitute.
 
@@ -301,10 +335,12 @@ skipped, as search-after semantics require.
 
 Depth: a single-leaf query pages by fetching deeper (its order is
 depth-independent by the exact top-k prefix property), capped by
-`max_k`. A composite pages within its fixed `selection_k` pool — the
-fusion strategies' orders are depth-dependent (RRF ranks, blend
-normalization, the cascade gate), so the pool is never silently
-deepened; exhaustion refuses and names `selection_k`. A full page
+`max_k`. A composite — and any query carrying the composite scorer,
+whose normalization statistics move with the pool — pages within its
+fixed `selection_k` pool: the fusion strategies' orders are
+depth-dependent (RRF ranks, blend normalization, the cascade gate), so
+the pool is never silently deepened; exhaustion refuses and names
+`selection_k`. A full page
 always mints `next_cursor`; a short page provably has nothing after it
 at the served depth and mints none.
 

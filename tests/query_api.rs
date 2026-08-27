@@ -524,7 +524,7 @@ async fn unsupported_shapes_refuse_by_name() {
                 }),
                 ..Default::default()
             },
-            "generic composite scorer",
+            "no dimensions",
         ),
         (
             QueryRequest {
