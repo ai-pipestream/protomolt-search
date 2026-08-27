@@ -16,7 +16,7 @@ use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::search_service_server::SearchService;
 use turbovec_search::pb::{
     aggregate_result::Value as W, AddDocumentsRequest, AggregateOp, AggregateRequest,
-    AggregateResponse, Aggregation, FacetValue, IntegerValue, NumericValue,
+    AggregateResponse, Aggregation, FacetValue, HistogramSpec, IntegerValue, NumericValue,
 };
 
 use common::{mock::start_mock_analysis, start_empty_node};
@@ -35,8 +35,8 @@ fn year_of(id: usize) -> Option<i64> {
     (id != 5).then_some(1990 + id as i64)
 }
 
-fn court_of(id: usize) -> &'static str {
-    ["scotus", "ca9", "ca2"][id % 3]
+fn court_of(id: usize) -> Option<&'static str> {
+    (id != 6).then(|| ["scotus", "ca9", "ca2"][id % 3])
 }
 
 async fn start_cluster() -> (
@@ -78,10 +78,14 @@ async fn start_cluster() -> (
                         }]
                     })
                     .unwrap_or_default(),
-                facets: vec![FacetValue {
-                    field: "court".into(),
-                    value: court_of(id).into(),
-                }],
+                facets: court_of(id)
+                    .map(|v| {
+                        vec![FacetValue {
+                            field: "court".into(),
+                            value: v.into(),
+                        }]
+                    })
+                    .unwrap_or_default(),
                 ..Default::default()
             })
             .await
@@ -105,6 +109,15 @@ fn agg(name: &str, expression: &str, op: AggregateOp) -> Aggregation {
     }
 }
 
+fn hist(name: &str, expression: &str, interval: f64, max_buckets: u32) -> HistogramSpec {
+    HistogramSpec {
+        name: name.into(),
+        expression: expression.into(),
+        interval,
+        max_buckets,
+    }
+}
+
 async fn run(
     coordinator: &CoordinatorServiceImpl,
     filter: &str,
@@ -113,8 +126,8 @@ async fn run(
     coordinator
         .aggregate(Request::new(AggregateRequest {
             filter: filter.into(),
-            geo_filters: Vec::new(),
             aggregations,
+            ..Default::default()
         }))
         .await
         .map(|r| r.into_inner())
@@ -280,13 +293,15 @@ async fn the_filter_scopes_the_fold() {
     )
     .await
     .unwrap();
-    let admitted: Vec<usize> = (0..N_DOCS).filter(|id| court_of(*id) == "ca9").collect();
+    let admitted: Vec<usize> = (0..N_DOCS)
+        .filter(|id| court_of(*id) == Some("ca9"))
+        .collect();
     assert_eq!(response.matched, admitted.len() as u64);
     let prices: Vec<Vec<f64>> = (0..2)
         .map(|shard| {
             (0..SHARD_DOCS)
                 .map(|i| shard * SHARD_DOCS + i)
-                .filter(|id| court_of(*id) == "ca9")
+                .filter(|id| court_of(*id) == Some("ca9"))
                 .filter_map(price_of)
                 .collect()
         })
@@ -307,7 +322,7 @@ async fn the_filter_scopes_the_fold() {
         .map(|shard| {
             (0..SHARD_DOCS)
                 .map(|i| shard * SHARD_DOCS + i)
-                .filter(|id| court_of(*id) == "ca9")
+                .filter(|id| court_of(*id) == Some("ca9"))
                 .filter_map(|id| Some(price_of(id)? * 2.0 + year_of(id)? as f64))
                 .collect()
         })
@@ -444,6 +459,235 @@ async fn refusals_name_the_aggregation() {
     assert!(
         status.message().contains("nosuch"),
         "filter typos refuse by name: {}",
+        status.message()
+    );
+    for h in handles {
+        h.abort();
+    }
+}
+
+/// Grouping folds every aggregation once per facet value with the
+/// same exactness contract as the totals; groups return ascending by
+/// value, a doc without the value counts in `ungrouped`, and the
+/// fleet-wide totals still cover every admitted doc.
+#[tokio::test]
+async fn group_by_facet_folds_per_group() {
+    let (coordinator, handles) = start_cluster().await;
+    let request = AggregateRequest {
+        filter: String::new(),
+        geo_filters: Vec::new(),
+        aggregations: vec![
+            agg("n", "price", AggregateOp::Count),
+            agg("total", "price", AggregateOp::Sum),
+            agg("mean", "price", AggregateOp::Mean),
+        ],
+        group_by: "court".into(),
+        max_groups: 0,
+        histograms: Vec::new(),
+    };
+    let first = coordinator
+        .aggregate(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let second = coordinator
+        .aggregate(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first, second, "grouped folds answer the same bits twice");
+
+    assert_eq!(first.matched, N_DOCS as u64);
+    assert_eq!(first.ungrouped, 1, "doc 6 carries no court");
+    let mut expected_values: Vec<&str> = (0..N_DOCS).filter_map(court_of).collect();
+    expected_values.sort_unstable();
+    expected_values.dedup();
+    assert_eq!(
+        first.groups.iter().map(|g| g.value.as_str()).collect::<Vec<_>>(),
+        expected_values,
+        "groups return ascending by value"
+    );
+    for group in &first.groups {
+        let members: Vec<usize> = (0..N_DOCS)
+            .filter(|id| court_of(*id) == Some(group.value.as_str()))
+            .collect();
+        assert_eq!(group.matched, members.len() as u64, "group {}", group.value);
+        let prices: Vec<Vec<f64>> = (0..2)
+            .map(|shard| {
+                (0..SHARD_DOCS)
+                    .map(|i| shard * SHARD_DOCS + i)
+                    .filter(|id| members.contains(id))
+                    .filter_map(price_of)
+                    .collect()
+            })
+            .collect();
+        let n: u64 = prices.iter().map(|s| s.len() as u64).sum();
+        assert_eq!(group.results[0].value, Some(W::IntValue(n as i64)));
+        assert_eq!(
+            group.results[1].value,
+            Some(W::DoubleValue(reference_sum(&prices))),
+            "group {}",
+            group.value
+        );
+        let (wn, mean, _) = chan(welford(&prices[0]), welford(&prices[1]));
+        assert_eq!(wn, n);
+        assert_eq!(
+            group.results[2].value,
+            Some(W::DoubleValue(mean)),
+            "group {}",
+            group.value
+        );
+    }
+    // The fleet-wide totals still cover the ungrouped doc.
+    let total_present: u64 = (0..N_DOCS).filter_map(price_of).count() as u64;
+    assert_eq!(first.results[0].value, Some(W::IntValue(total_present as i64)));
+    for h in handles {
+        h.abort();
+    }
+}
+
+/// Histograms bucket by floor(value / interval), sparse and exact;
+/// unbucketable values (NaN, infinity) are reported, never dropped
+/// silently.
+#[tokio::test]
+async fn histograms_bucket_exactly() {
+    let (coordinator, handles) = start_cluster().await;
+    let response = coordinator
+        .aggregate(Request::new(AggregateRequest {
+            filter: String::new(),
+            geo_filters: Vec::new(),
+            aggregations: Vec::new(),
+            group_by: String::new(),
+            max_groups: 0,
+            histograms: vec![
+                hist("price", "price", 2.5, 0),
+                hist("negated", "0.0 - price", 2.5, 0),
+                hist("inf", "1.0 / (price - price)", 2.5, 0),
+            ],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let prices: Vec<f64> = (0..N_DOCS).filter_map(price_of).collect();
+    for (result, transform) in response.histograms[..2].iter().zip([1.0f64, -1.0]) {
+        let mut expected: std::collections::BTreeMap<i64, u64> = Default::default();
+        for &p in &prices {
+            let idx = (p * transform / 2.5).floor() as i64;
+            *expected.entry(idx).or_insert(0) += 1;
+        }
+        let got: Vec<(f64, u64)> = result.buckets.iter().map(|b| (b.lower, b.count)).collect();
+        let want: Vec<(f64, u64)> = expected.iter().map(|(&i, &c)| (i as f64 * 2.5, c)).collect();
+        assert_eq!(got, want, "{}", result.name);
+        assert_eq!(result.present, prices.len() as u64);
+        assert_eq!(result.unbucketable, 0);
+    }
+    let inf = &response.histograms[2];
+    assert_eq!(inf.present, prices.len() as u64);
+    assert_eq!(
+        inf.unbucketable,
+        prices.len() as u64,
+        "an infinity has no honest bucket and is reported"
+    );
+    assert!(inf.buckets.is_empty());
+    for h in handles {
+        h.abort();
+    }
+}
+
+/// The caps refuse loudly, never truncate; histogram and grouping
+/// validation names the problem.
+#[tokio::test]
+async fn caps_and_shapes_refuse_loudly() {
+    let (coordinator, handles) = start_cluster().await;
+    let base = |aggregations, group_by: &str, max_groups, histograms| AggregateRequest {
+        filter: String::new(),
+        geo_filters: Vec::new(),
+        aggregations,
+        group_by: group_by.into(),
+        max_groups,
+        histograms,
+    };
+    let status = coordinator
+        .aggregate(Request::new(base(
+            vec![agg("n", "price", AggregateOp::Count)],
+            "court",
+            2,
+            Vec::new(),
+        )))
+        .await
+        .unwrap_err();
+    assert!(
+        status.message().contains("distinct values"),
+        "3 courts against a cap of 2: {}",
+        status.message()
+    );
+    let status = coordinator
+        .aggregate(Request::new(base(
+            Vec::new(),
+            "",
+            0,
+            vec![hist("h", "price", 2.5, 2)],
+        )))
+        .await
+        .unwrap_err();
+    assert!(
+        status.message().contains("buckets"),
+        "4 buckets against a cap of 2: {}",
+        status.message()
+    );
+    for (interval, needle) in [(0.0, "positive and finite"), (f64::INFINITY, "positive and finite")]
+    {
+        let status = coordinator
+            .aggregate(Request::new(base(
+                Vec::new(),
+                "",
+                0,
+                vec![hist("h", "price", interval, 0)],
+            )))
+            .await
+            .unwrap_err();
+        assert!(status.message().contains(needle), "{}", status.message());
+    }
+    let status = coordinator
+        .aggregate(Request::new(base(
+            Vec::new(),
+            "",
+            0,
+            vec![hist("h", "year", 10.0, 0)],
+        )))
+        .await
+        .unwrap_err();
+    assert!(
+        status.message().contains("double()"),
+        "an int histogram names the conversion: {}",
+        status.message()
+    );
+    let status = coordinator
+        .aggregate(Request::new(base(
+            vec![agg("n", "price", AggregateOp::Count)],
+            "price",
+            0,
+            Vec::new(),
+        )))
+        .await
+        .unwrap_err();
+    assert!(
+        status.message().contains("not a facet column"),
+        "group_by over a numeric column: {}",
+        status.message()
+    );
+    let status = coordinator
+        .aggregate(Request::new(base(
+            vec![agg("x", "price", AggregateOp::Count)],
+            "",
+            0,
+            vec![hist("x", "price", 2.5, 0)],
+        )))
+        .await
+        .unwrap_err();
+    assert!(
+        status.message().contains("duplicate"),
+        "one name namespace across aggregations and histograms: {}",
         status.message()
     );
     for h in handles {

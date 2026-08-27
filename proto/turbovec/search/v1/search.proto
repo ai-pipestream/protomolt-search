@@ -3933,9 +3933,45 @@ message AggregateRequest {
   // route.
   repeated GeoFilter geo_filters = 2;
 
-  // The aggregations, at least one, at most 32; names non-empty and
-  // request-unique.
+  // The aggregations, at most 32; names non-empty and request-unique
+  // across aggregations and histograms. At least one aggregation or
+  // histogram per request.
   repeated Aggregation aggregations = 3;
+
+  // Group the aggregations by one facet column's values: every
+  // aggregation folds once fleet-wide (`results`) and once per
+  // distinct value (`groups`, ascending by value). An admitted
+  // document WITHOUT the value joins no group (absence is not a
+  // value) and counts in `ungrouped`. Empty = no grouping.
+  string group_by = 4;
+
+  // Cap on distinct groups, 0 = 1000. Exceeding it REFUSES loudly
+  // (naming the cap), never a silent truncation: a top-N cut would
+  // need an ordering this request did not state.
+  uint32 max_groups = 5;
+
+  // Fixed-interval histograms, at most 8.
+  repeated HistogramSpec histograms = 6;
+}
+
+// One requested histogram: counts of a double expression's present
+// values in fixed intervals. Bucket index = floor(value / interval);
+// the bucket's inclusive lower bound is index * interval. Buckets are
+// SPARSE: only occupied ones return, ascending.
+message HistogramSpec {
+  // Name the result is returned under.
+  string name = 1;
+
+  // CEL value expression, double-typed (an int expression converts
+  // with double()).
+  string expression = 2;
+
+  // Bucket width. Positive and finite.
+  double interval = 3;
+
+  // Cap on distinct buckets, 0 = 1024. Exceeding it REFUSES loudly:
+  // the honest fixes are a coarser interval or a tighter filter.
+  uint32 max_buckets = 4;
 }
 
 // One requested aggregate.
@@ -3983,11 +4019,60 @@ enum AggregateOp {
 }
 
 message AggregateResponse {
-  // One result per requested aggregation, in request order.
+  // One result per requested aggregation, in request order —
+  // fleet-wide totals whether or not the request groups.
   repeated AggregateResult results = 1;
 
   // Documents the filter admitted, fleet-wide.
   uint64 matched = 2;
+
+  // Per-group results when `group_by` is set, ascending by value.
+  repeated AggregateGroup groups = 3;
+
+  // Admitted documents without the group_by value (group_by only).
+  uint64 ungrouped = 4;
+
+  // One result per requested histogram, in request order.
+  repeated HistogramResult histograms = 5;
+}
+
+// One group's results.
+message AggregateGroup {
+  // The facet value.
+  string value = 1;
+
+  // Admitted documents carrying this value.
+  uint64 matched = 2;
+
+  // The aggregations folded over this group's documents, request
+  // order — the same exactness contract as the totals.
+  repeated AggregateResult results = 3;
+}
+
+// One histogram's merged buckets.
+message HistogramResult {
+  // The request's name, echoed.
+  string name = 1;
+
+  // Occupied buckets, ascending by lower bound.
+  repeated HistogramBucket buckets = 2;
+
+  // Values bucketed.
+  uint64 present = 3;
+
+  // Present values no bucket can hold honestly: NaN, an infinity, or
+  // a bucket index outside i64 (an interval too fine for the value's
+  // magnitude). Reported, never silently dropped.
+  uint64 unbucketable = 4;
+}
+
+// One occupied bucket.
+message HistogramBucket {
+  // Inclusive lower bound: index * interval.
+  double lower = 1;
+
+  // Present values with floor(value / interval) at this index.
+  uint64 count = 2;
 }
 
 // One aggregate result.
@@ -4022,6 +4107,31 @@ message AggregateShardRequest {
 
   // Compiled aggregations, request order.
   repeated CompiledAggregation aggregations = 3;
+
+  // Facet column to group by; empty = no grouping.
+  string group_by = 4;
+
+  // The resolved group cap (a shard exceeding it alone refuses
+  // early; the merged count checks again at the coordinator).
+  uint32 max_groups = 5;
+
+  // Compiled histograms, request order.
+  repeated CompiledHistogram histograms = 6;
+}
+
+// One compiled histogram.
+message CompiledHistogram {
+  // The compiled expression.
+  ValueExpr expr = 1;
+
+  // Bucket width, validated at the coordinator.
+  double interval = 2;
+
+  // The resolved bucket cap.
+  uint32 max_buckets = 3;
+
+  // The request's name, so shard-side refusals name the histogram.
+  string name = 4;
 }
 
 // One compiled aggregation.
@@ -4047,10 +4157,55 @@ message AggregateShardResponse {
   repeated bool geo_columns_known = 3;
   repeated bool filter_columns_known = 4;
 
-  // Column-read leaves across ALL aggregation expressions, request
-  // order then depth-first within each — the projection typo rule: a
-  // leaf no shard knows refuses by name at the coordinator.
+  // Column-read leaves across ALL aggregation and histogram
+  // expressions, aggregations first then histograms, request order
+  // then depth-first within each — the projection typo rule: a leaf
+  // no shard knows refuses by name at the coordinator.
   repeated bool expr_leaves_known = 5;
+
+  // This shard's groups, one per distinct facet value among its
+  // admitted documents. Order is unspecified; the coordinator merges
+  // by value.
+  repeated AggregateShardGroup groups = 6;
+
+  // Admitted documents without the group_by value here. A shard
+  // whose tables lack the column counts every admitted document.
+  uint64 ungrouped = 7;
+
+  // Whether this shard resolves the group_by column (facet family);
+  // a column NO shard knows refuses by name at the coordinator.
+  bool group_column_known = 8;
+
+  // One sparse histogram per compiled histogram, request order.
+  repeated ShardHistogram histograms = 9;
+}
+
+// One shard's partials for one facet value.
+message AggregateShardGroup {
+  // The facet value, rendered from this shard's dictionary.
+  string value = 1;
+
+  // Admitted documents carrying this value here.
+  uint64 matched = 2;
+
+  // One partial per aggregation, request order.
+  repeated AggregatePartial partials = 3;
+}
+
+// One shard's sparse histogram: parallel index/count columns.
+message ShardHistogram {
+  // Occupied bucket indexes (floor(value / interval)).
+  repeated sint64 bucket_index = 1;
+
+  // Counts, parallel to bucket_index.
+  repeated uint64 bucket_count = 2;
+
+  // Values bucketed on this shard.
+  uint64 present = 3;
+
+  // Values no bucket holds honestly (NaN, infinity, index outside
+  // i64).
+  uint64 unbucketable = 4;
 }
 
 // One shard's exact partial for one aggregation. Only the fields for

@@ -1,10 +1,11 @@
 # Aggregations: exact folds over the filtered corpus
 
-Status: implemented (increment 1, 2026-08-27) — COUNT / SUM / MIN /
-MAX / MEAN / VARIANCE / STDDEV of one CEL value expression over the
-filter-admitted document set, per-shard partials merged exactly.
-Group-by-facet, histograms, and exact percentiles are the next
-increments (`docs/plans/roadmap-2026-08.md`).
+Status: increments 1 and 2 implemented (2026-08-27) — COUNT / SUM /
+MIN / MAX / MEAN / VARIANCE / STDDEV of CEL value expressions over
+the filter-admitted document set, per-shard partials merged exactly;
+plus group-by-facet (every aggregation folded per facet value) and
+fixed-interval histograms. Exact percentiles are the next increment
+(`docs/plans/roadmap-2026-08.md`).
 
 `SearchService.Aggregate` is the analytics half of the value layer:
 the same compiled expression language that filters
@@ -79,10 +80,51 @@ them all and the coordinator reads what the op needs. The walk is
 exhaustive by construction, so the exactness certificate is trivial,
 the same argument sorted browse makes.
 
-## 4. What this is not (yet)
+## 4. Group-by-facet
 
-No group-by, no histograms, no percentiles — next increments. No
-text-scoped aggregation: the scope is the FILTER's admitted set, not
-a BM25 result set (facet counts already serve the search routes).
-And deliberately no approximate anything: when an exact answer needs
-a different request shape, the refusal says which.
+`group_by` names one facet column: every aggregation folds once
+fleet-wide (`results`) and once per distinct facet value (`groups`),
+with the SAME exactness contract — per-shard, per-group partials
+merged in shard order, groups joined across shards by value and
+returned ascending by value (deterministic, like everything else
+here). Per group: `matched` (admitted documents carrying the value)
+and the full result list in request order.
+
+Absence stays honest: an admitted document WITHOUT the group_by value
+joins no group — absence is not a value — and is counted in
+`ungrouped`; the fleet-wide totals still cover it. A shard whose
+tables lack the column groups nothing and counts all its admitted
+documents ungrouped; a column NO shard resolves as a facet refuses by
+name.
+
+Cardinality is capped (`max_groups`, default 1000) and the cap
+REFUSES loudly — never a silent top-N truncation, because a top-N cut
+would need an ordering the request did not state. The refusal names
+the cap and the fixes: tighten the filter or raise it.
+
+## 5. Histograms
+
+`histograms` carries up to 8 `(name, expression, interval)` specs
+over double expressions (int converts with `double()`; the names
+share one namespace with the aggregations). Bucketing is ES-shaped
+and exact: bucket index = `floor(value / interval)`, the bucket's
+inclusive lower bound is `index * interval`, and only OCCUPIED
+buckets return, ascending — sparse, no gap filling. Shards fold
+sparse (index, count) maps; the coordinator sums counts by index.
+
+A present value no bucket can hold honestly — NaN, an infinity, or a
+bucket index outside i64 (an interval too fine for the magnitude) —
+is counted in `unbucketable`, reported, never silently dropped.
+Bucket cardinality is capped per histogram (`max_buckets`, default
+1024), refusing loudly with the honest fixes: a coarser interval or a
+tighter filter.
+
+## 6. What this is not (yet)
+
+No percentiles — next increment (exact, via coordinator-driven
+count-below rounds, not a sketch). No per-group histograms, no
+nested grouping. No text-scoped aggregation: the scope is the
+FILTER's admitted set, not a BM25 result set (facet counts already
+serve the search routes). And deliberately no approximate anything:
+when an exact answer needs a different request shape, the refusal
+says which.
