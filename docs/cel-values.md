@@ -39,11 +39,32 @@ A value expression is:
   the ternary's branches must agree on one type, and only the TAKEN
   branch's value and absence matter.
 
+- **The function vocabulary** (2026-08-27). `math.*` carries the
+  official CEL math extension's names and semantics, so stock CEL
+  tooling with that extension agrees with the engine: `math.abs`,
+  `math.sign` (type-preserving, NaN stays NaN), `math.greatest` /
+  `math.least` (n-ary, type-preserving, a double NaN propagates),
+  `math.ceil` / `math.floor` / `math.trunc`, `math.round` (half away
+  from zero, CEL's rule), `math.sqrt`, and the three predicates
+  `math.isNaN` / `math.isInf` / `math.isFinite`. `engine.*` is this
+  engine's own transcendental namespace — `engine.ln`, `engine.exp`,
+  `engine.log10`, `engine.pow(x, y)` — deliberately OUTSIDE `math.*`
+  so the official namespace stays exactly the official extension.
+  Typing is the house rule: `abs`/`sign`/`greatest`/`least` preserve
+  one agreed numeric type; everything else takes doubles only (ints
+  convert with `double()`). Results are IEEE values, never errors —
+  `math.sqrt(-1.0)` is NaN, `engine.ln(0.0)` is -inf — with one
+  integer edge: `math.abs(i64::MIN)` overflows, so it evaluates
+  ABSENT where stock CEL errors, the checked arithmetic's own
+  deviation. Absence is Kleene through every argument. The `math` and
+  `engine` names are reserved as call receivers; columns of those
+  names still read (a bare read has no parentheses).
+
 Everything else refuses **by name** at compile: `has()`, `in`, string
-functions, `matches()`, unknown functions, bare string literals (a
-string literal is legal only as a `==`/`!=` operand), lists. The
-refusal names the construct and, where one exists, the supported
-alternative.
+functions, `matches()`, unknown functions (`math.foo()` refuses naming
+`math.foo`), bare string literals (a string literal is legal only as a
+`==`/`!=` operand), lists. The refusal names the construct and, where
+one exists, the supported alternative.
 
 ## 2. Typing: stock CEL's, finished per shard
 
@@ -179,8 +200,8 @@ from a protobuf document's own mapped values with the same contract.
 ## 6. What this is not
 
 - Not a scripting engine: the vocabulary is arithmetic, the
-  conditional layer, and one conversion, extended deliberately or not
-  at all.
+  conditional layer, the math functions, and one conversion, extended
+  deliberately or not at all.
 - Not a scoring path: projections annotate hits; they cannot change
   rank. Scoring stays with function chains, whose bounds math is
   argued in `docs/score-functions.md`.

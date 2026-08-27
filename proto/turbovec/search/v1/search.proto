@@ -3830,7 +3830,71 @@ message ValueExpr {
     // facet or map-facet read; a string literal is not a computable
     // value anywhere else.
     string string_literal = 13;
+
+    // A math function call. The `math.*` names carry the official CEL
+    // math extension's semantics; the `engine.*` names are this
+    // engine's own transcendentals, documented in docs/cel-values.md.
+    ValueFunc func = 14;
   }
+}
+
+// The function vocabulary. Typing per function: ABS, SIGN, GREATEST,
+// and LEAST are type-preserving over one numeric type (int with int,
+// double with double, mixed refused naming double()); the rest take
+// doubles only (an int converts explicitly with double()) and return
+// a double, except the three predicates, which return bool. All
+// results are IEEE values, never errors: sqrt(-1.0) is NaN,
+// engine.ln(0.0) is -inf. The one integer edge: math.abs(i64 MIN)
+// overflows, so it evaluates ABSENT where stock CEL errors, the same
+// deviation the checked arithmetic takes.
+enum ValueFn {
+  // Zero value. Never present in a compiled expression.
+  VALUE_FN_UNSPECIFIED = 0;
+  // math.abs(x): absolute value, type-preserving.
+  VALUE_FN_ABS = 1;
+  // math.sign(x): -1, 0, or 1 in the argument's type; NaN stays NaN.
+  VALUE_FN_SIGN = 2;
+  // math.ceil(x): double, rounds up.
+  VALUE_FN_CEIL = 3;
+  // math.floor(x): double, rounds down.
+  VALUE_FN_FLOOR = 4;
+  // math.round(x): double, rounds half away from zero (CEL's rule).
+  VALUE_FN_ROUND = 5;
+  // math.trunc(x): double, rounds toward zero.
+  VALUE_FN_TRUNC = 6;
+  // math.sqrt(x): double square root; negative input is NaN.
+  VALUE_FN_SQRT = 7;
+  // math.isNaN(x): bool.
+  VALUE_FN_IS_NAN = 8;
+  // math.isInf(x): bool, true for either infinity.
+  VALUE_FN_IS_INF = 9;
+  // math.isFinite(x): bool.
+  VALUE_FN_IS_FINITE = 10;
+  // math.greatest(x, ...): n-ary maximum, type-preserving; a double
+  // NaN operand propagates.
+  VALUE_FN_GREATEST = 11;
+  // math.least(x, ...): n-ary minimum, type-preserving; a double NaN
+  // operand propagates.
+  VALUE_FN_LEAST = 12;
+  // engine.ln(x): natural log; ln(0.0) is -inf, negatives are NaN.
+  VALUE_FN_LN = 13;
+  // engine.exp(x): e to the x.
+  VALUE_FN_EXP = 14;
+  // engine.log10(x): base-10 log.
+  VALUE_FN_LOG10 = 15;
+  // engine.pow(x, y): x to the y, IEEE powf.
+  VALUE_FN_POW = 16;
+}
+
+// One function call node.
+message ValueFunc {
+  // The function.
+  ValueFn function = 1;
+
+  // Arguments in source order. Arity is the function's: one for the
+  // unary functions, two for engine.pow, one or more for
+  // math.greatest and math.least.
+  repeated ValueExpr args = 2;
 }
 
 // Comparison operations over value subexpressions.

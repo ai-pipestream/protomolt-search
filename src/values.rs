@@ -196,6 +196,13 @@ pub enum ResolvedValue {
     },
     /// Logical not.
     Not(Box<ResolvedValue>),
+    /// A math function call over present arguments.
+    Func {
+        /// The function.
+        f: pb::ValueFn,
+        /// Resolved arguments in source order.
+        args: Vec<ResolvedValue>,
+    },
     /// The conditional; only the taken branch evaluates.
     Ternary {
         /// Bool condition.
@@ -485,6 +492,68 @@ pub fn resolve(
                 }
             }
         }
+        V::Func(func) => {
+            let f = match pb::ValueFn::try_from(func.function) {
+                Ok(pb::ValueFn::Unspecified) | Err(_) => {
+                    return Err(refuse("function node with an unknown function"));
+                }
+                Ok(f) => f,
+            };
+            let display = fn_display(f);
+            check_fn_arity(f, func.args.len())?;
+            let type_preserving = matches!(
+                f,
+                pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least
+            );
+            let mut args = Vec::with_capacity(func.args.len());
+            let mut known: Option<ValueType> = None;
+            let mut any_absent = false;
+            for a in &func.args {
+                let (rv, vt) = resolve(a, cols)?;
+                match vt {
+                    ValueType::Bool | ValueType::Str => {
+                        return Err(refuse(format!(
+                            "{display} over a {}; it takes numbers",
+                            vt.name()
+                        )));
+                    }
+                    ValueType::Unknown => any_absent = true,
+                    t => {
+                        if let Some(k) = known {
+                            if k != t {
+                                return Err(refuse(format!(
+                                    "{display} mixes int and double operands; stock CEL \
+                                     does not coerce — convert explicitly with double()"
+                                )));
+                            }
+                        }
+                        known = Some(t);
+                    }
+                }
+                args.push(rv);
+            }
+            if !type_preserving && known == Some(ValueType::Int) {
+                return Err(refuse(format!(
+                    "{display} takes a double; convert explicitly with double()"
+                )));
+            }
+            if any_absent {
+                // Kleene: an argument that can never hold a value makes
+                // the call absent for every document here.
+                return Ok((ResolvedValue::Absent, ValueType::Unknown));
+            }
+            let vt = if type_preserving {
+                known.unwrap_or(ValueType::Unknown)
+            } else {
+                match f {
+                    pb::ValueFn::IsNan | pb::ValueFn::IsInf | pb::ValueFn::IsFinite => {
+                        ValueType::Bool
+                    }
+                    _ => ValueType::Double,
+                }
+            };
+            Ok((ResolvedValue::Func { f, args }, vt))
+        }
         V::Logic(logic) => {
             let and = match pb::ValueLogicOp::try_from(logic.op) {
                 Ok(pb::ValueLogicOp::And) => true,
@@ -724,6 +793,14 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
             Val::Bool(b) => Some(Val::Bool(!b)),
             _ => unreachable!("resolution type-checked the operand"),
         },
+        ResolvedValue::Func { f, args } => {
+            // Kleene: every argument must be present.
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval(a, doc_id, cols)?);
+            }
+            eval_fn(*f, &vals)
+        }
         ResolvedValue::Ternary {
             cond,
             then,
@@ -760,6 +837,125 @@ fn double_arith(op: Op, a: f64, b: f64) -> f64 {
         Op::Mul => a * b,
         Op::Div => a / b,
         Op::Mod => unreachable!("resolution refused a double remainder"),
+    }
+}
+
+/// Source-form name of one function, for refusals.
+fn fn_display(f: pb::ValueFn) -> &'static str {
+    match f {
+        pb::ValueFn::Abs => "math.abs()",
+        pb::ValueFn::Sign => "math.sign()",
+        pb::ValueFn::Ceil => "math.ceil()",
+        pb::ValueFn::Floor => "math.floor()",
+        pb::ValueFn::Round => "math.round()",
+        pb::ValueFn::Trunc => "math.trunc()",
+        pb::ValueFn::Sqrt => "math.sqrt()",
+        pb::ValueFn::IsNan => "math.isNaN()",
+        pb::ValueFn::IsInf => "math.isInf()",
+        pb::ValueFn::IsFinite => "math.isFinite()",
+        pb::ValueFn::Greatest => "math.greatest()",
+        pb::ValueFn::Least => "math.least()",
+        pb::ValueFn::Ln => "engine.ln()",
+        pb::ValueFn::Exp => "engine.exp()",
+        pb::ValueFn::Log10 => "engine.log10()",
+        pb::ValueFn::Pow => "engine.pow()",
+        pb::ValueFn::Unspecified => "unspecified()",
+    }
+}
+
+/// Arity check, shared by both evaluation paths.
+fn check_fn_arity(f: pb::ValueFn, n: usize) -> Result<(), Status> {
+    let ok = match f {
+        pb::ValueFn::Greatest | pb::ValueFn::Least => n >= 1,
+        pb::ValueFn::Pow => n == 2,
+        _ => n == 1,
+    };
+    if ok {
+        Ok(())
+    } else {
+        let want = match f {
+            pb::ValueFn::Greatest | pb::ValueFn::Least => "at least one argument",
+            pb::ValueFn::Pow => "exactly two arguments",
+            _ => "exactly one argument",
+        };
+        Err(refuse(format!("{} takes {want}", fn_display(f))))
+    }
+}
+
+/// Apply one function to its PRESENT, type-agreeing arguments. The
+/// semantics are the official CEL math extension's where the name is
+/// `math.*`: round is half away from zero, sign preserves NaN and the
+/// argument's type, abs of i64::MIN evaluates absent where stock CEL
+/// errors (the engine's documented deviation), and the transcendental
+/// results are IEEE values, never errors.
+fn eval_fn(f: pb::ValueFn, vals: &[Val]) -> Option<Val> {
+    use pb::ValueFn as F;
+    let d = |v: &Val| match v {
+        Val::Double(x) => *x,
+        _ => unreachable!("resolution typed the argument double"),
+    };
+    match f {
+        F::Abs => match vals[0] {
+            Val::Int(v) => v.checked_abs().map(Val::Int),
+            Val::Double(v) => Some(Val::Double(v.abs())),
+            _ => unreachable!("resolution typed the argument numeric"),
+        },
+        F::Sign => match vals[0] {
+            Val::Int(v) => Some(Val::Int(v.signum())),
+            Val::Double(v) => Some(Val::Double(if v.is_nan() {
+                v
+            } else if v > 0.0 {
+                1.0
+            } else if v < 0.0 {
+                -1.0
+            } else {
+                0.0
+            })),
+            _ => unreachable!("resolution typed the argument numeric"),
+        },
+        F::Ceil => Some(Val::Double(d(&vals[0]).ceil())),
+        F::Floor => Some(Val::Double(d(&vals[0]).floor())),
+        F::Round => Some(Val::Double(d(&vals[0]).round())),
+        F::Trunc => Some(Val::Double(d(&vals[0]).trunc())),
+        F::Sqrt => Some(Val::Double(d(&vals[0]).sqrt())),
+        F::Ln => Some(Val::Double(d(&vals[0]).ln())),
+        F::Exp => Some(Val::Double(d(&vals[0]).exp())),
+        F::Log10 => Some(Val::Double(d(&vals[0]).log10())),
+        F::IsNan => Some(Val::Bool(d(&vals[0]).is_nan())),
+        F::IsInf => Some(Val::Bool(d(&vals[0]).is_infinite())),
+        F::IsFinite => Some(Val::Bool(d(&vals[0]).is_finite())),
+        F::Pow => Some(Val::Double(d(&vals[0]).powf(d(&vals[1])))),
+        F::Greatest | F::Least => {
+            let greatest = f == F::Greatest;
+            match vals[0] {
+                Val::Int(first) => {
+                    let mut acc = first;
+                    for v in &vals[1..] {
+                        let Val::Int(x) = v else {
+                            unreachable!("resolution typed the arguments alike")
+                        };
+                        if (greatest && *x > acc) || (!greatest && *x < acc) {
+                            acc = *x;
+                        }
+                    }
+                    Some(Val::Int(acc))
+                }
+                Val::Double(first) => {
+                    let mut acc = first;
+                    for v in &vals[1..] {
+                        let x = d(v);
+                        if x.is_nan() || acc.is_nan() {
+                            acc = f64::NAN;
+                        } else if (greatest && x > acc) || (!greatest && x < acc) {
+                            acc = x;
+                        }
+                    }
+                    Some(Val::Double(acc))
+                }
+                _ => unreachable!("resolution typed the arguments numeric"),
+            }
+        }
+        F::Unspecified => unreachable!("resolution decoded the function"),
     }
 }
 
@@ -823,6 +1019,11 @@ pub fn column_leaves(expr: &pb::ValueExpr, out: &mut Vec<ValueLeaf>) {
         Some(V::Logic(logic)) => {
             for child in &logic.children {
                 column_leaves(child, out);
+            }
+        }
+        Some(V::Func(func)) => {
+            for a in &func.args {
+                column_leaves(a, out);
             }
         }
         Some(V::Ternary(t)) => {
@@ -1041,6 +1242,69 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                      explicitly with double()",
                 )),
             }
+        }
+        V::Func(func) => {
+            let f = match pb::ValueFn::try_from(func.function) {
+                Ok(pb::ValueFn::Unspecified) | Err(_) => {
+                    return Err(refuse("function node with an unknown function"));
+                }
+                Ok(f) => f,
+            };
+            let display = fn_display(f);
+            check_fn_arity(f, func.args.len())?;
+            let type_preserving = matches!(
+                f,
+                pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least
+            );
+            let mut vals: Vec<Option<Val>> = Vec::with_capacity(func.args.len());
+            let mut known: Option<ValueType> = None;
+            for a in &func.args {
+                let v = match eval_ingest(a, env)? {
+                    None => None,
+                    Some(IngestVal::Bool(_)) => {
+                        return Err(refuse(format!("{display} over a bool; it takes numbers")));
+                    }
+                    Some(IngestVal::Int(v)) => {
+                        if known == Some(ValueType::Double) {
+                            return Err(refuse(format!(
+                                "{display} mixes int and double operands on this \
+                                 document; stock CEL does not coerce — convert \
+                                 explicitly with double()"
+                            )));
+                        }
+                        known = Some(ValueType::Int);
+                        Some(Val::Int(v))
+                    }
+                    Some(IngestVal::Double(v)) => {
+                        if known == Some(ValueType::Int) {
+                            return Err(refuse(format!(
+                                "{display} mixes int and double operands on this \
+                                 document; stock CEL does not coerce — convert \
+                                 explicitly with double()"
+                            )));
+                        }
+                        known = Some(ValueType::Double);
+                        Some(Val::Double(v))
+                    }
+                };
+                vals.push(v);
+            }
+            if !type_preserving && known == Some(ValueType::Int) {
+                return Err(refuse(format!(
+                    "{display} takes a double; convert explicitly with double()"
+                )));
+            }
+            let Some(vals) = vals.into_iter().collect::<Option<Vec<Val>>>() else {
+                return Ok(None);
+            };
+            Ok(eval_fn(f, &vals).map(|v| match v {
+                Val::Int(i) => IngestVal::Int(i),
+                Val::Double(d) => IngestVal::Double(d),
+                Val::Bool(b) => IngestVal::Bool(b),
+                Val::FacetOrd { .. } | Val::MapFacetOrd { .. } => {
+                    unreachable!("functions compute numbers and bools")
+                }
+            }))
         }
         V::Logic(logic) => {
             let and = match pb::ValueLogicOp::try_from(logic.op) {
