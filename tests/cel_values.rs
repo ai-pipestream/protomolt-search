@@ -355,6 +355,119 @@ async fn kleene_absence_and_dictionary_misses_are_pinned() {
     }
 }
 
+/// The math vocabulary, pinned by the engine (the oracle crate does
+/// not carry the CEL math extension): `math.*` follows the official
+/// extension's semantics, `engine.*` is this engine's own, and every
+/// result is an IEEE value computed here in the test from the same
+/// inputs. Absence propagates through every argument, and
+/// math.abs(i64::MIN) is absent where stock CEL errors, the checked
+/// arithmetic's own deviation.
+#[tokio::test]
+async fn math_functions_match_their_pinned_semantics() {
+    let spec = MaterializeSpec {
+        columns: vec![MaterializedColumn {
+            name: "lnp".into(),
+            expression: "engine.ln(price)".into(),
+            kind: MaterializeKind::F64 as i32,
+        }],
+    };
+    let (coordinator, handles) = start_cluster(Some(spec), &["lnp"], &[]).await;
+    let rows = run_projections(
+        &coordinator,
+        vec![
+            projection("abs", "math.abs(0.5 - price)"),
+            projection("sign", "math.sign(year - 1993)"),
+            projection("greatest", "math.greatest(price, 2.0, double(year) / 1000.0)"),
+            projection("least", "math.least(year, 1993)"),
+            projection("round", "math.round(price)"),
+            projection("sqrt", "math.sqrt(price)"),
+            projection("nan", "math.isNaN((price - price) / 0.0)"),
+            projection("inf", "math.isInf(1.0 / (price - price))"),
+            projection("pow", "engine.pow(price, 2.0)"),
+            projection("log10", "engine.log10(price * price) / 2.0"),
+            projection("minabs", "math.abs(-9223372036854775808)"),
+            projection("lnp", "lnp"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), N_DOCS);
+    for (doc_id, values) in rows {
+        let id = doc_id as usize;
+        let d = projected_value::Value::DoubleValue;
+        let b = projected_value::Value::BoolValue;
+        match (price_of(id), year_of(id)) {
+            (Some(p), year) => {
+                assert_eq!(values[0], Some(d((0.5 - p).abs())), "doc {id}: abs");
+                assert_eq!(values[4], Some(d(p.round())), "doc {id}: round");
+                assert_eq!(values[5], Some(d(p.sqrt())), "doc {id}: sqrt");
+                assert_eq!(values[6], Some(b(true)), "doc {id}: 0/0 is NaN");
+                assert_eq!(values[7], Some(b(true)), "doc {id}: 1/0 is inf");
+                assert_eq!(values[8], Some(d(p.powf(2.0))), "doc {id}: pow");
+                assert_eq!(values[9], Some(d((p * p).log10() / 2.0)), "doc {id}: log10");
+                assert_eq!(values[11], Some(d(p.ln())), "doc {id}: materialized ln");
+                match year {
+                    Some(y) => assert_eq!(
+                        values[2],
+                        Some(d(p.max(2.0).max(y as f64 / 1000.0))),
+                        "doc {id}: greatest"
+                    ),
+                    None => assert!(values[2].is_none(), "doc {id}: absent leg, absent call"),
+                }
+            }
+            (None, _) => {
+                for (i, v) in values.iter().enumerate() {
+                    if i == 1 || i == 3 || i == 10 {
+                        continue;
+                    }
+                    assert!(v.is_none(), "doc {id}: projection {i} reads price, absent");
+                }
+            }
+        }
+        match year_of(id) {
+            Some(y) => {
+                assert_eq!(
+                    values[1],
+                    Some(projected_value::Value::IntValue((y - 1993).signum())),
+                    "doc {id}: sign preserves int"
+                );
+                assert_eq!(
+                    values[3],
+                    Some(projected_value::Value::IntValue(y.min(1993))),
+                    "doc {id}: least preserves int"
+                );
+            }
+            None => {
+                assert!(values[1].is_none(), "doc {id}: no year, no sign");
+                assert!(values[3].is_none(), "doc {id}: no year, no least");
+            }
+        }
+        assert!(
+            values[10].is_none(),
+            "doc {id}: math.abs(i64::MIN) is absent, not an error"
+        );
+    }
+
+    // Resolution-time refusals name the function.
+    for (expr, needle) in [
+        ("math.ceil(year)", "takes a double"),
+        ("math.greatest(price, year)", "mixes int and double"),
+        ("math.abs(court)", "takes numbers"),
+    ] {
+        let status = run_projections(&coordinator, vec![projection("p", expr)])
+            .await
+            .expect_err(&format!("{expr:?} must refuse"));
+        assert!(
+            status.message().contains(needle),
+            "{expr:?}: wanted {needle:?} in {:?}",
+            status.message()
+        );
+    }
+    for h in handles {
+        h.abort();
+    }
+}
+
 /// Refusals, by name: a typo'd column no shard knows, mixed-type
 /// arithmetic, predicate constructs, unknown functions, `%` on
 /// doubles, duplicate and empty names.

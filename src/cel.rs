@@ -1627,7 +1627,32 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
                 vt,
             ))
         }
-        Ast::Call(name, args) => match name.as_str() {
+        Ast::Call(name, args) => {
+            // Namespaced math calls parse as method syntax: the
+            // receiver is the namespace identifier (`math.abs(x)` is
+            // Call("abs", [Ident("math"), x])). The namespaces are
+            // reserved: a column named "math" or "engine" still READS
+            // (no parentheses), it just cannot be a call receiver.
+            if let Some(Ast::Ident(ns)) = args.first() {
+                if ns == "math" || ns == "engine" {
+                    return compile_math_call(ns, name, &args[1..], depth);
+                }
+            }
+            compile_plain_call(name, args, depth)
+        }
+        other => compile_value_tail(other, depth),
+    }
+}
+
+/// The non-namespaced calls: `double()` compiles, the rest refuse by
+/// name.
+fn compile_plain_call(
+    name: &str,
+    args: &[Ast],
+    depth: usize,
+) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+    use pb::value_expr::Expr as V;
+    match name {
             "double" => {
                 if args.len() != 1 {
                     return Err(refuse("double() takes exactly one argument"));
@@ -1659,9 +1684,118 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
             ))),
             other => Err(refuse(format!(
                 "unknown function {other}() in a value expression; the vocabulary is \
-                 arithmetic and double()"
+                 arithmetic, the conditional layer, double(), math.*, and engine.*"
             ))),
-        },
+    }
+}
+
+/// One `math.*` / `engine.*` call: arity, then typing as far as
+/// literals pin it down (finished per shard like everything else).
+fn compile_math_call(
+    ns: &str,
+    name: &str,
+    args: &[Ast],
+    depth: usize,
+) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+    use pb::value_expr::Expr as V;
+    let Some(f) = math_fn_of(ns, name) else {
+        return Err(refuse(format!(
+            "unknown function {ns}.{name}(); the function vocabulary is documented \
+             in docs/cel-values.md"
+        )));
+    };
+    let display = format!("{ns}.{name}()");
+    let arity_ok = match f {
+        pb::ValueFn::Greatest | pb::ValueFn::Least => !args.is_empty(),
+        pb::ValueFn::Pow => args.len() == 2,
+        _ => args.len() == 1,
+    };
+    if !arity_ok {
+        let want = match f {
+            pb::ValueFn::Greatest | pb::ValueFn::Least => "at least one argument",
+            pb::ValueFn::Pow => "exactly two arguments",
+            _ => "exactly one argument",
+        };
+        return Err(refuse(format!("{display} takes {want}")));
+    }
+    let type_preserving = matches!(
+        f,
+        pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least
+    );
+    let mut compiled = Vec::with_capacity(args.len());
+    let mut known: Option<VType> = None;
+    for a in args {
+        let (e, vt) = compile_value_ast(a, depth + 1)?;
+        match vt {
+            Some(VType::Bool) | Some(VType::Str) => {
+                return Err(refuse(format!(
+                    "{display} over a {}; it takes numbers",
+                    vt.unwrap().name()
+                )));
+            }
+            Some(t) => match known {
+                Some(k) if k != t => {
+                    return Err(refuse(format!(
+                        "{display} mixes int and double operands; stock CEL does not \
+                         coerce — convert explicitly with double()"
+                    )));
+                }
+                _ => known = Some(t),
+            },
+            None => {}
+        }
+        compiled.push(e);
+    }
+    let vt = if type_preserving {
+        known
+    } else {
+        if known == Some(VType::Int) {
+            return Err(refuse(format!(
+                "{display} takes a double; convert explicitly with double()"
+            )));
+        }
+        match f {
+            pb::ValueFn::IsNan | pb::ValueFn::IsInf | pb::ValueFn::IsFinite => Some(VType::Bool),
+            _ => Some(VType::Double),
+        }
+    };
+    Ok((
+        value_of(V::Func(pb::ValueFunc {
+            function: f as i32,
+            args: compiled,
+        })),
+        vt,
+    ))
+}
+
+/// The (namespace, name) to wire-function table.
+fn math_fn_of(ns: &str, name: &str) -> Option<pb::ValueFn> {
+    match (ns, name) {
+        ("math", "abs") => Some(pb::ValueFn::Abs),
+        ("math", "sign") => Some(pb::ValueFn::Sign),
+        ("math", "ceil") => Some(pb::ValueFn::Ceil),
+        ("math", "floor") => Some(pb::ValueFn::Floor),
+        ("math", "round") => Some(pb::ValueFn::Round),
+        ("math", "trunc") => Some(pb::ValueFn::Trunc),
+        ("math", "sqrt") => Some(pb::ValueFn::Sqrt),
+        ("math", "isNaN") => Some(pb::ValueFn::IsNan),
+        ("math", "isInf") => Some(pb::ValueFn::IsInf),
+        ("math", "isFinite") => Some(pb::ValueFn::IsFinite),
+        ("math", "greatest") => Some(pb::ValueFn::Greatest),
+        ("math", "least") => Some(pb::ValueFn::Least),
+        ("engine", "ln") => Some(pb::ValueFn::Ln),
+        ("engine", "exp") => Some(pb::ValueFn::Exp),
+        ("engine", "log10") => Some(pb::ValueFn::Log10),
+        ("engine", "pow") => Some(pb::ValueFn::Pow),
+        _ => None,
+    }
+}
+
+/// The leaf and structural AST arms of the value compiler, split out
+/// of [`compile_value_ast`]'s match for the call dispatch above.
+fn compile_value_tail(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+    use pb::value_expr::Expr as V;
+    match ast {
         Ast::Str(v) => Ok((value_of(V::StringLiteral(v.clone())), Some(VType::Str))),
         Ast::List(_) => Err(refuse("a list is not a value")),
         Ast::Or(children) | Ast::And(children) => {
@@ -1811,6 +1945,15 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
                 vt,
             ))
         }
+        Ast::Ident(_)
+        | Ast::MapAccess(..)
+        | Ast::Int(_)
+        | Ast::Float(_)
+        | Ast::Neg(_)
+        | Ast::Arith(..)
+        | Ast::Call(..) => {
+            unreachable!("compile_value_ast handles these before delegating")
+        }
     }
 }
 
@@ -1893,6 +2036,38 @@ mod value_tests {
         ] {
             compile_value(text).unwrap_or_else(|e| panic!("{text:?}: {}", e.message()));
         }
+    }
+
+    /// The math vocabulary compiles at both namespaces, and its typing
+    /// and arity refuse by name.
+    #[test]
+    fn math_functions_compile_and_type_check() {
+        for text in [
+            "math.abs(a)",
+            "math.sign(a - b)",
+            "math.greatest(a, b, 2)",
+            "math.least(1.5, a)",
+            "math.ceil(a)",
+            "math.sqrt(2.0)",
+            "math.isNaN(a / b)",
+            "engine.ln(a)",
+            "engine.exp(1.0)",
+            "engine.pow(a, 2.0)",
+            "engine.log10(a) / 2.0",
+            "math.greatest(a, b) > 1.0 ? math.abs(a) : 0.0",
+        ] {
+            compile_value(text).unwrap_or_else(|e| panic!("{text:?}: {}", e.message()));
+        }
+        assert!(refusal("math.foo(a)").contains("math.foo()"));
+        assert!(refusal("engine.foo(a)").contains("engine.foo()"));
+        assert!(refusal("math.abs(a, b)").contains("exactly one argument"));
+        assert!(refusal("engine.pow(a)").contains("exactly two arguments"));
+        assert!(refusal("math.greatest()").contains("at least one argument"));
+        assert!(refusal("math.ceil(1)").contains("double()"));
+        assert!(refusal("math.abs(true)").contains("takes numbers"));
+        assert!(refusal("math.greatest(1, 2.0)").contains("double()"));
+        assert!(refusal("math.abs(\"x\")").contains("takes numbers"));
+        assert!(refusal("math.isNaN(a) + 1").contains("no arithmetic"));
     }
 
     /// The ternary is right-associative and its condition binds the
