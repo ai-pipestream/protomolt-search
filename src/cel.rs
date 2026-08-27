@@ -438,6 +438,8 @@ enum Ast {
     Arith(Box<Ast>, VOp, Box<Ast>),
     /// Value mode only: unary minus on a non-literal.
     Neg(Box<Ast>),
+    /// Value mode only: the conditional `cond ? then : else`.
+    Ternary(Box<Ast>, Box<Ast>, Box<Ast>),
 }
 
 /// Arithmetic operators, value mode only.
@@ -770,31 +772,75 @@ impl Parser {
 
     // -- value mode -------------------------------------------------
 
-    /// Top level of a VALUE expression: additive arithmetic, then
-    /// refusals by name for the predicate constructs a value cannot be.
+    /// Top level of a VALUE expression, CEL's conditional grammar:
+    /// `?:` (right-associative, lowest) over `||` over `&&` over
+    /// relations over arithmetic. `in` is the one relation that stays
+    /// refused: a list is not a value.
     fn value_expr(&mut self) -> Result<Ast, Status> {
-        let e = self.additive()?;
-        let offender = match self.peek() {
-            Some(Tok::EqEq) => Some("=="),
-            Some(Tok::NotEq) => Some("!="),
-            Some(Tok::Lt) => Some("<"),
-            Some(Tok::Le) => Some("<="),
-            Some(Tok::Gt) => Some(">"),
-            Some(Tok::Ge) => Some(">="),
-            Some(Tok::In) => Some("in"),
-            Some(Tok::AndAnd) => Some("&&"),
-            Some(Tok::OrOr) => Some("||"),
-            Some(Tok::Question) => Some("?"),
-            _ => None,
-        };
-        if let Some(sym) = offender {
-            return Err(refuse(format!(
-                "`{sym}` is a predicate construct; a value expression computes a \
-                 number (or reads a string column), it does not select — selection \
-                 belongs in the filter"
-            )));
+        let cond = self.value_or()?;
+        if !self.eat(&Tok::Question) {
+            return Ok(cond);
         }
-        Ok(e)
+        // CEL: Expr = ConditionalOr ["?" ConditionalOr ":" Expr].
+        let then = self.value_or()?;
+        self.expect(Tok::Colon, "`:` after the ternary's then-branch")?;
+        let otherwise = self.value_expr()?;
+        Ok(Ast::Ternary(
+            Box::new(cond),
+            Box::new(then),
+            Box::new(otherwise),
+        ))
+    }
+
+    fn value_or(&mut self) -> Result<Ast, Status> {
+        let first = self.value_and()?;
+        if self.peek() != Some(&Tok::OrOr) {
+            return Ok(first);
+        }
+        let mut children = vec![first];
+        while self.eat(&Tok::OrOr) {
+            children.push(self.value_and()?);
+        }
+        Ok(Ast::Or(children))
+    }
+
+    fn value_and(&mut self) -> Result<Ast, Status> {
+        let first = self.value_rel()?;
+        if self.peek() != Some(&Tok::AndAnd) {
+            return Ok(first);
+        }
+        let mut children = vec![first];
+        while self.eat(&Tok::AndAnd) {
+            children.push(self.value_rel()?);
+        }
+        Ok(Ast::And(children))
+    }
+
+    /// One relation over additive arithmetic. Left-associative like
+    /// CEL's grammar; a chained relation compiles here and the type
+    /// check refuses the nonsense (`a < b < c` compares a bool with a
+    /// number).
+    fn value_rel(&mut self) -> Result<Ast, Status> {
+        let mut e = self.additive()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::EqEq) => RelOp::Eq,
+                Some(Tok::NotEq) => RelOp::Ne,
+                Some(Tok::Lt) => RelOp::Lt,
+                Some(Tok::Le) => RelOp::Le,
+                Some(Tok::Gt) => RelOp::Gt,
+                Some(Tok::Ge) => RelOp::Ge,
+                Some(Tok::In) => {
+                    return Err(refuse(
+                        "`in` needs a list, and a list is not a value; write the \
+                         alternatives as `==` comparisons joined with `||`",
+                    ));
+                }
+                _ => return Ok(e),
+            };
+            self.pos += 1;
+            e = Ast::Rel(Box::new(e), op, Box::new(self.additive()?));
+        }
     }
 
     fn additive(&mut self) -> Result<Ast, Status> {
@@ -825,10 +871,8 @@ impl Parser {
     }
 
     fn value_unary(&mut self) -> Result<Ast, Status> {
-        if self.peek() == Some(&Tok::Bang) {
-            return Err(refuse(
-                "`!` is a predicate construct; a value expression computes a value",
-            ));
+        if self.eat(&Tok::Bang) {
+            return Ok(Ast::Not(Box::new(self.value_unary()?)));
         }
         if self.eat(&Tok::Minus) {
             // Literals fold; anything else keeps an explicit negate
@@ -909,6 +953,9 @@ fn compile(ast: &Ast) -> Result<pb::FilterExpr, Status> {
         Ast::Arith(..) | Ast::Neg(_) => {
             unreachable!("the predicate parser refuses arithmetic before building it")
         }
+        Ast::Ternary(..) => {
+            unreachable!("the predicate parser refuses the ternary before building it")
+        }
     }
 }
 
@@ -947,6 +994,9 @@ fn side_of(ast: &Ast) -> Result<Side, Status> {
         )),
         Ast::Arith(..) | Ast::Neg(_) => {
             unreachable!("the predicate parser refuses arithmetic before building it")
+        }
+        Ast::Ternary(..) => {
+            unreachable!("the predicate parser refuses the ternary before building it")
         }
     }
 }
@@ -1419,11 +1469,27 @@ fn parse_rfc3339_micros(s: &str) -> Result<i64, Status> {
 enum VType {
     Int,
     Double,
+    /// A comparison, Kleene logic, `!`, or a bool literal.
+    Bool,
+    /// A string literal: legal only as a `==`/`!=` operand.
+    Str,
+}
+
+impl VType {
+    fn name(self) -> &'static str {
+        match self {
+            VType::Int => "int",
+            VType::Double => "double",
+            VType::Bool => "bool",
+            VType::Str => "string",
+        }
+    }
 }
 
 /// Compile a CEL VALUE expression (projections, materialized columns):
-/// column reads, int and double literals, `+ - * / %`, unary minus,
-/// and `double()`. Everything else refuses by name, exactly like the
+/// column reads, int, double, and bool literals, `+ - * / %`, unary
+/// minus, `double()`, comparisons, Kleene `&& || !`, and the ternary.
+/// Everything else refuses by name, exactly like the
 /// filter front-end. Typing is stock CEL's — int with int, double with
 /// double — checked here as far as literals pin it down and finished
 /// per shard where column kinds are known.
@@ -1440,7 +1506,13 @@ pub fn compile_value(text: &str) -> Result<pb::ValueExpr, Status> {
     };
     let ast = p.value_expr()?;
     p.expect_end()?;
-    let (expr, _) = compile_value_ast(&ast, 0)?;
+    let (expr, vt) = compile_value_ast(&ast, 0)?;
+    if vt == Some(VType::Str) {
+        return Err(refuse(
+            "a string literal is not a computable value; string projections are \
+             bare facet or map-facet column reads",
+        ));
+    }
     Ok(expr)
 }
 
@@ -1461,9 +1533,8 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
     }
     match ast {
         Ast::Ident(name) => match name.as_str() {
-            "true" | "false" => Err(refuse(
-                "boolean literals are not values here; the engine has no boolean columns",
-            )),
+            "true" => Ok((value_of(V::BoolLiteral(true)), Some(VType::Bool))),
+            "false" => Ok((value_of(V::BoolLiteral(false)), Some(VType::Bool))),
             "null" => Err(refuse(
                 "null is not a value; an absent input already propagates to an absent result",
             )),
@@ -1490,11 +1561,40 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
         }
         Ast::Neg(inner) => {
             let (expr, vt) = compile_value_ast(inner, depth + 1)?;
+            match vt {
+                Some(VType::Bool) => {
+                    return Err(refuse(
+                        "unary minus over a boolean; booleans negate with `!`",
+                    ));
+                }
+                Some(VType::Str) => {
+                    return Err(refuse("unary minus over a string literal"));
+                }
+                _ => {}
+            }
             Ok((value_of(V::Negate(Box::new(expr))), vt))
         }
         Ast::Arith(l, op, r) => {
             let (le, lt) = compile_value_ast(l, depth + 1)?;
             let (re, rt) = compile_value_ast(r, depth + 1)?;
+            for t in [lt, rt].into_iter().flatten() {
+                match t {
+                    VType::Bool => {
+                        return Err(refuse(format!(
+                            "`{}` over a boolean; a boolean joins no arithmetic — wrap \
+                             it in a ternary that yields a number",
+                            op.name()
+                        )));
+                    }
+                    VType::Str => {
+                        return Err(refuse(
+                            "a string joins no arithmetic; string literals appear only \
+                             as `==`/`!=` comparison operands",
+                        ));
+                    }
+                    VType::Int | VType::Double => {}
+                }
+            }
             let vt = match (lt, rt) {
                 (Some(a), Some(b)) if a != b => {
                     return Err(refuse(format!(
@@ -1532,7 +1632,13 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
                 if args.len() != 1 {
                     return Err(refuse("double() takes exactly one argument"));
                 }
-                let (inner, _) = compile_value_ast(&args[0], depth + 1)?;
+                let (inner, vt) = compile_value_ast(&args[0], depth + 1)?;
+                if matches!(vt, Some(VType::Bool) | Some(VType::Str)) {
+                    return Err(refuse(format!(
+                        "double() over a {}; only numbers convert",
+                        vt.unwrap().name()
+                    )));
+                }
                 Ok((value_of(V::ToDouble(Box::new(inner))), Some(VType::Double)))
             }
             "int" | "uint" => Err(refuse(format!(
@@ -1556,14 +1662,155 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
                  arithmetic and double()"
             ))),
         },
-        Ast::Str(_) => Err(refuse(
-            "a string literal is not a computable value; string projections are \
-             bare facet or map-facet column reads",
-        )),
+        Ast::Str(v) => Ok((value_of(V::StringLiteral(v.clone())), Some(VType::Str))),
         Ast::List(_) => Err(refuse("a list is not a value")),
-        Ast::Or(_) | Ast::And(_) | Ast::Not(_) | Ast::Rel(..) => Err(refuse(
-            "a predicate is not a value; selection belongs in the filter",
-        )),
+        Ast::Or(children) | Ast::And(children) => {
+            let and = matches!(ast, Ast::And(_));
+            let sym = if and { "&&" } else { "||" };
+            let mut compiled = Vec::with_capacity(children.len());
+            for child in children {
+                let (expr, vt) = compile_value_ast(child, depth + 1)?;
+                if let Some(t) = vt {
+                    if t != VType::Bool {
+                        return Err(refuse(format!(
+                            "`{sym}` over a {}; Kleene logic joins booleans",
+                            t.name()
+                        )));
+                    }
+                }
+                compiled.push(expr);
+            }
+            let op = if and {
+                pb::ValueLogicOp::And
+            } else {
+                pb::ValueLogicOp::Or
+            };
+            Ok((
+                value_of(V::Logic(pb::ValueLogic {
+                    children: compiled,
+                    op: op as i32,
+                })),
+                Some(VType::Bool),
+            ))
+        }
+        Ast::Not(inner) => {
+            let (expr, vt) = compile_value_ast(inner, depth + 1)?;
+            if let Some(t) = vt {
+                if t != VType::Bool {
+                    return Err(refuse(format!(
+                        "`!` over a {}; Kleene logic joins booleans",
+                        t.name()
+                    )));
+                }
+            }
+            Ok((value_of(V::Not(Box::new(expr))), Some(VType::Bool)))
+        }
+        Ast::Rel(l, op, r) => {
+            let (le, lt) = compile_value_ast(l, depth + 1)?;
+            let (re, rt) = compile_value_ast(r, depth + 1)?;
+            let ordering = !matches!(op, RelOp::Eq | RelOp::Ne);
+            for t in [lt, rt].into_iter().flatten() {
+                match t {
+                    VType::Str if ordering => {
+                        return Err(refuse(format!(
+                            "`{}` orders strings, which is not in the vocabulary; only \
+                             `==` and `!=` compare strings",
+                            op.name()
+                        )));
+                    }
+                    VType::Bool if ordering => {
+                        return Err(refuse(format!(
+                            "`{}` over a boolean; booleans do not order",
+                            op.name()
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some(a), Some(b)) = (lt, rt) {
+                if a != b {
+                    let fix = if matches!(
+                        (a, b),
+                        (VType::Int, VType::Double) | (VType::Double, VType::Int)
+                    ) {
+                        "; stock CEL does not coerce — convert explicitly with double()"
+                    } else {
+                        ""
+                    };
+                    return Err(refuse(format!(
+                        "`{}` compares a {} with a {}{fix}",
+                        op.name(),
+                        a.name(),
+                        b.name()
+                    )));
+                }
+            }
+            let wire_op = match op {
+                RelOp::Eq => pb::ValueCmpOp::Eq,
+                RelOp::Ne => pb::ValueCmpOp::Ne,
+                RelOp::Lt => pb::ValueCmpOp::Lt,
+                RelOp::Le => pb::ValueCmpOp::Le,
+                RelOp::Gt => pb::ValueCmpOp::Gt,
+                RelOp::Ge => pb::ValueCmpOp::Ge,
+                RelOp::In => unreachable!("the value parser refuses `in` before building it"),
+            };
+            Ok((
+                value_of(V::Compare(Box::new(pb::ValueCompare {
+                    left: Some(Box::new(le)),
+                    right: Some(Box::new(re)),
+                    op: wire_op as i32,
+                }))),
+                Some(VType::Bool),
+            ))
+        }
+        Ast::Ternary(c, t, e) => {
+            let (ce, ct) = compile_value_ast(c, depth + 1)?;
+            if let Some(vt) = ct {
+                if vt != VType::Bool {
+                    return Err(refuse(format!(
+                        "the ternary's condition is a {}; a condition is a boolean",
+                        vt.name()
+                    )));
+                }
+            }
+            let (te, tt) = compile_value_ast(t, depth + 1)?;
+            let (ee, et) = compile_value_ast(e, depth + 1)?;
+            for bt in [tt, et].into_iter().flatten() {
+                if bt == VType::Str {
+                    return Err(refuse(
+                        "a string literal is not a computable value; a string-valued \
+                         ternary reads facet columns in both branches",
+                    ));
+                }
+            }
+            let vt = match (tt, et) {
+                (Some(a), Some(b)) if a != b => {
+                    let fix = if matches!(
+                        (a, b),
+                        (VType::Int, VType::Double) | (VType::Double, VType::Int)
+                    ) {
+                        "; stock CEL does not coerce — convert explicitly with double()"
+                    } else {
+                        ""
+                    };
+                    return Err(refuse(format!(
+                        "the ternary's branches disagree: {} versus {}{fix}",
+                        a.name(),
+                        b.name()
+                    )));
+                }
+                (Some(a), _) | (_, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            Ok((
+                value_of(V::Ternary(Box::new(pb::ValueTernary {
+                    cond: Some(Box::new(ce)),
+                    then_value: Some(Box::new(te)),
+                    else_value: Some(Box::new(ee)),
+                }))),
+                vt,
+            ))
+        }
     }
 }
 
@@ -1587,22 +1834,41 @@ mod value_tests {
         assert!(refusal("2.0 - 1").contains("double()"));
     }
 
-    /// The predicate vocabulary refuses by name in value position.
+    /// What stays outside the vocabulary refuses by name in value
+    /// position; the conditional layer itself now compiles.
     #[test]
-    fn predicate_constructs_refuse_by_name() {
-        assert!(refusal("a == b").contains("=="));
-        assert!(refusal("a && b").contains("&&"));
-        assert!(refusal("!a").contains("`!`"));
-        assert!(refusal("a ? b : c").contains("?"));
+    fn out_of_vocabulary_constructs_refuse_by_name() {
         assert!(refusal("has(a)").contains("has()"));
         assert!(refusal("a.matches(\"x\")").contains("matches()"));
         assert!(refusal("\"lit\"").contains("string literal"));
         assert!(refusal("[1, 2]").contains("list"));
         assert!(refusal("int(a)").contains("int()"));
+        assert!(refusal("a in [1, 2]").contains("`in`"));
+        assert!(refusal("null").contains("null"));
+    }
+
+    /// The conditional layer's literal-pinned typing refuses at
+    /// compile: strings order nowhere, booleans join no arithmetic,
+    /// branches and comparisons agree on a type.
+    #[test]
+    fn conditional_typing_refuses_at_compile() {
+        assert!(refusal("1 < 2.0").contains("double()"));
+        assert!(refusal("court < \"m\"").contains("orders strings"));
+        assert!(refusal("true < false").contains("do not order"));
+        assert!(refusal("true + 1").contains("no arithmetic"));
+        assert!(refusal("-(a > b)").contains("`!`"));
+        assert!(refusal("!(a + 1)").contains("Kleene"));
+        assert!(refusal("(a > b) && 1").contains("Kleene"));
+        assert!(refusal("a > b ? 1 : 2.0").contains("double()"));
+        assert!(refusal("1 ? a : b").contains("condition is a"));
+        assert!(refusal("a > b ? \"x\" : \"y\"").contains("string literal"));
+        assert!(refusal("\"x\" == 1").contains("compares a"));
+        assert!(refusal("double(true)").contains("double()"));
     }
 
     /// Shapes that must compile: precedence, parens re-entering the
-    /// value grammar, dotted and map reads, double(), unary minus.
+    /// value grammar, dotted and map reads, double(), unary minus,
+    /// and the conditional layer.
     #[test]
     fn the_value_grammar_compiles_its_vocabulary() {
         for text in [
@@ -1614,9 +1880,44 @@ mod value_tests {
             "-a * 2",
             "-(a + b)",
             "7 % 3",
+            "a == b",
+            "a + 1 >= b * 2",
+            "court == \"scotus\"",
+            "\"scotus\" != court",
+            "prices[\"usd\"] > 10.0 && a < b || !(c >= d)",
+            "a > b ? x + 1 : y - 1",
+            "a > b ? c > d : e > f",
+            "true",
+            "a > b == (c > d)",
+            "x > 0 ? a : y > 0 ? b : c",
         ] {
             compile_value(text).unwrap_or_else(|e| panic!("{text:?}: {}", e.message()));
         }
+    }
+
+    /// The ternary is right-associative and its condition binds the
+    /// whole `||` layer, exactly CEL's grammar.
+    #[test]
+    fn ternary_shape_matches_cel_grammar() {
+        use pb::value_expr::Expr as V;
+        let expr = compile_value("x > 0 ? a : y > 0 ? b : c").unwrap();
+        let Some(V::Ternary(outer)) = expr.expr else {
+            panic!("outer ternary expected");
+        };
+        let else_branch = outer.else_value.expect("else branch");
+        assert!(
+            matches!(else_branch.expr, Some(V::Ternary(_))),
+            "the second `?` nests in the ELSE branch"
+        );
+        let expr = compile_value("a > 0 || b > 0 ? 1 : 2").unwrap();
+        let Some(V::Ternary(outer)) = expr.expr else {
+            panic!("ternary expected");
+        };
+        let cond = outer.cond.expect("condition");
+        assert!(
+            matches!(cond.expr, Some(V::Logic(_))),
+            "the whole `||` is the condition"
+        );
     }
 
     /// Unary minus folds literals (so i64::MIN is expressible) and

@@ -23,11 +23,27 @@ A value expression is:
   parentheses. `%` is integer-only, as in CEL.
 - **`double(x)`.** The one conversion: int to double (identity on
   double). There is no `int()`, no `uint()`, no string conversion.
+- **The conditional layer** (2026-08-27). Comparisons
+  (`== != < <= > >=`), Kleene `&&`/`||`/`!`, bool literals, and CEL's
+  ternary `cond ? a : b` — the full conditional grammar, at CEL's
+  precedence (`?:` lowest and right-associative, then `||`, `&&`,
+  relations, arithmetic). Comparisons follow the arithmetic typing
+  rule (int with int, double with double, mixed refused naming
+  `double()`); doubles compare IEEE, so every comparison with NaN is
+  false except `!=`. `==`/`!=` also compare a DIRECT facet or
+  map-facet read against a string literal — resolved per shard to a
+  dictionary-ordinal check, so a literal the dictionary lacks compares
+  FALSE against every present value (and stays absent for absent
+  ones). String ordering, bool ordering, comparing two string columns,
+  and `in` refuse by name. A bool is a first-class projected value;
+  the ternary's branches must agree on one type, and only the TAKEN
+  branch's value and absence matter.
 
-Everything else refuses **by name** at compile: comparisons, `&&`/`||`,
-`!`, the ternary, `has()`, `in`, string functions, `matches()`, unknown
-functions, string literals, lists. The refusal names the construct and,
-where one exists, the supported alternative.
+Everything else refuses **by name** at compile: `has()`, `in`, string
+functions, `matches()`, unknown functions, bare string literals (a
+string literal is legal only as a `==`/`!=` operand), lists. The
+refusal names the construct and, where one exists, the supported
+alternative.
 
 ## 2. Typing: stock CEL's, finished per shard
 
@@ -64,6 +80,15 @@ Two places deliberately deviate from stock CEL, both pinned in
 - **Integer arithmetic errors.** Stock CEL errors on i64 overflow,
   division by zero, and the `i64::MIN` edge cases. The engine's checked
   arithmetic answers ABSENT.
+
+The conditional layer needs no third deviation, because Kleene logic
+IS stock CEL's logic with absence in the error role: CEL's `&&`/`||`
+are commutative and absorb an error when the other operand determines
+the answer, so `false && absent` is false and `true || absent` is true
+— and only an undetermined absent operand makes the result absent. An
+absent ternary condition makes the result absent, and `!` of absent
+stays absent, matching CEL's error propagation the same way. These are
+pinned in `tests/cel_values.rs` alongside the two deviations.
 
 Everywhere stock CEL yields a VALUE, the engine yields the same value —
 bit-for-bit on doubles. `tests/cel_values.rs` runs the `cel-interpreter`
@@ -125,12 +150,16 @@ quality and geography layers use (`docs/quality-columns.md`):
    against the document's OWN values: its `numerics`, `integers`, and
    `map_numerics` by name. Facet strings are not inputs;
    materialization computes numbers.
-3. Results are pushed into the request's ordinary `numerics` /
+3. A BOOL result never stores — the refusal names the ternary
+   (`cond ? 1 : 0`) as the fix. The conditional layer's use at ingest
+   is bucketing (`year >= 1994 ? 1 : 0`) into an ordinary numeric
+   column.
+4. Numeric results are pushed into the request's ordinary `numerics` /
    `integers` lists, so name resolution, the duplicate-column refusal,
    the declared-table check, the apply, and the WAL record all take the
    one path they already took. The target name must be a declared
    column (`--numeric-fields` / `--integer-fields`), like any other.
-4. The spec is cleared before the WAL logs the document: the logged
+5. The spec is cleared before the WAL logs the document: the logged
    request carries the values, so **replay never evaluates twice** and
    a later spec change cannot silently rewrite history.
 
@@ -149,8 +178,9 @@ from a protobuf document's own mapped values with the same contract.
 
 ## 6. What this is not
 
-- Not a scripting engine: the vocabulary is arithmetic and one
-  conversion, extended deliberately or not at all.
+- Not a scripting engine: the vocabulary is arithmetic, the
+  conditional layer, and one conversion, extended deliberately or not
+  at all.
 - Not a scoring path: projections annotate hits; they cannot change
   rank. Scoring stays with function chains, whose bounds math is
   argued in `docs/score-functions.md`.

@@ -1391,6 +1391,12 @@ impl crate::values::ColumnLookup for Bm25Shard {
     fn map_facet_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
         Bm25Shard::map_facet_key_ord(self, ci, key)
     }
+    fn facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32> {
+        Bm25Shard::facet_value_ord_of(self, ci, value)
+    }
+    fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32> {
+        Bm25Shard::map_facet_value_ord_of(self, ci, value)
+    }
 }
 
 impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
@@ -1452,6 +1458,7 @@ fn projected_value(
         Some(crate::values::Val::MapFacetOrd { column, ord }) => Some(W::StringValue(
             store.map_facet_value(column, ord).to_string(),
         )),
+        Some(crate::values::Val::Bool(v)) => Some(W::BoolValue(v)),
     };
     crate::pb::ProjectedValue { value }
 }
@@ -4206,6 +4213,13 @@ impl NodeServiceImpl {
             })?;
             match value {
                 None => {}
+                Some(crate::values::IngestVal::Bool(_)) => {
+                    return Err(Status::invalid_argument(format!(
+                        "materialize: column {name:?} evaluated a boolean; a stored \
+                         column holds numbers — wrap the expression in a ternary \
+                         (`cond ? 1 : 0`)"
+                    )));
+                }
                 Some(crate::values::IngestVal::Double(v)) => {
                     if *kind != crate::pb::MaterializeKind::F64 {
                         return Err(Status::invalid_argument(format!(
