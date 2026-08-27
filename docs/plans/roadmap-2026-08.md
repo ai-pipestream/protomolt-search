@@ -251,7 +251,22 @@ exists and is priced at ~1.2 ns/posting), or a monotone precomputed
 ordering that lets the scan stop early. What must not happen is sorting
 the top-k-by-score and calling it sorted.
 
-### 8. Aggregations beyond counting — LANDED
+### 8. Aggregations beyond counting — LANDED (and the analytics engine, 2026-08-27)
+
+**Extended 2026-08-27 (PRs #36-#40, `docs/aggregations.md`):** the
+value dialect grew CEL's conditional layer (ternary, comparisons,
+Kleene logic — PR #36) and the math function vocabulary (the official
+`math.*` extension plus `engine.*` transcendentals — PR #37), and a
+dedicated `SearchService.Aggregate` route now folds CEL value
+expressions over the FILTERED corpus with exactness as the contract:
+COUNT/SUM/MIN/MAX/MEAN/VARIANCE/STDDEV with i128 int sums, Neumaier
+double sums, and Welford/Chan moments merged deterministically in
+shard order (PR #38); group-by-facet and sparse fixed-interval
+histograms with loud caps (PR #39); and EXACT percentiles —
+nearest-rank order statistics found by a count-below binary search
+over the order-bits domain, at most 64 rounds, never a sketch
+(PR #40). Suite 491/0. Remaining ideas recorded there: per-group
+histograms/percentiles, nested grouping, text-scoped aggregation.
 
 **Landed 2026-08-24 (`Bm25SearchRequest.stats_fields` /
 `.cardinality_fields`, `tests/aggregations.rs`).** As priced: stats
