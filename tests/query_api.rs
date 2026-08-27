@@ -529,15 +529,6 @@ async fn unsupported_shapes_refuse_by_name() {
         (
             QueryRequest {
                 k: 5,
-                selection: Some(lexical_leaf("lex", "zebra")),
-                profile: true,
-                ..Default::default()
-            },
-            "profile",
-        ),
-        (
-            QueryRequest {
-                k: 5,
                 selection: Some(composite(
                     SelectionOperator::And,
                     vec![lexical_leaf("dup", "zebra"), cel_filter("dup", "year >= 0")],

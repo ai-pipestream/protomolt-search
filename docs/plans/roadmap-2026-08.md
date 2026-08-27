@@ -108,10 +108,21 @@ the absence of a relevance score. It is the natural pair to item 7
 (sort), and together they are the "structured browse" half of what
 people use OpenSearch for.
 
-### 3. The public `Query` RPC, increment 1 — LANDED
+### 3. The public `Query` RPC, increment 1 — LANDED (and the LTR path, 2026-08-26)
 
-**Landed 2026-08-24 (`src/query.rs`, `tests/query_api.rs`).** The
-adapter and nothing more, as scoped: seven shapes execute bitwise
+**Landed 2026-08-24 (`src/query.rs`, `tests/query_api.rs`).**
+**2026-08-26: the LTR path completed the contract** (PRs #32-#35,
+`src/ltr.rs`, `tests/ltr.rs`): the generic composite scorer (six
+operations, pool normalization, missing policies, per-dimension
+provenance precise enough to recompute every score client-side), the
+generalized boost phase (lexical and dense, any scored shape, several
+under the scorer, through the candidate-scoped rescore seams), stored-
+value dimensions and projections on every shape (the `FetchValues`
+seam), and the profile surface. The remaining unsupported shape is
+arbitrary nested boolean search.
+
+The original increment-1 scope, kept: the adapter and nothing more, as
+scoped: seven shapes execute bitwise
 through their ordinary routes, everything else refuses by name. One
 design point settled during implementation: cascade is expressed as a
 strategy whose membership is the gate's own (operator UNSPECIFIED

@@ -3046,9 +3046,9 @@ message QueryRequest {
   // single-leaf shapes when a scorer is present (the pool the scorer
   // reorders).
   CompositeScorer scorer = 6;
-  // Profile timings. Increment 1: must be false (the response carries
-  // no profile surface yet; accepting the flag and ignoring it would
-  // be a lie).
+  // Profile timings: when true the response carries QueryProfile.
+  // Timings never alter results — the same request with profile off
+  // returns the identical hits, bitwise.
   bool profile = 7;
   // Resume token from a previous response's `next_cursor`
   // (docs/query-api.md): search-after paging. The rest of the request
@@ -3382,6 +3382,30 @@ message QueryResponse {
   // this page was short of k — there is provably nothing after it at
   // the served depth.
   string next_cursor = 4;
+  // Phase timings, present exactly when the request set `profile`.
+  QueryProfile profile = 5;
+}
+
+// Where the request's time went, by adapter phase. Purely
+// observational: timings never alter results.
+message QueryProfile {
+  // The delegated selection route (analysis, stats, fan-out, fusion —
+  // and, for the composite + single lexical boost without a scorer,
+  // that boost's rescore, which rides inside the hybrid route).
+  float selection_ms = 1;
+  // Adapter-side boost signal rescores (the Bm25Rescore/VectorRescore
+  // seams).
+  float boost_ms = 2;
+  // The stored-dimension value fetch over the candidate pool (the
+  // FetchValues seam). 0 when the scorer has no stored dimensions.
+  float values_ms = 3;
+  // The composite scorer arithmetic.
+  float scorer_ms = 4;
+  // The post-selection projection fetch for the returned page (the
+  // shapes the lexical route does not carry natively).
+  float projection_ms = 5;
+  // Wall time of the whole adapter call.
+  float total_ms = 6;
 }
 
 // One public hit with score provenance.
