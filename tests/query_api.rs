@@ -574,22 +574,27 @@ async fn unsupported_shapes_refuse_by_name() {
             "silent no-op",
         ),
         (
+            // Two boosts with no scorer: nothing defines how their
+            // signals combine.
             QueryRequest {
                 k: 5,
                 selection: Some(lexical_leaf("lex", "zebra")),
-                boosts: vec![BoostQuery {
-                    query: Some(SearchQuery {
-                        id: "boost".into(),
-                        query: Some(search_query::Query::Lexical(LexicalQuery {
-                            text: "plain".into(),
-                            ..Default::default()
-                        })),
-                    }),
-                    ..Default::default()
-                }],
+                boosts: ["b1", "b2"]
+                    .iter()
+                    .map(|id| BoostQuery {
+                        query: Some(SearchQuery {
+                            id: (*id).into(),
+                            query: Some(search_query::Query::Lexical(LexicalQuery {
+                                text: "plain".into(),
+                                ..Default::default()
+                            })),
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
                 ..Default::default()
             },
-            "single-leaf selection",
+            "no composite scorer",
         ),
     ];
     for (req, needle) in cases {

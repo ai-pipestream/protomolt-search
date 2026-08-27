@@ -603,3 +603,258 @@ async fn scorer_interplays_refuse_by_name() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Boost generalization: dense boosts, boosts on single-leaf shapes,
+// multiple boosts under the scorer.
+
+fn lexical_boost(id: &str, text: &str) -> BoostQuery {
+    BoostQuery {
+        query: Some(SearchQuery {
+            id: id.to_string(),
+            query: Some(search_query::Query::Lexical(LexicalQuery {
+                text: text.to_string(),
+                ..Default::default()
+            })),
+        }),
+        ..Default::default()
+    }
+}
+
+fn dense_boost(id: &str, vector: &[f32]) -> BoostQuery {
+    BoostQuery {
+        query: Some(SearchQuery {
+            id: id.to_string(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                vector: vector.to_vec(),
+            })),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dense_boost_reranks_a_lexical_leaf() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+    // "document" scores every doc identically; the dense boost breaks
+    // the tie by similarity to doc 0's own vector, decisively.
+    let mut boost = dense_boost("sim", &qvec);
+    boost.boost_weight = 100.0;
+    let response = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            boosts: vec![boost],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.executed, "bm25_search");
+    assert_eq!(response.hits[0].doc_id, 0);
+    // The boost is provenance, never the score: the reported score is
+    // still the base BM25 score, and the boost's calibrated product
+    // rides the named signal on every doc carrying a vector.
+    for h in &response.hits {
+        let sim = h.signals.iter().find(|s| s.id == "sim").unwrap();
+        assert!(sim.score.is_finite());
+        assert!(h.matched.contains(&"sim".to_string()));
+    }
+    let top_sim = response.hits[0]
+        .signals
+        .iter()
+        .find(|s| s.id == "sim")
+        .unwrap()
+        .score;
+    for h in &response.hits[1..] {
+        let sim = h.signals.iter().find(|s| s.id == "sim").unwrap().score;
+        assert!(top_sim >= sim);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lexical_boost_windows_a_single_leaf_pool() {
+    let (coordinator, _qvec, _handles) = start_cluster().await;
+    // Base order for "document" is the doc-id tie order 0..7; the
+    // boost rescores only the top-4 window, so "zebra" lifts docs 0
+    // and 2 while docs 4 and 6 (equally zebra-bearing, outside the
+    // window) keep their place and carry no boost signal.
+    let mut boost = lexical_boost("z", "zebra");
+    boost.window = 4;
+    boost.boost_weight = 100.0;
+    let response = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            boosts: vec![boost],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ids: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(ids, vec![0, 2, 1, 3, 4, 5, 6, 7]);
+    for h in &response.hits {
+        let has_signal = h.signals.iter().any(|s| s.id == "z");
+        // Signals land only inside the window, and only on matches.
+        assert_eq!(has_signal, h.doc_id < 4 && h.doc_id % 2 == 0, "doc {}", h.doc_id);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lexical_boost_on_a_dense_leaf_carries_its_own_analysis() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+    // A dense-only selection has no lexical leaf to inherit from, so
+    // the boost's own analysis spec is admitted.
+    let mut boost = lexical_boost("plain", "plain");
+    boost.boost_weight = 100.0;
+    if let Some(search_query::Query::Lexical(lex)) =
+        boost.query.as_mut().unwrap().query.as_mut()
+    {
+        lex.analysis = Some(Default::default());
+    }
+    let response = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(dense_leaf("vec", &qvec)),
+            boosts: vec![boost.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.executed, "search");
+    // Odd docs carry "plain": boosted to the top, signals on exactly
+    // those docs.
+    assert!(response.hits[0].doc_id % 2 == 1);
+    for h in &response.hits {
+        assert_eq!(
+            h.signals.iter().any(|s| s.id == "plain"),
+            h.doc_id % 2 == 1,
+            "doc {}",
+            h.doc_id
+        );
+    }
+
+    // On a selection WITH a lexical leaf the same spec refuses: term
+    // identity belongs to the leaf.
+    let err = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            boosts: vec![boost],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("analyzed under that leaf's analysis"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_boosts_combine_through_the_scorer() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+    let mut d_sim = query_dim("sim", "sim");
+    d_sim.weight = Some(10.0);
+    let mut d_plain = query_dim("plain", "plain");
+    d_plain.weight = Some(5.0);
+    let response = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection_k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            boosts: vec![dense_boost("sim", &qvec), lexical_boost("plain", "plain")],
+            scorer: Some(scorer(
+                CompositeScoreOperation::WeightedSum,
+                vec![base_dim("base"), d_sim, d_plain],
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.executed, "bm25_search+scorer:weighted_sum");
+    // Doc 0 tops the pool: its dense similarity min-maxes to 1.0 at
+    // weight 10, beating any odd doc's plain dimension at weight 5.
+    assert_eq!(response.hits[0].doc_id, 0);
+    for h in &response.hits {
+        assert_eq!(h.dimensions.len(), 3);
+        assert_eq!(h.dimensions[1].id, "sim");
+        assert_eq!(h.dimensions[2].id, "plain");
+        // Both boost signals report exactly where they exist: dense on
+        // every doc (all carry vectors), plain on odd docs.
+        assert!(h.dimensions[1].raw.is_some());
+        assert_eq!(h.dimensions[2].raw.is_some(), h.doc_id % 2 == 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boost_shapes_refuse_by_name() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+    let browse = SelectionQuery {
+        node: Some(selection_query::Node::Filter(FilterQuery {
+            id: "f".into(),
+            predicate: Some(turbovec_search::pb::filter_query::Predicate::Cel(
+                "year >= 0".into(),
+            )),
+        })),
+    };
+    let cases = vec![
+        (
+            QueryRequest {
+                k: 5,
+                selection: Some(browse),
+                boosts: vec![lexical_boost("b", "plain")],
+                ..Default::default()
+            },
+            "SCORED selection",
+        ),
+        (
+            QueryRequest {
+                k: 5,
+                selection: Some(lexical_leaf("lex", "document")),
+                boosts: vec![dense_boost("b", &[])],
+                ..Default::default()
+            },
+            "empty vector",
+        ),
+        (
+            QueryRequest {
+                k: 5,
+                selection: Some(lexical_leaf("lex", "document")),
+                boosts: vec![lexical_boost("b", "")],
+                ..Default::default()
+            },
+            "empty text",
+        ),
+        (
+            // Two boosts, no scorer: nothing defines combination.
+            QueryRequest {
+                k: 5,
+                selection: Some(dense_leaf("vec", &qvec)),
+                boosts: vec![lexical_boost("b1", "plain"), dense_boost("b2", &qvec)],
+                ..Default::default()
+            },
+            "no composite scorer",
+        ),
+    ];
+    for (req, needle) in cases {
+        let err = query(&coordinator, req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
+        assert!(
+            err.message().contains(needle),
+            "expected {needle:?} in: {}",
+            err.message()
+        );
+    }
+}

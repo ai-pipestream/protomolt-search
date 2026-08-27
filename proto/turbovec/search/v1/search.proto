@@ -2970,9 +2970,15 @@ message QueryRequest {
   uint32 selection_k = 3;
   // The selection tree. Required.
   SelectionQuery selection = 4;
-  // Candidate-scoped boosts. Increment 1: at most ONE, lexical only,
-  // and only on a composite selection (it maps to the hybrid route's
-  // BoostRescore). A boost never admits a document.
+  // Candidate-scoped boosts: lexical or dense, on any SCORED
+  // selection (a browse has no base order to boost). A boost never
+  // admits a document. Without a scorer exactly one boost is served —
+  // its base_weight/boost_weight reorder is the combination; multiple
+  // boosts require the composite scorer, which owns combination and
+  // consumes each boost's relevance as a named signal. A boost makes
+  // selection_k meaningful on single-leaf shapes: it is the pool the
+  // boost rescores (the honest form of the rescore window), and a
+  // boosted query pages within it.
   repeated BoostQuery boosts = 5;
   // The generic named-dimension composite scorer (docs/query-api.md):
   // combines the base order and the named raw signals into the FINAL
@@ -3183,7 +3189,13 @@ message CascadeScore {
 // candidate set is scored — a window would manufacture missing signals
 // out of rescore cost, and the pool is already bounded by selection_k.
 message BoostQuery {
-  // The boost's scoring query. Increment 1: lexical only.
+  // The boost's scoring query: lexical (the Bm25Rescore seam; scored
+  // with global stats, comparable across shards) or dense (the
+  // VectorRescore seam; bitwise the calibrated products a full search
+  // emits). A lexical boost inherits the selection's lexical leaf's
+  // analysis when one exists — term identity must match the index the
+  // leaf searched, so a spec of its own refuses there; on a dense-only
+  // selection it carries its own.
   SearchQuery query = 1;
   // How many top candidates are rescored. 0 = all selection_k.
   uint32 window = 2;
