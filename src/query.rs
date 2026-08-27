@@ -220,13 +220,17 @@ pub async fn execute(
         }
         _ => None,
     };
-    if !req.projections.is_empty() && !matches!(plan.shape, Shape::Lexical { .. }) {
-        return Err(refuse(
-            "projections are served on single-lexical-leaf selections only in this \
-             increment (the Bm25Search delegate carries them); other shapes refuse \
-             until their ordinary route does",
-        ));
-    }
+    // Projections: the lexical route carries them natively (bitwise the
+    // path that always served them); every other shape — browse
+    // included — fetches them post-selection by id through the
+    // FetchValues seam. The selection is already fixed when that runs,
+    // so no pruning certificate is involved.
+    let compiled_projections =
+        if req.projections.is_empty() || matches!(plan.shape, Shape::Lexical { .. }) {
+            Vec::new()
+        } else {
+            crate::coordinator::compile_projections(&req.projections)?
+        };
     if let Some(sort) = &req.sort {
         if sort.column.is_empty() {
             return Err(refuse("sort names no column"));
@@ -398,6 +402,8 @@ pub async fn execute(
             } else {
                 String::new()
             };
+            let mut hits = hits;
+            fill_projected(coordinator, &compiled_projections, &mut hits).await?;
             Ok(done(req.request_id, hits, "browse", next))
         }
         Shape::Lexical { id, query } => {
@@ -432,7 +438,7 @@ pub async fn execute(
                 })
                 .collect();
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
-            let executed = apply_scorer(&scorer, &mut hits, "bm25_search")?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, "bm25_search").await?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
             Ok(done(req.request_id, hits, &executed, next))
         }
@@ -466,8 +472,9 @@ pub async fn execute(
                 })
                 .collect();
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
-            let executed = apply_scorer(&scorer, &mut hits, "search")?;
-            let (hits, next) = page(hits, req.k, cursor.as_ref())?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, "search").await?;
+            let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
+            fill_projected(coordinator, &compiled_projections, &mut hits).await?;
             Ok(done(response.request_id, hits, &executed, next))
         }
         Shape::Composite {
@@ -596,8 +603,9 @@ pub async fn execute(
                 _ => "hybrid_search:cascade",
             };
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
-            let executed = apply_scorer(&scorer, &mut hits, route)?;
-            let (hits, next) = page(hits, req.k, cursor.as_ref())?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, route).await?;
+            let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
+            fill_projected(coordinator, &compiled_projections, &mut hits).await?;
             Ok(done(response.request_id, hits, &executed, next))
         }
     }
@@ -605,8 +613,11 @@ pub async fn execute(
 
 /// Apply the composite scorer (when present) to the candidate pool and
 /// return the `executed` echo: the route name, suffixed with the
-/// operation that reordered it.
-fn apply_scorer(
+/// operation that reordered it. Stored-value dimensions fetch their
+/// per-candidate contributions first (the FetchValues seam) — over the
+/// whole pool, because normalization statistics are pool statistics.
+async fn apply_scorer(
+    coordinator: &CoordinatorServiceImpl,
     scorer: &Option<crate::ltr::Scorer>,
     hits: &mut [QueryHit],
     route: &str,
@@ -614,10 +625,41 @@ fn apply_scorer(
     match scorer {
         None => Ok(route.to_string()),
         Some(s) => {
-            s.apply(hits)?;
+            let stored = if s.stored_stages().is_empty() {
+                Vec::new()
+            } else {
+                let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
+                coordinator
+                    .fetch_values(&ids, &[], s.stored_stages())
+                    .await?
+                    .stage_rows
+            };
+            s.apply(hits, &stored)?;
             Ok(format!("{route}{}", s.executed_suffix()))
         }
     }
+}
+
+/// Fill the paged hits' projected values through the FetchValues seam
+/// (non-lexical shapes; the lexical route carries projections
+/// natively). A hit whose shard holds no column tables projects
+/// all-absent — exact, its document holds no such values.
+async fn fill_projected(
+    coordinator: &CoordinatorServiceImpl,
+    compiled: &[crate::pb::CompiledProjection],
+    hits: &mut [QueryHit],
+) -> Result<(), Status> {
+    if compiled.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
+    let fetched = coordinator.fetch_values(&ids, compiled, &[]).await?;
+    for hit in hits.iter_mut() {
+        hit.projected = fetched.rows.get(&hit.doc_id).cloned().unwrap_or_else(|| {
+            vec![crate::pb::ProjectedValue::default(); compiled.len()]
+        });
+    }
+    Ok(())
 }
 
 /// Every request id and what it names, for scorer source validation.

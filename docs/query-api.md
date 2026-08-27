@@ -14,8 +14,15 @@ and `VectorRescore` seams), serve any scored selection including
 single-leaf shapes, and combine through the scorer when there is more
 than one — without a scorer, exactly one boost is served and its
 `base_weight`/`boost_weight` reorder is the combination. Stored-value
-dimensions (`ScoreSignal.bounded_value`) remain refused by name until
-their increment lands. The phase split, the boost contract, and the
+dimensions are IMPLEMENTED (2026-08-26): `ScoreSignal.bounded_value`
+carries a score stage evaluated at its IDENTITY score per candidate
+(the factor for the multiplicative ops — exp decay, log boost, geo
+decay — the addend for `ADD_LINEAR`) through the candidate-scoped
+`NodeService.FetchValues` seam, with the stage admission rules and the
+column typo rule exactly as on the lexical route; a candidate without
+the value is a missing signal under the dimension's policy. The same
+seam serves `QueryRequest.projections` on every shape
+(`docs/cel-values.md`). The phase split, the boost contract, and the
 refusal rules in this document are the binding contract.
 
 The public model separates three things that are easy to conflate:
@@ -295,7 +302,9 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | filters only (browse, id order, `after`-floor paging) | `BrowseShard` fan-out |
 | browse + `sort` by i64/f64 column (asc/desc) | `BrowseShard` column-keyed heap |
 | projections on one lexical leaf | `Bm25Search.projections` (`docs/cel-values.md`) |
+| projections on dense/composite/browse | `FetchValues` post-selection fetch, same semantics |
 | any scored shape + composite scorer | the route above, then the coordinator-side scorer (`src/ltr.rs`) |
+| projections on any other shape; stored-value dimensions | `FetchValues` candidate-scoped fan-out, post-selection |
 
 `selection_k` maps to the hybrid leg depth; the response is the best `k`
 of that candidate set (`k <= selection_k` enforced; a `selection_k` that
@@ -319,9 +328,9 @@ The adapter must execute those ordinary paths rather than fork their scoring
 logic. Vector-plus-CEL has since acquired its ordinary path
 (`docs/vector-filters.md`): `SearchRequest` and `HybridSearchRequest` both
 carry `geo_filters` and a CEL `filter`, and every fusion mode applies them to
-both legs. Shapes still not represented by the table — arbitrary nested
-boolean search and stored-value scorer dimensions — remain unsupported
-until their ordinary engine paths exist. The public RPC must return `INVALID_ARGUMENT` or
+both legs. The one shape still not represented by the table —
+arbitrary nested boolean search — remains unsupported until its
+ordinary engine path exists. The public RPC must return `INVALID_ARGUMENT` or
 `FAILED_PRECONDITION` for such a shape; compatibility never authorizes a
 heuristic substitute.
 

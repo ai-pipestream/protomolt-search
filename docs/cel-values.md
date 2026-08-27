@@ -96,9 +96,15 @@ The filter rules for missing columns carry over exactly:
 Projections are served on the flat (single-field) Bm25Search route;
 the fused multi-field route refuses them by name, like stats and
 cardinality. The public `Query` adapter (`docs/query-api.md`) carries
-`QueryRequest.projections` on the single-lexical-leaf shape — the
-Bm25Search delegate — and refuses other shapes until their ordinary
-route serves values; hits return them as `QueryHit.projected`.
+`QueryRequest.projections` on EVERY shape (2026-08-26): the
+single-lexical-leaf shape rides the Bm25Search delegate natively, and
+every other shape — dense, composite, browse — fetches the paged hits'
+values post-selection through the candidate-scoped `FetchValues` seam
+(`NodeService.FetchValues`), where the selection is already fixed and
+no pruning certificate is involved. Semantics are identical on both
+paths (one compile, one resolve rule, the same typo refusal), and
+`tests/cel_values.rs` holds the browse path to the lexical route's
+values; hits return them as `QueryHit.projected`.
 
 ## 5. Ingest-time materialized columns
 

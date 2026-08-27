@@ -47,6 +47,11 @@ enum Source {
     Base,
     /// A search or boost query's raw relevance, by id.
     Query(String),
+    /// A stored-value score function: index into `Scorer::stored`,
+    /// whose values arrive per candidate through the FetchValues seam
+    /// (each stage evaluated at its identity score; a document without
+    /// the value is a missing signal).
+    Stored(usize),
 }
 
 #[derive(Debug)]
@@ -65,6 +70,9 @@ struct Dim {
 pub struct Scorer {
     operation: CompositeScoreOperation,
     dims: Vec<Dim>,
+    /// The stored-value stages, in dimension order; the adapter
+    /// fetches their per-candidate contributions before `apply`.
+    stored: Vec<crate::pb::ScoreStage>,
 }
 
 /// The `executed` suffix for one operation, e.g. `weighted_mean`.
@@ -84,6 +92,13 @@ impl Scorer {
     /// The operation's name for the response's `executed` echo.
     pub fn executed_suffix(&self) -> String {
         format!("+scorer:{}", op_name(self.operation))
+    }
+
+    /// The stored-value stages the dimensions reference, in dimension
+    /// order. The caller fetches their per-candidate contributions
+    /// (the FetchValues seam) and hands them to `apply` positionally.
+    pub fn stored_stages(&self) -> &[crate::pb::ScoreStage] {
+        &self.stored
     }
 
     /// Validate the wire scorer against the request's id namespace.
@@ -106,6 +121,7 @@ impl Scorer {
             return Err(refuse("the scorer has no dimensions"));
         }
         let mut dims = Vec::with_capacity(scorer.dimensions.len());
+        let mut stored: Vec<crate::pb::ScoreStage> = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for d in &scorer.dimensions {
             if d.id.is_empty() {
@@ -157,13 +173,13 @@ impl Scorer {
                         }
                     }
                 }
-                Some(score_signal::Source::BoundedValue(_)) => {
-                    return Err(refuse(format!(
-                        "dimension {:?} sources a stored-value score function; \
-                         stored-value dimensions arrive with the candidate-scoped value \
-                         fetch and are refused until then",
-                        d.id
-                    )))
+                Some(score_signal::Source::BoundedValue(stage)) => {
+                    // The stage admission rules apply here exactly as
+                    // on the lexical route; a malformed stage refuses
+                    // by name before anything runs.
+                    crate::node::parse_score_stages(std::slice::from_ref(stage))?;
+                    stored.push(stage.clone());
+                    Source::Stored(stored.len() - 1)
                 }
                 None => {
                     return Err(refuse(format!("dimension {:?} has no source", d.id)));
@@ -204,13 +220,22 @@ impl Scorer {
                  would order every document at 0, silently",
             ));
         }
-        Ok(Scorer { operation, dims })
+        Ok(Scorer {
+            operation,
+            dims,
+            stored,
+        })
     }
 
     /// Score the candidate pool: set every hit's final score and
     /// per-dimension provenance, then order by (f32 score desc, doc id
     /// asc) — ties break on exactly the score the client sees.
-    pub fn apply(&self, hits: &mut [QueryHit]) -> Result<(), Status> {
+    pub fn apply(
+        &self,
+        hits: &mut [QueryHit],
+        stored: &[std::collections::HashMap<u64, f64>],
+    ) -> Result<(), Status> {
+        debug_assert_eq!(stored.len(), self.stored.len());
         if hits.is_empty() {
             return Ok(());
         }
@@ -220,7 +245,7 @@ impl Scorer {
         let mut raws: Vec<Vec<Option<f64>>> = Vec::with_capacity(self.dims.len());
         let mut norms: Vec<Norm> = Vec::with_capacity(self.dims.len());
         for dim in &self.dims {
-            let vals: Vec<Option<f64>> = hits.iter().map(|h| raw_of(dim, h)).collect();
+            let vals: Vec<Option<f64>> = hits.iter().map(|h| raw_of(dim, h, stored)).collect();
             if dim.missing == MissingScorePolicy::Error {
                 if let Some(i) = vals.iter().position(Option::is_none) {
                     return Err(Status::failed_precondition(format!(
@@ -385,6 +410,7 @@ fn source_name(source: &Source) -> String {
     match source {
         Source::Base => "base".to_string(),
         Source::Query(id) => id.clone(),
+        Source::Stored(i) => format!("stored value {i}"),
     }
 }
 
@@ -392,7 +418,7 @@ fn source_name(source: &Source) -> String {
 /// pre-scorer score; a query signal is present exactly when the hit's
 /// `signals` provenance carries the id — the provenance surface and
 /// the scorer never disagree about what a document matched.
-fn raw_of(dim: &Dim, hit: &QueryHit) -> Option<f64> {
+fn raw_of(dim: &Dim, hit: &QueryHit, stored: &[std::collections::HashMap<u64, f64>]) -> Option<f64> {
     match &dim.source {
         Source::Base => Some(f64::from(hit.score)),
         Source::Query(id) => hit
@@ -400,6 +426,7 @@ fn raw_of(dim: &Dim, hit: &QueryHit) -> Option<f64> {
             .iter()
             .find(|s| &s.id == id)
             .map(|s| f64::from(s.score)),
+        Source::Stored(i) => stored[*i].get(&hit.doc_id).copied(),
     }
 }
 
@@ -561,9 +588,11 @@ mod tests {
     }
 
     #[test]
-    fn refuses_missing_source_and_bounded_value() {
+    fn refuses_missing_source_and_malformed_stage() {
         let s = scorer(CompositeScoreOperation::WeightedSum, vec![dim("d", None)]);
         assert!(msg(validate(&s).unwrap_err()).contains("no source"));
+        // A stage under bounded_value obeys the stage admission rules:
+        // the default stage names no column.
         let s = scorer(
             CompositeScoreOperation::WeightedSum,
             vec![dim(
@@ -571,7 +600,33 @@ mod tests {
                 Some(score_signal::Source::BoundedValue(Default::default())),
             )],
         );
-        assert!(msg(validate(&s).unwrap_err()).contains("stored-value"));
+        assert!(msg(validate(&s).unwrap_err()).contains("names the numeric column"));
+    }
+
+    #[test]
+    fn stored_dimensions_read_their_fetched_values() {
+        use std::collections::HashMap;
+        let stage = crate::pb::ScoreStage {
+            op: crate::pb::ScoreOp::AddLinear as i32,
+            column: "year".into(),
+            weight: 1.0,
+            ..Default::default()
+        };
+        let mut d = dim("recency", Some(score_signal::Source::BoundedValue(stage)));
+        d.normalization = ScoreNormalization::None as i32;
+        let s = validate(&scorer(CompositeScoreOperation::WeightedSum, vec![d])).unwrap();
+        assert_eq!(s.stored_stages().len(), 1);
+        let mut hits = vec![hit(0, 0.0, &[]), hit(1, 0.0, &[]), hit(2, 0.0, &[])];
+        // Doc 2 has no value: the ZERO default applies.
+        let stored: Vec<HashMap<u64, f64>> =
+            vec![[(0u64, 1990.0), (1u64, 2020.0)].into_iter().collect()];
+        s.apply(&mut hits, &stored).unwrap();
+        assert_eq!(hits[0].doc_id, 1);
+        assert_eq!(hits[0].score, 2020.0);
+        assert_eq!(hits[1].score, 1990.0);
+        assert_eq!(hits[2].doc_id, 2);
+        assert_eq!(hits[2].score, 0.0);
+        assert_eq!(hits[2].dimensions[0].raw, None);
     }
 
     #[test]
@@ -621,7 +676,7 @@ mod tests {
         ))
         .unwrap();
         let mut hits = vec![hit(0, 4.0, &[]), hit(1, 2.0, &[]), hit(2, 3.0, &[])];
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // (4-2)/(4-2)=1, (3-2)/2=0.5, (2-2)/2=0.
         assert_eq!(hits[0].score, 1.0);
         assert_eq!(hits[0].doc_id, 0);
@@ -629,7 +684,7 @@ mod tests {
         assert_eq!(hits[2].score, 0.0);
 
         let mut equal = vec![hit(0, 7.0, &[]), hit(1, 7.0, &[])];
-        s.apply(&mut equal).unwrap();
+        s.apply(&mut equal, &[]).unwrap();
         assert!(equal.iter().all(|h| h.score == 1.0));
     }
 
@@ -639,14 +694,14 @@ mod tests {
         d.normalization = ScoreNormalization::ZScore as i32;
         let s = validate(&scorer(CompositeScoreOperation::WeightedSum, vec![d])).unwrap();
         let mut hits = vec![hit(0, 1.0, &[]), hit(1, 3.0, &[])];
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // mean 2, population std 1: z = +1 and -1.
         assert_eq!(hits[0].score, 1.0);
         assert_eq!(hits[0].doc_id, 1);
         assert_eq!(hits[1].score, -1.0);
 
         let mut equal = vec![hit(0, 5.0, &[]), hit(1, 5.0, &[])];
-        s.apply(&mut equal).unwrap();
+        s.apply(&mut equal, &[]).unwrap();
         assert!(equal.iter().all(|h| h.score == 0.0));
     }
 
@@ -656,7 +711,7 @@ mod tests {
         d.normalization = ScoreNormalization::None as i32;
         let s = validate(&scorer(CompositeScoreOperation::WeightedSum, vec![d])).unwrap();
         let mut hits = vec![hit(0, 4.5, &[]), hit(1, 2.5, &[])];
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         assert_eq!(hits[0].score, 4.5);
         assert_eq!(hits[1].score, 2.5);
     }
@@ -673,7 +728,7 @@ mod tests {
             vec![base_dim("b"), query_dim("l", "lex")],
         ))
         .unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 0: base minmax -> 1, lex present alone -> degenerate 1;
         // mean = 1. doc 1: base -> 0, lex missing -> ZERO; mean = 0.
         assert_eq!(hits[0].score, 1.0);
@@ -693,7 +748,7 @@ mod tests {
             vec![base_dim("b"), d],
         ))
         .unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 1: lex SKIPPED, mean over base alone = 0 (its minmax is
         // 0) — same value as ZERO here, but the report says skipped.
         let doc1 = hits.iter().find(|h| h.doc_id == 1).unwrap();
@@ -707,7 +762,7 @@ mod tests {
         d.missing = MissingScorePolicy::Error as i32;
         let mut hits = vec![hit(0, 2.0, &[("lex", 3.0)]), hit(7, 1.0, &[])];
         let s = validate(&scorer(CompositeScoreOperation::WeightedSum, vec![d])).unwrap();
-        let err = s.apply(&mut hits).unwrap_err();
+        let err = s.apply(&mut hits, &[]).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("document 7"));
         assert!(err.message().contains("\"l\""));
@@ -735,7 +790,7 @@ mod tests {
     fn weighted_sum_golden() {
         let (mut hits, dims) = two_signal_fixture();
         let s = validate(&scorer(CompositeScoreOperation::WeightedSum, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 1: 2*1 + 3*8 = 26; doc 0: 2*4 + 3*0.5 = 9.5.
         assert_eq!(hits[0].doc_id, 1);
         assert_eq!(hits[0].score, 26.0);
@@ -748,7 +803,7 @@ mod tests {
     fn weighted_mean_golden() {
         let (mut hits, dims) = two_signal_fixture();
         let s = validate(&scorer(CompositeScoreOperation::WeightedMean, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 1: 26/5 = 5.2; doc 0: 9.5/5 = 1.9.
         assert_eq!(hits[0].score, 5.2);
         assert_eq!(hits[1].score, 1.9);
@@ -758,7 +813,7 @@ mod tests {
     fn maximum_golden() {
         let (mut hits, dims) = two_signal_fixture();
         let s = validate(&scorer(CompositeScoreOperation::Maximum, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 1: max(2, 24) = 24; doc 0: max(8, 1.5) = 8.
         assert_eq!(hits[0].score, 24.0);
         assert_eq!(hits[1].score, 8.0);
@@ -768,7 +823,7 @@ mod tests {
     fn product_golden() {
         let (mut hits, dims) = two_signal_fixture();
         let s = validate(&scorer(CompositeScoreOperation::Product, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 1: 2 * 24 = 48; doc 0: 8 * 1.5 = 12.
         assert_eq!(hits[0].score, 48.0);
         assert_eq!(hits[1].score, 12.0);
@@ -778,7 +833,7 @@ mod tests {
     fn geometric_mean_golden() {
         let (mut hits, dims) = two_signal_fixture();
         let s = validate(&scorer(CompositeScoreOperation::GeometricMean, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 1: 1^(2/5) * 8^(3/5); doc 0: 4^(2/5) * 0.5^(3/5).
         let d1 = 8f64.powf(0.6);
         let d0 = 4f64.powf(0.4) * 0.5f64.powf(0.6);
@@ -790,7 +845,7 @@ mod tests {
     fn harmonic_mean_golden() {
         let (mut hits, dims) = two_signal_fixture();
         let s = validate(&scorer(CompositeScoreOperation::HarmonicMean, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 1: 5 / (2/1 + 3/8) = 5/2.375; doc 0: 5 / (2/4 + 3/0.5).
         let d1 = 5.0 / (2.0 + 0.375);
         let d0 = 5.0 / (0.5 + 6.0);
@@ -813,7 +868,7 @@ mod tests {
             vec![d1, d2],
         ))
         .unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         assert_eq!(hits[0].score, 8.0);
         assert!(hits[0].dimensions[0].skipped);
         assert!(!hits[0].dimensions[1].skipped);
@@ -825,7 +880,7 @@ mod tests {
         let mut d = query_dim("l", "lex");
         d.normalization = ScoreNormalization::None as i32;
         let s = validate(&scorer(CompositeScoreOperation::HarmonicMean, vec![d])).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         assert_eq!(hits[0].score, 0.0);
         assert!(hits[0].dimensions[0].skipped);
     }
@@ -835,7 +890,7 @@ mod tests {
         let (mut hits, mut dims) = two_signal_fixture();
         dims[1].weight = Some(0.0);
         let s = validate(&scorer(CompositeScoreOperation::WeightedSum, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // Only the lex dimension counts: doc 0 wins on 2*4 = 8.
         assert_eq!(hits[0].doc_id, 0);
         assert_eq!(hits[0].score, 8.0);
@@ -850,7 +905,7 @@ mod tests {
         let (mut hits, mut dims) = two_signal_fixture();
         dims[1].weight = Some(-3.0);
         let s = validate(&scorer(CompositeScoreOperation::WeightedSum, dims)).unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         // doc 0: 8 - 1.5 = 6.5; doc 1: 2 - 24 = -22.
         assert_eq!(hits[0].doc_id, 0);
         assert_eq!(hits[0].score, 6.5);
@@ -867,7 +922,7 @@ mod tests {
             vec![base_dim("d")],
         ))
         .unwrap();
-        s.apply(&mut hits).unwrap();
+        s.apply(&mut hits, &[]).unwrap();
         let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
         assert_eq!(ids, vec![2, 5, 9]);
     }
@@ -887,7 +942,7 @@ mod tests {
             let (mut hits, dims) = two_signal_fixture();
             let weights: Vec<f64> = dims.iter().map(|d| d.weight.unwrap()).collect();
             let s = validate(&scorer(op, dims)).unwrap();
-            s.apply(&mut hits).unwrap();
+            s.apply(&mut hits, &[]).unwrap();
             for h in &hits {
                 let active: Vec<(usize, &DimensionScore)> = h
                     .dimensions

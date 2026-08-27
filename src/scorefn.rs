@@ -149,6 +149,45 @@ pub struct Stage {
     pub min_max: (f64, f64),
 }
 
+impl Stage {
+    /// The stage's own contribution at its IDENTITY score: the factor
+    /// for the multiplicative ops, the addend for `ADD_LINEAR`. `None`
+    /// exactly when the document has no value (or the shard lacks the
+    /// column) — identity, which a stored-value scorer dimension reads
+    /// as a missing signal. The float expressions match
+    /// [`ScoreChain::eval`] term for term, so a contribution composed
+    /// back onto a score reproduces the chain's arithmetic.
+    pub fn contribution(&self, doc_id: u32, columns: &dyn NumericRead) -> Option<f64> {
+        if let StageOp::MultGeoDecay {
+            metric,
+            origin_lat,
+            origin_lon,
+            scale,
+        } = self.op
+        {
+            let Some(ColumnRef::Geo(gi)) = self.column else {
+                return None;
+            };
+            let (lat, lon) = columns.geo_value(gi, doc_id)?;
+            return Some((-metric.meters(origin_lat, origin_lon, lat, lon) / scale).exp());
+        }
+        let x = match self.column {
+            Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
+            Some(ColumnRef::Integer(ii)) => columns.int_value(ii, doc_id).map(|v| v as f64),
+            Some(ColumnRef::MapKey { column, key_ord }) => {
+                columns.map_value(column, key_ord, doc_id)
+            }
+            Some(ColumnRef::Geo(_)) | None => None,
+        }?;
+        Some(match self.op {
+            StageOp::MultExpDecay { origin, scale } => (-((x - origin).abs()) / scale).exp(),
+            StageOp::MultLog { weight } => 1.0 + weight * (1.0 + x.max(0.0)).ln(),
+            StageOp::AddLinear { weight } => weight * x,
+            StageOp::MultGeoDecay { .. } => unreachable!("geo ops returned above"),
+        })
+    }
+}
+
 /// A resolved score-function chain; empty means identity.
 #[derive(Debug, Clone, Default)]
 pub struct ScoreChain {
