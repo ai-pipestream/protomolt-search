@@ -1690,6 +1690,78 @@ impl HistAcc {
     }
 }
 
+/// One shard's phase-1 percentile fold.
+#[derive(Default)]
+struct PctAcc {
+    present: u64,
+    unrankable: u64,
+    min_bits: u64,
+    max_bits: u64,
+}
+
+impl PctAcc {
+    fn push(&mut self, bits: Option<u64>) {
+        let Some(bits) = bits else {
+            self.unrankable += 1;
+            return;
+        };
+        if self.present == 0 {
+            self.min_bits = bits;
+            self.max_bits = bits;
+        } else {
+            self.min_bits = self.min_bits.min(bits);
+            self.max_bits = self.max_bits.max(bits);
+        }
+        self.present += 1;
+    }
+}
+
+/// Resolve one percentile expression: only int and double rank.
+/// `Ok(None)` = the expression can never hold a value on this shard.
+fn resolve_rankable(
+    store: &Bm25Shard,
+    expr: Option<&crate::pb::ValueExpr>,
+    name: &str,
+    what: &str,
+) -> Result<Option<(crate::values::ResolvedValue, bool)>, Status> {
+    let expr = expr.ok_or_else(|| {
+        Status::invalid_argument(format!("{what} {name:?} without an expression"))
+    })?;
+    let (rv, vt) = crate::values::resolve(expr, store)
+        .map_err(|e| Status::invalid_argument(format!("{what} {name:?}: {}", e.message())))?;
+    match vt {
+        crate::values::ValueType::Int => Ok(Some((rv, true))),
+        crate::values::ValueType::Double => Ok(Some((rv, false))),
+        crate::values::ValueType::Unknown => Ok(None),
+        crate::values::ValueType::Str => Err(Status::invalid_argument(format!(
+            "{what} {name:?} ranks numbers; a string does not order here"
+        ))),
+        crate::values::ValueType::Bool => Err(Status::invalid_argument(format!(
+            "{what} {name:?} ranks numbers, not booleans"
+        ))),
+    }
+}
+
+/// Order bits of one evaluated rankable value; `None` = computed NaN
+/// (present but unrankable).
+fn rankable_bits(v: crate::values::Val, int_typed: bool) -> Option<u64> {
+    match v {
+        crate::values::Val::Int(x) => {
+            debug_assert!(int_typed);
+            let _ = int_typed;
+            Some(i64_order_bits(x))
+        }
+        crate::values::Val::Double(x) => {
+            if x.is_nan() {
+                None
+            } else {
+                Some(f64_order_bits(x))
+            }
+        }
+        _ => unreachable!("resolution typed the expression numeric"),
+    }
+}
+
 /// The op-versus-type admission rule, shared wording with the
 /// coordinator's literal-pinned precheck.
 fn check_agg_type(
@@ -1789,8 +1861,22 @@ fn filter_known_flags(
 /// Order-preserving u64 key for an i64 value: offset binary, so the
 /// unsigned comparison of the results matches the signed comparison of
 /// the inputs (docs/query-api.md, sorted browse).
-fn i64_order_bits(x: i64) -> u64 {
+pub(crate) fn i64_order_bits(x: i64) -> u64 {
     (x as u64) ^ (1u64 << 63)
+}
+
+/// Inverse of [`i64_order_bits`].
+pub(crate) fn i64_from_order_bits(bits: u64) -> i64 {
+    (bits ^ (1u64 << 63)) as i64
+}
+
+/// Inverse of [`f64_order_bits`].
+pub(crate) fn f64_from_order_bits(bits: u64) -> f64 {
+    if bits >> 63 == 1 {
+        f64::from_bits(bits & !(1u64 << 63))
+    } else {
+        f64::from_bits(!bits)
+    }
 }
 
 /// Order-preserving u64 key for a (finite) f64 value: the sign-flip
@@ -1798,7 +1884,7 @@ fn i64_order_bits(x: i64) -> u64 {
 /// unsigned comparison matches numeric order. NaN never reaches this
 /// (NaN is the f64 column's absence sentinel and absent values are
 /// excluded before keying).
-fn f64_order_bits(x: f64) -> u64 {
+pub(crate) fn f64_order_bits(x: f64) -> u64 {
     let bits = x.to_bits();
     if bits >> 63 == 1 {
         !bits
@@ -5908,9 +5994,10 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
         crate::metrics::inc_request(crate::metrics::Route::AggregateShard);
         let req = request.into_inner();
-        if req.aggregations.is_empty() && req.histograms.is_empty() {
+        if req.aggregations.is_empty() && req.histograms.is_empty() && req.percentiles.is_empty()
+        {
             return Err(Status::invalid_argument(
-                "aggregate requires at least one aggregation or histogram",
+                "aggregate requires at least one aggregation, histogram, or percentile",
             ));
         }
         let grouping = !req.group_by.is_empty();
@@ -5928,6 +6015,7 @@ impl NodeService for NodeServiceImpl {
             .iter()
             .filter_map(|a| a.expr.as_ref())
             .chain(req.histograms.iter().filter_map(|h| h.expr.as_ref()))
+            .chain(req.percentiles.iter().filter_map(|p| p.expr.as_ref()))
         {
             crate::values::column_leaves(expr, &mut leaves);
         }
@@ -5952,6 +6040,14 @@ impl NodeService for NodeServiceImpl {
                     .histograms
                     .iter()
                     .map(|_| crate::pb::ShardHistogram::default())
+                    .collect(),
+                percentile_partials: req
+                    .percentiles
+                    .iter()
+                    .map(|_| crate::pb::PercentilePartial {
+                        vtype: crate::pb::AggregateValueType::Absent as i32,
+                        ..Default::default()
+                    })
                     .collect(),
             }));
         };
@@ -6040,6 +6136,12 @@ impl NodeService for NodeServiceImpl {
                 HistAcc::default(),
             ));
         }
+        let mut pcts: Vec<(Option<(crate::values::ResolvedValue, bool)>, PctAcc)> =
+            Vec::with_capacity(req.percentiles.len());
+        for spec in &req.percentiles {
+            let resolved = resolve_rankable(store, spec.expr.as_ref(), &spec.name, "percentile")?;
+            pcts.push((resolved, PctAcc::default()));
+        }
         let doc_filter = crate::filter::DocFilter {
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
             pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
@@ -6107,6 +6209,12 @@ impl NodeService for NodeServiceImpl {
                     acc.push(x, *interval, *cap, name)?;
                 }
             }
+            for (resolved, acc) in pcts.iter_mut() {
+                let Some((rv, int_typed)) = resolved else { continue };
+                if let Some(v) = crate::values::eval(rv, doc, &cols) {
+                    acc.push(rankable_bits(v, *int_typed));
+                }
+            }
         }
         let mut group_rows: Vec<(u32, u64, Vec<AggAcc>)> = groups
             .into_iter()
@@ -6138,7 +6246,91 @@ impl NodeService for NodeServiceImpl {
                 .iter()
                 .map(|(_, _, _, _, acc)| acc.response())
                 .collect(),
+            percentile_partials: pcts
+                .iter()
+                .map(|(resolved, acc)| {
+                    use crate::pb::AggregateValueType as T;
+                    crate::pb::PercentilePartial {
+                        vtype: match resolved {
+                            None => T::Absent as i32,
+                            Some((_, true)) => T::Int as i32,
+                            Some((_, false)) => T::Double as i32,
+                        },
+                        present: acc.present,
+                        unrankable: acc.unrankable,
+                        min_bits: acc.min_bits,
+                        max_bits: acc.max_bits,
+                    }
+                })
+                .collect(),
         }))
+    }
+
+    async fn quantile_counts(
+        &self,
+        request: Request<crate::pb::QuantileCountsRequest>,
+    ) -> Result<Response<crate::pb::QuantileCountsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::QuantileCounts);
+        let req = request.into_inner();
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let Some(store) = guard.bm25.as_ref() else {
+            return Ok(Response::new(crate::pb::QuantileCountsResponse {
+                counts: vec![0; req.targets.len()],
+            }));
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush before aggregating",
+            ));
+        }
+        let mut exprs = Vec::with_capacity(req.exprs.len());
+        for spec in &req.exprs {
+            exprs.push(resolve_rankable(
+                store,
+                spec.expr.as_ref(),
+                &spec.name,
+                "percentile",
+            )?);
+        }
+        for t in &req.targets {
+            if t.expr_index as usize >= exprs.len() {
+                return Err(Status::internal(
+                    "quantile target refers past the expression list",
+                ));
+            }
+        }
+        let doc_filter = crate::filter::DocFilter {
+            geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+            pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+        };
+        let cols = ShardNumericRead(store);
+        let n = store.doc_count();
+        let mut counts = vec![0u64; req.targets.len()];
+        let mut bits_of = vec![None; exprs.len()];
+        // One admitted-set pass per round: each expression evaluates
+        // once per document, every target reads the cached bits.
+        for local in 0..n {
+            let doc = local as u32;
+            if !doc_filter.passes(doc, &cols) {
+                continue;
+            }
+            for (slot, resolved) in bits_of.iter_mut().zip(&exprs) {
+                *slot = match resolved {
+                    Some((rv, int_typed)) => crate::values::eval(rv, doc, &cols)
+                        .and_then(|v| rankable_bits(v, *int_typed)),
+                    None => None,
+                };
+            }
+            for (count, t) in counts.iter_mut().zip(&req.targets) {
+                if let Some(bits) = bits_of[t.expr_index as usize] {
+                    if bits <= t.threshold_bits {
+                        *count += 1;
+                    }
+                }
+            }
+        }
+        Ok(Response::new(crate::pb::QuantileCountsResponse { counts }))
     }
 
     async fn health(

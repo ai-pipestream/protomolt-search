@@ -269,22 +269,34 @@ pub(crate) fn compile_projections(
     Ok(compiled)
 }
 
+/// The compiled aggregate request: everything the fan-out sends and
+/// the merge needs.
+pub(crate) struct CompiledAggregate {
+    aggregations: Vec<crate::pb::CompiledAggregation>,
+    histograms: Vec<crate::pb::CompiledHistogram>,
+    percentiles: Vec<crate::pb::CompiledPercentile>,
+    percentile_specs: Vec<crate::pb::PercentileSpec>,
+    group_by: String,
+    max_groups: u32,
+}
+
 /// Compile the public aggregation list: names checked, ops decoded,
 /// expressions compiled once into the ValueExpr IR the shards resolve.
 pub(crate) fn compile_aggregations(
-    aggregations: &[crate::pb::Aggregation],
-    histograms: &[crate::pb::HistogramSpec],
-) -> Result<
-    (
-        Vec<crate::pb::CompiledAggregation>,
-        Vec<crate::pb::CompiledHistogram>,
-    ),
-    Status,
-> {
-    if aggregations.is_empty() && histograms.is_empty() {
+    req: &crate::pb::AggregateRequest,
+) -> Result<CompiledAggregate, Status> {
+    let (aggregations, histograms, percentiles) =
+        (&req.aggregations, &req.histograms, &req.percentiles);
+    if aggregations.is_empty() && histograms.is_empty() && percentiles.is_empty() {
         return Err(Status::invalid_argument(
-            "aggregate requires at least one aggregation or histogram",
+            "aggregate requires at least one aggregation, histogram, or percentile",
         ));
+    }
+    if percentiles.len() > 8 {
+        return Err(Status::invalid_argument(format!(
+            "aggregate takes at most 8 percentile specs per request, got {}",
+            percentiles.len()
+        )));
     }
     if aggregations.len() > 32 {
         return Err(Status::invalid_argument(format!(
@@ -357,7 +369,115 @@ pub(crate) fn compile_aggregations(
             name: h.name.clone(),
         });
     }
-    Ok((compiled, compiled_hists))
+    let mut compiled_pcts = Vec::with_capacity(percentiles.len());
+    for spec in percentiles {
+        if spec.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "percentile: a percentile spec needs a non-empty name",
+            ));
+        }
+        if !names.insert(spec.name.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "aggregation: duplicate aggregation name {:?}",
+                spec.name
+            )));
+        }
+        if spec.percentiles.is_empty() || spec.percentiles.len() > 16 {
+            return Err(Status::invalid_argument(format!(
+                "percentile {:?}: 1 to 16 percentile values per spec, got {}",
+                spec.name,
+                spec.percentiles.len()
+            )));
+        }
+        for &p in &spec.percentiles {
+            if !(p.is_finite() && (0.0..=100.0).contains(&p)) {
+                return Err(Status::invalid_argument(format!(
+                    "percentile {:?}: {p} is not a percentile; values are finite in \
+                     [0, 100]",
+                    spec.name
+                )));
+            }
+        }
+        let expr = crate::cel::compile_value(&spec.expression).map_err(|e| {
+            Status::invalid_argument(format!("percentile {:?}: {}", spec.name, e.message()))
+        })?;
+        compiled_pcts.push(crate::pb::CompiledPercentile {
+            expr: Some(expr),
+            name: spec.name.clone(),
+        });
+    }
+    Ok(CompiledAggregate {
+        aggregations: compiled,
+        histograms: compiled_hists,
+        percentiles: compiled_pcts,
+        percentile_specs: req.percentiles.clone(),
+        group_by: req.group_by.clone(),
+        max_groups: if req.max_groups == 0 {
+            1000
+        } else {
+            req.max_groups
+        },
+    })
+}
+
+/// One percentile expression's merged phase-1 statistics.
+struct PctMerge {
+    vt: Option<crate::pb::AggregateValueType>,
+    present: u64,
+    unrankable: u64,
+    min_bits: u64,
+    max_bits: u64,
+}
+
+impl PctMerge {
+    fn new() -> Self {
+        Self {
+            vt: None,
+            present: 0,
+            unrankable: 0,
+            min_bits: 0,
+            max_bits: 0,
+        }
+    }
+
+    fn fold(&mut self, p: &crate::pb::PercentilePartial, name: &str) -> Result<(), Status> {
+        use crate::pb::AggregateValueType as T;
+        let vt = match T::try_from(p.vtype) {
+            Ok(T::Absent) => return Ok(()),
+            Ok(T::Int) => T::Int,
+            Ok(T::Double) => T::Double,
+            _ => {
+                return Err(Status::internal(
+                    "shard answered a percentile partial without a numeric type",
+                ));
+            }
+        };
+        match self.vt {
+            None => self.vt = Some(vt),
+            Some(prev) if prev != vt => {
+                return Err(Status::failed_precondition(format!(
+                    "percentile {name:?}: shards disagree on the expression's type \
+                     ({} against {}); the column families diverge across shards",
+                    agg_vt_name(prev),
+                    agg_vt_name(vt)
+                )));
+            }
+            Some(_) => {}
+        }
+        self.unrankable += p.unrankable;
+        if p.present == 0 {
+            return Ok(());
+        }
+        if self.present == 0 {
+            self.min_bits = p.min_bits;
+            self.max_bits = p.max_bits;
+        } else {
+            self.min_bits = self.min_bits.min(p.min_bits);
+            self.max_bits = self.max_bits.max(p.max_bits);
+        }
+        self.present += p.present;
+        Ok(())
+    }
 }
 
 /// One aggregation's merged fleet-wide statistics: a type vote plus
@@ -4211,16 +4331,21 @@ impl CoordinatorServiceImpl {
     /// bit-for-bit across runs. The typo rules hold as on every
     /// filtered route, and expression column leaves follow the
     /// projection contract: a leaf NO shard knows refuses by name.
-    pub async fn fanout_aggregate(
+    pub(crate) async fn fanout_aggregate(
         &self,
         filters: &RequestFilters,
-        aggregations: &[crate::pb::CompiledAggregation],
-        histograms: &[crate::pb::CompiledHistogram],
-        group_by: &str,
-        max_groups: u32,
+        compiled: &CompiledAggregate,
     ) -> Result<crate::pb::AggregateResponse, Status> {
+        let CompiledAggregate {
+            aggregations,
+            histograms,
+            percentiles,
+            percentile_specs,
+            group_by,
+            max_groups,
+        } = compiled;
         let grouping = !group_by.is_empty();
-        let group_cap = max_groups as usize;
+        let group_cap = *max_groups as usize;
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
             let request = crate::pb::AggregateShardRequest {
@@ -4228,8 +4353,9 @@ impl CoordinatorServiceImpl {
                 geo_filters: filters.geo.clone(),
                 aggregations: aggregations.to_vec(),
                 group_by: group_by.to_string(),
-                max_groups,
+                max_groups: *max_groups,
                 histograms: histograms.to_vec(),
+                percentiles: percentiles.to_vec(),
             };
             let client = self.node_client(node);
             tasks.push(tokio::spawn(async move {
@@ -4246,6 +4372,7 @@ impl CoordinatorServiceImpl {
             .iter()
             .filter_map(|a| a.expr.as_ref())
             .chain(histograms.iter().filter_map(|h| h.expr.as_ref()))
+            .chain(percentiles.iter().filter_map(|p| p.expr.as_ref()))
         {
             crate::values::column_leaves(expr, &mut leaves);
         }
@@ -4264,6 +4391,7 @@ impl CoordinatorServiceImpl {
             histograms.iter().map(|_| Default::default()).collect();
         let mut hist_present = vec![0u64; histograms.len()];
         let mut hist_unbucketable = vec![0u64; histograms.len()];
+        let mut pct_merged: Vec<PctMerge> = percentiles.iter().map(|_| PctMerge::new()).collect();
         for task in tasks {
             let response = task
                 .await
@@ -4327,6 +4455,19 @@ impl CoordinatorServiceImpl {
                     response.histograms.len(),
                     histograms.len()
                 )));
+            }
+            if response.percentile_partials.len() != percentiles.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} percentile partials for {} requested",
+                    response.percentile_partials.len(),
+                    percentiles.len()
+                )));
+            }
+            for (m, (p, spec)) in pct_merged
+                .iter_mut()
+                .zip(response.percentile_partials.iter().zip(percentiles))
+            {
+                m.fold(p, &spec.name)?;
             }
             for (i, (shard_hist, spec)) in
                 response.histograms.iter().zip(histograms).enumerate()
@@ -4397,13 +4538,168 @@ impl CoordinatorServiceImpl {
                 unbucketable: hist_unbucketable[i],
             })
             .collect();
+        let pct_results = self
+            .solve_percentiles(filters, percentile_specs, percentiles, &pct_merged)
+            .await?;
         Ok(crate::pb::AggregateResponse {
             results,
             matched,
             groups: group_results,
             ungrouped: if grouping { ungrouped } else { 0 },
             histograms: hist_results,
+            percentiles: pct_results,
         })
+    }
+
+    /// The exact-percentile binary search (docs/aggregations.md): every
+    /// requested (spec, percentile) target converges simultaneously
+    /// over at most 64 count-below rounds in the order-bits domain, and
+    /// each answer is the nearest-rank order statistic — a value some
+    /// admitted document actually holds, never an interpolation.
+    async fn solve_percentiles(
+        &self,
+        filters: &RequestFilters,
+        specs: &[crate::pb::PercentileSpec],
+        compiled: &[crate::pb::CompiledPercentile],
+        merged: &[PctMerge],
+    ) -> Result<Vec<crate::pb::PercentileResult>, Status> {
+        struct Target {
+            spec: usize,
+            pct_index: usize,
+            k: u64,
+            lo: u64,
+            hi: u64,
+        }
+        let mut targets = Vec::new();
+        for (si, (spec, m)) in specs.iter().zip(merged).enumerate() {
+            if m.present == 0 {
+                continue;
+            }
+            for (pi, &p) in spec.percentiles.iter().enumerate() {
+                // Nearest rank: the k-th smallest, k = ceil(p/100 * n)
+                // clamped into [1, n].
+                let k = ((p / 100.0 * m.present as f64).ceil() as u64).clamp(1, m.present);
+                targets.push(Target {
+                    spec: si,
+                    pct_index: pi,
+                    k,
+                    lo: m.min_bits,
+                    hi: m.max_bits,
+                });
+            }
+        }
+        // Invariant per target: the answer (the smallest bits value b
+        // with count(<= b) >= k) lies in [lo, hi]. Bit space is 64
+        // wide, so at most 64 rounds close every window.
+        while targets.iter().any(|t| t.lo < t.hi) {
+            let active: Vec<usize> = (0..targets.len())
+                .filter(|&i| targets[i].lo < targets[i].hi)
+                .collect();
+            let probes: Vec<crate::pb::QuantileTarget> = active
+                .iter()
+                .map(|&i| {
+                    let t = &targets[i];
+                    crate::pb::QuantileTarget {
+                        expr_index: t.spec as u32,
+                        threshold_bits: t.lo + (t.hi - t.lo) / 2,
+                    }
+                })
+                .collect();
+            let counts = self.quantile_round(filters, compiled, &probes).await?;
+            for (&i, (probe, count)) in active.iter().zip(probes.iter().zip(counts)) {
+                let t = &mut targets[i];
+                if count >= t.k {
+                    t.hi = probe.threshold_bits;
+                } else {
+                    t.lo = probe.threshold_bits + 1;
+                }
+            }
+        }
+        let mut answers: Vec<Vec<Option<(u64, u64)>>> = specs
+            .iter()
+            .map(|s| vec![None; s.percentiles.len()])
+            .collect();
+        for t in &targets {
+            answers[t.spec][t.pct_index] = Some((t.k, t.lo));
+        }
+        let mut results = Vec::with_capacity(specs.len());
+        for (si, (spec, m)) in specs.iter().zip(merged).enumerate() {
+            use crate::pb::percentile_value::Value as W;
+            let int_typed = m.vt == Some(crate::pb::AggregateValueType::Int);
+            let values = spec
+                .percentiles
+                .iter()
+                .enumerate()
+                .map(|(pi, &p)| {
+                    let (rank, value) = match answers[si][pi] {
+                        None => (0, None),
+                        Some((k, bits)) => (
+                            k,
+                            Some(if int_typed {
+                                W::IntValue(crate::node::i64_from_order_bits(bits))
+                            } else {
+                                W::DoubleValue(crate::node::f64_from_order_bits(bits))
+                            }),
+                        ),
+                    };
+                    crate::pb::PercentileValue {
+                        percentile: p,
+                        rank,
+                        value,
+                    }
+                })
+                .collect();
+            results.push(crate::pb::PercentileResult {
+                name: spec.name.clone(),
+                present: m.present,
+                unrankable: m.unrankable,
+                values,
+            });
+        }
+        Ok(results)
+    }
+
+    /// One count-below round against every shard, counts summed per
+    /// target.
+    async fn quantile_round(
+        &self,
+        filters: &RequestFilters,
+        exprs: &[crate::pb::CompiledPercentile],
+        targets: &[crate::pb::QuantileTarget],
+    ) -> Result<Vec<u64>, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::QuantileCountsRequest {
+                filter: filters.tree.clone(),
+                geo_filters: filters.geo.clone(),
+                exprs: exprs.to_vec(),
+                targets: targets.to_vec(),
+            };
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .quantile_counts(request)
+                    .await
+                    .map(|r| r.into_inner())
+            }));
+        }
+        let mut totals = vec![0u64; targets.len()];
+        for task in tasks {
+            let response = task
+                .await
+                .map_err(|e| Status::internal(format!("quantile task failed: {e}")))??;
+            if response.counts.len() != totals.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} quantile counts for {} targets",
+                    response.counts.len(),
+                    totals.len()
+                )));
+            }
+            for (total, c) in totals.iter_mut().zip(&response.counts) {
+                *total += *c;
+            }
+        }
+        Ok(totals)
     }
 
     pub async fn fanout_calibration(
@@ -5395,22 +5691,10 @@ impl SearchService for CoordinatorServiceImpl {
     ) -> Result<Response<crate::pb::AggregateResponse>, Status> {
         let req = request.into_inner();
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
-        let (compiled, compiled_hists) =
-            compile_aggregations(&req.aggregations, &req.histograms)?;
-        let max_groups = if req.max_groups == 0 {
-            1000
-        } else {
-            req.max_groups
-        };
-        self.fanout_aggregate(
-            &filters,
-            &compiled,
-            &compiled_hists,
-            &req.group_by,
-            max_groups,
-        )
-        .await
-        .map(Response::new)
+        let compiled = compile_aggregations(&req)?;
+        self.fanout_aggregate(&filters, &compiled)
+            .await
+            .map(Response::new)
     }
 
     async fn cluster_health(

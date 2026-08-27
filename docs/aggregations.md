@@ -1,11 +1,11 @@
 # Aggregations: exact folds over the filtered corpus
 
-Status: increments 1 and 2 implemented (2026-08-27) — COUNT / SUM /
-MIN / MAX / MEAN / VARIANCE / STDDEV of CEL value expressions over
-the filter-admitted document set, per-shard partials merged exactly;
-plus group-by-facet (every aggregation folded per facet value) and
-fixed-interval histograms. Exact percentiles are the next increment
-(`docs/plans/roadmap-2026-08.md`).
+Status: complete (2026-08-27) — COUNT / SUM / MIN / MAX / MEAN /
+VARIANCE / STDDEV of CEL value expressions over the filter-admitted
+document set, per-shard partials merged exactly; group-by-facet
+(every aggregation folded per facet value); fixed-interval
+histograms; and EXACT percentiles (nearest-rank order statistics via
+count-below binary search, never a sketch).
 
 `SearchService.Aggregate` is the analytics half of the value layer:
 the same compiled expression language that filters
@@ -119,12 +119,44 @@ Bucket cardinality is capped per histogram (`max_buckets`, default
 1024), refusing loudly with the honest fixes: a coarser interval or a
 tighter filter.
 
-## 6. What this is not (yet)
+## 6. Exact percentiles
 
-No percentiles — next increment (exact, via coordinator-driven
-count-below rounds, not a sketch). No per-group histograms, no
-nested grouping. No text-scoped aggregation: the scope is the
-FILTER's admitted set, not a BM25 result set (facet counts already
-serve the search routes). And deliberately no approximate anything:
-when an exact answer needs a different request shape, the refusal
-says which.
+The headline. Every mainstream search engine answers percentiles with
+a sketch (t-digest, HDR) and calls the error acceptable. This engine
+answers the EXACT nearest-rank order statistic — for percentile p
+over n present values, the k-th smallest with k = max(1, ceil(p/100
+n)) — a value some admitted document actually holds, never an
+interpolation, never an estimate.
+
+The algorithm is a coordinator-driven binary search over the
+ORDER-BITS domain (the same order-preserving u64 keys sorted browse
+uses: offset-binary for i64, sign-flip for f64), which makes
+convergence exact and bounded: at most 64 count-below rounds close
+every window, no epsilon anywhere. Phase 1 rides the ordinary
+AggregateShard fan-out (per-expression type vote, rankable count,
+global min/max bits); then every requested (spec, percentile) target
+converges SIMULTANEOUSLY — one `QuantileCounts` round per iteration
+carries all still-open thresholds, each shard answers them in a
+single admitted-set pass with each expression evaluated once per
+document. Cost is O(rounds) admitted-set scans, bounded by 64 total
+regardless of how many percentiles are asked: exactness paid in
+scans, not in memory or error.
+
+Typing and absence: int expressions answer ints, double expressions
+doubles (the type vote refuses cross-shard divergence); p = 0 is the
+minimum, p = 100 the maximum, p = 50 the lower median on even
+counts, and every answer reports its rank k. A computed NaN is
+`unrankable` — reported, excluded from ranking, never dropped
+silently; infinities rank at the ends. An empty selection answers
+rank 0 with no value. Percentiles are fleet-wide only (they ignore
+`group_by`); up to 8 specs of up to 16 percentiles each, one name
+namespace with everything else.
+
+## 7. What this is not (yet)
+
+No per-group histograms or per-group percentiles, no nested
+grouping. No text-scoped aggregation: the scope is the FILTER's
+admitted set, not a BM25 result set (facet counts already serve the
+search routes). And deliberately no approximate anything: when an
+exact answer needs a different request shape, the refusal says
+which.

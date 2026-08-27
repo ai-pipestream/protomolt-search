@@ -15,8 +15,9 @@ use turbovec_search::node::NodeConfig;
 use turbovec_search::pb::node_service_client::NodeServiceClient;
 use turbovec_search::pb::search_service_server::SearchService;
 use turbovec_search::pb::{
-    aggregate_result::Value as W, AddDocumentsRequest, AggregateOp, AggregateRequest,
-    AggregateResponse, Aggregation, FacetValue, HistogramSpec, IntegerValue, NumericValue,
+    aggregate_result::Value as W, percentile_value::Value as P, AddDocumentsRequest, AggregateOp,
+    AggregateRequest, AggregateResponse, Aggregation, FacetValue, HistogramSpec, IntegerValue,
+    NumericValue, PercentileSpec,
 };
 
 use common::{mock::start_mock_analysis, start_empty_node};
@@ -474,16 +475,13 @@ async fn refusals_name_the_aggregation() {
 async fn group_by_facet_folds_per_group() {
     let (coordinator, handles) = start_cluster().await;
     let request = AggregateRequest {
-        filter: String::new(),
-        geo_filters: Vec::new(),
         aggregations: vec![
             agg("n", "price", AggregateOp::Count),
             agg("total", "price", AggregateOp::Sum),
             agg("mean", "price", AggregateOp::Mean),
         ],
         group_by: "court".into(),
-        max_groups: 0,
-        histograms: Vec::new(),
+        ..Default::default()
     };
     let first = coordinator
         .aggregate(Request::new(request.clone()))
@@ -554,16 +552,12 @@ async fn histograms_bucket_exactly() {
     let (coordinator, handles) = start_cluster().await;
     let response = coordinator
         .aggregate(Request::new(AggregateRequest {
-            filter: String::new(),
-            geo_filters: Vec::new(),
-            aggregations: Vec::new(),
-            group_by: String::new(),
-            max_groups: 0,
             histograms: vec![
                 hist("price", "price", 2.5, 0),
                 hist("negated", "0.0 - price", 2.5, 0),
                 hist("inf", "1.0 / (price - price)", 2.5, 0),
             ],
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -600,12 +594,11 @@ async fn histograms_bucket_exactly() {
 async fn caps_and_shapes_refuse_loudly() {
     let (coordinator, handles) = start_cluster().await;
     let base = |aggregations, group_by: &str, max_groups, histograms| AggregateRequest {
-        filter: String::new(),
-        geo_filters: Vec::new(),
         aggregations,
         group_by: group_by.into(),
         max_groups,
         histograms,
+        ..Default::default()
     };
     let status = coordinator
         .aggregate(Request::new(base(
@@ -690,6 +683,184 @@ async fn caps_and_shapes_refuse_loudly() {
         "one name namespace across aggregations and histograms: {}",
         status.message()
     );
+    for h in handles {
+        h.abort();
+    }
+}
+
+fn pct(name: &str, expression: &str, percentiles: &[f64]) -> PercentileSpec {
+    PercentileSpec {
+        name: name.into(),
+        expression: expression.into(),
+        percentiles: percentiles.to_vec(),
+    }
+}
+
+async fn run_percentiles(
+    coordinator: &CoordinatorServiceImpl,
+    filter: &str,
+    percentiles: Vec<PercentileSpec>,
+) -> Result<AggregateResponse, tonic::Status> {
+    coordinator
+        .aggregate(Request::new(AggregateRequest {
+            filter: filter.into(),
+            percentiles,
+            ..Default::default()
+        }))
+        .await
+        .map(|r| r.into_inner())
+}
+
+/// Nearest rank: k = max(1, ceil(p/100 * n)), the k-th smallest.
+fn nearest_rank(sorted: &[f64], p: f64) -> (u64, f64) {
+    let n = sorted.len() as u64;
+    let k = ((p / 100.0 * n as f64).ceil() as u64).clamp(1, n);
+    (k, sorted[(k - 1) as usize])
+}
+
+/// Every percentile answers the exact nearest-rank order statistic, in
+/// the expression's type; computed NaN counts as unrankable; and the
+/// same request answers the same bits twice.
+#[tokio::test]
+async fn percentiles_answer_exact_order_statistics() {
+    let (coordinator, handles) = start_cluster().await;
+    let asked = [0.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 100.0];
+    let specs = vec![
+        pct("price", "price", &asked),
+        pct("year", "year", &[0.0, 50.0, 100.0]),
+        pct(
+            "cheap",
+            "price < 5.0 ? price : (price - price) / 0.0",
+            &[100.0],
+        ),
+    ];
+    let first = run_percentiles(&coordinator, "", specs.clone()).await.unwrap();
+    let second = run_percentiles(&coordinator, "", specs).await.unwrap();
+    assert_eq!(first, second, "percentiles answer the same bits twice");
+
+    let mut prices: Vec<f64> = (0..N_DOCS).filter_map(price_of).collect();
+    prices.sort_unstable_by(f64::total_cmp);
+    let price_result = &first.percentiles[0];
+    assert_eq!(price_result.present, prices.len() as u64);
+    assert_eq!(price_result.unrankable, 0);
+    for (value, &p) in price_result.values.iter().zip(&asked) {
+        let (k, expected) = nearest_rank(&prices, p);
+        assert_eq!(value.percentile, p);
+        assert_eq!(value.rank, k, "p{p}");
+        assert_eq!(
+            value.value,
+            Some(P::DoubleValue(expected)),
+            "p{p} answers the exact k-th smallest"
+        );
+    }
+
+    let mut years: Vec<i64> = (0..N_DOCS).filter_map(year_of).collect();
+    years.sort_unstable();
+    let year_result = &first.percentiles[1];
+    for (value, &p) in year_result.values.iter().zip(&[0.0, 50.0, 100.0]) {
+        let n = years.len() as u64;
+        let k = ((p / 100.0 * n as f64).ceil() as u64).clamp(1, n);
+        assert_eq!(
+            value.value,
+            Some(P::IntValue(years[(k - 1) as usize])),
+            "p{p} answers in the expression's own type"
+        );
+    }
+
+    let cheap = &first.percentiles[2];
+    let rankable: Vec<f64> = prices.iter().copied().filter(|&x| x < 5.0).collect();
+    assert_eq!(cheap.present, rankable.len() as u64);
+    assert_eq!(
+        cheap.unrankable,
+        (prices.len() - rankable.len()) as u64,
+        "computed NaN is reported, never silently dropped"
+    );
+    assert_eq!(
+        cheap.values[0].value,
+        Some(P::DoubleValue(*rankable.last().unwrap())),
+        "p100 ranks only the rankable values"
+    );
+    for h in handles {
+        h.abort();
+    }
+}
+
+/// The filter scopes the ranking, and an empty selection answers rank
+/// 0 with no value.
+#[tokio::test]
+async fn percentiles_respect_the_filter() {
+    let (coordinator, handles) = start_cluster().await;
+    let response = run_percentiles(
+        &coordinator,
+        "court == \"ca9\"",
+        vec![pct("p", "price", &[0.0, 50.0, 100.0])],
+    )
+    .await
+    .unwrap();
+    let mut prices: Vec<f64> = (0..N_DOCS)
+        .filter(|id| court_of(*id) == Some("ca9"))
+        .filter_map(price_of)
+        .collect();
+    prices.sort_unstable_by(f64::total_cmp);
+    let result = &response.percentiles[0];
+    assert_eq!(result.present, prices.len() as u64);
+    for (value, &p) in result.values.iter().zip(&[0.0, 50.0, 100.0]) {
+        let (k, expected) = nearest_rank(&prices, p);
+        assert_eq!(value.rank, k);
+        assert_eq!(value.value, Some(P::DoubleValue(expected)), "p{p}");
+    }
+
+    let empty = run_percentiles(
+        &coordinator,
+        "court == \"nonexistent\"",
+        vec![pct("p", "price", &[50.0])],
+    )
+    .await
+    .unwrap();
+    assert_eq!(empty.percentiles[0].present, 0);
+    assert_eq!(empty.percentiles[0].values[0].rank, 0);
+    assert_eq!(
+        empty.percentiles[0].values[0].value, None,
+        "no values, no percentile, never a fabricated zero"
+    );
+    for h in handles {
+        h.abort();
+    }
+}
+
+/// Percentile refusals name the spec and the problem.
+#[tokio::test]
+async fn percentile_refusals_name_the_spec() {
+    let (coordinator, handles) = start_cluster().await;
+    for (spec, needle) in [
+        (pct("p", "price", &[101.0]), "not a percentile"),
+        (pct("p", "price", &[f64::NAN]), "not a percentile"),
+        (pct("p", "price", &[-1.0]), "not a percentile"),
+        (pct("p", "price", &[]), "1 to 16 percentile values"),
+        (pct("p", "court", &[50.0]), "ranks numbers"),
+        (pct("p", "price > 2.0", &[50.0]), "ranks numbers"),
+        (pct("", "price", &[50.0]), "non-empty name"),
+        (pct("p", "pricee", &[50.0]), "no shard has column pricee"),
+    ] {
+        let status = run_percentiles(&coordinator, "", vec![spec.clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            status.message().contains(needle),
+            "{spec:?}: wanted {needle:?} in {:?}",
+            status.message()
+        );
+    }
+    // One name namespace across all three families.
+    let status = coordinator
+        .aggregate(Request::new(AggregateRequest {
+            aggregations: vec![agg("x", "price", AggregateOp::Count)],
+            percentiles: vec![pct("x", "price", &[50.0])],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(status.message().contains("duplicate"));
     for h in handles {
         h.abort();
     }
