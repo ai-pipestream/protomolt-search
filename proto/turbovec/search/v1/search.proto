@@ -3747,11 +3747,14 @@ message NamedProjection {
   string name = 1;
 
   // CEL value expression over the document's columns: column reads
-  // (dotted names fold, map access by string-literal key), int and
-  // double literals, `+ - * / %`, unary minus, and `double()`. Typing
-  // is stock CEL's: int with int, double with double, mixed arithmetic
-  // refused naming double(). A bare facet or map-facet read projects
-  // the string value; strings join no arithmetic.
+  // (dotted names fold, map access by string-literal key), int,
+  // double, and bool literals, `+ - * / %`, unary minus, `double()`,
+  // comparisons (`== != < <= > >=`), Kleene `&& || !`, and the
+  // ternary `cond ? a : b`. Typing is stock CEL's: int with int,
+  // double with double, mixed arithmetic or comparison refused naming
+  // double(). A bare facet or map-facet read projects the string
+  // value; strings join no arithmetic and compare (`==`/`!=` only)
+  // against string literals.
   string expression = 2;
 }
 
@@ -3766,7 +3769,8 @@ message CompiledProjection {
 
 // ValueExpr is the compiled value-expression IR, the sibling of
 // FilterExpr: leaves read columns or hold literals, nodes are pure
-// arithmetic. Shards resolve column names against their own
+// arithmetic, comparison, Kleene logic, and the conditional.
+// Shards resolve column names against their own
 // dictionaries and evaluate with array reads — never text, never an
 // interpreter.
 message ValueExpr {
@@ -3794,7 +3798,100 @@ message ValueExpr {
     // Unary minus. Kept as its own node because -x and 0-x differ on
     // IEEE signed zero, and stock CEL negates.
     ValueExpr negate = 7;
+
+    // One comparison, bool-typed. Numeric sides follow the arithmetic
+    // rule (int with int, double with double, mixed refused naming
+    // double()); `==`/`!=` also compare a facet or map-facet read
+    // against a string literal, and two bool subexpressions. String
+    // and bool ORDERING refuse by name. Doubles compare IEEE: every
+    // comparison with NaN is false except `!=`, which is true.
+    ValueCompare compare = 8;
+
+    // Kleene `&&` / `||` over bool subexpressions. A determinate
+    // answer absorbs an absent operand — `false && absent` is false,
+    // `true || absent` is true — exactly stock CEL's commutative
+    // error-absorbing logic with absence in the error role; otherwise
+    // an absent operand makes the result absent.
+    ValueLogic logic = 9;
+
+    // Logical `!` over a bool subexpression. Absent stays absent.
+    ValueExpr not = 10;
+
+    // CEL's conditional `cond ? a : b`. The condition is bool and the
+    // branches are the SAME type; only the TAKEN branch's value (and
+    // absence) matters, and an absent condition makes the result
+    // absent.
+    ValueTernary ternary = 11;
+
+    // Bool literal.
+    bool bool_literal = 12;
+
+    // String literal. Legal only as a `==`/`!=` operand against a
+    // facet or map-facet read; a string literal is not a computable
+    // value anywhere else.
+    string string_literal = 13;
   }
+}
+
+// Comparison operations over value subexpressions.
+enum ValueCmpOp {
+  // Zero value. Never present in a compiled expression.
+  VALUE_CMP_OP_UNSPECIFIED = 0;
+  // Equality.
+  VALUE_CMP_OP_EQ = 1;
+  // Inequality.
+  VALUE_CMP_OP_NE = 2;
+  // Less than.
+  VALUE_CMP_OP_LT = 3;
+  // Less than or equal.
+  VALUE_CMP_OP_LE = 4;
+  // Greater than.
+  VALUE_CMP_OP_GT = 5;
+  // Greater than or equal.
+  VALUE_CMP_OP_GE = 6;
+}
+
+// Binary comparison node.
+message ValueCompare {
+  // Left operand.
+  ValueExpr left = 1;
+
+  // Right operand.
+  ValueExpr right = 2;
+
+  // The operation.
+  ValueCmpOp op = 3;
+}
+
+// Kleene logic operations.
+enum ValueLogicOp {
+  // Zero value. Never present in a compiled expression.
+  VALUE_LOGIC_OP_UNSPECIFIED = 0;
+  // Conjunction.
+  VALUE_LOGIC_OP_AND = 1;
+  // Disjunction.
+  VALUE_LOGIC_OP_OR = 2;
+}
+
+// N-ary Kleene logic node; children in source order.
+message ValueLogic {
+  // Bool-typed operands, at least two.
+  repeated ValueExpr children = 1;
+
+  // The operation.
+  ValueLogicOp op = 2;
+}
+
+// The conditional node.
+message ValueTernary {
+  // Bool-typed condition.
+  ValueExpr cond = 1;
+
+  // Value when the condition is true.
+  ValueExpr then_value = 2;
+
+  // Value when the condition is false.
+  ValueExpr else_value = 3;
 }
 
 // One map-column read.
@@ -3848,8 +3945,13 @@ message ProjectedValue {
     // An int-typed result.
     sint64 int_value = 2;
 
-    // A string result: a bare facet or map-facet column read.
+    // A string result: a bare facet or map-facet column read, or a
+    // ternary whose branches read facet columns.
     string string_value = 3;
+
+    // A bool result: a comparison, Kleene logic, `!`, or a bool
+    // literal as the whole expression.
+    bool bool_value = 4;
   }
 }
 

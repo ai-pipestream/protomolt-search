@@ -162,6 +162,7 @@ fn oracle(expr: &str, id: usize) -> Option<projected_value::Value> {
         Ok(cel_interpreter::Value::String(v)) => {
             Some(projected_value::Value::StringValue(v.as_ref().clone()))
         }
+        Ok(cel_interpreter::Value::Bool(v)) => Some(projected_value::Value::BoolValue(v)),
         Ok(other) => panic!("oracle produced a non-scalar: {other:?}"),
         Err(_) => None,
     }
@@ -193,6 +194,20 @@ async fn projections_agree_with_the_stock_cel_oracle() {
         "double(year % 10) * price",
         "2.0 * 3.5",
         "7 * 6",
+        "price > 2.0",
+        "year % 2 == 0",
+        "court == \"ca9\"",
+        "court != \"scotus\"",
+        "price > 2.0 && year % 2 == 0",
+        "price > 100.0 || year >= 1994",
+        "!(price > 2.0)",
+        "price > 2.0 ? price * 2.0 : price / 2.0",
+        "year % 2 == 0 ? year : -year",
+        "court == \"ca9\" ? 1 : 0",
+        "price > 0.5 == (year > 1990)",
+        "(price - price) / 0.0 != (price - price) / 0.0",
+        "true ? price : price + 1.0",
+        "price < 1.0 ? 0.0 : price < 5.0 ? 1.0 : 2.0",
     ];
     let projections: Vec<NamedProjection> = expressions
         .iter()
@@ -281,20 +296,82 @@ async fn absence_and_integer_edges_are_absent_not_errors() {
     }
 }
 
+/// The conditional layer's deviations, pinned: Kleene logic absorbs
+/// an absent operand when the present one determines the answer
+/// (exactly stock CEL's commutative error-absorbing `&&`/`||`, with
+/// absence in the error role), an absent condition makes the ternary
+/// absent, `!` of absent stays absent, and a string literal the
+/// dictionary lacks compares FALSE against a present value — false,
+/// never absent.
+#[tokio::test]
+async fn kleene_absence_and_dictionary_misses_are_pinned() {
+    let (coordinator, handles) = start_cluster(None, &[], &[]).await;
+    let rows = run_projections(
+        &coordinator,
+        vec![
+            projection("absorb_or", "price > 0.0 || year > 0"),
+            projection("absorb_and", "price > 0.0 && year < 0"),
+            projection("open_and", "price < 0.0 && year > 0"),
+            projection("cond", "price > 2.0 ? 1 : 0"),
+            projection("neg", "!(price > 2.0)"),
+            projection("miss", "court == \"nonexistent\""),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), N_DOCS);
+    for (doc_id, values) in rows {
+        let id = doc_id as usize;
+        let t = Some(projected_value::Value::BoolValue(true));
+        let f = Some(projected_value::Value::BoolValue(false));
+        assert_eq!(values[0], t, "doc {id}: a true leg absorbs an absent one");
+        if year_of(id).is_none() {
+            assert!(
+                values[1].is_none(),
+                "doc {id}: true && absent stays absent; truth determines nothing for `&&`"
+            );
+        } else {
+            assert_eq!(values[1], f, "doc {id}: a false leg absorbs an absent one");
+        }
+        if price_of(id).is_none() {
+            assert!(
+                values[2].is_none(),
+                "doc {id}: absent && true is absent, not false"
+            );
+            assert!(values[3].is_none(), "doc {id}: absent condition, absent result");
+            assert!(values[4].is_none(), "doc {id}: `!` of absent stays absent");
+        } else {
+            assert!(values[2].is_some(), "doc {id}: both legs present");
+            assert!(values[3].is_some(), "doc {id}: present condition");
+            assert!(values[4].is_some(), "doc {id}: present operand");
+        }
+        assert_eq!(
+            values[5], f,
+            "doc {id}: a dictionary miss compares false against a present value"
+        );
+    }
+    for h in handles {
+        h.abort();
+    }
+}
+
 /// Refusals, by name: a typo'd column no shard knows, mixed-type
 /// arithmetic, predicate constructs, unknown functions, `%` on
 /// doubles, duplicate and empty names.
 #[tokio::test]
 async fn projection_refusals_name_the_problem() {
     let (coordinator, handles) = start_cluster(None, &[], &[]).await;
-    let cases: [(&str, &str); 7] = [
+    let cases: [(&str, &str); 10] = [
         ("pricee * 2.0", "no shard has column pricee"),
         ("price + year", "double()"),
-        ("price > 2.0", "predicate construct"),
+        ("price > year", "mixes an int and a double"),
         ("size(court)", "size()"),
         ("price % 2.0", "integer-only"),
         ("court * 2", "arithmetic"),
         ("has(price)", "has()"),
+        ("price ? 1 : 2", "condition is a"),
+        ("court < \"m\"", "orders strings"),
+        ("court == price", "string column compares only"),
     ];
     for (expr, needle) in cases {
         let status = run_projections(&coordinator, vec![projection("p", expr)])
@@ -440,6 +517,97 @@ async fn materialize_kind_mismatch_refuses_loudly() {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
         status.message().contains("double(...)"),
+        "the refusal must name the fix: {}",
+        status.message()
+    );
+    node.abort();
+    mock.abort();
+}
+
+/// The ternary buckets at ingest: a materialized column computed
+/// through the conditional layer stores, filters, and projects like
+/// any other, and a BOOL-valued expression refuses naming the ternary
+/// as the fix.
+#[tokio::test]
+async fn ternary_materialization_buckets_and_bool_refuses() {
+    let spec = MaterializeSpec {
+        columns: vec![MaterializedColumn {
+            name: "tier".into(),
+            expression: "year >= 1994 ? 1 : 0".into(),
+            kind: MaterializeKind::I64 as i32,
+        }],
+    };
+    let (coordinator, handles) = start_cluster(Some(spec), &[], &["tier"]).await;
+    let rows = run_projections(&coordinator, vec![projection("t", "tier")])
+        .await
+        .unwrap();
+    for (doc_id, values) in rows {
+        let id = doc_id as usize;
+        match year_of(id) {
+            Some(y) => assert_eq!(
+                values[0],
+                Some(projected_value::Value::IntValue(i64::from(y >= 1994))),
+                "doc {id}: tier must be the ingest-time bucket"
+            ),
+            None => assert!(values[0].is_none(), "doc {id}: no year, no tier"),
+        }
+    }
+    let response = coordinator
+        .bm25_search(Request::new(Bm25SearchRequest {
+            text: "document".into(),
+            k: N_DOCS as u32,
+            filter: "tier == 1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let expect: Vec<u64> = (0..N_DOCS)
+        .filter(|&id| year_of(id).is_some_and(|y| y >= 1994))
+        .map(|id| id as u64)
+        .collect();
+    let mut got: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
+    got.sort_unstable();
+    assert_eq!(got, expect, "the bucket must filter exactly");
+    for h in handles {
+        h.abort();
+    }
+
+    // A bool never stores: the refusal names the ternary as the fix.
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addr, node) = start_empty_node(NodeConfig {
+        analysis_addr: Some(analysis),
+        integer_fields: vec!["year".into(), "flag".into()],
+        ..Default::default()
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    let (tx, rx) = mpsc::channel(4);
+    tx.send(AddDocumentsRequest {
+        text: "a document".into(),
+        integers: vec![IntegerValue {
+            field: "year".into(),
+            value: 1999,
+        }],
+        materialize: Some(MaterializeSpec {
+            columns: vec![MaterializedColumn {
+                name: "flag".into(),
+                expression: "year > 0".into(),
+                kind: MaterializeKind::I64 as i32,
+            }],
+        }),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let status = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .expect_err("a bool expression into a stored column must refuse");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("ternary"),
         "the refusal must name the fix: {}",
         status.message()
     );
