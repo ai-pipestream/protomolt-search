@@ -3543,6 +3543,84 @@ impl CoordinatorServiceImpl {
         });
         Ok((ranked, dbg))
     }
+    /// Candidate-scoped LEXICAL signal for the public route's boost
+    /// phase: analyze `text` under `spec`, then score `ids` against
+    /// the analyzed terms with GLOBAL stats through the `Bm25Rescore`
+    /// seam, broadcast to every shard — the rescore contract ignores
+    /// ids a shard does not own, so no id-to-shard map is needed.
+    /// Returns doc -> score for exactly the candidates matching at
+    /// least one term; absence means the document matched nothing.
+    pub async fn lexical_signal(
+        &self,
+        text: &str,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        ids: &[u64],
+    ) -> Result<HashMap<u64, f32>, Status> {
+        if text.is_empty() {
+            return Err(Status::invalid_argument(
+                "boost.text must be non-empty when boost is present",
+            ));
+        }
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+        })?;
+        let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+        let mut terms: Vec<String> = Vec::new();
+        for (term, _, _) in analyzed.into_body().terms {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+        if terms.is_empty() || ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let by_shard: HashMap<u32, Vec<u64>> = (0..self.node_addrs.len())
+            .map(|s| (s as u32, ids.to_vec()))
+            .collect();
+        // Stats + rescore run as a round (a stale-stats refusal reruns
+        // them once with fresh stats and no claim) — the same protocol
+        // as every other stats consumer.
+        let mut fresh = false;
+        loop {
+            let (global, epochs) = self.body_stats(&terms, fresh).await?;
+            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            match self
+                .fanout_bm25_rescore_scores(&terms, &global, &claims, by_shard.clone())
+                .await
+            {
+                Err(e) if !fresh && is_stale_stats(&e) => {
+                    self.stats_cache.invalidate_all();
+                    fresh = true;
+                }
+                Err(e) => return Err(e),
+                Ok(scores) => return Ok(scores),
+            }
+        }
+    }
+
+    /// Candidate-scoped DENSE signal for the public route's boost
+    /// phase (the `VectorRescore` seam), broadcast to every shard.
+    /// Present exactly for the candidates that carry a vector; scores
+    /// are bitwise the same calibrated products a full search emits.
+    pub async fn dense_signal(
+        &self,
+        vector: &[f32],
+        ids: &[u64],
+    ) -> Result<HashMap<u64, f32>, Status> {
+        if vector.is_empty() {
+            return Err(Status::invalid_argument(
+                "a dense boost needs a non-empty vector",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let by_shard: HashMap<u32, Vec<u64>> = (0..self.node_addrs.len())
+            .map(|s| (s as u32, ids.to_vec()))
+            .collect();
+        self.fanout_vector_rescore(vector, by_shard).await
+    }
+
     /// Second-pass lexical boost (see the proto's `BoostRescore`): score
     /// the top-`window` hits against the boost query's terms through the
     /// candidate-scoped `Bm25Rescore` seam and reorder the window by

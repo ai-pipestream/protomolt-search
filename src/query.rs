@@ -264,12 +264,15 @@ pub async fn execute(
         )));
     }
 
-    let boost = parse_boost(&req.boosts, &plan.shape, scorer.is_some())?;
-    // On a single-leaf shape without a scorer no phase uses extra
-    // selection depth; on a composite it is the leg/gate depth (and
-    // the paging pool), and with a scorer it is the pool the scorer
-    // reorders.
-    let pooled = matches!(plan.shape, Shape::Composite { .. }) || scorer.is_some();
+    let boosts = parse_boosts(&req.boosts, &plan.shape, scorer.is_some())?;
+    // On a single-leaf shape without a scorer or boost no phase uses
+    // extra selection depth; on a composite it is the leg/gate depth
+    // (and the paging pool), with a scorer it is the pool the scorer
+    // reorders, and with a boost it is the pool the boost rescores
+    // (the honest form of the rescore window).
+    let pooled = matches!(plan.shape, Shape::Composite { .. })
+        || scorer.is_some()
+        || !req.boosts.is_empty();
     if !pooled && selection_k != req.k {
         return Err(refuse(
             "selection_k differs from k but nothing on a single-leaf shape uses the \
@@ -428,6 +431,7 @@ pub async fn execute(
                     dimensions: Vec::new(),
                 })
                 .collect();
+            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
             let executed = apply_scorer(&scorer, &mut hits, "bm25_search")?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
             Ok(done(req.request_id, hits, &executed, next))
@@ -461,6 +465,7 @@ pub async fn execute(
                     dimensions: Vec::new(),
                 })
                 .collect();
+            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
             let executed = apply_scorer(&scorer, &mut hits, "search")?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
             Ok(done(response.request_id, hits, &executed, next))
@@ -473,7 +478,11 @@ pub async fn execute(
             strategy,
         } => {
             let (mode, legs) = leg_options(strategy, selection_k);
-            let boost_id = boost.as_ref().map(|(id, _)| id.to_string());
+            let legacy = match &boosts {
+                BoostPlan::LegacyHybrid(id, b) => Some((id.clone(), b.clone())),
+                _ => None,
+            };
+            let boost_id = legacy.as_ref().map(|(id, _)| id.clone());
             let response = coordinator
                 .hybrid_search(Request::new(HybridSearchRequest {
                     request_id: req.request_id.clone(),
@@ -486,7 +495,7 @@ pub async fn execute(
                     k: selection_k,
                     analysis: lexical.analysis.clone(),
                     legs: Some(legs),
-                    boost: boost.map(|(_, b)| b),
+                    boost: legacy.map(|(_, b)| b),
                     geo_filters: plan.geo_filters.clone(),
                     filter,
                     ..Default::default()
@@ -586,6 +595,7 @@ pub async fn execute(
                 FusionMode::Decomposed => "hybrid_search:decomposed",
                 _ => "hybrid_search:cascade",
             };
+            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
             let executed = apply_scorer(&scorer, &mut hits, route)?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
             Ok(done(response.request_id, hits, &executed, next))
@@ -921,77 +931,223 @@ fn leg_options(strategy: &Strategy<'_>, selection_k: u32) -> (FusionMode, Hybrid
     (mode, legs)
 }
 
-/// Boost validation: at most one, lexical, composite selections only
-/// (it maps to the hybrid route's BoostRescore). With a composite
-/// scorer present the boost is signal-only: the scorer owns
-/// combination, so the reorder knobs (window, base_weight,
-/// boost_weight) are refused — each would be a silent no-op — and the
-/// whole candidate set is scored.
-fn parse_boost<'a>(
+/// One validated boost query, ready to score adapter-side through the
+/// candidate-scoped rescore seams.
+struct ParsedBoost<'a> {
+    id: &'a str,
+    kind: BoostKind<'a>,
+    window: u32,
+    base_weight: f32,
+    boost_weight: f32,
+}
+
+enum BoostKind<'a> {
+    /// A lexical boost with the analysis it resolves to: the
+    /// selection's lexical leaf's spec when one exists (term identity
+    /// must match the index the leaf searched), the boost's own on a
+    /// dense-only selection (there is nothing to inherit).
+    Lexical {
+        text: &'a str,
+        analysis: Option<crate::pb::AnalysisSpec>,
+    },
+    Dense { vector: &'a [f32] },
+}
+
+/// How the request's boosts execute.
+enum BoostPlan<'a> {
+    None,
+    /// The composite + single lexical boost without a scorer keeps its
+    /// original engine path (`BoostRescore` on the hybrid route),
+    /// bitwise.
+    LegacyHybrid(String, BoostRescore),
+    /// Everything else scores adapter-side through the rescore seams:
+    /// signal-only under a scorer, the weighted window reorder alone.
+    Adapter(Vec<ParsedBoost<'a>>),
+}
+
+/// Boost validation. A boost never admits a document; it scores the
+/// fixed candidate pool. Without a scorer exactly one boost is served
+/// (its base_weight/boost_weight reorder is the combination); multiple
+/// boosts need the composite scorer, which owns combination. With a
+/// scorer present every boost is signal-only: the reorder knobs
+/// (window, base_weight, boost_weight) are refused — each would be a
+/// silent no-op — and the whole candidate set is scored.
+fn parse_boosts<'a>(
     boosts: &'a [crate::pb::BoostQuery],
-    shape: &Shape<'_>,
+    shape: &Shape<'a>,
     scorer_present: bool,
-) -> Result<Option<(&'a str, BoostRescore)>, Status> {
-    let boost = match boosts {
-        [] => return Ok(None),
-        [one] => one,
-        many => {
-            return Err(refuse(format!(
-                "{} boost queries; increment 1 serves at most one (the hybrid route's \
-                 single BoostRescore)",
-                many.len()
-            )))
-        }
-    };
-    if !matches!(shape, Shape::Composite { .. }) {
+) -> Result<BoostPlan<'a>, Status> {
+    if boosts.is_empty() {
+        return Ok(BoostPlan::None);
+    }
+    if matches!(shape, Shape::Browse) {
         return Err(refuse(
-            "a boost on a single-leaf selection is not served yet: the boost rescoring \
-             rides the hybrid route. Use the composite selection, or wait for the \
-             single-leaf boost increment",
+            "a boost needs a SCORED selection: a browse has no base order to boost, and \
+             reordering its deterministic id order would make it a scored query in \
+             disguise",
         ));
     }
-    let query = boost
-        .query
-        .as_ref()
-        .ok_or_else(|| refuse("boost has no query"))?;
-    let Some(search_query::Query::Lexical(lexical)) = query.query.as_ref() else {
+    if boosts.len() > 1 && !scorer_present {
         return Err(refuse(format!(
-            "boost {:?} is not lexical; only a candidate-scoped LEXICAL boost has an \
-             engine path (BoostRescore)",
-            query.id
+            "{} boost queries with no composite scorer; the scorer is what defines how \
+             multiple boost signals combine — name one, or send a single boost with \
+             base_weight/boost_weight",
+            boosts.len()
         )));
-    };
-    if !lexical.score_stages.is_empty() {
-        return Err(refuse(
-            "score_stages on a boost query are not served; stages ride the selection's \
-             lexical leaf only",
-        ));
     }
-    if lexical.analysis.is_some() {
-        return Err(refuse(
-            "a boost query carries no analysis of its own: BoostRescore analyzes the \
-             boost text under the REQUEST's analysis options, so a differing spec here \
-             would be silently ignored",
-        ));
-    }
-    if scorer_present && (boost.window != 0 || boost.base_weight != 0.0 || boost.boost_weight != 0.0)
-    {
-        return Err(refuse(
-            "window, base_weight, and boost_weight belong to the boost's own reorder; \
-             with a composite scorer present the boost is signal-only (the scorer owns \
-             combination and the whole candidate set is scored), so naming them would \
-             be a silent no-op",
-        ));
-    }
-    Ok(Some((
-        &query.id,
-        BoostRescore {
-            text: lexical.text.clone(),
+    let has_lexical_leaf = matches!(shape, Shape::Lexical { .. } | Shape::Composite { .. });
+    let mut parsed = Vec::with_capacity(boosts.len());
+    for boost in boosts {
+        let query = boost
+            .query
+            .as_ref()
+            .ok_or_else(|| refuse("boost has no query"))?;
+        if scorer_present
+            && (boost.window != 0 || boost.base_weight != 0.0 || boost.boost_weight != 0.0)
+        {
+            return Err(refuse(
+                "window, base_weight, and boost_weight belong to the boost's own reorder; \
+                 with a composite scorer present the boost is signal-only (the scorer owns \
+                 combination and the whole candidate set is scored), so naming them would \
+                 be a silent no-op",
+            ));
+        }
+        let kind = match query.query.as_ref() {
+            Some(search_query::Query::Lexical(lexical)) => {
+                if !lexical.score_stages.is_empty() {
+                    return Err(refuse(
+                        "score_stages on a boost query are not served; stages ride the \
+                         selection's lexical leaf only",
+                    ));
+                }
+                if lexical.analysis.is_some() && has_lexical_leaf {
+                    return Err(refuse(
+                        "a boost query carries no analysis of its own when the selection \
+                         has a lexical leaf: the boost text is analyzed under that leaf's \
+                         analysis options (term identity must match the index it \
+                         searched), so a differing spec here would be silently ignored",
+                    ));
+                }
+                if lexical.text.is_empty() {
+                    return Err(refuse(format!("boost {:?} has empty text", query.id)));
+                }
+                let analysis = match shape {
+                    Shape::Lexical { query: leaf, .. } => leaf.analysis.clone(),
+                    Shape::Composite { lexical: leaf, .. } => leaf.analysis.clone(),
+                    Shape::Dense { .. } => lexical.analysis.clone(),
+                    Shape::Browse => unreachable!("refused above"),
+                };
+                BoostKind::Lexical {
+                    text: &lexical.text,
+                    analysis,
+                }
+            }
+            Some(search_query::Query::Dense(dense)) => {
+                if dense.vector.is_empty() {
+                    return Err(refuse(format!(
+                        "dense boost {:?} has an empty vector",
+                        query.id
+                    )));
+                }
+                BoostKind::Dense {
+                    vector: &dense.vector,
+                }
+            }
+            None => return Err(refuse(format!("boost {:?} has no query", query.id))),
+        };
+        parsed.push(ParsedBoost {
+            id: &query.id,
+            kind,
             window: boost.window,
             base_weight: boost.base_weight,
             boost_weight: boost.boost_weight,
-        },
-    )))
+        });
+    }
+    if !scorer_present && parsed.len() == 1 && matches!(shape, Shape::Composite { .. }) {
+        if let BoostKind::Lexical { text, .. } = &parsed[0].kind {
+            return Ok(BoostPlan::LegacyHybrid(
+                parsed[0].id.to_string(),
+                BoostRescore {
+                    text: (*text).to_string(),
+                    window: parsed[0].window,
+                    base_weight: parsed[0].base_weight,
+                    boost_weight: parsed[0].boost_weight,
+                },
+            ));
+        }
+    }
+    Ok(BoostPlan::Adapter(parsed))
+}
+
+/// Score the adapter-side boosts over the candidate pool: each boost
+/// scores the top-`window` of the CURRENT order through its rescore
+/// seam and lands its raw relevance as a named signal on the hits it
+/// scored. Without a scorer (a single boost, by validation) the window
+/// is then reordered by `base_weight * base + boost_weight * boost`
+/// (0 = 1.0, the BoostRescore convention), ties by doc id; hits beyond
+/// the window keep their order after it. The reported score stays the
+/// BASE score — exactly the legacy boost surface: the boost's own
+/// relevance rides provenance, never the score field.
+async fn apply_boosts(
+    coordinator: &CoordinatorServiceImpl,
+    plan: &BoostPlan<'_>,
+    hits: &mut [QueryHit],
+    scorer_present: bool,
+) -> Result<(), Status> {
+    let BoostPlan::Adapter(list) = plan else {
+        return Ok(());
+    };
+    for b in list {
+        let window = if b.window == 0 {
+            hits.len()
+        } else {
+            (b.window as usize).min(hits.len())
+        };
+        let ids: Vec<u64> = hits[..window].iter().map(|h| h.doc_id).collect();
+        let scores = match &b.kind {
+            BoostKind::Lexical { text, analysis } => {
+                coordinator
+                    .lexical_signal(text, analysis.as_ref(), &ids)
+                    .await?
+            }
+            BoostKind::Dense { vector } => coordinator.dense_signal(vector, &ids).await?,
+        };
+        for hit in hits[..window].iter_mut() {
+            if let Some(score) = scores.get(&hit.doc_id) {
+                hit.signals.push(QuerySignal {
+                    id: b.id.to_string(),
+                    score: *score,
+                });
+                hit.matched.push(b.id.to_string());
+            }
+        }
+        if !scorer_present {
+            let base_w = if b.base_weight == 0.0 {
+                1.0
+            } else {
+                f64::from(b.base_weight)
+            };
+            let boost_w = if b.boost_weight == 0.0 {
+                1.0
+            } else {
+                f64::from(b.boost_weight)
+            };
+            let combined = |h: &QueryHit| {
+                let boost = h
+                    .signals
+                    .iter()
+                    .find(|s| s.id == b.id)
+                    .map_or(0.0, |s| f64::from(s.score));
+                base_w * f64::from(h.score) + boost_w * boost
+            };
+            hits[..window].sort_by(|a, c| {
+                combined(c)
+                    .total_cmp(&combined(a))
+                    .then_with(|| a.doc_id.cmp(&c.doc_id))
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Every id in the request — search leaves, filters, boosts — must be

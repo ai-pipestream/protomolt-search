@@ -8,11 +8,15 @@ generic composite scorer is IMPLEMENTED (2026-08-26, `src/ltr.rs`,
 `tests/ltr.rs`): all six operations, per-dimension normalization and
 missing policies, and per-dimension provenance (`QueryHit.dimensions`)
 precise enough to recompute every final score client-side — the
-reconstruction guarantee is a test, not a promise. Stored-value
-dimensions (`ScoreSignal.bounded_value`) and multiple boost queries
-remain refused by name until their increments land. The phase split,
-the boost contract, and the refusal rules in this document are the
-binding contract.
+reconstruction guarantee is a test, not a promise. The boost phase is
+GENERALIZED (2026-08-26): boosts are lexical or dense (the `Bm25Rescore`
+and `VectorRescore` seams), serve any scored selection including
+single-leaf shapes, and combine through the scorer when there is more
+than one — without a scorer, exactly one boost is served and its
+`base_weight`/`boost_weight` reorder is the combination. Stored-value
+dimensions (`ScoreSignal.bounded_value`) remain refused by name until
+their increment lands. The phase split, the boost contract, and the
+refusal rules in this document are the binding contract.
 
 The public model separates three things that are easy to conflate:
 
@@ -286,7 +290,8 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | `OR(dense, lexical)` + score_blend | `HybridSearch` SCORE_BLEND |
 | `OR(dense, lexical)` + decomposed | `HybridSearch` DECOMPOSED |
 | cascade(gate = dense) over {dense, lexical} | `HybridSearch` CASCADE |
-| one lexical boost on a composite selection | `BoostRescore` |
+| one lexical boost on a composite selection, no scorer | `BoostRescore` (bitwise the original path) |
+| boosts otherwise (dense, single-leaf shapes, several under a scorer) | `Bm25Rescore` / `VectorRescore` candidate-scoped seams, adapter-side |
 | filters only (browse, id order, `after`-floor paging) | `BrowseShard` fan-out |
 | browse + `sort` by i64/f64 column (asc/desc) | `BrowseShard` column-keyed heap |
 | projections on one lexical leaf | `Bm25Search.projections` (`docs/cel-values.md`) |
@@ -315,9 +320,8 @@ logic. Vector-plus-CEL has since acquired its ordinary path
 (`docs/vector-filters.md`): `SearchRequest` and `HybridSearchRequest` both
 carry `geo_filters` and a CEL `filter`, and every fusion mode applies them to
 both legs. Shapes still not represented by the table — arbitrary nested
-boolean search, multiple boost queries, boosts on single-leaf shapes,
-and stored-value scorer dimensions — remain unsupported until their
-ordinary engine paths exist. The public RPC must return `INVALID_ARGUMENT` or
+boolean search and stored-value scorer dimensions — remain unsupported
+until their ordinary engine paths exist. The public RPC must return `INVALID_ARGUMENT` or
 `FAILED_PRECONDITION` for such a shape; compatibility never authorizes a
 heuristic substitute.
 
