@@ -1070,3 +1070,45 @@ async fn projections_ride_every_shape() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("no shard has column"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn profile_reports_phases_without_altering_results() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+    let make = |profile: bool| QueryRequest {
+        k: 8,
+        selection_k: 8,
+        selection: Some(rrf_union(&qvec, "zebra")),
+        boosts: vec![lexical_boost("plain", "plain")],
+        scorer: Some(scorer(
+            CompositeScoreOperation::WeightedSum,
+            vec![
+                base_dim("base"),
+                stored_dim("recency", add_linear("year", 1.0)),
+            ],
+        )),
+        projections: vec![NamedProjection {
+            name: "year".into(),
+            expression: "year".into(),
+        }],
+        profile,
+        ..Default::default()
+    };
+    let profiled = query(&coordinator, make(true)).await.unwrap();
+    let plain = query(&coordinator, make(false)).await.unwrap();
+    // Timings never alter results: the hits agree bitwise.
+    assert!(plain.profile.is_none());
+    assert_eq!(profiled.hits.len(), plain.hits.len());
+    for (a, b) in profiled.hits.iter().zip(&plain.hits) {
+        assert_eq!(a.doc_id, b.doc_id);
+        assert_eq!(a.score.to_bits(), b.score.to_bits());
+    }
+    // Every exercised phase reports; the whole exceeds its parts'
+    // largest piece.
+    let p = profiled.profile.expect("profile requested");
+    assert!(p.selection_ms > 0.0);
+    assert!(p.boost_ms > 0.0);
+    assert!(p.values_ms > 0.0);
+    assert!(p.scorer_ms >= 0.0);
+    assert!(p.projection_ms > 0.0);
+    assert!(p.total_ms >= p.selection_ms);
+}

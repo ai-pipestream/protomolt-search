@@ -193,12 +193,10 @@ pub async fn execute(
     coordinator: &CoordinatorServiceImpl,
     req: QueryRequest,
 ) -> Result<QueryResponse, Status> {
-    if req.profile {
-        return Err(refuse(
-            "profile is not served yet: the response carries no profile surface, and \
-             accepting the flag while ignoring it would misreport what ran",
-        ));
-    }
+    let t_total = std::time::Instant::now();
+    // Purely observational: the same request with profile off returns
+    // identical hits, bitwise.
+    let mut prof: Option<crate::pb::QueryProfile> = req.profile.then(Default::default);
     let selection = req
         .selection
         .as_ref()
@@ -364,9 +362,13 @@ pub async fn execute(
                 }
             };
             let base_rank = cursor.as_ref().map_or(0, |c| c.rank);
+            let t_sel = std::time::Instant::now();
             let rows = coordinator
                 .fanout_browse(req.k, after, sort.as_ref(), &compiled)
                 .await?;
+            if let Some(p) = prof.as_mut() {
+                p.selection_ms = ms(t_sel);
+            }
             let hits: Vec<QueryHit> = rows
                 .ids
                 .iter()
@@ -403,10 +405,11 @@ pub async fn execute(
                 String::new()
             };
             let mut hits = hits;
-            fill_projected(coordinator, &compiled_projections, &mut hits).await?;
-            Ok(done(req.request_id, hits, "browse", next))
+            fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
+            Ok(done(req.request_id, hits, "browse", next, finish_prof(prof, t_total)))
         }
         Shape::Lexical { id, query } => {
+            let t_sel = std::time::Instant::now();
             let response = coordinator
                 .bm25_search(Request::new(Bm25SearchRequest {
                     text: query.text.clone(),
@@ -420,6 +423,9 @@ pub async fn execute(
                 }))
                 .await?
                 .into_inner();
+            if let Some(p) = prof.as_mut() {
+                p.selection_ms = ms(t_sel);
+            }
             let mut hits: Vec<QueryHit> = response
                 .hits
                 .iter()
@@ -437,12 +443,13 @@ pub async fn execute(
                     dimensions: Vec::new(),
                 })
                 .collect();
-            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
-            let executed = apply_scorer(coordinator, &scorer, &mut hits, "bm25_search").await?;
+            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, "bm25_search", &mut prof).await?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
-            Ok(done(req.request_id, hits, &executed, next))
+            Ok(done(req.request_id, hits, &executed, next, finish_prof(prof, t_total)))
         }
         Shape::Dense { id, query } => {
+            let t_sel = std::time::Instant::now();
             let response = coordinator
                 .search(Request::new(SearchRequest {
                     request_id: req.request_id.clone(),
@@ -454,6 +461,9 @@ pub async fn execute(
                 }))
                 .await?
                 .into_inner();
+            if let Some(p) = prof.as_mut() {
+                p.selection_ms = ms(t_sel);
+            }
             let mut hits: Vec<QueryHit> = response
                 .hits
                 .iter()
@@ -471,11 +481,11 @@ pub async fn execute(
                     dimensions: Vec::new(),
                 })
                 .collect();
-            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
-            let executed = apply_scorer(coordinator, &scorer, &mut hits, "search").await?;
+            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, "search", &mut prof).await?;
             let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
-            fill_projected(coordinator, &compiled_projections, &mut hits).await?;
-            Ok(done(response.request_id, hits, &executed, next))
+            fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
+            Ok(done(response.request_id, hits, &executed, next, finish_prof(prof, t_total)))
         }
         Shape::Composite {
             dense_id,
@@ -490,6 +500,7 @@ pub async fn execute(
                 _ => None,
             };
             let boost_id = legacy.as_ref().map(|(id, _)| id.clone());
+            let t_sel = std::time::Instant::now();
             let response = coordinator
                 .hybrid_search(Request::new(HybridSearchRequest {
                     request_id: req.request_id.clone(),
@@ -509,6 +520,9 @@ pub async fn execute(
                 }))
                 .await?
                 .into_inner();
+            if let Some(p) = prof.as_mut() {
+                p.selection_ms = ms(t_sel);
+            }
             let mut hits: Vec<QueryHit> = if matches!(strategy, Strategy::Cascade) {
                 response
                     .cascade_hits
@@ -602,11 +616,11 @@ pub async fn execute(
                 FusionMode::Decomposed => "hybrid_search:decomposed",
                 _ => "hybrid_search:cascade",
             };
-            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some()).await?;
-            let executed = apply_scorer(coordinator, &scorer, &mut hits, route).await?;
+            apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
-            fill_projected(coordinator, &compiled_projections, &mut hits).await?;
-            Ok(done(response.request_id, hits, &executed, next))
+            fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
+            Ok(done(response.request_id, hits, &executed, next, finish_prof(prof, t_total)))
         }
     }
 }
@@ -621,6 +635,7 @@ async fn apply_scorer(
     scorer: &Option<crate::ltr::Scorer>,
     hits: &mut [QueryHit],
     route: &str,
+    prof: &mut Option<crate::pb::QueryProfile>,
 ) -> Result<String, Status> {
     match scorer {
         None => Ok(route.to_string()),
@@ -628,13 +643,22 @@ async fn apply_scorer(
             let stored = if s.stored_stages().is_empty() {
                 Vec::new()
             } else {
+                let t0 = std::time::Instant::now();
                 let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
-                coordinator
+                let rows = coordinator
                     .fetch_values(&ids, &[], s.stored_stages())
                     .await?
-                    .stage_rows
+                    .stage_rows;
+                if let Some(p) = prof.as_mut() {
+                    p.values_ms = ms(t0);
+                }
+                rows
             };
+            let t0 = std::time::Instant::now();
             s.apply(hits, &stored)?;
+            if let Some(p) = prof.as_mut() {
+                p.scorer_ms = ms(t0);
+            }
             Ok(format!("{route}{}", s.executed_suffix()))
         }
     }
@@ -648,16 +672,21 @@ async fn fill_projected(
     coordinator: &CoordinatorServiceImpl,
     compiled: &[crate::pb::CompiledProjection],
     hits: &mut [QueryHit],
+    prof: &mut Option<crate::pb::QueryProfile>,
 ) -> Result<(), Status> {
     if compiled.is_empty() {
         return Ok(());
     }
+    let t0 = std::time::Instant::now();
     let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
     let fetched = coordinator.fetch_values(&ids, compiled, &[]).await?;
     for hit in hits.iter_mut() {
         hit.projected = fetched.rows.get(&hit.doc_id).cloned().unwrap_or_else(|| {
             vec![crate::pb::ProjectedValue::default(); compiled.len()]
         });
+    }
+    if let Some(p) = prof.as_mut() {
+        p.projection_ms = ms(t0);
     }
     Ok(())
 }
@@ -692,17 +721,33 @@ fn signal_ids<'a>(
     ids
 }
 
+fn ms(t: std::time::Instant) -> f32 {
+    t.elapsed().as_secs_f32() * 1e3
+}
+
+fn finish_prof(
+    mut prof: Option<crate::pb::QueryProfile>,
+    t_total: std::time::Instant,
+) -> Option<crate::pb::QueryProfile> {
+    if let Some(p) = prof.as_mut() {
+        p.total_ms = ms(t_total);
+    }
+    prof
+}
+
 fn done(
     request_id: String,
     hits: Vec<QueryHit>,
     executed: &str,
     next_cursor: String,
+    profile: Option<crate::pb::QueryProfile>,
 ) -> QueryResponse {
     QueryResponse {
         request_id,
         hits,
         executed: executed.to_string(),
         next_cursor,
+        profile,
     }
 }
 
@@ -1135,10 +1180,12 @@ async fn apply_boosts(
     plan: &BoostPlan<'_>,
     hits: &mut [QueryHit],
     scorer_present: bool,
+    prof: &mut Option<crate::pb::QueryProfile>,
 ) -> Result<(), Status> {
     let BoostPlan::Adapter(list) = plan else {
         return Ok(());
     };
+    let t0 = std::time::Instant::now();
     for b in list {
         let window = if b.window == 0 {
             hits.len()
@@ -1188,6 +1235,9 @@ async fn apply_boosts(
                     .then_with(|| a.doc_id.cmp(&c.doc_id))
             });
         }
+    }
+    if let Some(p) = prof.as_mut() {
+        p.boost_ms = ms(t0);
     }
     Ok(())
 }

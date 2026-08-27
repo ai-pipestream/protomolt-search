@@ -22,8 +22,13 @@ decay — the addend for `ADD_LINEAR`) through the candidate-scoped
 column typo rule exactly as on the lexical route; a candidate without
 the value is a missing signal under the dimension's policy. The same
 seam serves `QueryRequest.projections` on every shape
-(`docs/cel-values.md`). The phase split, the boost contract, and the
-refusal rules in this document are the binding contract.
+(`docs/cel-values.md`). `profile` is served (2026-08-26):
+`QueryResponse.profile` reports per-phase timings (selection, boost,
+values, scorer, projection, total) and never alters results — the
+suite holds profiled hits bitwise to unprofiled ones. With that, every
+response requirement in this document is met except arbitrary nested
+boolean search. The phase split, the boost contract, and the refusal
+rules in this document are the binding contract.
 
 The public model separates three things that are easy to conflate:
 
