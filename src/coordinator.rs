@@ -273,10 +273,17 @@ pub(crate) fn compile_projections(
 /// expressions compiled once into the ValueExpr IR the shards resolve.
 pub(crate) fn compile_aggregations(
     aggregations: &[crate::pb::Aggregation],
-) -> Result<Vec<crate::pb::CompiledAggregation>, Status> {
-    if aggregations.is_empty() {
+    histograms: &[crate::pb::HistogramSpec],
+) -> Result<
+    (
+        Vec<crate::pb::CompiledAggregation>,
+        Vec<crate::pb::CompiledHistogram>,
+    ),
+    Status,
+> {
+    if aggregations.is_empty() && histograms.is_empty() {
         return Err(Status::invalid_argument(
-            "aggregate requires at least one aggregation",
+            "aggregate requires at least one aggregation or histogram",
         ));
     }
     if aggregations.len() > 32 {
@@ -285,6 +292,13 @@ pub(crate) fn compile_aggregations(
             aggregations.len()
         )));
     }
+    if histograms.len() > 8 {
+        return Err(Status::invalid_argument(format!(
+            "aggregate takes at most 8 histograms per request, got {}",
+            histograms.len()
+        )));
+    }
+    // One name namespace across aggregations and histograms.
     let mut names = std::collections::HashSet::new();
     let mut compiled = Vec::with_capacity(aggregations.len());
     for a in aggregations {
@@ -310,7 +324,40 @@ pub(crate) fn compile_aggregations(
             name: a.name.clone(),
         });
     }
-    Ok(compiled)
+    let mut compiled_hists = Vec::with_capacity(histograms.len());
+    for h in histograms {
+        if h.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "histogram: a histogram needs a non-empty name",
+            ));
+        }
+        if !names.insert(h.name.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "aggregation: duplicate aggregation name {:?}",
+                h.name
+            )));
+        }
+        if !(h.interval > 0.0 && h.interval.is_finite()) {
+            return Err(Status::invalid_argument(format!(
+                "histogram {:?}: the interval must be positive and finite, got {}",
+                h.name, h.interval
+            )));
+        }
+        let expr = crate::cel::compile_value(&h.expression).map_err(|e| {
+            Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
+        })?;
+        compiled_hists.push(crate::pb::CompiledHistogram {
+            expr: Some(expr),
+            interval: h.interval,
+            max_buckets: if h.max_buckets == 0 {
+                1024
+            } else {
+                h.max_buckets
+            },
+            name: h.name.clone(),
+        });
+    }
+    Ok((compiled, compiled_hists))
 }
 
 /// One aggregation's merged fleet-wide statistics: a type vote plus
@@ -4168,13 +4215,21 @@ impl CoordinatorServiceImpl {
         &self,
         filters: &RequestFilters,
         aggregations: &[crate::pb::CompiledAggregation],
+        histograms: &[crate::pb::CompiledHistogram],
+        group_by: &str,
+        max_groups: u32,
     ) -> Result<crate::pb::AggregateResponse, Status> {
+        let grouping = !group_by.is_empty();
+        let group_cap = max_groups as usize;
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
             let request = crate::pb::AggregateShardRequest {
                 filter: filters.tree.clone(),
                 geo_filters: filters.geo.clone(),
                 aggregations: aggregations.to_vec(),
+                group_by: group_by.to_string(),
+                max_groups,
+                histograms: histograms.to_vec(),
             };
             let client = self.node_client(node);
             tasks.push(tokio::spawn(async move {
@@ -4184,17 +4239,31 @@ impl CoordinatorServiceImpl {
                     .map(|r| r.into_inner())
             }));
         }
-        // The same leaf enumeration the shards answer positionally.
+        // The same leaf enumeration the shards answer positionally:
+        // aggregations first, then histograms.
         let mut leaves = Vec::new();
-        for agg in aggregations {
-            if let Some(expr) = agg.expr.as_ref() {
-                crate::values::column_leaves(expr, &mut leaves);
-            }
+        for expr in aggregations
+            .iter()
+            .filter_map(|a| a.expr.as_ref())
+            .chain(histograms.iter().filter_map(|h| h.expr.as_ref()))
+        {
+            crate::values::column_leaves(expr, &mut leaves);
         }
         let mut known = FilterKnown::new(filters);
         let mut leaves_known = vec![false; leaves.len()];
+        let mut group_column_known = !grouping;
         let mut matched = 0u64;
+        let mut ungrouped = 0u64;
         let mut merged: Vec<AggMerge> = aggregations.iter().map(|_| AggMerge::new()).collect();
+        // Groups merge by VALUE: the BTreeMap is both the cross-shard
+        // join and the deterministic ascending order the response
+        // promises.
+        let mut groups: std::collections::BTreeMap<String, (u64, Vec<AggMerge>)> =
+            std::collections::BTreeMap::new();
+        let mut hist_buckets: Vec<std::collections::BTreeMap<i64, u64>> =
+            histograms.iter().map(|_| Default::default()).collect();
+        let mut hist_present = vec![0u64; histograms.len()];
+        let mut hist_unbucketable = vec![0u64; histograms.len()];
         for task in tasks {
             let response = task
                 .await
@@ -4217,12 +4286,69 @@ impl CoordinatorServiceImpl {
                     merged.len()
                 )));
             }
+            group_column_known |= response.group_column_known;
             matched += response.matched;
+            ungrouped += response.ungrouped;
             for (m, (p, agg)) in merged
                 .iter_mut()
                 .zip(response.partials.iter().zip(aggregations))
             {
                 m.fold(p, &agg.name)?;
+            }
+            for shard_group in &response.groups {
+                if shard_group.partials.len() != aggregations.len() {
+                    return Err(Status::internal(format!(
+                        "shard answered {} group partials for {} aggregations",
+                        shard_group.partials.len(),
+                        aggregations.len()
+                    )));
+                }
+                let entry = groups
+                    .entry(shard_group.value.clone())
+                    .or_insert_with(|| (0, aggregations.iter().map(|_| AggMerge::new()).collect()));
+                entry.0 += shard_group.matched;
+                for (m, (p, agg)) in entry
+                    .1
+                    .iter_mut()
+                    .zip(shard_group.partials.iter().zip(aggregations))
+                {
+                    m.fold(p, &agg.name)?;
+                }
+                if groups.len() > group_cap {
+                    return Err(Status::failed_precondition(format!(
+                        "group_by {group_by:?} exceeds {group_cap} distinct values \
+                         across the fleet; tighten the filter or raise max_groups"
+                    )));
+                }
+            }
+            if response.histograms.len() != histograms.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} histograms for {} requested",
+                    response.histograms.len(),
+                    histograms.len()
+                )));
+            }
+            for (i, (shard_hist, spec)) in
+                response.histograms.iter().zip(histograms).enumerate()
+            {
+                if shard_hist.bucket_index.len() != shard_hist.bucket_count.len() {
+                    return Err(Status::internal(
+                        "shard answered a histogram with mismatched columns",
+                    ));
+                }
+                hist_present[i] += shard_hist.present;
+                hist_unbucketable[i] += shard_hist.unbucketable;
+                for (&idx, &count) in shard_hist.bucket_index.iter().zip(&shard_hist.bucket_count)
+                {
+                    *hist_buckets[i].entry(idx).or_insert(0) += count;
+                }
+                if hist_buckets[i].len() > spec.max_buckets as usize {
+                    return Err(Status::failed_precondition(format!(
+                        "histogram {:?} exceeds {} buckets across the fleet; use a \
+                         coarser interval or a tighter filter",
+                        spec.name, spec.max_buckets
+                    )));
+                }
             }
         }
         known.refuse_unknown(filters)?;
@@ -4234,11 +4360,50 @@ impl CoordinatorServiceImpl {
                 )));
             }
         }
+        if !group_column_known {
+            return Err(Status::invalid_argument(format!(
+                "group_by column {group_by:?} is not a facet column on any shard"
+            )));
+        }
         let mut results = Vec::with_capacity(aggregations.len());
         for (agg, m) in aggregations.iter().zip(&merged) {
             results.push(m.result(&agg.name, crate::node::agg_op_of(agg.op)?)?);
         }
-        Ok(crate::pb::AggregateResponse { results, matched })
+        let mut group_results = Vec::with_capacity(groups.len());
+        for (value, (group_matched, ms)) in &groups {
+            let mut rs = Vec::with_capacity(aggregations.len());
+            for (agg, m) in aggregations.iter().zip(ms) {
+                rs.push(m.result(&agg.name, crate::node::agg_op_of(agg.op)?)?);
+            }
+            group_results.push(crate::pb::AggregateGroup {
+                value: value.clone(),
+                matched: *group_matched,
+                results: rs,
+            });
+        }
+        let hist_results = histograms
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| crate::pb::HistogramResult {
+                name: spec.name.clone(),
+                buckets: hist_buckets[i]
+                    .iter()
+                    .map(|(&idx, &count)| crate::pb::HistogramBucket {
+                        lower: idx as f64 * spec.interval,
+                        count,
+                    })
+                    .collect(),
+                present: hist_present[i],
+                unbucketable: hist_unbucketable[i],
+            })
+            .collect();
+        Ok(crate::pb::AggregateResponse {
+            results,
+            matched,
+            groups: group_results,
+            ungrouped: if grouping { ungrouped } else { 0 },
+            histograms: hist_results,
+        })
     }
 
     pub async fn fanout_calibration(
@@ -5230,10 +5395,22 @@ impl SearchService for CoordinatorServiceImpl {
     ) -> Result<Response<crate::pb::AggregateResponse>, Status> {
         let req = request.into_inner();
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
-        let compiled = compile_aggregations(&req.aggregations)?;
-        self.fanout_aggregate(&filters, &compiled)
-            .await
-            .map(Response::new)
+        let (compiled, compiled_hists) =
+            compile_aggregations(&req.aggregations, &req.histograms)?;
+        let max_groups = if req.max_groups == 0 {
+            1000
+        } else {
+            req.max_groups
+        };
+        self.fanout_aggregate(
+            &filters,
+            &compiled,
+            &compiled_hists,
+            &req.group_by,
+            max_groups,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn cluster_health(

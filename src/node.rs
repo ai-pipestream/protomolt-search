@@ -1620,6 +1620,76 @@ impl AggAcc {
     }
 }
 
+/// A fresh accumulator for one resolved type.
+fn acc_of(vt: crate::values::ValueType) -> AggAcc {
+    match vt {
+        crate::values::ValueType::Unknown => AggAcc::Absent,
+        crate::values::ValueType::Int => AggAcc::Int {
+            present: 0,
+            sum: 0,
+            min: 0,
+            max: 0,
+        },
+        crate::values::ValueType::Double => AggAcc::Double {
+            present: 0,
+            sum: 0.0,
+            compensation: 0.0,
+            min: 0.0,
+            max: 0.0,
+            mean: 0.0,
+            m2: 0.0,
+        },
+        crate::values::ValueType::Str => AggAcc::Str { present: 0 },
+        crate::values::ValueType::Bool => unreachable!("check_agg_type refused booleans"),
+    }
+}
+
+/// One shard's sparse histogram fold.
+#[derive(Default)]
+struct HistAcc {
+    buckets: std::collections::HashMap<i64, u64>,
+    present: u64,
+    unbucketable: u64,
+}
+
+impl HistAcc {
+    /// Fold one present value. `Err` = this shard alone exceeds the
+    /// bucket cap.
+    fn push(&mut self, x: f64, interval: f64, cap: usize, name: &str) -> Result<(), Status> {
+        self.present += 1;
+        let idx_f = (x / interval).floor();
+        // Any integral float in [-2^63, 2^63) casts exactly; NaN,
+        // infinities, and indexes outside i64 have no honest bucket.
+        let lo = -(2f64.powi(63));
+        let hi = 2f64.powi(63);
+        if !idx_f.is_finite() || idx_f < lo || idx_f >= hi {
+            self.unbucketable += 1;
+            return Ok(());
+        }
+        let n = self.buckets.len();
+        let slot = self.buckets.entry(idx_f as i64).or_insert(0);
+        *slot += 1;
+        if *slot == 1 && n == cap {
+            return Err(Status::failed_precondition(format!(
+                "histogram {name:?} exceeds {cap} buckets on one shard; use a coarser \
+                 interval or a tighter filter"
+            )));
+        }
+        Ok(())
+    }
+
+    fn response(&self) -> crate::pb::ShardHistogram {
+        let mut rows: Vec<(i64, u64)> = self.buckets.iter().map(|(k, v)| (*k, *v)).collect();
+        rows.sort_unstable();
+        crate::pb::ShardHistogram {
+            bucket_index: rows.iter().map(|r| r.0).collect(),
+            bucket_count: rows.iter().map(|r| r.1).collect(),
+            present: self.present,
+            unbucketable: self.unbucketable,
+        }
+    }
+}
+
 /// The op-versus-type admission rule, shared wording with the
 /// coordinator's literal-pinned precheck.
 fn check_agg_type(
@@ -5838,22 +5908,28 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
         crate::metrics::inc_request(crate::metrics::Route::AggregateShard);
         let req = request.into_inner();
-        if req.aggregations.is_empty() {
+        if req.aggregations.is_empty() && req.histograms.is_empty() {
             return Err(Status::invalid_argument(
-                "aggregate requires at least one aggregation",
+                "aggregate requires at least one aggregation or histogram",
             ));
         }
+        let grouping = !req.group_by.is_empty();
+        let group_cap = req.max_groups as usize;
         let geo_regions = validate_geo_filters(&req.geo_filters)?;
         let guard = self.state.read().expect("shard state lock poisoned");
         let (geo_columns_known, filter_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
-        // Expression column leaves across all aggregations, request
-        // order then depth-first — the projection typo contract.
+        // Expression column leaves: aggregations first, then
+        // histograms, request order then depth-first — the projection
+        // typo contract.
         let mut leaves = Vec::new();
-        for agg in &req.aggregations {
-            if let Some(expr) = agg.expr.as_ref() {
-                crate::values::column_leaves(expr, &mut leaves);
-            }
+        for expr in req
+            .aggregations
+            .iter()
+            .filter_map(|a| a.expr.as_ref())
+            .chain(req.histograms.iter().filter_map(|h| h.expr.as_ref()))
+        {
+            crate::values::column_leaves(expr, &mut leaves);
         }
         let Some(store) = guard.bm25.as_ref() else {
             // A document-less shard holds no values and no columns; its
@@ -5869,6 +5945,14 @@ impl NodeService for NodeServiceImpl {
                 geo_columns_known,
                 filter_columns_known,
                 expr_leaves_known: vec![false; leaves.len()],
+                groups: Vec::new(),
+                ungrouped: 0,
+                group_column_known: false,
+                histograms: req
+                    .histograms
+                    .iter()
+                    .map(|_| crate::pb::ShardHistogram::default())
+                    .collect(),
             }));
         };
         if store.as_index().is_none() {
@@ -5880,11 +5964,14 @@ impl NodeService for NodeServiceImpl {
             .iter()
             .map(|l| crate::values::leaf_known(l, store))
             .collect();
+        let group_facet = grouping.then(|| store.facet_index(&req.group_by)).flatten();
+        let group_column_known = group_facet.is_some();
         // Resolve every expression and admit its op against the
         // resolved type BEFORE touching any document: a type conflict
         // refuses the request, it never mis-aggregates.
-        let mut resolved: Vec<(crate::values::ResolvedValue, AggAcc)> =
+        let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType)> =
             Vec::with_capacity(req.aggregations.len());
+        let mut totals: Vec<AggAcc> = Vec::with_capacity(req.aggregations.len());
         for agg in &req.aggregations {
             let op = agg_op_of(agg.op)?;
             let expr = agg.expr.as_ref().ok_or_else(|| {
@@ -5901,27 +5988,57 @@ impl NodeService for NodeServiceImpl {
                 ))
             })?;
             check_agg_type(&agg.name, op, vt)?;
-            let acc = match vt {
-                crate::values::ValueType::Unknown => AggAcc::Absent,
-                crate::values::ValueType::Int => AggAcc::Int {
-                    present: 0,
-                    sum: 0,
-                    min: 0,
-                    max: 0,
-                },
-                crate::values::ValueType::Double => AggAcc::Double {
-                    present: 0,
-                    sum: 0.0,
-                    compensation: 0.0,
-                    min: 0.0,
-                    max: 0.0,
-                    mean: 0.0,
-                    m2: 0.0,
-                },
-                crate::values::ValueType::Str => AggAcc::Str { present: 0 },
-                crate::values::ValueType::Bool => unreachable!("check_agg_type refused"),
+            totals.push(acc_of(vt));
+            exprs.push((rv, vt));
+        }
+        let mut hists: Vec<(
+            Option<crate::values::ResolvedValue>,
+            f64,
+            usize,
+            String,
+            HistAcc,
+        )> = Vec::with_capacity(req.histograms.len());
+        for h in &req.histograms {
+            if !(h.interval > 0.0 && h.interval.is_finite()) {
+                return Err(Status::internal(format!(
+                    "histogram {:?} arrived with an unvalidated interval",
+                    h.name
+                )));
+            }
+            let expr = h.expr.as_ref().ok_or_else(|| {
+                Status::invalid_argument(format!("histogram {:?} without an expression", h.name))
+            })?;
+            let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
+                Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
+            })?;
+            let rv = match vt {
+                crate::values::ValueType::Double => Some(rv),
+                crate::values::ValueType::Unknown => None,
+                crate::values::ValueType::Int => {
+                    return Err(Status::invalid_argument(format!(
+                        "histogram {:?} takes a double expression; convert explicitly \
+                         with double()",
+                        h.name
+                    )));
+                }
+                other => {
+                    return Err(Status::invalid_argument(format!(
+                        "histogram {:?} takes a double expression, not a {}",
+                        h.name,
+                        match other {
+                            crate::values::ValueType::Str => "string",
+                            _ => "boolean",
+                        }
+                    )));
+                }
             };
-            resolved.push((rv, acc));
+            hists.push((
+                rv,
+                h.interval,
+                h.max_buckets as usize,
+                h.name.clone(),
+                HistAcc::default(),
+            ));
         }
         let doc_filter = crate::filter::DocFilter {
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
@@ -5930,6 +6047,11 @@ impl NodeService for NodeServiceImpl {
         let cols = ShardNumericRead(store);
         let n = store.doc_count();
         let mut matched = 0u64;
+        let mut ungrouped = 0u64;
+        // Group accumulators by facet ordinal; each holds (matched,
+        // one accumulator per aggregation).
+        let mut groups: std::collections::HashMap<u32, (u64, Vec<AggAcc>)> =
+            std::collections::HashMap::new();
         // One pass in doc order: the fold orders themselves are part
         // of the determinism contract (Neumaier and Welford both fold
         // exactly this sequence on every run).
@@ -5939,21 +6061,83 @@ impl NodeService for NodeServiceImpl {
                 continue;
             }
             matched += 1;
-            for (rv, acc) in resolved.iter_mut() {
-                if matches!(acc, AggAcc::Absent) {
+            let group = if grouping {
+                match group_facet.and_then(|fi| store.facet_ord(fi, doc)) {
+                    Some(ord) => {
+                        let n_groups = groups.len();
+                        let entry = groups.entry(ord).or_insert_with(|| {
+                            (0, exprs.iter().map(|(_, vt)| acc_of(*vt)).collect())
+                        });
+                        if entry.0 == 0 && n_groups == group_cap {
+                            return Err(Status::failed_precondition(format!(
+                                "group_by {:?} exceeds {group_cap} distinct values on \
+                                 one shard; tighten the filter or raise max_groups",
+                                req.group_by
+                            )));
+                        }
+                        entry.0 += 1;
+                        Some(entry)
+                    }
+                    None => {
+                        ungrouped += 1;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut group_accs = group.map(|g| &mut g.1);
+            for (i, (rv, _)) in exprs.iter().enumerate() {
+                // Absent-typed totals imply an absent-typed group
+                // accumulator: the type is the expression's, not the
+                // group's.
+                if matches!(totals[i], AggAcc::Absent) {
                     continue;
                 }
                 if let Some(v) = crate::values::eval(rv, doc, &cols) {
-                    acc.push(v);
+                    totals[i].push(v);
+                    if let Some(accs) = group_accs.as_deref_mut() {
+                        accs[i].push(v);
+                    }
+                }
+            }
+            for (rv, interval, cap, name, acc) in hists.iter_mut() {
+                let Some(rv) = rv else { continue };
+                if let Some(crate::values::Val::Double(x)) = crate::values::eval(rv, doc, &cols) {
+                    acc.push(x, *interval, *cap, name)?;
                 }
             }
         }
+        let mut group_rows: Vec<(u32, u64, Vec<AggAcc>)> = groups
+            .into_iter()
+            .map(|(ord, (m, accs))| (ord, m, accs))
+            .collect();
+        group_rows.sort_unstable_by_key(|r| r.0);
+        let groups = group_facet
+            .map(|fi| {
+                group_rows
+                    .iter()
+                    .map(|(ord, m, accs)| crate::pb::AggregateShardGroup {
+                        value: store.facet_value(fi, *ord).to_string(),
+                        matched: *m,
+                        partials: accs.iter().map(AggAcc::partial).collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Response::new(crate::pb::AggregateShardResponse {
-            partials: resolved.iter().map(|(_, acc)| acc.partial()).collect(),
+            partials: totals.iter().map(AggAcc::partial).collect(),
             matched,
             geo_columns_known,
             filter_columns_known,
             expr_leaves_known,
+            groups,
+            ungrouped,
+            group_column_known,
+            histograms: hists
+                .iter()
+                .map(|(_, _, _, _, acc)| acc.response())
+                .collect(),
         }))
     }
 
