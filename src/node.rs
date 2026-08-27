@@ -1463,6 +1463,205 @@ fn projected_value(
     crate::pb::ProjectedValue { value }
 }
 
+/// Decode one wire aggregate op.
+pub(crate) fn agg_op_of(op: i32) -> Result<crate::pb::AggregateOp, Status> {
+    match crate::pb::AggregateOp::try_from(op) {
+        Ok(crate::pb::AggregateOp::Unspecified) | Err(_) => Err(Status::invalid_argument(
+            "aggregation with an unspecified operation",
+        )),
+        Ok(op) => Ok(op),
+    }
+}
+
+/// One shard's exact accumulator for one aggregation, typed at
+/// resolution. Every statistic for the type folds in the single pass
+/// (they are a handful of flops each); the response carries them all
+/// and the coordinator reads the ones the op needs.
+enum AggAcc {
+    /// The expression can never hold a value on this shard.
+    Absent,
+    Int {
+        present: u64,
+        sum: i128,
+        min: i64,
+        max: i64,
+    },
+    Double {
+        present: u64,
+        /// Neumaier-compensated running sum.
+        sum: f64,
+        compensation: f64,
+        /// NaN-propagating extrema, the math.least/greatest rule.
+        min: f64,
+        max: f64,
+        /// Welford.
+        mean: f64,
+        m2: f64,
+    },
+    Str {
+        present: u64,
+    },
+}
+
+impl AggAcc {
+    fn push(&mut self, v: crate::values::Val) {
+        match (self, v) {
+            (AggAcc::Absent, _) => unreachable!("absent expressions never evaluate"),
+            (
+                AggAcc::Int {
+                    present,
+                    sum,
+                    min,
+                    max,
+                },
+                crate::values::Val::Int(x),
+            ) => {
+                if *present == 0 {
+                    *min = x;
+                    *max = x;
+                } else {
+                    *min = (*min).min(x);
+                    *max = (*max).max(x);
+                }
+                *present += 1;
+                *sum += i128::from(x);
+            }
+            (
+                AggAcc::Double {
+                    present,
+                    sum,
+                    compensation,
+                    min,
+                    max,
+                    mean,
+                    m2,
+                },
+                crate::values::Val::Double(x),
+            ) => {
+                if *present == 0 {
+                    *min = x;
+                    *max = x;
+                } else if x.is_nan() || min.is_nan() {
+                    *min = f64::NAN;
+                    *max = f64::NAN;
+                } else {
+                    *min = (*min).min(x);
+                    *max = (*max).max(x);
+                }
+                *present += 1;
+                // Neumaier: the compensation catches whichever addend
+                // the naive add truncated.
+                let t = *sum + x;
+                *compensation += if sum.abs() >= x.abs() {
+                    (*sum - t) + x
+                } else {
+                    (x - t) + *sum
+                };
+                *sum = t;
+                // Welford, in doc order.
+                let n = *present as f64;
+                let delta = x - *mean;
+                *mean += delta / n;
+                *m2 += delta * (x - *mean);
+            }
+            (AggAcc::Str { present }, crate::values::Val::FacetOrd { .. })
+            | (AggAcc::Str { present }, crate::values::Val::MapFacetOrd { .. }) => {
+                *present += 1;
+            }
+            _ => unreachable!("resolution typed the accumulator"),
+        }
+    }
+
+    fn partial(&self) -> crate::pb::AggregatePartial {
+        use crate::pb::AggregateValueType as T;
+        let mut p = crate::pb::AggregatePartial {
+            vtype: T::Absent as i32,
+            ..Default::default()
+        };
+        match self {
+            AggAcc::Absent => {}
+            AggAcc::Int {
+                present,
+                sum,
+                min,
+                max,
+            } => {
+                p.vtype = T::Int as i32;
+                p.present = *present;
+                p.int_sum_hi = (*sum >> 64) as i64;
+                p.int_sum_lo = *sum as u64;
+                p.int_min = *min;
+                p.int_max = *max;
+            }
+            AggAcc::Double {
+                present,
+                sum,
+                compensation,
+                min,
+                max,
+                mean,
+                m2,
+            } => {
+                p.vtype = T::Double as i32;
+                p.present = *present;
+                p.double_sum = *sum;
+                p.double_compensation = *compensation;
+                p.double_min = *min;
+                p.double_max = *max;
+                p.mean = *mean;
+                p.m2 = *m2;
+            }
+            AggAcc::Str { present } => {
+                p.vtype = T::String as i32;
+                p.present = *present;
+            }
+        }
+        p
+    }
+}
+
+/// The op-versus-type admission rule, shared wording with the
+/// coordinator's literal-pinned precheck.
+fn check_agg_type(
+    name: &str,
+    op: crate::pb::AggregateOp,
+    vt: crate::values::ValueType,
+) -> Result<(), Status> {
+    use crate::pb::AggregateOp as O;
+    use crate::values::ValueType as V;
+    match vt {
+        V::Bool => Err(Status::invalid_argument(format!(
+            "aggregation {name:?}: a boolean aggregates nowhere; filter on the \
+             expression instead and read `matched`"
+        ))),
+        V::Str if op != O::Count => Err(Status::invalid_argument(format!(
+            "aggregation {name:?}: a string expression aggregates only under COUNT"
+        ))),
+        V::Int if matches!(op, O::Mean | O::Variance | O::Stddev) => {
+            Err(Status::invalid_argument(format!(
+                "aggregation {name:?}: {} takes a double; convert explicitly with double()",
+                agg_op_name(op)
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Lowercase op name for refusals.
+pub(crate) fn agg_op_name(op: crate::pb::AggregateOp) -> &'static str {
+    use crate::pb::AggregateOp as O;
+    match op {
+        O::Unspecified => "unspecified",
+        O::Count => "count",
+        O::Sum => "sum",
+        O::Min => "min",
+        O::Max => "max",
+        O::Mean => "mean",
+        O::Variance => "variance",
+        O::Stddev => "stddev",
+    }
+}
+
 fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,
     n: usize,
@@ -5630,6 +5829,131 @@ impl NodeService for NodeServiceImpl {
             sort_key_bits: Vec::new(),
             sort_keys: Vec::new(),
             sort_column_known: req.sort.is_none(),
+        }))
+    }
+
+    async fn aggregate_shard(
+        &self,
+        request: Request<crate::pb::AggregateShardRequest>,
+    ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::AggregateShard);
+        let req = request.into_inner();
+        if req.aggregations.is_empty() {
+            return Err(Status::invalid_argument(
+                "aggregate requires at least one aggregation",
+            ));
+        }
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let (geo_columns_known, filter_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+        // Expression column leaves across all aggregations, request
+        // order then depth-first — the projection typo contract.
+        let mut leaves = Vec::new();
+        for agg in &req.aggregations {
+            if let Some(expr) = agg.expr.as_ref() {
+                crate::values::column_leaves(expr, &mut leaves);
+            }
+        }
+        let Some(store) = guard.bm25.as_ref() else {
+            // A document-less shard holds no values and no columns; its
+            // all-absent partials and all-false flags feed the merge
+            // and the typo rule like everywhere.
+            return Ok(Response::new(crate::pb::AggregateShardResponse {
+                partials: req
+                    .aggregations
+                    .iter()
+                    .map(|_| AggAcc::Absent.partial())
+                    .collect(),
+                matched: 0,
+                geo_columns_known,
+                filter_columns_known,
+                expr_leaves_known: vec![false; leaves.len()],
+            }));
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush before aggregating",
+            ));
+        }
+        let expr_leaves_known: Vec<bool> = leaves
+            .iter()
+            .map(|l| crate::values::leaf_known(l, store))
+            .collect();
+        // Resolve every expression and admit its op against the
+        // resolved type BEFORE touching any document: a type conflict
+        // refuses the request, it never mis-aggregates.
+        let mut resolved: Vec<(crate::values::ResolvedValue, AggAcc)> =
+            Vec::with_capacity(req.aggregations.len());
+        for agg in &req.aggregations {
+            let op = agg_op_of(agg.op)?;
+            let expr = agg.expr.as_ref().ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "aggregation {:?} without an expression",
+                    agg.name
+                ))
+            })?;
+            let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "aggregation {:?}: {}",
+                    agg.name,
+                    e.message()
+                ))
+            })?;
+            check_agg_type(&agg.name, op, vt)?;
+            let acc = match vt {
+                crate::values::ValueType::Unknown => AggAcc::Absent,
+                crate::values::ValueType::Int => AggAcc::Int {
+                    present: 0,
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                },
+                crate::values::ValueType::Double => AggAcc::Double {
+                    present: 0,
+                    sum: 0.0,
+                    compensation: 0.0,
+                    min: 0.0,
+                    max: 0.0,
+                    mean: 0.0,
+                    m2: 0.0,
+                },
+                crate::values::ValueType::Str => AggAcc::Str { present: 0 },
+                crate::values::ValueType::Bool => unreachable!("check_agg_type refused"),
+            };
+            resolved.push((rv, acc));
+        }
+        let doc_filter = crate::filter::DocFilter {
+            geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+            pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+        };
+        let cols = ShardNumericRead(store);
+        let n = store.doc_count();
+        let mut matched = 0u64;
+        // One pass in doc order: the fold orders themselves are part
+        // of the determinism contract (Neumaier and Welford both fold
+        // exactly this sequence on every run).
+        for local in 0..n {
+            let doc = local as u32;
+            if !doc_filter.passes(doc, &cols) {
+                continue;
+            }
+            matched += 1;
+            for (rv, acc) in resolved.iter_mut() {
+                if matches!(acc, AggAcc::Absent) {
+                    continue;
+                }
+                if let Some(v) = crate::values::eval(rv, doc, &cols) {
+                    acc.push(v);
+                }
+            }
+        }
+        Ok(Response::new(crate::pb::AggregateShardResponse {
+            partials: resolved.iter().map(|(_, acc)| acc.partial()).collect(),
+            matched,
+            geo_columns_known,
+            filter_columns_known,
+            expr_leaves_known,
         }))
     }
 

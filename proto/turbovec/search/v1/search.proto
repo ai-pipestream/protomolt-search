@@ -230,6 +230,13 @@ service NodeService {
   // every shape and stored-value scorer dimensions through it.
   rpc FetchValues(FetchValuesRequest) returns (FetchValuesResponse);
 
+  // One shard's exact aggregation partials over its filter-admitted
+  // documents (docs/aggregations.md): a single pass in doc order
+  // folding every requested aggregation at once. Typo flags follow
+  // the filtered-route contract; expression column leaves report like
+  // projection leaves.
+  rpc AggregateShard(AggregateShardRequest) returns (AggregateShardResponse);
+
   // Candidate-scoped VECTOR scoring: the vector twin of Bm25Rescore.
   // Scores just `candidate_ids` against this shard's index through a
   // masked scan; the kernel short-circuits fully-masked SIMD blocks, so
@@ -381,6 +388,21 @@ service SearchService {
   // Binding and protobuf-native ingest are later increments; this RPC
   // is the part an operator argues with first.
   rpc PlanIndex(PlanIndexRequest) returns (PlanIndexResponse);
+
+  // Exact aggregates of CEL value expressions over the FILTERED
+  // corpus (docs/aggregations.md). The filter is the same CEL the
+  // search routes take (empty = every document); each aggregation
+  // names a value expression (docs/cel-values.md, the projection
+  // dialect exactly) and one operation. Shards fold exact partials
+  // over their admitted documents in one pass and the coordinator
+  // merges them IN SHARD ORDER, so results are deterministic
+  // bit-for-bit across runs: int sums accumulate in 128-bit
+  // integers (an out-of-i64 total refuses naming double() as the
+  // fix, never a silent approximation), double sums are
+  // Neumaier-compensated, and mean/variance merge by the Chan
+  // parallel rule. Absence is Kleene: a document whose expression is
+  // absent is skipped and counted nowhere — never a fabricated zero.
+  rpc Aggregate(AggregateRequest) returns (AggregateResponse);
 }
 
 // One shard's slice of a filter-only browse.
@@ -3895,6 +3917,188 @@ message ValueFunc {
   // unary functions, two for engine.pow, one or more for
   // math.greatest and math.least.
   repeated ValueExpr args = 2;
+}
+
+// ---------------------------------------------------------------------
+// Aggregations (docs/aggregations.md): exact folds of value
+// expressions over the filtered corpus.
+// ---------------------------------------------------------------------
+
+message AggregateRequest {
+  // CEL filter (docs/cel-filters.md). Empty or whitespace = every
+  // document.
+  string filter = 1;
+
+  // Geo filters, AND semantics, the same rules as every filtered
+  // route.
+  repeated GeoFilter geo_filters = 2;
+
+  // The aggregations, at least one, at most 32; names non-empty and
+  // request-unique.
+  repeated Aggregation aggregations = 3;
+}
+
+// One requested aggregate.
+message Aggregation {
+  // Name the result is returned under.
+  string name = 1;
+
+  // CEL value expression over the document's columns — exactly the
+  // projection dialect (docs/cel-values.md), functions and the
+  // conditional layer included.
+  string expression = 2;
+
+  // The fold.
+  AggregateOp op = 3;
+}
+
+// The aggregate operations. Typing: COUNT serves every expression
+// type, strings included; SUM, MIN, and MAX serve int and double
+// expressions in their own type; MEAN, VARIANCE, and STDDEV serve
+// doubles only (an int expression converts with double()). A boolean
+// expression aggregates nowhere — filter on it instead and read
+// `matched`.
+enum AggregateOp {
+  // Zero value. Refused.
+  AGGREGATE_OP_UNSPECIFIED = 0;
+  // Documents where the expression holds a value.
+  AGGREGATE_OP_COUNT = 1;
+  // Exact sum. Int expressions accumulate in 128-bit integers and a
+  // total outside i64 REFUSES naming double() as the fix; double
+  // expressions sum Neumaier-compensated in doc order per shard,
+  // partials folded in shard order.
+  AGGREGATE_OP_SUM = 2;
+  // Minimum, in the expression's type. A double NaN propagates, the
+  // same rule math.least takes.
+  AGGREGATE_OP_MIN = 3;
+  // Maximum, in the expression's type. A double NaN propagates.
+  AGGREGATE_OP_MAX = 4;
+  // Arithmetic mean of the present values, Welford per shard and the
+  // Chan parallel merge across shards.
+  AGGREGATE_OP_MEAN = 5;
+  // Population variance (M2 / n) of the present values.
+  AGGREGATE_OP_VARIANCE = 6;
+  // Population standard deviation, sqrt of the variance.
+  AGGREGATE_OP_STDDEV = 7;
+}
+
+message AggregateResponse {
+  // One result per requested aggregation, in request order.
+  repeated AggregateResult results = 1;
+
+  // Documents the filter admitted, fleet-wide.
+  uint64 matched = 2;
+}
+
+// One aggregate result.
+message AggregateResult {
+  // The request's name, echoed.
+  string name = 1;
+
+  // Documents where the expression held a value (present values, the
+  // Kleene rule: absence is skipped, never counted as zero).
+  uint64 present = 2;
+
+  // The folded value; unset when no document held a value. COUNT
+  // reports `present` as int_value (0 included). SUM, MIN, and MAX
+  // report in the expression's type; the statistical ops report
+  // doubles.
+  oneof value {
+    // Double-typed result.
+    double double_value = 3;
+
+    // Int-typed result.
+    sint64 int_value = 4;
+  }
+}
+
+// The internal fan-out: compiled expressions, resolved per shard.
+message AggregateShardRequest {
+  // Compiled filter IR; absent = no tree filter.
+  FilterExpr filter = 1;
+
+  // Geo filters, verbatim.
+  repeated GeoFilter geo_filters = 2;
+
+  // Compiled aggregations, request order.
+  repeated CompiledAggregation aggregations = 3;
+}
+
+// One compiled aggregation.
+message CompiledAggregation {
+  // The compiled expression.
+  ValueExpr expr = 1;
+
+  // The fold.
+  AggregateOp op = 2;
+
+  // The request's name, so shard-side refusals name the aggregation.
+  string name = 3;
+}
+
+message AggregateShardResponse {
+  // One partial per aggregation, request order.
+  repeated AggregatePartial partials = 1;
+
+  // Documents this shard's filter admitted.
+  uint64 matched = 2;
+
+  // Geo/filter typo flags, the filtered-route contract.
+  repeated bool geo_columns_known = 3;
+  repeated bool filter_columns_known = 4;
+
+  // Column-read leaves across ALL aggregation expressions, request
+  // order then depth-first within each — the projection typo rule: a
+  // leaf no shard knows refuses by name at the coordinator.
+  repeated bool expr_leaves_known = 5;
+}
+
+// One shard's exact partial for one aggregation. Only the fields for
+// the resolved type and requested op carry meaning; the rest stay at
+// their defaults.
+message AggregatePartial {
+  // The type this shard resolved the expression to. ABSENT when the
+  // expression can never hold a value here (a column this shard
+  // lacks): present = 0 and no type vote.
+  AggregateValueType vtype = 1;
+
+  // Documents where the expression held a value on this shard.
+  uint64 present = 2;
+
+  // SUM over an int expression: the exact signed 128-bit sum, two's
+  // complement split (hi carries the sign).
+  sfixed64 int_sum_hi = 3;
+  fixed64 int_sum_lo = 4;
+
+  // SUM over a double expression: Neumaier-compensated running sum
+  // and its compensation, folded in doc order.
+  double double_sum = 5;
+  double double_compensation = 6;
+
+  // MIN/MAX in the resolved type.
+  sint64 int_min = 7;
+  sint64 int_max = 8;
+  double double_min = 9;
+  double double_max = 10;
+
+  // MEAN/VARIANCE/STDDEV: the Welford partial (mean, M2) over this
+  // shard's present values in doc order.
+  double mean = 11;
+  double m2 = 12;
+}
+
+// The type a shard resolved one aggregation expression to.
+enum AggregateValueType {
+  // Zero value. Never sent.
+  AGGREGATE_VALUE_TYPE_UNSPECIFIED = 0;
+  // The expression can never hold a value on this shard.
+  AGGREGATE_VALUE_TYPE_ABSENT = 1;
+  // CEL int.
+  AGGREGATE_VALUE_TYPE_INT = 2;
+  // CEL double.
+  AGGREGATE_VALUE_TYPE_DOUBLE = 3;
+  // A facet or map-facet read; COUNT only.
+  AGGREGATE_VALUE_TYPE_STRING = 4;
 }
 
 // Comparison operations over value subexpressions.

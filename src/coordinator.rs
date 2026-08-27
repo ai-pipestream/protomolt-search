@@ -269,6 +269,222 @@ pub(crate) fn compile_projections(
     Ok(compiled)
 }
 
+/// Compile the public aggregation list: names checked, ops decoded,
+/// expressions compiled once into the ValueExpr IR the shards resolve.
+pub(crate) fn compile_aggregations(
+    aggregations: &[crate::pb::Aggregation],
+) -> Result<Vec<crate::pb::CompiledAggregation>, Status> {
+    if aggregations.is_empty() {
+        return Err(Status::invalid_argument(
+            "aggregate requires at least one aggregation",
+        ));
+    }
+    if aggregations.len() > 32 {
+        return Err(Status::invalid_argument(format!(
+            "aggregate takes at most 32 aggregations per request, got {}",
+            aggregations.len()
+        )));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut compiled = Vec::with_capacity(aggregations.len());
+    for a in aggregations {
+        if a.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "aggregation: an aggregation needs a non-empty name",
+            ));
+        }
+        if !names.insert(a.name.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "aggregation: duplicate aggregation name {:?}",
+                a.name
+            )));
+        }
+        crate::node::agg_op_of(a.op)
+            .map_err(|e| Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message())))?;
+        let expr = crate::cel::compile_value(&a.expression).map_err(|e| {
+            Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message()))
+        })?;
+        compiled.push(crate::pb::CompiledAggregation {
+            expr: Some(expr),
+            op: a.op,
+            name: a.name.clone(),
+        });
+    }
+    Ok(compiled)
+}
+
+/// One aggregation's merged fleet-wide statistics: a type vote plus
+/// every fold, gated per type. Extrema and moments fold only over
+/// shards that HELD values; the type vote counts on any shard whose
+/// columns resolve, so cross-shard type disagreement stays loud even
+/// when one side is empty.
+struct AggMerge {
+    vt: Option<crate::pb::AggregateValueType>,
+    present: u64,
+    int_sum: i128,
+    int_min: i64,
+    int_max: i64,
+    dsum: f64,
+    dcomp: f64,
+    dmin: f64,
+    dmax: f64,
+    mean: f64,
+    m2: f64,
+}
+
+impl AggMerge {
+    fn new() -> Self {
+        Self {
+            vt: None,
+            present: 0,
+            int_sum: 0,
+            int_min: 0,
+            int_max: 0,
+            dsum: 0.0,
+            dcomp: 0.0,
+            dmin: 0.0,
+            dmax: 0.0,
+            mean: 0.0,
+            m2: 0.0,
+        }
+    }
+
+    /// Neumaier step: fold one addend into (sum, compensation).
+    fn neumaier(&mut self, x: f64) {
+        let t = self.dsum + x;
+        self.dcomp += if self.dsum.abs() >= x.abs() {
+            (self.dsum - t) + x
+        } else {
+            (x - t) + self.dsum
+        };
+        self.dsum = t;
+    }
+
+    /// Fold one shard's partial in. Shard order is the caller's
+    /// contract; every fold here is deterministic given that order.
+    fn fold(&mut self, p: &crate::pb::AggregatePartial, name: &str) -> Result<(), Status> {
+        use crate::pb::AggregateValueType as T;
+        let vt = match T::try_from(p.vtype) {
+            Ok(T::Absent) => return Ok(()),
+            Ok(T::Unspecified) | Err(_) => {
+                return Err(Status::internal(
+                    "shard answered an aggregation partial without a type",
+                ));
+            }
+            Ok(vt) => vt,
+        };
+        match self.vt {
+            None => self.vt = Some(vt),
+            Some(prev) if prev != vt => {
+                return Err(Status::failed_precondition(format!(
+                    "aggregation {name:?}: shards disagree on the expression's type \
+                     ({} against {}); the column families diverge across shards",
+                    agg_vt_name(prev),
+                    agg_vt_name(vt)
+                )));
+            }
+            Some(_) => {}
+        }
+        if p.present == 0 {
+            return Ok(());
+        }
+        match vt {
+            T::Int => {
+                self.int_sum += (i128::from(p.int_sum_hi) << 64) | i128::from(p.int_sum_lo);
+                if self.present == 0 {
+                    self.int_min = p.int_min;
+                    self.int_max = p.int_max;
+                } else {
+                    self.int_min = self.int_min.min(p.int_min);
+                    self.int_max = self.int_max.max(p.int_max);
+                }
+            }
+            T::Double => {
+                // The shard's compensated sum folds as its two exact
+                // halves, keeping the coordinator's own compensation.
+                self.neumaier(p.double_sum);
+                self.neumaier(p.double_compensation);
+                if self.present == 0 {
+                    self.dmin = p.double_min;
+                    self.dmax = p.double_max;
+                } else if p.double_min.is_nan() || self.dmin.is_nan() {
+                    self.dmin = f64::NAN;
+                    self.dmax = f64::NAN;
+                } else {
+                    self.dmin = self.dmin.min(p.double_min);
+                    self.dmax = self.dmax.max(p.double_max);
+                }
+                // Chan's parallel Welford merge.
+                let (na, nb) = (self.present, p.present);
+                if na == 0 {
+                    self.mean = p.mean;
+                    self.m2 = p.m2;
+                } else {
+                    let n = (na + nb) as f64;
+                    let delta = p.mean - self.mean;
+                    self.mean += delta * (nb as f64 / n);
+                    self.m2 += p.m2 + delta * delta * (na as f64 * nb as f64 / n);
+                }
+            }
+            T::String => {}
+            T::Absent | T::Unspecified => unreachable!("handled above"),
+        }
+        self.present += p.present;
+        Ok(())
+    }
+
+    /// The final result for one op. `present == 0` reports no value
+    /// (COUNT aside, which reports the zero).
+    fn result(
+        &self,
+        name: &str,
+        op: crate::pb::AggregateOp,
+    ) -> Result<crate::pb::AggregateResult, Status> {
+        use crate::pb::aggregate_result::Value as W;
+        use crate::pb::{AggregateOp as O, AggregateValueType as T};
+        let int_typed = self.vt == Some(T::Int);
+        let value = match op {
+            O::Count => Some(W::IntValue(self.present as i64)),
+            _ if self.present == 0 => None,
+            O::Sum if int_typed => match i64::try_from(self.int_sum) {
+                Ok(v) => Some(W::IntValue(v)),
+                Err(_) => {
+                    return Err(Status::failed_precondition(format!(
+                        "aggregation {name:?}: the exact int sum {} does not fit i64; \
+                         aggregate double(...) for an IEEE sum, or ask for the mean",
+                        self.int_sum
+                    )));
+                }
+            },
+            O::Sum => Some(W::DoubleValue(self.dsum + self.dcomp)),
+            O::Min if int_typed => Some(W::IntValue(self.int_min)),
+            O::Min => Some(W::DoubleValue(self.dmin)),
+            O::Max if int_typed => Some(W::IntValue(self.int_max)),
+            O::Max => Some(W::DoubleValue(self.dmax)),
+            O::Mean => Some(W::DoubleValue(self.mean)),
+            O::Variance => Some(W::DoubleValue(self.m2 / self.present as f64)),
+            O::Stddev => Some(W::DoubleValue((self.m2 / self.present as f64).sqrt())),
+            O::Unspecified => unreachable!("compile refused the unspecified op"),
+        };
+        Ok(crate::pb::AggregateResult {
+            name: name.to_string(),
+            present: self.present,
+            value,
+        })
+    }
+}
+
+/// Type name for the disagreement refusal.
+fn agg_vt_name(vt: crate::pb::AggregateValueType) -> &'static str {
+    use crate::pb::AggregateValueType as T;
+    match vt {
+        T::Int => "int",
+        T::Double => "double",
+        T::String => "string",
+        T::Absent | T::Unspecified => "absent",
+    }
+}
+
 fn merge_column_stats(
     requested: &[String],
     shard_stats: &[Vec<crate::pb::ColumnStats>],
@@ -3942,6 +4158,89 @@ impl CoordinatorServiceImpl {
         })
     }
 
+    /// Aggregation fan-out (docs/aggregations.md): every shard folds
+    /// exact partials over its admitted documents; the coordinator
+    /// merges them IN SHARD ORDER so the folds are deterministic
+    /// bit-for-bit across runs. The typo rules hold as on every
+    /// filtered route, and expression column leaves follow the
+    /// projection contract: a leaf NO shard knows refuses by name.
+    pub async fn fanout_aggregate(
+        &self,
+        filters: &RequestFilters,
+        aggregations: &[crate::pb::CompiledAggregation],
+    ) -> Result<crate::pb::AggregateResponse, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::AggregateShardRequest {
+                filter: filters.tree.clone(),
+                geo_filters: filters.geo.clone(),
+                aggregations: aggregations.to_vec(),
+            };
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .aggregate_shard(request)
+                    .await
+                    .map(|r| r.into_inner())
+            }));
+        }
+        // The same leaf enumeration the shards answer positionally.
+        let mut leaves = Vec::new();
+        for agg in aggregations {
+            if let Some(expr) = agg.expr.as_ref() {
+                crate::values::column_leaves(expr, &mut leaves);
+            }
+        }
+        let mut known = FilterKnown::new(filters);
+        let mut leaves_known = vec![false; leaves.len()];
+        let mut matched = 0u64;
+        let mut merged: Vec<AggMerge> = aggregations.iter().map(|_| AggMerge::new()).collect();
+        for task in tasks {
+            let response = task
+                .await
+                .map_err(|e| Status::internal(format!("aggregate task failed: {e}")))??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            if response.expr_leaves_known.len() != leaves_known.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} expression-leaf flags for {} leaves",
+                    response.expr_leaves_known.len(),
+                    leaves_known.len()
+                )));
+            }
+            for (acc, k) in leaves_known.iter_mut().zip(&response.expr_leaves_known) {
+                *acc |= *k;
+            }
+            if response.partials.len() != merged.len() {
+                return Err(Status::internal(format!(
+                    "shard answered {} aggregation partials for {} aggregations",
+                    response.partials.len(),
+                    merged.len()
+                )));
+            }
+            matched += response.matched;
+            for (m, (p, agg)) in merged
+                .iter_mut()
+                .zip(response.partials.iter().zip(aggregations))
+            {
+                m.fold(p, &agg.name)?;
+            }
+        }
+        known.refuse_unknown(filters)?;
+        for (leaf, k) in leaves.iter().zip(&leaves_known) {
+            if !k {
+                return Err(Status::invalid_argument(format!(
+                    "aggregation: no shard has column {}",
+                    leaf.describe()
+                )));
+            }
+        }
+        let mut results = Vec::with_capacity(aggregations.len());
+        for (agg, m) in aggregations.iter().zip(&merged) {
+            results.push(m.result(&agg.name, crate::node::agg_op_of(agg.op)?)?);
+        }
+        Ok(crate::pb::AggregateResponse { results, matched })
+    }
+
     pub async fn fanout_calibration(
         &self,
         req: &BroadcastCalibrationRequest,
@@ -4919,6 +5218,22 @@ impl SearchService for CoordinatorServiceImpl {
         Ok(Response::new(crate::pb::PlanIndexResponse {
             plan: Some(plan),
         }))
+    }
+
+    /// Exact aggregates over the filtered corpus
+    /// (docs/aggregations.md). CEL compiles ONCE, here: the filter
+    /// into the predicate IR, each expression into the ValueExpr IR;
+    /// no shard ever sees text.
+    async fn aggregate(
+        &self,
+        request: Request<crate::pb::AggregateRequest>,
+    ) -> Result<Response<crate::pb::AggregateResponse>, Status> {
+        let req = request.into_inner();
+        let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+        let compiled = compile_aggregations(&req.aggregations)?;
+        self.fanout_aggregate(&filters, &compiled)
+            .await
+            .map(Response::new)
     }
 
     async fn cluster_health(
