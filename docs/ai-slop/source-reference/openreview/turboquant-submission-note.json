@@ -1,0 +1,90 @@
+{
+  "notes": [
+    {
+      "content": {
+        "title": {
+          "value": "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"
+        },
+        "authors": {
+          "value": [
+            "Amir Zandieh",
+            "Majid Daliri",
+            "Majid Hadian",
+            "Vahab Mirrokni"
+          ]
+        },
+        "authorids": {
+          "value": [
+            "~Amir_Zandieh2",
+            "~Majid_Daliri1",
+            "~Majid_Hadian1",
+            "~Vahab_Mirrokni2"
+          ]
+        },
+        "keywords": {
+          "value": [
+            "Vector Quantization",
+            "KV Cache Compression",
+            "Nearest Neighbor Search",
+            "Similarity Search Acceleration",
+            "Online Compression Algorithms"
+          ]
+        },
+        "abstract": {
+          "value": "Vector quantization, a problem rooted in Shannon's source coding theory, aims to quantize high-dimensional Euclidean vectors while minimizing distortion in their geometric structure. We propose TurboQuant to address both mean-squared error (MSE) and inner product distortion, overcoming limitations of existing methods that fail to achieve optimal distortion rates. Our data-oblivious algorithms, suitable for online applications, achieve near-optimal distortion rates (within a small constant factor) across all bit-widths and dimensions. TurboQuant achieves this by randomly rotating input vectors, inducing a concentrated Beta distribution on coordinates, and leveraging the near-independence property of distinct coordinates in high dimensions to simply apply optimal scalar quantizers per each coordinate. Recognizing that MSE-optimal quantizers introduce bias in inner product estimation, we propose a two-stage approach: applying an MSE quantizer followed by a 1-bit Quantized JL (QJL) transform on the residual, resulting in an unbiased inner product quantizer. We also provide a formal proof of the information-theoretic lower bounds on best achievable distortion rate by any vector quantizer, demonstrating that TurboQuant closely matches these bounds, differing only by a small constant ($\\approx 2.7$) factor. Experimental results validate our theoretical findings, showing that for KV cache quantization, we achieve absolute quality neutrality with 3.5 bits per channel and marginal quality degradation with 2.5 bits per channel. Furthermore, in nearest neighbor search tasks, our method outperforms existing product quantization techniques in recall while reducing indexing time to virtually zero."
+        },
+        "primary_area": {
+          "value": "optimization"
+        },
+        "venue": {
+          "value": "ICLR 2026 Poster"
+        },
+        "venueid": {
+          "value": "ICLR.cc/2026/Conference"
+        },
+        "pdf": {
+          "value": "/pdf/86df3c70aa9b7035c407e886e8238951a5d6ec23.pdf"
+        },
+        "_bibtex": {
+          "value": "@inproceedings{\nzandieh2026turboquant,\ntitle={TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate},\nauthor={Amir Zandieh and Majid Daliri and Majid Hadian and Vahab Mirrokni},\nbooktitle={The Fourteenth International Conference on Learning Representations},\nyear={2026},\nurl={https://openreview.net/forum?id=tO3ASKZlok}\n}"
+        },
+        "paperhash": {
+          "value": "zandieh|turboquant_online_vector_quantization_with_nearoptimal_distortion_rate"
+        }
+      },
+      "id": "tO3ASKZlok",
+      "forum": "tO3ASKZlok",
+      "license": "CC BY 4.0",
+      "signatures": [
+        "ICLR.cc/2026/Conference/Submission16479/Authors"
+      ],
+      "readers": [
+        "everyone"
+      ],
+      "writers": [
+        "ICLR.cc/2026/Conference",
+        "ICLR.cc/2026/Conference/Submission16479/Authors"
+      ],
+      "number": 16479,
+      "odate": 1759896705795,
+      "invitations": [
+        "ICLR.cc/2026/Conference/-/Submission",
+        "ICLR.cc/2026/Conference/-/Post_Submission",
+        "ICLR.cc/2026/Conference/Submission16479/-/Full_Submission",
+        "ICLR.cc/2026/Conference/-/Edit",
+        "ICLR.cc/2026/Conference/Submission16479/-/Camera_Ready_Revision"
+      ],
+      "domain": "ICLR.cc/2026/Conference",
+      "tcdate": 1758264987743,
+      "cdate": 1758264987743,
+      "tmdate": 1778676131801,
+      "mdate": 1778676131801,
+      "pdate": 1769436300204,
+      "version": 2,
+      "details": {
+        "writable": false
+      }
+    }
+  ],
+  "count": 1
+}
