@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy_fleet.sh -- get a turbovec-search aarch64 binary and the bench
+# deploy_fleet.sh -- get a pipestream-search aarch64 binary and the bench
 # node scripts onto the pi fleet.
 #
 # usage:
@@ -61,7 +61,7 @@ One-time setup on this box (then re-run):
 Or skip the cross toolchain entirely and hand over a binary built
 elsewhere (e.g. natively on a pi):
 
-  BINARY=/path/to/turbovec-search deploy_fleet.sh all
+  BINARY=/path/to/pipestream-search deploy_fleet.sh all
 EOF
 }
 
@@ -71,7 +71,7 @@ ensure_binary() {
   elif cross_setup_ready; then
     say "cross-building aarch64 release binary (this takes a while)"
     (cd "$REPO" && cargo build --release --target aarch64-unknown-linux-gnu -j 8)
-    BINARY="$REPO/target/aarch64-unknown-linux-gnu/release/turbovec-search"
+    BINARY="$REPO/target/aarch64-unknown-linux-gnu/release/pipestream-search"
     [[ -x $BINARY ]] || die "cross build finished but $BINARY is missing"
   else
     print_cross_setup_instructions
@@ -98,9 +98,9 @@ deploy_host() {
     die "$h: rsync of node scripts failed"
   rm -rf "$tmp"
   say "$h ($ip): binary"
-  rsync -aW --partial --info=progress2 "$BINARY" "$h:$root/bin/turbovec-search" ||
+  rsync -aW --partial --info=progress2 "$BINARY" "$h:$root/bin/pipestream-search" ||
     die "$h: rsync of binary failed"
-  host_sh "$h" "chmod +x $(printf '%q' "$root")/bin/turbovec-search" ||
+  host_sh "$h" "chmod +x $(printf '%q' "$root")/bin/pipestream-search" ||
     die "$h: chmod failed"
   say "$h done (run scripts + binary under $root)"
 }
@@ -114,7 +114,7 @@ doctor_host() {
   fi
   printf '%-8s ssh ok (%s)\n' "$h" "$ip"
   host_sh "$h" "
-    b=$(q "$root")/bin/turbovec-search
+    b=$(q "$root")/bin/pipestream-search
     if [[ -x \"\$b\" ]]; then echo \"  binary   present+exec\"; else echo \"  binary   MISSING (\$b)\"; fi
     echo \"  disk     \$(d=$(q "$root"); while [[ ! -d \"\$d\" && \"\$d\" != / ]]; do d=\$(dirname \"\$d\"); done; df -h \"\$d\" | awk -v d=\"\$d\" 'NR==2{print \$4\" free of \"\$2\" (at \"d\")\"}')\"
     echo \"  memory   \$(free -g | awk '/Mem:/{print \$7\" GB avail of \"\$2}')\"

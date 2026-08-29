@@ -1,6 +1,6 @@
 # Test results — CourtListener corpus, full-scale battery
 
-First full-scale measurement round of turbovec-search: correctness,
+First full-scale measurement round of pipestream-search: correctness,
 latency scaling, collaborative pruning, and quantization recall over the
 complete CourtListener opinion corpus. 2026-07-29/30.
 

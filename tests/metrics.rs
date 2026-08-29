@@ -8,13 +8,13 @@
 
 mod common;
 
+use pipestream_search::metrics;
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::AddDocumentsRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::metrics;
-use turbovec_search::node::{NodeConfig, NodeServiceImpl};
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::AddDocumentsRequest;
 
 use common::mock::start_mock_analysis;
 use common::start_empty_node;
@@ -77,10 +77,7 @@ async fn counters_move_with_traffic() {
         .unwrap();
     }
     drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap();
+    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
     let after = metrics::render(&[]);
 
     let delta = |needle: &str| counter(&after, needle) - counter(&before, needle);

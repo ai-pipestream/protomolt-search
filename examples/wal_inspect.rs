@@ -20,8 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
-use turbovec_search::pb::wal::wal_record;
-use turbovec_search::wal::{self, RecordReader};
+use pipestream_search::pb::wal::wal_record;
+use pipestream_search::wal::{self, RecordReader};
 
 fn opt(key: &str) -> Option<String> {
     let prefix = format!("--{key}=");

@@ -1,6 +1,6 @@
 # Court end-to-end demo
 
-Full pipeline from public bulk data to a queried 4-shard turbovec-search
+Full pipeline from public bulk data to a queried 4-shard pipestream-search
 cluster, as a reproducible installer **and** an end-to-end test. No
 Python anywhere: data movement is the AWS CLI, extraction is Rust,
 embedding/serving is Rust + the GraalVM-native OpenNLP sidecar.

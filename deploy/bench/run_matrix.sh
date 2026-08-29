@@ -48,11 +48,11 @@ REPO="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=inventory.env
 source "$HERE/inventory.env"
 
-BIN_LOCAL=${BIN_LOCAL:-$REPO/target/release/turbovec-search}
+BIN_LOCAL=${BIN_LOCAL:-$REPO/target/release/pipestream-search}
 SWEEP=${SWEEP:-$REPO/target/release/examples/cluster_sweep}
 VERIFY=${VERIFY:-$REPO/target/release/examples/v7_verify}
 # Where krick-1's own checkout would put a release binary, if it has one.
-KRICK1_CLONE_BIN=/work/worktrees/turbovec-workspace/turbovec-search/target/release/turbovec-search
+KRICK1_CLONE_BIN=/work/worktrees/turbovec-workspace/turbovec-search/target/release/pipestream-search
 
 die() { echo "run_matrix: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -88,7 +88,7 @@ declare -a SHARD_IDS=()          # shard ordinals discovered under SHARD_SET
 declare -A SHARD_HOST=()         # shard ordinal -> host
 declare -A SHARD_PORT=()         # shard ordinal -> sharing port (twin is +1... see below)
 declare -A HOST_SHARDS=()        # host -> space-separated shard ordinals
-declare -A HOST_BIN=()           # host -> turbovec-search path on that host
+declare -A HOST_BIN=()           # host -> pipestream-search path on that host
 N_SHARDS=0
 
 # host_cmd helper for embedding values safely into remote scripts (q lives
@@ -245,13 +245,13 @@ ensure_host_binary() {
   case $host in
     krick)
       [[ -x $BIN_LOCAL ]] || die "no local binary at $BIN_LOCAL (cargo build --release)"
-      # The generated start-node.sh execs $DIR/bin/turbovec-search, so the
+      # The generated start-node.sh execs $DIR/bin/pipestream-search, so the
       # local host needs the binary under its bench root too. Copy (not
       # symlink): a cargo rebuild must not swap the file under a live node.
       must krick "mkdir $root/bin" "mkdir -p $(q "$root")/bin"
-      cp "$BIN_LOCAL" "$root/bin/turbovec-search" ||
+      cp "$BIN_LOCAL" "$root/bin/pipestream-search" ||
         die "krick: could not copy $BIN_LOCAL into $root/bin"
-      HOST_BIN[$host]=$root/bin/turbovec-search
+      HOST_BIN[$host]=$root/bin/pipestream-search
       ;;
     krick-1)
       if host_sh krick-1 "[[ -x $(q "$KRICK1_CLONE_BIN") ]]"; then
@@ -260,15 +260,15 @@ ensure_host_binary() {
         [[ -x $BIN_LOCAL ]] || die "no local binary at $BIN_LOCAL to rsync to krick-1"
         say "krick-1 has no built clone; rsyncing this repo's release binary"
         must krick-1 "mkdir $root/bin" "mkdir -p $(q "$root")/bin"
-        rsync -aW --partial "$BIN_LOCAL" "krick-1:$root/bin/turbovec-search" ||
+        rsync -aW --partial "$BIN_LOCAL" "krick-1:$root/bin/pipestream-search" ||
           die "krick-1: binary rsync failed"
-        HOST_BIN[$host]=$root/bin/turbovec-search
+        HOST_BIN[$host]=$root/bin/pipestream-search
       fi
       ;;
     *)
-      host_sh "$host" "[[ -x $(q "$root")/bin/turbovec-search ]]" ||
-        die "$host: no binary at $root/bin/turbovec-search -- run deploy_fleet.sh $host first"
-      HOST_BIN[$host]=$root/bin/turbovec-search
+      host_sh "$host" "[[ -x $(q "$root")/bin/pipestream-search ]]" ||
+        die "$host: no binary at $root/bin/pipestream-search -- run deploy_fleet.sh $host first"
+      HOST_BIN[$host]=$root/bin/pipestream-search
       ;;
   esac
 }

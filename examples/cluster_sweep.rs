@@ -48,9 +48,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pipestream_search::coordinator::{CoordinatorServiceImpl, FanoutLimits};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
 use tokio::sync::Semaphore;
-use turbovec_search::coordinator::{CoordinatorServiceImpl, FanoutLimits};
-use turbovec_search::pb::node_service_client::NodeServiceClient;
 
 const DEFAULT_DATA_DIR: &str = "/work/opensearch-grpc-knn/distributed_test_data/wikipedia";
 const PART_COUNT: usize = 61_077;
@@ -74,7 +74,7 @@ fn load_probes(probes_from: &str, data_dir: &str, n_queries: usize) -> Vec<Probe
         (0..n_queries)
             .map(|qi| {
                 let (part, index) = (qi % 4, 1_000 + (qi / 4) * 9_000 % PART_COUNT);
-                let (vector, _) = turbovec_search::demo::dataset::read_embedding_at(
+                let (vector, _) = pipestream_search::demo::dataset::read_embedding_at(
                     &std::path::PathBuf::from(format!("{data_dir}/embeddings_part_{part}.bin")),
                     index,
                 )
@@ -83,8 +83,9 @@ fn load_probes(probes_from: &str, data_dir: &str, n_queries: usize) -> Vec<Probe
             })
             .collect()
     } else {
-        let (_, reader) = turbovec_search::demo::court::EmbeddingReader::open(probes_from.as_ref())
-            .expect("open probes file");
+        let (_, reader) =
+            pipestream_search::demo::court::EmbeddingReader::open(probes_from.as_ref())
+                .expect("open probes file");
         let mut probes = Vec::new();
         for record in reader {
             if probes.len() >= n_queries {

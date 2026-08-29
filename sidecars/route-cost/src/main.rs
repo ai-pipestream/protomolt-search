@@ -8,7 +8,7 @@
 //! SIDECAR. The search engine never links routee-compass; precomputed
 //! anchor costs land in ordinary map-numeric columns, where range
 //! facets, score chains, and (future) CEL filters work unchanged. This
-//! crate is deliberately not a workspace member of turbovec-search.
+//! crate is deliberately not a workspace member of pipestream-search.
 //!
 //! Failure model, per the loud-failures rule: malformed inputs refuse
 //! up front by name, before any routing runs. PER-PAIR routing

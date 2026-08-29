@@ -7,22 +7,21 @@
 #[test]
 fn same_vector_same_score_across_layouts() {
     let dim = 64;
-    let corpus = turbovec_search::harness::unit_vectors(12, dim, 0x3333_0001);
-    let (shift, scale) = turbovec_search::harness::fit_calibration(dim, 4, &corpus);
+    let corpus = pipestream_search::harness::unit_vectors(12, dim, 0x3333_0001);
+    let (shift, scale) = pipestream_search::harness::fit_calibration(dim, 4, &corpus);
     let query = corpus[..dim].to_vec();
 
-    let mut big = turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
-    big.add(&corpus);
-    let big_res = big.search(&query, 12);
+    let mut big = pipestream_search::harness::seeded_index(dim, 4, &shift, &scale);
+    big.add(&corpus, dim).unwrap();
+    let big_res = big.search_unfiltered(&query, 12);
 
     // A 4-vector shard holding docs 8..12 of the same corpus: doc 9 lives
     // at slot 9 in the big index and slot 1 here.
-    let mut small =
-        turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
-    small.add(&corpus[8 * dim..12 * dim]);
-    let small_res = small.search(&query, 4);
+    let mut small = pipestream_search::harness::seeded_index(dim, 4, &shift, &scale);
+    small.add(&corpus[8 * dim..12 * dim], dim).unwrap();
+    let small_res = small.search_unfiltered(&query, 4);
 
-    let find = |res: &turbovec::SearchResults, slot: i64| {
+    let find = |res: &pipestream_search::vector::VectorSearchResults, slot: i64| {
         let pos = res
             .indices_for_query(0)
             .iter()
@@ -47,15 +46,14 @@ fn same_vector_same_score_across_layouts() {
 #[test]
 fn cross_size_scores_differ_only_within_a_few_ulps() {
     let dim = 128;
-    let corpus = turbovec_search::harness::unit_vectors(12, dim, 0x3333_0002);
-    let (shift, scale) = turbovec_search::harness::fit_calibration(dim, 4, &corpus);
+    let corpus = pipestream_search::harness::unit_vectors(12, dim, 0x3333_0002);
+    let (shift, scale) = pipestream_search::harness::fit_calibration(dim, 4, &corpus);
     let query = corpus[..dim].to_vec();
 
     let score_in = |vecs: &[f32], slot: i64| {
-        let mut idx =
-            turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
-        idx.add(vecs);
-        let res = idx.search(&query, idx.len());
+        let mut idx = pipestream_search::harness::seeded_index(dim, 4, &shift, &scale);
+        idx.add(vecs, dim).unwrap();
+        let res = idx.search_unfiltered(&query, idx.len());
         let pos = res
             .indices_for_query(0)
             .iter()

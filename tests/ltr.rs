@@ -6,14 +6,11 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     score_signal, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     AddVectorsRequest, BoostQuery, CompositeScoreOperation, CompositeScorer,
     CompositeSearchStrategy, DenseQuery, FilterQuery, IntegerValue, LexicalQuery,
@@ -21,6 +18,9 @@ use turbovec_search::pb::{
     RrfScore, ScoreDimension, ScoreNormalization, ScoreOp, ScoreSignal, ScoreStage, SearchQuery,
     SelectionOperator, SelectionQuery, SelectionScoreStrategy, SetCalibrationRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 
@@ -189,7 +189,11 @@ async fn query(
 /// Recompute one hit's final score from its dimension provenance the
 /// way the contract promises a client can: contributions only, plus
 /// the request's weights for the harmonic denominator.
-fn recompute(op: CompositeScoreOperation, hit: &turbovec_search::pb::QueryHit, weights: &[f64]) -> f32 {
+fn recompute(
+    op: CompositeScoreOperation,
+    hit: &pipestream_search::pb::QueryHit,
+    weights: &[f64],
+) -> f32 {
     let active: Vec<(usize, f64)> = hit
         .dimensions
         .iter()
@@ -201,9 +205,10 @@ fn recompute(op: CompositeScoreOperation, hit: &turbovec_search::pb::QueryHit, w
         CompositeScoreOperation::WeightedSum | CompositeScoreOperation::WeightedMean => {
             active.iter().map(|(_, c)| c).sum()
         }
-        CompositeScoreOperation::Maximum => {
-            active.iter().map(|(_, c)| *c).fold(f64::NEG_INFINITY, f64::max)
-        }
+        CompositeScoreOperation::Maximum => active
+            .iter()
+            .map(|(_, c)| *c)
+            .fold(f64::NEG_INFINITY, f64::max),
         CompositeScoreOperation::Product | CompositeScoreOperation::GeometricMean => {
             active.iter().map(|(_, c)| c).product()
         }
@@ -239,7 +244,10 @@ async fn scorer_reorders_the_hybrid_pool_and_reports_dimensions() {
     )
     .await
     .unwrap();
-    assert_eq!(response.executed, "hybrid_search:global_rank+scorer:weighted_sum");
+    assert_eq!(
+        response.executed,
+        "hybrid_search:global_rank+scorer:weighted_sum"
+    );
     assert_eq!(response.hits.len(), N_DOCS);
     for (i, hit) in response.hits.iter().enumerate() {
         // Dimensions ride every hit, aligned with the request.
@@ -437,10 +445,13 @@ async fn boost_signals_feed_the_scorer() {
     // "plain" lives in the odd docs: with the boost dimension at
     // weight 5 over a min-max base, every boosted doc outranks every
     // unboosted one.
-    let (odd, even): (Vec<&turbovec_search::pb::QueryHit>, Vec<_>) =
+    let (odd, even): (Vec<&pipestream_search::pb::QueryHit>, Vec<_>) =
         response.hits.iter().partition(|h| h.doc_id % 2 == 1);
     let worst_odd = odd.iter().map(|h| h.score).fold(f32::INFINITY, f32::min);
-    let best_even = even.iter().map(|h| h.score).fold(f32::NEG_INFINITY, f32::max);
+    let best_even = even
+        .iter()
+        .map(|h| h.score)
+        .fold(f32::NEG_INFINITY, f32::max);
     assert!(worst_odd > best_even);
     // The boost signal rides provenance on exactly the boosted docs.
     for h in &response.hits {
@@ -517,7 +528,7 @@ async fn scorer_interplays_refuse_by_name() {
                 selection: Some(SelectionQuery {
                     node: Some(selection_query::Node::Filter(FilterQuery {
                         id: "f".into(),
-                        predicate: Some(turbovec_search::pb::filter_query::Predicate::Cel(
+                        predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
                             "year >= 0".into(),
                         )),
                     })),
@@ -556,7 +567,7 @@ async fn scorer_interplays_refuse_by_name() {
                                 node: Some(selection_query::Node::Filter(FilterQuery {
                                     id: "f".into(),
                                     predicate: Some(
-                                        turbovec_search::pb::filter_query::Predicate::Cel(
+                                        pipestream_search::pb::filter_query::Predicate::Cel(
                                             "year >= 0".into(),
                                         ),
                                     ),
@@ -713,7 +724,12 @@ async fn lexical_boost_windows_a_single_leaf_pool() {
     for h in &response.hits {
         let has_signal = h.signals.iter().any(|s| s.id == "z");
         // Signals land only inside the window, and only on matches.
-        assert_eq!(has_signal, h.doc_id < 4 && h.doc_id % 2 == 0, "doc {}", h.doc_id);
+        assert_eq!(
+            has_signal,
+            h.doc_id < 4 && h.doc_id % 2 == 0,
+            "doc {}",
+            h.doc_id
+        );
     }
 }
 
@@ -724,9 +740,7 @@ async fn lexical_boost_on_a_dense_leaf_carries_its_own_analysis() {
     // the boost's own analysis spec is admitted.
     let mut boost = lexical_boost("plain", "plain");
     boost.boost_weight = 100.0;
-    if let Some(search_query::Query::Lexical(lex)) =
-        boost.query.as_mut().unwrap().query.as_mut()
-    {
+    if let Some(search_query::Query::Lexical(lex)) = boost.query.as_mut().unwrap().query.as_mut() {
         lex.analysis = Some(Default::default());
     }
     let response = query(
@@ -769,7 +783,9 @@ async fn lexical_boost_on_a_dense_leaf_carries_its_own_analysis() {
     .await
     .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("analyzed under that leaf's analysis"));
+    assert!(err
+        .message()
+        .contains("analyzed under that leaf's analysis"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -816,7 +832,7 @@ async fn boost_shapes_refuse_by_name() {
     let browse = SelectionQuery {
         node: Some(selection_query::Node::Filter(FilterQuery {
             id: "f".into(),
-            predicate: Some(turbovec_search::pb::filter_query::Predicate::Cel(
+            predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
                 "year >= 0".into(),
             )),
         })),
@@ -1020,7 +1036,7 @@ async fn projections_ride_every_shape() {
         selection: Some(SelectionQuery {
             node: Some(selection_query::Node::Filter(FilterQuery {
                 id: "f".into(),
-                predicate: Some(turbovec_search::pb::filter_query::Predicate::Cel(
+                predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
                     "year >= 0".into(),
                 )),
             })),
@@ -1035,7 +1051,7 @@ async fn projections_ride_every_shape() {
             assert_eq!(h.projected.len(), 2, "{}", response.executed);
             assert_eq!(
                 h.projected[0].value,
-                Some(turbovec_search::pb::projected_value::Value::IntValue(
+                Some(pipestream_search::pb::projected_value::Value::IntValue(
                     h.doc_id as i64
                 )),
                 "{}",
@@ -1043,7 +1059,7 @@ async fn projections_ride_every_shape() {
             );
             assert_eq!(
                 h.projected[1].value,
-                Some(turbovec_search::pb::projected_value::Value::IntValue(
+                Some(pipestream_search::pb::projected_value::Value::IntValue(
                     2 * h.doc_id as i64
                 )),
                 "{}",

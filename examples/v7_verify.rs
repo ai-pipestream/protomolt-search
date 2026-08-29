@@ -14,9 +14,9 @@
 //!     --query="qualified immunity" --case-name-query="United States"
 //! ```
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::analyzer;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
     search_variant, AnalysisSpec, Bm25SearchRequest, ClusterHealthRequest, FusionMode,
     HybridLegOptions, HybridSearchRequest, QueryField, SearchRequest, SearchVariant,
     VariantSearchRequest,
@@ -31,7 +31,7 @@ fn arg(key: &str, default: &str) -> String {
 
 /// The body field's ingest analysis.
 fn body_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 /// The case_name field's ingest analysis: UNSTEMMED, tokens as identity.

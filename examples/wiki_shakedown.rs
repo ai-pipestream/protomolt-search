@@ -1,6 +1,6 @@
 //! Real-data shakedown: ingest the Lucene-era wikipedia corpus (bge-m3
 //! embeddings + Simple English Wikipedia sentences) into a 4-shard
-//! turbovec-search cluster on loopback, using the REAL OpenNLP analysis
+//! pipestream-search cluster on loopback, using the REAL OpenNLP analysis
 //! sidecar for BM25, then run hybrid queries end-to-end.
 //!
 //! The corpus stays at its absolute path (NOT copied into the repo);
@@ -11,7 +11,7 @@
 //! What this demonstrates, end to end:
 //!   1. dataset parsing (binary embeddings + newline-less-last-line text)
 //!   2. calibration fitted on a sample, then SearchService-level
-//!      BroadcastCalibration to every shard (its first real use)
+//!      BroadcastVectorBackend to every shard (its first real use)
 //!   3. AddDocuments (texts) + AddVectors (embeddings) with aligned ids
 //!   4. BM25 ingest through the REAL native analysis sidecar (PORTER
 //!      stems, MODE_FULL) — falls back to the in-repo mock with a loud
@@ -31,17 +31,17 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::time::Instant;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::demo::dataset;
-use turbovec_search::harness::{self, mock_analysis};
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
-    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastCalibrationRequest,
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::demo::dataset;
+use pipestream_search::harness::{self, mock_analysis};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
+    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastVectorBackendRequest,
     FlushRequest, GetDocumentsRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 const SIDECAR_BIN: &str =
     "/work/main/grpc-services/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
@@ -51,7 +51,7 @@ const VECTOR_BATCH: usize = 512;
 /// WHITESPACE tokenizer, PORTER stemmer, MODE_FULL, SOURCE_STEMS — query
 /// and ingest share term identity through the stems.
 fn analysis_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 fn arg(key: &str, default: &str) -> String {
@@ -62,7 +62,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn start_sidecar(port: u16) -> Result<(Child, String), String> {
-    turbovec_search::harness::start_sidecar(SIDECAR_BIN, port)
+    pipestream_search::harness::start_sidecar(SIDECAR_BIN, port)
 }
 
 async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shard: usize) {
@@ -200,19 +200,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coordinator = CoordinatorServiceImpl::new(node_addrs.clone())
         .with_bm25(Some(analysis_addr), Default::default());
 
-    // --- 5. Broadcast the calibration (first real use) -------------------
+    // --- 5. Broadcast provider-owned construction state ------------------
+    let backend = harness::embedded_backend_request(dim, 4, &shift, &scale);
     let results = coordinator
-        .fanout_calibration(&BroadcastCalibrationRequest {
-            dim: dim as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
+        .fanout_vector_backend(&BroadcastVectorBackendRequest {
+            dim: backend.dim,
+            config: backend.config,
         })
         .await;
     for r in &results {
-        assert!(r.ok, "calibration rejected by {}: {}", r.node, r.error);
+        assert!(r.ok, "vector backend rejected by {}: {}", r.node, r.error);
     }
-    eprintln!("calibration broadcast to {} shards OK", results.len());
+    eprintln!("vector backend broadcast to {} shards OK", results.len());
 
     // --- 6. Ingest: documents (BM25) then vectors, ids aligned ----------
     let spec = analysis_spec();
@@ -241,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
         assert!(flushed.written);
         let tv = PathBuf::from(&out_dir).join(format!("shard-{shard}.tv"));
-        let bm = turbovec_search::node::bm25_sidecar_path(&tv);
+        let bm = pipestream_search::node::bm25_sidecar_path(&tv);
         eprintln!(
             "shard {shard}: flushed {} vectors + {} docs ({:.0} MiB + {:.0} MiB)",
             flushed.num_vectors,
@@ -264,7 +263,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let global_probe_id = (part * counts[0] + index) as u64;
         println!("\n=== query (doc {global_probe_id}): {text:?}");
         let hits = coordinator
-            .fanout_cascade("shakedown", text, &vector, 5, Some(&spec), 0.0, false, &Default::default())
+            .fanout_cascade(
+                "shakedown",
+                text,
+                &vector,
+                5,
+                Some(&spec),
+                0.0,
+                false,
+                &Default::default(),
+            )
             .await?
             .0;
         for hit in &hits {

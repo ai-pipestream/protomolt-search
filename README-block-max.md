@@ -66,7 +66,7 @@ Reproduce with `cargo run --release --example bm25_bench`.
   forwarded to every shard; `kth_best` comes back so a client re-query
   seeds the whole fleet. The lexical twin of the vector side's
   `initial_threshold`.
-- **A/B switch** — `--block-max=false` / `TURBOVEC_BLOCK_MAX` forces
+- **A/B switch** — `--block-max=false` / `PIPESTREAM_SEARCH_BLOCK_MAX` forces
   the exhaustive path on v5 files, so one cluster can race itself.
 - **Fleet factorial** — `cluster_sweep --bm25-terms="court,state,appeal"`
   runs `{floor seeding} × {block-max}` with a hit-signature gate that

@@ -7,17 +7,17 @@
 
 mod common;
 
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
+    AddDocumentsRequest, Bm25QueryRequest, Bm25SearchRequest, FacetValue, FlushRequest,
+};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
-    AddDocumentsRequest, Bm25QueryRequest, Bm25SearchRequest, FacetValue, FlushRequest,
-};
-use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -55,7 +55,7 @@ const SHARD_DOCS: [&[(&str, Facets)]; 3] = [
 async fn add_documents_faceted(
     addr: &str,
     docs: &[(&str, &[(&str, &str)])],
-) -> Result<turbovec_search::pb::AddDocumentsResponse, tonic::Status> {
+) -> Result<pipestream_search::pb::AddDocumentsResponse, tonic::Status> {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(8);
     for (text, facets) in docs {
@@ -122,7 +122,7 @@ async fn start_faceted_shards(
     (addrs, handles)
 }
 
-fn counts_of(ff: &turbovec_search::pb::FacetFieldCounts) -> Vec<(&str, u64)> {
+fn counts_of(ff: &pipestream_search::pb::FacetFieldCounts) -> Vec<(&str, u64)> {
     ff.counts
         .iter()
         .map(|c| (c.value.as_str(), c.count))
@@ -284,7 +284,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     assert_eq!(counts_of(&facets_k1[0]), vec![("ca9", 2), ("scotus", 1)]);
 
     // A seeded floor narrows the surfaced hits, never the counts.
-    let seed = turbovec_search::bm25::floor_seed(hits[0].score);
+    let seed = pipestream_search::bm25::floor_seed(hits[0].score);
     let (seeded_hits, seeded_facets, _) = coordinator
         .fanout_bm25_faceted("rust", 6, None, seed, &want, &[], &[], &[], &[], None)
         .await
@@ -307,7 +307,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     );
 
     // The fused route counts the same match set (one body leg).
-    let fields = vec![turbovec_search::pb::QueryField {
+    let fields = vec![pipestream_search::pb::QueryField {
         field: "body".to_string(),
         analysis: None,
         weight: 1.0,
@@ -428,7 +428,7 @@ async fn facet_ingest_validation_refuses_bad_values() {
     // The refused documents never entered the store.
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let stats = client
-        .term_stats(turbovec_search::pb::TermStatsRequest {
+        .term_stats(pipestream_search::pb::TermStatsRequest {
             terms: vec!["some".into()],
             fields: Vec::new(),
         })
@@ -462,7 +462,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
     assert!(flushed.written);
-    let bm25_path = turbovec_search::node::bm25_sidecar_path(&index_path);
+    let bm25_path = pipestream_search::node::bm25_sidecar_path(&index_path);
     let mut magic = [0u8; 8];
     use std::io::Read;
     std::fs::File::open(&bm25_path)

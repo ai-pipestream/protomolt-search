@@ -8,10 +8,10 @@
 //!     --probe-id=12345 --docs-per-shard=340000
 //! ```
 
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::demo::court;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{AnalysisSpec, GetDocumentsRequest};
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::demo::court;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{AnalysisSpec, GetDocumentsRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -30,7 +30,7 @@ fn prefix(s: &str, n: usize) -> &str {
 }
 
 fn analysis_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]

@@ -1,4 +1,4 @@
-# turbovec-search: Architecture
+# pipestream-search: Architecture
 
 Status: living document. The coordination model between nodes is settled and
 tested; the index shape is close but not final; the repo service integration
@@ -16,7 +16,7 @@ which is deliberately still placeholders.
 
 The system is a distributed search cluster built from four kinds of parts.
 At the center is turbovec, an embedded vector search library, not a server.
-Around it we built turbovec-search: a single binary that can serve as a
+Around it we built pipestream-search: a single binary that can serve as a
 search node, as a coordinator, or as both at once. Text analysis lives
 outside the cluster in a separate NLP sidecar process, and document storage
 is headed toward a repo service that holds source material and derived data
@@ -28,7 +28,7 @@ exception described later (a UDP fast lane for typed stream signals).
 C4Context
     title System context
     Person(client, "Search client", "Any gRPC caller: console, pipelines, apps")
-    System(cluster, "turbovec-search cluster", "Coordinator + search nodes, one binary per process")
+    System(cluster, "pipestream-search cluster", "Coordinator + search nodes, one binary per process")
     System_Ext(nlp, "OpenNLP analysis sidecar", "JVM gRPC service: tokenization, stemming, term identity")
     System_Ext(repo, "Repo service", "Claim-check document store: Postgres ledger + S3 object storage")
     Rel(client, cluster, "Search / ingest", "gRPC")
@@ -49,7 +49,7 @@ the repo service does not have to live on the search path.
 
 ```mermaid
 flowchart TB
-    subgraph cluster["turbovec-search cluster"]
+    subgraph cluster["pipestream-search cluster"]
         coord["Coordinator role<br/>fan-out, merge, fusion, floors"]
         n1["Search node<br/>shard 0 (.tv + .bm25)"]
         n2["Search node<br/>shard 1 (.tv + .bm25)"]
@@ -92,7 +92,7 @@ Both exist to serve the coordination model in section 4.
 
 ## 3. The server and its roles
 
-turbovec-search is one binary with one configuration file, and a process
+pipestream-search is one binary with one configuration file, and a process
 takes on one of three roles: node, coordinator, or both. A node serves
 shards. A coordinator fans queries out to nodes and merges. A process
 running both does each with no special casing, which is what single-machine

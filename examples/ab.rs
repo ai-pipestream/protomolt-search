@@ -57,9 +57,9 @@
 
 use std::time::Instant;
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::analyzer;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
     search_variant, AnalysisSpec, Bm25SearchRequest, FusionMode, HybridLegOptions,
     HybridSearchRequest, InterleaveTeam, QueryField, SearchVariant, VariantSearchRequest,
 };
@@ -433,7 +433,7 @@ impl Totals {
     /// Returns false when the query could not be compared at all, so
     /// the caller can report it separately instead of averaging a
     /// non-measurement into the summary.
-    fn add(&mut self, d: &turbovec_search::pb::RankingDiff) -> bool {
+    fn add(&mut self, d: &pipestream_search::pb::RankingDiff) -> bool {
         if d.depth == 0 {
             self.incomparable += 1;
             return false;

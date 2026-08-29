@@ -24,20 +24,20 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use pipestream_search::bm25::{self, CorpusStats};
+use pipestream_search::harness::{build_monolithic, mock_analysis};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
+    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, FlushRequest, SetCalibrationRequest,
+};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
+use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
+use pipestream_search::{analyzer, reshard};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Error as TransportError;
-use turbovec::TurboQuantIndex;
-use turbovec_search::bm25::{self, CorpusStats};
-use turbovec_search::harness::{build_monolithic, mock_analysis};
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
-    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, FlushRequest, SetCalibrationRequest,
-};
-use turbovec_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
-use turbovec_search::{analyzer, reshard};
 
 use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
 
@@ -158,6 +158,7 @@ async fn ingest(
 /// The batch analyzer closure for reshard replay: the same mock sidecar
 /// the node ingested through, bridged into the sync core (sequential
 /// within a batch — test corpora are small).
+#[allow(clippy::type_complexity)]
 fn replay_analyzer(
     analysis_addr: &str,
 ) -> impl FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> + '_ {
@@ -190,12 +191,12 @@ fn analyze_one(
 /// Top-k of one query as `(global_id, score_bits)`, coordinator order
 /// (score desc, id asc).
 fn topk(
-    index: &TurboQuantIndex,
+    index: &VectorIndex,
     query: &[f32],
     k: usize,
     id_of: impl Fn(u64) -> u64,
 ) -> Vec<(u64, u32)> {
-    let results = index.search(query, k);
+    let results = index.search_unfiltered(query, k);
     let mut hits: Vec<(u64, u32)> = results
         .indices_for_query(0)
         .iter()
@@ -219,14 +220,14 @@ async fn split_reconstructs_parent_topk() {
     ingest(&mut client, &corpus, N, DOCS).await;
 
     // Parent reference: the flushed image.
-    let parent = TurboQuantIndex::load(&index_path).unwrap();
-    parent.prepare();
+    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
+    parent.prepare().unwrap();
 
     // Split the node's WAL 1 -> 2 (cheap path: 2 <= 64 buckets, each
     // child owns a contiguous bucket range).
     let out_dir = dir.join("split");
     let output = reshard::split(
-        &reshard::resolve_gen(&turbovec_search::wal::wal_dir(&index_path)).unwrap(),
+        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
         2,
         &out_dir,
         0,
@@ -260,12 +261,12 @@ async fn split_reconstructs_parent_topk() {
         );
     }
 
-    let children: Vec<(&reshard::ChildImage, TurboQuantIndex)> = output
+    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
         .children
         .iter()
         .map(|c| {
-            let index = TurboQuantIndex::load(&c.tv_path).unwrap();
-            index.prepare();
+            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
+            index.prepare().unwrap();
             (c, index)
         })
         .collect();
@@ -316,7 +317,7 @@ async fn merge_reproduces_monolithic() {
 
     let generations = [a_path, b_path]
         .iter()
-        .map(|p| reshard::resolve_gen(&turbovec_search::wal::wal_dir(p)).unwrap())
+        .map(|p| reshard::resolve_gen(&pipestream_search::wal::wal_dir(p)).unwrap())
         .collect::<Vec<_>>();
     let out_dir = dir.join("merged");
     let output = reshard::merge(
@@ -342,8 +343,8 @@ async fn merge_reproduces_monolithic() {
 
     // Vector side: merged image == monolithic reference, bitwise.
     let reference = build_monolithic(&corpus, DIM, BIT_WIDTH, &shift, &scale);
-    let merged = TurboQuantIndex::load(&child.tv_path).unwrap();
-    merged.prepare();
+    let mut merged = VectorIndex::load(EMBEDDED_TURBOVEC, &child.vector_path).unwrap();
+    merged.prepare().unwrap();
     for q in 0..8u64 {
         let query = unit_vectors(1, DIM, 0xB0B0_0000 + q);
         assert_eq!(
@@ -372,7 +373,7 @@ async fn merge_reproduces_monolithic() {
         total_doc_length: reference_store.total_doc_length(),
         dfs: terms.iter().map(|t| reference_store.df(t)).collect(),
     };
-    let params = turbovec_search::bm25::Bm25Params::default();
+    let params = pipestream_search::bm25::Bm25Params::default();
     let expected: Vec<(u32, u64)> = bm25::top_k(&reference_store, &terms, &stats, params, 10)
         .iter()
         .map(|d| (d.doc_id, d.score.to_bits()))
@@ -388,8 +389,11 @@ async fn merge_reproduces_monolithic() {
     // different bucket count (cheap proxies for differently-built shards).
     let craft_gen = |name: &str, bucket_count: u32, perturb: bool| {
         let wal_root = dir.join(name);
-        let manifest = turbovec_search::wal::WalManifest {
+        let manifest = pipestream_search::wal::WalManifest {
             dim: DIM as u32,
+            vector_backend: String::new(),
+            vector_config_format: String::new(),
+            vector_config_payload: Vec::new(),
             bit_width: BIT_WIDTH as u32,
             calibration_shift: if perturb {
                 shift.iter().map(|x| x + 1.0).collect()
@@ -403,16 +407,16 @@ async fn merge_reproduces_monolithic() {
             bucket_count,
             preexisting_vectors: 0,
             preexisting_documents: 0,
-            format_version: turbovec_search::wal::FORMAT_VERSION,
+            format_version: pipestream_search::wal::FORMAT_VERSION,
         };
-        let mut writer = turbovec_search::wal::WalWriter::create(&wal_root, manifest).unwrap();
+        let mut writer = pipestream_search::wal::WalWriter::create(&wal_root, manifest).unwrap();
         writer
-            .append(turbovec_search::pb::wal::wal_record::Op::Flush(
-                turbovec_search::pb::wal::FlushMarker {},
+            .append(pipestream_search::pb::wal::wal_record::Op::Flush(
+                pipestream_search::pb::wal::FlushMarker {},
             ))
             .unwrap();
         writer.flush().unwrap();
-        turbovec_search::wal::gen_dir(&wal_root, 0)
+        pipestream_search::wal::gen_dir(&wal_root, 0)
     };
     let bad_calibration = craft_gen("other-cal.wal", 64, true);
     let bad = reshard::merge(
@@ -464,11 +468,11 @@ async fn split_consumes_each_bucket_once() {
     )
     .await;
     ingest(&mut client, &corpus, n, 0).await;
-    let parent = TurboQuantIndex::load(&index_path).unwrap();
-    parent.prepare();
+    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
+    parent.prepare().unwrap();
 
     let output = reshard::split(
-        &reshard::resolve_gen(&turbovec_search::wal::wal_dir(&index_path)).unwrap(),
+        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
         BUCKETS,
         &dir.join("split"),
         0,
@@ -509,12 +513,12 @@ async fn split_consumes_each_bucket_once() {
         );
     }
     // The top-k invariant holds per child pair too (union == parent).
-    let children: Vec<(&reshard::ChildImage, TurboQuantIndex)> = output
+    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
         .children
         .iter()
         .map(|c| {
-            let index = TurboQuantIndex::load(&c.tv_path).unwrap();
-            index.prepare();
+            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
+            index.prepare().unwrap();
             (c, index)
         })
         .collect();
@@ -549,13 +553,13 @@ async fn split_finer_than_buckets_repartitions() {
     let (mut client, index_path, _node) =
         start_wal_node(&dir, "shard.tv", 0, 2, &analysis_addr, &shift, &scale).await;
     ingest(&mut client, &corpus, n, 0).await;
-    let parent = TurboQuantIndex::load(&index_path).unwrap();
-    parent.prepare();
+    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
+    parent.prepare().unwrap();
 
     // 2 bucket files, split=4: the WAL bucket count caps cheap splits at
     // 2, so this exercises the re-partitioning fallback.
     let output = reshard::split(
-        &reshard::resolve_gen(&turbovec_search::wal::wal_dir(&index_path)).unwrap(),
+        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
         4,
         &dir.join("split"),
         0,
@@ -579,12 +583,12 @@ async fn split_finer_than_buckets_repartitions() {
             "child {i} holds ids outside its repartitioned range"
         );
     }
-    let children: Vec<(&reshard::ChildImage, TurboQuantIndex)> = output
+    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
         .children
         .iter()
         .map(|c| {
-            let index = TurboQuantIndex::load(&c.tv_path).unwrap();
-            index.prepare();
+            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
+            index.prepare().unwrap();
             (c, index)
         })
         .collect();
@@ -615,8 +619,11 @@ async fn split_finer_than_buckets_repartitions() {
 #[test]
 fn reshard_refuses_a_log_with_preexisting_state() {
     let dir = tempdir("preexisting");
-    let manifest = turbovec_search::wal::WalManifest {
+    let manifest = pipestream_search::wal::WalManifest {
         dim: DIM as u32,
+        vector_backend: String::new(),
+        vector_config_format: String::new(),
+        vector_config_payload: Vec::new(),
         bit_width: BIT_WIDTH as u32,
         calibration_shift: vec![0.0; DIM],
         calibration_scale: vec![1.0; DIM],
@@ -626,9 +633,9 @@ fn reshard_refuses_a_log_with_preexisting_state() {
         bucket_count: 4,
         preexisting_vectors: 123,
         preexisting_documents: 0,
-        format_version: turbovec_search::wal::FORMAT_VERSION,
+        format_version: pipestream_search::wal::FORMAT_VERSION,
     };
-    let writer = turbovec_search::wal::WalWriter::create(&dir, manifest).unwrap();
+    let writer = pipestream_search::wal::WalWriter::create(&dir, manifest).unwrap();
     let gen = writer.dir().to_path_buf();
     drop(writer);
 
@@ -685,7 +692,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
 
     let generations = [a_path, b_path]
         .iter()
-        .map(|p| reshard::resolve_gen(&turbovec_search::wal::wal_dir(p)).unwrap())
+        .map(|p| reshard::resolve_gen(&pipestream_search::wal::wal_dir(p)).unwrap())
         .collect::<Vec<_>>();
     let out_dir = dir.join("redistributed");
     let output = reshard::split_logs(
@@ -721,12 +728,12 @@ async fn split_logs_redistributes_two_shards_into_four() {
 
     // Union of child top-k == monolithic reference, bitwise.
     let reference = build_monolithic(&corpus, DIM, BIT_WIDTH, &shift, &scale);
-    let children: Vec<(&reshard::ChildImage, TurboQuantIndex)> = output
+    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
         .children
         .iter()
         .map(|c| {
-            let index = TurboQuantIndex::load(&c.tv_path).unwrap();
-            index.prepare();
+            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
+            index.prepare().unwrap();
             (c, index)
         })
         .collect();
@@ -759,7 +766,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
 /// ranking bit for bit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_preserves_multi_field_postings_and_fused_ranking() {
-    use turbovec_search::pb::DocumentField;
+    use pipestream_search::pb::DocumentField;
 
     let dir = tempdir("multifield");
     let n = 600usize;
@@ -794,7 +801,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     // Every third document carries a case name; names reuse body terms
     // ("alpha") plus name-only terms ("smith", "acme").
     let name_of = |i: usize| -> Option<String> {
-        (i % 3 == 0).then(|| {
+        i.is_multiple_of(3).then(|| {
             format!(
                 "{} v {}",
                 ["smith", "acme", "alpha"][i % 4 % 3],
@@ -855,12 +862,13 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     assert!(flushed.written);
 
     // Parent reference: the flushed two-field sidecar.
-    let parent = Bm25Reader::open(&turbovec_search::node::bm25_sidecar_path(&index_path)).unwrap();
+    let parent =
+        Bm25Reader::open(&pipestream_search::node::bm25_sidecar_path(&index_path)).unwrap();
     assert_eq!(parent.field_count(), 2);
     assert_eq!(parent.field_name(1), "case_name");
 
     let output = reshard::split(
-        &reshard::resolve_gen(&turbovec_search::wal::wal_dir(&index_path)).unwrap(),
+        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
         2,
         &dir.join("split"),
         0,

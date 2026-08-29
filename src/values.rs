@@ -249,7 +249,11 @@ pub fn resolve(
     cols: &dyn ColumnLookup,
 ) -> Result<(ResolvedValue, ValueType), Status> {
     use pb::value_expr::Expr as V;
-    match expr.expr.as_ref().ok_or_else(|| refuse("empty ValueExpr node"))? {
+    match expr
+        .expr
+        .as_ref()
+        .ok_or_else(|| refuse("empty ValueExpr node"))?
+    {
         V::Column(name) => {
             let num = cols.numeric_index(name);
             let int = cols.integer_index(name);
@@ -285,16 +289,24 @@ pub fn resolve(
             }
             if let Some(ci) = num {
                 match cols.map_numeric_key_ord(ci, &read.key) {
-                    Some(key_ord) => {
-                        Ok((ResolvedValue::MapNum { column: ci, key_ord }, ValueType::Double))
-                    }
+                    Some(key_ord) => Ok((
+                        ResolvedValue::MapNum {
+                            column: ci,
+                            key_ord,
+                        },
+                        ValueType::Double,
+                    )),
                     None => Ok((ResolvedValue::Absent, ValueType::Unknown)),
                 }
             } else if let Some(ci) = facet {
                 match cols.map_facet_key_ord(ci, &read.key) {
-                    Some(key_ord) => {
-                        Ok((ResolvedValue::MapFacet { column: ci, key_ord }, ValueType::Str))
-                    }
+                    Some(key_ord) => Ok((
+                        ResolvedValue::MapFacet {
+                            column: ci,
+                            key_ord,
+                        },
+                        ValueType::Str,
+                    )),
                     None => Ok((ResolvedValue::Absent, ValueType::Unknown)),
                 }
             } else {
@@ -1027,9 +1039,13 @@ pub fn column_leaves(expr: &pb::ValueExpr, out: &mut Vec<ValueLeaf>) {
             }
         }
         Some(V::Ternary(t)) => {
-            for part in [t.cond.as_ref(), t.then_value.as_ref(), t.else_value.as_ref()]
-                .into_iter()
-                .flatten()
+            for part in [
+                t.cond.as_ref(),
+                t.then_value.as_ref(),
+                t.else_value.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 column_leaves(part, out);
             }
@@ -1103,7 +1119,11 @@ pub enum IngestVal {
 /// per the loud-failure rule, never stored as a guess.
 pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<IngestVal>, Status> {
     use pb::value_expr::Expr as V;
-    match expr.expr.as_ref().ok_or_else(|| refuse("empty ValueExpr node"))? {
+    match expr
+        .expr
+        .as_ref()
+        .ok_or_else(|| refuse("empty ValueExpr node"))?
+    {
         V::Column(name) => {
             let num = env.numerics.get(name);
             let int = env.integers.get(name);
@@ -1207,7 +1227,11 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                     (left.expr.as_ref(), right.expr.as_ref())
                 {
                     let eq = a == b;
-                    return Ok(Some(IngestVal::Bool(if op == CmpOp::Ne { !eq } else { eq })));
+                    return Ok(Some(IngestVal::Bool(if op == CmpOp::Ne {
+                        !eq
+                    } else {
+                        eq
+                    })));
                 }
                 let other = if is_lit(left) { right } else { left };
                 return match eval_ingest(other, env)? {

@@ -97,7 +97,7 @@ cost.
    before believing it. A theory that does not explain why four
    processes were worse is incomplete.
 
-Harness: `examples/annotation_throughput` in turbovec-search sweeps
+Harness: `examples/annotation_throughput` in pipestream-search sweeps
 concurrency over unary and streaming and reports docs/s and MB/s;
 `examples/annotation_cost` prices layers and re-measures its own
 baseline; `examples/annotator_race_check` proves span-exactness of any

@@ -14,8 +14,8 @@
 
 use std::time::Instant;
 
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{Bm25FieldLeg, Bm25QueryRequest};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{Bm25FieldLeg, Bm25QueryRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");

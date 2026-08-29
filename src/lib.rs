@@ -1,10 +1,11 @@
-//! turbovec-search: distributed top-k search over turbovec shard indexes.
+//! Pipestream Search: provider-neutral distributed lexical, vector, and
+//! hybrid search.
 //!
 //! Hub-and-spoke architecture:
 //!
 //! - [`node`] serves [`NodeService`](pb::node_service_server::NodeService)
-//!   on shard owners. Each node holds one turbovec index (a disjoint
-//!   partition of the corpus) and scans it in chunks of SIMD blocks via
+//!   on shard owners. Each node holds one provider-backed vector index (a
+//!   disjoint partition of the corpus) and scans it in chunks via
 //!   [`chunked::chunked_topk`].
 //! - [`coordinator`] serves the client-facing
 //!   [`SearchService`](pb::search_service_server::SearchService), fans each
@@ -36,6 +37,7 @@ pub mod geo;
 pub mod harness;
 pub mod interleave;
 pub mod ltr;
+pub mod mapping;
 pub mod merge;
 pub mod metrics;
 pub mod node;
@@ -44,13 +46,13 @@ pub mod postings;
 pub mod query;
 pub mod rankdiff;
 pub mod reshard;
-pub mod mapping;
 pub mod scorefn;
 pub mod sha256;
 pub mod snapshot;
 pub mod stats_cache;
 mod stream_signal;
 pub mod values;
+pub mod vector;
 pub mod vocab;
 pub mod wal;
 

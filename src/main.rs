@@ -1,78 +1,81 @@
-//! turbovec-search binary: one process, one or both roles, one or more
+//! pipestream-search binary: one process, one or both roles, one or more
 //! shards.
 //!
-//! Configuration: `--config cluster.toml` (TOML file) with `TURBOVEC_*`
+//! Configuration: `--config cluster.toml` (TOML file) with `PIPESTREAM_SEARCH_*`
 //! env overrides and `--key=value` flags on top (see `src/config.rs`).
 //!
-//! Subcommand: `turbovec-search calibrate --fit-from=host:port
-//! --apply-to=h1:p1,h2:p2` reads the calibration from one seeded node and
-//! pushes it to the others (see the README "ingest flow").
+//! Subcommand: `pipestream-search configure-backend --fit-from=host:port
+//! --apply-to=h1:p1,h2:p2` copies opaque provider construction state from
+//! one configured node to empty peers.
 //!
 //! Examples:
 //!
 //! ```text
 //! # Single-process demo: coordinator + node + random demo corpus,
 //! # then one self-issued search against itself.
-//! turbovec-search --role=both --demo-vectors=20000 \
+//! pipestream-search --role=both --demo-vectors=20000 \
 //!     --nodes=127.0.0.1:50051 --demo-query
 //!
 //! # Static two-machine cluster (see README "Two-machine runbook").
-//! # host-a:    turbovec-search --config /etc/turbovec/host-a.toml
-//! # host-b:   turbovec-search --config /etc/turbovec/host-b.toml
+//! # host-a:    pipestream-search --config /etc/turbovec/host-a.toml
+//! # host-b:   pipestream-search --config /etc/turbovec/host-b.toml
 //! ```
 
 use std::net::SocketAddr;
 use std::path::Path;
 
+use pipestream_search::config::{parse, Config, DemoConfig, Role, ShardConfig};
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::harness;
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
+    ConfigureVectorBackendRequest, GetVectorBackendRequest, SearchRequest,
+};
+use pipestream_search::vector::VectorIndex;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
-use turbovec::TurboQuantIndex;
-use turbovec_search::config::{parse, Config, DemoConfig, Role, ShardConfig};
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::harness;
-use turbovec_search::node::{NodeConfig, NodeServiceImpl};
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{GetCalibrationRequest, SearchRequest, SetCalibrationRequest};
 
-/// Build a demo index: fit TQ+ calibration on a 20% sample (min 1024
-/// vectors), then construct the real index seeded with it — the same flow a
-/// multi-shard deployment uses to keep shard scores comparable.
-fn build_demo_index(demo: DemoConfig) -> Result<TurboQuantIndex, String> {
+/// Build a demo index by fitting provider-owned state on a sample and then
+/// constructing the served generation from that state.
+fn build_demo_index(demo: DemoConfig, backend_kind: &str) -> Result<VectorIndex, String> {
     let corpus = harness::unit_vectors(demo.vectors, demo.dim, 0xDE10_0001);
     let sample_n = (demo.vectors / 5).max(1).min(demo.vectors);
-    let mut index = TurboQuantIndex::new(demo.dim, demo.bit_width)
+    let backend_config = VectorIndex::fit_backend_config(
+        backend_kind,
+        demo.dim,
+        demo.bit_width,
+        &corpus[..sample_n * demo.dim],
+    )
+    .map_err(|e| format!("demo calibration fit: {e}"))?;
+    let mut index = VectorIndex::from_backend_config(demo.dim, &backend_config)
         .map_err(|e| format!("demo index construct: {e}"))?;
-    // Calibrate before the add (upstream's explicit pattern): the pair
-    // fits deterministically on the sample and every add encodes under
-    // it, exactly as the multi-shard deployment seeds every shard with
-    // one pair for score comparability.
     index
-        .calibrate(&corpus[..sample_n * demo.dim])
-        .map_err(|e| format!("demo calibration fit: {e}"))?;
-    index.add(&corpus);
-    index.prepare();
+        .add(&corpus, demo.dim)
+        .map_err(|e| format!("demo add: {e}"))?;
+    index.prepare().map_err(|e| format!("demo prepare: {e}"))?;
     Ok(index)
 }
 
 /// Load a shard's index, or `None` when the shard starts empty: its index
-/// path does not exist yet (a from-scratch shard awaiting SetCalibration +
-/// AddVectors; Flush later writes exactly that path). When a snapshot
+/// path does not exist yet (a from-scratch shard awaiting
+/// ConfigureVectorBackend + AddVectors; Flush later writes that path). When a snapshot
 /// generation is active, the index loads from INSIDE it — the generation
 /// always reflects the newest installed or flushed image.
 fn load_shard_index(
     shard: &ShardConfig,
     generation: Option<&Path>,
-) -> Result<Option<TurboQuantIndex>, String> {
+) -> Result<Option<VectorIndex>, String> {
     if let Some(demo) = shard.demo {
         eprintln!(
             "building demo index: {} vectors x dim {} @ {} bits",
             demo.vectors, demo.dim, demo.bit_width
         );
-        return build_demo_index(demo).map(Some);
+        return build_demo_index(demo, &shard.vector_backend).map(Some);
     }
     let path = match generation {
-        Some(dir) => turbovec_search::node::generation_tv(dir),
+        Some(dir) => pipestream_search::node::generation_vector(dir),
         None => shard
             .index_path
             .as_ref()
@@ -82,9 +85,11 @@ fn load_shard_index(
     if !path.exists() {
         return Ok(None);
     }
-    let index =
-        TurboQuantIndex::load(&path).map_err(|e| format!("load {}: {e}", path.display()))?;
-    index.prepare();
+    let mut index = VectorIndex::load(&shard.vector_backend, &path)
+        .map_err(|e| format!("load {}: {e}", path.display()))?;
+    index
+        .prepare()
+        .map_err(|e| format!("prepare {}: {e}", path.display()))?;
     Ok(Some(index))
 }
 
@@ -122,7 +127,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let generation = shard
                 .index_path
                 .as_ref()
-                .and_then(|p| turbovec_search::node::recover_generation(p));
+                .and_then(|p| pipestream_search::node::recover_generation(p));
             let index = load_shard_index(shard, generation.as_deref())?;
             match &index {
                 Some(index) => eprintln!(
@@ -130,11 +135,11 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     shard.listen,
                     index.len(),
                     index.dim_opt(),
-                    index.bit_width(),
+                    index.bits_per_dimension().unwrap_or_default(),
                     shard.slot_offset
                 ),
                 None => eprintln!(
-                    "shard @{}: no index at {}; starting empty (awaiting SetCalibration/AddVectors)",
+                    "shard @{}: no index at {}; starting empty (awaiting ConfigureVectorBackend/AddVectors)",
                     shard.listen,
                     shard.index_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
                 ),
@@ -144,8 +149,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let mut bm25_store = None;
             if let Some(p) = shard.index_path.as_ref() {
                 let bm25_path = match &generation {
-                    Some(dir) => turbovec_search::node::generation_bm25(dir),
-                    None => turbovec_search::node::bm25_sidecar_path(p),
+                    Some(dir) => pipestream_search::node::generation_bm25(dir),
+                    None => pipestream_search::node::bm25_sidecar_path(p),
                 };
                 if bm25_path.exists() {
                     eprintln!(
@@ -154,10 +159,10 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                         bm25_path.display()
                     );
                     bm25_store = Some(
-                        turbovec_search::node::Bm25Shard::open(&bm25_path)
+                        pipestream_search::node::Bm25Shard::open(&bm25_path)
                             .unwrap_or_else(|e| panic!("load {}: {e}", bm25_path.display())),
                     );
-                } else if turbovec_search::node::bm25_build_dir(&bm25_path).exists()
+                } else if pipestream_search::node::bm25_build_dir(&bm25_path).exists()
                     && !cfg.allow_missing_bm25
                 {
                     // A spill directory with no .bm25 beside it means a
@@ -181,7 +186,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                          shard, or pass --allow-missing-bm25 to serve it vector-only \
                          on purpose.",
                         shard.listen,
-                        turbovec_search::node::bm25_build_dir(&bm25_path).display(),
+                        pipestream_search::node::bm25_build_dir(&bm25_path).display(),
                         bm25_path.display()
                     )
                     .into());
@@ -190,6 +195,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let node = NodeServiceImpl::new(
                 index,
                 NodeConfig {
+                    vector_backend: shard.vector_backend.clone(),
                     slot_offset: shard.slot_offset,
                     chunk_blocks: cfg.chunk_blocks,
                     share_floors: cfg.share_floors,
@@ -226,8 +232,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let mut shutdown = shutdown_rx.clone();
             handles.push(tokio::spawn(
                 Server::builder()
-                    .initial_stream_window_size(turbovec_search::H2_STREAM_WINDOW)
-                    .initial_connection_window_size(turbovec_search::H2_CONN_WINDOW)
+                    .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
+                    .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                     .add_service(NodeServiceImpl::into_server(node, max))
                     .serve_with_incoming_shutdown(
                         harness::nodelay_incoming(listener),
@@ -242,13 +248,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(metrics_addr) = cfg.metrics_listen {
         let listener = TcpListener::bind(metrics_addr).await?;
         let bound = listener.local_addr()?;
-        let gauges: Vec<turbovec_search::metrics::GaugeProvider> = node_services
+        let gauges: Vec<pipestream_search::metrics::GaugeProvider> = node_services
             .iter()
             .map(|node| node.metrics_provider())
             .collect();
-        eprintln!("metrics on http://{bound}/metrics ({} shard gauges)", gauges.len());
+        eprintln!(
+            "metrics on http://{bound}/metrics ({} shard gauges)",
+            gauges.len()
+        );
         handles.push(tokio::spawn(async move {
-            turbovec_search::metrics::serve(listener, gauges).await;
+            pipestream_search::metrics::serve(listener, gauges).await;
             Ok(())
         }));
     }
@@ -260,12 +269,12 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         let coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone())
             .with_bm25(
                 cfg.analysis_addr.clone(),
-                turbovec_search::bm25::Bm25Params {
+                pipestream_search::bm25::Bm25Params {
                     k1: f64::from(cfg.bm25_k1),
                     b: f64::from(cfg.bm25_b),
                 },
             )
-            .with_limits(turbovec_search::coordinator::FanoutLimits {
+            .with_limits(pipestream_search::coordinator::FanoutLimits {
                 shard_deadline: to_duration(cfg.shard_deadline_ms),
                 hedge_delay: to_duration(cfg.hedge_delay_ms),
             })
@@ -288,8 +297,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         let mut shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(
             Server::builder()
-                .initial_stream_window_size(turbovec_search::H2_STREAM_WINDOW)
-                .initial_connection_window_size(turbovec_search::H2_CONN_WINDOW)
+                .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
+                .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                 .add_service(CoordinatorServiceImpl::into_server(coordinator, max))
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;
@@ -349,14 +358,13 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `turbovec-search calibrate --fit-from=host:port --apply-to=a,b`:
-/// read the calibration from one seeded node and push it to the others.
-async fn calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// Copy provider-owned construction state from one node to empty peers.
+async fn configure_backend(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let get = |key: &str| {
         let prefix = format!("--{key}=");
         args.iter()
             .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
-            .ok_or_else(|| format!("calibrate requires --{key}"))
+            .ok_or_else(|| format!("configure-backend requires --{key}"))
     };
     let normalize = |s: &str| {
         if s.starts_with("http://") || s.starts_with("https://") {
@@ -373,39 +381,43 @@ async fn calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map(normalize)
         .collect();
     if apply_to.is_empty() {
-        return Err("calibrate requires at least one --apply-to node".into());
+        return Err("configure-backend requires at least one --apply-to node".into());
     }
 
     let mut source = NodeServiceClient::connect(fit_from.clone()).await?;
-    let cal = source
-        .get_calibration(GetCalibrationRequest {})
+    let backend = source
+        .get_vector_backend(GetVectorBackendRequest {})
         .await?
         .into_inner();
-    if cal.shift.is_empty() {
-        return Err(format!("{fit_from} reports no locked calibration").into());
-    }
+    let descriptor = backend
+        .descriptor
+        .ok_or_else(|| format!("{fit_from} reports no vector backend"))?;
+    let config = backend
+        .config
+        .ok_or_else(|| format!("{fit_from} reports no vector backend config"))?;
     println!(
-        "fit-from {fit_from}: dim {} @ {} bits, {} vectors",
-        cal.dim, cal.bit_width, cal.num_vectors
+        "fit-from {fit_from}: {} dim {} fingerprint {}, {} vectors",
+        descriptor.backend_kind,
+        descriptor.dim,
+        descriptor.scoring_fingerprint,
+        backend.num_vectors
     );
 
     for addr in &apply_to {
         let mut client = NodeServiceClient::connect(addr.clone()).await?;
         let resp = client
-            .set_calibration(SetCalibrationRequest {
-                dim: cal.dim,
-                bit_width: cal.bit_width,
-                shift: cal.shift.clone(),
-                scale: cal.scale.clone(),
+            .configure_vector_backend(ConfigureVectorBackendRequest {
+                dim: descriptor.dim,
+                config: Some(config.clone()),
             })
             .await?
             .into_inner();
         println!(
             "apply-to {addr}: {}",
-            if resp.already_seeded {
-                "already seeded (idempotent)"
+            if resp.already_configured {
+                "already configured (idempotent)"
             } else {
-                "calibration locked"
+                "vector backend configured"
             }
         );
     }
@@ -415,8 +427,11 @@ async fn calibrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().map(String::as_str) == Some("calibrate") {
-        return calibrate(&argv[1..]).await;
+    if matches!(
+        argv.first().map(String::as_str),
+        Some("configure-backend" | "calibrate")
+    ) {
+        return configure_backend(&argv[1..]).await;
     }
     let cfg = parse(&argv)?;
     run(cfg).await

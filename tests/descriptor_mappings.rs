@@ -11,14 +11,14 @@
 
 mod common;
 
+use pipestream_search::mapping::derive_plan;
+use pipestream_search::pb::{hints, ColumnFamily, MappedKind, MappedRole};
 use prost::Message as _;
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{
     DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
     FileDescriptorProto, FileDescriptorSet, MessageOptions,
 };
-use turbovec_search::mapping::derive_plan;
-use turbovec_search::pb::{hints, ColumnFamily, MappedKind, MappedRole};
 
 // ---------------------------------------------------------------------
 // prost-types construction for plain (hint-free) sets
@@ -280,14 +280,35 @@ fn the_product_plan_resolves_every_inference_rule() {
             ("title", "title", K::Text, false, R::None, C::TextField),
             ("price", "price", K::Double, false, R::None, C::F64),
             // Repeated float named "embedding": the one vector candidate.
-            ("embedding", "embedding", K::Vector, true, R::None, C::Vector),
+            (
+                "embedding",
+                "embedding",
+                K::Vector,
+                true,
+                R::None,
+                C::Vector
+            ),
             // Enums are exact values; "status" is keyword-shaped anyway.
             ("status", "status", K::Keyword, false, R::None, C::Facet),
             // Timestamp is a well-known leaf landing as epoch micros.
             ("created_at", "created_at", K::Date, false, R::None, C::I64),
             // A singular unannotated message expands into dotted paths.
-            ("meta.author", "meta_author", K::Text, false, R::None, C::TextField),
-            ("meta.page_count", "meta_page_count", K::Int32, false, R::None, C::I64),
+            (
+                "meta.author",
+                "meta_author",
+                K::Text,
+                false,
+                R::None,
+                C::TextField
+            ),
+            (
+                "meta.page_count",
+                "meta_page_count",
+                K::Int32,
+                false,
+                R::None,
+                C::I64
+            ),
             // Repeated scalars have no single-slot family: visible NONE.
             ("tags", "tags", K::Text, true, R::None, C::None),
             ("blob", "blob", K::Binary, false, R::None, C::None),
@@ -309,14 +330,13 @@ fn the_fingerprint_is_deterministic_and_pinned() {
     assert_eq!(a.fingerprint.len(), 64);
     assert!(a.fingerprint.bytes().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(
-        a.fingerprint,
-        "8cee16f59eba07fdf53a2800aaa1c657ad7a64a58931911f8f778897bc90129f",
+        a.fingerprint, "8cee16f59eba07fdf53a2800aaa1c657ad7a64a58931911f8f778897bc90129f",
         "the derivation semantics or canonical encoding changed; if that \
          was deliberate, bump FINGERPRINT_VERSION and re-pin"
     );
     assert_eq!(
         a.descriptor_sha256,
-        turbovec_search::sha256::hex_digest(&set),
+        pipestream_search::sha256::hex_digest(&set),
         "the descriptor content address is the SHA-256 the exchange \
          contract registers"
     );
@@ -383,7 +403,14 @@ fn hints_are_read_from_field_options_and_win() {
     let doc = wire_message(
         "Doc",
         &[
-            wire_field("sku", 1, Label::Optional, Type::String, None, Some(&sku_hint)),
+            wire_field(
+                "sku",
+                1,
+                Label::Optional,
+                Type::String,
+                None,
+                Some(&sku_hint),
+            ),
             wire_field(
                 "vecs",
                 2,
@@ -392,21 +419,41 @@ fn hints_are_read_from_field_options_and_win() {
                 None,
                 Some(&vector_hint),
             ),
-            wire_field("body", 3, Label::Optional, Type::String, None, Some(&body_hint)),
+            wire_field(
+                "body",
+                3,
+                Label::Optional,
+                Type::String,
+                None,
+                Some(&body_hint),
+            ),
         ],
         &[],
     );
     let set = wire_set(&[wire_file("docs.proto", "docs.v1", &[doc])]);
     let plan = derive_plan(&set, "docs.v1.Doc").unwrap();
 
-    assert_eq!(plan.doc_id_path, "sku", "the DOC_ID role wins over the name fallback");
-    assert_eq!(plan.vector_path, "vecs", "the VECTOR hint wins over name shapes");
+    assert_eq!(
+        plan.doc_id_path, "sku",
+        "the DOC_ID role wins over the name fallback"
+    );
+    assert_eq!(
+        plan.vector_path, "vecs",
+        "the VECTOR hint wins over name shapes"
+    );
     assert_eq!(plan.dim, 4, "declared dims reach the plan");
 
     let sku = &plan.fields[0];
-    assert_eq!(sku.name, "sku_key", "the name override is the engine column name");
+    assert_eq!(
+        sku.name, "sku_key",
+        "the name override is the engine column name"
+    );
     assert_eq!(sku.role, MappedRole::DocId as i32);
-    assert_eq!(sku.kind, MappedKind::Text as i32, "an unset hint type still infers");
+    assert_eq!(
+        sku.kind,
+        MappedKind::Text as i32,
+        "an unset hint type still infers"
+    );
 
     let body = &plan.fields[2];
     assert_eq!(body.analyzer, "english");
@@ -495,8 +542,8 @@ fn a_chunked_plan_scopes_vector_and_chunk_id() {
 // ---------------------------------------------------------------------
 
 fn expect_refusal(set: &[u8], message_type: &str, needle: &str) {
-    let status = derive_plan(set, message_type)
-        .expect_err("this derivation must refuse rather than guess");
+    let status =
+        derive_plan(set, message_type).expect_err("this derivation must refuse rather than guess");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
         status.message().contains(needle),
@@ -725,7 +772,14 @@ fn hint_refusal_table() {
 fn chunk_scope_rules_are_enforced() {
     let chunk = wire_message(
         "Chunk",
-        &[wire_field("text", 1, Label::Optional, Type::String, None, None)],
+        &[wire_field(
+            "text",
+            1,
+            Label::Optional,
+            Type::String,
+            None,
+            None,
+        )],
         &[],
     );
     // Chunked schema whose vector lives on the PARENT: refused, each
@@ -830,12 +884,12 @@ fn a_conflicting_extension_declaration_is_refused() {
 /// serves it.
 #[tokio::test]
 async fn plan_index_answers_over_the_wire() {
-    use turbovec_search::pb::search_service_client::SearchServiceClient;
+    use pipestream_search::pb::search_service_client::SearchServiceClient;
     let (addr, coordinator) = common::start_coordinator(Vec::new()).await;
     let mut client = SearchServiceClient::connect(addr).await.unwrap();
     let set = product_set();
     let response = client
-        .plan_index(turbovec_search::pb::PlanIndexRequest {
+        .plan_index(pipestream_search::pb::PlanIndexRequest {
             descriptor_set: set.clone(),
             message_type: "shop.v1.Product".to_string(),
         })
@@ -846,7 +900,7 @@ async fn plan_index_answers_over_the_wire() {
     assert_eq!(response.plan, Some(local));
 
     let refusal = client
-        .plan_index(turbovec_search::pb::PlanIndexRequest {
+        .plan_index(pipestream_search::pb::PlanIndexRequest {
             descriptor_set: set,
             message_type: "shop.v1.Nope".to_string(),
         })

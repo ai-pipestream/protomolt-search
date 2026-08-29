@@ -9,16 +9,16 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService as _;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService as _;
+use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, DocLineage, SearchRequest, SearchResponse,
     SetCalibrationRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 
@@ -181,7 +181,7 @@ async fn document_search(
         .into_inner()
 }
 
-fn rep_signature(hits: &[turbovec_search::pb::ScoredHit]) -> Vec<(u64, u64, u32)> {
+fn rep_signature(hits: &[pipestream_search::pb::ScoredHit]) -> Vec<(u64, u64, u32)> {
     hits.iter()
         .map(|h| (h.parent_id, h.vector_id, h.score.to_bits()))
         .collect()
@@ -218,7 +218,13 @@ async fn document_mode_matches_bidi_collapse_and_retrieves_chunk_groups() {
     // the returned floor, score descending then id.
     let deep = fx
         .bidi
-        .fanout_search("deep", &query, 2 * SHARD_DOCS as u32, false, &Default::default())
+        .fanout_search(
+            "deep",
+            &query,
+            2 * SHARD_DOCS as u32,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap();
     assert_eq!(streamed.groups.len(), streamed.hits.len());
@@ -267,7 +273,7 @@ async fn document_mode_matches_bidi_collapse_and_retrieves_chunk_groups() {
     assert_eq!(rep_signature(&streamed.hits), rep_signature(&again.hits));
     assert_eq!(streamed.chunk_floor.to_bits(), again.chunk_floor.to_bits());
     for (a, b) in streamed.groups.iter().zip(&again.groups) {
-        let sig = |g: &turbovec_search::pb::ParentGroup| {
+        let sig = |g: &pipestream_search::pb::ParentGroup| {
             g.chunks
                 .iter()
                 .map(|c| (c.vector_id, c.score.to_bits()))

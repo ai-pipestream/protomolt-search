@@ -17,9 +17,9 @@
 
 use std::path::Path;
 
-use turbovec_search::demo::court;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{Bm25SearchRequest, SearchRequest};
+use pipestream_search::demo::court;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{Bm25SearchRequest, SearchRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             facet_fields: Vec::new(),
             text: "court".into(),
             k: 5,
-            analysis: Some(turbovec_search::analyzer::body_spec()),
+            analysis: Some(pipestream_search::analyzer::body_spec()),
             min_score: 0.0,
             fields: Vec::new(),
             range_facet_fields: Vec::new(),

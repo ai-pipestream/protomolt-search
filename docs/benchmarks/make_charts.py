@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark SVGs for turbovec-search, in the same visual idiom as
+"""Benchmark SVGs for pipestream-search, in the same visual idiom as
 upstream turbovec's docs (900x460, white surface, slate ink, indigo
 accent). Data is inlined from the recorded sweep JSONL / recall logs."""
 

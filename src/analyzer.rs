@@ -1,7 +1,7 @@
 //! Client for the OpenNLP analysis sidecar (vendored proto
 //! `ai.pipestream.opennlp.analysis.v1`).
 //!
-//! This is the ONLY analysis entry point: turbovec-search deliberately has
+//! This is the ONLY analysis entry point: pipestream-search deliberately has
 //! no tokenizer/stemmer/normalizer of its own — text in, term vectors out,
 //! offsets always in original-text coordinates.
 

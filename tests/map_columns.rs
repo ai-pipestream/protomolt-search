@@ -6,20 +6,20 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats};
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats};
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, MapFacetEntry, MapFacetField, MapNumericEntry,
     ScoreOp, ScoreStage,
 };
-use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
-use turbovec_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -57,7 +57,7 @@ const SHARD_DOCS: [&[(&str, StrEntries, NumEntries)]; 3] = [
 async fn add_documents_mapped(
     addr: &str,
     docs: &[(&str, StrEntries, NumEntries)],
-) -> Result<turbovec_search::pb::AddDocumentsResponse, tonic::Status> {
+) -> Result<pipestream_search::pb::AddDocumentsResponse, tonic::Status> {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(8);
     for (text, strs, nums) in docs {
@@ -140,7 +140,7 @@ fn map_field(column: &str, key: &str) -> MapFacetField {
     }
 }
 
-fn counts_of(ff: &turbovec_search::pb::FacetFieldCounts) -> Vec<(&str, u64)> {
+fn counts_of(ff: &pipestream_search::pb::FacetFieldCounts) -> Vec<(&str, u64)> {
     ff.counts
         .iter()
         .map(|c| (c.value.as_str(), c.count))

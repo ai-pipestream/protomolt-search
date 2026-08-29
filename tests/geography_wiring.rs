@@ -11,21 +11,20 @@
 
 mod common;
 
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
+    AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, GeoBbox, GeoFilter, GeographySpec,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
-    AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, GeoBbox, GeoFilter,
-    GeographySpec,
-};
 
 use common::mock::start_mock_analysis;
 use common::start_empty_node;
-use turbovec_search::harness::mock_analysis::start_mock_analysis_without_ner;
+use pipestream_search::harness::mock_analysis::start_mock_analysis_without_ner;
 
 /// The corpus. Every text contains "case"; place mentions per the
 /// mock's gazetteer. Expected reductions:
@@ -59,10 +58,7 @@ fn geo_doc(text: &str, spec: Option<GeographySpec>) -> AddDocumentsRequest {
     }
 }
 
-async fn add_docs(
-    addr: &str,
-    docs: Vec<AddDocumentsRequest>,
-) -> Result<(), tonic::Status> {
+async fn add_docs(addr: &str, docs: Vec<AddDocumentsRequest>) -> Result<(), tonic::Status> {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(64);
     for doc in docs {
@@ -105,7 +101,7 @@ async fn start_geography_cluster() -> (
 fn bbox(column: &str, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> GeoFilter {
     GeoFilter {
         column: column.to_string(),
-        region: Some(turbovec_search::pb::geo_filter::Region::Bbox(GeoBbox {
+        region: Some(pipestream_search::pb::geo_filter::Region::Bbox(GeoBbox {
             min_lat,
             max_lat,
             min_lon,
@@ -156,12 +152,22 @@ async fn geocoded_mentions_become_spatial_search() {
     );
     // Around Berlin.
     assert_eq!(
-        search_ids(&coordinator, "", vec![bbox("place", 52.0, 53.0, 13.0, 14.0)]).await,
+        search_ids(
+            &coordinator,
+            "",
+            vec![bbox("place", 52.0, 53.0, 13.0, 14.0)]
+        )
+        .await,
         vec![1]
     );
     // The whole world: the place-less d3 is nowhere, not at (0,0).
     assert_eq!(
-        search_ids(&coordinator, "", vec![bbox("place", -90.0, 90.0, -180.0, 180.0)]).await,
+        search_ids(
+            &coordinator,
+            "",
+            vec![bbox("place", -90.0, 90.0, -180.0, 180.0)]
+        )
+        .await,
         vec![0, 1, 2],
         "absence is absence, not the Gulf of Guinea"
     );

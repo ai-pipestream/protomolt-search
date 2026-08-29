@@ -16,9 +16,9 @@
 //!         --text="federal rules of civil procedure rule 12b6"
 //! ```
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{AnalysisSpec, FieldTerms, TermStatsRequest};
+use pipestream_search::analyzer;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{AnalysisSpec, FieldTerms, TermStatsRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -28,7 +28,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn body_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]

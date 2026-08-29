@@ -14,7 +14,7 @@ mod common;
 
 use std::time::Instant;
 
-use turbovec_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::coordinator::CoordinatorServiceImpl;
 
 use common::{unit_vectors, Cluster, DIM};
 
@@ -46,7 +46,13 @@ async fn bench(share_floors: bool) -> BenchRun {
         let query = unit_vectors(1, DIM, 0xB300_0000 + qi as u64);
         let start = Instant::now();
         let result = coordinator
-            .fanout_search(&format!("bench-{qi}"), &query, K, false, &Default::default())
+            .fanout_search(
+                &format!("bench-{qi}"),
+                &query,
+                K,
+                false,
+                &Default::default(),
+            )
             .await
             .expect("fanout search");
         run.wall_times_ms.push(start.elapsed().as_secs_f64() * 1e3);

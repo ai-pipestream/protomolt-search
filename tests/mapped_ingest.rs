@@ -10,6 +10,18 @@
 
 mod common;
 
+use common::mock::start_mock_analysis;
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::harness::{fit_calibration, start_empty_node, unit_vectors};
+use pipestream_search::mapping::derive_plan;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
+    ingest_mapped_request, projected_value, AddDocumentsRequest, Bm25SearchRequest,
+    IngestMappedRequest, IngestMappedResponse, MappedBind, MaterializeKind, MaterializeSpec,
+    MaterializedColumn, NamedProjection, SearchRequest, SetCalibrationRequest,
+};
 use prost::Message as _;
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{
@@ -19,18 +31,6 @@ use prost_types::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use common::mock::start_mock_analysis;
-use turbovec_search::harness::{fit_calibration, start_empty_node, unit_vectors};
-use turbovec_search::mapping::derive_plan;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
-    ingest_mapped_request, projected_value, AddDocumentsRequest, Bm25SearchRequest,
-    IngestMappedRequest, IngestMappedResponse, MappedBind, MaterializeKind, MaterializeSpec,
-    MaterializedColumn, NamedProjection, SearchRequest, SetCalibrationRequest,
-};
 
 const DIM: usize = 8;
 const BIT_WIDTH: usize = 4;
@@ -284,11 +284,7 @@ fn case_node_config(analysis: String) -> NodeConfig {
         analysis_addr: Some(analysis),
         bm25_fields: vec!["body".into(), "meta_author".into()],
         facet_fields: vec!["id".into(), "status".into(), "published".into()],
-        integer_fields: vec![
-            "created_at".into(),
-            "meta_page_count".into(),
-            "year".into(),
-        ],
+        integer_fields: vec!["created_at".into(), "meta_page_count".into(), "year".into()],
         numeric_fields: vec!["price".into(), "price2".into()],
         ..Default::default()
     }
@@ -376,9 +372,13 @@ async fn mapped_ingest_lands_on_every_plane() {
     let (addr, _node) = start_empty_node(case_node_config(analysis.clone())).await;
     seed_calibration(&addr).await;
 
-    let response = ingest(&addr, bind(), (0..N_DOCS).map(|i| doc(i).encode()).collect())
-        .await
-        .expect("mapped ingest succeeds");
+    let response = ingest(
+        &addr,
+        bind(),
+        (0..N_DOCS).map(|i| doc(i).encode()).collect(),
+    )
+    .await
+    .expect("mapped ingest succeeds");
     assert_eq!(response.added, N_DOCS as u64);
     assert_eq!(response.total, N_DOCS as u64);
     assert_eq!(response.first_id, 0);
@@ -387,21 +387,29 @@ async fn mapped_ingest_lands_on_every_plane() {
         derive_plan(&case_set(), "law.v1.Case").unwrap().fingerprint
     );
 
-    let coordinator = CoordinatorServiceImpl::new(vec![addr])
-        .with_bm25(Some(analysis), Default::default());
+    let coordinator =
+        CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis), Default::default());
 
     // Projections read back every column, absences included.
     let hits = coordinator
         .bm25_search(Request::new(Bm25SearchRequest {
             text: "case".into(),
             k: N_DOCS as u32,
-            projections: ["price", "year", "created_at", "meta_page_count", "id", "status", "published"]
-                .iter()
-                .map(|name| NamedProjection {
-                    name: (*name).to_string(),
-                    expression: (*name).to_string(),
-                })
-                .collect(),
+            projections: [
+                "price",
+                "year",
+                "created_at",
+                "meta_page_count",
+                "id",
+                "status",
+                "published",
+            ]
+            .iter()
+            .map(|name| NamedProjection {
+                name: (*name).to_string(),
+                expression: (*name).to_string(),
+            })
+            .collect(),
             ..Default::default()
         }))
         .await
@@ -584,7 +592,10 @@ async fn document_refusals_name_position_and_field() {
 
     let mut no_id = doc(0);
     no_id.id = None;
-    expect_refusal(ingest(&addr, bind(), vec![no_id.encode()]).await, "has no id");
+    expect_refusal(
+        ingest(&addr, bind(), vec![no_id.encode()]).await,
+        "has no id",
+    );
 
     let mut no_body = doc(0);
     no_body.title = None;
@@ -661,12 +672,16 @@ async fn materialized_columns_ride_the_bind() {
             kind: MaterializeKind::F64 as i32,
         }],
     });
-    ingest(&addr, with_spec, (0..N_DOCS).map(|i| doc(i).encode()).collect())
-        .await
-        .expect("mapped ingest with materialization");
+    ingest(
+        &addr,
+        with_spec,
+        (0..N_DOCS).map(|i| doc(i).encode()).collect(),
+    )
+    .await
+    .expect("mapped ingest with materialization");
 
-    let coordinator = CoordinatorServiceImpl::new(vec![addr])
-        .with_bm25(Some(analysis), Default::default());
+    let coordinator =
+        CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis), Default::default());
     let hits = coordinator
         .bm25_search(Request::new(Bm25SearchRequest {
             text: "case".into(),
@@ -717,8 +732,8 @@ fn case_set_without_tags() -> Vec<u8> {
     set.encode_to_vec()
 }
 
-fn expected_binding() -> turbovec_search::postings::StoredBinding {
-    turbovec_search::postings::StoredBinding {
+fn expected_binding() -> pipestream_search::postings::StoredBinding {
+    pipestream_search::postings::StoredBinding {
         plan_fingerprint: derive_plan(&case_set(), "law.v1.Case").unwrap().fingerprint,
         body_path: "title".into(),
         materialize_sha: String::new(),
@@ -751,34 +766,38 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     assert_eq!(response.added, 3);
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     client
-        .flush(turbovec_search::pb::FlushRequest {})
+        .flush(pipestream_search::pb::FlushRequest {})
         .await
         .unwrap();
     node.abort();
 
     // The flushed file itself carries the binding.
-    let bm25_path = turbovec_search::node::bm25_sidecar_path(&index_path);
-    let store = turbovec_search::postings::Bm25Store::load(&bm25_path).unwrap();
+    let bm25_path = pipestream_search::node::bm25_sidecar_path(&index_path);
+    let store = pipestream_search::postings::Bm25Store::load(&bm25_path).unwrap();
     assert_eq!(store.binding(), Some(&expected_binding()));
 
     // Restart from disk, no in-memory state carried over. The wider
     // bm25_fields table (title added) is only there to let the
     // body-path probe below reach the BINDING check instead of the
     // declared-columns check.
-    let index = turbovec::TurboQuantIndex::load(&index_path).unwrap();
-    index.prepare();
-    let bm25 = turbovec_search::node::Bm25Shard::open(&bm25_path).unwrap();
+    let mut index = pipestream_search::vector::VectorIndex::load(
+        pipestream_search::vector::EMBEDDED_TURBOVEC,
+        &index_path,
+    )
+    .unwrap();
+    index.prepare().unwrap();
+    let bm25 = pipestream_search::node::Bm25Shard::open(&bm25_path).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = format!("http://{}", listener.local_addr().unwrap());
     let mut config = case_node_config(analysis);
     config.index_path = Some(index_path.clone());
     config.bm25_fields.push("title".into());
-    let service = turbovec_search::node::NodeServiceImpl::new(Some(index), config)
-        .with_bm25(Some(bm25));
+    let service =
+        pipestream_search::node::NodeServiceImpl::new(Some(index), config).with_bm25(Some(bm25));
     let _node2 = tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(service.into_server(turbovec_search::MAX_MESSAGE_BYTES))
-            .serve_with_incoming(turbovec_search::harness::nodelay_incoming(listener)),
+            .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
+            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
     );
 
     // Same plan: still bound, ids continue.
@@ -794,10 +813,7 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     let mut other_plan = bind();
     other_plan.descriptor_set = case_set_without_tags();
     other_plan.expected_fingerprint = variant.fingerprint;
-    expect_refusal(
-        ingest(&addr2, other_plan, vec![]).await,
-        "durably bound",
-    );
+    expect_refusal(ingest(&addr2, other_plan, vec![]).await, "durably bound");
 
     // Same plan, different body.
     let mut other_body = bind();
@@ -813,10 +829,7 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
             kind: MaterializeKind::F64 as i32,
         }],
     });
-    expect_refusal(
-        ingest(&addr2, other_spec, vec![]).await,
-        "materialize spec",
-    );
+    expect_refusal(ingest(&addr2, other_spec, vec![]).await, "materialize spec");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -846,19 +859,19 @@ async fn reshard_replay_carries_the_binding() {
         .expect("mapped ingest succeeds");
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     client
-        .flush(turbovec_search::pb::FlushRequest {})
+        .flush(pipestream_search::pb::FlushRequest {})
         .await
         .unwrap();
 
     let handle = tokio::runtime::Handle::current();
     let analysis_addr = analysis.clone();
-    let mut analyze = move |docs: &[(&str, Option<&turbovec_search::pb::AnalysisSpec>)]| {
+    let mut analyze = move |docs: &[(&str, Option<&pipestream_search::pb::AnalysisSpec>)]| {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut out = Vec::with_capacity(docs.len());
                 for (text, spec) in docs {
                     out.push(
-                        turbovec_search::analyzer::analyze_document(&analysis_addr, text, *spec)
+                        pipestream_search::analyzer::analyze_document(&analysis_addr, text, *spec)
                             .await
                             .map_err(|e| e.to_string())?,
                     );
@@ -868,10 +881,11 @@ async fn reshard_replay_carries_the_binding() {
         })
     };
     let fields: Vec<String> = vec!["body".into(), "meta_author".into()];
-    let gen = turbovec_search::reshard::resolve_gen(&turbovec_search::wal::wal_dir(&index_path))
-        .unwrap();
+    let gen =
+        pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path))
+            .unwrap();
     let out_dir = dir.join("out");
-    let output = turbovec_search::reshard::merge(
+    let output = pipestream_search::reshard::merge(
         &[gen],
         &out_dir,
         None,
@@ -885,7 +899,7 @@ async fn reshard_replay_carries_the_binding() {
         .bm25_path
         .as_ref()
         .expect("documents were replayed");
-    let child = turbovec_search::postings::Bm25Store::load(child_bm25).unwrap();
+    let child = pipestream_search::postings::Bm25Store::load(child_bm25).unwrap();
     assert_eq!(child.doc_count(), 4);
     assert_eq!(child.binding(), Some(&expected_binding()));
 
@@ -904,7 +918,7 @@ fn d_field(
     label: prost_types::field_descriptor_proto::Label,
     typ: Type,
     type_name: Option<&str>,
-    hint: Option<&turbovec_search::pb::hints::FieldIndexHint>,
+    hint: Option<&pipestream_search::pb::hints::FieldIndexHint>,
 ) -> Vec<u8> {
     let mut f = Vec::new();
     w_str(&mut f, 1, name);
@@ -943,8 +957,10 @@ fn d_set(package: &str, file: &str, messages: &[Vec<u8>]) -> Vec<u8> {
     s
 }
 
-fn role(role: turbovec_search::pb::hints::BlockRole) -> turbovec_search::pb::hints::FieldIndexHint {
-    turbovec_search::pb::hints::FieldIndexHint {
+fn role(
+    role: pipestream_search::pb::hints::BlockRole,
+) -> pipestream_search::pb::hints::FieldIndexHint {
+    pipestream_search::pb::hints::FieldIndexHint {
         block_role: role as i32,
         ..Default::default()
     }
@@ -964,7 +980,7 @@ fn opinion_set() -> Vec<u8> {
                 Label::Optional,
                 Type::String,
                 None,
-                Some(&role(turbovec_search::pb::hints::BlockRole::ChunkId)),
+                Some(&role(pipestream_search::pb::hints::BlockRole::ChunkId)),
             ),
             d_field("text", 2, Label::Optional, Type::String, None, None),
             d_field("embedding", 3, Label::Repeated, Type::Float, None, None),
@@ -984,7 +1000,7 @@ fn opinion_set() -> Vec<u8> {
                 Label::Repeated,
                 Type::Message,
                 Some(".law2.v1.Chunk"),
-                Some(&role(turbovec_search::pb::hints::BlockRole::Chunks)),
+                Some(&role(pipestream_search::pb::hints::BlockRole::Chunks)),
             ),
         ],
     );
@@ -998,7 +1014,13 @@ struct ChunkDoc {
     page: Option<u64>,
 }
 
-fn opinion_doc(id: Option<&str>, case_name: &str, court: &str, year: i64, chunks: &[ChunkDoc]) -> Vec<u8> {
+fn opinion_doc(
+    id: Option<&str>,
+    case_name: &str,
+    court: &str,
+    year: i64,
+    chunks: &[ChunkDoc],
+) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some(id) = id {
         w_str(&mut out, 1, id);
@@ -1059,7 +1081,7 @@ fn opinion_node_config(analysis: String) -> NodeConfig {
 
 fn reduced(id: &str) -> u64 {
     u64::from_be_bytes(
-        turbovec_search::sha256::digest(id.as_bytes())[..8]
+        pipestream_search::sha256::digest(id.as_bytes())[..8]
             .try_into()
             .unwrap(),
     )
@@ -1096,13 +1118,18 @@ async fn chunked_ingest_denormalizes_and_collapses() {
             &chunks,
         ));
     }
-    let response = ingest(&addr, opinion_bind(), docs).await.expect("chunked ingest");
+    let response = ingest(&addr, opinion_bind(), docs)
+        .await
+        .expect("chunked ingest");
     assert_eq!(response.added, 5, "rows = chunks");
-    assert_eq!(response.parents, 3, "source documents, the chunkless one included");
+    assert_eq!(
+        response.parents, 3,
+        "source documents, the chunkless one included"
+    );
     assert_eq!(response.total, 5);
 
-    let coordinator = CoordinatorServiceImpl::new(vec![addr])
-        .with_bm25(Some(analysis), Default::default());
+    let coordinator =
+        CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis), Default::default());
 
     // A filter mixing PARENT and CHUNK fields selects exact rows, and
     // projections read the denormalized parent id next to per-chunk
@@ -1127,7 +1154,12 @@ async fn chunked_ingest_denormalizes_and_collapses() {
         .hits;
     let mut selected: Vec<(u64, Vec<Option<projected_value::Value>>)> = hits
         .iter()
-        .map(|h| (h.doc_id, h.projected.iter().map(|p| p.value.clone()).collect()))
+        .map(|h| {
+            (
+                h.doc_id,
+                h.projected.iter().map(|p| p.value.clone()).collect(),
+            )
+        })
         .collect();
     selected.sort_unstable_by_key(|(id, _)| *id);
     use projected_value::Value::{IntValue, StringValue};
@@ -1188,15 +1220,11 @@ async fn chunked_refusals_name_document_chunk_and_field() {
     // The body must live inside the CHUNKS scope.
     let mut parent_body = opinion_bind();
     parent_body.body_path = "case_name".into();
-    expect_refusal(
-        ingest(&addr, parent_body, vec![]).await,
-        "CHUNKS-scope",
-    );
+    expect_refusal(ingest(&addr, parent_body, vec![]).await, "CHUNKS-scope");
 
     let good = |row: usize| chunk_of(0, row, row);
-    let doc_with = |chunks: &[ChunkDoc]| {
-        opinion_doc(Some("op-0"), "case name 0", "ca9", 1990, chunks)
-    };
+    let doc_with =
+        |chunks: &[ChunkDoc]| opinion_doc(Some("op-0"), "case name 0", "ca9", 1990, chunks);
 
     let mut no_vector = good(1);
     no_vector.embedding = Vec::new();

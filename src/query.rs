@@ -23,11 +23,10 @@ use tonic::{Request, Status};
 use crate::coordinator::CoordinatorServiceImpl;
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
-    selection_query, selection_score_strategy, search_query, BlendScore, Bm25SearchRequest,
-    DecomposedScore, DenseQuery, FilterQuery, FusionMode, GeoFilter,
+    search_query, selection_query, selection_score_strategy, BlendScore, Bm25SearchRequest,
+    BoostRescore, DecomposedScore, DenseQuery, FilterQuery, FusionMode, GeoFilter,
     HybridLegOptions, HybridSearchRequest, LexicalQuery, QueryHit, QueryRequest, QueryResponse,
     QuerySignal, RrfScore, SearchQuery, SearchRequest, SelectionOperator, SelectionQuery,
-    BoostRescore,
 };
 
 fn refuse(msg: impl Into<String>) -> Status {
@@ -214,7 +213,10 @@ pub async fn execute(
                      order is the whole contract of the route",
                 ));
             }
-            Some(crate::ltr::Scorer::validate(s, &signal_ids(&plan, &req.boosts))?)
+            Some(crate::ltr::Scorer::validate(
+                s,
+                &signal_ids(&plan, &req.boosts),
+            )?)
         }
         _ => None,
     };
@@ -272,9 +274,8 @@ pub async fn execute(
     // (and the paging pool), with a scorer it is the pool the scorer
     // reorders, and with a boost it is the pool the boost rescores
     // (the honest form of the rescore window).
-    let pooled = matches!(plan.shape, Shape::Composite { .. })
-        || scorer.is_some()
-        || !req.boosts.is_empty();
+    let pooled =
+        matches!(plan.shape, Shape::Composite { .. }) || scorer.is_some() || !req.boosts.is_empty();
     if !pooled && selection_k != req.k {
         return Err(refuse(
             "selection_k differs from k but nothing on a single-leaf shape uses the \
@@ -406,7 +407,13 @@ pub async fn execute(
             };
             let mut hits = hits;
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
-            Ok(done(req.request_id, hits, "browse", next, finish_prof(prof, t_total)))
+            Ok(done(
+                req.request_id,
+                hits,
+                "browse",
+                next,
+                finish_prof(prof, t_total),
+            ))
         }
         Shape::Lexical { id, query } => {
             let t_sel = std::time::Instant::now();
@@ -444,9 +451,16 @@ pub async fn execute(
                 })
                 .collect();
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
-            let executed = apply_scorer(coordinator, &scorer, &mut hits, "bm25_search", &mut prof).await?;
+            let executed =
+                apply_scorer(coordinator, &scorer, &mut hits, "bm25_search", &mut prof).await?;
             let (hits, next) = page(hits, req.k, cursor.as_ref())?;
-            Ok(done(req.request_id, hits, &executed, next, finish_prof(prof, t_total)))
+            Ok(done(
+                req.request_id,
+                hits,
+                &executed,
+                next,
+                finish_prof(prof, t_total),
+            ))
         }
         Shape::Dense { id, query } => {
             let t_sel = std::time::Instant::now();
@@ -482,10 +496,17 @@ pub async fn execute(
                 })
                 .collect();
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
-            let executed = apply_scorer(coordinator, &scorer, &mut hits, "search", &mut prof).await?;
+            let executed =
+                apply_scorer(coordinator, &scorer, &mut hits, "search", &mut prof).await?;
             let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
-            Ok(done(response.request_id, hits, &executed, next, finish_prof(prof, t_total)))
+            Ok(done(
+                response.request_id,
+                hits,
+                &executed,
+                next,
+                finish_prof(prof, t_total),
+            ))
         }
         Shape::Composite {
             dense_id,
@@ -620,7 +641,13 @@ pub async fn execute(
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
-            Ok(done(response.request_id, hits, &executed, next, finish_prof(prof, t_total)))
+            Ok(done(
+                response.request_id,
+                hits,
+                &executed,
+                next,
+                finish_prof(prof, t_total),
+            ))
         }
     }
 }
@@ -681,9 +708,11 @@ async fn fill_projected(
     let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
     let fetched = coordinator.fetch_values(&ids, compiled, &[]).await?;
     for hit in hits.iter_mut() {
-        hit.projected = fetched.rows.get(&hit.doc_id).cloned().unwrap_or_else(|| {
-            vec![crate::pb::ProjectedValue::default(); compiled.len()]
-        });
+        hit.projected = fetched
+            .rows
+            .get(&hit.doc_id)
+            .cloned()
+            .unwrap_or_else(|| vec![crate::pb::ProjectedValue::default(); compiled.len()]);
     }
     if let Some(p) = prof.as_mut() {
         p.projection_ms = ms(t0);
@@ -835,7 +864,10 @@ fn collect_filter<'a>(
     match f.predicate.as_ref() {
         Some(crate::pb::filter_query::Predicate::Cel(text)) => {
             if text.is_empty() {
-                return Err(refuse(format!("filter {:?} has an empty CEL predicate", f.id)));
+                return Err(refuse(format!(
+                    "filter {:?} has an empty CEL predicate",
+                    f.id
+                )));
             }
             cel.push(text.as_str());
         }
@@ -862,9 +894,7 @@ fn leaf_shape(leaf: &SearchQuery) -> Result<Shape<'_>, Status> {
 /// The two-leaf strategy composite: exactly one dense and one lexical
 /// scoring leaf, an operator the strategy can certify, and a strategy
 /// that maps onto a fusion mode.
-fn composite_shape(
-    composite: &crate::pb::CompositeSearchStrategy,
-) -> Result<Shape<'_>, Status> {
+fn composite_shape(composite: &crate::pb::CompositeSearchStrategy) -> Result<Shape<'_>, Status> {
     let mut dense: Option<(&str, &DenseQuery)> = None;
     let mut lexical: Option<(&str, &LexicalQuery)> = None;
     for clause in &composite.clauses {
@@ -1037,7 +1067,9 @@ enum BoostKind<'a> {
         text: &'a str,
         analysis: Option<crate::pb::AnalysisSpec>,
     },
-    Dense { vector: &'a [f32] },
+    Dense {
+        vector: &'a [f32],
+    },
 }
 
 /// How the request's boosts execute.

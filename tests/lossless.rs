@@ -13,7 +13,7 @@
 mod common;
 
 use common::{monolithic_topk, unit_vectors, Cluster, BIT_WIDTH, DIM};
-use turbovec_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::coordinator::CoordinatorServiceImpl;
 
 // 24k rows across the cluster. With one explicit global calibration
 // (upstream #474) codes are a pure function of (row, pair), so
@@ -34,7 +34,13 @@ async fn assert_lossless(share_floors: bool) {
     for qi in 0..QUERIES {
         let query = unit_vectors(1, DIM, 0x9E4A_0000 + qi as u64);
         let result = coordinator
-            .fanout_search(&format!("lossless-{qi}"), &query, K, false, &Default::default())
+            .fanout_search(
+                &format!("lossless-{qi}"),
+                &query,
+                K,
+                false,
+                &Default::default(),
+            )
             .await
             .expect("fanout search");
 
@@ -88,7 +94,13 @@ async fn distributed_matches_monolithic_at_k_1000() {
     for qi in 0..2u64 {
         let query = unit_vectors(1, DIM, 0xB16B_0000 + qi);
         let result = coordinator
-            .fanout_search(&format!("bigk-{qi}"), &query, BIG_K, false, &Default::default())
+            .fanout_search(
+                &format!("bigk-{qi}"),
+                &query,
+                BIG_K,
+                false,
+                &Default::default(),
+            )
             .await
             .expect("fanout search");
 
@@ -116,8 +128,8 @@ async fn distributed_matches_monolithic_at_k_1000() {
 /// in-process fanout, so the client-facing surface is covered too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn search_service_over_loopback_matches_monolithic() {
-    use turbovec_search::pb::search_service_client::SearchServiceClient;
-    use turbovec_search::pb::SearchRequest;
+    use pipestream_search::pb::search_service_client::SearchServiceClient;
+    use pipestream_search::pb::SearchRequest;
 
     let cluster = Cluster::start(N, 8, true).await;
     let (coord_addr, coord_handle) = common::start_coordinator(cluster.node_addrs.clone()).await;
@@ -155,8 +167,8 @@ async fn search_service_over_loopback_matches_monolithic() {
 /// cluster was seeded with, plus consistent shape metadata.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_calibration_reports_seeded_values() {
-    use turbovec_search::pb::node_service_client::NodeServiceClient;
-    use turbovec_search::pb::GetCalibrationRequest;
+    use pipestream_search::pb::node_service_client::NodeServiceClient;
+    use pipestream_search::pb::GetCalibrationRequest;
 
     // Sub-block shards: before any block seals, every shard's reported
     // calibration IS the seed, so cross-shard equality is exactly the

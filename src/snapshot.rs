@@ -1,8 +1,8 @@
 //! Client side of `NodeService.InstallSnapshot`: push a centrally built
-//! shard image (`.tv` plus optional `.bm25` sidecar) to a node over one
-//! client stream. This is the bulk-load path for pre-computed corpora —
-//! build the index once with the cluster's seeded calibration, then push
-//! the artifact to every shard owner instead of re-embedding per node.
+//! shard image (opaque vector bytes plus optional `.bm25` sidecar) to a node
+//! over one client stream. This is the bulk-load path for pre-computed corpora:
+//! build compatible provider images once, then push each artifact to its shard
+//! owner instead of re-embedding per node.
 //! See the proto comments on the RPC for the install rules.
 
 use std::path::{Path, PathBuf};
@@ -18,16 +18,16 @@ use crate::pb::{snapshot_chunk, InstallSnapshotResponse, SnapshotChunk, Snapshot
 /// [`crate::MAX_MESSAGE_BYTES`] while amortizing per-message overhead.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 
-/// Stream the `.tv` image at `tv_path` (and the `.bm25` sidecar at
+/// Stream the provider image at `vector_path` (and the `.bm25` sidecar at
 /// `bm25_path`, when given) to the node at `addr`, returning the node's
 /// install report.
 pub async fn install_snapshot(
     addr: &str,
-    tv_path: &Path,
+    vector_path: &Path,
     bm25_path: Option<&Path>,
 ) -> Result<InstallSnapshotResponse, Status> {
-    let tv_bytes = std::fs::metadata(tv_path)
-        .map_err(|e| Status::internal(format!("stat {}: {e}", tv_path.display())))?
+    let tv_bytes = std::fs::metadata(vector_path)
+        .map_err(|e| Status::internal(format!("stat {}: {e}", vector_path.display())))?
         .len();
     let bm25_bytes = match bm25_path {
         Some(p) => std::fs::metadata(p)
@@ -35,7 +35,7 @@ pub async fn install_snapshot(
             .len(),
         None => 0,
     };
-    let paths: Vec<PathBuf> = [Some(tv_path), bm25_path]
+    let paths: Vec<PathBuf> = [Some(vector_path), bm25_path]
         .into_iter()
         .flatten()
         .map(Path::to_path_buf)
@@ -45,7 +45,7 @@ pub async fn install_snapshot(
     tokio::spawn(async move {
         let manifest = SnapshotChunk {
             payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
-                tv_bytes,
+                vector_bytes: tv_bytes,
                 bm25_bytes,
             })),
         };

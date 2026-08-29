@@ -194,7 +194,7 @@ function at all is a better outcome than needing it and proving it.
 
 ## Configuration
 
-`--geo-fields=courthouse` / `TURBOVEC_GEO_FIELDS` / `geo_fields` in the
+`--geo-fields=courthouse` / `PIPESTREAM_SEARCH_GEO_FIELDS` / `geo_fields` in the
 TOML, same rules as every other column table: declared per shard,
 immutable once a shard is built, and sharing ONE name space with the
 facet, numeric, map, and integer tables (the v7 column table holds one

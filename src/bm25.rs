@@ -492,6 +492,9 @@ pub struct FieldQuery<'a> {
     pub weight: f64,
 }
 
+/// One field-and-term key plus the matching source offsets.
+pub type FusedTermOffset = (usize, usize, Vec<(u32, u32)>);
+
 /// One document scored by the fused weighted per-field sum.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FusedDoc {
@@ -501,7 +504,7 @@ pub struct FusedDoc {
     pub score: f64,
     /// `(field id, term index within that field's terms, offsets)` for
     /// the (field, term) pairs present in this doc.
-    pub term_offsets: Vec<(usize, usize, Vec<(u32, u32)>)>,
+    pub term_offsets: Vec<FusedTermOffset>,
 }
 
 /// The fused multi-field exhaustive scorer (`docs/multi-field.md`):
@@ -1792,7 +1795,7 @@ mod tests {
         for (f, w) in fused.iter().zip(&want) {
             assert_eq!(f.doc_id, w.doc_id);
             assert_eq!(f.score.to_bits(), w.score.to_bits(), "doc {}", w.doc_id);
-            let mapped: Vec<(usize, usize, Vec<(u32, u32)>)> = w
+            let mapped: Vec<FusedTermOffset> = w
                 .term_offsets
                 .iter()
                 .map(|(ti, o)| (0, *ti, o.clone()))
@@ -1958,7 +1961,11 @@ mod tests {
                     length: 2,
                 });
             }
-            AnalyzedDoc { fields, quality: None, geography: None }
+            AnalyzedDoc {
+                fields,
+                quality: None,
+                geography: None,
+            }
         }
         fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
             let mut store = Bm25Store::with_fields(&["body", "name"]);

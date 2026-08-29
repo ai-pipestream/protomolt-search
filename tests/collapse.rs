@@ -8,15 +8,15 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService as _;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService as _;
+use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, DocLineage, SearchRequest, SetCalibrationRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 
@@ -140,7 +140,13 @@ async fn collapse_returns_distinct_parents_and_matches_reference() {
     // Reference: deep plain search over everything, grouped by parent
     // client-side (max aggregation, ties to the lower global id).
     let deep = coordinator
-        .fanout_search("ref", &query, 2 * SHARD_DOCS as u32, false, &Default::default())
+        .fanout_search(
+            "ref",
+            &query,
+            2 * SHARD_DOCS as u32,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap();
     let mut best: std::collections::HashMap<u64, (u64, f32)> = std::collections::HashMap::new();

@@ -10,7 +10,7 @@ columns doc before starting.
 1. **Place mentions** — the OpenNLP sidecar's NER finds place names in
    opinions; the openmap tooling in the OpenNLP fork geocodes them to
    coordinates. (That half lives in the user's OpenNLP branches, not
-   this repo — `project-boundaries` applies: turbovec-search stays a
+   this repo — `project-boundaries` applies: pipestream-search stays a
    standalone engine, the CourtListener pipeline is a consumer.)
 2. **Geo columns** (feature-track increment 3) — coordinates land on
    documents as a geo-point column kind; bbox, haversine radius, and

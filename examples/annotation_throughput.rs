@@ -13,13 +13,13 @@
 //! ```text
 //! annotation_throughput --addr=http://127.0.0.1:59202 --n=100 --levels=1,4,8,16,32
 //! ```
-use std::sync::Arc;
-use std::time::Instant;
-use turbovec_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use turbovec_search::pb::analysis::{
+use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
+use pipestream_search::pb::analysis::{
     analyze_stream_request, AnalysisOptions, AnalyzeRequest, AnalyzeStreamDoc,
     AnalyzeStreamRequest, TermVectorOptions,
 };
+use std::sync::Arc;
+use std::time::Instant;
 
 fn arg(key: &str, default: &str) -> String {
     let p = format!("--{key}=");
@@ -29,7 +29,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn base() -> AnalysisOptions {
-    let spec = turbovec_search::analyzer::body_spec();
+    let spec = pipestream_search::analyzer::body_spec();
     AnalysisOptions {
         language: "en".into(),
         tokenizer: spec.tokenizer,
@@ -152,7 +152,7 @@ async fn run_streams(
                     let mut inbound = resp.into_inner();
                     while let Ok(Some(msg)) = inbound.message().await {
                         if let Some(
-                            turbovec_search::pb::analysis::analyze_stream_response::Result::Ok(r),
+                            pipestream_search::pb::analysis::analyze_stream_response::Result::Ok(r),
                         ) = msg.result
                         {
                             entities += r.entities.len();
@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let f = std::io::BufReader::new(std::fs::File::open(&path)?);
         Arc::new(
             f.lines()
-                .filter_map(|l| l.ok())
+                .map_while(Result::ok)
                 .filter_map(|l| {
                     let v: serde_json::Value = serde_json::from_str(&l).ok()?;
                     let t = v.get("text")?.as_str()?.to_string();

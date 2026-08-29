@@ -1,7 +1,7 @@
 # Metrics: the Prometheus exporter
 
 `--metrics-listen=host:port` (TOML `metrics_listen`, env
-`TURBOVEC_METRICS_LISTEN`) serves a Prometheus text-format metrics page
+`PIPESTREAM_SEARCH_METRICS_LISTEN`) serves a Prometheus text-format metrics page
 over plain HTTP. Off by default; when unset, nothing listens and the
 counters still count (they are relaxed atomic adds, cheap enough to be
 always on).

@@ -10,8 +10,8 @@
 //! file failed but at least one predates v8 and so has nothing to
 //! verify — "unverifiable" must never look like "verified".
 
+use pipestream_search::postings::Bm25Reader;
 use std::path::Path;
-use turbovec_search::postings::Bm25Reader;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

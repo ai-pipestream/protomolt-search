@@ -12,7 +12,8 @@ the CEL front-end), each field mapped onto the engine column family it
 would land on (`ColumnFamily` — repeated scalars and OBJECT/NESTED/
 BINARY fields visibly map to FAMILY_NONE, never silently dropped), and
 the whole plan identified by a lowercase-hex SHA-256 over a canonical
-fixed-layout encoding (version tag `turbovec-search.plan.v1`, hash from
+fixed-layout encoding (frozen compatibility tag `turbovec-search.plan.v1`,
+retained so the product rename does not invalidate existing generations; hash from
 the hand-rolled `src/sha256.rs`, pinned to the NIST vectors). Every
 refusal in section 2 is implemented and pinned by tests: ambiguous or
 missing vector/doc-id candidates, contradictory hints, chunk-scope
@@ -33,7 +34,7 @@ keyed by the reduced parent id (section 4a). The original framing,
 kept:
 
 The ownership move is decided (descriptor-derived mappings belong to
-turbovec-search, not turbovec-grpc), and the reference implementation
+pipestream-search, not turbovec-grpc), and the reference implementation
 is frozen in turbovec-grpc git history.
 
 ## 1. The layering rule
@@ -59,11 +60,11 @@ Three things are easy to conflate and must not be:
    is a conformance reference the test suite holds us to, not a library
    we link.
 
-The dependency consequence is the point of the layering: turbovec-search
+The dependency consequence is the point of the layering: pipestream-search
 has **no dependency on protomolt**, compile-time or runtime. It vendors
 one proto file (section 5) exactly as it already vendors the OpenNLP
 sidecar's `analysis.proto`, and it consumes the exchange service as one
-gRPC client among any. Protomolt is a future client of turbovec-search,
+gRPC client among any. Protomolt is a future client of pipestream-search,
 and any other system that can register a FileDescriptorSet is equally a
 client. Nothing in the engine's build, wire contract, or ranking path
 names protomolt.
@@ -319,7 +320,7 @@ The bring-your-own-descriptor flow, end to end:
 1. A client registers a complete `FileDescriptorSet`
    (`protoc --include_imports`, or any registry that stores complete
    sets) with the exchange service and gets back its content address.
-2. The client asks turbovec-search to plan an index over a message type
+2. The client asks pipestream-search to plan an index over a message type
    in that set — first as a dry run, then bound. Derivation is local,
    deterministic, and fingerprinted (section 2). Two engines agree on
    their mapping exactly when their fingerprints agree.

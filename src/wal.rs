@@ -4,11 +4,11 @@
 //! One directory per shard generation at `<index path>.wal/gen-<NNNNNN>/`
 //! holding:
 //!
-//! - `manifest.toml` — the shard shape (dim, bit width, calibration, slot
-//!   offset, generation) plus `bucket_bits`/`bucket_count` and a format
-//!   version. Calibration starts empty on a from-scratch shard and the
-//!   manifest is REWRITTEN (atomically: tmp + rename) when calibration
-//!   locks — the same lazy-completion semantics the frame header had.
+//! - `manifest.toml` — the shard shape (dimension, provider configuration,
+//!   compatibility bit width, slot offset, generation) plus
+//!   `bucket_bits`/`bucket_count` and a format version. Provider state starts
+//!   incomplete on a from-scratch shard and the manifest is rewritten
+//!   atomically when that state locks.
 //! - `bucket-<NNN>.wal` — one append-only file per hash bucket. Every
 //!   vector/document record routes to `bucket_of(id, bucket_count)` — the
 //!   exact partition function the reshard tool splits by, so each bucket
@@ -179,16 +179,25 @@ pub fn latest_gen(wal_dir: &Path) -> io::Result<Option<(u64, PathBuf)>> {
 // Manifest
 // ---------------------------------------------------------------------------
 
-/// The shard shape of one WAL generation (`manifest.toml`). Replaying a
-/// generation requires a locked calibration (`calibration_shift`/`scale`
-/// present, length `dim`); a generation logged by an UNSEEDED shard
-/// carries an empty calibration and cannot be resharded (its scores are
-/// not comparable across shards anyway — see `NodeService.AddVectors`).
+/// The shard shape of one WAL generation (`manifest.toml`). Resharding a
+/// generation requires complete provider configuration that reproduces its
+/// score semantics. Legacy manifests express embedded TurboVec configuration
+/// through `calibration_shift` and `calibration_scale`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalManifest {
     /// Vector dimensionality. 0 while the shard has not committed to one.
     pub dim: u32,
-    /// Quantization bit width (2, 3, or 4).
+    /// Provider identifier for the vector generation. Empty in legacy
+    /// manifests, which are interpreted as the embedded TurboVec adapter.
+    #[serde(default)]
+    pub vector_backend: String,
+    /// Media type/version for the opaque provider configuration.
+    #[serde(default)]
+    pub vector_config_format: String,
+    /// Provider-owned construction state. The product never interprets it.
+    #[serde(default)]
+    pub vector_config_payload: Vec<u8>,
+    /// Legacy embedded-adapter bit width (2, 3, or 4).
     pub bit_width: u32,
     /// Per-coordinate calibration shift (length `dim`), matching how
     /// search.proto carries calibration (`GetCalibrationResponse`).
@@ -223,6 +232,46 @@ pub struct WalManifest {
     pub format_version: u32,
 }
 
+impl WalManifest {
+    /// Resolve the generic provider state, including legacy v1 manifests.
+    pub fn backend_config(&self) -> Result<crate::vector::VectorBackendConfig, String> {
+        if !self.vector_backend.is_empty() && !self.vector_config_format.is_empty() {
+            return Ok(crate::vector::VectorBackendConfig {
+                backend_kind: self.vector_backend.clone(),
+                config_format: self.vector_config_format.clone(),
+                payload: self.vector_config_payload.clone(),
+            });
+        }
+        if !self.vector_backend.is_empty()
+            && self.vector_backend != crate::vector::EMBEDDED_TURBOVEC
+        {
+            return Err(format!(
+                "manifest has backend {:?} but no provider configuration",
+                self.vector_backend
+            ));
+        }
+        crate::vector::embedded_turbovec_config(
+            self.bit_width as usize,
+            &self.calibration_shift,
+            &self.calibration_scale,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Store provider state and maintain the legacy embedded-adapter fields
+    /// so older tooling can still inspect new manifests during migration.
+    pub fn set_backend_config(&mut self, config: crate::vector::VectorBackendConfig) {
+        self.vector_backend = config.backend_kind.clone();
+        self.vector_config_format = config.config_format.clone();
+        self.vector_config_payload = config.payload.clone();
+        if let Ok(Some(legacy)) = crate::vector::legacy_calibration_config(&config) {
+            self.bit_width = legacy.bits_per_dimension as u32;
+            self.calibration_shift = legacy.shift;
+            self.calibration_scale = legacy.scale;
+        }
+    }
+}
+
 /// Write the manifest atomically (tmp file + fsync + rename + parent
 /// fsync). A manifest that vanishes in a crash makes the whole
 /// generation invisible to replay, so the rename's directory entry
@@ -242,7 +291,11 @@ pub fn write_manifest(gen_dir: &Path, manifest: &WalManifest) -> io::Result<()> 
     ));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(toml::to_string(manifest).map_err(io::Error::other)?.as_bytes())?;
+        f.write_all(
+            toml::to_string(manifest)
+                .map_err(io::Error::other)?
+                .as_bytes(),
+        )?;
         f.sync_all()?;
     }
     let dst = manifest_path(gen_dir);
@@ -700,15 +753,13 @@ impl WalWriter {
                         records_appended: 0,
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    match read_manifest(&dir) {
-                        Ok(m) => return Self::resume(&dir, m),
-                        Err(e) if e.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
-                            std::thread::sleep(PEER_CREATE_POLL);
-                        }
-                        Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match read_manifest(&dir) {
+                    Ok(m) => return Self::resume(&dir, m),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
+                        std::thread::sleep(PEER_CREATE_POLL);
                     }
-                }
+                    Err(e) => return Err(e),
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -745,8 +796,8 @@ impl WalWriter {
         })
     }
 
-    /// Complete the manifest (calibration on `SetCalibration`, dim on the
-    /// first batch); rewrites `manifest.toml` atomically when anything
+    /// Complete the manifest (provider state on configuration, dimension on
+    /// the first batch); rewrites `manifest.toml` atomically when anything
     /// changed. Returns false once any vector/document record has been
     /// logged — the manifest records describe the shard as the log
     /// started and must never change under it.
@@ -863,6 +914,9 @@ mod tests {
     fn manifest(bucket_count: u32) -> WalManifest {
         WalManifest {
             dim: 8,
+            vector_backend: String::new(),
+            vector_config_format: String::new(),
+            vector_config_payload: Vec::new(),
             bit_width: 4,
             calibration_shift: vec![0.0; 8],
             calibration_scale: vec![1.0; 8],
@@ -874,6 +928,28 @@ mod tests {
             preexisting_documents: 0,
             format_version: FORMAT_VERSION,
         }
+    }
+
+    #[test]
+    fn manifest_round_trips_opaque_vector_backend_state() {
+        let mut manifest = manifest(4);
+        let config = crate::vector::embedded_turbovec_config(4, &[0.25; 8], &[1.5; 8]).unwrap();
+        manifest.set_backend_config(config.clone());
+        let encoded = toml::to_string(&manifest).unwrap();
+        let decoded: WalManifest = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.backend_config().unwrap(), config);
+    }
+
+    #[test]
+    fn legacy_manifest_fields_upgrade_to_embedded_backend_config() {
+        let manifest = manifest(4);
+        let config = manifest.backend_config().unwrap();
+        assert_eq!(config.backend_kind, crate::vector::EMBEDDED_TURBOVEC);
+        let legacy = crate::vector::legacy_calibration_config(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.shift, vec![0.0; 8]);
+        assert_eq!(legacy.scale, vec![1.0; 8]);
     }
 
     fn add_op(id: u64) -> wal_record::Op {
@@ -961,7 +1037,7 @@ mod tests {
     fn roundtrip_buckets_and_resume() {
         let dir = tempdir("roundtrip");
         let mut writer = WalWriter::create(&dir, manifest(4)).unwrap();
-        // Manifest completion is still possible while uncalibrated.
+        // Manifest completion is still possible before provider state locks.
         assert!(writer.update_manifest(|m| m.slot_offset = 42));
         for id in 0..20u64 {
             writer.append(add_op(id)).unwrap();
@@ -1313,12 +1389,9 @@ mod tests {
         let path = bucket_path(&gen_dir(&dir, 0), 0);
         let mut prev = Vec::new();
         for id in 0..12u64 {
-            writer.append(if id % 2 == 0 {
-                add_op(id)
-            } else {
-                doc_op(id)
-            })
-            .unwrap();
+            writer
+                .append(if id % 2 == 0 { add_op(id) } else { doc_op(id) })
+                .unwrap();
             writer.flush().unwrap();
             let now = std::fs::read(&path).unwrap();
             assert!(now.len() > prev.len(), "append {id} wrote nothing");

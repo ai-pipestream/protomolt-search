@@ -22,8 +22,8 @@
 
 use std::time::Instant;
 
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats, FieldQuery, PruneStats};
-use turbovec_search::postings::{Bm25Index, Bm25Reader};
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats, FieldQuery, PruneStats};
+use pipestream_search::postings::{Bm25Index, Bm25Reader};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");

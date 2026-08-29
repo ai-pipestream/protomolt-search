@@ -13,14 +13,14 @@
 
 use std::time::Instant;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::harness::{fit_calibration, start_node, unit_vectors};
-use turbovec_search::node::{scan_batch_counters, NodeConfig};
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::harness::{fit_calibration, start_node, unit_vectors};
+use pipestream_search::node::{scan_batch_counters, NodeConfig};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
     search_shard_request, search_shard_response, SearchShardRequest, StartShardSearch,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     let prefix = format!("--{name}=");
@@ -75,7 +75,7 @@ async fn main() {
         .collect();
     let scan_parallel: usize = opt(&args, "scan-parallel").map_or(0, |s| s.parse().unwrap());
     let chunk_blocks: usize = opt(&args, "chunk-blocks")
-        .map_or(turbovec_search::chunked::DEFAULT_CHUNK_BLOCKS, |s| {
+        .map_or(pipestream_search::chunked::DEFAULT_CHUNK_BLOCKS, |s| {
             s.parse().unwrap()
         });
 
@@ -92,9 +92,9 @@ async fn main() {
     println!("| coalesce | clients | total queries | wall s | QPS | mean latency ms |");
     println!("|---|---:|---:|---:|---:|---:|");
     for coalesce in [false, true] {
-        let mut index = turbovec_search::harness::seeded_index(dim, 4, &shift, &scale);
-        index.add(&corpus);
-        index.prepare();
+        let mut index = pipestream_search::harness::seeded_index(dim, 4, &shift, &scale);
+        index.add(&corpus, dim).unwrap();
+        index.prepare().unwrap();
         let (addr, server) = start_node(
             index,
             NodeConfig {

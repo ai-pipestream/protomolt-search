@@ -28,13 +28,12 @@
 
 use std::path::{Path, PathBuf};
 
+use pipestream_search::vocab::{self, SnapshotMeta};
 use prost::Message;
-use turbovec_search::vocab::{self, SnapshotMeta};
 
 fn opt(key: &str) -> Option<String> {
     let prefix = format!("--{key}=");
-    std::env::args()
-        .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+    std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
 }
 
 fn usage() -> ! {
@@ -60,9 +59,9 @@ fn resolve<'a>(scan: &'a [(SnapshotMeta, PathBuf)], reference: &str) -> Result<&
 }
 
 fn channel_name(channel: i32) -> &'static str {
-    match turbovec_search::pb::analysis::VocabChannel::try_from(channel) {
-        Ok(turbovec_search::pb::analysis::VocabChannel::Terms) => "TERMS ",
-        Ok(turbovec_search::pb::analysis::VocabChannel::Tokens) => "TOKENS",
+    match pipestream_search::pb::analysis::VocabChannel::try_from(channel) {
+        Ok(pipestream_search::pb::analysis::VocabChannel::Terms) => "TERMS ",
+        Ok(pipestream_search::pb::analysis::VocabChannel::Tokens) => "TOKENS",
         _ => "????? ",
     }
 }
@@ -109,7 +108,12 @@ fn main() {
             eprintln!("vocab_drift: write {out}: {e}");
             std::process::exit(1);
         });
-        let documents: u64 = merged.channels.iter().map(|c| c.documents).max().unwrap_or(0);
+        let documents: u64 = merged
+            .channels
+            .iter()
+            .map(|c| c.documents)
+            .max()
+            .unwrap_or(0);
         println!(
             "merged {} snapshot(s) -> {out} ({} byte(s), {} document(s))",
             snapshots.len(),
@@ -180,9 +184,12 @@ fn main() {
                     m.novelty_rate,
                     m.jensen_shannon_divergence
                 );
-                if channel.channel == turbovec_search::pb::analysis::VocabChannel::Tokens {
+                if channel.channel == pipestream_search::pb::analysis::VocabChannel::Tokens {
                     if m.embedding_oov_computed {
-                        println!("        embedding OOV share (token mass): {:.4}", m.embedding_oov_share);
+                        println!(
+                            "        embedding OOV share (token mass): {:.4}",
+                            m.embedding_oov_share
+                        );
                     } else {
                         println!("        embedding OOV share: not computed (no vocabulary given/readable)");
                     }

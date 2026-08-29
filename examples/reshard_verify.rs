@@ -2,7 +2,7 @@
 //! then verify the children reconstruct the parent — bitwise.
 //!
 //! ```text
-//! reshard_verify --log=/data/shard-0.tv.wal --parent=/data/shard-0.tv \
+//! reshard_verify --log=/data/shard-0.vector.wal --parent=/data/shard-0.vector \
 //!     --probes-from=/corpus/embeddings.bin --queries=50 --k=100 \
 //!     --split=2 --out-dir=/tmp/verify --analysis-addr=http://127.0.0.1:59202
 //! ```
@@ -19,11 +19,11 @@
 
 use std::path::{Path, PathBuf};
 
-use turbovec::TurboQuantIndex;
-use turbovec_search::demo::court;
-use turbovec_search::pb::AnalysisSpec;
-use turbovec_search::postings::AnalyzedDoc;
-use turbovec_search::{analyzer, reshard};
+use pipestream_search::demo::court;
+use pipestream_search::pb::AnalysisSpec;
+use pipestream_search::postings::AnalyzedDoc;
+use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
+use pipestream_search::{analyzer, reshard};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -34,13 +34,8 @@ fn arg(key: &str, default: &str) -> String {
 
 /// Top-k of one query as `(id, score_bits)`, coordinator order
 /// (score desc, id asc), with `map` translating local slots to ids.
-fn topk(
-    index: &TurboQuantIndex,
-    query: &[f32],
-    k: usize,
-    map: impl Fn(u64) -> u64,
-) -> Vec<(u64, u32)> {
-    let results = index.search(query, k);
+fn topk(index: &VectorIndex, query: &[f32], k: usize, map: impl Fn(u64) -> u64) -> Vec<(u64, u32)> {
+    let results = index.search_unfiltered(query, k);
     let mut hits: Vec<(u64, u32)> = results
         .indices_for_query(0)
         .iter()
@@ -51,13 +46,14 @@ fn topk(
     hits
 }
 
+#[allow(clippy::result_large_err)]
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log = arg("log", "");
     let parent_path = arg("parent", "");
     let probes_path = arg("probes-from", "");
     if log.is_empty() || parent_path.is_empty() || probes_path.is_empty() {
-        return Err("usage: reshard_verify --log=<wal> --parent=<shard.tv> \
+        return Err("usage: reshard_verify --log=<wal> --parent=<shard.vector> \
                     --probes-from=<embeddings.bin> [--queries=50] [--k=100] \
                     [--split=2] [--out-dir=DIR] [--analysis-addr=ADDR]"
             .into());
@@ -82,8 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = reshard::split(&gen, n, &out_dir, 0, 25_000_000, false, None, &mut analyze)?;
     eprintln!("split done in {:?}", t0.elapsed());
 
-    let parent = TurboQuantIndex::load(Path::new(&parent_path))?;
-    parent.prepare();
+    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, Path::new(&parent_path))?;
+    parent.prepare()?;
 
     // 1. Conservation.
     let total_vectors: u64 = output.children.iter().map(|c| c.num_vectors).sum();
@@ -124,12 +120,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("{} probes of dim {dim}", probes.len());
 
-    let children: Vec<(&reshard::ChildImage, TurboQuantIndex)> = output
+    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
         .children
         .iter()
         .map(|c| {
-            let index = TurboQuantIndex::load(&c.tv_path).expect("load child");
-            index.prepare();
+            let mut index =
+                VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).expect("load child");
+            index.prepare().expect("prepare child");
             (c, index)
         })
         .collect();

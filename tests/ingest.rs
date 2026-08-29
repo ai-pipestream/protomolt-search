@@ -4,20 +4,20 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
     AddVectorsRequest, FlushRequest, GetCalibrationRequest, SetCalibrationRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{fit_calibration, unit_vectors, DIM};
 
 async fn push_batches(
     client: &mut NodeServiceClient<tonic::transport::Channel>,
     batches: Vec<AddVectorsRequest>,
-) -> Result<turbovec_search::pb::AddVectorsResponse, tonic::Status> {
+) -> Result<pipestream_search::pb::AddVectorsResponse, tonic::Status> {
     let (tx, rx) = mpsc::channel(8);
     for batch in batches {
         tx.send(batch).await.unwrap();
@@ -213,19 +213,22 @@ async fn flush_persists_and_reload_matches() {
     handle.abort();
 
     // The reloaded index must search identically to a freshly built one.
-    let loaded = turbovec::TurboQuantIndex::load(&path).unwrap();
+    let loaded = pipestream_search::vector::VectorIndex::load(
+        pipestream_search::vector::EMBEDDED_TURBOVEC,
+        &path,
+    )
+    .unwrap();
     assert_eq!(loaded.len(), 1_500);
     let query = unit_vectors(1, DIM, 0xA100_0002);
     let fresh = {
-        let mut idx =
-            turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
-        idx.add(&vectors);
+        let mut idx = pipestream_search::harness::seeded_index(DIM, 4, &shift, &scale);
+        idx.add(&vectors, DIM).unwrap();
         idx
     };
-    let a = loaded.search(&query, 10);
-    let b = fresh.search(&query, 10);
+    let a = loaded.search_unfiltered(&query, 10);
+    let b = fresh.search_unfiltered(&query, 10);
     assert_eq!(a.scores, b.scores);
-    assert_eq!(a.indices, b.indices);
+    assert_eq!(a.slots, b.slots);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

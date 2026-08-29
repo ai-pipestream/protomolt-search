@@ -15,8 +15,8 @@
 
 use std::path::PathBuf;
 
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats, PruneStats, ScoredDoc};
-use turbovec_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, DocTerms};
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats, PruneStats, ScoredDoc};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, DocTerms};
 
 /// Hand-rolled deterministic RNG (LCG, same style as
 /// `harness::unit_vectors`) — no proptest dependency.

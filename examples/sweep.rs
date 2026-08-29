@@ -27,11 +27,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::harness::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::harness::{
     build_shards, fit_calibration, start_node, unit_vectors, write_shards,
 };
-use turbovec_search::node::NodeConfig;
+use pipestream_search::node::NodeConfig;
 
 struct Args {
     vectors: usize,
@@ -108,7 +108,13 @@ async fn run_mode(node_addrs: &[String], queries: &[Vec<f32>], k: u32, sharing: 
     for (qi, query) in queries.iter().enumerate() {
         let start = Instant::now();
         let result = coordinator
-            .fanout_search(&format!("sweep-{sharing}-{k}-{qi}"), query, k, false, &Default::default())
+            .fanout_search(
+                &format!("sweep-{sharing}-{k}-{qi}"),
+                query,
+                k,
+                false,
+                &Default::default(),
+            )
             .await
             .expect("fanout search");
         walls.push(start.elapsed().as_secs_f64() * 1e3);

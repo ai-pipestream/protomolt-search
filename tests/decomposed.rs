@@ -15,17 +15,17 @@ mod common;
 
 use std::collections::HashMap;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::{CoordinatorServiceImpl, HybridLegs};
-use turbovec_search::fusion::{Combination, Normalization};
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService as _;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::{CoordinatorServiceImpl, HybridLegs};
+use pipestream_search::fusion::{Combination, Normalization};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService as _;
+use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, FusionMode, HybridHit, HybridLegOptions,
     HybridSearchRequest, SetCalibrationRequest, VectorRescoreRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 
@@ -270,13 +270,31 @@ async fn decomposed_is_deterministic_across_racy_floor_timing() {
     let legs = || legs_decomposed(1.0, 0.5, 12);
     let first = fx
         .coordinator
-        .fanout_hybrid("det-1", "zebra", &query, 12, None, legs(), false, &Default::default())
+        .fanout_hybrid(
+            "det-1",
+            "zebra",
+            &query,
+            12,
+            None,
+            legs(),
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
     let second = fx
         .coordinator
-        .fanout_hybrid("det-2", "zebra", &query, 12, None, legs(), false, &Default::default())
+        .fanout_hybrid(
+            "det-2",
+            "zebra",
+            &query,
+            12,
+            None,
+            legs(),
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
@@ -338,7 +356,13 @@ async fn decomposed_min_vector_score_gates_the_result_set_exactly() {
     // absent at this boundary).
     let deep_v = fx
         .coordinator
-        .fanout_stream_search("gate-deep", &query, N_DOCS as u32, None, &Default::default())
+        .fanout_stream_search(
+            "gate-deep",
+            &query,
+            N_DOCS as u32,
+            None,
+            &Default::default(),
+        )
         .await
         .unwrap();
     let min_v = deep_v.hits[19].score;
@@ -346,7 +370,16 @@ async fn decomposed_min_vector_score_gates_the_result_set_exactly() {
     legs.min_vector_score = min_v;
     let got = fx
         .coordinator
-        .fanout_hybrid("gate-1", "zebra crossing", &query, k, None, legs, false, &Default::default())
+        .fanout_hybrid(
+            "gate-1",
+            "zebra crossing",
+            &query,
+            k,
+            None,
+            legs,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;

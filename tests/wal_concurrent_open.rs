@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 
-use turbovec_search::wal::{self, WalManifest, WalWriter};
+use pipestream_search::wal::{self, WalManifest, WalWriter};
 
 const ITERATIONS: usize = 200;
 const OPENERS: usize = 2;
@@ -45,6 +45,9 @@ fn fresh_dir(tag: &str) -> PathBuf {
 fn manifest() -> WalManifest {
     WalManifest {
         dim: 8,
+        vector_backend: String::new(),
+        vector_config_format: String::new(),
+        vector_config_payload: Vec::new(),
         bit_width: 4,
         calibration_shift: vec![0.0; 8],
         calibration_scale: vec![1.0; 8],
@@ -122,9 +125,7 @@ fn assert_one_wellformed_generation(wal_dir: &Path, expected: &WalManifest) {
 fn concurrent_first_open_converges_on_one_generation() {
     let root = fresh_dir("race");
     for iteration in 0..ITERATIONS {
-        let wal_dir = root
-            .join(format!("iter{iteration}"))
-            .join("shard.tv.wal");
+        let wal_dir = root.join(format!("iter{iteration}")).join("shard.tv.wal");
         let writers = concurrent_open(&wal_dir, OPENERS, &manifest());
         drop(writers);
         assert_one_wellformed_generation(&wal_dir, &manifest());
@@ -178,5 +179,14 @@ fn first_open_creates_a_missing_parent_chain() {
     assert_eq!(writer.generation(), 0);
     drop(writer);
     assert_one_wellformed_generation(&wal_dir, &manifest());
-    std::fs::remove_dir_all(wal_dir.parent().unwrap().parent().unwrap().parent().unwrap()).ok();
+    std::fs::remove_dir_all(
+        wal_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    )
+    .ok();
 }

@@ -4,8 +4,8 @@
 
 mod common;
 
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats};
-use turbovec_search::postings::{
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats};
+use pipestream_search::postings::{
     AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, DocLineage, DocTerms,
 };
 
@@ -135,7 +135,7 @@ fn resident_open_does_not_grow_rss_like_a_heap_load() {
     let rss_resident = rss_bytes();
     drop(reader);
 
-    let heap = turbovec_search::postings::Bm25Store::load(&path).unwrap();
+    let heap = pipestream_search::postings::Bm25Store::load(&path).unwrap();
     let rss_heap = rss_bytes();
     drop(heap);
 

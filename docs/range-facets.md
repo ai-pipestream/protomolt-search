@@ -141,7 +141,7 @@ land.
 
 ## Configuration
 
-`--integer-fields=citations,filed_at` / `TURBOVEC_INTEGER_FIELDS` /
+`--integer-fields=citations,filed_at` / `PIPESTREAM_SEARCH_INTEGER_FIELDS` /
 `integer_fields` in the TOML, same rules as every other column table:
 declared per shard, immutable once a shard is built, and sharing ONE
 name space with the facet, numeric, and map tables (the v7 column table

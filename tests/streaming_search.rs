@@ -18,9 +18,9 @@
 mod common;
 
 use common::{monolithic_topk, start_node, unit_vectors, Cluster, BIT_WIDTH, DIM};
-use turbovec::TurboQuantIndex;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 
 /// The engine's streaming emission-chunk cadence (8192 rows): shards
 /// hold two chunks each, so the stream carries real multi-batch
@@ -36,13 +36,18 @@ const K: u32 = 10;
 /// needed for bitwise agreement: an uncalibrated index is plain
 /// TurboQuant, whose encoded bytes are a pure function of the row —
 /// independent of batching, insertion order, and which shard holds it.
-async fn multi_chunk_cluster() -> (Vec<String>, TurboQuantIndex) {
+async fn multi_chunk_cluster() -> (Vec<String>, VectorIndex) {
     let corpus = unit_vectors(N, DIM, 0x5EED_B10C);
     let mut addrs = Vec::new();
     for shard in 0..N_SHARDS {
-        let mut index = TurboQuantIndex::new(DIM, BIT_WIDTH).unwrap();
-        index.add(&corpus[shard * SHARD_ROWS * DIM..(shard + 1) * SHARD_ROWS * DIM]);
-        index.prepare();
+        let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, DIM, BIT_WIDTH).unwrap();
+        index
+            .add(
+                &corpus[shard * SHARD_ROWS * DIM..(shard + 1) * SHARD_ROWS * DIM],
+                DIM,
+            )
+            .unwrap();
+        index.prepare().unwrap();
         let (addr, _handle) = start_node(
             index,
             NodeConfig {
@@ -53,13 +58,13 @@ async fn multi_chunk_cluster() -> (Vec<String>, TurboQuantIndex) {
         .await;
         addrs.push(addr);
     }
-    let mut monolithic = TurboQuantIndex::new(DIM, BIT_WIDTH).unwrap();
-    monolithic.add(&corpus);
-    monolithic.prepare();
+    let mut monolithic = VectorIndex::create(EMBEDDED_TURBOVEC, DIM, BIT_WIDTH).unwrap();
+    monolithic.add(&corpus, DIM).unwrap();
+    monolithic.prepare().unwrap();
     (addrs, monolithic)
 }
 
-fn bits(hits: &[turbovec_search::pb::ScoredHit]) -> Vec<(u64, u32)> {
+fn bits(hits: &[pipestream_search::pb::ScoredHit]) -> Vec<(u64, u32)> {
     hits.iter()
         .map(|h| (h.vector_id, h.score.to_bits()))
         .collect()
@@ -73,7 +78,13 @@ async fn streaming_matches_monolithic_and_fanout_exactly() {
     for qi in 0..6u64 {
         let query = unit_vectors(1, DIM, 0x57AE_0000 + qi);
         let streamed = coordinator
-            .fanout_stream_search(&format!("stream-{qi}"), &query, K, None, &Default::default())
+            .fanout_stream_search(
+                &format!("stream-{qi}"),
+                &query,
+                K,
+                None,
+                &Default::default(),
+            )
             .await
             .expect("stream fanout");
         let got = bits(&streamed.hits);
@@ -82,7 +93,13 @@ async fn streaming_matches_monolithic_and_fanout_exactly() {
         assert_eq!(got, want, "query {qi}: streaming != monolithic");
 
         let fanout = coordinator
-            .fanout_search(&format!("classic-{qi}"), &query, K, false, &Default::default())
+            .fanout_search(
+                &format!("classic-{qi}"),
+                &query,
+                K,
+                false,
+                &Default::default(),
+            )
             .await
             .expect("classic fanout");
         assert_eq!(
@@ -117,7 +134,13 @@ async fn streaming_matches_on_seeded_default_cluster() {
     for qi in 0..3u64 {
         let query = unit_vectors(1, DIM, 0x5EED_57AE + qi);
         let streamed = coordinator
-            .fanout_stream_search(&format!("dstream-{qi}"), &query, K, None, &Default::default())
+            .fanout_stream_search(
+                &format!("dstream-{qi}"),
+                &query,
+                K,
+                None,
+                &Default::default(),
+            )
             .await
             .expect("stream fanout");
         let got = bits(&streamed.hits);
@@ -127,7 +150,13 @@ async fn streaming_matches_on_seeded_default_cluster() {
             "query {qi}: streaming != monolithic"
         );
         let fanout = coordinator
-            .fanout_search(&format!("dclassic-{qi}"), &query, K, false, &Default::default())
+            .fanout_search(
+                &format!("dclassic-{qi}"),
+                &query,
+                K,
+                false,
+                &Default::default(),
+            )
             .await
             .expect("classic fanout");
         assert_eq!(got, bits(&fanout.hits), "query {qi}: streaming != fan-out");
@@ -178,8 +207,8 @@ async fn initial_floor_is_deterministic_and_lossless() {
 /// Protocol errors: a stream that does not open with Start is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_without_start_is_refused() {
-    use turbovec_search::pb::node_service_client::NodeServiceClient;
-    use turbovec_search::pb::{stream_search_request, FloorUpdate, StreamSearchRequest};
+    use pipestream_search::pb::node_service_client::NodeServiceClient;
+    use pipestream_search::pb::{stream_search_request, FloorUpdate, StreamSearchRequest};
 
     let (addrs, _monolithic) = multi_chunk_cluster().await;
     let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
@@ -200,17 +229,17 @@ async fn stream_without_start_is_refused() {
 /// the authoritative gRPC lane, the terminal summary cannot certify the scan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grpc_stop_returns_an_incomplete_node_certificate() {
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-    use turbovec_search::pb::node_service_client::NodeServiceClient;
-    use turbovec_search::pb::{
+    use pipestream_search::pb::node_service_client::NodeServiceClient;
+    use pipestream_search::pb::{
         stream_search_request, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
     };
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     let corpus = unit_vectors(8 * CHUNK, DIM, 0xCA11_CE11);
-    let mut index = TurboQuantIndex::new(DIM, BIT_WIDTH).unwrap();
-    index.add(&corpus);
-    index.prepare();
+    let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, DIM, BIT_WIDTH).unwrap();
+    index.add(&corpus, DIM).unwrap();
+    index.prepare().unwrap();
     let (addr, _handle) = start_node(index, NodeConfig::default()).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let query = unit_vectors(1, DIM, 0xCA11_0001);
@@ -242,7 +271,7 @@ async fn grpc_stop_returns_an_incomplete_node_certificate() {
 
     let summary = loop {
         let message = inbound.message().await.unwrap().expect("terminal summary");
-        if let Some(turbovec_search::pb::stream_search_response::Payload::Summary(summary)) =
+        if let Some(pipestream_search::pb::stream_search_response::Payload::Summary(summary)) =
             message.payload
         {
             break summary;

@@ -17,9 +17,9 @@
 //!               --queries=deploy/v7-rebuild/queries-case-folding.txt --k=10000 --n=8
 //! ```
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{AnalysisSpec, FusionMode, HybridLegOptions, HybridSearchRequest};
+use pipestream_search::analyzer;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{AnalysisSpec, FusionMode, HybridLegOptions, HybridSearchRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -29,7 +29,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn body_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 #[derive(Default, Clone)]
@@ -137,7 +137,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
     for (qi, (total, legs, fusion, shards)) in rows.iter().enumerate() {
-        print!("  {:>3} {:>9.1} {:>9.1} {:>9.1}", qi + 1, total, legs, fusion);
+        print!(
+            "  {:>3} {:>9.1} {:>9.1} {:>9.1}",
+            qi + 1,
+            total,
+            legs,
+            fusion
+        );
         for s in shards {
             print!(" {:>9.1}", s.rpc_ms);
         }

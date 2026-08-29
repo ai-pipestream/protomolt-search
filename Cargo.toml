@@ -1,9 +1,9 @@
 [package]
-name = "turbovec-search"
+name = "pipestream-search"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Distributed top-k search over turbovec shard indexes with collaborative mid-query floor sharing"
+description = "Provider-neutral distributed lexical, vector, and hybrid search"
 
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s17" }

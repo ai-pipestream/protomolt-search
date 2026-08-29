@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use turbovec_search::postings::{transcode_to_v5, Bm25Index, Bm25Reader};
+use pipestream_search::postings::{transcode_to_v5, Bm25Index, Bm25Reader};
 
 /// FNV-1a over a posting stream: order-sensitive digest of every
 /// (doc_id, tf, offsets) triple, O(1) memory however long the stream.

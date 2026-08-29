@@ -4,9 +4,9 @@ Status: Reference Architecture & Specification.
 
 ## Introduction
 
-TurboVec hybrid retrieval marries the dense semantic search capabilities of
-quantized vector embeddings (TurboQuant 4-bit) with the precision of lexical
-sparse scoring (BM25 with block-max pruning). In a distributed environment,
+Pipestream Search hybrid retrieval combines dense semantic search from the
+configured vector backend with lexical scoring from BM25 and block-max pruning.
+In a distributed environment,
 combining these two fundamentally different retrieval legs across multiple
 independent shards introduces substantial mathematical and architectural
 challenges:
@@ -22,7 +22,7 @@ challenges:
    compromising exactness.
 
 This document fixes the architectural contract, storage layouts, global
-statistics protocols, and fusion strategies implemented in `turbovec-search` and
+statistics protocols, and fusion strategies implemented in `pipestream-search` and
 specified for `turbovec-grpc`.
 
 ---

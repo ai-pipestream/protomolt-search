@@ -5,13 +5,13 @@
 
 mod common;
 
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::analysis::VocabChannel;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{AddDocumentsRequest, AddDocumentsResponse};
+use pipestream_search::vocab;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{AddDocumentsRequest, AddDocumentsResponse};
-use turbovec_search::pb::analysis::VocabChannel;
-use turbovec_search::vocab;
 
 use common::mock::start_mock_analysis;
 use common::start_empty_node;

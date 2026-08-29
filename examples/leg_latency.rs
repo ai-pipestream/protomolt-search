@@ -20,9 +20,9 @@
 
 use std::time::Instant;
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::analyzer;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
     AnalysisSpec, Bm25SearchRequest, FusionMode, HybridLegOptions, HybridSearchRequest,
     SearchRequest,
 };
@@ -38,14 +38,14 @@ fn arg(key: &str, default: &str) -> String {
 /// terms will not match the index and the timing would be of a query
 /// that finds nothing.
 fn body_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 fn pct(sorted: &[f64], p: usize) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    sorted[((sorted.len() * p / 100).min(sorted.len() - 1)).max(0)]
+    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
 }
 
 fn report(label: &str, mut ms: Vec<f64>, hits: usize, queries: usize) {

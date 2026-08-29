@@ -7,17 +7,17 @@
 mod common;
 
 use common::{monolithic_topk, Cluster, DIM};
+use pipestream_search::coordinator::{CoordinatorServiceImpl, FanoutLimits};
+use pipestream_search::harness::unit_vectors;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{ClusterHealthRequest, HealthRequest};
 use tokio::net::TcpListener;
 use tonic::Request;
-use turbovec_search::coordinator::{CoordinatorServiceImpl, FanoutLimits};
-use turbovec_search::harness::unit_vectors;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{ClusterHealthRequest, HealthRequest};
 
 const K: u32 = 25;
 
-fn fanout_hits(result: &turbovec_search::coordinator::FanoutResult) -> Vec<(u64, u32)> {
+fn fanout_hits(result: &pipestream_search::coordinator::FanoutResult) -> Vec<(u64, u32)> {
     result
         .hits
         .iter()
@@ -52,7 +52,7 @@ async fn health_reports_shard_shape() {
     let health = client.health(HealthRequest {}).await.unwrap().into_inner();
     assert!(health.num_vectors > 0);
     assert_eq!(health.dim, DIM as u32);
-    assert_eq!(health.bit_width, 4);
+    assert_eq!(health.bits_per_dimension, 4);
     assert!(!health.ingest_active);
     assert!(!health.bm25_building);
     assert_eq!(health.bm25_docs, 0);
@@ -130,7 +130,13 @@ async fn hedged_query_returns_identical_results() {
 
     for round in 0..5 {
         let result = coordinator
-            .fanout_search(&format!("hedge-{round}"), &query, K, false, &Default::default())
+            .fanout_search(
+                &format!("hedge-{round}"),
+                &query,
+                K,
+                false,
+                &Default::default(),
+            )
             .await
             .expect("hedged fan-out must succeed");
         assert_eq!(fanout_hits(&result), expected, "round {round}");
@@ -200,12 +206,12 @@ async fn shard_deadline_fires_on_a_hanging_node() {
 
 #[tokio::test]
 async fn pooled_channel_reconnects_after_node_restart() {
-    use tonic::transport::Server;
-    use turbovec_search::harness::{
+    use pipestream_search::harness::{
         build_monolithic, build_shards, fit_calibration, nodelay_incoming,
     };
-    use turbovec_search::node::{NodeConfig, NodeServiceImpl};
-    use turbovec_search::MAX_MESSAGE_BYTES;
+    use pipestream_search::node::{NodeConfig, NodeServiceImpl};
+    use pipestream_search::MAX_MESSAGE_BYTES;
+    use tonic::transport::Server;
 
     let n = 3_000;
     let corpus = unit_vectors(n, DIM, 0x5EED_CA11);
@@ -282,8 +288,8 @@ async fn pooled_channel_reconnects_after_node_restart() {
 async fn floor_delta_gate_never_changes_results() {
     // A delta so large no floor ever clears the gate: pruning hints stop
     // flowing entirely, results must not move.
-    use turbovec_search::harness::{build_monolithic, build_shards, fit_calibration, start_node};
-    use turbovec_search::node::NodeConfig;
+    use pipestream_search::harness::{build_monolithic, build_shards, fit_calibration, start_node};
+    use pipestream_search::node::NodeConfig;
 
     let n = 6_000;
     let corpus = unit_vectors(n, DIM, 0x5EED_CA11);

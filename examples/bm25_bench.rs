@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats};
-use turbovec_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, DocTerms, SpillBuilder};
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, DocTerms, SpillBuilder};
 
 // --- counting allocator -------------------------------------------------
 

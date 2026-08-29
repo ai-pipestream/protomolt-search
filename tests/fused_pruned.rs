@@ -21,8 +21,8 @@
 
 use std::path::PathBuf;
 
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats, FieldQuery, FusedDoc, PruneStats};
-use turbovec_search::postings::{
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats, FieldQuery, FusedDoc, PruneStats};
+use pipestream_search::postings::{
     AnalyzedDoc, AnalyzedField, Bm25Index, Bm25Reader, Bm25Store, DocTerms,
 };
 
@@ -122,7 +122,15 @@ fn random_two_field_corpus(
                 length: name_len,
             });
         }
-        docs.push((id, format!("doc {id}"), AnalyzedDoc { fields, quality: None, geography: None }));
+        docs.push((
+            id,
+            format!("doc {id}"),
+            AnalyzedDoc {
+                fields,
+                quality: None,
+                geography: None,
+            },
+        ));
     }
     docs
 }
@@ -353,7 +361,7 @@ fn fused_pruned_single_field_degenerate_identity() {
                     "doc {}, k {k}, floor {floor:e}",
                     w.doc_id
                 );
-                let mapped: Vec<(usize, usize, Vec<(u32, u32)>)> = w
+                let mapped: Vec<pipestream_search::bm25::FusedTermOffset> = w
                     .term_offsets
                     .iter()
                     .map(|(ti, o)| (0, *ti, o.clone()))
@@ -483,7 +491,15 @@ fn fused_ties_at_floor_and_kth_slot() {
                 length: 1,
             });
         }
-        store.add_document(i, format!("doc {i}"), AnalyzedDoc { fields, quality: None, geography: None });
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            AnalyzedDoc {
+                fields,
+                quality: None,
+                geography: None,
+            },
+        );
     }
     let path = dir.join("b.bm25");
     store.save(&path).unwrap();
@@ -567,7 +583,15 @@ fn fused_blocks_actually_skip() {
                 length: 10 + i % 5,
             },
         ];
-        store.add_document(i, format!("doc {i}"), AnalyzedDoc { fields, quality: None, geography: None });
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            AnalyzedDoc {
+                fields,
+                quality: None,
+                geography: None,
+            },
+        );
     }
     let path = dir.join("s.bm25");
     store.save(&path).unwrap();
@@ -812,7 +836,11 @@ fn fused_pruned_distributed_equals_monolithic() {
                 length: 2,
             });
         }
-        AnalyzedDoc { fields, quality: None, geography: None }
+        AnalyzedDoc {
+            fields,
+            quality: None,
+            geography: None,
+        }
     }
     fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
         let mut store = Bm25Store::with_fields(&["body", "name"]);

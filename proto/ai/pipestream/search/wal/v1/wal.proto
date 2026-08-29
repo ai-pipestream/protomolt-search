@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-// Per-shard write-ahead log (WAL) for turbovec-search nodes.
+// Per-shard write-ahead log (WAL) for Pipestream Search nodes.
 //
 // Every mutation a shard applies (vector batches, document batches, flush
 // points, snapshot installs) is framed into append-only bucket files
@@ -19,9 +19,9 @@ syntax = "proto3";
 // bytes]` carrying one WalRecord; seq is 1-based and gapless per FILE. A
 // snapshot install supersedes the prior log, so the node rotates to
 // `gen-(generation+1)` with a fresh manifest.
-package turbovec.search.wal.v1;
+package ai.pipestream.search.wal.v1;
 
-import "turbovec/search/v1/search.proto";
+import "ai/pipestream/search/v1/search.proto";
 
 // A logged `AddVectors` batch with its server-assigned id base.
 // `AddVectorsRequest` does not carry assigned ids, so the envelope adds
@@ -30,7 +30,7 @@ message LoggedAddVectors {
   // Global id assigned to the batch's first vector.
   uint64 first_id = 1;
   // The batch as received (flat row-major vectors, optional dim).
-  turbovec.search.v1.AddVectorsRequest batch = 2;
+  ai.pipestream.search.v1.AddVectorsRequest batch = 2;
 }
 
 // A logged `AddDocuments` unit with its server-assigned id base. Documents
@@ -41,7 +41,7 @@ message LoggedAddDocuments {
   // Global id assigned to the first document.
   uint64 first_id = 1;
   // The documents as received (raw text + analysis spec + lineage).
-  repeated turbovec.search.v1.AddDocumentsRequest documents = 2;
+  repeated ai.pipestream.search.v1.AddDocumentsRequest documents = 2;
 }
 
 // The shard flushed its indexes to disk at this point.

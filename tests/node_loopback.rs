@@ -4,14 +4,14 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
     search_shard_request, search_shard_response, FloorUpdate, SearchShardDone, SearchShardRequest,
     StartShardSearch,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{fit_calibration, unit_vectors, DIM};
 
@@ -81,14 +81,15 @@ async fn drive_scan(addr: &str, query: &[f32], inject_floor: Option<f32>) -> Sca
 async fn mid_scan_floor_update_is_lossless() {
     let corpus = unit_vectors(N, DIM, 0x10AD_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus[..2_000 * DIM]);
-    let mut index =
-        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
-    index.add(&corpus);
-    index.prepare();
+    let mut index = pipestream_search::harness::seeded_index(DIM, 4, &shift, &scale);
+    index.add(&corpus, DIM).unwrap();
+    index.prepare().unwrap();
 
     let query = unit_vectors(1, DIM, 0x10AD_0002);
     // The shard's true k-th best is a lossless floor.
-    let true_kth = index.search(&query, K as usize).scores_for_query(0)[(K - 1) as usize];
+    let true_kth = index
+        .search_unfiltered(&query, K as usize)
+        .scores_for_query(0)[(K - 1) as usize];
 
     // chunk_blocks=2 → 64 vectors per chunk → ~157 chunks: the injected
     // floor is guaranteed to land before most chunks run.
@@ -145,12 +146,11 @@ async fn mid_scan_floor_update_is_lossless() {
 async fn overhigh_floor_yields_fewer_hits() {
     let corpus = unit_vectors(4_096, DIM, 0x10AD_0003);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus[..1_024 * DIM]);
-    let mut index =
-        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
-    index.add(&corpus);
+    let mut index = pipestream_search::harness::seeded_index(DIM, 4, &shift, &scale);
+    index.add(&corpus, DIM).unwrap();
 
     let query = unit_vectors(1, DIM, 0x10AD_0004);
-    let best = index.search(&query, 1).scores_for_query(0)[0];
+    let best = index.search_unfiltered(&query, 1).scores_for_query(0)[0];
 
     let (addr, handle) = common::start_node(
         index,
@@ -182,10 +182,9 @@ async fn concurrent_coalesced_scans_match_solo() {
     let corpus = unit_vectors(N, DIM, 0x10AD_0007);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus[..2_000 * DIM]);
     let build = || {
-        let mut index =
-            turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
-        index.add(&corpus);
-        index.prepare();
+        let mut index = pipestream_search::harness::seeded_index(DIM, 4, &shift, &scale);
+        index.add(&corpus, DIM).unwrap();
+        index.prepare().unwrap();
         index
     };
     let (solo_addr, solo_handle) = common::start_node(
@@ -217,7 +216,7 @@ async fn concurrent_coalesced_scans_match_solo() {
         solo.push(drive_scan(&solo_addr, query, None).await.done);
     }
 
-    let (batches_before, jobs_before) = turbovec_search::node::scan_batch_counters();
+    let (batches_before, jobs_before) = pipestream_search::node::scan_batch_counters();
     let tasks: Vec<_> = queries
         .iter()
         .map(|query| {
@@ -230,7 +229,7 @@ async fn concurrent_coalesced_scans_match_solo() {
     for task in tasks {
         batched.push(task.await.unwrap());
     }
-    let (batches_after, jobs_after) = turbovec_search::node::scan_batch_counters();
+    let (batches_after, jobs_after) = pipestream_search::node::scan_batch_counters();
 
     let hits_of = |done: &SearchShardDone| {
         done.hits

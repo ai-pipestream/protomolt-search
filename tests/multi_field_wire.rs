@@ -18,15 +18,15 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::{Bm25Shard, NodeConfig};
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::{Bm25Shard, NodeConfig};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, DocumentField, FieldTerms, FlushRequest, QueryField,
     ShardLegsRequest, TermStatsRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -236,7 +236,7 @@ async fn fused_distributed_equals_monolithic_over_the_wire() {
         .await
         .unwrap();
     assert!(full.len() >= 2);
-    let seed = turbovec_search::bm25::floor_seed(full.last().unwrap().score);
+    let seed = pipestream_search::bm25::floor_seed(full.last().unwrap().score);
     let seeded = distributed
         .fanout_bm25_fused("rust smith", 6, &query_fields(2.0), seed)
         .await
@@ -412,12 +412,12 @@ fn bm25_shard_open_maps_current_formats_resident() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("tvmfw_open_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut store = turbovec_search::postings::Bm25Store::with_fields(&["body", "case_name"]);
+    let mut store = pipestream_search::postings::Bm25Store::with_fields(&["body", "case_name"]);
     for i in 0..40u32 {
         store.add_document(
             i,
             format!("doc {i}"),
-            turbovec_search::postings::AnalyzedDoc::body(
+            pipestream_search::postings::AnalyzedDoc::body(
                 vec![("court".to_string(), 1 + i % 3, vec![(0, 5)])],
                 1 + i % 3,
             ),
@@ -433,12 +433,12 @@ fn bm25_shard_open_maps_current_formats_resident() {
 
     // v5 carries exactly one field; build the oracle file from a
     // single-field store.
-    let mut single = turbovec_search::postings::Bm25Store::new();
+    let mut single = pipestream_search::postings::Bm25Store::new();
     for i in 0..40u32 {
         single.add_document(
             i,
             format!("doc {i}"),
-            turbovec_search::postings::AnalyzedDoc::body(
+            pipestream_search::postings::AnalyzedDoc::body(
                 vec![("court".to_string(), 1 + i % 3, vec![(0, 5)])],
                 1 + i % 3,
             ),
@@ -614,8 +614,8 @@ async fn a_field_no_shard_indexes_is_refused_not_silently_skipped() {
 /// exhaustive scorer.
 #[tokio::test]
 async fn request_level_analysis_with_fields_is_refused_not_ignored() {
-    use turbovec_search::pb::search_service_server::SearchService;
-    use turbovec_search::pb::{AnalysisSpec, Bm25SearchRequest};
+    use pipestream_search::pb::search_service_server::SearchService;
+    use pipestream_search::pb::{AnalysisSpec, Bm25SearchRequest};
 
     let (analysis, mock) = start_mock_analysis().await;
     let (a, node_a) = start_empty_node(two_field_node(&analysis, 0, None)).await;
@@ -695,21 +695,21 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
 /// A sidecar that records every UNARY `Analyze` it is asked for, and
 /// otherwise behaves exactly like the shared mock.
 struct CountingMock {
-    inner: turbovec_search::harness::mock_analysis::MockAnalysis,
+    inner: pipestream_search::harness::mock_analysis::MockAnalysis,
     unary: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[tonic::async_trait]
-impl turbovec_search::pb::analysis::analysis_service_server::AnalysisService for CountingMock {
+impl pipestream_search::pb::analysis::analysis_service_server::AnalysisService for CountingMock {
     async fn analyze(
         &self,
-        request: tonic::Request<turbovec_search::pb::analysis::AnalyzeRequest>,
-    ) -> Result<tonic::Response<turbovec_search::pb::analysis::AnalyzeResponse>, tonic::Status>
+        request: tonic::Request<pipestream_search::pb::analysis::AnalyzeRequest>,
+    ) -> Result<tonic::Response<pipestream_search::pb::analysis::AnalyzeResponse>, tonic::Status>
     {
         self.unary
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::analyze(
+        pipestream_search::pb::analysis::analysis_service_server::AnalysisService::analyze(
             &self.inner,
             request,
         )
@@ -720,7 +720,7 @@ impl turbovec_search::pb::analysis::analysis_service_server::AnalysisService for
         Box<
             dyn tokio_stream::Stream<
                     Item = Result<
-                        turbovec_search::pb::analysis::AnalyzeStreamResponse,
+                        pipestream_search::pb::analysis::AnalyzeStreamResponse,
                         tonic::Status,
                     >,
                 > + Send,
@@ -730,12 +730,12 @@ impl turbovec_search::pb::analysis::analysis_service_server::AnalysisService for
     async fn analyze_stream(
         &self,
         request: tonic::Request<
-            tonic::Streaming<turbovec_search::pb::analysis::AnalyzeStreamRequest>,
+            tonic::Streaming<pipestream_search::pb::analysis::AnalyzeStreamRequest>,
         >,
     ) -> Result<tonic::Response<Self::AnalyzeStreamStream>, tonic::Status> {
         self.streams
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::analyze_stream(
+        pipestream_search::pb::analysis::analysis_service_server::AnalysisService::analyze_stream(
             &self.inner,
             request,
         )
@@ -744,12 +744,12 @@ impl turbovec_search::pb::analysis::analysis_service_server::AnalysisService for
 
     async fn get_capabilities(
         &self,
-        request: tonic::Request<turbovec_search::pb::analysis::GetCapabilitiesRequest>,
+        request: tonic::Request<pipestream_search::pb::analysis::GetCapabilitiesRequest>,
     ) -> Result<
-        tonic::Response<turbovec_search::pb::analysis::GetCapabilitiesResponse>,
+        tonic::Response<pipestream_search::pb::analysis::GetCapabilitiesResponse>,
         tonic::Status,
     > {
-        turbovec_search::pb::analysis::analysis_service_server::AnalysisService::get_capabilities(
+        pipestream_search::pb::analysis::analysis_service_server::AnalysisService::get_capabilities(
             &self.inner,
             request,
         )
@@ -779,15 +779,15 @@ async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
     let mock = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(
-                turbovec_search::pb::analysis::analysis_service_server::AnalysisServiceServer::new(
+                pipestream_search::pb::analysis::analysis_service_server::AnalysisServiceServer::new(
                     CountingMock {
-                        inner: turbovec_search::harness::mock_analysis::MockAnalysis::default(),
+                        inner: pipestream_search::harness::mock_analysis::MockAnalysis::default(),
                         unary: unary.clone(),
                         streams: streams.clone(),
                     },
                 ),
             )
-            .serve_with_incoming(turbovec_search::harness::nodelay_incoming(listener)),
+            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
     );
 
     let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;
@@ -868,8 +868,8 @@ async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
 /// does not carry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
-    use turbovec_search::analyzer::{analysis_fingerprint, body_spec, cased_body_spec};
-    use turbovec_search::pb::{Bm25FieldLeg, Bm25QueryRequest};
+    use pipestream_search::analyzer::{analysis_fingerprint, body_spec, cased_body_spec};
+    use pipestream_search::pb::{Bm25FieldLeg, Bm25QueryRequest};
 
     let (analysis, mock) = start_mock_analysis().await;
     let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;

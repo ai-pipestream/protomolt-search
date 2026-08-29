@@ -1,10 +1,10 @@
-# turbovec-search
+# pipestream-search
 
-Distributed top-k search over [turbovec](https://github.com/ai-pipestream/turbovec)
-(TurboQuant) shard indexes, with **collaborative mid-query floor sharing**:
-shard nodes publish their current k-th best score while they scan, the
-coordinator aggregates the maximum and pushes it back, and nodes prune the
-remainder of their scan against it — losslessly.
+Provider-neutral distributed lexical, vector, and hybrid search. The product
+owns BM25, CEL selection, document semantics, fusion, generations, and public
+quality claims. Vector engines plug in behind one descriptor/configuration
+contract. The shipped `embedded-turbovec` adapter provides exhaustive
+TurboQuant scoring and collaborative live-floor streaming.
 
 ## Repository map
 
@@ -13,13 +13,14 @@ remainder of their scan against it — losslessly.
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
 | [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s17` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s17` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) (this repo) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s17` |
+| [Pipestream Search](https://github.com/ai-pipestream/turbovec-search) (this repository; remote rename pending) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s17` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
-The `s16` dependency reads and writes only TurboVec v7 vector indexes. It
-refuses pre-v7 `.tv` files, so build and verify a new shard generation before
-cutting this binary over an older corpus. BM25 sidecar format compatibility is
-independent of this vector-container break.
+The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
+uses TurboVec's current `.tv` persistence format. Provider images are opaque to
+the product and are selected by manifest/config identity, never by extension.
+See [the Pipestream Search migration note](docs/pipestream-search-migration.md)
+for renamed surfaces, compatibility aliases, and rebuild impact.
 
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
 The phased public query contract under design is
@@ -38,7 +39,7 @@ A one-command installer that syncs real data and exercises the whole stack:
 CourtListener bulk opinions (public S3) → [rustfs](https://rustfs.com)
 object store → Rust extraction → chunk + static-embedding via the
 [grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
-sidecar (GraalVM native, Model2Vec table) → a 4-shard turbovec-search
+sidecar (GraalVM native, Model2Vec table) → a 4-shard pipestream-search
 cluster → an automated search-verification gate. No Python anywhere.
 
 ```bash
@@ -55,7 +56,7 @@ up — coordinator on `localhost:50050`, rustfs console on
 [deploy/court-e2e/README.md](deploy/court-e2e/README.md).
 
 Query it with any gRPC client generated from
-[search.proto](proto/turbovec/search/v1/search.proto) — `Search`
+[search.proto](proto/ai/pipestream/search/v1/search.proto) — `Search`
 (vector top-k with floor sharing), `Bm25Search` (distributed lexical),
 `HybridSearch` (cascade, RRF, or score-blend fusion) — or with the
 bundled probe tool:
@@ -137,15 +138,13 @@ gRPC and asserts identical results.
 
 ## Why scores are comparable across shards at all
 
-Quantized scores are only comparable across separately built indexes if
-every index encodes vectors identically. turbovec's seeded TQ+ calibration
-provides this: fit the per-coordinate `(shift, scale)` once on a
-representative sample (build a throwaway index from the sample, read
-`calibration()`), then construct every shard with
-`TurboQuantIndex::new_with_calibration`. Same calibration ⇒ byte-identical
-codes for the same vector ⇒ per-slot scores are pure functions of the
-vector, so shard scores can be merged directly. `NodeService.GetCalibration`
-exposes a shard's calibration so deployments can verify uniform seeding.
+Scores are mergeable across shards only when the provider says they share one
+scoring identity. `NodeService.GetVectorBackend` reports the provider,
+version, metric, quality contract, capabilities, and scoring fingerprint.
+`ConfigureVectorBackend` accepts provider-owned opaque state before ingest.
+For `embedded-turbovec`, that state contains the fitted TQ+ parameters, so a
+given vector is encoded consistently across shard layouts. The product does
+not interpret those bytes.
 
 ## Running
 
@@ -154,16 +153,17 @@ cargo build --release
 
 # Single-process demo: both roles, random demo corpus (calibration fitted
 # on a 20% sample and seeded), one self-issued search at the end.
-./target/release/turbovec-search --role=both \
+./target/release/pipestream-search --role=both \
     --demo-vectors=20000 --dim=128 --bit-width=4 \
     --nodes=127.0.0.1:50051 --demo-query
 
-# A real shard node over a persisted .tv index.
-./target/release/turbovec-search --role=node \
-    --index=/data/shard-0.tv --slot-offset=0 --node-listen=0.0.0.0:50051
+# A real shard node over a persisted embedded-TurboVec image.
+./target/release/pipestream-search --role=node \
+    --vector-backend=embedded-turbovec --index=/data/shard-0.tv \
+    --slot-offset=0 --node-listen=0.0.0.0:50051
 
 # A coordinator over three nodes.
-./target/release/turbovec-search --role=coordinator \
+./target/release/pipestream-search --role=coordinator \
     --coord-listen=0.0.0.0:50050 \
     --nodes=node0:50051,node1:50051,node2:50051
 ```
@@ -171,7 +171,7 @@ cargo build --release
 ### Cluster configuration file
 
 For real deployments the binary reads a TOML file (`--config cluster.toml`,
-or `TURBOVEC_CONFIG`). Precedence: **CLI flag > env var > config file >
+or `PIPESTREAM_SEARCH_CONFIG`). Precedence: **CLI flag > env var > config file >
 default**. Every flag takes `--key=value` or `--key value`.
 
 ```toml
@@ -181,6 +181,7 @@ nodes = ["host-a:50051", "host-b:50051"]      # fan-out order = tie-break order
 chunk_blocks = 64                              # scan chunk size (SIMD blocks)
 floor_sharing = true
 floor_delta = 0.0                              # min raise before a floor publishes (0 = every raise)
+vector_backend = "embedded-turbovec"            # default provider for shards
 shard_deadline_ms = 0                          # per-shard query deadline (0 = none)
 hedge_delay_ms = 0                             # hedge slow shards to their replica after this (0 = failover only; set above healthy p99)
 max_message_mib = 64                           # gRPC message cap (both directions)
@@ -309,7 +310,7 @@ cannot reach the running floor — bit-identical results, measured up to
 whole fleet with a floor the client already holds (e.g. a previous
 query's `kth_best`, re-issued after appends); `min_score` and `kth_best`
 are additive, optional, and 0 means unseeded. `--block-max=false`
-(`TURBOVEC_BLOCK_MAX`) forces the exhaustive scorer for A/B; results are
+(`PIPESTREAM_SEARCH_BLOCK_MAX`) forces the exhaustive scorer for A/B; results are
 identical either way. `cluster_sweep --bm25-terms` sweeps the
 `{seeding} x {block-max}` factorial with a hit-signature gate.
 
@@ -327,8 +328,8 @@ run). Setup:
 # 1. the sidecar (native binary, no models needed)
 PORT=59101 .../grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis &
 
-# 2. a turbovec-search node+coordinator pointed at it
-turbovec-search --role=both --index=/tmp/tv-live/shard-0.tv \
+# 2. a pipestream-search node+coordinator pointed at it
+pipestream-search --role=both --index=/tmp/tv-live/shard-0.tv \
     --node-listen=127.0.0.1:50051 --coord-listen=127.0.0.1:50050 \
     --nodes=127.0.0.1:50051 --analysis-addr=127.0.0.1:59101 &
 
@@ -412,7 +413,7 @@ paragraph-ish blocks with exact original-text offsets.
    TEI embedding stage's ~326 chunks/s end-to-end.
 2. **Ingest** (`court_ingest`): unchanged mechanics — joins chunks and
    embeddings on `(opinion_id, ordinal)`, contiguous blocks to N shards,
-   calibration fit + BroadcastCalibration, AddDocuments with `DocLineage`
+   provider fit + BroadcastVectorBackend, AddDocuments with `DocLineage`
    + AddVectors with aligned ids, Flush (e.g.
    `/work/court-corpus/shards-static/`). dim comes from the embeddings
    file header (256 here, 1024 for TEI).
@@ -458,7 +459,7 @@ cargo run --release --example wiki_shakedown   # --data-dir, --out-dir, --sideca
 ```
 
 loads the parts, fits calibration on a sample, pushes it to every shard
-with `BroadcastCalibration`, starts the native analysis sidecar
+with `BroadcastVectorBackend`, starts the native analysis sidecar
 (falls back to the in-repo mock with a loud warning), ingests documents
 (AddDocuments, PORTER stems) and vectors (AddVectors) with aligned ids,
 persists `.tv` + `.bm25` under `--out-dir` for the later two-machine
@@ -554,13 +555,14 @@ RRF-merges the shard lists. Rank-based, needs NO comparable scores, but
 NOT partition-independent (local ranks are compressed vs global ranks).
 Use only when shards cannot share a calibration.
 
-### Shared calibration and its caveats
+### Shared provider scoring identity and its caveats
 
-`SearchService.BroadcastCalibration` pushes ONE TQ+ calibration to every
-shard (fan-out of `SetCalibration`, per-node outcomes). Fit once,
-broadcast BEFORE ingest, verify with `GetCalibration`. Calibration is
-locked for an index's lifetime, so recalibration on drift is a
-coordinated re-seed + re-ingest event.
+`SearchService.BroadcastVectorBackend` pushes one opaque provider
+configuration to every shard. Configure before ingest and verify matching
+`scoring_fingerprint` values with `GetVectorBackend`. Provider configuration
+is locked for a generation, so a scoring-identity change is a coordinated
+rebuild and cutover event. The old calibration RPCs remain compatibility
+adapters for existing embedded-TurboVec clients.
 
 Fork caveats (read from the turbovec source, pinned in
 `tests/score_layout.rs`): with a shared calibration, encoding is a pure
@@ -626,18 +628,17 @@ separately so clients see both parts; the debug block reports
 
 ## Ingest flow (write path)
 
-Shards ingest over gRPC; prebuilt `.tv` files are no longer required.
-Deployment order for a from-scratch cluster is **fit → seed → ingest →
+Shards ingest over gRPC; prebuilt provider images are not required.
+Deployment order for a from-scratch cluster is **fit → configure → ingest →
 search**:
 
-1. **Fit** a calibration on a representative sample (any tool that can run
-   turbovec: build a throwaway index from the sample, read `calibration()`).
-2. **Seed** every shard with it via `NodeService.SetCalibration` — or let
-   the CLI do it: start one seeded node (demo or loaded index), then
-   `turbovec-search calibrate --fit-from=node0:50051 --apply-to=node1:50051,node2:50051`.
-   SetCalibration is accepted only while a shard is empty; calibration is
-   locked for the index's lifetime (turbovec's own rule), so a retry of the
-   same calibration is an idempotent no-op and anything else is rejected.
+1. **Fit** provider state on a representative sample. The provider owns the
+   fitting algorithm and returned payload.
+2. **Configure** every empty shard with the same payload via
+   `NodeService.ConfigureVectorBackend`, or copy it from a configured node:
+   `pipestream-search configure-backend --fit-from=node0:50051 --apply-to=node1:50051,node2:50051`.
+   An identical retry is idempotent. A different configuration or any change
+   after vectors exist is rejected.
 3. **Ingest** with `NodeService.AddVectors` (client-streaming, flat
    batches). Batches apply under the shard's write lock; searches hold the
    read lock for their whole scan, so no search observes a half-applied
@@ -652,31 +653,29 @@ search**:
 default) flushes on SIGINT/SIGTERM. A shard whose index path does not
 exist at startup starts empty; after ingest + flush (or graceful
 shutdown), a restart with the same config comes back with all vectors
-and the locked calibration (`.tv` persists it). Note that an EMPTY but
-calibration-seeded shard also persists on shutdown — restarting a node
-does not "unseed" it; wiping the shard file (or installing a snapshot)
-is the only reset.
+and the provider configuration. An empty but configured shard also persists
+on shutdown. Resetting provider identity requires a new generation.
 
 ### Bulk load: InstallSnapshot
 
 For pre-computed corpora, skip per-node ingest entirely: build the
-shard image once (with the cluster's seeded calibration) and push the
+shard image once (with the cluster's shared provider configuration) and push the
 FINISHED index to every shard owner over one client stream —
 `NodeService.InstallSnapshot`, with `snapshot::install_snapshot(addr,
 tv_path, bm25_path)` as the bundled client.
 
 The node stages the image in a generation directory
 (`<index path>.snap/`), validates it (well-formed index, sidecar opens,
-calibration matches any calibration locked on the shard — a mismatch is
-rejected, keeping scores comparable cluster-wide), then swaps it live
+scoring fingerprint matches the configured shard. A mismatch is rejected,
+keeping scores comparable cluster-wide. The node then swaps it live
 under the write lock. Both files travel inside ONE directory rename, so
 the pair is installed atomically; a crash mid-swap is recovered
 deterministically at startup (see `recover_generation`). Once a shard
 serves from a generation, Flush and restart loading follow it — the
 legacy layout and the generation never split-brain.
 
-Rules of thumb: seed calibration first (or let an unseeded shard adopt
-the image's), replace every shard together on recalibration, and expect
+Rules of thumb: configure the provider first (or let an empty shard adopt
+the image's state), replace every shard together on scoring changes, and expect
 an image without a `.bm25` sidecar to wholesale-replace the postings
 store. Covered by `tests/snapshot.rs` (7 cases, incl. restart survival
 and crash recovery).
@@ -687,29 +686,29 @@ Design rationale, invariants, and the deferred-work list:
 [docs/resharding.md](docs/resharding.md).
 
 Every shard with an `index` path keeps a write-ahead log at
-`<index path>.wal/` (on by default; `--wal=false` / `TURBOVEC_WAL=false`
+`<index path>.wal/` (on by default; `--wal=false` / `PIPESTREAM_SEARCH_WAL=false`
 to disable, always off for `--demo-vectors`). The log is a folder of
 hash-bucketed files per generation:
 
 ```text
 <index path>.wal/gen-<generation:06>/
-    manifest.toml       dim, bit width, calibration, slot offset,
-                        bucket_bits, bucket_count, format_version
+    manifest.toml       dimension, provider state, slot offset,
+                        bucket geometry, format version
     bucket-<NNN>.wal    records routed by fnv1a64(id) >> (64 - bucket_bits)
     markers.wal         FlushMarker / SnapshotMarker records
 ```
 
 Frames are `[u32 len][u32 crc32][prost WalRecord]` with a 1-based gapless
-seq per file, written BEFORE the mutation hits the index. Writes are
+seq per file, written after the mutation successfully applies under the shard
+lock. Writes are
 buffered; only Flush and generation rotation fsync, and the log is never
 on the search path. A crash can leave a torn tail frame in any file;
 replay ignores it (with a warning), and a restarted node truncates the
 tail and continues that file's sequence — damage stays scoped to the one
-bucket file it happened in. Calibration starts empty on a from-scratch
-shard and the small manifest is rewritten atomically (tmp + rename) when
-it locks, the same lazy-completion semantics as before. A snapshot
+bucket file it happened in. Provider state starts incomplete on a from-scratch
+shard and the small manifest is rewritten atomically when it locks. A snapshot
 install supersedes the log, so the node rotates to `gen-(g+1)` with a
-fresh manifest (the installed image's calibration, same bucket geometry)
+fresh manifest (the installed image's provider state, same bucket geometry)
 and a `SnapshotMarker` in its `markers.wal`.
 
 Because records are routed by the SAME partition function the reshard
@@ -718,7 +717,7 @@ bucket file is a pre-partitioned log slice: a split with
 `N <= bucket_count` hands each child a contiguous range of bucket files
 without re-hashing a record. Finer splits still work but re-partition
 every record — **`bucket_count` (default 64, `--wal-buckets` /
-`TURBOVEC_WAL_BUCKETS`, power of two, max 1024) caps cheap split
+`PIPESTREAM_SEARCH_WAL_BUCKETS`, power of two, max 1024) caps cheap split
 granularity**. The count is fixed at WAL creation; a resumed log keeps
 its own and warns if the flag disagrees. Choose it with the bulk load's
 growth in mind.
@@ -737,30 +736,29 @@ The `reshard` example is the offline tool for step 2:
 ```sh
 # Split one shard 1 -> N (N a power of two):
 cargo run --release --example reshard -- \
-    --log=/data/shard-0.tv.wal --split=2 --out-dir=/data/split \
+    --log=/data/shard-0.vector.wal --split=2 --out-dir=/data/split \
     --slot-base=0 --slot-stride=25000000 --analysis-addr=http://localhost:50051
 
-# Merge several shards -> 1 (identical calibration AND bucket count):
+# Merge several shards -> 1 (identical provider state AND bucket count):
 cargo run --release --example reshard -- \
-    --logs=/data/shard-0.tv.wal,/data/shard-1.tv.wal --out-dir=/data/merged \
+    --logs=/data/shard-0.vector.wal,/data/shard-1.vector.wal --out-dir=/data/merged \
     --analysis-addr=http://localhost:50051
 ```
 
-It writes `<out>/shard-<i>.tv` (+ `.bm25`, documents re-analyzed with
+It writes `<out>/shard-<i>.vector` (+ `.bm25`, documents re-analyzed with
 their ingested analysis options), a `shard-map.toml`, and prints the
 matching `[[shards]]` node config blocks. Invariants, enforced hard:
 
-- **One calibration per split/merge.** The WAL manifest must carry a
-  locked calibration (a seeded shard); merge requires byte-identical
-  calibrations and identical bucket counts across all inputs. Unseeded
-  shards cannot be resharded — their scores are not comparable across
-  buckets anyway.
+- **One provider configuration per split/merge.** The WAL manifest must carry
+  locked provider state; merge requires byte-identical backend configuration
+  and identical bucket counts across all inputs. Unconfigured shards cannot
+  be resharded because their scores cannot be certified comparable.
 - **Ids are generation-scoped.** Children re-assign dense local slots in
   original id order and take their slot base from the new shard map
   (stride 25M by default, matching deploy/court-e2e); parent ids never
   leak into a child.
 - **The shard map is the id-to-shard authority.** `--shard-map=<file>`
-  (`TURBOVEC_SHARD_MAP`) on the coordinator replaces `--nodes` (passing
+  (`PIPESTREAM_SEARCH_SHARD_MAP`) on the coordinator replaces `--nodes` (passing
   both is an error): `generation = N` plus `[[shards]]` with `addr`,
   an optional `replica` (failover and hedged retries; see
   "Operability"), `slot_offset`, and the child's `hash_lo`/`hash_hi`
@@ -775,16 +773,16 @@ Two operational rules follow from the design:
 - **Live compaction is a self-snapshot.** To bound log growth, push the
   shard's own flushed image back through InstallSnapshot: the install
   supersedes the log and rotates to a fresh generation directory, so old
-  `gen-*` directories can be deleted once the swap is confirmed.
+  `gen-*` directories can be archived once the swap is confirmed.
 
 Covered by `tests/reshard.rs`: split 1→2 reconstructs the parent's top-k
 bitwise (union of child top-k, ids remapped), a split with
 N == bucket_count consumes every bucket exactly once, a finer-than-
 buckets split re-partitions correctly, merge 2→1 reproduces the
-monolithic top-k and the BM25 doc set, and mixed-calibration or
+monolithic top-k and the BM25 doc set, and mixed-provider-configuration or
 mixed-bucket-count merges are rejected.
 
-## Two-machine runbook
+## Two-machine embedded-TurboVec runbook
 
 Topology: host A (this host) runs coordinator + shard 0; host B (`host-b`)
 runs shard 1. Static membership — both configs list the same node set.
@@ -800,14 +798,15 @@ runs shard 1. Static membership — both configs list the same node set.
 
    (Any source of `.tv` files works as long as every shard was built with
    the SAME seeded calibration — that is what makes scores mergeable.
-   Verify with `NodeService.GetCalibration` if in doubt. Alternatively,
+   Verify matching scoring fingerprints with `NodeService.GetVectorBackend`.
+   Alternatively,
    skip files entirely: point each node's `index` at a fresh path, start
    empty, then seed + ingest over gRPC per "Ingest flow" above.)
 
 2. **Copy the binary and shard 1 to host-b:**
 
    ```bash
-   scp target/release/turbovec-search host-b:/usr/local/bin/
+   scp target/release/pipestream-search host-b:/usr/local/bin/
    scp /data/turbovec/shard-1.tv host-b:/data/turbovec/
    ```
 
@@ -821,7 +820,7 @@ runs shard 1. Static membership — both configs list the same node set.
    slot_offset = 50000          # = vectors in shard 0 (contiguous offsets)
    ```
 
-   Start: `turbovec-search --config /etc/turbovec/host-b.toml`
+   Start: `pipestream-search --config /etc/turbovec/host-b.toml`
 
 4. **Config on host A** (`/etc/turbovec/host-a.toml`):
 
@@ -836,19 +835,19 @@ runs shard 1. Static membership — both configs list the same node set.
    slot_offset = 0
    ```
 
-   Start: `turbovec-search --config /etc/turbovec/host-a.toml`
+   Start: `pipestream-search --config /etc/turbovec/host-a.toml`
 
 5. **Verify.** From host A (or any host that can reach `host-a:50050`),
    issue a real search. The binary's built-in check does one:
 
    ```bash
-   turbovec-search --role=coordinator --nodes=host-a:50051,host-b:50051 \
+   pipestream-search --role=coordinator --nodes=host-a:50051,host-b:50051 \
        --coord-listen=127.0.0.1:59999 --demo-query --query-dim=128
    ```
 
    (spins a throwaway coordinator against the running nodes and prints the
    merged top-10). Or call `SearchService.Search` with any gRPC client
-   against `host-a:50050` — proto at `proto/turbovec/search/v1/search.proto`.
+   against `host-a:50050` — proto at `proto/ai/pipestream/search/v1/search.proto`.
 
 6. **The large-k two-machine experiment** uses `cluster_sweep`, which
    drives a pre-existing cluster over the network (no in-process shards).
@@ -857,10 +856,10 @@ runs shard 1. Static membership — both configs list the same node set.
 
    ```bash
    # per shard, on the machine owning it (setsid to survive ssh):
-   setsid nohup turbovec-search --role=node --index=/tmp/wiki-shards/shard-N.tv \
+   setsid nohup pipestream-search --role=node --index=/tmp/wiki-shards/shard-N.tv \
        --slot-offset=OFFSET --node-listen=0.0.0.0:PORT \
        --floor-sharing=true  > node-sharing.log 2>&1 &
-   setsid nohup turbovec-search --role=node --index=/tmp/wiki-shards/shard-N.tv \
+   setsid nohup pipestream-search --role=node --index=/tmp/wiki-shards/shard-N.tv \
        --slot-offset=OFFSET --node-listen=0.0.0.0:PORT2 \
        --floor-sharing=false > node-nosharing.log 2>&1 &
 
@@ -916,7 +915,7 @@ losslessness at k=1000 over a 24k corpus.
 
 ## Layout
 
-- `proto/turbovec/search/v1/search.proto` — the wire API (heavily
+- `proto/ai/pipestream/search/v1/search.proto` — the wire API (heavily
   commented), codegen via `build.rs` + tonic-build.
 - `src/chunked.rs` — the chunked scan (mask per chunk, floor seeding,
   running heap, publish/poll points). Pure and unit-tested, including
@@ -1014,6 +1013,6 @@ TODO list).
   packed-bytes abstraction — owned Vec or mmap behind one accessor,
   with a paged blocked cache — is a fork-level decision, reported not
   built.
-- **Calibration verification.** Ingest drivers fit and broadcast the
-  shared calibration; mismatched shards score incomparably with no
-  warning beyond `GetCalibration` inspection.
+- **Provider verification.** Ingest drivers fit and broadcast opaque provider
+  state; health and `GetVectorBackend` expose the scoring fingerprint so a
+  mismatched fleet can be rejected before traffic.

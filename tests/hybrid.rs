@@ -18,15 +18,15 @@
 
 mod common;
 
+use pipestream_search::coordinator::{CoordinatorServiceImpl, HybridLegs};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{AddDocumentsRequest, AddVectorsRequest, SetCalibrationRequest};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::{CoordinatorServiceImpl, HybridLegs};
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{AddDocumentsRequest, AddVectorsRequest, SetCalibrationRequest};
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
-use turbovec_search::fusion::{Combination, Normalization};
+use pipestream_search::fusion::{Combination, Normalization};
 
 const DIM: usize = 64;
 const SHARD_DOCS: usize = 4;
@@ -100,7 +100,7 @@ fn legs_default() -> HybridLegs {
         vector_weight: 1.0,
         bm25_weight: 1.0,
         rrf_k: 60.0,
-        fusion_mode: turbovec_search::pb::FusionMode::GlobalRank,
+        fusion_mode: pipestream_search::pb::FusionMode::GlobalRank,
         normalization: Normalization::MinMax,
         combination: Combination::Arithmetic,
         min_vector_score: 0.0,
@@ -109,21 +109,21 @@ fn legs_default() -> HybridLegs {
 
 fn legs_two_level() -> HybridLegs {
     HybridLegs {
-        fusion_mode: turbovec_search::pb::FusionMode::TwoLevel,
+        fusion_mode: pipestream_search::pb::FusionMode::TwoLevel,
         ..legs_default()
     }
 }
 
 fn legs_blend(normalization: Normalization, combination: Combination) -> HybridLegs {
     HybridLegs {
-        fusion_mode: turbovec_search::pb::FusionMode::ScoreBlend,
+        fusion_mode: pipestream_search::pb::FusionMode::ScoreBlend,
         normalization,
         combination,
         ..legs_default()
     }
 }
 
-fn ids(hits: &[turbovec_search::pb::HybridHit]) -> Vec<u64> {
+fn ids(hits: &[pipestream_search::pb::HybridHit]) -> Vec<u64> {
     hits.iter().map(|h| h.doc_id).collect()
 }
 
@@ -188,12 +188,30 @@ async fn hybrid_is_deterministic_and_carries_provenance() {
     let query = corpus[..DIM].to_vec();
 
     let first = coordinator
-        .fanout_hybrid("h1", "zebra", &query, 8, None, legs_default(), false, &Default::default())
+        .fanout_hybrid(
+            "h1",
+            "zebra",
+            &query,
+            8,
+            None,
+            legs_default(),
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_hybrid("h2", "zebra", &query, 8, None, legs_default(), false, &Default::default())
+        .fanout_hybrid(
+            "h2",
+            "zebra",
+            &query,
+            8,
+            None,
+            legs_default(),
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
@@ -202,7 +220,7 @@ async fn hybrid_is_deterministic_and_carries_provenance() {
         ids(&second),
         "fused output must be deterministic"
     );
-    let sig = |hits: &[turbovec_search::pb::HybridHit]| {
+    let sig = |hits: &[pipestream_search::pb::HybridHit]| {
         hits.iter()
             .map(|h| (h.doc_id, h.fused_score.to_bits()))
             .collect::<Vec<_>>()
@@ -243,11 +261,10 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
     // The vector query: doc 0's own vector. The monolithic vector leg
     // order O over all 12 docs determines the shard assignment below.
     let query = corpus[..DIM].to_vec();
-    let mut mono_vectors =
-        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
-    mono_vectors.add(&corpus);
+    let mut mono_vectors = pipestream_search::harness::seeded_index(DIM, 4, &shift, &scale);
+    mono_vectors.add(&corpus, DIM).unwrap();
     let order: Vec<usize> = mono_vectors
-        .search(&query, N_DOCS)
+        .search_unfiltered(&query, N_DOCS)
         .indices_for_query(0)
         .iter()
         .map(|&i| i as usize)
@@ -377,11 +394,10 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
     let (shift, scale) = fit_calibration(DIM, 4, &corpus);
 
     let query = corpus[..DIM].to_vec();
-    let mut mono_index =
-        turbovec_search::harness::seeded_index(DIM, 4, &shift, &scale);
-    mono_index.add(&corpus);
+    let mut mono_index = pipestream_search::harness::seeded_index(DIM, 4, &shift, &scale);
+    mono_index.add(&corpus, DIM).unwrap();
     let order: Vec<usize> = mono_index
-        .search(&query, N_DOCS)
+        .search_unfiltered(&query, N_DOCS)
         .indices_for_query(0)
         .iter()
         .map(|&i| i as usize)
@@ -445,12 +461,30 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
         legs_blend(Normalization::None, Combination::Harmonic),
     ] {
         let got = distributed
-            .fanout_hybrid("adv", "zebra", &query, N_DOCS as u32, None, legs, false, &Default::default())
+            .fanout_hybrid(
+                "adv",
+                "zebra",
+                &query,
+                N_DOCS as u32,
+                None,
+                legs,
+                false,
+                &Default::default(),
+            )
             .await
             .unwrap()
             .0;
         let want = monolithic
-            .fanout_hybrid("adv-m", "zebra", &query, N_DOCS as u32, None, legs, false, &Default::default())
+            .fanout_hybrid(
+                "adv-m",
+                "zebra",
+                &query,
+                N_DOCS as u32,
+                None,
+                legs,
+                false,
+                &Default::default(),
+            )
             .await
             .unwrap()
             .0;
@@ -538,16 +572,34 @@ async fn score_blend_follows_documented_arithmetic() {
     let blend = legs_blend(Normalization::MinMax, Combination::Arithmetic);
 
     let first = coordinator
-        .fanout_hybrid("b1", "zebra", &query, 8, None, blend, false, &Default::default())
+        .fanout_hybrid(
+            "b1",
+            "zebra",
+            &query,
+            8,
+            None,
+            blend,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_hybrid("b2", "zebra", &query, 8, None, blend, false, &Default::default())
+        .fanout_hybrid(
+            "b2",
+            "zebra",
+            &query,
+            8,
+            None,
+            blend,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
-    let sig = |hits: &[turbovec_search::pb::HybridHit]| {
+    let sig = |hits: &[pipestream_search::pb::HybridHit]| {
         hits.iter()
             .map(|h| (h.doc_id, h.fused_score.to_bits()))
             .collect::<Vec<_>>()
@@ -585,7 +637,16 @@ async fn score_blend_follows_documented_arithmetic() {
         ..blend
     };
     let boosted = coordinator
-        .fanout_hybrid("b3", "zebra", &query, 8, None, weighted, false, &Default::default())
+        .fanout_hybrid(
+            "b3",
+            "zebra",
+            &query,
+            8,
+            None,
+            weighted,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
@@ -604,12 +665,30 @@ async fn score_blend_follows_documented_arithmetic() {
         legs_blend(Normalization::MinMax, Combination::Harmonic),
     ] {
         let hits = coordinator
-            .fanout_hybrid("bx", "zebra", &query, 8, None, legs, false, &Default::default())
+            .fanout_hybrid(
+                "bx",
+                "zebra",
+                &query,
+                8,
+                None,
+                legs,
+                false,
+                &Default::default(),
+            )
             .await
             .unwrap()
             .0;
         let again = coordinator
-            .fanout_hybrid("by", "zebra", &query, 8, None, legs, false, &Default::default())
+            .fanout_hybrid(
+                "by",
+                "zebra",
+                &query,
+                8,
+                None,
+                legs,
+                false,
+                &Default::default(),
+            )
             .await
             .unwrap()
             .0;
@@ -634,8 +713,8 @@ async fn score_blend_follows_documented_arithmetic() {
 /// plants "quagga" on doc 3 only, so the boost lifts exactly one doc.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boost_rescore_reorders_the_window() {
-    use turbovec_search::pb::search_service_server::SearchService as _;
-    use turbovec_search::pb::{BoostRescore, HybridLegOptions, HybridSearchRequest};
+    use pipestream_search::pb::search_service_server::SearchService as _;
+    use pipestream_search::pb::{BoostRescore, HybridLegOptions, HybridSearchRequest};
 
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x7777_0001);
@@ -682,7 +761,7 @@ async fn boost_rescore_reorders_the_window() {
     };
     let global_rank = || {
         Some(HybridLegOptions {
-            fusion_mode: turbovec_search::pb::FusionMode::GlobalRank as i32,
+            fusion_mode: pipestream_search::pb::FusionMode::GlobalRank as i32,
             ..Default::default()
         })
     };
@@ -788,8 +867,8 @@ async fn boost_rescore_reorders_the_window() {
 /// every mode (deeper qualifying docs get promoted, not truncated).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leg_disabling_and_vector_floor() {
-    use turbovec_search::pb::search_service_server::SearchService as _;
-    use turbovec_search::pb::{HybridLegOptions, HybridSearchRequest, SearchRequest};
+    use pipestream_search::pb::search_service_server::SearchService as _;
+    use pipestream_search::pb::{HybridLegOptions, HybridSearchRequest, SearchRequest};
 
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = unit_vectors(2 * SHARD_DOCS, DIM, 0x8888_0001);
@@ -834,7 +913,7 @@ async fn leg_disabling_and_vector_floor() {
         })
     };
     let global_rank = HybridLegOptions {
-        fusion_mode: turbovec_search::pb::FusionMode::GlobalRank as i32,
+        fusion_mode: pipestream_search::pb::FusionMode::GlobalRank as i32,
         ..Default::default()
     };
 
@@ -891,7 +970,7 @@ async fn leg_disabling_and_vector_floor() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     let err = coordinator
         .hybrid_search(request(HybridLegOptions {
-            fusion_mode: turbovec_search::pb::FusionMode::TwoLevel as i32,
+            fusion_mode: pipestream_search::pb::FusionMode::TwoLevel as i32,
             bm25_weight: Some(0.0),
             ..global_rank
         }))
@@ -911,9 +990,9 @@ async fn leg_disabling_and_vector_floor() {
         .map(|h| h.vector_id)
         .collect();
     for mode in [
-        turbovec_search::pb::FusionMode::GlobalRank,
-        turbovec_search::pb::FusionMode::ScoreBlend,
-        turbovec_search::pb::FusionMode::TwoLevel,
+        pipestream_search::pb::FusionMode::GlobalRank,
+        pipestream_search::pb::FusionMode::ScoreBlend,
+        pipestream_search::pb::FusionMode::TwoLevel,
     ] {
         let filtered = coordinator
             .hybrid_search(request(HybridLegOptions {
@@ -940,7 +1019,7 @@ async fn leg_disabling_and_vector_floor() {
     // Cascade: same floor, applied to the phase-1 pool.
     let cascade = coordinator
         .hybrid_search(request(HybridLegOptions {
-            fusion_mode: turbovec_search::pb::FusionMode::Cascade as i32,
+            fusion_mode: pipestream_search::pb::FusionMode::Cascade as i32,
             min_vector_score: floor,
             ..global_rank
         }))
@@ -1002,12 +1081,30 @@ async fn two_level_fallback_is_reachable_and_deterministic() {
     let query = corpus[..DIM].to_vec();
 
     let first = coordinator
-        .fanout_hybrid("t1", "zebra", &query, 8, None, legs_two_level(), false, &Default::default())
+        .fanout_hybrid(
+            "t1",
+            "zebra",
+            &query,
+            8,
+            None,
+            legs_two_level(),
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_hybrid("t2", "zebra", &query, 8, None, legs_two_level(), false, &Default::default())
+        .fanout_hybrid(
+            "t2",
+            "zebra",
+            &query,
+            8,
+            None,
+            legs_two_level(),
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
@@ -1039,7 +1136,7 @@ async fn broadcast_calibration_reaches_all_shards() {
 
     let coordinator =
         CoordinatorServiceImpl::new(vec![addr_a.clone(), addr_b.clone(), addr_c.clone()]);
-    let request = turbovec_search::pb::BroadcastCalibrationRequest {
+    let request = pipestream_search::pb::BroadcastCalibrationRequest {
         dim: DIM as u32,
         bit_width: 4,
         shift: shift.clone(),
@@ -1064,7 +1161,7 @@ async fn broadcast_calibration_reaches_all_shards() {
     for addr in [&addr_a, &addr_b] {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         let cal = client
-            .get_calibration(turbovec_search::pb::GetCalibrationRequest {})
+            .get_calibration(pipestream_search::pb::GetCalibrationRequest {})
             .await
             .unwrap()
             .into_inner();
@@ -1119,7 +1216,7 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
     {
         let mut client = NodeServiceClient::connect(addr_v5.clone()).await.unwrap();
         let flushed = client
-            .flush(turbovec_search::pb::FlushRequest {})
+            .flush(pipestream_search::pb::FlushRequest {})
             .await
             .unwrap()
             .into_inner();
@@ -1133,13 +1230,22 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
             .with_bm25(Some(analysis.clone()), Default::default());
         runs.push(
             coordinator
-                .fanout_hybrid("h", "zebra", &query, 8, None, legs_default(), false, &Default::default())
+                .fanout_hybrid(
+                    "h",
+                    "zebra",
+                    &query,
+                    8,
+                    None,
+                    legs_default(),
+                    false,
+                    &Default::default(),
+                )
                 .await
                 .unwrap()
                 .0,
         );
     }
-    let sig = |hits: &[turbovec_search::pb::HybridHit]| {
+    let sig = |hits: &[pipestream_search::pb::HybridHit]| {
         hits.iter()
             .map(|h| {
                 (
@@ -1209,12 +1315,30 @@ async fn debug_block_profiles_every_fusion_mode() {
         legs_blend(Normalization::MinMax, Combination::Arithmetic),
     ] {
         let (plain, no_debug) = coordinator
-            .fanout_hybrid("p", "zebra", &query, 8, None, legs, false, &Default::default())
+            .fanout_hybrid(
+                "p",
+                "zebra",
+                &query,
+                8,
+                None,
+                legs,
+                false,
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert!(no_debug.is_none(), "debug=false must not build a profile");
         let (hits, debug) = coordinator
-            .fanout_hybrid("d", "zebra", &query, 8, None, legs, true, &Default::default())
+            .fanout_hybrid(
+                "d",
+                "zebra",
+                &query,
+                8,
+                None,
+                legs,
+                true,
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ids(&plain), ids(&hits), "debug changed the results");
@@ -1238,22 +1362,40 @@ async fn debug_block_profiles_every_fusion_mode() {
     }
 
     let (plain, no_debug) = coordinator
-        .fanout_cascade("cp", "zebra", &query, 4, None, 0.0, false, &Default::default())
+        .fanout_cascade(
+            "cp",
+            "zebra",
+            &query,
+            4,
+            None,
+            0.0,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap();
     assert!(no_debug.is_none());
     let (hits, debug) = coordinator
-        .fanout_cascade("cd", "zebra", &query, 4, None, 0.0, true, &Default::default())
+        .fanout_cascade(
+            "cd",
+            "zebra",
+            &query,
+            4,
+            None,
+            0.0,
+            true,
+            &Default::default(),
+        )
         .await
         .unwrap();
-    let cascade_sig = |hits: &[turbovec_search::pb::CascadeHit]| {
+    let cascade_sig = |hits: &[pipestream_search::pb::CascadeHit]| {
         hits.iter().map(|h| (h.doc_id, h.rank)).collect::<Vec<_>>()
     };
     assert_eq!(cascade_sig(&plain), cascade_sig(&hits));
     let debug = debug.unwrap();
     assert_eq!(
         debug.fusion_mode,
-        turbovec_search::pb::FusionMode::Cascade as i32
+        pipestream_search::pb::FusionMode::Cascade as i32
     );
     assert_eq!(debug.terms, vec!["zebra".to_string()]);
     assert_eq!(debug.shards.len(), 2);
@@ -1321,7 +1463,16 @@ async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
 
     // Control: both legs on, both legs report work.
     let (_, debug) = coordinator
-        .fanout_hybrid("both", "zebra", &query, 8, None, legs_default(), true, &Default::default())
+        .fanout_hybrid(
+            "both",
+            "zebra",
+            &query,
+            8,
+            None,
+            legs_default(),
+            true,
+            &Default::default(),
+        )
         .await
         .unwrap();
     let debug = debug.unwrap();

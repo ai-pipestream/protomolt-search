@@ -8,7 +8,7 @@
 
 ## Status and scope
 
-This report asks how the vector edge of `turbovec-search` can become
+This report asks how the vector edge of `pipestream-search` can become
 replaceable while the product continues to own BM25, filters, facets, hybrid
 fusion, analysis, document semantics, and its public query contract. It
 compares the current TurboVec implementation with the current official RaBitQ
@@ -21,11 +21,19 @@ by their authors, not as reproduced facts. OpenReview allegations and responses
 are also attributed claims unless the underlying fact is directly visible in
 the saved paper, forum record, repository, or code.
 
+Implementation update, 2026-08-28: the provider-boundary recommendation was
+implemented after the source snapshot below. The product is now named
+Pipestream Search, uses the `ai.pipestream.search.v1` protobuf namespace, and
+routes runtime vector operations through a neutral provider contract. The
+shipped `embedded-turbovec` adapter is the only production adapter today.
+Sections describing direct `TurboQuantIndex` coupling remain as historical
+evidence for the inspected revision, not the current worktree.
+
 Local code inspected:
 
 | Checkout | Revision inspected | Role |
 |---|---|---|
-| `turbovec-search` | `4bcaeb82beb1d1d21aff8fec8497dbd8a55c5107` | Full search product |
+| `pipestream-search` | `4bcaeb82beb1d1d21aff8fec8497dbd8a55c5107` | Full search product |
 | `turbovec-grpc` | `fb28aa70ef09d37793b7b1829d5a4a6965df48e9` | Distributed TurboVec facade |
 | `turbovec` | `65699eff623cefa0aeddbf7c67847372c106a3e2` | Local TurboVec engine, fork chain `turbovec-pipestream-s17` |
 | RaBitQ Library | `94a9b277571eecbed7e1338dce23d76c1420d874` | Official C++ RaBitQ library |
@@ -44,7 +52,7 @@ would weaken its exactness and encoded-row movement contracts.
 
 The practical direction is:
 
-1. Keep all search-product meaning in `turbovec-search`.
+1. Keep all search-product meaning in `pipestream-search`.
 2. Extract a backend-neutral provider contract around its current direct
    `TurboQuantIndex` use.
 3. Implement embedded TurboVec and remote `turbovec-grpc` adapters first.
@@ -92,7 +100,7 @@ decisions.
 | Quantization method | TurboQuant MSE or product estimator, plus current upstream TQ+ extensions | 1-bit or multi-bit RaBitQ estimators | Distortion, estimator error, code size, encode/decode cost |
 | Local search engine | `turbovec::TurboQuantIndex` | RaBitQ Library IVF, HNSW, or QG | Recall, latency, build, mutation, memory, persistence, filtering |
 | Distributed service | `turbovec-grpc` | Does not exist in the inspected official library | Network cost, shard scaling, failure meaning, topology, split/join |
-| Search product | `turbovec-search` with BM25 and document semantics | No corresponding RaBitQ product | End-to-end relevance and operations |
+| Search product | `pipestream-search` with BM25 and document semantics | No corresponding RaBitQ product | End-to-end relevance and operations |
 
 A result about a quantizer does not establish that its available index is a
 better storage engine. Likewise, TurboVec's production features do not prove
@@ -102,7 +110,7 @@ that TurboQuant gives the best recall at a fixed memory budget.
 
 ### The product boundary is already correct
 
-`turbovec-search` owns the user-visible search behavior:
+`pipestream-search` owns the user-visible search behavior:
 
 - BM25 with global statistics and block-max pruning;
 - dense, lexical, and hybrid query strategies;
@@ -117,7 +125,7 @@ the local TurboVec engine. It already has the right low-level boundary. It
 should continue to expose TurboVec-specific calibration, streaming scan, and
 encoded-row movement where those details are necessary for exactness.
 
-### `turbovec-search` is concretely coupled to TurboVec
+### The inspected revision was concretely coupled to TurboVec
 
 This is not currently a small dependency-injection change. The coupling spans
 five surfaces:
@@ -147,7 +155,7 @@ The fork intentionally carries two distributed-search primitives:
 - `TurboQuantIndex::search_streaming`, which emits candidates above a live,
   monotonically rising floor and returns a completion result.
 
-The current `turbovec-search` streaming route opens one bidirectional stream
+The current `pipestream-search` streaming route opens one bidirectional stream
 per shard. The coordinator owns the only global heap, sends increasing score
 floors, receives candidate batches, and accepts the query only when every
 shard reports `completed=true`. Shared coordinate-exact calibration makes
@@ -313,7 +321,7 @@ win alone is insufficient.
 Public query and ingest API
            |
            v
-turbovec-search product layer
+pipestream-search product layer
   BM25 | CEL | facets | documents | hybrid fusion | lineage
            |
            v
@@ -343,7 +351,7 @@ TurboVec and RaBitQ shards can share one global heap.
 | Hybrid exactness/refusal rules | Quality/completion certificate |
 | Generation cutover and source rebuild policy | Snapshot/image validation for that backend |
 
-`turbovec-search` may compile CEL to a generic allowed-ID set or mask. The
+`pipestream-search` may compile CEL to a generic allowed-ID set or mask. The
 provider must not understand CEL, protobuf document schemas, BM25, facets, or
 parents.
 
@@ -430,7 +438,7 @@ VectorCompletion
 ```
 
 For `turbovec-grpc`, the remote adapter should call the cluster coordinator as
-one provider. `turbovec-search` should not learn the cluster's node topology or
+one provider. `pipestream-search` should not learn the cluster's node topology or
 reimplement its exact heap. This prevents two coordinators from competing for
 ownership of floors, replicas, and completion.
 
@@ -647,30 +655,23 @@ has established superior quantization quality.
 No initial step should rename repositories, change the public API, launch a
 corpus rebuild, or alter the serving cluster.
 
-## Naming and the `basic-search` idea
+## Naming decision
 
-The current repository name overstates one attached vector implementation and
-understates the full-search product. `basic-search` is a useful ironic working
-name because the system is anything but basic, but a repository-wide rename
-should wait until the public API and ownership home are proven. Otherwise the
-rename adds packaging churn while the backend boundary is still moving.
+The repository name overstated one attached vector implementation and
+understated the full-search product. The implementation adopted **Pipestream
+Search** for the crate, binary, documentation, configuration prefix, and
+`ai.pipestream.search.v1` protocol namespace. The remote repository and local
+checkout retain their old names until an explicit hosting-level rename.
 
-If the project is renamed later, a concise README note could say:
-
-> `basic-search` is a provisional name for a protobuf-native full-text and
-> hybrid search product. The eventual open-source project home will determine
-> its permanent branding. Public contracts and vector-provider boundaries are
-> intentionally independent of the repository name.
-
-The internal architecture should use neutral terms such as “search product,”
-“vector provider,” and “vector generation” now. That makes a later rename a
-packaging change instead of a protocol rewrite.
+The internal architecture uses neutral terms such as “search product,”
+“vector provider,” and “vector generation.” `basic-search` remains only a
+discarded research-era naming idea.
 
 ## Evidence assessment
 
 | Finding | Evidence class | Confidence |
 |---|---|---|
-| `turbovec-search` directly embeds TurboVec across query, ingest, persistence, and resharding | Current local source | High |
+| The inspected pre-refactor revision directly embedded TurboVec across query, ingest, persistence, and resharding | Pinned local source snapshot | High |
 | `turbovec-grpc` is correctly bounded as a distributed TurboVec engine | Current local source and docs | High |
 | RaBitQ IVF uses 32-vector coarse batches and conditionally reads extended bits per vector | Current official source | High |
 | RaBitQ IVF scans all selected clusters and has no external live threshold | Current official source and docs | High |
@@ -799,7 +800,7 @@ Important gaps remain directly visible in that PDF:
 
 These observations strengthen the case for an independent benchmark. They do
 not establish research misconduct, prove the private correspondence claims,
-or establish RaBitQ as the better production backend for `turbovec-search`.
+or establish RaBitQ as the better production backend for `pipestream-search`.
 The architecture recommendation therefore remains unchanged: preserve a
 neutral provider seam, reproduce both sides on the same system, and make the
 production decision from measured workload evidence.

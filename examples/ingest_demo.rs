@@ -1,8 +1,8 @@
-//! Live-interop demo: ingest documents into a turbovec-search node through
+//! Live-interop demo: ingest documents into a pipestream-search node through
 //! the OpenNLP analysis sidecar, then run distributed BM25 queries
 //! and fetch raw texts for highlighting.
 //!
-//! Usage (sidecar and a turbovec-search node+coordinator already running):
+//! Usage (sidecar and a pipestream-search node+coordinator already running):
 //!
 //! ```text
 //! cargo run --example ingest_demo -- \
@@ -14,13 +14,13 @@
 //! postings are real OpenNLP Porter stems, and every occurrence keeps its
 //! original-text span for highlighting.
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
     AddDocumentsRequest, Bm25SearchRequest, GetDocumentsRequest, TermStatsRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 const DOCS: [&str; 4] = [
     "The dogs are barking loudly at the running foxes",
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // WHITESPACE tokenizer, PORTER stemmer, MODE_FULL, SOURCE_STEMS.
-    let spec = turbovec_search::analyzer::body_spec();
+    let spec = pipestream_search::analyzer::body_spec();
 
     let mut node_client = NodeServiceClient::connect(node).await?;
 

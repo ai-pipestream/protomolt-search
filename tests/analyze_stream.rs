@@ -12,25 +12,25 @@ mod common;
 
 use std::pin::Pin;
 
+use pipestream_search::analyzer::{
+    analyze_batch, analyze_batch_streams, analyze_document, AnalyzeStream,
+};
+use pipestream_search::harness::mock_analysis::MockAnalysis;
+use pipestream_search::harness::nodelay_incoming;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::analysis::analysis_service_server::{
+    AnalysisService, AnalysisServiceServer,
+};
+use pipestream_search::pb::analysis::{
+    AnalyzeRequest, AnalyzeResponse, AnalyzeStreamRequest, AnalyzeStreamResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse,
+};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{AddDocumentsRequest, AnalysisSpec};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
-use turbovec_search::analyzer::{
-    analyze_batch, analyze_batch_streams, analyze_document, AnalyzeStream,
-};
-use turbovec_search::harness::mock_analysis::MockAnalysis;
-use turbovec_search::harness::nodelay_incoming;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::analysis::analysis_service_server::{
-    AnalysisService, AnalysisServiceServer,
-};
-use turbovec_search::pb::analysis::{
-    AnalyzeRequest, AnalyzeResponse, AnalyzeStreamRequest, AnalyzeStreamResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse,
-};
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{AddDocumentsRequest, AnalysisSpec};
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -152,7 +152,9 @@ async fn start_no_stream_mock() -> (
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(AnalysisServiceServer::new(NoStreamMock(MockAnalysis::default())))
+            .add_service(AnalysisServiceServer::new(NoStreamMock(
+                MockAnalysis::default(),
+            )))
             .serve_with_incoming(nodelay_incoming(listener)),
     );
     (format!("http://{addr}"), handle)

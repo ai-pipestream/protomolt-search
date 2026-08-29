@@ -8,18 +8,18 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     projected_value, search_query, selection_query, AddDocumentsRequest, Bm25SearchRequest,
     FacetValue, IntegerValue, LexicalQuery, MaterializeKind, MaterializeSpec, MaterializedColumn,
     NamedProjection, NumericValue, QueryRequest, SearchQuery, SelectionQuery,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -133,12 +133,7 @@ async fn run_projections(
     Ok(response
         .hits
         .into_iter()
-        .map(|h| {
-            (
-                h.doc_id,
-                h.projected.into_iter().map(|p| p.value).collect(),
-            )
-        })
+        .map(|h| (h.doc_id, h.projected.into_iter().map(|p| p.value).collect()))
         .collect())
 }
 
@@ -152,7 +147,8 @@ fn oracle(expr: &str, id: usize) -> Option<projected_value::Value> {
     // Stock CEL errors on an unbound variable, which is exactly the
     // "undefined" half the engine's absence rule covers; bind only
     // what the document holds.
-    ctx.add_variable("price", price_of(id)?).expect("bind price");
+    ctx.add_variable("price", price_of(id)?)
+        .expect("bind price");
     ctx.add_variable("year", year_of(id)?).expect("bind year");
     ctx.add_variable("court", court_of(id).to_string())
         .expect("bind court");
@@ -224,18 +220,14 @@ async fn projections_agree_with_the_stock_cel_oracle() {
                 None => {}
                 Some(expected) => {
                     oracle_hits += 1;
-                    let engine = engine
-                        .as_ref()
-                        .unwrap_or_else(|| panic!("doc {id} {expr:?}: engine absent, oracle {expected:?}"));
+                    let engine = engine.as_ref().unwrap_or_else(|| {
+                        panic!("doc {id} {expr:?}: engine absent, oracle {expected:?}")
+                    });
                     match (engine, &expected) {
                         (
                             projected_value::Value::DoubleValue(a),
                             projected_value::Value::DoubleValue(b),
-                        ) => assert_eq!(
-                            a.to_bits(),
-                            b.to_bits(),
-                            "doc {id} {expr:?}: {a} != {b}"
-                        ),
+                        ) => assert_eq!(a.to_bits(), b.to_bits(), "doc {id} {expr:?}: {a} != {b}"),
                         (a, b) => assert_eq!(a, b, "doc {id} {expr:?}"),
                     }
                 }
@@ -338,7 +330,10 @@ async fn kleene_absence_and_dictionary_misses_are_pinned() {
                 values[2].is_none(),
                 "doc {id}: absent && true is absent, not false"
             );
-            assert!(values[3].is_none(), "doc {id}: absent condition, absent result");
+            assert!(
+                values[3].is_none(),
+                "doc {id}: absent condition, absent result"
+            );
             assert!(values[4].is_none(), "doc {id}: `!` of absent stays absent");
         } else {
             assert!(values[2].is_some(), "doc {id}: both legs present");
@@ -377,7 +372,10 @@ async fn math_functions_match_their_pinned_semantics() {
         vec![
             projection("abs", "math.abs(0.5 - price)"),
             projection("sign", "math.sign(year - 1993)"),
-            projection("greatest", "math.greatest(price, 2.0, double(year) / 1000.0)"),
+            projection(
+                "greatest",
+                "math.greatest(price, 2.0, double(year) / 1000.0)",
+            ),
             projection("least", "math.least(year, 1993)"),
             projection("round", "math.round(price)"),
             projection("sqrt", "math.sqrt(price)"),
@@ -762,12 +760,7 @@ async fn query_projections_agree_across_shapes() {
     let via_query: Vec<(u64, Vec<Option<projected_value::Value>>)> = response
         .hits
         .into_iter()
-        .map(|h| {
-            (
-                h.doc_id,
-                h.projected.into_iter().map(|p| p.value).collect(),
-            )
-        })
+        .map(|h| (h.doc_id, h.projected.into_iter().map(|p| p.value).collect()))
         .collect();
     assert_eq!(via_query, direct, "the adapter must not fork the values");
 
@@ -775,9 +768,9 @@ async fn query_projections_agree_across_shapes() {
     // value fetch, and the values agree with the lexical route's.
     let browse = SelectionQuery {
         node: Some(selection_query::Node::Filter(
-            turbovec_search::pb::FilterQuery {
+            pipestream_search::pb::FilterQuery {
                 id: "f".into(),
-                predicate: Some(turbovec_search::pb::filter_query::Predicate::Cel(
+                predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
                     "year >= 1990".into(),
                 )),
             },

@@ -11,8 +11,8 @@
 //!     --text="COURT court Court COURTS courts"
 //! ```
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::AnalysisSpec;
+use pipestream_search::analyzer;
+use pipestream_search::pb::AnalysisSpec;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");

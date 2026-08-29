@@ -35,6 +35,7 @@
 //!   heap gate), which `crate::bm25` owns.
 
 use std::cmp::Ordering;
+use std::ops::Not;
 
 use tonic::Status;
 
@@ -86,9 +87,13 @@ impl Tri {
     pub fn or(self, other: Tri) -> Tri {
         self.max(other)
     }
+}
+
+impl Not for Tri {
+    type Output = Tri;
 
     /// Kleene negation: True and False swap, Unknown stays.
-    pub fn not(self) -> Tri {
+    fn not(self) -> Tri {
         match self {
             Tri::True => Tri::False,
             Tri::False => Tri::True,
@@ -473,7 +478,7 @@ impl ResolvedFilter {
                 }
                 acc
             }
-            ResolvedFilter::Not(child) => child.eval(doc_id, cols).not(),
+            ResolvedFilter::Not(child) => !child.eval(doc_id, cols),
             ResolvedFilter::Leaf(leaf) => leaf.eval(doc_id, cols),
         }
     }
@@ -775,14 +780,14 @@ mod tests {
                 assert_eq!(a.and(b), b.and(a), "and commutes");
                 assert_eq!(a.or(b), b.or(a), "or commutes");
                 // De Morgan holds in Kleene logic.
-                assert_eq!(a.and(b).not(), a.not().or(b.not()));
+                assert_eq!(!a.and(b), (!a).or(!b));
             }
         }
         assert_eq!(Unknown.and(Unknown), Unknown);
         assert_eq!(Unknown.or(Unknown), Unknown);
-        assert_eq!(Unknown.not(), Unknown, "negation cannot launder absence");
-        assert_eq!(True.not(), False);
-        assert_eq!(False.not(), True);
+        assert_eq!(!Unknown, Unknown, "negation cannot launder absence");
+        assert_eq!(!True, False);
+        assert_eq!(!False, True);
     }
 
     /// The exact f64-vs-i64 comparison at the values where a rounded

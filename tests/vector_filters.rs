@@ -16,17 +16,17 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, FacetValue, FusionMode, HybridSearchRequest,
     SearchRequest, SetCalibrationRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 
@@ -39,7 +39,7 @@ const N_DOCS: usize = SHARD_DOCS * N_SHARDS;
 /// odd ids "ca5". Both shards hold both values, so no result can be
 /// explained by a shard boundary.
 fn court_of(id: usize) -> &'static str {
-    if id % 2 == 0 {
+    if id.is_multiple_of(2) {
         "scotus"
     } else {
         "ca5"
@@ -217,15 +217,9 @@ async fn a_filtered_vector_search_is_the_unfiltered_one_narrowed() {
             // And at a k that truncates: the top-k of the survivors, not
             // the survivors of the top-k.
             let k = 3;
-            let short = vector_search(
-                &coord,
-                &query,
-                k,
-                &format!(r#"court == "{court}""#),
-                false,
-            )
-            .await
-            .unwrap();
+            let short = vector_search(&coord, &query, k, &format!(r#"court == "{court}""#), false)
+                .await
+                .unwrap();
             assert_eq!(short, expected[..k as usize], "streaming={streaming}");
         }
     }
@@ -311,7 +305,7 @@ async fn every_fusion_mode_filters_both_legs() {
                 vector: query.clone(),
                 k: N_DOCS as u32,
                 filter: r#"court == "scotus""#.into(),
-                legs: Some(turbovec_search::pb::HybridLegOptions {
+                legs: Some(pipestream_search::pb::HybridLegOptions {
                     fusion_mode: mode as i32,
                     leg_k: 32,
                     ..Default::default()

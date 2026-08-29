@@ -5,21 +5,21 @@
 
 mod common;
 
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
+    search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
+    AddVectorsRequest, Bm25SearchRequest, BoostQuery, BoostRescore, CascadeScore, CompositeScorer,
+    CompositeSearchStrategy, DecomposedScore, DenseQuery, FilterQuery, FusionMode,
+    HybridLegOptions, HybridSearchRequest, IntegerValue, LexicalQuery, QueryRequest, QueryResponse,
+    QuerySort, RrfScore, SearchQuery, SearchRequest, SelectionOperator, SelectionQuery,
+    SelectionScoreStrategy, SetCalibrationRequest,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
-    search_query, QuerySort, selection_query, selection_score_strategy, AddDocumentsRequest,
-    AddVectorsRequest, Bm25SearchRequest, BoostQuery, BoostRescore, CascadeScore,
-    CompositeScorer, CompositeSearchStrategy, DecomposedScore, DenseQuery, FilterQuery,
-    FusionMode, HybridLegOptions, HybridSearchRequest, IntegerValue, LexicalQuery, QueryRequest,
-    QueryResponse, RrfScore, SearchQuery, SearchRequest, SelectionOperator,
-    SelectionQuery, SelectionScoreStrategy, SetCalibrationRequest,
-};
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 
@@ -72,7 +72,7 @@ async fn start_cluster_with_addrs() -> (
         let (tx, rx) = mpsc::channel(16);
         for i in 0..SHARD_DOCS {
             let id = shard * SHARD_DOCS + i;
-            let text = if id % 2 == 0 {
+            let text = if id.is_multiple_of(2) {
                 format!("zebra document {id}")
             } else {
                 format!("plain document {id}")
@@ -135,7 +135,7 @@ fn cel_filter(id: &str, cel: &str) -> SelectionQuery {
     SelectionQuery {
         node: Some(selection_query::Node::Filter(FilterQuery {
             id: id.to_string(),
-            predicate: Some(turbovec_search::pb::filter_query::Predicate::Cel(
+            predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
                 cel.to_string(),
             )),
         })),
@@ -280,12 +280,7 @@ async fn filters_ride_the_and_wrapper_and_conjoin() {
 async fn composites_execute_their_fusion_modes() {
     let (coordinator, qvec, _handles) = start_cluster().await;
 
-    let two_leaves = || {
-        vec![
-            dense_leaf("vec", &qvec),
-            lexical_leaf("lex", "zebra"),
-        ]
-    };
+    let two_leaves = || vec![dense_leaf("vec", &qvec), lexical_leaf("lex", "zebra")];
     for (strategy, operator, mode, executed) in [
         (
             selection_score_strategy::Strategy::Rrf(RrfScore::default()),
@@ -491,11 +486,11 @@ async fn unsupported_shapes_refuse_by_name() {
         (
             QueryRequest {
                 k: 5,
-                selection: Some(or_two(Some(
-                    selection_score_strategy::Strategy::Cascade(CascadeScore {
+                selection: Some(or_two(Some(selection_score_strategy::Strategy::Cascade(
+                    CascadeScore {
                         gate_id: "vec".into(),
-                    }),
-                ))),
+                    },
+                )))),
                 ..Default::default()
             },
             "operator must be left unspecified",
@@ -631,7 +626,11 @@ async fn pages_stitch_into_the_full_ranking() {
         )
         .await
         .unwrap();
-        stitched.extend(resp.hits.iter().map(|h| (h.doc_id, h.score.to_bits(), h.rank)));
+        stitched.extend(
+            resp.hits
+                .iter()
+                .map(|h| (h.doc_id, h.score.to_bits(), h.rank)),
+        );
         pages += 1;
         if resp.next_cursor.is_empty() {
             assert!(resp.hits.len() < 3, "a full page always mints a cursor");
@@ -781,7 +780,11 @@ async fn a_changed_corpus_refuses_the_cursor() {
     .await
     .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("malformed cursor"), "{}", err.message());
+    assert!(
+        err.message().contains("malformed cursor"),
+        "{}",
+        err.message()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -814,7 +817,10 @@ async fn filter_only_browse_pages_in_id_order() {
     let selection = || {
         composite(
             SelectionOperator::And,
-            vec![cel_filter("low", "year >= 1"), cel_filter("high", "year <= 6")],
+            vec![
+                cel_filter("low", "year >= 1"),
+                cel_filter("high", "year <= 6"),
+            ],
             None,
         )
     };
@@ -887,7 +893,10 @@ async fn sorted_browse_orders_by_column_and_pages() {
     let rows: Vec<(u64, f64)> = full.hits.iter().map(|h| (h.doc_id, h.sort_key)).collect();
     assert_eq!(
         rows,
-        (1..8).rev().map(|i| (i as u64, i as f64)).collect::<Vec<_>>(),
+        (1..8)
+            .rev()
+            .map(|i| (i as u64, i as f64))
+            .collect::<Vec<_>>(),
         "newest first, and the sort key is reported"
     );
 

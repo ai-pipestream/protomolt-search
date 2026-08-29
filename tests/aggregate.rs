@@ -7,18 +7,18 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     aggregate_result::Value as W, percentile_value::Value as P, AddDocumentsRequest, AggregateOp,
     AggregateRequest, AggregateResponse, Aggregation, FacetValue, HistogramSpec, IntegerValue,
     NumericValue, PercentileSpec,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -371,11 +371,7 @@ async fn int_sum_overflow_refuses_naming_the_fix() {
     let status = run(
         &coordinator,
         "",
-        vec![agg(
-            "big",
-            "9223372036854775807 / 4",
-            AggregateOp::Sum,
-        )],
+        vec![agg("big", "9223372036854775807 / 4", AggregateOp::Sum)],
     )
     .await
     .expect_err("an out-of-i64 exact total must refuse");
@@ -393,10 +389,7 @@ async fn int_sum_overflow_refuses_naming_the_fix() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        response.results[0].value,
-        Some(W::IntValue(i64::MAX / 4))
-    );
+    assert_eq!(response.results[0].value, Some(W::IntValue(i64::MAX / 4)));
     for h in handles {
         h.abort();
     }
@@ -410,7 +403,11 @@ async fn refusals_name_the_aggregation() {
     let cases: [(&str, AggregateOp, &str); 5] = [
         ("year", AggregateOp::Mean, "takes a double"),
         ("court", AggregateOp::Sum, "only under COUNT"),
-        ("price > 2.0", AggregateOp::Count, "filter on the expression"),
+        (
+            "price > 2.0",
+            AggregateOp::Count,
+            "filter on the expression",
+        ),
         ("pricee", AggregateOp::Sum, "no shard has column pricee"),
         ("price ? 1 : 2", AggregateOp::Sum, "condition is a"),
     ];
@@ -501,7 +498,11 @@ async fn group_by_facet_folds_per_group() {
     expected_values.sort_unstable();
     expected_values.dedup();
     assert_eq!(
-        first.groups.iter().map(|g| g.value.as_str()).collect::<Vec<_>>(),
+        first
+            .groups
+            .iter()
+            .map(|g| g.value.as_str())
+            .collect::<Vec<_>>(),
         expected_values,
         "groups return ascending by value"
     );
@@ -538,7 +539,10 @@ async fn group_by_facet_folds_per_group() {
     }
     // The fleet-wide totals still cover the ungrouped doc.
     let total_present: u64 = (0..N_DOCS).filter_map(price_of).count() as u64;
-    assert_eq!(first.results[0].value, Some(W::IntValue(total_present as i64)));
+    assert_eq!(
+        first.results[0].value,
+        Some(W::IntValue(total_present as i64))
+    );
     for h in handles {
         h.abort();
     }
@@ -570,7 +574,10 @@ async fn histograms_bucket_exactly() {
             *expected.entry(idx).or_insert(0) += 1;
         }
         let got: Vec<(f64, u64)> = result.buckets.iter().map(|b| (b.lower, b.count)).collect();
-        let want: Vec<(f64, u64)> = expected.iter().map(|(&i, &c)| (i as f64 * 2.5, c)).collect();
+        let want: Vec<(f64, u64)> = expected
+            .iter()
+            .map(|(&i, &c)| (i as f64 * 2.5, c))
+            .collect();
         assert_eq!(got, want, "{}", result.name);
         assert_eq!(result.present, prices.len() as u64);
         assert_eq!(result.unbucketable, 0);
@@ -628,8 +635,10 @@ async fn caps_and_shapes_refuse_loudly() {
         "4 buckets against a cap of 2: {}",
         status.message()
     );
-    for (interval, needle) in [(0.0, "positive and finite"), (f64::INFINITY, "positive and finite")]
-    {
+    for (interval, needle) in [
+        (0.0, "positive and finite"),
+        (f64::INFINITY, "positive and finite"),
+    ] {
         let status = coordinator
             .aggregate(Request::new(base(
                 Vec::new(),
@@ -734,7 +743,9 @@ async fn percentiles_answer_exact_order_statistics() {
             &[100.0],
         ),
     ];
-    let first = run_percentiles(&coordinator, "", specs.clone()).await.unwrap();
+    let first = run_percentiles(&coordinator, "", specs.clone())
+        .await
+        .unwrap();
     let second = run_percentiles(&coordinator, "", specs).await.unwrap();
     assert_eq!(first, second, "percentiles answer the same bits twice");
 

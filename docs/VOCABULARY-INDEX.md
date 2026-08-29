@@ -4,7 +4,7 @@ The Rust realization of the vocabulary listener designed in
 `grpc-opennlp-analysis/VOCABULARY-LISTENER.md` (the sidecar repo is the
 authoritative design doc). The split by role: the Java sidecar
 **calculates** (term identity is counted exactly as the analysis pipeline
-produced it); turbovec-search **accumulates, stores, and aggregates** —
+produced it); pipestream-search **accumulates, stores, and aggregates** —
 inline in the ingest path, from the AnalyzeStream responses the node
 already consumes to build postings. No new gRPC channel, no proto changes.
 
@@ -47,9 +47,9 @@ response.
 
 | Setting | CLI | Env | TOML | Default |
 |---|---|---|---|---|
-| enable per shard | `--vocab=true` | `TURBOVEC_VOCAB` | `vocab` (top-level or `[[shards]]`) | `false` |
-| docs per window | `--vocab-window-docs=N` | `TURBOVEC_VOCAB_WINDOW_DOCS` | `vocab_window_docs` | 1,000,000 |
-| heavy-hitter K | `--vocab-top-k=K` | `TURBOVEC_VOCAB_TOP_K` | `vocab_top_k` | 1024 |
+| enable per shard | `--vocab=true` | `PIPESTREAM_SEARCH_VOCAB` | `vocab` (top-level or `[[shards]]`) | `false` |
+| docs per window | `--vocab-window-docs=N` | `PIPESTREAM_SEARCH_VOCAB_WINDOW_DOCS` | `vocab_window_docs` | 1,000,000 |
+| heavy-hitter K | `--vocab-top-k=K` | `PIPESTREAM_SEARCH_VOCAB_TOP_K` | `vocab_top_k` | 1024 |
 
 Requires an index path (demo shards cannot enable it). An unwritable
 vocab directory degrades the shard to uncounted with a loud warning —

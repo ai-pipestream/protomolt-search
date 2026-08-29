@@ -82,7 +82,7 @@ export JAVA_OPTS=${JAVA_OPTS:--Xmx4g}
 # embeddings file -- but every query path does, so the serve stage would
 # otherwise come up unable to embed a query.
 EMBEDDINGS_DIR=${EMBEDDINGS_DIR:-/work/court-corpus/models/minilm-l6-v2-static}
-BIN=${BIN:-$REPO/target/release/turbovec-search}
+BIN=${BIN:-$REPO/target/release/pipestream-search}
 INGEST=${INGEST:-$REPO/target/release/examples/court_ingest}
 PROBE=${PROBE:-$REPO/target/release/examples/analyze_probe}
 VERIFY=${VERIFY:-$REPO/target/release/examples/v7_verify}

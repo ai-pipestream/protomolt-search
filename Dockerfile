@@ -1,11 +1,11 @@
-# turbovec-search server + court pipeline examples.
+# pipestream-search server + court pipeline examples.
 #
 # Stage 1 builds the server binary and the court example binaries (the
 # pipeline stages); stage 2 is a slim runtime with rclone for pulling the
 # seeded corpus from the rustfs object store (deploy/court-e2e).
 #
-#   docker build -t turbovec-search .
-#   docker run --rm -p 50051:50051 turbovec-search \
+#   docker build -t pipestream-search .
+#   docker run --rm -p 50051:50051 pipestream-search \
 #     --role=node --index=/shard/shard.tv
 
 FROM rust:1-bookworm AS build
@@ -14,7 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo build --release --bin turbovec-search \
+RUN cargo build --release --bin pipestream-search \
       --example court_chunks \
       --example court_extract \
       --example court_ingest \
@@ -28,7 +28,7 @@ RUN apt-get update \
     && dpkg -i /tmp/rclone.deb \
     && rm -f /tmp/rclone.deb \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/turbovec-search /usr/local/bin/turbovec-search
+COPY --from=build /src/target/release/pipestream-search /usr/local/bin/pipestream-search
 COPY --from=build \
     /src/target/release/examples/court_chunks \
     /src/target/release/examples/court_extract \
@@ -38,4 +38,4 @@ COPY --from=build \
     /usr/local/bin/
 COPY deploy/court-e2e/pipeline/run.sh /deploy/pipeline/run.sh
 RUN chmod +x /deploy/pipeline/run.sh
-ENTRYPOINT ["turbovec-search"]
+ENTRYPOINT ["pipestream-search"]

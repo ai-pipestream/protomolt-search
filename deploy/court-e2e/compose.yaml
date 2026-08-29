@@ -1,6 +1,6 @@
 # Court end-to-end demo/test: CourtListener bulk data -> rustfs (S3) ->
 # chunk+embed (OpenNLP analysis sidecar, static MiniLM) -> 4-shard
-# turbovec-search cluster -> verification gate.
+# pipestream-search cluster -> verification gate.
 #
 #   docker compose --env-file .env up --build --abort-on-container-exit --exit-code-from pipeline
 #   docker compose down -v          # wipe everything (volumes included)

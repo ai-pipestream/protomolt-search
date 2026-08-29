@@ -1457,7 +1457,6 @@ fn parse_rfc3339_micros(s: &str) -> Result<i64, Status> {
         .ok_or_else(|| bad("does not fit epoch microseconds"))
 }
 
-
 // ---------------------------------------------------------------------
 // Value compiler (Ast -> pb::ValueExpr, docs/cel-values.md)
 // ---------------------------------------------------------------------
@@ -1547,10 +1546,7 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
             })),
             None,
         )),
-        Ast::Int(v) => Ok((
-            value_of(V::IntLiteral(int_literal(*v)?)),
-            Some(VType::Int),
-        )),
+        Ast::Int(v) => Ok((value_of(V::IntLiteral(int_literal(*v)?)), Some(VType::Int))),
         Ast::Float(v) => {
             if !v.is_finite() {
                 return Err(refuse(format!(
@@ -1653,39 +1649,39 @@ fn compile_plain_call(
 ) -> Result<(pb::ValueExpr, Option<VType>), Status> {
     use pb::value_expr::Expr as V;
     match name {
-            "double" => {
-                if args.len() != 1 {
-                    return Err(refuse("double() takes exactly one argument"));
-                }
-                let (inner, vt) = compile_value_ast(&args[0], depth + 1)?;
-                if matches!(vt, Some(VType::Bool) | Some(VType::Str)) {
-                    return Err(refuse(format!(
-                        "double() over a {}; only numbers convert",
-                        vt.unwrap().name()
-                    )));
-                }
-                Ok((value_of(V::ToDouble(Box::new(inner))), Some(VType::Double)))
+        "double" => {
+            if args.len() != 1 {
+                return Err(refuse("double() takes exactly one argument"));
             }
-            "int" | "uint" => Err(refuse(format!(
-                "{name}() conversion does not compile; compute in double, or store \
+            let (inner, vt) = compile_value_ast(&args[0], depth + 1)?;
+            if matches!(vt, Some(VType::Bool) | Some(VType::Str)) {
+                return Err(refuse(format!(
+                    "double() over a {}; only numbers convert",
+                    vt.unwrap().name()
+                )));
+            }
+            Ok((value_of(V::ToDouble(Box::new(inner))), Some(VType::Double)))
+        }
+        "int" | "uint" => Err(refuse(format!(
+            "{name}() conversion does not compile; compute in double, or store \
                  the value as an integer column"
-            ))),
-            "timestamp" => Err(refuse(
-                "timestamp() is a filter literal; a projection over an i64 date column \
+        ))),
+        "timestamp" => Err(refuse(
+            "timestamp() is a filter literal; a projection over an i64 date column \
                  already reads epoch micros",
-            )),
-            "has" => Err(refuse(
-                "has() is a predicate; an absent input already propagates to an \
+        )),
+        "has" => Err(refuse(
+            "has() is a predicate; an absent input already propagates to an \
                  absent result",
-            )),
-            "matches" | "contains" | "startsWith" | "endsWith" | "size" => Err(refuse(format!(
-                "{name}() does not compile to a value; string functions are not in \
+        )),
+        "matches" | "contains" | "startsWith" | "endsWith" | "size" => Err(refuse(format!(
+            "{name}() does not compile to a value; string functions are not in \
                  the engine's vocabulary"
-            ))),
-            other => Err(refuse(format!(
-                "unknown function {other}() in a value expression; the vocabulary is \
+        ))),
+        other => Err(refuse(format!(
+            "unknown function {other}() in a value expression; the vocabulary is \
                  arithmetic, the conditional layer, double(), math.*, and engine.*"
-            ))),
+        ))),
     }
 }
 
@@ -2100,10 +2096,7 @@ mod value_tests {
     #[test]
     fn unary_minus_folds_literals_only() {
         let min = compile_value("-9223372036854775808").unwrap();
-        assert_eq!(
-            min.expr,
-            Some(pb::value_expr::Expr::IntLiteral(i64::MIN))
-        );
+        assert_eq!(min.expr, Some(pb::value_expr::Expr::IntLiteral(i64::MIN)));
         let neg = compile_value("-a").unwrap();
         assert!(matches!(neg.expr, Some(pb::value_expr::Expr::Negate(_))));
     }

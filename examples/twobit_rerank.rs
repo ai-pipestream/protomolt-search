@@ -16,7 +16,7 @@
 use std::io::Read;
 use std::time::Instant;
 
-use turbovec::TurboQuantIndex;
+use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 
 const DIM: usize = 256;
 const HEADER: usize = 12;
@@ -101,9 +101,9 @@ fn main() {
     let mut indexes = Vec::new();
     for bits in [4usize, 2] {
         let t0 = Instant::now();
-        let mut index = TurboQuantIndex::new(DIM, bits).expect("index");
-        index.add(&corpus);
-        index.prepare();
+        let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, DIM, bits).expect("index");
+        index.add(&corpus, DIM).expect("add corpus");
+        index.prepare().expect("prepare index");
         eprintln!(
             "{bits}-bit index built in {:?} ({} MB packed)",
             t0.elapsed(),
@@ -119,7 +119,7 @@ fn main() {
             .chunks(DIM)
             .map(|q| {
                 let t = Instant::now();
-                std::hint::black_box(index.search(q, 100));
+                std::hint::black_box(index.search_unfiltered(q, 100));
                 t.elapsed().as_secs_f64()
             })
             .collect();
@@ -136,7 +136,7 @@ fn main() {
     for (bits, index) in &indexes {
         let mut recall = 0.0;
         for (query, truth) in queries.chunks(DIM).zip(&truths) {
-            let got = index.search(query, K);
+            let got = index.search_unfiltered(query, K);
             recall += recall_at_k(got.indices_for_query(0), truth);
         }
         println!("| raw {bits}-bit | {:.4} |", recall / n_queries as f64);
@@ -148,7 +148,7 @@ fn main() {
             }
             let mut recall = 0.0;
             for (query, truth) in queries.chunks(DIM).zip(&truths) {
-                let got = index.search(query, kp);
+                let got = index.search_unfiltered(query, kp);
                 // Exact f32 rerank of the candidates, then top-10.
                 let mut reranked: Vec<(f32, i64)> = got
                     .indices_for_query(0)

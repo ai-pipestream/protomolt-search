@@ -10,9 +10,9 @@
 //! annotator_race_check --ref=http://127.0.0.1:59220 --cand=http://127.0.0.1:59221 \
 //!     --n=400 --concurrency=32
 //! ```
+use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
+use pipestream_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, TermVectorOptions};
 use std::sync::Arc;
-use turbovec_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use turbovec_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, TermVectorOptions};
 
 fn arg(key: &str, default: &str) -> String {
     let p = format!("--{key}=");
@@ -22,7 +22,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn opts() -> AnalysisOptions {
-    let spec = turbovec_search::analyzer::body_spec();
+    let spec = pipestream_search::analyzer::body_spec();
     AnalysisOptions {
         language: "en".into(),
         tokenizer: spec.tokenizer,
@@ -44,7 +44,7 @@ fn opts() -> AnalysisOptions {
 
 /// Everything the guarded annotators produce, flattened to a comparable
 /// string: entity spans with their types, and the POS tag sequence.
-fn fingerprint(r: &turbovec_search::pb::analysis::AnalyzeResponse) -> String {
+fn fingerprint(r: &pipestream_search::pb::analysis::AnalyzeResponse) -> String {
     let mut ents: Vec<String> = r
         .entities
         .iter()
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let f = std::io::BufReader::new(std::fs::File::open(&path)?);
         Arc::new(
             f.lines()
-                .filter_map(|l| l.ok())
+                .map_while(Result::ok)
                 .filter_map(|l| {
                     let v: serde_json::Value = serde_json::from_str(&l).ok()?;
                     let t = v.get("text")?.as_str()?.to_string();
@@ -94,14 +94,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect(),
         )
     };
-    println!("{} docs; reference serial on {reference}, candidate x{concurrency} on {candidate}", texts.len());
+    println!(
+        "{} docs; reference serial on {reference}, candidate x{concurrency} on {candidate}",
+        texts.len()
+    );
 
     // Reference: one at a time, so nothing can interfere with it.
     let mut rc = AnalysisServiceClient::connect(reference).await?;
     let mut expected = Vec::with_capacity(texts.len());
     for t in texts.iter() {
         let r = rc
-            .analyze(AnalyzeRequest { text: t.clone(), options: Some(opts()) })
+            .analyze(AnalyzeRequest {
+                text: t.clone(),
+                options: Some(opts()),
+            })
             .await?
             .into_inner();
         expected.push(fingerprint(&r));
@@ -118,7 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for (layer, n) in [("entities", entities), ("POS", pos), ("locations", geo)] {
         if n == 0 {
-            println!("  WARNING: {layer} empty on every document; this run does not test that layer");
+            println!(
+                "  WARNING: {layer} empty on every document; this run does not test that layer"
+            );
         }
     }
 
@@ -132,10 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = texts.clone();
         tasks.push(tokio::spawn(async move {
             let _p = permit;
-            c.analyze(AnalyzeRequest { text: t[i].clone(), options: Some(opts()) })
-                .await
-                .map(|r| fingerprint(&r.into_inner()))
-                .map_err(|e| e.message().to_string())
+            c.analyze(AnalyzeRequest {
+                text: t[i].clone(),
+                options: Some(opts()),
+            })
+            .await
+            .map(|r| fingerprint(&r.into_inner()))
+            .map_err(|e| e.message().to_string())
         }));
     }
     let mut mismatches = 0usize;
@@ -151,15 +162,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(got) if got != expected[i] => {
                 mismatches += 1;
                 if mismatches <= 3 {
-                    println!("  doc {i} DIFFERS\n    serial:     {}\n    concurrent: {}",
-                             &expected[i][..expected[i].len().min(160)],
-                             &got[..got.len().min(160)]);
+                    println!(
+                        "  doc {i} DIFFERS\n    serial:     {}\n    concurrent: {}",
+                        &expected[i][..expected[i].len().min(160)],
+                        &got[..got.len().min(160)]
+                    );
                 }
             }
             Ok(_) => {}
         }
     }
-    println!("\nmismatches: {mismatches}   errors: {errors}   of {} docs", texts.len());
+    println!(
+        "\nmismatches: {mismatches}   errors: {errors}   of {} docs",
+        texts.len()
+    );
     if mismatches == 0 && errors == 0 {
         println!("PASS: concurrent candidate agrees with the serial reference on every document.");
     } else {

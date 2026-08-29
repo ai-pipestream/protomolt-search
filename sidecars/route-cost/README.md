@@ -24,7 +24,7 @@ only; the default no-energy build involves no OpenSSL at all.
 
 Routing is an ENRICHMENT SIDECAR, never an index dependency — the same
 line the NLP sidecar draws. This crate is deliberately NOT a workspace
-member of turbovec-search: the engine builds without it, it builds
+member of pipestream-search: the engine builds without it, it builds
 without the engine (own lockfile, own target dir), and the only thing
 that crosses the boundary is data. Costs it computes land in ordinary
 map-numeric columns (`travel_min["scotus"]`) through normal ingest,

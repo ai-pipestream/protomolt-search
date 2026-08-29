@@ -21,8 +21,8 @@
 //! is safe today because no BM25 request is hedged to a replica.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// One field's share of the stats on one node (the named-field channel
 /// of `TermStatsRequest.fields`).
@@ -121,7 +121,11 @@ impl StatsCache {
 
     /// Fused-channel lookup: `Some` only when every requested field and
     /// every term under it is cached for this node.
-    pub fn lookup_fused(&self, node: usize, fields: &[crate::pb::FieldTerms]) -> Option<FusedShare> {
+    pub fn lookup_fused(
+        &self,
+        node: usize,
+        fields: &[crate::pb::FieldTerms],
+    ) -> Option<FusedShare> {
         let guard = self.nodes.lock().expect("stats cache lock poisoned");
         let share = guard.get(node)?.as_ref()?;
         let mut out = Vec::with_capacity(fields.len());

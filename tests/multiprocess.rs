@@ -16,15 +16,17 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
+    AddVectorsRequest, FlushRequest, SearchRequest, SetCalibrationRequest,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{AddVectorsRequest, FlushRequest, SearchRequest, SetCalibrationRequest};
 
 use common::{monolithic_topk, unit_vectors, BIT_WIDTH, DIM};
 
-const BIN: &str = env!("CARGO_BIN_EXE_turbovec-search");
+const BIN: &str = env!("CARGO_BIN_EXE_pipestream-search");
 const SHARD_VECTORS: usize = 3_000;
 
 /// Kill-on-drop guard so a failed assertion never leaks server processes.
@@ -38,7 +40,7 @@ impl Proc {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn turbovec-search"),
+                .expect("spawn pipestream-search"),
         )
     }
 
@@ -104,7 +106,7 @@ async fn wait_ready(addr: &str) {
     }
 }
 
-async fn add_vectors(addr: &str, vectors: Vec<f32>) -> turbovec_search::pb::AddVectorsResponse {
+async fn add_vectors(addr: &str, vectors: Vec<f32>) -> pipestream_search::pb::AddVectorsResponse {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(4);
     // Two batches, to exercise the streaming path.
@@ -213,7 +215,7 @@ async fn ingest_across_processes_is_lossless_and_persistent() {
 
     // Monolithic reference: same corpus, same calibration.
     let monolithic =
-        turbovec_search::harness::build_monolithic(&corpus, DIM, BIT_WIDTH, &shift, &scale);
+        pipestream_search::harness::build_monolithic(&corpus, DIM, BIT_WIDTH, &shift, &scale);
 
     // Lossless over ingested data, for several queries and two k values.
     let coord_http = format!("http://{coord}");
@@ -251,7 +253,7 @@ async fn ingest_across_processes_is_lossless_and_persistent() {
     let cal = NodeServiceClient::connect(format!("http://{node1}"))
         .await
         .unwrap()
-        .get_calibration(turbovec_search::pb::GetCalibrationRequest {})
+        .get_calibration(pipestream_search::pb::GetCalibrationRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -310,8 +312,9 @@ async fn an_interrupted_bm25_build_refuses_to_serve() {
         node.terminate();
     }
     assert!(index.exists(), "the shard should have saved its vectors");
-    let build =
-        turbovec_search::node::bm25_build_dir(&turbovec_search::node::bm25_sidecar_path(&index));
+    let build = pipestream_search::node::bm25_build_dir(
+        &pipestream_search::node::bm25_sidecar_path(&index),
+    );
     std::fs::create_dir_all(&build).unwrap();
 
     // Refused: the process exits rather than serving a half-built shard.

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-// Distributed top-k search over turbovec (TurboQuant) shard indexes.
+// Distributed lexical, vector, and hybrid search over provider-backed shards.
 //
 // Architecture: hub-and-spoke. A client-facing coordinator fans each query
 // out to shard-owner nodes over `NodeService.SearchShard` (bidi stream),
@@ -18,7 +18,7 @@ syntax = "proto3";
 // or below the max published floor can never drop a true global top-k hit.
 // turbovec keeps candidates scoring exactly at the floor, so ties at the
 // boundary survive.
-package turbovec.search.v1;
+package ai.pipestream.search.v1;
 
 import "google/protobuf/timestamp.proto";
 
@@ -52,10 +52,17 @@ service NodeService {
   // floor is the mechanism, not an optimization.
   rpc StreamSearch(stream StreamSearchRequest) returns (stream StreamSearchResponse);
 
-  // Exposes the shard's TQ+ calibration (per-coordinate shift/scale) plus
-  // basic shape metadata. Scores are only comparable across shards whose
-  // indexes were built with byte-identical calibration, so callers can use
-  // this to verify a cluster is uniformly seeded before serving traffic.
+  // Reports the active vector provider, scoring identity, quality contract,
+  // capabilities, and opaque construction state. Shard scores are mergeable
+  // only when their scoring fingerprints match.
+  rpc GetVectorBackend(GetVectorBackendRequest) returns (GetVectorBackendResponse);
+
+  // Configures an empty shard from provider-owned opaque state. Repeating the
+  // identical configuration is idempotent; changing it after vectors exist is
+  // rejected. The named provider must be installed on the node.
+  rpc ConfigureVectorBackend(ConfigureVectorBackendRequest) returns (ConfigureVectorBackendResponse);
+
+  // Deprecated compatibility view for the embedded TurboVec adapter.
   rpc GetCalibration(GetCalibrationRequest) returns (GetCalibrationResponse);
 
   // Pushes a TQ+ calibration to this shard BEFORE its first vector is
@@ -112,8 +119,8 @@ service NodeService {
   // by construction.
   //
   // Protocol: the first message must be `manifest`, then `data` chunks in
-  // any chunking the sender likes. The first `manifest.tv_bytes` of data
-  // are the .tv image; the following `manifest.bm25_bytes` are the .bm25
+  // any chunking the sender likes. The first `manifest.vector_bytes` of data
+  // are the provider image; the following `manifest.bm25_bytes` are the .bm25
   // sidecar. The node stages both files inside a generation directory
   // (`<index path>.snap/`), loads and validates the image, then swaps the
   // directory into place with ONE atomic rename — the pair can never
@@ -314,14 +321,11 @@ service SearchService {
   // incomparable scores. Hits carry global per-leg ranks and raw scores.
   rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
 
-  // Pushes ONE TQ+ calibration to every known shard (fan-out of
-  // NodeService.SetCalibration). This is the shared-calibration handshake
-  // that makes vector scores globally comparable — a prerequisite for
-  // FUSION_MODE_GLOBAL_RANK. Fit the calibration once (bootstrap sample
-  // or a single indexer), broadcast before ingest, and treat
-  // recalibration on data drift as a coordinated cluster event: all
-  // shards must be re-seeded and re-ingested together, or their scores
-  // stop being comparable.
+  // Pushes one provider configuration to every known shard. The scoring
+  // fingerprint is the cross-shard comparability identity.
+  rpc BroadcastVectorBackend(BroadcastVectorBackendRequest) returns (BroadcastVectorBackendResponse);
+
+  // Deprecated compatibility fan-out for the embedded TurboVec adapter.
   rpc BroadcastCalibration(BroadcastCalibrationRequest) returns (BroadcastCalibrationResponse);
 
   // Fans NodeService.Health out to every shard (and any configured
@@ -518,12 +522,12 @@ message HealthRequest {}
 
 // One shard's liveness and shape.
 message HealthResponse {
-  // Vectors resident in the turbovec index (0 for an empty shard).
+  // Vectors resident in the vector index (0 for an empty shard).
   uint64 num_vectors = 1;
   // Vector dimensionality (0 until the first add locks it).
   uint32 dim = 2;
-  // Quantization bit width.
-  uint32 bit_width = 3;
+  // Provider-reported storage bits per vector dimension, when applicable.
+  uint32 bits_per_dimension = 3;
   // The shard's global id base.
   uint64 slot_offset = 4;
   // Documents in the BM25 store (0 when the shard has none).
@@ -533,6 +537,11 @@ message HealthResponse {
   // True while an AddVectors/AddDocuments stream holds the single-writer
   // ingest slot.
   bool ingest_active = 7;
+  // Active provider identity and score-comparability fingerprint.
+  string vector_backend = 8;
+  string scoring_fingerprint = 9;
+  // Stable spelling of the provider's declared completion semantics.
+  string quality_contract = 10;
 }
 
 message ClusterHealthRequest {}
@@ -823,6 +832,54 @@ message StreamSearchSummary {
   repeated bool filter_columns_known = 6;
 }
 
+enum VectorScoreDirection {
+  VECTOR_SCORE_DIRECTION_UNSPECIFIED = 0;
+  VECTOR_SCORE_DIRECTION_HIGHER_IS_BETTER = 1;
+  VECTOR_SCORE_DIRECTION_LOWER_IS_BETTER = 2;
+}
+
+enum VectorQualityContract {
+  VECTOR_QUALITY_CONTRACT_UNSPECIFIED = 0;
+  VECTOR_QUALITY_CONTRACT_EXHAUSTIVE_NATIVE_SCORE = 1;
+  VECTOR_QUALITY_CONTRACT_CONFIGURED_ANN = 2;
+  VECTOR_QUALITY_CONTRACT_PROBABILISTIC_BOUND = 3;
+}
+
+message VectorBackendConfig {
+  string backend_kind = 1;
+  string config_format = 2;
+  bytes payload = 3;
+}
+
+message VectorBackendDescriptor {
+  string backend_kind = 1;
+  string backend_version = 2;
+  uint32 dim = 3;
+  uint32 bits_per_dimension = 4;
+  string metric = 5;
+  VectorScoreDirection score_direction = 6;
+  string scoring_fingerprint = 7;
+  VectorQualityContract quality_contract = 8;
+  repeated string capabilities = 9;
+}
+
+message GetVectorBackendRequest {}
+
+message GetVectorBackendResponse {
+  VectorBackendDescriptor descriptor = 1;
+  VectorBackendConfig config = 2;
+  uint64 num_vectors = 3;
+}
+
+message ConfigureVectorBackendRequest {
+  uint32 dim = 1;
+  VectorBackendConfig config = 2;
+}
+
+message ConfigureVectorBackendResponse {
+  bool already_configured = 1;
+}
+
 // Empty: the node reports whatever its loaded index holds.
 message GetCalibrationRequest {}
 
@@ -912,8 +969,8 @@ message SnapshotChunk {
     // else about the shard (dim, bit width, vector count, calibration)
     // is read from the image itself — the file is the source of truth.
     SnapshotManifest manifest = 1;
-    // Opaque image bytes: the first `manifest.tv_bytes` across all data
-    // chunks are the .tv file, the next `manifest.bm25_bytes` the .bm25
+    // Opaque image bytes: the first `manifest.vector_bytes` across all data
+    // chunks are the provider image, followed by the BM25 sidecar.
     // sidecar. Senders should keep chunks around 1 MiB.
     bytes data = 2;
   }
@@ -921,9 +978,9 @@ message SnapshotChunk {
 
 // The byte layout of an `InstallSnapshot` stream.
 message SnapshotManifest {
-  // Total .tv bytes on the stream. Required (nonzero).
-  uint64 tv_bytes = 1;
-  // Total .bm25 bytes following the .tv bytes; 0 for a vector-only image.
+  // Total provider image bytes on the stream. Required (nonzero).
+  uint64 vector_bytes = 1;
+  // Total .bm25 bytes following the provider bytes; 0 for a vector-only image.
   uint64 bm25_bytes = 2;
 }
 
@@ -1908,7 +1965,7 @@ message Bm25FieldLeg {
   // This field's BM25 b; 0 selects the default (0.75).
   float b = 7;
   // Fingerprint of the analyzer that produced `terms`
-  // (turbovec_search::analyzer::analysis_fingerprint). The shard REFUSES
+  // (`analysis_fingerprint` in the search implementation). The shard REFUSES
   // the query when this disagrees with the analyzer its column was built
   // under, because the two would score different term identities against
   // one idf and report a confident wrong ranking rather than an error.
@@ -2741,6 +2798,22 @@ message CalibrationApplyResult {
 message BroadcastCalibrationResponse {
   // One result per configured node.
   repeated CalibrationApplyResult results = 1;
+}
+
+message BroadcastVectorBackendRequest {
+  uint32 dim = 1;
+  VectorBackendConfig config = 2;
+}
+
+message VectorBackendApplyResult {
+  string node = 1;
+  bool ok = 2;
+  bool already_configured = 3;
+  string error = 4;
+}
+
+message BroadcastVectorBackendResponse {
+  repeated VectorBackendApplyResult results = 1;
 }
 
 // Candidate-scoped BM25 scoring: phase 2 of the cascade fusion mode.

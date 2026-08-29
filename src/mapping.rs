@@ -62,6 +62,10 @@ const MAX_DEPTH: usize = 8;
 /// change to derivation semantics or to the canonical encoding: a
 /// changed fingerprint is how drift is caught, and a drift at restore
 /// time is an index compatibility event, not a warning.
+// Frozen persisted identity. Renaming this string would invalidate every
+// existing mapped generation even though the canonical plan bytes did not
+// change. The legacy product name is therefore a compatibility tag, not the
+// current API namespace.
 const FINGERPRINT_VERSION: &str = "turbovec-search.plan.v1";
 
 /// One refusal, uniformly shaped: every message begins `plan: `.
@@ -484,8 +488,11 @@ fn extract_hints(bytes: &[u8]) -> Result<HashMap<(MsgKey, usize), hints::FieldIn
     })?;
     let mut decoded = HashMap::with_capacity(raw.len());
     for (key, bytes) in raw {
-        let hint = hints::FieldIndexHint::decode(bytes.as_slice())
-            .map_err(|e| refuse(format!("a field's ({HINT_EXTENSION_NAME}) hint does not decode: {e}")))?;
+        let hint = hints::FieldIndexHint::decode(bytes.as_slice()).map_err(|e| {
+            refuse(format!(
+                "a field's ({HINT_EXTENSION_NAME}) hint does not decode: {e}"
+            ))
+        })?;
         decoded.insert(key, hint);
     }
     Ok(decoded)
@@ -545,7 +552,11 @@ struct ResolvedHint {
 enum Shape<'a> {
     Scalar(prost_types::field_descriptor_proto::Type),
     Enum,
-    Message { full: String, entry: &'a MsgEntry<'a>, map: bool },
+    Message {
+        full: String,
+        entry: &'a MsgEntry<'a>,
+        map: bool,
+    },
 }
 
 fn shape<'a>(
@@ -558,11 +569,7 @@ fn shape<'a>(
         Type::Message => {
             let entry = index.message_by_type_name(field.type_name(), path)?;
             let full = field.type_name().trim_start_matches('.').to_string();
-            let map = entry
-                .desc
-                .options
-                .as_ref()
-                .is_some_and(|o| o.map_entry());
+            let map = entry.desc.options.as_ref().is_some_and(|o| o.map_entry());
             Ok(Shape::Message { full, entry, map })
         }
         Type::Enum => {
@@ -570,7 +577,10 @@ fn shape<'a>(
             if full.is_empty() || !index.enums.contains(full) {
                 return Err(refuse_at(
                     path,
-                    format!("enum type {:?} is not in the descriptor set", field.type_name()),
+                    format!(
+                        "enum type {:?} is not in the descriptor set",
+                        field.type_name()
+                    ),
                 ));
             }
             Ok(Shape::Enum)
@@ -599,12 +609,12 @@ fn inferred_kind(field: &FieldDescriptorProto, shape: &Shape<'_>) -> pb::MappedK
             }
         }
         Shape::Scalar(Type::Bool) => pb::MappedKind::Boolean,
-        Shape::Scalar(Type::Int32 | Type::Uint32 | Type::Sint32 | Type::Fixed32 | Type::Sfixed32) => {
-            pb::MappedKind::Int32
-        }
-        Shape::Scalar(Type::Int64 | Type::Uint64 | Type::Sint64 | Type::Fixed64 | Type::Sfixed64) => {
-            pb::MappedKind::Int64
-        }
+        Shape::Scalar(
+            Type::Int32 | Type::Uint32 | Type::Sint32 | Type::Fixed32 | Type::Sfixed32,
+        ) => pb::MappedKind::Int32,
+        Shape::Scalar(
+            Type::Int64 | Type::Uint64 | Type::Sint64 | Type::Fixed64 | Type::Sfixed64,
+        ) => pb::MappedKind::Int64,
         Shape::Scalar(Type::Float) => pb::MappedKind::Float,
         Shape::Scalar(Type::Double) => pb::MappedKind::Double,
         Shape::Scalar(Type::Bytes) => pb::MappedKind::Binary,
@@ -886,7 +896,12 @@ fn walk(
         };
         validate_hint(field, &field_shape, &hint, &path)?;
 
-        if let Shape::Message { full, entry: child, map } = &field_shape {
+        if let Shape::Message {
+            full,
+            entry: child,
+            map,
+        } = &field_shape
+        {
             let blocked = depth >= MAX_DEPTH || visiting.iter().any(|n| n == full);
             if hint.role == pb::MappedRole::Chunks {
                 // The chunk scope keeps its container entry and expands
@@ -907,7 +922,16 @@ fn walk(
                     pb::MappedKind::Object | pb::MappedKind::Nested if hint.explicit_kind
                 );
             if expandable && !blocked {
-                walk(child, &path, &name, depth + 1, index, hint_map, out, visiting)?;
+                walk(
+                    child,
+                    &path,
+                    &name,
+                    depth + 1,
+                    index,
+                    hint_map,
+                    out,
+                    visiting,
+                )?;
                 continue;
             }
         }
@@ -1313,10 +1337,11 @@ impl Extractor {
         // body — the stored, highlighted text of a row — must live
         // inside the scope; parent TEXT fields denormalize as ordinary
         // multi-field columns on every chunk row instead.
-        let chunk_prefix =
-            (!plan.chunks_path.is_empty()).then(|| format!("{}.", plan.chunks_path));
+        let chunk_prefix = (!plan.chunks_path.is_empty()).then(|| format!("{}.", plan.chunks_path));
         let in_scope = |path: &str| -> bool {
-            chunk_prefix.as_deref().is_none_or(|prefix| path.starts_with(prefix))
+            chunk_prefix
+                .as_deref()
+                .is_none_or(|prefix| path.starts_with(prefix))
         };
         let text_paths: Vec<&str> = plan
             .fields
@@ -1427,7 +1452,13 @@ impl Extractor {
                 _ => {
                     let leaf_desc = index.navigate(root_entry, &field.path)?;
                     let land = land_for(field, is_vector, leaf_desc, &enums)?;
-                    insert_path(&mut root, root_entry, &index, &field.path, Child::Leaf(slot))?;
+                    insert_path(
+                        &mut root,
+                        root_entry,
+                        &index,
+                        &field.path,
+                        Child::Leaf(slot),
+                    )?;
                     land
                 }
             };
@@ -1906,9 +1937,7 @@ fn read_len<'a>(b: &'a [u8], i: &mut usize) -> Result<&'a [u8], Status> {
     let end = i
         .checked_add(len)
         .filter(|end| *end <= b.len())
-        .ok_or_else(|| {
-            refuse("malformed document: length-delimited field overruns the buffer")
-        })?;
+        .ok_or_else(|| refuse("malformed document: length-delimited field overruns the buffer"))?;
     let sub = &b[*i..end];
     *i = end;
     Ok(sub)

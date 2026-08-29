@@ -7,21 +7,21 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats};
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::geo::{self, GeoFilters, GeoMetric, GeoRegion};
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats};
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::geo::{self, GeoFilters, GeoMetric, GeoRegion};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, GeoBbox, GeoFilter, GeoPointValue, GeoRadius,
     QueryField, ScoreOp, ScoreStage,
 };
-use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
-use turbovec_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -70,7 +70,7 @@ const OFFSETS: [u64; 3] = [0, 3, 7];
 async fn add_documents_geo(
     addr: &str,
     docs: &[(&str, Points)],
-) -> Result<turbovec_search::pb::AddDocumentsResponse, tonic::Status> {
+) -> Result<pipestream_search::pb::AddDocumentsResponse, tonic::Status> {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     // Capacity above the largest batch this file sends: the whole
     // stream is queued BEFORE `add_documents` starts draining it, so a
@@ -144,7 +144,7 @@ async fn start_geo_shards(
 fn bbox_filter(column: &str, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> GeoFilter {
     GeoFilter {
         column: column.to_string(),
-        region: Some(turbovec_search::pb::geo_filter::Region::Bbox(GeoBbox {
+        region: Some(pipestream_search::pb::geo_filter::Region::Bbox(GeoBbox {
             min_lat,
             max_lat,
             min_lon,
@@ -156,15 +156,17 @@ fn bbox_filter(column: &str, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: 
 fn radius_filter(column: &str, lat: f64, lon: f64, meters: f64, metric: GeoMetric) -> GeoFilter {
     GeoFilter {
         column: column.to_string(),
-        region: Some(turbovec_search::pb::geo_filter::Region::Radius(GeoRadius {
-            lat,
-            lon,
-            meters,
-            metric: match metric {
-                GeoMetric::Haversine => turbovec_search::pb::GeoMetric::Haversine as i32,
-                GeoMetric::Manhattan => turbovec_search::pb::GeoMetric::Manhattan as i32,
+        region: Some(pipestream_search::pb::geo_filter::Region::Radius(
+            GeoRadius {
+                lat,
+                lon,
+                meters,
+                metric: match metric {
+                    GeoMetric::Haversine => pipestream_search::pb::GeoMetric::Haversine as i32,
+                    GeoMetric::Manhattan => pipestream_search::pb::GeoMetric::Manhattan as i32,
+                },
             },
-        })),
+        )),
     }
 }
 
@@ -927,7 +929,7 @@ async fn geo_filter_refusals_are_loud() {
 
     let antimeridian = GeoFilter {
         column: "courthouse".to_string(),
-        region: Some(turbovec_search::pb::geo_filter::Region::Bbox(GeoBbox {
+        region: Some(pipestream_search::pb::geo_filter::Region::Bbox(GeoBbox {
             min_lat: -46.0,
             max_lat: -44.0,
             min_lon: 179.0,
@@ -940,12 +942,14 @@ async fn geo_filter_refusals_are_loud() {
     };
     let unspecified_metric = GeoFilter {
         column: "courthouse".to_string(),
-        region: Some(turbovec_search::pb::geo_filter::Region::Radius(GeoRadius {
-            lat: 0.0,
-            lon: 0.0,
-            meters: 1000.0,
-            metric: 0,
-        })),
+        region: Some(pipestream_search::pb::geo_filter::Region::Radius(
+            GeoRadius {
+                lat: 0.0,
+                lon: 0.0,
+                meters: 1000.0,
+                metric: 0,
+            },
+        )),
     };
     for (bad, needle) in [
         (antimeridian, "antimeridian"),
@@ -1223,9 +1227,9 @@ fn geo_filtered_decayed_pruned_matches_exhaustive_bitwise() {
                 metric: GeoMetric::Manhattan,
             },
         ] {
-            let filters = turbovec_search::filter::DocFilter {
+            let filters = pipestream_search::filter::DocFilter {
                 geo: GeoFilters {
-                    filters: vec![turbovec_search::geo::GeoFilter {
+                    filters: vec![pipestream_search::geo::GeoFilter {
                         column: Some(gi),
                         region,
                     }],
@@ -1577,9 +1581,9 @@ fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
             metric: GeoMetric::Manhattan,
         },
     ] {
-        let filters = turbovec_search::filter::DocFilter {
+        let filters = pipestream_search::filter::DocFilter {
             geo: GeoFilters {
-                filters: vec![turbovec_search::geo::GeoFilter {
+                filters: vec![pipestream_search::geo::GeoFilter {
                     column: Some(gi),
                     region,
                 }],

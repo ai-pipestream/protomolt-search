@@ -28,10 +28,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tonic::transport::Channel;
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::analyzer;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
     Bm25SearchRequest, BoostRescore, ClusterHealthRequest, FusionMode, GetDocumentsRequest,
     HybridDebug, HybridLegOptions, HybridSearchRequest, ScoreCombination, ScoreNormalization,
 };
@@ -212,16 +212,16 @@ async fn respond(
 fn search_client(addr: &str) -> Result<SearchServiceClient<Channel>, String> {
     Ok(
         SearchServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
-            .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES),
+            .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES),
     )
 }
 
 fn node_client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
     Ok(
         NodeServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
-            .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES),
+            .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES),
     )
 }
 
@@ -378,7 +378,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
     // literal repeated at this call site. An override is a deliberate
     // A/B; a default that drifts from the index is a silent mismatch
     // that scores different terms instead of failing.
-    let corpus = turbovec_search::analyzer::body_spec();
+    let corpus = pipestream_search::analyzer::body_spec();
     let tokenizer = pick(
         &req.tokenizer,
         &[("whitespace", 1), ("simple", 2)],
@@ -390,7 +390,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         &[("tokens", 1), ("stems", 2), ("normalized_stems", 3)],
         corpus.term_vector_source,
     )?;
-    let analysis = Some(turbovec_search::pb::AnalysisSpec {
+    let analysis = Some(pipestream_search::pb::AnalysisSpec {
         tokenizer,
         stemmer,
         term_vector_mode: 0,
@@ -555,7 +555,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
 async fn bm25_filtered_search(
     ctx: &Ctx,
     req: &SearchBody,
-    analysis: Option<turbovec_search::pb::AnalysisSpec>,
+    analysis: Option<pipestream_search::pb::AnalysisSpec>,
 ) -> Result<Value, String> {
     let t0 = std::time::Instant::now();
     let mut client = search_client(&ctx.coordinator)?;

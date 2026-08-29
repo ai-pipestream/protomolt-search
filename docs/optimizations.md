@@ -1,6 +1,6 @@
 # Engine optimizations
 
-How turbovec-search keeps memory bounded and latency low, organized by
+How pipestream-search keeps memory bounded and latency low, organized by
 pipeline stage. Numbers cited were measured on the CourtListener corpus:
 9,740,254 opinions chunked into 86,633,399 passages (dim-256 vectors,
 8 shards of 10,829,174 chunks each) on one 121 GB build machine.

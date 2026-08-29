@@ -4,7 +4,7 @@
 // lint bar.
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]
 
-tonic::include_proto!("turbovec.search.v1");
+tonic::include_proto!("ai.pipestream.search.v1");
 
 /// The vendored analysis-sidecar API (`proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`,
 /// copied from the grpc-opennlp-analysis repo — see the file header).
@@ -38,10 +38,11 @@ pub mod hints {
     tonic::include_proto!("ai.pipestream.proto.index.hints.v1");
 }
 
-/// The per-shard write-ahead log envelope (`proto/turbovec/search/wal/v1/wal.proto`).
+/// The per-shard write-ahead log envelope
+/// (`proto/ai/pipestream/search/wal/v1/wal.proto`).
 pub mod wal {
     pub mod v1 {
-        tonic::include_proto!("turbovec.search.wal.v1");
+        tonic::include_proto!("ai.pipestream.search.wal.v1");
     }
     pub use v1::*;
 }

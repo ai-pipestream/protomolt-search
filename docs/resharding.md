@@ -2,7 +2,7 @@
 
 > **Note: AI-generated. Human review needed.**
 
-This document describes how turbovec-search grows a live cluster: how
+This document describes how pipestream-search grows a live cluster: how
 shards split when they get too big, merge when they get too small, and
 how the log underneath makes both possible without re-indexing from the
 source pipeline. It records the design lineage, the invariants, what is
@@ -28,17 +28,16 @@ metadata.** Systems where the index is the source of truth struggle to
 reshard. Systems where the index is a *materialized view of a log* get
 split, merge, rebuild, and disaster recovery from the same primitive.
 
-### Our structural ace
+### Provider implications
 
-For most vector indexes (HNSW graphs, IVF centroids) split/merge is
-painful because the structure is entangled. With seeded calibration, a
-TurboQuant index is **row-separable**: rotation and codebook are pure
-functions of (dim, seed) and (bit_width, dim), calibration is pinned,
-and every vector's packed codes are an independent row. A split is row
-filtering, a merge is concatenation — byte-identical to a from-scratch
-build, with no re-encoding and no quality drift. Doc-partitioned BM25
-postings behave the same way. The hard part for us is orchestration,
-not index surgery.
+For most vector indexes, such as HNSW graphs and IVF structures, native image
+split/merge is painful because the structure is entangled. The current
+implementation instead rebuilds provider images from raw vectors retained in
+the WAL. The embedded TurboVec backend also has row-separable encoded data,
+which can support a future encoded-row path without making that property part
+of the product contract. Doc-partitioned BM25 postings are rebuilt from logged
+documents. The shared requirement is reproducible provider configuration and
+one scoring identity across the resulting shards.
 
 ## The pieces
 
@@ -50,8 +49,8 @@ log is a **folder of hash-bucketed segment files**, not one file:
 ```
 <index>.wal/
   gen-000000/
-    manifest.toml        # dim, bit_width, calibration, slot_offset,
-                         # generation, bucket_bits, format_version
+    manifest.toml        # dimension, provider configuration, slot offset,
+                         # generation, bucket geometry, format version
     bucket-000.wal       # framed records: [len][crc32][prost]
     ...
     bucket-063.wal
@@ -88,26 +87,25 @@ be rebuilt, never resharded).
 ### Split and merge (replay)
 
 The `reshard` tool replays the log offline and builds install images
-(`.tv` + `.tv.bm25`) plus an updated shard map:
+(`.vector` plus a BM25 sidecar) and an updated shard map:
 
 - **Split 1→N** (N ≤ bucket_count): child *i* owns a contiguous range
   of buckets. No repartitioning pass — the child's input is literally a
   set of bucket files. N > bucket_count falls back to re-hashing within
   buckets (correct, slower; bucket_count caps *cheap* split
   granularity).
-- **Merge N→1**: replay the inputs' buckets together. Requires
-  identical calibration and identical bucket geometry — enforced, not
-  documented.
+- **Merge N→1**: replay the inputs' buckets together. Requires identical
+  provider configuration and identical bucket geometry, enforced in code.
 
-Children are built with the parent's seeded calibration, so scores are
-byte-comparable with the parent and with each other. BM25 postings are
+Children are built with the parent's provider configuration, so their native
+scores share one identity. BM25 postings are
 rebuilt from the logged document records; global df/avgdl re-aggregate
 from `TermStats` at query time as usual.
 
 ### Atomic swap (already existed)
 
 `InstallSnapshot` was designed for bulk load and is exactly phase 3 of
-the skeleton: stream an image, validate calibration, atomically rename
+the skeleton: stream an image, validate its provider and scoring fingerprint, atomically rename
 generation directories, recover interrupted swaps at startup. A node
 that installs a resharded image rotates its WAL to a fresh generation
 and logs on from there.
@@ -121,8 +119,8 @@ generation 0.
 
 ## Invariants
 
-1. **Split/merge only within one (engine version, calibration) pair.**
-   Mixed-calibration merges are hard errors. Engine-version upgrades
+1. **Split/merge only within one provider scoring configuration.** Inputs with
+   different backend state are hard errors. Engine-version upgrades
    are a different mechanism (blue/green: rebuild all shards from the
    log, swap the whole map) — pleasingly, the same machinery applied
    cluster-wide.
@@ -175,8 +173,8 @@ Because of that 1x cost, a full-corpus build should NOT ingest through
 the logged AddVectors path — logging ~100M raw vectors writes more WAL
 than index. The intended shape for an initial build:
 
-1. Build shard images offline (the harness / reshard machinery), with
-   the one seeded calibration.
+1. Build shard images offline (the harness / reshard machinery) with one
+   provider configuration and scoring identity.
 2. `InstallSnapshot` the images onto the nodes. The WAL rotates to a
    fresh generation whose manifest records the image as
    `preexisting_*` — cheap, honest, and the log stays near-empty.
@@ -212,16 +210,16 @@ Built and tested:
   full-history guard (`preexisting_*` manifest fields, refused by the
   reshard tool).
 - Offline `reshard` tool: cheap split by bucket range, fallback
-  re-partitioning, merge with calibration/geometry checks, shard-map
+  re-partitioning, merge with provider-configuration/geometry checks, shard-map
   emission. Split-then-search reconstructs the parent top-k bitwise;
   merge reproduces the monolithic index including BM25 identity.
 - Versioned shard-map config at the coordinator.
 
 Deliberately deferred:
 
-- **Image-aware reshard** — splitting a post-InstallSnapshot shard
-  means partitioning the base image (row-filtering the `.tv`, splitting
-  the BM25 store by doc) plus its log; today such shards are refused
+- **Image-aware reshard** — splitting a post-InstallSnapshot shard means
+  provider-specific partitioning or rebuilding the base vector image, splitting
+  the BM25 store by document, and applying its log; today such shards are refused
   rather than mis-resharded.
 
 - **Live catch-up** — children tailing the parent's log while it serves

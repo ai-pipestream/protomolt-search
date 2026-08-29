@@ -6,20 +6,20 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec::TurboQuantIndex;
-use turbovec_search::node::{
-    generation_bm25, generation_dir, generation_tv, recover_generation, Bm25Shard, NodeConfig,
+use pipestream_search::node::{
+    generation_bm25, generation_dir, generation_vector, recover_generation, Bm25Shard, NodeConfig,
     NodeServiceImpl,
 };
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
     search_shard_request, search_shard_response, snapshot_chunk, FlushRequest,
     GetCalibrationRequest, GetDocumentsRequest, ScoredHit, SearchShardRequest,
     SetCalibrationRequest, SnapshotChunk, SnapshotManifest, StartShardSearch,
 };
-use turbovec_search::postings::{AnalyzedDoc, Bm25Store, DocTerms};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Store, DocTerms};
+use pipestream_search::vector::{legacy_calibration_config, VectorIndex, EMBEDDED_TURBOVEC};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{fit_calibration, monolithic_topk, unit_vectors, BIT_WIDTH, DIM};
 
@@ -42,22 +42,28 @@ fn build_image(
     shift: &[f32],
     scale: &[f32],
     path: &std::path::Path,
-) -> TurboQuantIndex {
-    let mut index = turbovec_search::harness::seeded_index(DIM, BIT_WIDTH, shift, scale);
-    index.add(&corpus[..n * DIM]);
-    index.prepare();
+) -> VectorIndex {
+    let mut index = pipestream_search::harness::seeded_index(DIM, BIT_WIDTH, shift, scale);
+    index.add(&corpus[..n * DIM], DIM).unwrap();
+    index.prepare().unwrap();
     index.write(path).unwrap();
     index
 }
 
 /// Build the reference corpus index (seeded calibration) and persist it
 /// as the snapshot source image.
-fn build_source(dir: &std::path::Path) -> (TurboQuantIndex, Vec<f32>, std::path::PathBuf) {
+fn build_source(dir: &std::path::Path) -> (VectorIndex, Vec<f32>, std::path::PathBuf) {
     let corpus = unit_vectors(N, DIM, 0x5EED_CA11);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus[..DIM * 2_000.min(N)]);
     let tv = dir.join("source.tv");
     let index = build_image(&corpus, N, &shift, &scale, &tv);
     (index, corpus, tv)
+}
+
+fn legacy_calibration(index: &VectorIndex) -> (Vec<f32>, Vec<f32>) {
+    let config = index.backend_config().unwrap();
+    let legacy = legacy_calibration_config(&config).unwrap().unwrap();
+    (legacy.shift, legacy.scale)
 }
 
 /// A one-document BM25 image containing the given text.
@@ -134,10 +140,7 @@ async fn search_topk(
 async fn seeded_install_serves_and_persists() {
     let dir = tempdir("seeded");
     let (reference, corpus, src_tv) = build_source(&dir);
-    let (shift, scale) = (
-        reference.tqplus_shift().to_vec(),
-        reference.tqplus_scale().to_vec(),
-    );
+    let (shift, scale) = legacy_calibration(&reference);
     let src_bm25 = build_bm25(&dir, "rust search engines");
 
     let node_tv = dir.join("shard.tv");
@@ -151,13 +154,13 @@ async fn seeded_install_serves_and_persists() {
 
     // Seed the shard with the same calibration, then install the image.
     seed(&mut client, &shift, &scale).await;
-    let report = turbovec_search::snapshot::install_snapshot(&addr, &src_tv, Some(&src_bm25))
+    let report = pipestream_search::snapshot::install_snapshot(&addr, &src_tv, Some(&src_bm25))
         .await
         .unwrap();
     assert_eq!(report.num_vectors, N as u64);
     assert_eq!(report.num_documents, 1);
     let gen = generation_dir(&node_tv);
-    assert_eq!(report.path, generation_tv(&gen).display().to_string());
+    assert_eq!(report.path, generation_vector(&gen).display().to_string());
 
     // The installed shard serves exactly the monolithic reference.
     let query: Vec<f32> = corpus[..DIM].to_vec();
@@ -181,7 +184,7 @@ async fn seeded_install_serves_and_persists() {
 
     // Persistence without Flush: the generation holds both files, and the
     // legacy layout was never written.
-    assert!(generation_tv(&gen).exists());
+    assert!(generation_vector(&gen).exists());
     assert!(generation_bm25(&gen).exists());
     assert!(!node_tv.exists());
     assert_eq!(recover_generation(&node_tv), Some(gen));
@@ -206,7 +209,7 @@ async fn rejects_mismatched_calibration() {
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     seed(&mut client, &shift, &scale).await;
 
-    let err = turbovec_search::snapshot::install_snapshot(&addr, &src_tv, None)
+    let err = pipestream_search::snapshot::install_snapshot(&addr, &src_tv, None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -229,10 +232,7 @@ async fn rejects_mismatched_calibration() {
 async fn unseeded_node_adopts_snapshot_calibration() {
     let dir = tempdir("adopt");
     let (reference, corpus, src_tv) = build_source(&dir);
-    let (shift, scale) = (
-        reference.tqplus_shift().to_vec(),
-        reference.tqplus_scale().to_vec(),
-    );
+    let (shift, scale) = legacy_calibration(&reference);
 
     let node_tv = dir.join("shard.tv");
     let (addr, handle) = common::start_empty_node(NodeConfig {
@@ -243,7 +243,7 @@ async fn unseeded_node_adopts_snapshot_calibration() {
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
 
     // No SetCalibration: the shard adopts whatever the image carries.
-    let report = turbovec_search::snapshot::install_snapshot(&addr, &src_tv, None)
+    let report = pipestream_search::snapshot::install_snapshot(&addr, &src_tv, None)
         .await
         .unwrap();
     assert_eq!(report.num_vectors, N as u64);
@@ -286,7 +286,7 @@ async fn truncated_stream_rejected() {
     let (tx, rx) = mpsc::channel(4);
     tx.send(SnapshotChunk {
         payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
-            tv_bytes: bytes.len() as u64 + 64,
+            vector_bytes: bytes.len() as u64 + 64,
             bm25_bytes: 0,
         })),
     })
@@ -335,11 +335,11 @@ async fn replace_generation_swaps_and_survives_restart() {
     seed(&mut client, &shift, &scale).await;
 
     // Install A, then wholesale-replace with B.
-    let report_a = turbovec_search::snapshot::install_snapshot(&addr, &tv_a, None)
+    let report_a = pipestream_search::snapshot::install_snapshot(&addr, &tv_a, None)
         .await
         .unwrap();
     assert_eq!(report_a.num_vectors, 512);
-    let report_b = turbovec_search::snapshot::install_snapshot(&addr, &tv_b, Some(&bm25_b))
+    let report_b = pipestream_search::snapshot::install_snapshot(&addr, &tv_b, Some(&bm25_b))
         .await
         .unwrap();
     assert_eq!(report_b.num_vectors, 640);
@@ -347,7 +347,7 @@ async fn replace_generation_swaps_and_survives_restart() {
 
     // Exactly one generation, no swap-out dir left behind.
     let gen = generation_dir(&node_tv);
-    assert!(generation_tv(&gen).exists());
+    assert!(generation_vector(&gen).exists());
     assert!(generation_bm25(&gen).exists());
     assert!(!dir.join("shard.tv.snap-old").exists());
     assert!(!dir.join("shard.tv.snap-tmp").exists());
@@ -362,8 +362,8 @@ async fn replace_generation_swaps_and_survives_restart() {
     // Simulated restart: recover the generation and serve from disk, no
     // in-memory state carried over.
     let recovered = recover_generation(&node_tv).expect("generation survives");
-    let index = TurboQuantIndex::load(generation_tv(&recovered)).unwrap();
-    index.prepare();
+    let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &generation_vector(&recovered)).unwrap();
+    index.prepare().unwrap();
     assert_eq!(index.len(), 640);
     let bm25 = Bm25Shard::open(&generation_bm25(&recovered)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -380,8 +380,8 @@ async fn replace_generation_swaps_and_survives_restart() {
     .with_generation(Some(recovered));
     let handle2 = tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(service.into_server(turbovec_search::MAX_MESSAGE_BYTES))
-            .serve_with_incoming(turbovec_search::harness::nodelay_incoming(listener)),
+            .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
+            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
     );
     let mut client2 = NodeServiceClient::connect(addr2).await.unwrap();
     let hits2 = search_topk(&mut client2, query.clone(), 10).await;
@@ -405,10 +405,7 @@ async fn replace_generation_swaps_and_survives_restart() {
 async fn flush_after_install_writes_into_generation() {
     let dir = tempdir("flush");
     let (reference, _corpus, src_tv) = build_source(&dir);
-    let (shift, scale) = (
-        reference.tqplus_shift().to_vec(),
-        reference.tqplus_scale().to_vec(),
-    );
+    let (shift, scale) = legacy_calibration(&reference);
 
     let node_tv = dir.join("shard.tv");
     let (addr, handle) = common::start_empty_node(NodeConfig {
@@ -418,7 +415,7 @@ async fn flush_after_install_writes_into_generation() {
     .await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     seed(&mut client, &shift, &scale).await;
-    turbovec_search::snapshot::install_snapshot(&addr, &src_tv, None)
+    pipestream_search::snapshot::install_snapshot(&addr, &src_tv, None)
         .await
         .unwrap();
 
@@ -426,11 +423,11 @@ async fn flush_after_install_writes_into_generation() {
     // legacy layout never appears.
     let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
     let gen = generation_dir(&node_tv);
-    assert_eq!(flushed.path, generation_tv(&gen).display().to_string());
+    assert_eq!(flushed.path, generation_vector(&gen).display().to_string());
     assert!(flushed.written);
-    assert!(generation_tv(&gen).exists());
+    assert!(generation_vector(&gen).exists());
     assert!(!node_tv.exists());
-    let reloaded = TurboQuantIndex::load(generation_tv(&gen)).unwrap();
+    let reloaded = VectorIndex::load(EMBEDDED_TURBOVEC, &generation_vector(&gen)).unwrap();
     assert_eq!(reloaded.len(), N);
 
     handle.abort();
@@ -459,7 +456,7 @@ fn recover_generation_repairs_interrupted_swaps() {
     std::fs::create_dir_all(&old).unwrap();
     std::fs::write(old.join("index.tv"), b"x").unwrap();
     assert_eq!(recover_generation(&index_path), Some(snap.clone()));
-    assert!(generation_tv(&snap).exists());
+    assert!(generation_vector(&snap).exists());
     assert!(!old.exists());
 
     // Crashed after the second rename: both present — the new generation

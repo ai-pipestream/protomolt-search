@@ -14,7 +14,7 @@
 use std::io::Write as _;
 use std::time::Instant;
 
-use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, SpillBuilder};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, SpillBuilder};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -47,7 +47,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             terms.push(("rare".to_string(), 1, Vec::new()));
         }
         let len = terms.len() as u32;
-        builder.add_document_with_lineage(doc, ".".to_string(), AnalyzedDoc::body(terms, len), None)?;
+        builder.add_document_with_lineage(
+            doc,
+            ".".to_string(),
+            AnalyzedDoc::body(terms, len),
+            None,
+        )?;
         if doc % 10 != 9 {
             builder.set_facet(0, doc, &format!("c{:04}", doc % n_values));
         }
@@ -65,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec!["rare"],
         vec!["half", "rare"],
     ] {
-        use turbovec_search::postings::Bm25Index;
+        use pipestream_search::postings::Bm25Index;
         // Phase 1: the union walk (one doc-run pass per term).
         let mut bits = vec![0u64; (n_docs as usize).div_ceil(64)];
         let mut postings = 0u64;

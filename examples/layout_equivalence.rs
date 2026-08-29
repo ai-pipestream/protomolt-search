@@ -9,8 +9,8 @@
 //!     --probes-from=/corpus/embeddings.bin --queries=20 --k=100
 //! ```
 
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::demo::court;
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::demo::court;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -41,7 +41,9 @@ async fn scores(
     vector: &[f32],
     k: u32,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let result = coordinator.fanout_search(tag, vector, k, true, &Default::default()).await?;
+    let result = coordinator
+        .fanout_search(tag, vector, k, true, &Default::default())
+        .await?;
     let mut all: Vec<f32> = result
         .shard_hits
         .iter()

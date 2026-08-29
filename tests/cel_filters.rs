@@ -10,21 +10,21 @@ mod common;
 
 use std::collections::{BTreeSet, HashMap};
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats};
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::filter::{DocFilter, Edge, NumBound, ResolvedFilter, ResolvedLeaf, Tri};
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats};
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::filter::{DocFilter, Edge, NumBound, ResolvedFilter, ResolvedLeaf, Tri};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, FacetValue, GeoBbox, GeoFilter,
     GeoPointValue, IntegerValue, MapFacetEntry, MapNumericEntry, NumericValue, TimestampValue,
 };
-use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store};
-use turbovec_search::scorefn::NumericRead;
+use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store};
+use pipestream_search::scorefn::NumericRead;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -70,7 +70,6 @@ const SHARD_DOCS: [&[Doc]; 3] = [
             tags: &[("color", "red")],
             cites: &[("a", 3.0)],
             point: Some((0.0, 0.0)),
-            ..NONE_DOC
         },
         Doc {
             text: "vector search rust",
@@ -98,7 +97,6 @@ const SHARD_DOCS: [&[Doc]; 3] = [
             tags: &[("color", "red"), ("status", "live")],
             cites: &[("a", 1.0)],
             point: Some((10.0, 10.0)),
-            ..NONE_DOC
         },
         Doc {
             text: "vector vector vector rust",
@@ -455,7 +453,7 @@ async fn distributed_cel_filters_select_exactly() {
             filter: "year >= 2000".into(),
             geo_filters: vec![GeoFilter {
                 column: "courthouse".into(),
-                region: Some(turbovec_search::pb::geo_filter::Region::Bbox(GeoBbox {
+                region: Some(pipestream_search::pb::geo_filter::Region::Bbox(GeoBbox {
                     min_lat: 0.0,
                     max_lat: 1.0,
                     min_lon: 0.0,
@@ -584,7 +582,7 @@ async fn filters_narrow_facet_counts() {
             facet_fields: vec!["court".into()],
             geo_filters: vec![GeoFilter {
                 column: "courthouse".into(),
-                region: Some(turbovec_search::pb::geo_filter::Region::Bbox(GeoBbox {
+                region: Some(pipestream_search::pb::geo_filter::Region::Bbox(GeoBbox {
                     min_lat: 0.0,
                     max_lat: 1.0,
                     min_lon: 0.0,
@@ -608,11 +606,11 @@ async fn filters_narrow_facet_counts() {
         Bm25SearchRequest {
             text: "rust".into(),
             k: 1,
-            map_facet_fields: vec![turbovec_search::pb::MapFacetField {
+            map_facet_fields: vec![pipestream_search::pb::MapFacetField {
                 column: "tags".into(),
                 key: "color".into(),
             }],
-            range_facet_fields: vec![turbovec_search::pb::RangeFacetField {
+            range_facet_fields: vec![pipestream_search::pb::RangeFacetField {
                 column: "year".into(),
                 key: String::new(),
                 edges: vec![1990.0, 2000.0, 2030.0],
@@ -850,7 +848,7 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
             }),
         }))),
         ResolvedFilter::Leaf(ResolvedLeaf::MapHasKey(
-            turbovec_search::filter::MapKeyRef::Facet {
+            pipestream_search::filter::MapKeyRef::Facet {
                 column: 0,
                 key_ord: Some(status_key),
             },

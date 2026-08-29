@@ -25,14 +25,16 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Read;
 use std::time::Instant;
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::tei::embed_client::EmbedClient;
-use turbovec_search::pb::tei::EmbedRequest;
-use turbovec_search::pb::{GetDocumentsRequest, HealthRequest, SearchRequest};
+use pipestream_search::analyzer;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::tei::embed_client::EmbedClient;
+use pipestream_search::pb::tei::EmbedRequest;
+use pipestream_search::pb::{GetDocumentsRequest, HealthRequest, SearchRequest};
 
 const DIM: usize = 256;
+type RankedPool = Vec<(u64, f64)>;
+type RankedPoolPair = (RankedPool, RankedPool);
 const RECORD_HEADER: usize = 12;
 const SLOT_STRIDE: u64 = 25_000_000;
 /// Topical seed queries; the rest are sampled from the corpus.
@@ -168,7 +170,7 @@ fn exact_pools(path: &str, queries: &[Vec<f32>], k: usize) -> Vec<Vec<(u64, f32)
             }
         });
         base_row += rows as u64;
-        if base_row % (BLOCK_ROWS as u64 * 64) == 0 {
+        if base_row.is_multiple_of(BLOCK_ROWS as u64 * 64) {
             eprintln!("  exact scan: {base_row} rows in {:?}", t0.elapsed());
         }
         if rows < BLOCK_ROWS {
@@ -382,7 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let qi = next;
                 let mut client = SearchServiceClient::connect(coordinator.clone())
                     .await?
-                    .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES);
+                    .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES);
                 inflight.spawn(async move {
                     let hits = client
                         .search(SearchRequest {
@@ -443,7 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (shard, doc_ids) in by_shard {
         let mut client = NodeServiceClient::connect(nodes[shard].clone())
             .await?
-            .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES);
+            .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES);
         for ids in doc_ids.chunks(2000) {
             let found = client
                 .get_documents(GetDocumentsRequest {
@@ -513,7 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\npool_k | trusted depth (mean >= 0.98) | mean@10 | p10@10 | mean@100 | p10@100");
     for &pk in &pool_grid {
-        let per_query: Vec<(Vec<(u64, f64)>, Vec<(u64, f64)>)> = (0..queries.len())
+        let per_query: Vec<RankedPoolPair> = (0..queries.len())
             .map(|qi| {
                 let quant_members: HashSet<u64> = quant_pools[qi][..pk.min(quant_pools[qi].len())]
                     .iter()

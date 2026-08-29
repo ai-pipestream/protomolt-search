@@ -26,11 +26,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use pipestream_search::demo::court::{self, ChunkSource, ChunkWriter, EmbeddingWriter};
+use pipestream_search::harness::start_sidecar_with_env;
+use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
+use pipestream_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, EmbeddingOptions};
 use tokio::sync::{mpsc, Mutex};
-use turbovec_search::demo::court::{self, ChunkSource, ChunkWriter, EmbeddingWriter};
-use turbovec_search::harness::start_sidecar_with_env;
-use turbovec_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use turbovec_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, EmbeddingOptions};
 
 const SIDECAR_BIN: &str =
     "/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
@@ -57,10 +57,10 @@ async fn analyze(
     addr: &str,
     text: &str,
     embeddings: Option<EmbeddingOptions>,
-) -> Result<turbovec_search::pb::analysis::AnalyzeResponse, tonic::Status> {
-    let mut client = AnalysisServiceClient::new(turbovec_search::analyzer::shared_channel(addr)?)
-        .max_decoding_message_size(turbovec_search::MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(turbovec_search::MAX_MESSAGE_BYTES);
+) -> Result<pipestream_search::pb::analysis::AnalyzeResponse, tonic::Status> {
+    let mut client = AnalysisServiceClient::new(pipestream_search::analyzer::shared_channel(addr)?)
+        .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES);
     client
         .analyze(AnalyzeRequest {
             text: text.to_string(),
@@ -75,7 +75,7 @@ async fn analyze(
         .map(|r| r.into_inner())
 }
 
-fn to_spans(spans: &[turbovec_search::pb::analysis::Span]) -> Vec<court::Span> {
+fn to_spans(spans: &[pipestream_search::pb::analysis::Span]) -> Vec<court::Span> {
     spans
         .iter()
         .map(|s| court::Span {

@@ -3,7 +3,7 @@
 //!
 //! Used by the integration tests and the `sweep` benchmark binary. Also
 //! usable for real deployments: [`write_shards`] persists sharded,
-//! uniformly-calibrated `.tv` files that the `turbovec-search` binary loads
+//! uniformly configured vector images that the search binary loads
 //! via `[[shards]]` entries in the cluster config.
 
 use std::net::{SocketAddr, TcpStream};
@@ -15,10 +15,13 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Error as TransportError, Server};
-use turbovec::TurboQuantIndex;
 
 use crate::coordinator::CoordinatorServiceImpl;
 use crate::node::{NodeConfig, NodeServiceImpl};
+use crate::pb::{ConfigureVectorBackendRequest, VectorBackendConfig as WireVectorBackendConfig};
+use crate::vector::{
+    embedded_turbovec_config, legacy_calibration_config, VectorIndex, EMBEDDED_TURBOVEC,
+};
 use crate::MAX_MESSAGE_BYTES;
 
 /// Deterministic pseudo-random unit vectors (LCG + L2 normalize), same
@@ -54,14 +57,12 @@ pub fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 /// catastrophically biased. There is no warm-up threshold anymore —
 /// a tiny sample fits (deterministically), it just fits noisily.
 pub fn fit_calibration(dim: usize, bit_width: usize, sample: &[f32]) -> (Vec<f32>, Vec<f32>) {
-    let mut fitting = TurboQuantIndex::new(dim, bit_width).unwrap();
-    fitting
-        .calibrate(sample)
+    let config = VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, dim, bit_width, sample)
         .expect("calibration sample must be non-empty finite rows");
-    (
-        fitting.tqplus_shift().to_vec(),
-        fitting.tqplus_scale().to_vec(),
-    )
+    let legacy = legacy_calibration_config(&config)
+        .expect("fitted backend config must decode")
+        .expect("embedded backend exposes the legacy calibration view");
+    (legacy.shift, legacy.scale)
 }
 
 /// An empty index committed to an externally fitted calibration pair:
@@ -71,28 +72,37 @@ pub fn fit_calibration(dim: usize, bit_width: usize, sample: &[f32]) -> (Vec<f32
 /// an exact global top-k. (This replaces the fork's former
 /// `new_with_calibration` patch; upstream #474 made the property
 /// expressible with stock API.)
-pub fn seeded_index(
+pub fn seeded_index(dim: usize, bit_width: usize, shift: &[f32], scale: &[f32]) -> VectorIndex {
+    let config = embedded_turbovec_config(bit_width, shift, scale)
+        .expect("a fitted calibration pair is valid backend state");
+    VectorIndex::from_backend_config(dim, &config)
+        .expect("a fitted calibration pair is valid backend state")
+}
+
+/// Wire request for configuring the shipped embedded provider. Most tests use
+/// this generic RPC; dedicated compatibility tests cover SetCalibration.
+pub fn embedded_backend_request(
     dim: usize,
-    bit_width: usize,
+    bits_per_dimension: usize,
     shift: &[f32],
     scale: &[f32],
-) -> TurboQuantIndex {
-    TurboQuantIndex::from_parts(
-        Some(dim),
-        bit_width,
-        0,
-        Vec::new(),
-        Vec::new(),
-        shift.to_vec(),
-        scale.to_vec(),
-    )
-    .expect("a fitted calibration pair is valid index parts")
+) -> ConfigureVectorBackendRequest {
+    let config = embedded_turbovec_config(bits_per_dimension, shift, scale)
+        .expect("test calibration is valid provider state");
+    ConfigureVectorBackendRequest {
+        dim: dim as u32,
+        config: Some(WireVectorBackendConfig {
+            backend_kind: config.backend_kind,
+            config_format: config.config_format,
+            payload: config.payload,
+        }),
+    }
 }
 
 /// One shard's index plus its global id base (the corpus offset of its
 /// first vector; partitions are contiguous ranges).
 pub struct Shard {
-    pub index: TurboQuantIndex,
+    pub index: VectorIndex,
     pub slot_offset: u64,
 }
 
@@ -125,8 +135,10 @@ pub fn build_shards(
             let start = cut(i);
             let end = cut(i + 1).max(start);
             let mut index = seeded_index(dim, bit_width, shift, scale);
-            index.add(&corpus[start * dim..end * dim]);
-            index.prepare();
+            index
+                .add(&corpus[start * dim..end * dim], dim)
+                .expect("generated vectors are valid");
+            index.prepare().expect("backend prepare succeeds");
             Shard {
                 index,
                 slot_offset: start as u64,
@@ -143,14 +155,14 @@ pub fn build_monolithic(
     bit_width: usize,
     shift: &[f32],
     scale: &[f32],
-) -> TurboQuantIndex {
+) -> VectorIndex {
     let mut index = seeded_index(dim, bit_width, shift, scale);
-    index.add(corpus);
-    index.prepare();
+    index.add(corpus, dim).expect("generated vectors are valid");
+    index.prepare().expect("backend prepare succeeds");
     index
 }
 
-/// Persist shards as `.tv` files (`<dir>/shard-<i>.tv`) and print the
+/// Persist provider images as `<dir>/shard-<i>.vector` and print the
 /// matching `[[shards]]` config entries (listen ports starting at
 /// `base_port`, offsets from the partition layout) so a static cluster
 /// config can be assembled by hand.
@@ -162,8 +174,8 @@ pub fn write_shards(
     std::fs::create_dir_all(dir)?;
     let mut paths = Vec::with_capacity(shards.len());
     for (i, shard) in shards.iter().enumerate() {
-        let path = dir.join(format!("shard-{i}.tv"));
-        shard.index.write(&path)?;
+        let path = dir.join(format!("shard-{i}.vector"));
+        shard.index.write(&path).map_err(std::io::Error::other)?;
         println!(
             "[[shards]]\nlisten = \"0.0.0.0:{}\"\nindex = \"{}\"\nslot_offset = {}\n",
             base_port + i as u16,
@@ -194,7 +206,7 @@ pub fn nodelay_incoming(
 /// Start a node server over a prebuilt index on 127.0.0.1:0. Returns its
 /// `http://` address and the server task (abort to stop).
 pub async fn start_node(
-    index: TurboQuantIndex,
+    index: VectorIndex,
     config: NodeConfig,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
     start_node_inner(Some(index), config).await
@@ -209,7 +221,7 @@ pub async fn start_empty_node(
 }
 
 async fn start_node_inner(
-    index: Option<TurboQuantIndex>,
+    index: Option<VectorIndex>,
     config: NodeConfig,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -322,7 +334,11 @@ pub mod mock_analysis {
 
     /// The analysis itself, shared verbatim by the unary and streaming
     /// paths — the same guarantee the real sidecar tests prove.
-    fn analyze_text(text: &str, options: &AnalysisOptions, ner: bool) -> Result<AnalyzeResponse, Status> {
+    fn analyze_text(
+        text: &str,
+        options: &AnalysisOptions,
+        ner: bool,
+    ) -> Result<AnalyzeResponse, Status> {
         if text.is_empty() {
             return Err(Status::invalid_argument("empty text"));
         }
@@ -432,17 +448,16 @@ pub mod mock_analysis {
                 .iter()
                 .filter_map(|t| {
                     let lower = t.text.to_lowercase();
-                    GAZETTEER
-                        .iter()
-                        .find(|(key, ..)| *key == lower)
-                        .map(|&(_, name, country, lat, lon, confidence)| GeoLocation {
+                    GAZETTEER.iter().find(|(key, ..)| *key == lower).map(
+                        |&(_, name, country, lat, lon, confidence)| GeoLocation {
                             span: t.span,
                             name: name.to_string(),
                             country_code: country.to_string(),
                             latitude: lat,
                             longitude: lon,
                             confidence,
-                        })
+                        },
+                    )
                 })
                 .collect()
         } else {

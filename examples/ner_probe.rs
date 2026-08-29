@@ -5,8 +5,8 @@
 //! than of the request. This prints what came back, typed, which is the
 //! only way to tell a model that found nothing from a model that is not
 //! loaded.
-use turbovec_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use turbovec_search::pb::analysis::{AnalysisOptions, AnalyzeRequest};
+use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
+use pipestream_search::pb::analysis::{AnalysisOptions, AnalyzeRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let p = format!("--{key}=");
@@ -44,9 +44,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut by_type: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for e in &r.entities {
-        by_type.entry(e.r#type.clone()).or_default().push(e.text.clone());
+        by_type
+            .entry(e.r#type.clone())
+            .or_default()
+            .push(e.text.clone());
     }
-    println!("{} entities across {} types:", r.entities.len(), by_type.len());
+    println!(
+        "{} entities across {} types:",
+        r.entities.len(),
+        by_type.len()
+    );
     for (t, vals) in &by_type {
         println!("  {t:<14} {}", vals.join(", "));
     }

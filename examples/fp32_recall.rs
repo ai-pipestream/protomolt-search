@@ -13,8 +13,10 @@
 //!     --probes-from=/corpus/embeddings.bin --queries=20 --k=10,100
 //! ```
 
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::demo::court;
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::demo::court;
+
+type RankedHits = Vec<Vec<(u64, f32)>>;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -30,7 +32,7 @@ fn fp32_topk(
     path: &str,
     probes: &[Vec<f32>],
     k: usize,
-) -> Result<Vec<Vec<(u64, f32)>>, Box<dyn std::error::Error>> {
+) -> Result<RankedHits, Box<dyn std::error::Error>> {
     let (_, reader) = court::EmbeddingReader::open(std::path::Path::new(path))?;
     // One min-heap per probe as (score, id) with lazy sort at the end;
     // a simple threshold guard keeps heap churn negligible.
@@ -104,7 +106,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut quant: Vec<Vec<u64>> = Vec::with_capacity(probes.len());
     for (qi, vector) in probes.iter().enumerate() {
         let result = coordinator
-            .fanout_search(&format!("recall-{qi}"), vector, kmax as u32, true, &Default::default())
+            .fanout_search(
+                &format!("recall-{qi}"),
+                vector,
+                kmax as u32,
+                true,
+                &Default::default(),
+            )
             .await?;
         let mut hits: Vec<(u64, f32)> = result
             .shard_hits

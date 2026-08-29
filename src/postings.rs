@@ -2921,6 +2921,7 @@ fn skip_run_size(l0_bytes: u64, l1: &[L1Record]) -> u64 {
 /// occurrence pairs to `occ_out`, `(tf, dl)` to the skip builder (whose
 /// level-0 records stream to `skip_l0_out`). `occ_start` is the running
 /// occurrence count; returns the new count.
+#[allow(clippy::too_many_arguments)]
 fn push_posting_v5<D: Write, O: Write, S: Write>(
     doc_out: &mut D,
     occ_out: &mut O,
@@ -3599,13 +3600,16 @@ impl Bm25Store {
 /// One field's slice of a [`SpillBuilder`]: its pending postings
 /// buffer, spilled runs, and per-document lengths — the spill-side
 /// mirror of [`FieldStore`].
+type PendingPosting = (String, u32, u32, Vec<(u32, u32)>);
+type PostingDirectoryEntry = (String, u64, u64, u64, u32);
+
 struct FieldSpill {
     name: String,
     /// Hash of the field's AnalysisSpec, persisted in the v6 field
     /// table. 0 until the ingest layer wires real fingerprints.
     analysis_fingerprint: u64,
     /// Pending postings: (term, doc_id, tf, offsets).
-    buf: Vec<(String, u32, u32, Vec<(u32, u32)>)>,
+    buf: Vec<PendingPosting>,
     runs: Vec<PathBuf>,
     doc_lengths: Vec<u32>,
     total_length: u64,
@@ -4140,8 +4144,8 @@ impl SpillBuilder {
         doc_lengths: &[u32],
         body_path: &Path,
         occ_stage_path: &Path,
-    ) -> io::Result<Vec<(String, u64, u64, u64, u32)>> {
-        let mut directory: Vec<(String, u64, u64, u64, u32)> = Vec::new();
+    ) -> io::Result<Vec<PostingDirectoryEntry>> {
+        let mut directory: Vec<PostingDirectoryEntry> = Vec::new();
         let mut out = io::BufWriter::new(std::fs::File::create(body_path)?);
         let mut heads: Vec<RunHead> = Vec::new();
         for run in runs {
@@ -4220,7 +4224,7 @@ impl SpillBuilder {
         self.texts.flush()?;
 
         let occ_stage_path = self.dir.join("occ.stage");
-        let mut directories: Vec<Vec<(String, u64, u64, u64, u32)>> =
+        let mut directories: Vec<Vec<PostingDirectoryEntry>> =
             Vec::with_capacity(self.fields.len());
         let mut body_paths: Vec<PathBuf> = Vec::with_capacity(self.fields.len());
         let mut body_lens: Vec<u64> = Vec::with_capacity(self.fields.len());
@@ -5017,7 +5021,7 @@ fn validate_v5_directory(
         }
         // Occurrence run: length divisible by 8 and equal to the
         // sentinel occ_start.
-        if (skip_run_off - occ_run_off) % 8 != 0 {
+        if !(skip_run_off - occ_run_off).is_multiple_of(8) {
             return Err(invalid(format!(
                 "directory entry {i}: occurrence run not pair-aligned"
             )));
@@ -5256,7 +5260,7 @@ pub fn transcode_to_v5(src: &Path, dst: &Path) -> io::Result<TranscodeStats> {
     w.flush()?;
     let mut f = w
         .into_inner()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let bytes_out = f.stream_position()?;
     f.seek(io::SeekFrom::Start(40))?;
     f.write_all(&directory_off.to_le_bytes())?;
@@ -5465,8 +5469,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     // The reserved binding record: pinned name, inline
                     // payload, no sections. Duplicates fall to the
                     // table's name-uniqueness rule above.
-                    if column_names.last().map(Vec::as_slice)
-                        != Some(BINDING_ENTRY_NAME.as_bytes())
+                    if column_names.last().map(Vec::as_slice) != Some(BINDING_ENTRY_NAME.as_bytes())
                     {
                         return Err(invalid(format!(
                             "column {i}: kind {COLUMN_KIND_BINDING} must be named \
@@ -7171,7 +7174,7 @@ impl<'a> ImpactCursor<'a> {
         }
         self.block_rec_off += 5 + 8 * self.block_pairs.len();
         self.block += 1;
-        if self.block % LEVEL1_FACTOR as u32 == 0 {
+        if self.block.is_multiple_of(LEVEL1_FACTOR as u32) {
             self.next_l1();
         }
         self.pos = (self.block * BLOCK as u32).min(self.df);
@@ -7253,7 +7256,7 @@ impl<'a> ImpactCursor<'a> {
             return false;
         }
         self.pos += 1;
-        if self.pos < self.df && self.pos % BLOCK as u32 == 0 {
+        if self.pos < self.df && self.pos.is_multiple_of(BLOCK as u32) {
             self.next_block();
         }
         !self.exhausted()
@@ -7591,7 +7594,7 @@ mod tests {
             let mut terms: DocTerms = Vec::new();
             let mut length = 0;
             for (vi, term) in vocab.iter().enumerate() {
-                if (i as usize + vi) % (vi + 2) == 0 {
+                if (i as usize + vi).is_multiple_of(vi + 2) {
                     let tf = 1 + (i % 3);
                     let offsets = if vi % 2 == 0 {
                         (0..tf).map(|o| (o * 10, o * 10 + 4)).collect()
@@ -8194,12 +8197,12 @@ mod tests {
             // for_each_posting: identical (doc, tf, offsets) stream.
             let mut got = Vec::new();
             reader.for_each_posting(term, &mut |d, tf, o| got.push((d, tf, o.to_vec())));
-            let want: Vec<(u32, u32, Vec<(u32, u32)>)> = store
+            let want = store
                 .postings(term)
                 .map(|ps| {
                     ps.iter()
                         .map(|p| (p.doc_id, p.tf, p.offsets.clone()))
-                        .collect()
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             assert_eq!(got, want, "for_each_posting({term})");
@@ -8310,10 +8313,10 @@ mod tests {
                     b: bs[rng.below(bs.len() as u64) as usize],
                 };
                 let k = 1 + rng.below(30) as usize;
-                let sig = |hits: &[crate::bm25::ScoredDoc]| -> Vec<(u32, u64, Vec<(usize, Vec<(u32, u32)>)>)> {
+                let sig = |hits: &[crate::bm25::ScoredDoc]| {
                     hits.iter()
                         .map(|h| (h.doc_id, h.score.to_bits(), h.term_offsets.clone()))
-                        .collect()
+                        .collect::<Vec<_>>()
                 };
                 let heap = sig(&crate::bm25::top_k(&store, &terms, &stats, params, k));
                 let oracle = sig(&crate::bm25::top_k_exhaustive(
@@ -8674,12 +8677,12 @@ mod tests {
             assert_eq!(reader.df(term), store.df(term), "df({term})");
             let mut got = Vec::new();
             reader.for_each_posting(term, &mut |d, tf, o| got.push((d, tf, o.to_vec())));
-            let want: Vec<(u32, u32, Vec<(u32, u32)>)> = store
+            let want = store
                 .postings(term)
                 .map(|ps| {
                     ps.iter()
                         .map(|p| (p.doc_id, p.tf, p.offsets.clone()))
-                        .collect()
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             assert_eq!(got, want, "for_each_posting({term})");
@@ -8772,7 +8775,11 @@ mod tests {
             docs.push((
                 id,
                 format!("case {i} body"),
-                AnalyzedDoc { fields, quality: None, geography: None },
+                AnalyzedDoc {
+                    fields,
+                    quality: None,
+                    geography: None,
+                },
                 lineage,
             ));
         }

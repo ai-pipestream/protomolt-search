@@ -9,9 +9,9 @@
 //! ingest_probe --node=127.0.0.1:59800 --docs=3
 //! ```
 
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{AddDocumentsRequest, AnalysisSpec, DocLineage};
 use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{AddDocumentsRequest, AnalysisSpec, DocLineage};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docs: usize = arg("docs", "3").parse()?;
     let with_field = std::env::args().any(|a| a == "--with-field");
 
-    let spec = turbovec_search::analyzer::body_spec();
+    let spec = pipestream_search::analyzer::body_spec();
     // Real chunk texts when asked: the synthetic sentence below exercises
     // neither long documents nor the corpus's own byte content.
     let chunks_path = arg("chunks", "");
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     span_end: 40,
                 }),
                 fields: if with_field {
-                    vec![turbovec_search::pb::DocumentField {
+                    vec![pipestream_search::pb::DocumentField {
                         field: "case_name".to_string(),
                         text: format!("Probe v. Shard {i}"),
                         analysis: Some(AnalysisSpec {

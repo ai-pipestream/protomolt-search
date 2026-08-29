@@ -1,6 +1,6 @@
 //! Chunked shard scan with mid-scan floor adoption.
 //!
-//! turbovec's `search_with_options` is a single synchronous scan whose floor
+//! A provider's bounded search is a single synchronous scan whose floor
 //! is fixed at call time, so reactive floor sharing is built *around* it:
 //! the shard is scanned in chunks of `chunk_blocks` SIMD blocks, each chunk
 //! a masked `search_with_options` call (an allowlist over a contiguous slot
@@ -17,9 +17,9 @@
 //! the floor, so boundary ties survive. The merged heap therefore ends with
 //! exactly the shard's unchunked top-k.
 
-use turbovec::{SearchOptions, TurboQuantIndex};
+use crate::vector::{VectorIndex, VectorSearchOptions};
 
-/// Vectors per SIMD block in the turbovec scan kernel. Chunk ranges are
+/// Vectors per block in the current embedded scan provider. Chunk ranges are
 /// block-aligned so a chunk is always a whole number of kernel blocks.
 pub const BLOCK_VECTORS: usize = 32;
 
@@ -187,7 +187,7 @@ pub struct BatchQuery<'a> {
 /// statistics.
 #[allow(clippy::too_many_arguments)]
 pub fn chunked_topk(
-    index: &TurboQuantIndex,
+    index: &VectorIndex,
     query: &[f32],
     k: usize,
     chunk_blocks: usize,
@@ -236,7 +236,7 @@ pub fn chunked_topk(
 /// `external_floor` and `publish_floor` receive the query's position in
 /// `queries` as their first argument.
 pub fn chunked_topk_batch(
-    index: &TurboQuantIndex,
+    index: &VectorIndex,
     queries: &[BatchQuery<'_>],
     chunk_blocks: usize,
     external_floor: &mut dyn FnMut(usize) -> Option<f32>,
@@ -343,7 +343,7 @@ pub fn chunked_topk_batch(
             let results = index.search_with_options(
                 flat,
                 chunk_k,
-                SearchOptions::new()
+                VectorSearchOptions::new()
                     .with_mask(&mask)
                     .with_initial_threshold(kernel_floor),
             );
@@ -455,7 +455,7 @@ pub struct CollapsedHit {
 /// [`ScanStats::chunk_calls`].
 #[allow(clippy::too_many_arguments)]
 pub fn chunked_topk_collapsed(
-    index: &TurboQuantIndex,
+    index: &VectorIndex,
     query: &[f32],
     k: usize,
     chunk_blocks: usize,
@@ -467,7 +467,11 @@ pub fn chunked_topk_collapsed(
     let n = index.len();
     assert_eq!(parents.len(), n, "parents must map every slot of the index");
     if let Some(a) = allow {
-        assert_eq!(a.len(), n, "an allowlist must cover every slot of the index");
+        assert_eq!(
+            a.len(),
+            n,
+            "an allowlist must cover every slot of the index"
+        );
     }
     let mut stats = ScanStats::default();
     if n == 0 || k == 0 {
@@ -516,7 +520,7 @@ pub fn chunked_topk_collapsed(
             let results = index.search_with_options(
                 query,
                 chunk_k.min(end - start),
-                SearchOptions::new()
+                VectorSearchOptions::new()
                     .with_mask(&mask)
                     .with_initial_threshold(floor),
             );
@@ -614,9 +618,9 @@ mod tests {
         out
     }
 
-    fn build(n: usize, dim: usize) -> TurboQuantIndex {
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-        idx.add(&unit_vectors(n, dim, 0xC40C_0001));
+    fn build(n: usize, dim: usize) -> VectorIndex {
+        let mut idx = VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, dim, 4).unwrap();
+        idx.add(&unit_vectors(n, dim, 0xC40C_0001), dim).unwrap();
         idx
     }
 
@@ -627,7 +631,7 @@ mod tests {
         let (n, dim, k) = (5_000, 64, 10);
         let index = build(n, dim);
         let query = unit_vectors(1, dim, 0x0E50_0001);
-        let expected = index.search(&query, k);
+        let expected = index.search_unfiltered(&query, k);
 
         for chunk_blocks in [1, 2, 7, 64, 10_000] {
             let (hits, stats) = chunked_topk(
@@ -668,7 +672,7 @@ mod tests {
         let (n, dim, k) = (6_000, 64, 1_000);
         let index = build(n, dim);
         let query = unit_vectors(1, dim, 0x0E50_0005);
-        let expected = index.search(&query, k);
+        let expected = index.search_unfiltered(&query, k);
 
         for chunk_blocks in [1, 8] {
             let (hits, _) = chunked_topk(
@@ -705,10 +709,18 @@ mod tests {
         let (n, dim, k) = (8_192, 64, 10);
         let index = build(n, dim);
         let query = unit_vectors(1, dim, 0x0E50_0002);
-        let true_kth = index.search(&query, k).scores_for_query(0)[k - 1];
+        let true_kth = index.search_unfiltered(&query, k).scores_for_query(0)[k - 1];
 
-        let (baseline, base_stats) =
-            chunked_topk(&index, &query, k, 2, &mut || None, &mut |_| false, false, None);
+        let (baseline, base_stats) = chunked_topk(
+            &index,
+            &query,
+            k,
+            2,
+            &mut || None,
+            &mut |_| false,
+            false,
+            None,
+        );
 
         // Floor becomes visible after the first chunk, like a coordinator
         // update arriving mid-scan.
@@ -775,19 +787,37 @@ mod tests {
     #[test]
     fn tie_complete_keeps_boundary_tie_group() {
         let (n, dim, k) = (512, 64, 3);
-        let mut index = TurboQuantIndex::new(dim, 4).unwrap();
-        index.add(&unit_vectors(n, dim, 0xC40C_0002));
+        let mut index = VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, dim, 4).unwrap();
+        index.add(&unit_vectors(n, dim, 0xC40C_0002), dim).unwrap();
         // Six copies of the query vector: identical codes, identical
         // (top) score. They ARE the boundary tie group at k=3.
         let query = unit_vectors(1, dim, 0x0E50_0006);
         for _ in 0..6 {
-            index.add(&query);
+            index.add(&query, dim).unwrap();
         }
 
-        let (capped, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, false, None);
+        let (capped, _) = chunked_topk(
+            &index,
+            &query,
+            k,
+            1,
+            &mut || None,
+            &mut |_| false,
+            false,
+            None,
+        );
         assert_eq!(capped.len(), k, "without keep_ties the heap caps at k");
 
-        let (tied, _) = chunked_topk(&index, &query, k, 1, &mut || None, &mut |_| false, true, None);
+        let (tied, _) = chunked_topk(
+            &index,
+            &query,
+            k,
+            1,
+            &mut || None,
+            &mut |_| false,
+            true,
+            None,
+        );
         assert_eq!(tied.len(), 6, "whole boundary tie group must survive");
         assert!(tied.iter().all(|h| h.score == tied[0].score));
         assert!(tied.windows(2).all(|w| w[0].slot < w[1].slot));
@@ -866,7 +896,7 @@ mod tests {
             let allow: Vec<bool> = (0..n).map(|i| i % keep == 0).collect();
             let survivors = allow.iter().filter(|&&a| a).count();
             // The oracle: score everything, drop the removed, rank.
-            let full = index.search(&query, n);
+            let full = index.search_unfiltered(&query, n);
             let mut expected: Vec<ChunkHit> = full
                 .indices_for_query(0)
                 .iter()
@@ -895,10 +925,7 @@ mod tests {
                     false,
                     Some(&allow),
                 );
-                assert_eq!(
-                    hits, expected,
-                    "keep 1/{keep}, chunk_blocks {chunk_blocks}"
-                );
+                assert_eq!(hits, expected, "keep 1/{keep}, chunk_blocks {chunk_blocks}");
             }
         }
     }
@@ -912,8 +939,17 @@ mod tests {
         let index = build(n, dim);
         let query = unit_vectors(1, dim, 0x0A11_0002);
         let allow = vec![true; n];
-        let unfiltered =
-            chunked_topk(&index, &query, k, 3, &mut || None, &mut |_| false, false, None).0;
+        let unfiltered = chunked_topk(
+            &index,
+            &query,
+            k,
+            3,
+            &mut || None,
+            &mut |_| false,
+            false,
+            None,
+        )
+        .0;
         let allowed = chunked_topk(
             &index,
             &query,
@@ -1032,7 +1068,7 @@ mod tests {
 
         // Oracle: score everything, drop removed chunks, take each
         // parent's best, rank parents.
-        let full = index.search(&query, n);
+        let full = index.search_unfiltered(&query, n);
         let mut best: std::collections::HashMap<u64, ChunkHit> = std::collections::HashMap::new();
         for (&slot, &score) in full
             .indices_for_query(0)
@@ -1059,7 +1095,11 @@ mod tests {
                 score: h.score,
             })
             .collect();
-        expected.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.slot.cmp(&b.slot)));
+        expected.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.slot.cmp(&b.slot))
+        });
         expected.truncate(k);
 
         let (hits, _) = chunked_topk_collapsed(
@@ -1084,10 +1124,20 @@ mod tests {
         let index = build(n, dim);
         let q0 = unit_vectors(1, dim, 0xBA7C_1000);
         let q1 = unit_vectors(1, dim, 0xBA7C_1001);
-        let kth0 = index.search(&q0, k).scores_for_query(0)[k - 1];
+        let kth0 = index.search_unfiltered(&q0, k).scores_for_query(0)[k - 1];
 
         let solo1 = chunked_topk(&index, &q1, k, 2, &mut || None, &mut |_| false, false, None).0;
-        let solo0 = chunked_topk(&index, &q0, k, 2, &mut || Some(kth0), &mut |_| false, false, None).0;
+        let solo0 = chunked_topk(
+            &index,
+            &q0,
+            k,
+            2,
+            &mut || Some(kth0),
+            &mut |_| false,
+            false,
+            None,
+        )
+        .0;
 
         let batch = [
             BatchQuery {
@@ -1130,7 +1180,7 @@ mod tests {
         let (n, dim, k) = (2_048, 64, 10);
         let index = build(n, dim);
         let query = unit_vectors(1, dim, 0x0E50_0004);
-        let top = index.search(&query, k).scores_for_query(0)[0];
+        let top = index.search_unfiltered(&query, k).scores_for_query(0)[0];
 
         let (hits, _) = chunked_topk(
             &index,
@@ -1166,13 +1216,13 @@ mod tests {
     /// parent under max aggregation, top-k parents by (score desc, slot
     /// asc).
     fn collapse_reference(
-        index: &TurboQuantIndex,
+        index: &VectorIndex,
         query: &[f32],
         parents: &[u64],
         k: usize,
     ) -> Vec<CollapsedHit> {
         let n = index.len();
-        let all = index.search(query, n);
+        let all = index.search_unfiltered(query, n);
         let mut best: std::collections::HashMap<u64, ChunkHit> = std::collections::HashMap::new();
         for (&score, &slot) in all.scores_for_query(0).iter().zip(all.indices_for_query(0)) {
             let hit = ChunkHit {
@@ -1254,8 +1304,8 @@ mod tests {
                 *x = query[d] + ((i * 31 + d) % 17) as f32 * 1e-4;
             }
         }
-        let mut index = TurboQuantIndex::new(dim, 4).unwrap();
-        index.add(&vectors);
+        let mut index = VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, dim, 4).unwrap();
+        index.add(&vectors, dim).unwrap();
         let mut parents = run_parents(n, 5);
         for parent in parents.iter_mut().take(1424).skip(1024) {
             *parent = 7_777_777;
@@ -1293,11 +1343,19 @@ mod tests {
         let parents = run_parents(n, 9);
 
         let mut published = Vec::new();
-        let (hits, stats) =
-            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |f| {
+        let (hits, stats) = chunked_topk_collapsed(
+            &index,
+            &query,
+            k,
+            8,
+            &parents,
+            &mut || None,
+            &mut |f| {
                 published.push(f);
                 true
-            }, None);
+            },
+            None,
+        );
         assert!(!published.is_empty());
         assert!(
             published.windows(2).all(|w| w[0] <= w[1]),
@@ -1315,15 +1373,31 @@ mod tests {
         // a debounce interval produces at the node. The scan still OFFERS
         // every floor; only the wire count drops. Reporting one number
         // for both is what made those knobs measure as inert.
-        let (_, muted) =
-            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false, None);
+        let (_, muted) = chunked_topk_collapsed(
+            &index,
+            &query,
+            k,
+            8,
+            &parents,
+            &mut || None,
+            &mut |_| false,
+            None,
+        );
         assert_eq!(muted.floors_offered, stats.floors_offered);
         assert_eq!(muted.floors_published, 0);
 
         // Seed the true k-th best as an external floor: results identical,
         // strictly fewer candidates collected.
-        let (unseeded, base) =
-            chunked_topk_collapsed(&index, &query, k, 8, &parents, &mut || None, &mut |_| false, None);
+        let (unseeded, base) = chunked_topk_collapsed(
+            &index,
+            &query,
+            k,
+            8,
+            &parents,
+            &mut || None,
+            &mut |_| false,
+            None,
+        );
         let (seeded, pruned) = chunked_topk_collapsed(
             &index,
             &query,

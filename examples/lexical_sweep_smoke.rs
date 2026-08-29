@@ -11,13 +11,13 @@
 //! cargo run --release --example lexical_sweep_smoke
 //! ```
 
+use pipestream_search::harness::mock_analysis::start_mock_analysis;
+use pipestream_search::harness::start_empty_node;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{AddDocumentsRequest, FlushRequest};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::harness::mock_analysis::start_mock_analysis;
-use turbovec_search::harness::start_empty_node;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{AddDocumentsRequest, FlushRequest};
 
 const SHARD_DOCS: [&[&str]; 2] = [
     &["rust search rust fast", "vector search rust"],

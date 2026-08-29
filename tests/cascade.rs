@@ -9,8 +9,8 @@
 
 mod common;
 
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
 
 use common::{fit_calibration, mock::start_mock_analysis, unit_vectors, DIM};
 
@@ -95,7 +95,7 @@ async fn start_cluster(
         let start = shard * per;
         let texts: Vec<String> = corpus.texts[start..start + per].to_vec();
         let vectors = corpus.vectors[start * DIM..(start + per) * DIM].to_vec();
-        let (addr, handle) = common::start_empty_node(turbovec_search::node::NodeConfig {
+        let (addr, handle) = common::start_empty_node(pipestream_search::node::NodeConfig {
             slot_offset: (shard * per) as u64,
             analysis_addr: Some(analysis.to_string()),
             share_floors,
@@ -105,7 +105,7 @@ async fn start_cluster(
         // Seed, ingest docs first (ids 0..), then vectors (slots align).
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(turbovec_search::pb::SetCalibrationRequest {
+            .set_calibration(pipestream_search::pb::SetCalibrationRequest {
                 dim: DIM as u32,
                 bit_width: 4,
                 shift: shift.to_vec(),
@@ -117,7 +117,7 @@ async fn start_cluster(
             let (tx, rx) = tokio::sync::mpsc::channel(8);
             let feed = tokio::spawn(async move {
                 for text in texts {
-                    tx.send(turbovec_search::pb::AddDocumentsRequest {
+                    tx.send(pipestream_search::pb::AddDocumentsRequest {
                         materialize: None,
                         map_numerics: Vec::new(),
                         map_facets: Vec::new(),
@@ -145,7 +145,7 @@ async fn start_cluster(
         }
         {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
-            tx.send(turbovec_search::pb::AddVectorsRequest {
+            tx.send(pipestream_search::pb::AddVectorsRequest {
                 vectors,
                 dim: DIM as u32,
             })
@@ -163,7 +163,7 @@ async fn start_cluster(
     (addrs, handles)
 }
 
-fn signature(hits: &[turbovec_search::pb::CascadeHit]) -> Vec<(u64, u32, u32, u32)> {
+fn signature(hits: &[pipestream_search::pb::CascadeHit]) -> Vec<(u64, u32, u32, u32)> {
     hits.iter()
         .map(|h| {
             (
@@ -196,8 +196,8 @@ fn ulp_distance(a: f32, b: f32) -> u32 {
 /// can score a couple of ULPs differently in differently-sized shards.
 /// Bitwise identity only holds within same-shape kernel paths.
 fn assert_cascade_equivalent(
-    got: &[turbovec_search::pb::CascadeHit],
-    want: &[turbovec_search::pb::CascadeHit],
+    got: &[pipestream_search::pb::CascadeHit],
+    want: &[pipestream_search::pb::CascadeHit],
 ) {
     assert_eq!(got.len(), want.len());
     for (g, w) in got.iter().zip(want.iter()) {
@@ -223,12 +223,30 @@ async fn cascade_includes_whole_boundary_tie_group_and_is_deterministic() {
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
 
     let first = coordinator
-        .fanout_cascade("c1", "zebra", &corpus.query, 2, None, 0.0, false, &Default::default())
+        .fanout_cascade(
+            "c1",
+            "zebra",
+            &corpus.query,
+            2,
+            None,
+            0.0,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
     let second = coordinator
-        .fanout_cascade("c2", "zebra", &corpus.query, 2, None, 0.0, false, &Default::default())
+        .fanout_cascade(
+            "c2",
+            "zebra",
+            &corpus.query,
+            2,
+            None,
+            0.0,
+            false,
+            &Default::default(),
+        )
         .await
         .unwrap()
         .0;
@@ -272,12 +290,30 @@ async fn distributed_cascade_matches_monolithic_exactly() {
 
     for k in [2u32, 4, 12] {
         let got = distributed
-            .fanout_cascade("d", "zebra", &corpus.query, k, None, 0.0, false, &Default::default())
+            .fanout_cascade(
+                "d",
+                "zebra",
+                &corpus.query,
+                k,
+                None,
+                0.0,
+                false,
+                &Default::default(),
+            )
             .await
             .unwrap()
             .0;
         let want = monolithic
-            .fanout_cascade("m", "zebra", &corpus.query, k, None, 0.0, false, &Default::default())
+            .fanout_cascade(
+                "m",
+                "zebra",
+                &corpus.query,
+                k,
+                None,
+                0.0,
+                false,
+                &Default::default(),
+            )
             .await
             .unwrap()
             .0;
@@ -321,7 +357,7 @@ async fn floor_shared_candidates_equal_full_scan_candidates() {
     // savings). The equivalence claim is on the POOL: merge each mode's
     // lists, take the global k-th score s_k, and compare
     // {score >= s_k} — it must be identical, tie group included.
-    let pool_of = |result: &turbovec_search::coordinator::FanoutResult| {
+    let pool_of = |result: &pipestream_search::coordinator::FanoutResult| {
         let mut all: Vec<(u64, u32)> = result
             .shard_hits
             .iter()

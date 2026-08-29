@@ -275,8 +275,7 @@ impl Scorer {
                     // is reported as 0 but excluded below.
                     None => 0.0,
                 };
-                let active = !dim.disabled
-                    && !(missing && dim.missing == MissingScorePolicy::Skip);
+                let active = !dim.disabled && !(missing && dim.missing == MissingScorePolicy::Skip);
                 entries.push((normalized, dim.weight, active));
                 reports.push(DimensionScore {
                     id: dim.id.clone(),
@@ -308,11 +307,7 @@ impl Scorer {
     /// Combine one hit's per-dimension entries, filling each report's
     /// contribution (and the positive-value skips of the geometric and
     /// harmonic operations). A hit with no active dimension scores 0.
-    fn combine(
-        &self,
-        entries: &mut [(f64, f64, bool)],
-        reports: &mut [DimensionScore],
-    ) -> f64 {
+    fn combine(&self, entries: &mut [(f64, f64, bool)], reports: &mut [DimensionScore]) -> f64 {
         use CompositeScoreOperation as Op;
         match self.operation {
             Op::Unspecified => unreachable!("validated"),
@@ -345,9 +340,9 @@ impl Scorer {
                 for ((n, w, active), report) in entries.iter().zip(reports.iter_mut()) {
                     if *active {
                         report.contribution = w * n;
-                        best = Some(best.map_or(report.contribution, |b: f64| {
-                            b.max(report.contribution)
-                        }));
+                        best = Some(
+                            best.map_or(report.contribution, |b: f64| b.max(report.contribution)),
+                        );
                     }
                 }
                 best.unwrap_or(0.0)
@@ -418,7 +413,11 @@ fn source_name(source: &Source) -> String {
 /// pre-scorer score; a query signal is present exactly when the hit's
 /// `signals` provenance carries the id — the provenance surface and
 /// the scorer never disagree about what a document matched.
-fn raw_of(dim: &Dim, hit: &QueryHit, stored: &[std::collections::HashMap<u64, f64>]) -> Option<f64> {
+fn raw_of(
+    dim: &Dim,
+    hit: &QueryHit,
+    stored: &[std::collections::HashMap<u64, f64>],
+) -> Option<f64> {
     match &dim.source {
         Source::Base => Some(f64::from(hit.score)),
         Source::Query(id) => hit
@@ -453,7 +452,10 @@ impl Norm {
             ScoreNormalization::ZScore => {
                 let n = present.len() as f64;
                 if present.is_empty() {
-                    return Norm::ZScore { mean: 0.0, std: 0.0 };
+                    return Norm::ZScore {
+                        mean: 0.0,
+                        std: 0.0,
+                    };
                 }
                 let mean = present.iter().sum::<f64>() / n;
                 let var = present.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
@@ -578,7 +580,10 @@ mod tests {
 
     #[test]
     fn refuses_filter_and_unknown_sources() {
-        let s = scorer(CompositeScoreOperation::WeightedSum, vec![query_dim("d", "f")]);
+        let s = scorer(
+            CompositeScoreOperation::WeightedSum,
+            vec![query_dim("d", "f")],
+        );
         assert!(msg(validate(&s).unwrap_err()).contains("never contributes"));
         let s = scorer(
             CompositeScoreOperation::WeightedSum,
@@ -959,8 +964,7 @@ mod tests {
                         .iter()
                         .map(|(_, d)| d.contribution)
                         .fold(f64::NEG_INFINITY, f64::max),
-                    CompositeScoreOperation::Product
-                    | CompositeScoreOperation::GeometricMean => {
+                    CompositeScoreOperation::Product | CompositeScoreOperation::GeometricMean => {
                         active.iter().map(|(_, d)| d.contribution).product()
                     }
                     CompositeScoreOperation::HarmonicMean => {

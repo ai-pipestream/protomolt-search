@@ -11,13 +11,12 @@
 //!
 //! Invariants (enforced here, documented in the README):
 //!
-//! - ONE CALIBRATION per split/merge: the WAL manifest must carry a
-//!   locked calibration (a seeded shard), and merge requires
-//!   byte-identical calibrations AND identical bucket counts across all
-//!   inputs. Unseeded shards fit calibration from their own first batch,
-//!   so their scores are not comparable across buckets and
-//!   repartitioning them is meaningless — a hard error, like mixed
-//!   calibrations on `InstallSnapshot`.
+//! - ONE VECTOR CONFIGURATION per split/merge: the WAL manifest must carry
+//!   locked provider state, and merge requires byte-identical backend
+//!   configurations AND identical bucket counts across all
+//!   inputs. Provider state that cannot reproduce byte-comparable scores
+//!   cannot be resharded. This is a hard error, as is installing an image
+//!   whose scoring fingerprint differs from the active generation.
 //! - Ids are GENERATION-SCOPED: records carry the global ids the server
 //!   assigned; children re-assign dense local slots in original id order
 //!   and get their slot base from the new shard map, so parent ids never
@@ -30,11 +29,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use turbovec::TurboQuantIndex;
-
 use crate::pb::wal::wal_record;
 use crate::pb::{AddDocumentsRequest, AnalysisSpec};
 use crate::postings::{AnalyzedDoc, SpillBuilder};
+use crate::vector::VectorIndex;
 use crate::wal::{self, RecordReader, WalManifest};
 
 /// Text analyzer for rebuilding BM25 stores: a batch of (raw text, the
@@ -84,12 +82,12 @@ pub fn bucket_of(id: u64, n: usize) -> usize {
     (fnv1a64(id) >> shift) as usize
 }
 
-/// One built shard image: the `.tv` index, its optional `.bm25` sidecar,
+/// One built shard image: the opaque vector index, its optional `.bm25` sidecar,
 /// and the shard-map metadata the coordinator needs to route to it.
 #[derive(Debug)]
 pub struct ChildImage {
     /// The written index file.
-    pub tv_path: PathBuf,
+    pub vector_path: PathBuf,
     /// The written BM25 sidecar (absent when the child received no
     /// documents).
     pub bm25_path: Option<PathBuf>,
@@ -239,18 +237,21 @@ fn replay_buckets(
     Ok(())
 }
 
-/// Require a usable, locked calibration in the manifest (see the module
-/// docs for why unseeded logs cannot be resharded).
-fn require_calibration(manifest: &WalManifest, what: &Path) -> Result<(), String> {
+/// Require usable, locked provider state in the manifest (see the module
+/// docs for why incomplete provider state cannot be resharded).
+fn require_backend_config(manifest: &WalManifest, what: &Path) -> Result<(), String> {
     let dim = manifest.dim as usize;
-    if dim == 0
-        || manifest.calibration_shift.len() != dim
-        || manifest.calibration_scale.len() != dim
-    {
+    let config = manifest.backend_config();
+    let configured = config.as_ref().is_ok_and(|config| {
+        crate::vector::legacy_calibration_config(config)
+            .ok()
+            .flatten()
+            .is_none_or(|legacy| legacy.shift.len() == dim && legacy.scale.len() == dim)
+    });
+    if dim == 0 || !configured {
         return Err(format!(
-            "{}: WAL manifest carries no locked calibration (dim {}); resharding requires a \
-             seeded shard — an unseeded shard's calibration is fitted from its own first \
-             batch and its scores are not comparable across buckets",
+            "{}: WAL manifest carries no usable locked vector backend configuration (dim {}); \
+             resharding requires provider state that can reproduce byte-comparable shard scores",
             what.display(),
             manifest.dim
         ));
@@ -261,8 +262,8 @@ fn require_calibration(manifest: &WalManifest, what: &Path) -> Result<(), String
 /// Require full history: a generation whose manifest records preexisting
 /// state (an installed image, or logging enabled on an already-populated
 /// shard) does not contain everything the shard holds, and a log-only
-/// replay would silently drop that state. Hard error, like a missing
-/// calibration.
+/// replay would silently drop that state. Hard error, like missing provider
+/// configuration.
 fn require_complete_history(manifest: &WalManifest, what: &Path) -> Result<(), String> {
     if manifest.preexisting_vectors > 0 || manifest.preexisting_documents > 0 {
         return Err(format!(
@@ -285,9 +286,7 @@ fn require_complete_history(manifest: &WalManifest, what: &Path) -> Result<(), S
 /// under ONE plan — contradictory bindings mean the inputs were mapped
 /// under different plans and their columns must not merge. `None` when
 /// no input was ever bound (hand-built columns bind nothing).
-fn read_gens_binding(
-    gens: &[PathBuf],
-) -> Result<Option<crate::postings::StoredBinding>, String> {
+fn read_gens_binding(gens: &[PathBuf]) -> Result<Option<crate::postings::StoredBinding>, String> {
     let mut bound: Option<(crate::postings::StoredBinding, PathBuf)> = None;
     for gen in gens {
         let path = wal::markers_path(gen);
@@ -327,17 +326,14 @@ fn read_gens_binding(
     Ok(bound.map(|(binding, _)| binding))
 }
 
-/// Calibration identity for the merge check (slot offset and generation
-/// legitimately differ between inputs; the shape and calibration must not).
-fn same_calibration(a: &WalManifest, b: &WalManifest) -> bool {
-    a.dim == b.dim
-        && a.bit_width == b.bit_width
-        && a.calibration_shift == b.calibration_shift
-        && a.calibration_scale == b.calibration_scale
+/// Provider scoring identity for the merge check (slot offset and generation
+/// legitimately differ between inputs; the shape and provider state must not).
+fn same_backend_config(a: &WalManifest, b: &WalManifest) -> bool {
+    a.dim == b.dim && a.backend_config().ok() == b.backend_config().ok()
 }
 
 /// Build one child image from its share of the replay: the vector index
-/// (seeded with the manifest calibration, vectors in id order), the BM25
+/// (constructed from manifest provider state, vectors in id order), the BM25
 /// sidecar from the documents, and the two output files.
 ///
 /// Document local ids mirror the vector side's dense remap: a document
@@ -348,36 +344,32 @@ fn build_child(
     manifest: &WalManifest,
     vectors: Vec<(u64, Vec<f32>)>,
     documents: Vec<(u64, AddDocumentsRequest)>,
-    tv_path: &Path,
+    vector_path: &Path,
     bm25_fields: Option<&[String]>,
     binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let dim = manifest.dim as usize;
-    // An empty manifest pair means the parent was uncalibrated; the
-    // child is then uncalibrated too, which from_parts expresses as
-    // empty TQ+ arrays.
-    let mut index = TurboQuantIndex::from_parts(
-        Some(dim),
-        manifest.bit_width as usize,
-        0,
-        Vec::new(),
-        Vec::new(),
-        manifest.calibration_shift.clone(),
-        manifest.calibration_scale.clone(),
-    )
-    .map_err(|e| format!("construct child index: {e}"))?;
+    let backend_config = manifest
+        .backend_config()
+        .map_err(|e| format!("construct child backend config: {e}"))?;
+    let mut index = VectorIndex::from_backend_config(dim, &backend_config)
+        .map_err(|e| format!("construct child index: {e}"))?;
     let mut parent_ids = Vec::with_capacity(vectors.len());
     let mut flat = Vec::with_capacity(vectors.len() * dim);
     for (id, vector) in &vectors {
         parent_ids.push(*id);
         flat.extend_from_slice(vector);
     }
-    index.add(&flat);
-    index.prepare();
     index
-        .write(tv_path)
-        .map_err(|e| format!("write {}: {e}", tv_path.display()))?;
+        .add(&flat, dim)
+        .map_err(|e| format!("add child vectors: {e}"))?;
+    index
+        .prepare()
+        .map_err(|e| format!("prepare child index: {e}"))?;
+    index
+        .write(vector_path)
+        .map_err(|e| format!("write {}: {e}", vector_path.display()))?;
 
     // parent id -> child local slot, for the document remap.
     let slot_of: BTreeMap<u64, u32> = parent_ids
@@ -508,7 +500,7 @@ fn build_child(
         };
         // Children rebuild through the disk spiller for the same reason
         // nodes do: a full-scale child's postings do not fit in heap.
-        let path = crate::node::bm25_sidecar_path(tv_path);
+        let path = crate::node::bm25_sidecar_path(vector_path);
         let mut spill_dir = path.as_os_str().to_owned();
         spill_dir.push(".build");
         let spill_dir = std::path::PathBuf::from(spill_dir);
@@ -516,8 +508,7 @@ fn build_child(
         let facet_names: Vec<&str> = facet_table.iter().map(String::as_str).collect();
         let numeric_names: Vec<&str> = numeric_table.iter().map(String::as_str).collect();
         let map_facet_names: Vec<&str> = map_facet_table.iter().map(String::as_str).collect();
-        let map_numeric_names: Vec<&str> =
-            map_numeric_table.iter().map(String::as_str).collect();
+        let map_numeric_names: Vec<&str> = map_numeric_table.iter().map(String::as_str).collect();
         let integer_names: Vec<&str> = integer_table.iter().map(String::as_str).collect();
         let geo_names: Vec<&str> = geo_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
@@ -670,7 +661,7 @@ fn build_child(
     }
 
     Ok(ChildImage {
-        tv_path: tv_path.to_path_buf(),
+        vector_path: vector_path.to_path_buf(),
         bm25_path,
         slot_offset: 0, // filled in by the caller
         hash_lo: 0,
@@ -682,7 +673,8 @@ fn build_child(
 }
 
 /// Assemble one child: replay its vectors/documents into an image under
-/// `out_dir` named `shard-<ordinal>.tv`.
+/// `out_dir` named `shard-<ordinal>.vector`.
+#[allow(clippy::too_many_arguments)]
 fn finish_child(
     manifest: &WalManifest,
     replay: Replay,
@@ -695,18 +687,18 @@ fn finish_child(
     binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
-    let tv_path = out_dir.join(format!("shard-{ordinal}.tv"));
+    let vector_path = out_dir.join(format!("shard-{ordinal}.vector"));
     eprintln!(
         "reshard: child {ordinal}: {} vectors, {} documents -> {}",
         replay.vectors.len(),
         replay.documents.len(),
-        tv_path.display()
+        vector_path.display()
     );
     let mut child = build_child(
         manifest,
         replay.vectors.into_iter().collect(),
         replay.documents.into_iter().collect(),
-        &tv_path,
+        &vector_path,
         bm25_fields,
         binding,
         analyze,
@@ -730,6 +722,7 @@ fn finish_child(
 /// `slot_offset = slot_base + i * slot_stride` (stride defaults to 25M
 /// in the example, matching deploy/court-e2e) and dense local slots in
 /// original id order.
+#[allow(clippy::too_many_arguments)]
 pub fn split(
     gen: &Path,
     n: usize,
@@ -760,9 +753,10 @@ pub fn split(
 /// shards never collide (disjoint slot ranges), so the per-child replay
 /// map assembles the union in id order for free.
 ///
-/// All inputs must carry byte-identical calibrations and one bucket
+/// All inputs must carry byte-identical provider configurations and one bucket
 /// geometry, and be full-history — the same preconditions as
 /// [`merge`], enforced the same way.
+#[allow(clippy::too_many_arguments)]
 pub fn split_logs(
     gens: &[PathBuf],
     n: usize,
@@ -783,12 +777,12 @@ pub fn split_logs(
     let mut top_generation = manifest.generation;
     for gen in gens {
         let m = read_gen_manifest(gen)?;
-        require_calibration(&m, gen)?;
+        require_backend_config(&m, gen)?;
         require_complete_history(&m, gen)?;
-        if !same_calibration(&manifest, &m) {
+        if !same_backend_config(&manifest, &m) {
             return Err(format!(
-                "{}: calibration differs from the first input; split/merge is only \
-                 defined within ONE calibration",
+                "{}: vector backend configuration differs from the first input; \
+                 split/merge requires one scoring configuration",
                 gen.display()
             ));
         }
@@ -864,8 +858,8 @@ pub fn split_logs(
             )?;
         }
         let shift = 64 - n.trailing_zeros();
-        let mut buckets: Vec<(Vec<(u64, Vec<f32>)>, Vec<(u64, AddDocumentsRequest)>)> =
-            (0..n).map(|_| (Vec::new(), Vec::new())).collect();
+        type ReshardBucket = (Vec<(u64, Vec<f32>)>, Vec<(u64, AddDocumentsRequest)>);
+        let mut buckets: Vec<ReshardBucket> = (0..n).map(|_| (Vec::new(), Vec::new())).collect();
         for (id, vector) in replay.vectors {
             buckets[bucket_of(id, n)].0.push((id, vector));
         }
@@ -903,8 +897,8 @@ pub fn split_logs(
 }
 
 /// Merge several shards' WAL generations into ONE image. All inputs must
-/// carry byte-identical calibrations AND identical bucket counts
-/// (split/merge only within one calibration and one bucket geometry);
+/// carry byte-identical provider configurations AND identical bucket counts
+/// (split/merge only within one scoring configuration and bucket geometry);
 /// records replay bucket-by-bucket in global id order across all inputs.
 /// The child's slot base defaults to the lowest input slot offset. Its
 /// hash range is the full range: the merge inputs' ranges are not
@@ -924,13 +918,13 @@ pub fn merge(
     let mut manifests = Vec::with_capacity(gens.len());
     for gen in gens {
         let manifest = read_gen_manifest(gen)?;
-        require_calibration(&manifest, gen)?;
+        require_backend_config(&manifest, gen)?;
         require_complete_history(&manifest, gen)?;
         if let Some(first) = manifests.first() {
-            if !same_calibration(first, &manifest) {
+            if !same_backend_config(first, &manifest) {
                 return Err(format!(
-                    "{}: calibration differs from the first input; split/merge is only \
-                     defined within ONE calibration",
+                    "{}: vector backend configuration differs from the first input; \
+                     split/merge requires one scoring configuration",
                     gen.display()
                 ));
             }
@@ -1013,7 +1007,7 @@ pub fn shards_toml(out: &ReshardOutput) -> String {
         s.push_str(&format!(
             "[[shards]]\nlisten = \"0.0.0.0:50051\"  # TODO: one listener per child\nindex = \
              \"{}\"\nslot_offset = {}\n",
-            child.tv_path.display(),
+            child.vector_path.display(),
             child.slot_offset
         ));
     }

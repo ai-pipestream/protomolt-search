@@ -2,7 +2,8 @@
 //!
 //! Precedence (highest wins): CLI flag, then environment variable, then
 //! config file, then built-in default. `--config <path>` (or
-//! `TURBOVEC_CONFIG`) selects the file; every other flag is `--key=value`.
+//! `PIPESTREAM_SEARCH_CONFIG`) selects the file; every other flag is
+//! `--key=value`. Legacy `TURBOVEC_*` environment names remain fallbacks.
 //!
 //! Membership is STATIC: the coordinator's node list and each node's shard
 //! set are fixed at startup. There is no discovery, re-sharding, or
@@ -22,7 +23,7 @@
 //!
 //! [[shards]]                           # shards this process owns/serves
 //! listen = "0.0.0.0:50051"
-//! index = "/data/turbovec/shard-0.tv"
+//! index = "/data/search/shard-0.vector"
 //! slot_offset = 0
 //! ```
 
@@ -62,7 +63,9 @@ pub struct DemoConfig {
 pub struct ShardConfig {
     /// Listen address for this shard's `NodeService`.
     pub listen: SocketAddr,
-    /// Path to a `.tv` index file. Mutually exclusive with `demo`.
+    /// Vector provider used to load or construct this shard.
+    pub vector_backend: String,
+    /// Path to a provider-owned vector image. Mutually exclusive with `demo`.
     pub index_path: Option<PathBuf>,
     /// Build a random demo index instead of loading one.
     pub demo: Option<DemoConfig>,
@@ -266,6 +269,7 @@ struct FileConfig {
     demo_vectors: Option<usize>,
     dim: Option<usize>,
     bit_width: Option<usize>,
+    vector_backend: Option<String>,
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
     block_max: Option<bool>,
@@ -308,6 +312,7 @@ struct FileConfig {
 #[serde(default)]
 struct FileShard {
     listen: Option<String>,
+    vector_backend: Option<String>,
     index: Option<String>,
     slot_offset: Option<u64>,
     demo_vectors: Option<usize>,
@@ -338,7 +343,15 @@ fn flag_present(args: &[String], key: &str) -> bool {
 
 /// CLI > env > file, for string-valued options.
 fn opt(args: &[String], key: &str, env: &str, file: Option<&str>) -> Option<String> {
+    let neutral_env = env
+        .strip_prefix("TURBOVEC_")
+        .map(|suffix| format!("PIPESTREAM_SEARCH_{suffix}"));
     arg_value(args, key)
+        .or_else(|| {
+            neutral_env
+                .as_deref()
+                .and_then(|name| std::env::var(name).ok())
+        })
         .or_else(|| std::env::var(env).ok())
         .or_else(|| file.map(str::to_string))
 }
@@ -457,6 +470,13 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     .unwrap_or_else(|| "4".to_string())
     .parse::<usize>()
     .map_err(|e| format!("invalid bit width: {e}"))?;
+    let vector_backend = opt(
+        args,
+        "vector-backend",
+        "TURBOVEC_VECTOR_BACKEND",
+        file.vector_backend.as_deref(),
+    )
+    .unwrap_or_else(|| crate::vector::EMBEDDED_TURBOVEC.to_string());
 
     // Shard set. CLI --index/--demo-vectors (with --node-listen and
     // --slot-offset) describes a single shard and overrides the file's
@@ -572,6 +592,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .transpose()?;
         vec![ShardConfig {
             listen,
+            vector_backend: vector_backend.clone(),
             wal: wal_default && demo.is_none(),
             wal_buckets: wal_buckets_default,
             vocab: vocab_default && demo.is_none(),
@@ -603,6 +624,10 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                 }
                 Ok(ShardConfig {
                     listen,
+                    vector_backend: shard
+                        .vector_backend
+                        .clone()
+                        .unwrap_or_else(|| vector_backend.clone()),
                     wal: shard.wal.unwrap_or(wal_default) && demo.is_none(),
                     wal_buckets: parse_buckets(
                         shard.wal_buckets.unwrap_or(wal_buckets_default),
@@ -755,7 +780,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     .unwrap_or(MAX_MESSAGE_BYTES);
 
     let demo_query = flag_present(args, "demo-query")
-        || std::env::var("TURBOVEC_DEMO_QUERY")
+        || std::env::var("PIPESTREAM_SEARCH_DEMO_QUERY")
+            .or_else(|_| std::env::var("TURBOVEC_DEMO_QUERY"))
             .map(|s| parse_env_bool(&s))
             .unwrap_or(false)
         || file.demo_query.unwrap_or(false);
@@ -794,13 +820,15 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     };
 
     let stream_search = flag_present(args, "stream-search")
-        || std::env::var("TURBOVEC_STREAM_SEARCH")
+        || std::env::var("PIPESTREAM_SEARCH_STREAM_SEARCH")
+            .or_else(|_| std::env::var("TURBOVEC_STREAM_SEARCH"))
             .map(|s| parse_env_bool(&s))
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
 
     let bm25_stream = flag_present(args, "bm25-stream")
-        || std::env::var("TURBOVEC_BM25_STREAM")
+        || std::env::var("PIPESTREAM_SEARCH_BM25_STREAM")
+            .or_else(|_| std::env::var("TURBOVEC_BM25_STREAM"))
             .map(|s| parse_env_bool(&s))
             .unwrap_or(false)
         || file.bm25_stream.unwrap_or(false);
@@ -1086,6 +1114,10 @@ mod tests {
         assert_eq!(cfg.shards[0].slot_offset, 20000);
         assert_eq!(cfg.chunk_blocks, 8);
         assert_eq!(cfg.shards[0].demo.unwrap().vectors, 1000);
+        assert_eq!(
+            cfg.shards[0].vector_backend,
+            crate::vector::EMBEDDED_TURBOVEC
+        );
         assert!(cfg.share_floors);
         assert_eq!(cfg.max_message_bytes, MAX_MESSAGE_BYTES);
     }
@@ -1103,6 +1135,42 @@ mod tests {
     }
 
     #[test]
+    fn vector_backend_is_provider_neutral_and_can_vary_per_shard() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        let path = dir.join(format!(
+            "pipestream_search_backends_{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+role = "node"
+vector_backend = "default-provider"
+
+[[shards]]
+index = "/data/a.vector"
+
+[[shards]]
+index = "/data/b.vector"
+vector_backend = "shard-provider"
+"#,
+        )
+        .unwrap();
+        let cfg = parse(&args(&[&format!("--config={}", path.display())])).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(cfg.shards[0].vector_backend, "default-provider");
+        assert_eq!(cfg.shards[1].vector_backend, "shard-provider");
+
+        let cli = parse(&args(&[
+            "--role=node",
+            "--index=/data/c.vector",
+            "--vector-backend=cli-provider",
+        ]))
+        .unwrap();
+        assert_eq!(cli.shards[0].vector_backend, "cli-provider");
+    }
+
+    #[test]
     fn node_requires_a_shard() {
         assert!(parse(&args(&["--role=node"])).is_err());
         assert!(parse(&args(&[
@@ -1116,7 +1184,7 @@ mod tests {
     #[test]
     fn toml_file_multi_shard() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
-        let path = dir.join(format!("turbovec_search_cfg_{}.toml", std::process::id()));
+        let path = dir.join(format!("pipestream_search_cfg_{}.toml", std::process::id()));
         std::fs::write(
             &path,
             r#"
@@ -1163,7 +1231,7 @@ slot_offset = 20000
     #[test]
     fn cli_overrides_file() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
-        let path = dir.join(format!("turbovec_search_ovr_{}.toml", std::process::id()));
+        let path = dir.join(format!("pipestream_search_ovr_{}.toml", std::process::id()));
         std::fs::write(
             &path,
             "role = \"node\"\nchunk_blocks = 16\n\n[[shards]]\nindex = \"/data/a.tv\"\n",
@@ -1182,7 +1250,7 @@ slot_offset = 20000
     #[test]
     fn file_shard_needs_exactly_one_source() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
-        let path = dir.join(format!("turbovec_search_bad_{}.toml", std::process::id()));
+        let path = dir.join(format!("pipestream_search_bad_{}.toml", std::process::id()));
         std::fs::write(&path, "role = \"node\"\n\n[[shards]]\nslot_offset = 7\n").unwrap();
         let result = parse(&args(&[&format!("--config={}", path.display())]));
         let _ = std::fs::remove_file(&path);

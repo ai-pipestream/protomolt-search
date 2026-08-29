@@ -12,10 +12,10 @@
 //!          --query="qualified immunity"
 //! ```
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::analyzer;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{
     AnalysisSpec, Bm25SearchRequest, FusionMode, GetDocumentsRequest, HybridLegOptions,
     HybridSearchRequest, QueryField, SearchRequest,
 };
@@ -28,7 +28,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn body_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 /// Fetch stored text for global doc ids, asking each id's owning shard.

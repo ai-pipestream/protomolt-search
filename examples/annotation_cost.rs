@@ -9,9 +9,11 @@
 //! ```text
 //! annotation_cost --addr=http://127.0.0.1:59202 --chunks=/path/to.ndjson --n=200
 //! ```
+use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
+use pipestream_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, TermVectorOptions};
 use std::time::Instant;
-use turbovec_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use turbovec_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, TermVectorOptions};
+
+type LayerToggle = fn(&mut AnalysisOptions);
 
 fn arg(key: &str, default: &str) -> String {
     let p = format!("--{key}=");
@@ -23,7 +25,7 @@ fn arg(key: &str, default: &str) -> String {
 /// The corpus analyzer's own term-vector options, so the baseline here
 /// is the cost the index build actually pays rather than a stand-in.
 fn base() -> AnalysisOptions {
-    let spec = turbovec_search::analyzer::body_spec();
+    let spec = pipestream_search::analyzer::body_spec();
     AnalysisOptions {
         language: "en".into(),
         tokenizer: spec.tokenizer,
@@ -97,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use std::io::BufRead;
         let f = std::io::BufReader::new(std::fs::File::open(&path)?);
         f.lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .filter_map(|l| {
                 let v: serde_json::Value = serde_json::from_str(&l).ok()?;
                 let t = v.get("text")?.as_str()?.to_string();
@@ -106,9 +108,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .take(n)
             .collect()
     };
-    println!("{} chunks, mean {} bytes", texts.len(), texts.iter().map(String::len).sum::<usize>() / texts.len().max(1));
+    println!(
+        "{} chunks, mean {} bytes",
+        texts.len(),
+        texts.iter().map(String::len).sum::<usize>() / texts.len().max(1)
+    );
 
-    let layers: Vec<(&str, fn(&mut AnalysisOptions))> = vec![
+    let layers: Vec<(&str, LayerToggle)> = vec![
         ("term_vectors only (baseline)", |_| {}),
         ("+ sentence_detection", |o| o.sentence_detection = true),
         ("+ pos_tags", |o| o.pos_tags = true),
@@ -140,14 +146,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // baseline every ratio divides by.
     for t in texts.iter().cycle().take(60) {
         let _ = client
-            .analyze(AnalyzeRequest { text: t.clone(), options: Some(base()) })
+            .analyze(AnalyzeRequest {
+                text: t.clone(),
+                options: Some(base()),
+            })
             .await;
     }
 
     let (baseline_ms, _, base_out) = measure(&mut client, base(), &texts).await;
-    println!("\n{:<30}{:>10}{:>9}{:>11}{:>12}", "layer", "ms/chunk", "vs base", "per 86.6M", "annots/chunk");
-    println!("{:<30}{:>10.2}{:>9}{:>10.1}h{:>12.1}", "term_vectors only (baseline)", baseline_ms, "1.00x",
-             baseline_ms / 1000.0 * 86_633_399.0 / 3600.0, base_out as f64 / texts.len() as f64);
+    println!(
+        "\n{:<30}{:>10}{:>9}{:>11}{:>12}",
+        "layer", "ms/chunk", "vs base", "per 86.6M", "annots/chunk"
+    );
+    println!(
+        "{:<30}{:>10.2}{:>9}{:>10.1}h{:>12.1}",
+        "term_vectors only (baseline)",
+        baseline_ms,
+        "1.00x",
+        baseline_ms / 1000.0 * 86_633_399.0 / 3600.0,
+        base_out as f64 / texts.len() as f64
+    );
 
     let mut notes: Vec<String> = Vec::new();
     for (name, apply) in layers.iter().skip(1) {
@@ -160,9 +178,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let gained = out.saturating_sub(base_out) as f64 / texts.len() as f64;
-        let flag = if gained < 0.01 { "  <- PRODUCED NOTHING" } else { "" };
-        println!("{:<30}{:>10.2}{:>9.2}x{:>10.1}h{:>12.1}{}", name, per, per / baseline_ms,
-                 per / 1000.0 * 86_633_399.0 / 3600.0, gained, flag);
+        let flag = if gained < 0.01 {
+            "  <- PRODUCED NOTHING"
+        } else {
+            ""
+        };
+        println!(
+            "{:<30}{:>10.2}{:>9.2}x{:>10.1}h{:>12.1}{}",
+            name,
+            per,
+            per / baseline_ms,
+            per / 1000.0 * 86_633_399.0 / 3600.0,
+            gained,
+            flag
+        );
     }
 
     // Re-measure the baseline last. If it moved, the run drifted and no

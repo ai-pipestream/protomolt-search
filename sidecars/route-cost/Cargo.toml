@@ -10,7 +10,7 @@ rust-version = "1.96"
 description = "Batch travel-cost enrichment sidecar: (anchors x points) -> cost records via routee-compass"
 license = "BSD-3-Clause"
 
-# Deliberately NOT a workspace member of turbovec-search: the engine
+# Deliberately NOT a workspace member of pipestream-search: the engine
 # takes no routing dependency (docs/plans/routing-enrichment.md). This
 # crate builds on its own, with its own lockfile and target directory.
 

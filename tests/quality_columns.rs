@@ -12,17 +12,17 @@
 
 mod common;
 
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
+    AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, NumericValue, QualitySpec, ScoreOp,
+    ScoreStage,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
-    AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, NumericValue, QualitySpec,
-    ScoreOp, ScoreStage,
-};
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -59,10 +59,7 @@ fn quality_doc(text: &str, spec: Option<QualitySpec>) -> AddDocumentsRequest {
     }
 }
 
-async fn add_docs(
-    addr: &str,
-    docs: Vec<AddDocumentsRequest>,
-) -> Result<(), tonic::Status> {
+async fn add_docs(addr: &str, docs: Vec<AddDocumentsRequest>) -> Result<(), tonic::Status> {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(64);
     for doc in docs {
@@ -140,7 +137,11 @@ async fn derived_columns_hold_the_predicted_measurements() {
     for (filter, want, why) in [
         ("", vec![0, 1, 2, 3], "unfiltered baseline"),
         ("noise >= 0.4", vec![1, 2], "worst-finding score"),
-        ("noise == 1.0", vec![2], "the cap: 10 '#'s score exactly 1.0"),
+        (
+            "noise == 1.0",
+            vec![2],
+            "the cap: 10 '#'s score exactly 1.0",
+        ),
         ("noise_chars > 4", vec![2], "3 + 10 damaged chars"),
         ("noise_chars == 4", vec![1], "one four-char finding"),
         ("artifacts == 2", vec![3], "two U+FFFD replacements"),
@@ -227,9 +228,12 @@ async fn a_blank_spec_asks_for_nothing() {
         ..Default::default()
     })
     .await;
-    add_docs(&addr, vec![quality_doc("rust text", Some(QualitySpec::default()))])
-        .await
-        .unwrap();
+    add_docs(
+        &addr,
+        vec![quality_doc("rust text", Some(QualitySpec::default()))],
+    )
+    .await
+    .unwrap();
 }
 
 /// The derived values take the ordinary column path, so the ordinary

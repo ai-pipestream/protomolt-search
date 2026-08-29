@@ -175,7 +175,12 @@ impl CountMinSketch {
 
     /// Restores a sketch from [`Self::to_bytes`] output, with the total
     /// occurrence count carried alongside the table.
-    pub fn from_bytes(depth: usize, width: usize, bytes: &[u8], total: u64) -> Result<Self, String> {
+    pub fn from_bytes(
+        depth: usize,
+        width: usize,
+        bytes: &[u8],
+        total: u64,
+    ) -> Result<Self, String> {
         let sketch = Self::with_shape(depth, width);
         if bytes.len() != sketch.table.len() * 8 {
             return Err(format!(
@@ -528,10 +533,8 @@ impl WindowState {
         );
         state.documents = snapshot.documents;
         state.occurrences = snapshot.term_occurrences;
-        state.hyper_log_log = HyperLogLog::from_bytes(
-            snapshot.hll_precision as usize,
-            &snapshot.hll_registers,
-        )?;
+        state.hyper_log_log =
+            HyperLogLog::from_bytes(snapshot.hll_precision as usize, &snapshot.hll_registers)?;
         state.count_min = CountMinSketch::from_bytes(
             snapshot.cms_depth as usize,
             snapshot.cms_width as usize,
@@ -558,9 +561,17 @@ impl WindowState {
         // Re-run space-saving over the combined lists: each list's counts
         // are near-exact for its own heaviest terms, and their per-term
         // sums are the best estimate of the combined distribution's head.
-        let capacity = self.heavy_hitters.capacity().max(other.heavy_hitters.capacity());
+        let capacity = self
+            .heavy_hitters
+            .capacity()
+            .max(other.heavy_hitters.capacity());
         let mut combined: HashMap<String, u64> = HashMap::new();
-        for entry in self.heavy_hitters.snapshot().into_iter().chain(other.heavy_hitters.snapshot()) {
+        for entry in self
+            .heavy_hitters
+            .snapshot()
+            .into_iter()
+            .chain(other.heavy_hitters.snapshot())
+        {
             *combined.entry(entry.term).or_insert(0) += entry.count;
         }
         let mut entries: Vec<HeavyHitter> = combined
@@ -900,8 +911,7 @@ fn parse_snapshot_name(name: &str) -> Option<(u64, i64)> {
 /// Reads and decodes one persisted snapshot.
 pub fn load_snapshot_file(path: &Path) -> Result<VocabSnapshot, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    VocabSnapshot::decode(bytes.as_slice())
-        .map_err(|e| format!("decode {}: {e}", path.display()))
+    VocabSnapshot::decode(bytes.as_slice()).map_err(|e| format!("decode {}: {e}", path.display()))
 }
 
 /// Read-only scan of a snapshot directory (the offline-tooling counterpart
@@ -1185,9 +1195,8 @@ impl VocabularyListener {
         let file_name = format!("snapshot-{}-{sealed_millis}.pb", guard.next_sequence);
         let target = self.vocab_dir.join(&file_name);
         let temp = self.vocab_dir.join(format!("{file_name}.tmp"));
-        let persisted = std::fs::write(&temp, snapshot.encode_to_vec()).and_then(|()| {
-            std::fs::rename(&temp, &target)
-        });
+        let persisted = std::fs::write(&temp, snapshot.encode_to_vec())
+            .and_then(|()| std::fs::rename(&temp, &target));
         if let Err(e) = persisted {
             eprintln!(
                 "vocab: could not persist snapshot {}; the window continues instead of \
@@ -1204,9 +1213,7 @@ impl VocabularyListener {
             sealed_epoch_millis: snapshot.sealed_epoch_millis,
             documents,
         };
-        guard
-            .files_by_sequence
-            .insert(guard.next_sequence, target);
+        guard.files_by_sequence.insert(guard.next_sequence, target);
         eprintln!(
             "vocab: snapshot {} sealed ({} documents, {})",
             meta.name, documents, reason
@@ -1248,9 +1255,7 @@ fn locate_snapshot(guard: &Inner, reference: &str) -> Option<PathBuf> {
 /// sketches are parsed and immediately dropped; they are loaded again when
 /// a drift request names the snapshot. An unreadable snapshot is skipped
 /// with a warning: one corrupt file must not disable the listener.
-fn scan_snapshots(
-    vocab_dir: &Path,
-) -> io::Result<(Vec<SnapshotMeta>, HashMap<u64, PathBuf>, u64)> {
+fn scan_snapshots(vocab_dir: &Path) -> io::Result<(Vec<SnapshotMeta>, HashMap<u64, PathBuf>, u64)> {
     let mut found = Vec::new();
     let mut files = HashMap::new();
     for entry in std::fs::read_dir(vocab_dir)? {
@@ -1281,14 +1286,20 @@ fn scan_snapshots(
                 });
                 files.insert(snapshot.sequence, path);
             }
-            Err(e) => eprintln!("vocab: skipping unreadable snapshot {}: {e}", path.display()),
+            Err(e) => eprintln!(
+                "vocab: skipping unreadable snapshot {}: {e}",
+                path.display()
+            ),
         }
     }
     found.sort_by_key(|meta| meta.sequence);
-    let next_sequence = found.iter().map(|meta| meta.sequence).max().map_or(0, |max| max + 1);
+    let next_sequence = found
+        .iter()
+        .map(|meta| meta.sequence)
+        .max()
+        .map_or(0, |max| max + 1);
     Ok((found, files, next_sequence))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1328,17 +1339,17 @@ mod tests {
     }
 
     fn channel_drift(drift: &[ChannelDrift], channel: VocabChannel) -> &DriftMetrics {
-        &drift
-            .iter()
-            .find(|d| d.channel == channel)
-            .unwrap()
-            .metrics
+        &drift.iter().find(|d| d.channel == channel).unwrap().metrics
     }
 
     // ---- Count-min sketch (mirrors CountMinSketchTest) ----
 
     /// A Zipf-ish stream: term i occurs ~1/i of the lead term's count.
-    fn skewed_stream(sketch: &mut CountMinSketch, distinct: usize, lead_count: u64) -> Vec<(String, u64)> {
+    fn skewed_stream(
+        sketch: &mut CountMinSketch,
+        distinct: usize,
+        lead_count: u64,
+    ) -> Vec<(String, u64)> {
         let mut truth = Vec::new();
         for i in 1..=distinct {
             let term = format!("term-{i}");
@@ -1390,7 +1401,10 @@ mod tests {
         left.merge(&right).unwrap();
 
         for i in 0..500 {
-            assert_eq!(left.estimate(&format!("term-{i}")), all.estimate(&format!("term-{i}")));
+            assert_eq!(
+                left.estimate(&format!("term-{i}")),
+                all.estimate(&format!("term-{i}"))
+            );
         }
         assert_eq!(left.total_count(), all.total_count());
     }
@@ -1438,7 +1452,10 @@ mod tests {
     #[test]
     fn hll_cardinality_at_100k_distinct() {
         let estimate = hll_filled("term-", 100_000).estimate();
-        assert!((0.95..=1.05).contains(&(estimate / 100_000.0)), "{estimate}");
+        assert!(
+            (0.95..=1.05).contains(&(estimate / 100_000.0)),
+            "{estimate}"
+        );
     }
 
     #[test]
@@ -1513,11 +1530,7 @@ mod tests {
         assert_eq!(hitters.estimate("alpha"), 7);
         assert_eq!(hitters.estimate("beta"), 2);
         assert_eq!(hitters.estimate("gamma"), 0);
-        let terms: Vec<String> = hitters
-            .snapshot()
-            .into_iter()
-            .map(|e| e.term)
-            .collect();
+        let terms: Vec<String> = hitters.snapshot().into_iter().map(|e| e.term).collect();
         assert_eq!(terms, ["alpha", "beta"]);
     }
 
@@ -1624,7 +1637,11 @@ mod tests {
         }
         let older = listener.snapshot_now().unwrap().name;
         for _ in 0..5 {
-            feed_terms(&listener, &[("gamma", 2), ("delta", 1)], &["gamma", "delta"]);
+            feed_terms(
+                &listener,
+                &[("gamma", 2), ("delta", 1)],
+                &["gamma", "delta"],
+            );
         }
 
         let drift = listener.drift(&older, LIVE, None).unwrap();
@@ -1800,17 +1817,21 @@ mod tests {
         let listener_a = VocabularyListener::create(&dir_a, 1_000, 8).unwrap();
         let listener_b = VocabularyListener::create(&dir_b, 1_000, 8).unwrap();
         for _ in 0..3 {
-            feed_terms(&listener_a, &[("alpha", 2), ("beta", 1)], &["alpha", "beta"]);
-            feed_terms(&listener_b, &[("alpha", 1), ("gamma", 5)], &["alpha", "gamma"]);
+            feed_terms(
+                &listener_a,
+                &[("alpha", 2), ("beta", 1)],
+                &["alpha", "beta"],
+            );
+            feed_terms(
+                &listener_b,
+                &[("alpha", 1), ("gamma", 5)],
+                &["alpha", "gamma"],
+            );
         }
-        let snap_a = load_snapshot_file(
-            &dir_a.join(listener_a.snapshot_now().unwrap().name),
-        )
-        .unwrap();
-        let snap_b = load_snapshot_file(
-            &dir_b.join(listener_b.snapshot_now().unwrap().name),
-        )
-        .unwrap();
+        let snap_a =
+            load_snapshot_file(&dir_a.join(listener_a.snapshot_now().unwrap().name)).unwrap();
+        let snap_b =
+            load_snapshot_file(&dir_b.join(listener_b.snapshot_now().unwrap().name)).unwrap();
 
         let merged = merge_snapshots(&[snap_a, snap_b]).unwrap();
         let terms = merged

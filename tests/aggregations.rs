@@ -6,17 +6,17 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, FacetValue, IntegerValue,
     NumericValue, QueryField,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -31,15 +31,45 @@ struct Doc {
 /// heterogeneous fleet). d4 does not match the probe term.
 const SHARDS: [&[Doc]; 3] = [
     &[
-        Doc { text: "rust alpha", court: Some("scotus"), score: Some(1.5), year: Some(1990) },
-        Doc { text: "rust beta", court: Some("ca5"), score: Some(2.5), year: None },
-        Doc { text: "rust", court: None, score: None, year: None },
+        Doc {
+            text: "rust alpha",
+            court: Some("scotus"),
+            score: Some(1.5),
+            year: Some(1990),
+        },
+        Doc {
+            text: "rust beta",
+            court: Some("ca5"),
+            score: Some(2.5),
+            year: None,
+        },
+        Doc {
+            text: "rust",
+            court: None,
+            score: None,
+            year: None,
+        },
     ],
     &[
-        Doc { text: "rust gamma", court: Some("scotus"), score: Some(0.5), year: Some(2000) },
-        Doc { text: "other doc", court: Some("ca9"), score: Some(9.9), year: Some(1900) },
+        Doc {
+            text: "rust gamma",
+            court: Some("scotus"),
+            score: Some(0.5),
+            year: Some(2000),
+        },
+        Doc {
+            text: "other doc",
+            court: Some("ca9"),
+            score: Some(9.9),
+            year: Some(1900),
+        },
     ],
-    &[Doc { text: "rust delta", court: None, score: None, year: None }],
+    &[Doc {
+        text: "rust delta",
+        court: None,
+        score: None,
+        year: None,
+    }],
 ];
 
 async fn start() -> (
@@ -172,7 +202,10 @@ async fn stats_and_cardinality_aggregate_the_match_set() {
     .unwrap();
     assert_eq!(resp.hits.len(), 1, "only d3 has year >= 1995");
     let score = &resp.stats[0];
-    assert_eq!((score.count, score.min, score.max, score.sum), (1, 0.5, 0.5, 0.5));
+    assert_eq!(
+        (score.count, score.min, score.max, score.sum),
+        (1, 0.5, 0.5, 0.5)
+    );
     assert_eq!(resp.cardinality[0].cardinality, 1, "only scotus remains");
 }
 

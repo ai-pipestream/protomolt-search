@@ -1,16 +1,16 @@
 //! Offline resharding tool: replay a shard's write-ahead log to split it
 //! into N child images or merge several shards' logs into one image —
 //! split/merge as replay-from-log, with no re-embedding and no live
-//! cluster. The logic lives in `turbovec_search::reshard`; this is the
+//! cluster. The logic lives in `pipestream_search::reshard`; this is the
 //! thin CLI.
 //!
 //! ```text
 //! # Split one shard 1 -> N (N a power of two):
-//! reshard --log=/data/shard-0.tv.wal --split=2 --out-dir=/data/split \
+//! reshard --log=/data/shard-0.vector.wal --split=2 --out-dir=/data/split \
 //!     --slot-base=0 --slot-stride=25000000 --analysis-addr=http://localhost:50051
 //!
-//! # Merge several shards -> 1 (identical calibration required):
-//! reshard --logs=/data/shard-0.tv.wal,/data/shard-1.tv.wal --out-dir=/data/merged \
+//! # Merge several shards -> 1 (identical provider configuration required):
+//! reshard --logs=/data/shard-0.vector.wal,/data/shard-1.vector.wal --out-dir=/data/merged \
 //!     --analysis-addr=http://localhost:50051
 //! ```
 //!
@@ -19,14 +19,14 @@
 //! directory. Documents are re-analyzed with the SAME analysis options
 //! they were ingested with, so point `--analysis-addr` at the same
 //! sidecar configuration the cluster ingests through. Writes
-//! `<out>/shard-<i>.tv` (+ `.bm25`), `<out>/shard-map.toml`, and prints
+//! `<out>/shard-<i>.vector` (+ `.bm25`), `<out>/shard-map.toml`, and prints
 //! the matching `[[shards]]` node config blocks.
 
 use std::path::{Path, PathBuf};
 
-use turbovec_search::pb::AnalysisSpec;
-use turbovec_search::postings::AnalyzedDoc;
-use turbovec_search::{analyzer, reshard};
+use pipestream_search::pb::AnalysisSpec;
+use pipestream_search::postings::AnalyzedDoc;
+use pipestream_search::{analyzer, reshard};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -40,6 +40,7 @@ fn opt(key: &str) -> Option<String> {
     std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
 }
 
+#[allow(clippy::result_large_err)]
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = arg("out-dir", "");
@@ -54,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let analysis_addr = arg("analysis-addr", "http://127.0.0.1:50051");
     // Vector-only replay skips document analysis and the BM25 sidecars
     // entirely: shard-count and routing experiments only search the
-    // vector leg, and children shrink from tens of GB to the .tv files.
+    // vector leg, and children shrink from tens of GB to provider images.
     let vectors_only = std::env::args().any(|a| a == "--vectors-only");
     // Child BM25 field table override (docs/multi-field.md): comma list
     // starting with "body". Absent = derive from the replayed records.
@@ -157,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for child in &output.children {
         eprintln!(
             "child {}: {} vectors, {} documents, slot_offset {}, hash [{}, {}]",
-            child.tv_path.display(),
+            child.vector_path.display(),
             child.num_vectors,
             child.num_documents,
             child.slot_offset,

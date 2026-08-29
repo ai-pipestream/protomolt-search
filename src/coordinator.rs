@@ -23,13 +23,15 @@ use crate::pb::{
 use crate::pb::{
     search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest,
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
-    BroadcastCalibrationResponse, CalibrationApplyResult, CascadeHit, ClusterHealthRequest,
-    ClusterHealthResponse, FloorUpdate, FusionMode, HealthRequest, HybridDebug, HybridHit,
+    BroadcastCalibrationResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse,
+    CalibrationApplyResult, CascadeHit, ClusterHealthRequest, ClusterHealthResponse,
+    ConfigureVectorBackendRequest, FloorUpdate, FusionMode, HealthRequest, HybridDebug, HybridHit,
     HybridSearchRequest, HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup,
     ScoredHit, SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest,
     SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats,
     StartShardSearch, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermStatsRequest, VectorRescoreRequest,
+    StreamSearchResponse, StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult,
+    VectorRescoreRequest,
 };
 use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
@@ -325,8 +327,9 @@ pub(crate) fn compile_aggregations(
                 a.name
             )));
         }
-        crate::node::agg_op_of(a.op)
-            .map_err(|e| Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message())))?;
+        crate::node::agg_op_of(a.op).map_err(|e| {
+            Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message()))
+        })?;
         let expr = crate::cel::compile_value(&a.expression).map_err(|e| {
             Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message()))
         })?;
@@ -1017,10 +1020,7 @@ pub struct BrowseRows {
 
 impl RequestFilters {
     /// Compile a request's filter surface, validating both families.
-    pub(crate) fn compile(
-        geo: &[crate::pb::GeoFilter],
-        cel: &str,
-    ) -> Result<Self, Status> {
+    pub(crate) fn compile(geo: &[crate::pb::GeoFilter], cel: &str) -> Result<Self, Status> {
         crate::node::validate_geo_filters(geo)?;
         let tree = crate::cel::compile_filter(cel)?;
         if let Some(f) = tree.as_ref() {
@@ -1031,7 +1031,6 @@ impl RequestFilters {
             tree,
         })
     }
-
 }
 
 /// Accumulates the per-shard known-column handshakes for one request:
@@ -1384,13 +1383,7 @@ impl CoordinatorServiceImpl {
             }
         }
         if terms.is_empty() || k == 0 {
-            return Ok((
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ));
+            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
         }
 
         // (b) each shard's share of the corpus stats, cached per node;
@@ -1546,9 +1539,9 @@ impl CoordinatorServiceImpl {
         let mut shard_stats: Vec<Vec<crate::pb::ColumnStats>> = Vec::new();
         let mut shard_distinct: Vec<Vec<crate::pb::FacetDistinct>> = Vec::new();
         for task in query_tasks {
-            let (shard, hits, facets, ranges, known, geo, fknown, sstats, sdistinct, pknown) =
-                task.await
-                    .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            let (shard, hits, facets, ranges, known, geo, fknown, sstats, sdistinct, pknown) = task
+                .await
+                .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
             if pknown.len() != projection_leaves.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} projection-leaf flags for {} leaves",
@@ -1715,11 +1708,12 @@ impl CoordinatorServiceImpl {
         if let Some(f) = filter {
             crate::filter::validate_filter(f)?;
         }
-        // Phase timing, off unless TURBOVEC_TRACE_BM25 is set. The fused
+        // Phase timing, off unless PIPESTREAM_SEARCH_TRACE_BM25 is set.
         // route and the single-field route reach the same node scorer,
         // so when they disagree by orders of magnitude the question is
         // which phase, and that cannot be answered from outside.
-        let trace = std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
+        let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some()
+            || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
         let t0 = std::time::Instant::now();
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
@@ -2787,7 +2781,8 @@ impl CoordinatorServiceImpl {
         // Phase 3: the streaming vector scan, floored from the first
         // block, with re-decomposed floors chasing the rising k-th
         // best known bound.
-        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
+        let mut fanout =
+            self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
@@ -3358,7 +3353,8 @@ impl CoordinatorServiceImpl {
         }
 
         let mut known = FilterKnown::new(filters);
-        let mut fanout = self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
+        let mut fanout =
+            self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
 
         // The global top-k: a max-heap whose top is the WORST survivor
         // under the merge's total order, so peek() is the k-th best.
@@ -4046,10 +4042,7 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(node)?;
             tasks.push(tokio::spawn(async move {
-                client
-                    .fetch_values(request)
-                    .await
-                    .map(|r| r.into_inner())
+                client.fetch_values(request).await.map(|r| r.into_inner())
             }));
         }
         let projection_leaves: Vec<crate::values::ValueLeaf> = {
@@ -4469,9 +4462,7 @@ impl CoordinatorServiceImpl {
             {
                 m.fold(p, &spec.name)?;
             }
-            for (i, (shard_hist, spec)) in
-                response.histograms.iter().zip(histograms).enumerate()
-            {
+            for (i, (shard_hist, spec)) in response.histograms.iter().zip(histograms).enumerate() {
                 if shard_hist.bucket_index.len() != shard_hist.bucket_count.len() {
                     return Err(Status::internal(
                         "shard answered a histogram with mismatched columns",
@@ -4479,8 +4470,7 @@ impl CoordinatorServiceImpl {
                 }
                 hist_present[i] += shard_hist.present;
                 hist_unbucketable[i] += shard_hist.unbucketable;
-                for (&idx, &count) in shard_hist.bucket_index.iter().zip(&shard_hist.bucket_count)
-                {
+                for (&idx, &count) in shard_hist.bucket_index.iter().zip(&shard_hist.bucket_count) {
                     *hist_buckets[i].entry(idx).or_insert(0) += count;
                 }
                 if hist_buckets[i].len() > spec.max_buckets as usize {
@@ -4700,6 +4690,54 @@ impl CoordinatorServiceImpl {
             }
         }
         Ok(totals)
+    }
+
+    pub async fn fanout_vector_backend(
+        &self,
+        req: &BroadcastVectorBackendRequest,
+    ) -> Vec<VectorBackendApplyResult> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let node = node.clone();
+            let request = ConfigureVectorBackendRequest {
+                dim: req.dim,
+                config: req.config.clone(),
+            };
+            let client = self.node_client(&node);
+            tasks.push(tokio::spawn(async move {
+                let result = match client {
+                    Ok(mut client) => client.configure_vector_backend(request).await,
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(resp) => VectorBackendApplyResult {
+                        node: node.clone(),
+                        ok: true,
+                        already_configured: resp.into_inner().already_configured,
+                        error: String::new(),
+                    },
+                    Err(e) => VectorBackendApplyResult {
+                        node: node.clone(),
+                        ok: false,
+                        already_configured: false,
+                        error: e.message().to_string(),
+                    },
+                }
+            }));
+        }
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match task.await {
+                Ok(result) => results.push(result),
+                Err(e) => results.push(VectorBackendApplyResult {
+                    node: String::new(),
+                    ok: false,
+                    already_configured: false,
+                    error: format!("task failed: {e}"),
+                }),
+            }
+        }
+        results
     }
 
     pub async fn fanout_calibration(
@@ -5759,6 +5797,20 @@ impl SearchService for CoordinatorServiceImpl {
             }
         }
         Ok(Response::new(ClusterHealthResponse { targets }))
+    }
+
+    async fn broadcast_vector_backend(
+        &self,
+        request: Request<BroadcastVectorBackendRequest>,
+    ) -> Result<Response<BroadcastVectorBackendResponse>, Status> {
+        let req = request.into_inner();
+        if req.dim == 0 || req.config.is_none() {
+            return Err(Status::invalid_argument(
+                "positive dim and vector backend config are required",
+            ));
+        }
+        let results = self.fanout_vector_backend(&req).await;
+        Ok(Response::new(BroadcastVectorBackendResponse { results }))
     }
 
     async fn broadcast_calibration(

@@ -1,7 +1,7 @@
 //! Wire codegen for the protobuf APIs.
 //!
-//! Regenerates the tonic stubs for `turbovec.search.v1` (this service), the
-//! `turbovec.search.wal.v1` WAL envelope, and
+//! Regenerates the tonic stubs for `ai.pipestream.search.v1` (this service),
+//! the `ai.pipestream.search.wal.v1` WAL envelope, and
 //! `ai.pipestream.opennlp.analysis.v1` (the vendored analysis-sidecar API)
 //! into `OUT_DIR` whenever a proto changes; `src/pb.rs` pulls them in with
 //! `tonic::include_proto!`.
@@ -12,8 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(
             &[
-                "proto/turbovec/search/v1/search.proto",
-                "proto/turbovec/search/wal/v1/wal.proto",
+                "proto/ai/pipestream/search/v1/search.proto",
+                "proto/ai/pipestream/search/wal/v1/wal.proto",
                 "proto/ai/pipestream/opennlp/analysis/v1/analysis.proto",
                 "proto/tei/v1/tei.proto",
                 // Vendored from protomolt, byte-identical (see

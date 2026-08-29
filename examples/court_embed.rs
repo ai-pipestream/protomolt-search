@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use pipestream_search::demo::court::{self, EmbeddingWriter};
+use pipestream_search::pb::tei::embed_client::EmbedClient;
+use pipestream_search::pb::tei::EmbedRequest;
 use tokio::sync::{mpsc, Mutex};
-use turbovec_search::demo::court::{self, EmbeddingWriter};
-use turbovec_search::pb::tei::embed_client::EmbedClient;
-use turbovec_search::pb::tei::EmbedRequest;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");

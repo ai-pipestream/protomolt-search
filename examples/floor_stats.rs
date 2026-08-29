@@ -24,9 +24,9 @@
 //!             --queries=deploy/v7-rebuild/queries-case-folding.txt --k=10
 //! ```
 
-use turbovec_search::analyzer;
-use turbovec_search::pb::search_service_client::SearchServiceClient;
-use turbovec_search::pb::{AnalysisSpec, FusionMode, HybridLegOptions, HybridSearchRequest};
+use pipestream_search::analyzer;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
+use pipestream_search::pb::{AnalysisSpec, FusionMode, HybridLegOptions, HybridSearchRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -36,7 +36,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn body_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]

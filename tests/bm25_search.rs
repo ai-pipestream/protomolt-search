@@ -5,15 +5,15 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
     AddDocumentsRequest, AnalysisSpec, Bm25Hit, Bm25QueryRequest, GetDocumentsRequest,
     TermStatsRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -31,7 +31,7 @@ async fn add_documents(
     addr: &str,
     texts: &[&str],
     spec: Option<AnalysisSpec>,
-) -> turbovec_search::pb::AddDocumentsResponse {
+) -> pipestream_search::pb::AddDocumentsResponse {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(8);
     for text in texts {
@@ -233,15 +233,15 @@ async fn bm25_store_persists_through_flush() {
 
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let flushed = client
-        .flush(turbovec_search::pb::FlushRequest {})
+        .flush(pipestream_search::pb::FlushRequest {})
         .await
         .unwrap()
         .into_inner();
     assert!(flushed.written);
     assert_eq!(flushed.num_documents, 2);
 
-    let store = turbovec_search::postings::Bm25Store::load(
-        &turbovec_search::node::bm25_sidecar_path(&index_path),
+    let store = pipestream_search::postings::Bm25Store::load(
+        &pipestream_search::node::bm25_sidecar_path(&index_path),
     )
     .unwrap();
     assert_eq!(store.doc_count(), 2);
@@ -321,11 +321,11 @@ async fn bm25_query_min_score_seeds_floor() {
     // node compares the floor against those, not against the
     // f32-rounded hit scores). The corpus is known: N=2, avgdl=3.5,
     // doc0 rust tf=2 dl=4, doc1 rust tf=1 dl=3, k1/b defaults.
-    let idf = turbovec_search::bm25::idf(2, 2);
-    let params = turbovec_search::bm25::Bm25Params::default();
+    let idf = pipestream_search::bm25::idf(2, 2);
+    let params = pipestream_search::bm25::Bm25Params::default();
     let true_scores = [
-        idf * turbovec_search::bm25::tf_norm(params, 2, 4, 3.5),
-        idf * turbovec_search::bm25::tf_norm(params, 1, 3, 3.5),
+        idf * pipestream_search::bm25::tf_norm(params, 2, 4, 3.5),
+        idf * pipestream_search::bm25::tf_norm(params, 1, 3, 3.5),
     ];
     assert_eq!(unseeded[0].score, true_scores[0] as f32);
     assert_eq!(unseeded[1].score, true_scores[1] as f32);
@@ -355,7 +355,7 @@ async fn bm25_query_min_score_seeds_floor() {
     // produce the same filtered results.
     let mut client = NodeServiceClient::connect(addr_b.clone()).await.unwrap();
     let flushed = client
-        .flush(turbovec_search::pb::FlushRequest {})
+        .flush(pipestream_search::pb::FlushRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -541,7 +541,7 @@ async fn bm25_search_min_score_factorial_across_the_fleet() {
                 let mut client = NodeServiceClient::connect(addrs[i].clone()).await.unwrap();
                 assert!(
                     client
-                        .flush(turbovec_search::pb::FlushRequest {})
+                        .flush(pipestream_search::pb::FlushRequest {})
                         .await
                         .unwrap()
                         .into_inner()

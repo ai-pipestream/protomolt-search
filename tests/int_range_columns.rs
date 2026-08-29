@@ -7,20 +7,20 @@
 
 mod common;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use turbovec_search::bm25::{self, Bm25Params, CorpusStats};
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::search_service_server::SearchService;
-use turbovec_search::pb::{
+use pipestream_search::bm25::{self, Bm25Params, CorpusStats};
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, IntegerValue, RangeFacetField, ScoreOp,
     ScoreStage, TimestampValue,
 };
-use turbovec_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
-use turbovec_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -58,7 +58,7 @@ const EDGES: [f64; 4] = [0.0, 10.0, 20.0, 30.0];
 async fn add_documents_integer(
     addr: &str,
     docs: &[(&str, Integers)],
-) -> Result<turbovec_search::pb::AddDocumentsResponse, tonic::Status> {
+) -> Result<pipestream_search::pb::AddDocumentsResponse, tonic::Status> {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(8);
     for (text, integers) in docs {
@@ -135,7 +135,7 @@ fn range_field(column: &str, edges: &[f64]) -> RangeFacetField {
 
 /// A range facet's buckets as `(from, to, count)`, for hand-computed
 /// comparisons.
-fn buckets_of(rf: &turbovec_search::pb::RangeFacetCounts) -> Vec<(f64, f64, u64)> {
+fn buckets_of(rf: &pipestream_search::pb::RangeFacetCounts) -> Vec<(f64, f64, u64)> {
     rf.buckets.iter().map(|b| (b.from, b.to, b.count)).collect()
 }
 
@@ -489,7 +489,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     assert_eq!(buckets_of(&resp.range_facets[0]), buckets_of(&ranges[0]));
 
     // The fused route counts over the union of every leg's terms.
-    let fields = vec![turbovec_search::pb::QueryField {
+    let fields = vec![pipestream_search::pb::QueryField {
         field: "body".to_string(),
         analysis: None,
         weight: 1.0,

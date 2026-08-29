@@ -1,15 +1,16 @@
-//! Shard-owner side: serves [`NodeService`] over one turbovec index.
+//! Shard-owner side: serves [`NodeService`] over one vector provider.
 //!
 //! The shard is a small state machine behind a write lock:
 //!
 //! ```text
-//! empty (no index) ──SetCalibration──▶ seeded empty index ──AddVectors──▶ live index
-//!       │                                    │
-//!       └──AddVectors(dim=..)──▶ unseeded index (calibration fitted from first batch)
+//! empty ──ConfigureVectorBackend──▶ configured empty index ──AddVectors──▶ live index
+//!   │
+//!   └──AddVectors(dim=..)──▶ provider-created index
 //! ```
 //!
-//! Calibration locks for the index's lifetime (turbovec's own rule):
-//! `SetCalibration` is only ever accepted on an empty shard. Adds hold the
+//! Provider configuration locks for the generation's lifetime and can only be
+//! set on an empty shard. The legacy `SetCalibration` RPC adapts to the same
+//! rule for embedded TurboVec. Adds hold the
 //! write lock on the blocking pool; searches hold the read lock for the
 //! duration of their chunked scan, so a search never observes a
 //! half-applied batch.
@@ -22,7 +23,6 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use turbovec::TurboQuantIndex;
 
 use crate::bm25::{self, Bm25Params};
 use crate::chunked::{
@@ -39,23 +39,34 @@ use crate::pb::{
     search_shard_response, snapshot_chunk, stream_search_request, stream_search_response,
     AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit,
     Bm25QueryRequest, Bm25QueryResponse, Bm25QueryStreamRequest, Bm25QueryStreamResponse,
-    Bm25RescoreRequest, Bm25RescoreResponse, FloorUpdate, FlushRequest, FlushResponse,
+    Bm25RescoreRequest, Bm25RescoreResponse, ConfigureVectorBackendRequest,
+    ConfigureVectorBackendResponse, FloorUpdate, FlushRequest, FlushResponse,
     GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse,
-    HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse,
-    IngestMappedRequest, IngestMappedResponse,
+    GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit,
+    HybridShardRequest, HybridShardResponse, IngestMappedRequest, IngestMappedResponse,
     InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest,
     SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
     ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
     StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
     StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
-    VectorRescoreRequest, VectorRescoreResponse,
+    VectorBackendConfig as WireVectorBackendConfig,
+    VectorBackendDescriptor as WireVectorBackendDescriptor, VectorQualityContract,
+    VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
+use crate::vector::{
+    embedded_turbovec_config, first_invalid_coordinate, legacy_calibration_config, QualityContract,
+    ScoreDirection, VectorBackendConfig, VectorIndex, VectorSearchOptions, VectorStreamControl,
+    EMBEDDED_TURBOVEC,
+};
 use crate::wal::{self, WalWriter};
 
 /// How a node scans and whether it participates in floor sharing.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
+    /// Vector backend used for new and loaded generations. File extensions
+    /// never select a backend.
+    pub vector_backend: String,
     /// Added to every local slot to produce the global vector id reported
     /// in [`SearchShardDone`]. Shards must have disjoint ranges.
     pub slot_offset: u64,
@@ -99,8 +110,8 @@ pub struct NodeConfig {
     /// lost information -- the next publish carries a floor at least as
     /// high.
     pub floor_min_interval_ms: u64,
-    /// Bit width used when `AddVectors` constructs an index from scratch
-    /// (no loaded index, no seeded calibration).
+    /// Provider-specific bit width hint used when `AddVectors` constructs an
+    /// index from scratch with no loaded or configured backend.
     pub bit_width: usize,
     /// Persistence target for `Flush` / save-on-shutdown. `None` makes the
     /// shard purely in-memory (flush is a no-op).
@@ -166,6 +177,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
+            vector_backend: EMBEDDED_TURBOVEC.to_string(),
             slot_offset: 0,
             chunk_blocks: DEFAULT_CHUNK_BLOCKS,
             share_floors: true,
@@ -777,12 +789,12 @@ impl Bm25Shard {
         // One filter evaluation per matched document, exactly like the
         // ordinal resolution below — never per posting.
         if let Some((doc_filter, cols)) = filter {
-            for wi in 0..bits.len() {
-                let mut w = bits[wi];
+            for (wi, bits_word) in bits.iter_mut().enumerate() {
+                let mut w = *bits_word;
                 while w != 0 {
                     let doc = (wi * 64) as u32 + w.trailing_zeros();
                     if !doc_filter.passes(doc, cols) {
-                        bits[wi] &= !(1u64 << (doc % 64));
+                        *bits_word &= !(1u64 << (doc % 64));
                     }
                     w &= w - 1;
                 }
@@ -2006,7 +2018,7 @@ pub(crate) fn parse_score_stages(
 /// docs-only shards, from-scratch shards).
 #[derive(Default)]
 struct ShardState {
-    index: Option<TurboQuantIndex>,
+    index: Option<VectorIndex>,
     bm25: Option<Bm25Shard>,
     /// The active snapshot generation directory, when the shard's files
     /// came from (or were replaced by) an `InstallSnapshot` image.
@@ -2080,24 +2092,35 @@ pub fn bm25_build_dir(bm25_path: &std::path::Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Snapshot generation layout, next to the shard's configured index path:
-/// `<index path>.snap/` is the active generation holding the installed
-/// image as `index.tv` + `index.tv.bm25`. Because BOTH files live inside
-/// one directory, installing them is a single directory rename — which is
-/// atomic, so the pair can never tear.
+/// Snapshot generation layout, next to the shard's configured index path.
+/// New generations use `vector.index` and `documents.bm25`; readers also
+/// recognize the former `index.tv` pair.
 pub fn generation_dir(index_path: &Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".snap");
     PathBuf::from(p)
 }
 
-/// The image paths inside a generation directory.
-pub fn generation_tv(dir: &Path) -> PathBuf {
-    dir.join("index.tv")
+/// The provider image inside a generation directory. Existing generations
+/// written before the provider abstraction keep their legacy filename.
+pub fn generation_vector(dir: &Path) -> PathBuf {
+    let current = dir.join("vector.index");
+    let legacy = dir.join("index.tv");
+    if current.exists() || !legacy.exists() {
+        current
+    } else {
+        legacy
+    }
 }
 /// The BM25 sidecar path inside a generation directory.
 pub fn generation_bm25(dir: &Path) -> PathBuf {
-    dir.join("index.tv.bm25")
+    let current = dir.join("documents.bm25");
+    let legacy = dir.join("index.tv.bm25");
+    if current.exists() || !legacy.exists() {
+        current
+    } else {
+        legacy
+    }
 }
 
 /// Receive staging (`<index path>.snap-tmp/`) and swap-out
@@ -2118,7 +2141,7 @@ fn generation_old_dir(index_path: &Path) -> PathBuf {
 /// Returns `(index, bm25)` paths.
 fn storage_paths(index_path: &Path, generation: Option<&PathBuf>) -> (PathBuf, PathBuf) {
     match generation {
-        Some(dir) => (generation_tv(dir), generation_bm25(dir)),
+        Some(dir) => (generation_vector(dir), generation_bm25(dir)),
         None => (index_path.to_path_buf(), bm25_sidecar_path(index_path)),
     }
 }
@@ -2147,13 +2170,12 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
             let _ = std::fs::rename(&old, &snap);
         }
     }
-    generation_tv(&snap).exists().then_some(snap)
+    generation_vector(&snap).exists().then_some(snap)
 }
 
-/// The manifest describing a shard's current shape: calibration and dim
-/// from the loaded index when it has them (a seeded or fitted shard),
-/// zeros otherwise — an empty shard completes the manifest lazily, via
-/// `SetCalibration` or its first batch, until calibration locks.
+/// Build the manifest describing the shard's current provider state and
+/// dimension. An empty shard completes it lazily through backend configuration
+/// or its first batch, before any records make the manifest immutable.
 ///
 /// `preexisting` is the (vectors, documents) the shard already holds
 /// that this generation's log will NOT contain — the installed image on
@@ -2164,56 +2186,92 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
 /// The index's committed TQ+ pair, `None` when uncalibrated — the
 /// shape the fork's former `calibration()` getter returned, read here
 /// through upstream's explicit-calibration accessors (#474).
-fn calibration_of(index: &TurboQuantIndex) -> Option<(&[f32], &[f32])> {
-    match index.calibration_state() {
-        turbovec::CalibrationState::Calibrated => {
-            Some((index.tqplus_shift(), index.tqplus_scale()))
-        }
-        _ => None,
+fn calibration_of(index: &VectorIndex) -> Option<(Vec<f32>, Vec<f32>)> {
+    let config = index.backend_config().ok()?;
+    let legacy = legacy_calibration_config(&config).ok()??;
+    (!legacy.shift.is_empty()).then_some((legacy.shift, legacy.scale))
+}
+
+fn wire_backend_config(config: &VectorBackendConfig) -> WireVectorBackendConfig {
+    WireVectorBackendConfig {
+        backend_kind: config.backend_kind.clone(),
+        config_format: config.config_format.clone(),
+        payload: config.payload.clone(),
     }
 }
 
-/// Construct an empty index committed to an externally supplied
-/// calibration pair (empty pair = uncalibrated), refusing invalid
-/// parts instead of panicking: this is the wire/replay construction,
-/// and the pair arrives from a request or a manifest, not from code.
-fn seeded_or_plain(
-    dim: usize,
-    bit_width: usize,
-    shift: &[f32],
-    scale: &[f32],
-) -> Result<TurboQuantIndex, turbovec::FromPartsError> {
-    TurboQuantIndex::from_parts(
-        Some(dim),
-        bit_width,
-        0,
-        Vec::new(),
-        Vec::new(),
-        shift.to_vec(),
-        scale.to_vec(),
-    )
+fn internal_backend_config(config: WireVectorBackendConfig) -> Result<VectorBackendConfig, Status> {
+    if config.backend_kind.trim().is_empty() {
+        return Err(Status::invalid_argument("vector backend kind is required"));
+    }
+    if config.config_format.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "vector backend config format is required",
+        ));
+    }
+    Ok(VectorBackendConfig {
+        backend_kind: config.backend_kind,
+        config_format: config.config_format,
+        payload: config.payload,
+    })
+}
+
+fn wire_backend_descriptor(index: &VectorIndex) -> WireVectorBackendDescriptor {
+    let descriptor = index.descriptor();
+    WireVectorBackendDescriptor {
+        backend_kind: descriptor.backend_kind,
+        backend_version: descriptor.backend_version,
+        dim: descriptor.dimension.unwrap_or(0) as u32,
+        bits_per_dimension: descriptor.bits_per_dimension.unwrap_or(0),
+        metric: descriptor.metric,
+        score_direction: match descriptor.score_direction {
+            ScoreDirection::HigherIsBetter => VectorScoreDirection::HigherIsBetter as i32,
+            ScoreDirection::LowerIsBetter => VectorScoreDirection::LowerIsBetter as i32,
+        },
+        scoring_fingerprint: descriptor.scoring_fingerprint,
+        quality_contract: match descriptor.quality_contract {
+            QualityContract::ExhaustiveQuantized => {
+                VectorQualityContract::ExhaustiveNativeScore as i32
+            }
+            QualityContract::ConfiguredAnn => VectorQualityContract::ConfiguredAnn as i32,
+            QualityContract::ProbabilisticBound => VectorQualityContract::ProbabilisticBound as i32,
+        },
+        capabilities: descriptor
+            .capabilities
+            .into_iter()
+            .map(|capability| capability.as_str().to_string())
+            .collect(),
+    }
 }
 
 fn wal_manifest(
-    index: Option<&TurboQuantIndex>,
+    index: Option<&VectorIndex>,
     config: &NodeConfig,
     generation: u64,
     preexisting: (u64, u64),
 ) -> wal::WalManifest {
+    let backend_config = index.and_then(|index| index.backend_config().ok());
     let (dim, bit_width, shift, scale) = match index {
         Some(index) => {
-            let (shift, scale) = calibration_of(index).unwrap_or((&[], &[]));
+            let (shift, scale) = calibration_of(index).unwrap_or_default();
             (
                 index.dim_opt().unwrap_or(0) as u32,
-                index.bit_width() as u32,
-                shift.to_vec(),
-                scale.to_vec(),
+                index.bits_per_dimension().unwrap_or(config.bit_width) as u32,
+                shift,
+                scale,
             )
         }
         None => (0, config.bit_width as u32, Vec::new(), Vec::new()),
     };
     wal::WalManifest {
         dim,
+        vector_backend: backend_config
+            .as_ref()
+            .map_or_else(|| config.vector_backend.clone(), |c| c.backend_kind.clone()),
+        vector_config_format: backend_config
+            .as_ref()
+            .map_or_else(String::new, |c| c.config_format.clone()),
+        vector_config_payload: backend_config.map_or_else(Vec::new, |c| c.payload),
         bit_width,
         calibration_shift: shift,
         calibration_scale: scale,
@@ -2274,7 +2332,7 @@ fn persisted_doc_tip(index_path: &Path) -> u64 {
 /// whose WAL directory does not exist yet, and both end up with a
 /// writer onto the same well-formed generation instead of one of them
 /// panicking on the mid-create directory.
-fn open_wal(index: Option<&TurboQuantIndex>, config: &NodeConfig) -> Option<WalWriter> {
+fn open_wal(index: Option<&VectorIndex>, config: &NodeConfig) -> Option<WalWriter> {
     if !config.wal {
         return None;
     }
@@ -2309,6 +2367,11 @@ fn open_wal(index: Option<&TurboQuantIndex>, config: &NodeConfig) -> Option<WalW
         if m.calibration_shift.is_empty() {
             m.calibration_shift = fresh.calibration_shift;
             m.calibration_scale = fresh.calibration_scale;
+        }
+        if m.vector_config_format.is_empty() && !fresh.vector_config_format.is_empty() {
+            m.vector_backend = fresh.vector_backend;
+            m.vector_config_format = fresh.vector_config_format;
+            m.vector_config_payload = fresh.vector_config_payload;
         }
     });
     eprintln!("wal: logging to {}", writer.dir().display());
@@ -2666,7 +2729,7 @@ impl Drop for IngestGuard {
 
 impl NodeServiceImpl {
     /// Wrap an optional preloaded index in a node service.
-    pub fn new(index: Option<TurboQuantIndex>, config: NodeConfig) -> Self {
+    pub fn new(index: Option<VectorIndex>, config: NodeConfig) -> Self {
         let wal = open_wal(index.as_ref(), &config);
         let vocab = open_vocab(&config);
         Self {
@@ -2927,7 +2990,7 @@ impl NodeServiceImpl {
         built
     }
 
-    fn validate_start(index: &TurboQuantIndex, start: &StartShardSearch) -> Result<(), Status> {
+    fn validate_start(index: &VectorIndex, start: &StartShardSearch) -> Result<(), Status> {
         let dim = index
             .dim_opt()
             .ok_or_else(|| Status::failed_precondition("index has no vectors"))?;
@@ -2937,7 +3000,7 @@ impl NodeServiceImpl {
                 start.vector.len()
             )));
         }
-        if let Some((_, coord, value)) = turbovec::first_invalid_coord(&start.vector, dim) {
+        if let Some((_, coord, value)) = first_invalid_coordinate(&start.vector, dim) {
             return Err(Status::invalid_argument(format!(
                 "query coordinate {coord} is invalid: {value}"
             )));
@@ -2970,11 +3033,11 @@ impl NodeServiceImpl {
         }
         // Flush into the active snapshot generation when one was
         // installed, else the legacy layout — never split the two.
-        let (tv_path, bm25_path) = storage_paths(&config_path, guard.generation.as_ref());
+        let (vector_path, bm25_path) = storage_paths(&config_path, guard.generation.as_ref());
         if let Some(index) = guard.index.as_ref() {
             index
-                .write(&tv_path)
-                .map_err(|e| Status::internal(format!("write {}: {e}", tv_path.display())))?;
+                .write(&vector_path)
+                .map_err(|e| Status::internal(format!("write {}: {e}", vector_path.display())))?;
         }
         // Save the builder as v3 and immediately reopen it disk-resident:
         // after Flush a shard holds no postings or texts in heap.
@@ -3025,7 +3088,7 @@ impl NodeServiceImpl {
             }
         }
         Ok(FlushResponse {
-            path: tv_path.display().to_string(),
+            path: vector_path.display().to_string(),
             num_vectors,
             num_documents,
             written,
@@ -3033,8 +3096,8 @@ impl NodeServiceImpl {
     }
 
     /// Receive one snapshot image into the staging generation directory
-    /// (`index.tv`, plus `index.tv.bm25` when declared). The first
-    /// `manifest.tv_bytes` of data land in the index, the rest in the
+    /// (`vector.index`, plus `documents.bm25` when declared). The first
+    /// `manifest.vector_bytes` of data land in the provider image, the rest in the
     /// sidecar; both are synced before the caller swaps anything. Returns
     /// with the staging dir complete or not at all — on error the caller
     /// removes it.
@@ -3050,7 +3113,7 @@ impl NodeServiceImpl {
         tokio::fs::create_dir_all(tmp_dir)
             .await
             .map_err(|e| io_err(tmp_dir, e))?;
-        let tv_tmp = generation_tv(tmp_dir);
+        let tv_tmp = generation_vector(tmp_dir);
         let bm25_tmp = generation_bm25(tmp_dir);
         let mut tv = tokio::fs::File::create(&tv_tmp)
             .await
@@ -3071,8 +3134,8 @@ impl NodeServiceImpl {
                     "SnapshotChunk after the manifest must carry data",
                 ));
             };
-            // Fill the .tv first; overflow spills into the .bm25.
-            let tv_take = (manifest.tv_bytes - tv_written).min(data.len() as u64) as usize;
+            // Fill the provider image first; overflow spills into the BM25 sidecar.
+            let tv_take = (manifest.vector_bytes - tv_written).min(data.len() as u64) as usize;
             if tv_take > 0 {
                 tv.write_all(&data[..tv_take])
                     .await
@@ -3098,10 +3161,10 @@ impl NodeServiceImpl {
                 bm25_written += data.len() as u64;
             }
         }
-        if tv_written != manifest.tv_bytes || bm25_written != manifest.bm25_bytes {
+        if tv_written != manifest.vector_bytes || bm25_written != manifest.bm25_bytes {
             return Err(Status::invalid_argument(format!(
                 "truncated snapshot: received {tv_written}+{} of declared {}+{} bytes",
-                bm25_written, manifest.tv_bytes, manifest.bm25_bytes
+                bm25_written, manifest.vector_bytes, manifest.bm25_bytes
             )));
         }
         tv.sync_all().await.map_err(|e| io_err(&tv_tmp, e))?;
@@ -3113,11 +3176,11 @@ impl NodeServiceImpl {
 
     /// Validate a received snapshot image and atomically swap it in (the
     /// blocking half of `InstallSnapshot`). Everything that can fail —
-    /// loading the index, opening the sidecar, the calibration check —
+    /// loading the index, opening the sidecar, the scoring-identity check —
     /// happens BEFORE the swap, so a rejected install leaves the live
     /// shard and the on-disk generation untouched.
     ///
-    /// The swap itself is one directory rename: the whole `.tv` + `.bm25`
+    /// The swap itself is one directory rename: the vector and BM25 files
     /// pair travels inside the staging dir, so the two files can never
     /// tear. Replacing an existing generation renames it aside first; the
     /// crash window between the two renames is covered by
@@ -3135,11 +3198,11 @@ impl NodeServiceImpl {
             .clone();
         let snap = generation_dir(&path);
         let old = generation_old_dir(&path);
-        let tv_tmp = generation_tv(tmp_dir);
+        let tv_tmp = generation_vector(tmp_dir);
         let bm25_tmp = generation_bm25(tmp_dir);
 
-        let loaded = TurboQuantIndex::load(&tv_tmp).map_err(|e| {
-            Status::invalid_argument(format!("snapshot is not a valid turbovec index: {e}"))
+        let loaded = VectorIndex::load(&self.config.vector_backend, &tv_tmp).map_err(|e| {
+            Status::invalid_argument(format!("snapshot is not a valid vector backend image: {e}"))
         })?;
         if with_bm25 {
             // Open-check the sidecar (and drop it again) before the swap;
@@ -3150,18 +3213,18 @@ impl NodeServiceImpl {
         }
 
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        // Calibration comparability: a shard with a locked calibration
-        // (seeded or fitted) only accepts an identically calibrated image.
+        // Scoring comparability: a shard with a locked backend configuration
+        // only accepts an image with the identical scoring fingerprint.
         if let Some(index) = guard.index.as_ref() {
-            if let Some((shift, scale)) = calibration_of(index) {
-                let matches =
-                    calibration_of(&loaded).is_some_and(|(s, c)| s == shift && c == scale);
-                if !matches {
-                    return Err(Status::failed_precondition(
-                        "snapshot calibration differs from the calibration locked on this \
-                         shard; mixed calibrations make scores incomparable across shards",
-                    ));
-                }
+            let current = index.descriptor();
+            let incoming = loaded.descriptor();
+            if current.backend_kind != incoming.backend_kind
+                || current.scoring_fingerprint != incoming.scoring_fingerprint
+            {
+                return Err(Status::failed_precondition(
+                    "snapshot vector backend or scoring fingerprint differs from the \
+                     generation locked on this shard; mixed native scores are not mergeable",
+                ));
             }
         }
 
@@ -3171,7 +3234,7 @@ impl NodeServiceImpl {
         // sync_all covered bytes and inodes, not the names pointing at
         // them), and the parent is fsynced after so the swap itself
         // survives a crash.
-        crate::postings::fsync_parent(&generation_tv(tmp_dir))
+        crate::postings::fsync_parent(&generation_vector(tmp_dir))
             .map_err(|e| Status::internal(format!("fsync staging {}: {e}", tmp_dir.display())))?;
         if snap.exists() {
             std::fs::rename(&snap, &old)
@@ -3212,8 +3275,8 @@ impl NodeServiceImpl {
         guard.generation = Some(snap.clone());
         guard.stats_epoch += 1;
         // The snapshot supersedes the log: fsync and retire the current
-        // generation, open gen-(g+1) with the installed image's
-        // calibration (same bucket geometry), and mark where it came
+        // generation, open gen-(g+1) with the installed image's provider
+        // state (same bucket geometry), and mark where it came
         // from. Records before this point describe the OLD shard
         // contents.
         if guard.wal.is_some() {
@@ -3241,69 +3304,78 @@ impl NodeServiceImpl {
             wal.flush().map_err(wal_err)?;
         }
         Ok(InstallSnapshotResponse {
-            path: generation_tv(&snap).display().to_string(),
+            path: generation_vector(&snap).display().to_string(),
             num_vectors,
             num_documents,
         })
     }
 
-    /// Apply one `SetCalibration`: lock the calibration on an empty shard.
-    fn apply_calibration(&self, req: &SetCalibrationRequest) -> Result<bool, Status> {
+    /// Apply one backend-owned configuration to an empty shard.
+    fn apply_backend_config(&self, req: ConfigureVectorBackendRequest) -> Result<bool, Status> {
         let dim = req.dim as usize;
-        let bit_width = req.bit_width as usize;
+        if dim == 0 {
+            return Err(Status::invalid_argument(
+                "vector dimension must be positive",
+            ));
+        }
+        let config = internal_backend_config(
+            req.config
+                .ok_or_else(|| Status::invalid_argument("vector backend config is required"))?,
+        )?;
         let build = || {
-            if req.shift.len() != dim || req.scale.len() != dim {
-                return Err(Status::invalid_argument(format!(
-                    "invalid calibration: shift/scale hold {}/{} values for dim {dim}",
-                    req.shift.len(),
-                    req.scale.len()
-                )));
-            }
-            seeded_or_plain(dim, bit_width, &req.shift, &req.scale)
-                .map_err(|e| Status::invalid_argument(format!("invalid calibration: {e}")))
+            VectorIndex::from_backend_config(dim, &config)
+                .map_err(|e| Status::invalid_argument(format!("invalid backend config: {e}")))
         };
         let mut guard = self.state.write().expect("shard state lock poisoned");
         let result = match guard.index.as_ref() {
             Some(index) if !index.is_empty() => Err(Status::failed_precondition(format!(
-                "shard holds {} vectors; calibration is locked for the index lifetime",
+                "shard holds {} vectors; vector backend configuration is locked for the generation",
                 index.len()
             ))),
             Some(index) => {
-                let same = index.dim_opt() == Some(dim)
-                    && index.bit_width() == bit_width
-                    && calibration_of(index).is_some_and(|(s, c)| {
-                        s == req.shift.as_slice() && c == req.scale.as_slice()
-                    });
-                if same {
-                    return Ok(true); // idempotent retry
+                let existing = index
+                    .backend_config()
+                    .map_err(|e| Status::internal(format!("read vector backend config: {e}")))?;
+                if index.dim_opt() == Some(dim) && existing == config {
+                    return Ok(true);
                 }
-                if calibration_of(index).is_some() {
-                    return Err(Status::already_exists(
-                        "a different calibration is already locked on this shard",
-                    ));
-                }
-                // Empty, unseeded index: replace with the seeded one.
-                guard.index = Some(build()?);
-                Ok(false)
+                Err(Status::already_exists(
+                    "a different vector backend configuration is already locked on this shard",
+                ))
             }
             None => {
                 guard.index = Some(build()?);
                 Ok(false)
             }
         };
-        // Complete the pending WAL manifest with the locked calibration
-        // (no-op once calibration is on disk).
         if result.is_ok() {
             if let Some(wal) = guard.wal.as_mut() {
-                wal.update_manifest(|m| {
-                    m.dim = dim as u32;
-                    m.bit_width = bit_width as u32;
-                    m.calibration_shift = req.shift.clone();
-                    m.calibration_scale = req.scale.clone();
+                wal.update_manifest(|manifest| {
+                    manifest.dim = dim as u32;
+                    manifest.set_backend_config(config.clone());
                 });
             }
         }
         result
+    }
+
+    /// Apply one legacy calibration request through the generic provider
+    /// configuration path.
+    fn apply_calibration(&self, req: &SetCalibrationRequest) -> Result<bool, Status> {
+        let dim = req.dim as usize;
+        if req.shift.len() != dim || req.scale.len() != dim {
+            return Err(Status::invalid_argument(format!(
+                "invalid calibration: shift/scale hold {}/{} values for dim {dim}",
+                req.shift.len(),
+                req.scale.len()
+            )));
+        }
+        let config = embedded_turbovec_config(req.bit_width as usize, &req.shift, &req.scale)
+            .map_err(|e| Status::invalid_argument(format!("invalid calibration: {e}")))?;
+        self.apply_backend_config(ConfigureVectorBackendRequest {
+            dim: req.dim,
+            config: Some(wire_backend_config(&config)),
+        })
     }
 
     /// Apply one ingested batch under the write lock. Returns
@@ -3337,7 +3409,7 @@ impl NodeServiceImpl {
                 batch.vectors.len()
             )));
         }
-        if let Some((vi, ci, v)) = turbovec::first_invalid_coord(&batch.vectors, dim) {
+        if let Some((vi, ci, v)) = first_invalid_coordinate(&batch.vectors, dim) {
             return Err(Status::invalid_argument(format!(
                 "invalid input value at vector {vi}, coord {ci}: {v}"
             )));
@@ -3346,19 +3418,23 @@ impl NodeServiceImpl {
             let index = match guard.index.as_mut() {
                 Some(index) => index,
                 None => {
-                    // From-scratch, unseeded: turbovec fits calibration from
-                    // this first batch. Seeded deployment is the SetCalibration
-                    // path; this exists for single-shard convenience.
+                    // From-scratch: create the configured provider. Explicit
+                    // provisioning is the multi-shard path; this remains the
+                    // single-shard convenience path.
                     guard.index = Some(
-                        TurboQuantIndex::new(dim, self.config.bit_width)
-                            .map_err(|e| Status::invalid_argument(format!("{e}")))?,
+                        VectorIndex::create(
+                            &self.config.vector_backend,
+                            dim,
+                            self.config.bit_width,
+                        )
+                        .map_err(|e| Status::invalid_argument(format!("{e}")))?,
                     );
                     guard.index.as_mut().expect("just constructed")
                 }
             };
             (
                 self.config.slot_offset + index.len() as u64,
-                index.bit_width(),
+                index.bits_per_dimension().unwrap_or(self.config.bit_width),
             )
         };
         // Apply first, log after, under this one lock. A failed apply
@@ -3370,8 +3446,14 @@ impl NodeServiceImpl {
             .index
             .as_mut()
             .expect("constructed or present above")
-            .add_2d(&batch.vectors, dim)
+            .add(&batch.vectors, dim)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let committed_config = guard
+            .index
+            .as_ref()
+            .expect("constructed or present above")
+            .backend_config()
+            .map_err(|e| Status::internal(format!("read vector backend config: {e}")))?;
         // One record PER VECTOR: contiguous ids hash to different
         // buckets, and a bucket file must never hold vectors that belong
         // to another bucket. Buffered (no fsync per batch); Flush and
@@ -3380,8 +3462,9 @@ impl NodeServiceImpl {
             wal.update_manifest(|m| {
                 if m.dim == 0 {
                     m.dim = dim as u32;
-                    m.bit_width = index_bit_width as u32;
                 }
+                m.bit_width = index_bit_width as u32;
+                m.set_backend_config(committed_config.clone());
             });
         }
         for (i, vector) in batch.vectors.chunks_exact(dim).enumerate() {
@@ -3716,7 +3799,7 @@ impl NodeServiceImpl {
                         vector.len()
                     )));
                 }
-                if let Some((_, coord, value)) = turbovec::first_invalid_coord(vector, dim) {
+                if let Some((_, coord, value)) = first_invalid_coordinate(vector, dim) {
                     return Err(Status::invalid_argument(format!(
                         "hybrid vector coordinate {coord} is invalid: {value}"
                     )));
@@ -4561,10 +4644,7 @@ impl NodeServiceImpl {
         }
         for (name, expr, kind) in &compiled {
             let value = crate::values::eval_ingest(expr, &env).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "materialize: column {name:?}: {}",
-                    e.message()
-                ))
+                Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
             })?;
             match value {
                 None => {}
@@ -4670,17 +4750,21 @@ impl NodeServiceImpl {
                         )));
                     }
                 }
-                if let Some((_, ci, value)) = turbovec::first_invalid_coord(v, dim) {
+                if let Some((_, ci, value)) = first_invalid_coordinate(v, dim) {
                     return Err(Status::invalid_argument(format!(
                         "mapped vector coordinate {ci} is {value}; vectors must be finite"
                     )));
                 }
                 if guard.index.is_none() {
-                    // From-scratch, unseeded: same single-shard
-                    // convenience the AddVectors path allows.
+                    // From-scratch: same single-shard convenience the
+                    // AddVectors path allows.
                     guard.index = Some(
-                        TurboQuantIndex::new(dim, self.config.bit_width)
-                            .map_err(|e| Status::invalid_argument(format!("{e}")))?,
+                        VectorIndex::create(
+                            &self.config.vector_backend,
+                            dim,
+                            self.config.bit_width,
+                        )
+                        .map_err(|e| Status::invalid_argument(format!("{e}")))?,
                     );
                 }
                 Some(dim)
@@ -5062,19 +5146,25 @@ impl NodeServiceImpl {
         if let Some(v) = vector {
             let dim = vector_dim.expect("validated alongside the vector");
             let index = guard.index.as_mut().expect("ensured during validation");
-            index.add_2d(&v, dim).map_err(|e| {
+            index.add(&v, dim).map_err(|e| {
                 Status::internal(format!(
                     "vector apply failed after validation: {e}; the shard's legs may have \
                      diverged — the next mapped document will refuse if so"
                 ))
             })?;
-            let bit_width = index.bit_width();
+            let bit_width = index.bits_per_dimension().unwrap_or(self.config.bit_width);
+            let committed_config = index.backend_config().map_err(|e| {
+                Status::internal(format!(
+                    "read vector backend config after mapped ingest: {e}"
+                ))
+            })?;
             if let Some(wal) = guard.wal.as_mut() {
                 wal.update_manifest(|m| {
                     if m.dim == 0 {
                         m.dim = dim as u32;
-                        m.bit_width = bit_width as u32;
                     }
+                    m.bit_width = bit_width as u32;
+                    m.set_backend_config(committed_config.clone());
                 });
             }
             wal_append_or_degrade(
@@ -5099,7 +5189,10 @@ impl NodeServiceImpl {
     /// and refuse — up front, naming every gap at once — landing
     /// columns this shard does not declare. Nothing streams until the
     /// bind stands.
-    fn bind_mapped(&self, bind: &crate::pb::MappedBind) -> Result<crate::mapping::Extractor, Status> {
+    fn bind_mapped(
+        &self,
+        bind: &crate::pb::MappedBind,
+    ) -> Result<crate::mapping::Extractor, Status> {
         if bind.expected_fingerprint.is_empty() {
             return Err(Status::invalid_argument(
                 "expected_fingerprint is required: dry-run the plan with PlanIndex first, \
@@ -5363,9 +5456,7 @@ impl NodeServiceImpl {
                     // The quality layers are requested in the session's
                     // options message, so a change to them reopens the
                     // session for the same reason a spec change does.
-                    if doc.analysis != spec
-                        || doc.quality != quality
-                        || doc.geography != geography
+                    if doc.analysis != spec || doc.quality != quality || doc.geography != geography
                     {
                         // A mid-stream BODY spec change (rare): collect
                         // what the current session still owes so nothing
@@ -5653,8 +5744,11 @@ impl NodeService for NodeServiceImpl {
                         &geo_regions,
                         start.filter.as_ref(),
                     )?;
-                    let known =
-                        filter_known_flags(guard.bm25.as_ref(), &start.geo_filters, start.filter.as_ref());
+                    let known = filter_known_flags(
+                        guard.bm25.as_ref(),
+                        &start.geo_filters,
+                        start.filter.as_ref(),
+                    );
                     let (hits, stats) = chunked_topk_collapsed(
                         index,
                         &start.vector,
@@ -5899,31 +5993,28 @@ impl NodeService for NodeServiceImpl {
             // exactness certificate is trivial; per-shard exact top-k
             // by key means the coordinator's merged union contains the
             // global top-k (local rank <= global rank).
-            let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> =
-                if let Some(ni) = store.numeric_index(&sort.column) {
-                    Box::new(move |doc| {
-                        store
-                            .numeric_value(ni, doc)
-                            .map(|v| (f64_order_bits(v), v))
-                    })
-                } else if let Some(ii) = store.integer_index(&sort.column) {
-                    Box::new(move |doc| {
-                        store
-                            .integer_value(ii, doc)
-                            .map(|v| (i64_order_bits(v), v as f64))
-                    })
-                } else {
-                    // Unknown here; the coordinator's typo rule refuses
-                    // only when NO shard knows it.
-                    return Ok(Response::new(crate::pb::BrowseShardResponse {
-                        doc_ids: Vec::new(),
-                        geo_columns_known,
-                        filter_columns_known,
-                        sort_key_bits: Vec::new(),
-                        sort_keys: Vec::new(),
-                        sort_column_known: false,
-                    }));
-                };
+            let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> = if let Some(ni) =
+                store.numeric_index(&sort.column)
+            {
+                Box::new(move |doc| store.numeric_value(ni, doc).map(|v| (f64_order_bits(v), v)))
+            } else if let Some(ii) = store.integer_index(&sort.column) {
+                Box::new(move |doc| {
+                    store
+                        .integer_value(ii, doc)
+                        .map(|v| (i64_order_bits(v), v as f64))
+                })
+            } else {
+                // Unknown here; the coordinator's typo rule refuses
+                // only when NO shard knows it.
+                return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    doc_ids: Vec::new(),
+                    geo_columns_known,
+                    filter_columns_known,
+                    sort_key_bits: Vec::new(),
+                    sort_keys: Vec::new(),
+                    sort_column_known: false,
+                }));
+            };
             let boundary = (!req.first_page).then_some((req.after_key_bits, req.after));
             // Max-heap keeping the k SMALLEST (adjusted-bits, id) pairs.
             let mut heap: std::collections::BinaryHeap<(u64, u64, u64)> =
@@ -5994,8 +6085,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
         crate::metrics::inc_request(crate::metrics::Route::AggregateShard);
         let req = request.into_inner();
-        if req.aggregations.is_empty() && req.histograms.is_empty() && req.percentiles.is_empty()
-        {
+        if req.aggregations.is_empty() && req.histograms.is_empty() && req.percentiles.is_empty() {
             return Err(Status::invalid_argument(
                 "aggregate requires at least one aggregation, histogram, or percentile",
             ));
@@ -6077,11 +6167,7 @@ impl NodeService for NodeServiceImpl {
                 ))
             })?;
             let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "aggregation {:?}: {}",
-                    agg.name,
-                    e.message()
-                ))
+                Status::invalid_argument(format!("aggregation {:?}: {}", agg.name, e.message()))
             })?;
             check_agg_type(&agg.name, op, vt)?;
             totals.push(acc_of(vt));
@@ -6210,7 +6296,9 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             for (resolved, acc) in pcts.iter_mut() {
-                let Some((rv, int_typed)) = resolved else { continue };
+                let Some((rv, int_typed)) = resolved else {
+                    continue;
+                };
                 if let Some(v) = crate::values::eval(rv, doc, &cols) {
                     acc.push(rankable_bits(v, *int_typed));
                 }
@@ -6338,14 +6426,28 @@ impl NodeService for NodeServiceImpl {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         let guard = self.state.read().expect("shard state lock poisoned");
-        let (num_vectors, dim, bit_width) = match guard.index.as_ref() {
-            Some(index) => (
-                index.len() as u64,
-                index.dim_opt().unwrap_or(0) as u32,
-                index.bit_width() as u32,
-            ),
-            None => (0, 0, self.config.bit_width as u32),
-        };
+        let (num_vectors, dim, bit_width, vector_backend, scoring_fingerprint, quality_contract) =
+            match guard.index.as_ref() {
+                Some(index) => {
+                    let descriptor = index.descriptor();
+                    (
+                        index.len() as u64,
+                        index.dim_opt().unwrap_or(0) as u32,
+                        index.bits_per_dimension().unwrap_or(self.config.bit_width) as u32,
+                        descriptor.backend_kind,
+                        descriptor.scoring_fingerprint,
+                        format!("{:?}", descriptor.quality_contract).to_ascii_lowercase(),
+                    )
+                }
+                None => (
+                    0,
+                    0,
+                    self.config.bit_width as u32,
+                    self.config.vector_backend.clone(),
+                    String::new(),
+                    String::new(),
+                ),
+            };
         let (bm25_docs, bm25_building) = match guard.bm25.as_ref() {
             Some(shard) => (shard.doc_count(), matches!(shard, Bm25Shard::Spilling(_))),
             None => (0, false),
@@ -6353,11 +6455,14 @@ impl NodeService for NodeServiceImpl {
         Ok(Response::new(HealthResponse {
             num_vectors,
             dim,
-            bit_width,
+            bits_per_dimension: bit_width,
             slot_offset: self.config.slot_offset,
             bm25_docs,
             bm25_building,
             ingest_active: self.ingest_busy.load(std::sync::atomic::Ordering::Acquire),
+            vector_backend,
+            scoring_fingerprint,
+            quality_contract,
         }))
     }
 
@@ -6486,9 +6591,7 @@ impl NodeService for NodeServiceImpl {
                             start.vector.len()
                         )));
                     }
-                    if let Some((_, coord, value)) =
-                        turbovec::first_invalid_coord(&start.vector, dim)
-                    {
+                    if let Some((_, coord, value)) = first_invalid_coordinate(&start.vector, dim) {
                         return Err(Status::invalid_argument(format!(
                             "query coordinate {coord} is invalid: {value}"
                         )));
@@ -6521,7 +6624,7 @@ impl NodeService for NodeServiceImpl {
                         start.filter.as_ref(),
                     );
 
-                    let mut options = turbovec::SearchOptions::new();
+                    let mut options = VectorSearchOptions::new();
                     if let Some(a) = allow.as_deref() {
                         options = options.with_mask(a);
                     }
@@ -6565,9 +6668,9 @@ impl NodeService for NodeServiceImpl {
                                     )),
                                 }));
                                 if sent.is_err() {
-                                    turbovec::StreamControl::Stop
+                                    VectorStreamControl::Stop
                                 } else {
-                                    turbovec::StreamControl::Continue
+                                    VectorStreamControl::Continue
                                 }
                             },
                             || {
@@ -6575,7 +6678,7 @@ impl NodeService for NodeServiceImpl {
                                     .cancelled
                                     .load(std::sync::atomic::Ordering::Acquire)
                                 {
-                                    return turbovec::StreamControl::Stop;
+                                    return VectorStreamControl::Stop;
                                 }
                                 let f = f32::from_bits(
                                     scan_signals
@@ -6585,9 +6688,9 @@ impl NodeService for NodeServiceImpl {
                                 if f > floor_now {
                                     floor_now = f;
                                     raises += 1;
-                                    turbovec::StreamControl::RaiseFloor(f)
+                                    VectorStreamControl::RaiseFloor(f)
                                 } else {
-                                    turbovec::StreamControl::Continue
+                                    VectorStreamControl::Continue
                                 }
                             },
                         )
@@ -6598,7 +6701,7 @@ impl NodeService for NodeServiceImpl {
                                 .cancelled
                                 .load(std::sync::atomic::Ordering::Acquire),
                         emitted: summary.emitted as u64,
-                        blocks_scanned: summary.blocks_scanned as u64,
+                        blocks_scanned: summary.units_scanned as u64,
                         floor_raises_applied: raises,
                         geo_columns_known,
                         filter_columns_known,
@@ -6633,6 +6736,38 @@ impl NodeService for NodeServiceImpl {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn get_vector_backend(
+        &self,
+        _request: Request<GetVectorBackendRequest>,
+    ) -> Result<Response<GetVectorBackendResponse>, Status> {
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let Some(index) = guard.index.as_ref() else {
+            return Ok(Response::new(GetVectorBackendResponse {
+                descriptor: None,
+                config: None,
+                num_vectors: 0,
+            }));
+        };
+        let config = index
+            .backend_config()
+            .map_err(|e| Status::internal(format!("read vector backend config: {e}")))?;
+        Ok(Response::new(GetVectorBackendResponse {
+            descriptor: Some(wire_backend_descriptor(index)),
+            config: Some(wire_backend_config(&config)),
+            num_vectors: index.len() as u64,
+        }))
+    }
+
+    async fn configure_vector_backend(
+        &self,
+        request: Request<ConfigureVectorBackendRequest>,
+    ) -> Result<Response<ConfigureVectorBackendResponse>, Status> {
+        let already_configured = self.apply_backend_config(request.into_inner())?;
+        Ok(Response::new(ConfigureVectorBackendResponse {
+            already_configured,
+        }))
+    }
+
     async fn get_calibration(
         &self,
         _request: Request<GetCalibrationRequest>,
@@ -6640,12 +6775,10 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let (dim, bit_width, num_vectors, shift, scale) = match guard.index.as_ref() {
             Some(index) => {
-                let (shift, scale) = calibration_of(index)
-                    .map(|(s, c)| (s.to_vec(), c.to_vec()))
-                    .unwrap_or_default();
+                let (shift, scale) = calibration_of(index).unwrap_or_default();
                 (
                     index.dim_opt().unwrap_or(0) as u32,
-                    index.bit_width() as u32,
+                    index.bits_per_dimension().unwrap_or(self.config.bit_width) as u32,
                     index.len() as u64,
                     shift,
                     scale,
@@ -6732,10 +6865,10 @@ impl NodeService for NodeServiceImpl {
         let manifest = match inbound.message().await? {
             Some(SnapshotChunk {
                 payload: Some(snapshot_chunk::Payload::Manifest(m)),
-            }) if m.tv_bytes > 0 => m,
+            }) if m.vector_bytes > 0 => m,
             _ => {
                 return Err(Status::invalid_argument(
-                    "first SnapshotChunk must be a SnapshotManifest with tv_bytes > 0",
+                    "first SnapshotChunk must be a SnapshotManifest with vector_bytes > 0",
                 ))
             }
         };
@@ -7176,8 +7309,7 @@ impl NodeService for NodeServiceImpl {
                     })
                     .collect::<Result<_, Status>>()?;
                 let chain = store.resolve_chain(&specs);
-                let stage_columns_known =
-                    chain.stages.iter().map(|s| s.column.is_some()).collect();
+                let stage_columns_known = chain.stages.iter().map(|s| s.column.is_some()).collect();
                 let numeric_read = ShardNumericRead(store);
                 let n = store.doc_count();
                 let mut ids: Vec<u64> = req
@@ -7250,7 +7382,7 @@ impl NodeService for NodeServiceImpl {
                     req.vector.len()
                 )));
             }
-            if let Some((_, coord, value)) = turbovec::first_invalid_coord(&req.vector, dim) {
+            if let Some((_, coord, value)) = first_invalid_coordinate(&req.vector, dim) {
                 return Err(Status::invalid_argument(format!(
                     "query coordinate {coord} is invalid: {value}"
                 )));
@@ -7600,7 +7732,7 @@ impl NodeServiceImpl {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
-                // 0/absent means unseeded (scores are always positive).
+                // 0/absent means no supplied score floor (scores are positive).
                 let floor = if req.min_score == 0.0 {
                     f64::NEG_INFINITY
                 } else {

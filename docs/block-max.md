@@ -281,7 +281,7 @@ against the seeded scorer and
 `tests/bm25_search.rs::bm25_stream_relay_matches_unary_exactly` pins
 the fleet-level hit signature, streamed vs unary, seeded and not.
 
-The relay is opt-in (`--bm25-stream` / `TURBOVEC_BM25_STREAM` on the
+The relay is opt-in (`--bm25-stream` / `PIPESTREAM_SEARCH_BM25_STREAM` on the
 coordinator; nodes always serve the RPC). Measured on the v9 court
 fleet (8 shards, one host, 36 case-folding queries x 3): k=10 is
 noise-level either way; k=100 keeps p50 flat (71 ms) and trims the tail
@@ -337,7 +337,7 @@ Landed in this order, each measurable on its own:
    and unary. `kth_best` on
    `Bm25QueryResponse` / `Bm25SearchResponse`, `min_score` on
    `Bm25SearchRequest`, the `--block-max` node flag
-   (`TURBOVEC_BLOCK_MAX`, default true) for A/B, and `cluster_sweep
+   (`PIPESTREAM_SEARCH_BLOCK_MAX`, default true) for A/B, and `cluster_sweep
    --bm25-terms` running the `{floor seeding off, on} x {block-max off,
    on}` factorial with the hit-signature gate on every cell (the
    seeded cell seeds one f32 ULP below the merged k-th best, so seeded
@@ -473,7 +473,7 @@ on the vector side:
 `MaxScoreAccumulator` is worth reading next to `search.rs`'s
 `shared_floor`: both are a monotone max over a total-order key in one
 atomic, for the same reason. Lucene shares between segment searches;
-the fork shares between scan ranges, and turbovec-search shares between
+the fork shares between scan ranges, and pipestream-search shares between
 machines.
 
 **Ordering, the companion technique**: block-max gets better when blocks

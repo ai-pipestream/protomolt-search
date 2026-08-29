@@ -1,6 +1,6 @@
 //! Court pipeline stage 3: ingest the chunked, embedded corpus into an
-//! N-shard turbovec-search cluster on loopback — calibration fit +
-//! BroadcastCalibration, AddDocuments (chunk texts WITH lineage, real
+//! N-shard pipestream-search cluster on loopback — calibration fit +
+//! BroadcastVectorBackend, AddDocuments (chunk texts WITH lineage, real
 //! analysis sidecar for BM25) + AddVectors with aligned ids, Flush for
 //! persistence — then run sample hybrid cascade queries.
 //!
@@ -16,17 +16,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::demo::court::{self, Chunk};
+use pipestream_search::harness::{self, mock_analysis, start_sidecar};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::{
+    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastVectorBackendRequest,
+    DocLineage, DocumentField, FlushRequest, GetDocumentsRequest,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use turbovec_search::coordinator::CoordinatorServiceImpl;
-use turbovec_search::demo::court::{self, Chunk};
-use turbovec_search::harness::{self, mock_analysis, start_sidecar};
-use turbovec_search::node::NodeConfig;
-use turbovec_search::pb::node_service_client::NodeServiceClient;
-use turbovec_search::pb::{
-    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastCalibrationRequest, DocLineage,
-    DocumentField, FlushRequest, GetDocumentsRequest,
-};
 
 const SIDECAR_BIN: &str =
     "/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
@@ -39,7 +39,7 @@ fn arg(key: &str, default: &str) -> String {
 }
 
 fn analysis_spec() -> AnalysisSpec {
-    turbovec_search::analyzer::body_spec()
+    pipestream_search::analyzer::body_spec()
 }
 
 /// The case_name field's analysis (docs/multi-field.md): names stay
@@ -376,18 +376,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let coordinator = CoordinatorServiceImpl::new(node_addrs.clone())
         .with_bm25(Some(analysis_addr), Default::default());
+    let backend = harness::embedded_backend_request(dim, 4, &shift, &scale);
     let results = coordinator
-        .fanout_calibration(&BroadcastCalibrationRequest {
-            dim: dim as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
+        .fanout_vector_backend(&BroadcastVectorBackendRequest {
+            dim: backend.dim,
+            config: backend.config,
         })
         .await;
     for r in &results {
-        assert!(r.ok, "calibration rejected by {}: {}", r.node, r.error);
+        assert!(r.ok, "vector backend rejected by {}: {}", r.node, r.error);
     }
-    eprintln!("calibration broadcast to {} shards OK", results.len());
+    eprintln!("vector backend broadcast to {} shards OK", results.len());
 
     // --- Ingest: documents (with lineage) then vectors --------------------
     let spec = analysis_spec();
@@ -504,7 +503,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &chunk.text[..chunk.text.len().min(120)]
         );
         let hits = coordinator
-            .fanout_cascade("court", &chunk.text, vector, 5, Some(&spec), 0.0, false, &Default::default())
+            .fanout_cascade(
+                "court",
+                &chunk.text,
+                vector,
+                5,
+                Some(&spec),
+                0.0,
+                false,
+                &Default::default(),
+            )
             .await?
             .0;
         for hit in &hits {
@@ -690,25 +698,24 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     }
 
     // Broadcast only to this driver's range: nodes outside it may already
-    // hold vectors (another driver's shards), where SetCalibration is a
+    // hold vectors (another driver's shards), where provider configuration is a
     // failed_precondition rather than an idempotent retry.
     let coordinator = CoordinatorServiceImpl::new(node_addrs[first_shard..end_shard].to_vec())
         .with_bm25(
             Some(arg("analysis-addr", "http://127.0.0.1:59111")),
             Default::default(),
         );
+    let backend = harness::embedded_backend_request(dim, 4, &shift, &scale);
     let results = coordinator
-        .fanout_calibration(&BroadcastCalibrationRequest {
-            dim: dim as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
+        .fanout_vector_backend(&BroadcastVectorBackendRequest {
+            dim: backend.dim,
+            config: backend.config,
         })
         .await;
     for r in &results {
-        assert!(r.ok, "calibration rejected by {}: {}", r.node, r.error);
+        assert!(r.ok, "vector backend rejected by {}: {}", r.node, r.error);
     }
-    eprintln!("calibration broadcast to {} shards OK", results.len());
+    eprintln!("vector backend broadcast to {} shards OK", results.len());
 
     let spec = analysis_spec();
     for (shard, addr) in node_addrs

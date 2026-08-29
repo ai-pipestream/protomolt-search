@@ -1,6 +1,6 @@
 //! Shared fixtures for the integration tests. The heavy lifting (corpus
 //! generation, shard building, server startup) lives in
-//! [`turbovec_search::harness`] so the `sweep` binary uses the same code;
+//! [`pipestream_search::harness`] so the `sweep` binary uses the same code;
 //! this module adds the test-only `Cluster` wrapper and the monolithic
 //! reference comparator.
 //!
@@ -11,13 +11,16 @@
 
 pub mod mock;
 
+use pipestream_search::harness::{self, build_monolithic, build_shards};
+use pipestream_search::node::NodeConfig;
+use pipestream_search::vector::VectorIndex;
 use tokio::task::JoinHandle;
 use tonic::transport::Error as TransportError;
-use turbovec::TurboQuantIndex;
-use turbovec_search::harness::{self, build_monolithic, build_shards};
-use turbovec_search::node::NodeConfig;
 
-pub use harness::{fit_calibration, start_coordinator, start_empty_node, start_node, unit_vectors};
+pub use harness::{
+    embedded_backend_request, fit_calibration, start_coordinator, start_empty_node, start_node,
+    unit_vectors,
+};
 
 pub const DIM: usize = 128;
 pub const BIT_WIDTH: usize = 4;
@@ -25,8 +28,8 @@ pub const BIT_WIDTH: usize = 4;
 /// Reference top-k from the monolithic index as `(global_id, score_bits)`,
 /// re-sorted into the coordinator's total order (score desc, id asc) so the
 /// comparison is exact, tie-break included.
-pub fn monolithic_topk(index: &TurboQuantIndex, query: &[f32], k: usize) -> Vec<(u64, u32)> {
-    let results = index.search(query, k);
+pub fn monolithic_topk(index: &VectorIndex, query: &[f32], k: usize) -> Vec<(u64, u32)> {
+    let results = index.search_unfiltered(query, k);
     let mut hits: Vec<(u64, u32)> = results
         .indices_for_query(0)
         .iter()
@@ -41,7 +44,7 @@ pub fn monolithic_topk(index: &TurboQuantIndex, query: &[f32], k: usize) -> Vec<
 /// monolithic reference index.
 pub struct Cluster {
     pub node_addrs: Vec<String>,
-    pub monolithic: TurboQuantIndex,
+    pub monolithic: VectorIndex,
     pub n: usize,
     handles: Vec<JoinHandle<Result<(), TransportError>>>,
 }
