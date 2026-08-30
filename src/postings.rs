@@ -1,7 +1,7 @@
 //! Per-shard BM25 postings index and doc store, with persistence.
 //!
 //! The shard owns: term → postings (doc id, tf, occurrence offsets in
-//! original-text coordinates), per-document lengths and corpus totals, and
+//! original-text UTF-16 code units), per-document lengths and corpus totals, and
 //! the raw document texts (the highlight source). Append-only: no deletes,
 //! no updates, so postings for a term stay doc-id-ordered by construction.
 //!
@@ -561,7 +561,7 @@ pub struct Posting {
     pub doc_id: u32,
     /// Term frequency within the document.
     pub tf: u32,
-    /// Occurrence spans `(start, end)` in original-text coordinates
+    /// Occurrence spans `(start, end)` in original-text UTF-16 code units.
     /// (half-open). Empty when ingested with SCORING_ONLY term vectors.
     pub offsets: Vec<(u32, u32)>,
 }

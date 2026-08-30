@@ -3,7 +3,8 @@
 //!
 //! `native` runs the same product term contract in-process through the
 //! cross-platform `protomolt-analyzer` crate. HTTP(S) values use the OpenNLP
-//! sidecar. Both produce original-text UTF-16 offsets. Embeddings and optional
+//! sidecar. Search configures both to produce original-text UTF-16 offsets;
+//! direct users of either analyzer can select UTF-8 instead. Embeddings and optional
 //! model-backed/structural layers remain sidecar capabilities.
 
 use std::collections::HashMap;
@@ -325,7 +326,7 @@ pub async fn analyze_document(
     // (the channel connects lazily, so "sidecar down" surfaces HERE, not
     // at client construction), server errors keep their own codes.
     let response = client.analyze(request).await?.into_inner();
-    Ok(analyzed_from(response, SessionLayers::default()))
+    analyzed_from(response, SessionLayers::default())
 }
 
 /// Analyze one document with the in-process Rust provider.
@@ -580,6 +581,10 @@ fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> Analy
         // well. Availability was preflighted at session open.
         ner: layers.entities || layers.geography,
         geo: layers.geography,
+        // Search persistence remains one unambiguous legacy coordinate system.
+        // Offset output selection is separate from term identity and is exposed
+        // by the portable analyzer API rather than AnalysisSpec.
+        offset_unit: crate::pb::analysis::OffsetUnit::Utf16CodeUnits as i32,
         ..Default::default()
     }
 }
@@ -605,7 +610,21 @@ static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// have produced; the dropped token contributes nothing to the
 /// document length either, exactly as if the analyzer had never
 /// emitted it.
-fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> AnalyzedDoc {
+fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> Result<AnalyzedDoc, Status> {
+    match crate::pb::analysis::OffsetUnit::try_from(response.offset_unit) {
+        Ok(crate::pb::analysis::OffsetUnit::Unspecified)
+        | Ok(crate::pb::analysis::OffsetUnit::Utf16CodeUnits) => {}
+        Ok(crate::pb::analysis::OffsetUnit::Utf8Bytes) => {
+            return Err(Status::failed_precondition(
+                "analysis sidecar returned UTF-8 byte offsets after search requested UTF-16; refusing ambiguous persisted spans",
+            ));
+        }
+        Err(value) => {
+            return Err(Status::failed_precondition(format!(
+                "analysis sidecar returned unknown offset unit {value}"
+            )));
+        }
+    }
     let quality = layers.quality.then(|| doc_quality(&response));
     let geography = layers.geography.then(|| doc_geography(&response));
     let entities = if layers.entities {
@@ -650,12 +669,12 @@ fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> AnalyzedDo
         length += tv.frequency as u32;
         terms.push((tv.term, tv.frequency as u32, offsets));
     }
-    AnalyzedDoc {
+    Ok(AnalyzedDoc {
         quality,
         geography,
         entities,
         ..AnalyzedDoc::body(terms, length)
-    }
+    })
 }
 
 /// Fold a response's noise and artifact layers into the per-document
@@ -1029,7 +1048,7 @@ impl AnalyzeStream {
                                     ok.tokens.iter().map(|t| t.text.as_str()),
                                 );
                             }
-                            Ok(analyzed_from(ok, self.layers))
+                            analyzed_from(ok, self.layers)
                         }
                         Some(analyze_stream_response::Result::Error(error)) => {
                             Err(Status::new(tonic::Code::from(error.code), error.message))
@@ -1546,10 +1565,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            analyzed_from(with_empty, SessionLayers::default()),
-            analyzed_from(without, SessionLayers::default()),
+            analyzed_from(with_empty, SessionLayers::default()).unwrap(),
+            analyzed_from(without, SessionLayers::default()).unwrap(),
             "the empty term must vanish as if the analyzer never emitted it"
         );
+    }
+
+    #[test]
+    fn search_refuses_a_sidecar_that_violates_its_utf16_storage_request() {
+        let response = AnalyzeResponse {
+            offset_unit: crate::pb::analysis::OffsetUnit::Utf8Bytes as i32,
+            ..Default::default()
+        };
+        let error = analyzed_from(response, SessionLayers::default()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("ambiguous persisted spans"));
     }
 
     #[test]

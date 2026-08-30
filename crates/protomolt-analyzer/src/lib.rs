@@ -59,6 +59,27 @@ pub enum TermVectorSource {
     NormalizedStems,
 }
 
+/// Coordinate system used by every returned original-text span.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetUnit {
+    /// Java/OpenNLP string coordinates. Supplementary scalars occupy two
+    /// units. This is the backward-compatible default.
+    #[default]
+    Utf16CodeUnits,
+    /// Byte boundaries in the original text's UTF-8 encoding, directly usable
+    /// to slice a Rust string.
+    Utf8Bytes,
+}
+
+impl OffsetUnit {
+    fn position(self, utf16: u32, utf8: usize) -> u32 {
+        match self {
+            Self::Utf16CodeUnits => utf16,
+            Self::Utf8Bytes => utf8 as u32,
+        }
+    }
+}
+
 /// OpenNLP-compatible normalizer stages supported by the native analyzer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NormalizerStep {
@@ -82,7 +103,8 @@ pub struct AnalysisSpec {
     pub normalizers: Vec<NormalizerStep>,
 }
 
-/// Half-open UTF-16 span in the original input text.
+/// Half-open span in the original input text, using the result's selected
+/// [`OffsetUnit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: u32,
@@ -106,6 +128,8 @@ pub struct AnalyzedDocument {
     pub tokens: Vec<String>,
     /// Sum of retained term frequencies.
     pub length: u32,
+    /// Coordinate system shared by every term occurrence.
+    pub offset_unit: OffsetUnit,
 }
 
 /// One registered glossary surface form. Multiple entries may share an id to
@@ -189,7 +213,7 @@ impl Glossary {
                     entry.term
                 )));
             }
-            let count = tokenize_uax29(&entry.term).len() as u32;
+            let count = tokenize_uax29(&entry.term, OffsetUnit::Utf16CodeUnits).len() as u32;
             if count == 0 {
                 return Err(AnalysisError::new(format!(
                     "glossary term {:?} contains no indexable UAX #29 token",
@@ -228,7 +252,17 @@ impl Glossary {
 
     /// Leftmost-longest non-overlapping matches for annotation consumers.
     pub fn matches(&self, text: &str) -> Vec<GlossaryMatch> {
-        let mut matches = self.all_valid_matches(text);
+        self.matches_with_offset_unit(text, OffsetUnit::Utf16CodeUnits)
+    }
+
+    /// Leftmost-longest matches using the requested original-text coordinate
+    /// system.
+    pub fn matches_with_offset_unit(
+        &self,
+        text: &str,
+        offset_unit: OffsetUnit,
+    ) -> Vec<GlossaryMatch> {
+        let mut matches = self.all_valid_matches(text, offset_unit);
         matches.sort_by(|a, b| {
             a.span
                 .start
@@ -255,7 +289,17 @@ impl Glossary {
     /// as both `new york` and `new york city`. No unregistered shingle is
     /// synthesized.
     pub fn index_matches(&self, text: &str) -> Vec<GlossaryMatch> {
-        let mut matches = self.all_valid_matches(text);
+        self.index_matches_with_offset_unit(text, OffsetUnit::Utf16CodeUnits)
+    }
+
+    /// Every registered occurrence using the requested original-text
+    /// coordinate system.
+    pub fn index_matches_with_offset_unit(
+        &self,
+        text: &str,
+        offset_unit: OffsetUnit,
+    ) -> Vec<GlossaryMatch> {
+        let mut matches = self.all_valid_matches(text, offset_unit);
         matches.sort_by(|a, b| {
             a.span
                 .start
@@ -267,7 +311,7 @@ impl Glossary {
         matches
     }
 
-    fn all_valid_matches(&self, text: &str) -> Vec<GlossaryMatch> {
+    fn all_valid_matches(&self, text: &str, offset_unit: OffsetUnit) -> Vec<GlossaryMatch> {
         let folded = FoldedText::new(text, self.ignore_case);
         let mut matches = Vec::new();
         for matched in self.matcher.find_overlapping_iter(&folded.text) {
@@ -286,8 +330,8 @@ impl Glossary {
                     id: entry.id.clone(),
                     registered_term: entry.term.clone(),
                     span: Span {
-                        start: start_utf16,
-                        end: end_utf16,
+                        start: offset_unit.position(start_utf16, start_byte),
+                        end: offset_unit.position(end_utf16, end_byte),
                     },
                     token_count: self.token_counts[entry_index],
                 });
@@ -337,10 +381,19 @@ struct Token<'a> {
 /// Analyze one document. Terms are emitted in first-occurrence order and
 /// occurrence spans use Java/OpenNLP UTF-16 coordinates.
 pub fn analyze(text: &str, spec: &AnalysisSpec) -> Result<AnalyzedDocument, AnalysisError> {
+    analyze_with_offset_unit(text, spec, OffsetUnit::Utf16CodeUnits)
+}
+
+/// Analyze one document and return every occurrence in `offset_unit`.
+pub fn analyze_with_offset_unit(
+    text: &str,
+    spec: &AnalysisSpec,
+    offset_unit: OffsetUnit,
+) -> Result<AnalyzedDocument, AnalysisError> {
     validate(text, spec)?;
     let tokens = match spec.tokenizer {
-        Tokenizer::Whitespace => tokenize_whitespace(text),
-        Tokenizer::Uax29 => tokenize_uax29(text),
+        Tokenizer::Whitespace => tokenize_whitespace(text, offset_unit),
+        Tokenizer::Uax29 => tokenize_uax29(text, offset_unit),
     };
     let mut vectors = Vec::<TermVector>::new();
     let mut positions = HashMap::<String, usize>::new();
@@ -379,6 +432,7 @@ pub fn analyze(text: &str, spec: &AnalysisSpec) -> Result<AnalyzedDocument, Anal
             .map(|token| token.surface.to_string())
             .collect(),
         length,
+        offset_unit,
     })
 }
 
@@ -466,7 +520,7 @@ pub fn unicode_case_fold(text: &str) -> String {
     full_case_fold(text)
 }
 
-fn tokenize_whitespace(text: &str) -> Vec<Token<'_>> {
+fn tokenize_whitespace(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
     let mut tokens = Vec::new();
     let mut start_byte = None;
     let mut start_utf16 = 0u32;
@@ -478,8 +532,8 @@ fn tokenize_whitespace(text: &str) -> Vec<Token<'_>> {
                 tokens.push(Token {
                     surface: &text[start..byte],
                     span: Span {
-                        start: start_utf16,
-                        end: utf16,
+                        start: offset_unit.position(start_utf16, start),
+                        end: offset_unit.position(utf16, byte),
                     },
                 });
             }
@@ -493,15 +547,15 @@ fn tokenize_whitespace(text: &str) -> Vec<Token<'_>> {
         tokens.push(Token {
             surface: &text[start..],
             span: Span {
-                start: start_utf16,
-                end: utf16,
+                start: offset_unit.position(start_utf16, start),
+                end: offset_unit.position(utf16, text.len()),
             },
         });
     }
     tokens
 }
 
-fn tokenize_uax29(text: &str) -> Vec<Token<'_>> {
+fn tokenize_uax29(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
     const MAX_TOKEN_UTF16: u32 = 255;
     let pictographic = CodePointSetData::new::<ExtendedPictographic>();
     let mut tokens = Vec::new();
@@ -526,8 +580,8 @@ fn tokenize_uax29(text: &str) -> Vec<Token<'_>> {
                     tokens.push(Token {
                         surface: &text[chunk_byte..end],
                         span: Span {
-                            start: chunk_utf16,
-                            end: chunk_utf16 + used,
+                            start: offset_unit.position(chunk_utf16, chunk_byte),
+                            end: offset_unit.position(chunk_utf16 + used, end),
                         },
                     });
                     chunk_byte = end;
@@ -540,8 +594,8 @@ fn tokenize_uax29(text: &str) -> Vec<Token<'_>> {
                 tokens.push(Token {
                     surface: &text[chunk_byte..byte + segment.len()],
                     span: Span {
-                        start: chunk_utf16,
-                        end: chunk_utf16 + used,
+                        start: offset_unit.position(chunk_utf16, chunk_byte),
+                        end: offset_unit.position(chunk_utf16 + used, byte + segment.len()),
                     },
                 });
             }
@@ -763,6 +817,7 @@ mod tests {
     #[test]
     fn folded_terms_group_and_keep_utf16_offsets() {
         let doc = analyze("😀 Running Rodríguez running", &folded()).unwrap();
+        assert_eq!(doc.offset_unit, OffsetUnit::Utf16CodeUnits);
         assert_eq!(
             doc.term_vectors,
             vec![
@@ -784,6 +839,40 @@ mod tests {
             ]
         );
         assert_eq!(doc.length, 4);
+    }
+
+    #[test]
+    fn utf8_mode_changes_only_the_original_text_ruler() {
+        let text = "A 😀 café 東京";
+        let utf16 = analyze(text, &folded()).unwrap();
+        let utf8 = analyze_with_offset_unit(text, &folded(), OffsetUnit::Utf8Bytes).unwrap();
+
+        assert_eq!(utf8.offset_unit, OffsetUnit::Utf8Bytes);
+        assert_eq!(utf8.tokens, utf16.tokens);
+        assert_eq!(utf8.length, utf16.length);
+        assert_eq!(
+            utf8.term_vectors
+                .iter()
+                .map(|term| (&term.term, term.frequency))
+                .collect::<Vec<_>>(),
+            utf16
+                .term_vectors
+                .iter()
+                .map(|term| (&term.term, term.frequency))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            utf8.term_vectors
+                .iter()
+                .map(|term| term.occurrences[0])
+                .collect::<Vec<_>>(),
+            [
+                Span { start: 0, end: 1 },
+                Span { start: 2, end: 6 },
+                Span { start: 7, end: 12 },
+                Span { start: 13, end: 19 },
+            ]
+        );
     }
 
     #[test]
@@ -908,6 +997,10 @@ mod tests {
         let found = glossary.matches("😀 Straße!");
         assert_eq!(found[0].span, Span { start: 3, end: 9 });
         assert!(glossary.matches("Grosses").is_empty());
+        assert_eq!(
+            glossary.matches_with_offset_unit("😀 Straße!", OffsetUnit::Utf8Bytes)[0].span,
+            Span { start: 5, end: 12 }
+        );
     }
 
     #[test]

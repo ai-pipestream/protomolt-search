@@ -28,9 +28,10 @@ hot-dog	Hot Dog
 Repeated concept ids are aliases. Empty values, malformed rows, exact
 duplicate pairs, and punctuation-only surfaces are refused. Matching uses
 Aho-Corasick over Unicode full case folding by default, requires Unicode word
-boundaries, and retains original-text UTF-16 spans. Indexing retains every
-explicit nested match. Annotation consumers can instead use the portable
-matcher's deterministic leftmost-longest, non-overlapping view.
+boundaries, and retains original-text spans. The portable matcher can report
+UTF-16 code units or UTF-8 bytes; Protomolt Search persists UTF-16. Indexing
+retains every explicit nested match. Annotation consumers can instead use the
+portable matcher's deterministic leftmost-longest, non-overlapping view.
 
 The vocabulary fingerprint is independent of TSV row order and includes the
 field mapping, entity mapping, and NER setting. Nodes and the coordinator must
@@ -140,8 +141,9 @@ fail loudly.
 ## Mobile use
 
 Glossary compilation, matching, canonical posting identity, Unicode case
-folding, UAX #29 tokenization, and UTF-16 span accounting live in the portable
-`protomolt-analyzer` Rust crate. They require no filesystem, Tokio, gRPC, JVM,
-or model runtime. A mobile application can embed the vocabulary bytes through
-its own bridge and use the same semantics in process. OpenNLP remains the
-optional server-side boundary for model NER and other model-backed layers.
+folding, UAX #29 tokenization, and selectable UTF-16 or UTF-8 span accounting
+live in the portable `protomolt-analyzer` Rust crate. They require no
+filesystem, Tokio, gRPC, JVM, or model runtime. A mobile application can embed
+the vocabulary bytes through its own bridge and use the same semantics in
+process. OpenNLP remains the optional server-side boundary for model NER and
+other model-backed layers.

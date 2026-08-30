@@ -18,11 +18,16 @@ The native provider implements the exact subset used by the product's named
 | Term-vector mode | `MODE_FULL`, `MODE_SCORING_ONLY` |
 | Term-vector source | `SOURCE_TOKENS`, `SOURCE_STEMS`, `SOURCE_NORMALIZED_STEMS` |
 | Normalizers | `STRIP_INVISIBLE`, `WHITESPACE`, `ACCENT_FOLD`, `FULL_CASE_FOLD` |
-| Offsets | Half-open UTF-16 offsets into the original request text |
+| Offsets | Half-open UTF-16 code-unit or UTF-8 byte offsets into the original request text |
 
 Terms retain first-occurrence order. Full vectors retain every occurrence;
 scoring-only vectors retain frequencies without offsets. Input is capped at
 1 MiB, matching the sidecar.
+
+`analyze()` preserves the original UTF-16 behavior. Direct callers select a
+different ruler with `analyze_with_offset_unit(..., OffsetUnit::Utf8Bytes)`.
+The selected unit is recorded on `AnalyzedDocument`; it changes only numeric
+span coordinates, not tokens, normalization, term identity, or frequencies.
 
 An absent `AnalysisSpec` is not accepted by the native provider because the
 named `server` analyzer means "use the sidecar's configured defaults". Any
@@ -40,8 +45,10 @@ because silently changing the default would change every persisted term.
 
 The crate also owns the portable glossary matcher described in
 [`phrase-search.md`](phrase-search.md): pinned Aho-Corasick matching, Unicode
-full case folding, word boundaries, original UTF-16 spans, stable vocabulary
-fingerprints, and canonical concept posting identities.
+full case folding, word boundaries, selectable original-text UTF-16 or UTF-8
+spans, stable vocabulary fingerprints, and canonical concept posting
+identities. Existing `matches()` and `index_matches()` callers retain UTF-16;
+the corresponding `*_with_offset_unit` methods select UTF-8 when needed.
 
 ## Server configuration
 
@@ -71,6 +78,13 @@ backend for query analysis.
 The same backend dispatch is used by unary query analysis, streamed ingest,
 mapped ingest, replay, and resharding. There is no local network service and no
 loopback hop.
+
+Protomolt Search deliberately requests UTF-16 from either provider and stores
+that canonical unit in BM25 postings, WAL replay, and resharded generations.
+It accepts an unspecified response from an older sidecar as legacy UTF-16, but
+refuses a UTF-8 or unknown response when UTF-16 was requested. Offset selection
+therefore stays outside the term-identity fingerprint and cannot create a
+mixed-unit index generation.
 
 ## OpenNLP boundary
 

@@ -311,7 +311,10 @@ production `ingest`/`folded` and `cased` analyzer specs. The
 sidecar supplies the wider OpenNLP surface, including embeddings and
 model-backed layers. Its proto is vendored at
 `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`; see the file header.
-Both providers return offsets in original-text UTF-16 coordinates.
+Both providers support original-text UTF-16 coordinates. The portable Rust
+analyzer and sidecar can also return UTF-8 byte offsets to direct callers.
+Protomolt Search explicitly requests and persists UTF-16 offsets so one index
+generation cannot mix coordinate systems.
 
 Glossary-backed phrase and entity search is an additive product capability:
 ordinary body terms preserve recall, a dedicated phrase field stores only

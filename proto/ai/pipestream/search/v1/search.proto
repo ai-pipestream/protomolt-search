@@ -319,7 +319,7 @@ service SearchService {
   //   3. the coordinator sums them into GLOBAL stats and sends them back
   //      with Bm25Query, so every shard scores with identical idf/avgdl;
   //   4. shard hits merge into the global top-k (score desc, shard, doc id).
-  // Hits carry per-term occurrence offsets in original-text coordinates;
+  // Hits carry per-term occurrence offsets in original-text UTF-16 code units;
   // fetch the raw text with NodeService.GetDocuments to highlight.
   rpc Bm25Search(Bm25SearchRequest) returns (Bm25SearchResponse);
 
@@ -2049,7 +2049,9 @@ message Bm25FieldLeg {
   uint64 analysis_fingerprint = 8;
 }
 
-// A half-open span [start, end) in original-text coordinates.
+// A half-open span [start, end) in original-text UTF-16 code units. Search
+// persistence uses this one canonical unit even though its analysis providers
+// can expose selectable units to direct callers.
 message OffsetSpan {
   // Start offset (inclusive).
   uint32 start = 1;
@@ -2061,7 +2063,7 @@ message OffsetSpan {
 message TermOccurrences {
   // The query term as scored (stem identity when SOURCE_STEMS).
   string term = 1;
-  // Every occurrence span in original-text coordinates.
+  // Every occurrence span in original-text UTF-16 code units.
   repeated OffsetSpan offsets = 2;
   // The field this term matched in. Empty on the single-field path
   // (the body); fused multi-field hits name the field explicitly
