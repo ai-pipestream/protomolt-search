@@ -1213,7 +1213,7 @@ impl CoordinatorServiceImpl {
         Ok(requested)
     }
 
-    /// Configure the BM25 path: analysis sidecar for query analysis and
+    /// Configure the BM25 path: lexical analyzer for query analysis and
     /// the scoring parameters every shard is told to use.
     pub fn with_bm25(mut self, analysis_addr: Option<String>, params: Bm25Params) -> Self {
         self.analysis_addr = analysis_addr;
@@ -1383,7 +1383,7 @@ impl CoordinatorServiceImpl {
             crate::filter::validate_filter(f)?;
         }
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         // (a) Query analysis with the SAME options as ingest: query terms
         // share identity with indexed terms (stems when SOURCE_STEMS).
@@ -1728,7 +1728,7 @@ impl CoordinatorServiceImpl {
             || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
         let t0 = std::time::Instant::now();
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let mut seen: Vec<&str> = Vec::new();
         for f in fields {
@@ -2146,7 +2146,7 @@ impl CoordinatorServiceImpl {
         let t_total = std::time::Instant::now();
         // Query analysis for the BM25 leg (same options as ingest).
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let t = std::time::Instant::now();
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
@@ -3832,7 +3832,7 @@ impl CoordinatorServiceImpl {
 
         // Query analysis + global BM25 stats for phase 2.
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let t = std::time::Instant::now();
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
@@ -3962,7 +3962,7 @@ impl CoordinatorServiceImpl {
             ));
         }
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
         let mut terms: Vec<String> = Vec::new();
@@ -4193,7 +4193,7 @@ impl CoordinatorServiceImpl {
         // Analyze the boost text with the SAME options as the main query
         // (term identity must match the index, as everywhere).
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let analyzed = crate::analyzer::analyze_document(&addr, &boost.text, spec).await?;
         let mut terms: Vec<String> = Vec::new();

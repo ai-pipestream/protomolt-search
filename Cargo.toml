@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 description = "Provider-neutral distributed lexical, vector, and hybrid search"
 
+[workspace]
+members = ["crates/protomolt-analyzer"]
+resolver = "2"
+
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s17" }
 turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "a3c6ca8cbe82660b05403ca0b10ccc4f2343bf23" }
@@ -22,6 +26,7 @@ toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal", "fs"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 memmap2 = "0.9"
+protomolt-analyzer = { path = "crates/protomolt-analyzer" }
 
 [build-dependencies]
 tonic-build = "0.12"

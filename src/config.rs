@@ -71,7 +71,7 @@ pub struct ShardConfig {
     pub demo: Option<DemoConfig>,
     /// This shard's global id base (added to local slots).
     pub slot_offset: u64,
-    /// Analysis sidecar address for AddDocuments on this shard.
+    /// Lexical analysis backend for AddDocuments: `native` or a sidecar address.
     pub analysis_addr: Option<String>,
     /// Keep a write-ahead log at `<index path>.wal/`. Defaults on for
     /// shards with an index path, off for demo shards.
@@ -226,8 +226,8 @@ pub struct Config {
     pub bit_width: usize,
     /// Flush shards to their index paths on graceful shutdown.
     pub save_on_shutdown: bool,
-    /// Analysis sidecar address for the coordinator's query analysis
-    /// (Bm25Search). Required for BM25 queries.
+    /// Lexical analysis backend for coordinator queries: `native` or a
+    /// sidecar address. Required for BM25 queries.
     pub analysis_addr: Option<String>,
     /// BM25 k1 parameter sent to every shard.
     pub bm25_k1: f32,
@@ -405,6 +405,14 @@ fn normalize_addrs(addrs: Vec<String>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn normalize_analysis_backend(value: String) -> String {
+    if matches!(value.trim(), "native" | "native://") {
+        crate::analyzer::NATIVE_ANALYSIS_BACKEND.to_string()
+    } else {
+        normalize_addrs(vec![value]).remove(0)
+    }
 }
 
 /// Parse configuration from process args (excluding argv[0]).
@@ -757,10 +765,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     index_path: shard.index.as_ref().map(PathBuf::from),
                     demo,
                     slot_offset: shard.slot_offset.unwrap_or(0),
-                    analysis_addr: shard
-                        .analysis_addr
-                        .clone()
-                        .map(|a| normalize_addrs(vec![a]).remove(0)),
+                    analysis_addr: shard.analysis_addr.clone().map(normalize_analysis_backend),
                 })
             })
             .collect::<Result<_, String>>()?
@@ -985,8 +990,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "TURBOVEC_ANALYSIS_ADDR",
         file.analysis_addr.as_deref(),
     )
-    .map(|a| normalize_addrs(vec![a]).remove(0));
-    // A single-shard CLI setup shares the sidecar address with its shard.
+    .map(normalize_analysis_backend);
+    // A single-shard CLI setup shares the analysis backend with its shard.
     if analysis_addr.is_some() && shards.len() == 1 && shards[0].analysis_addr.is_none() {
         shards[0].analysis_addr.clone_from(&analysis_addr);
     }
@@ -1247,6 +1252,20 @@ mod tests {
         );
         assert!(cfg.share_floors);
         assert_eq!(cfg.max_message_bytes, MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn native_analysis_backend_is_not_rewritten_as_http() {
+        let cfg = parse(&args(&[
+            "--role=both",
+            "--demo-vectors=10",
+            "--nodes=127.0.0.1:9001",
+            "--node-listen=127.0.0.1:9001",
+            "--analysis-addr=native://",
+        ]))
+        .unwrap();
+        assert_eq!(cfg.analysis_addr.as_deref(), Some("native"));
+        assert_eq!(cfg.shards[0].analysis_addr.as_deref(), Some("native"));
     }
 
     #[test]

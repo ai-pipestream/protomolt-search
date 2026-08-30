@@ -116,8 +116,8 @@ pub struct NodeConfig {
     /// Persistence target for `Flush` / save-on-shutdown. `None` makes the
     /// shard purely in-memory (flush is a no-op).
     pub index_path: Option<PathBuf>,
-    /// Analysis sidecar address (`http://host:port`) for AddDocuments.
-    /// `None` makes AddDocuments fail UNAVAILABLE.
+    /// Lexical analysis backend (`native` or `http://host:port`) for
+    /// AddDocuments. `None` makes AddDocuments fail UNAVAILABLE.
     pub analysis_addr: Option<String>,
     /// The BM25 field table for NEW builders (`docs/multi-field.md`):
     /// "body" first, then the extra indexed fields. Shards loaded from
@@ -6934,16 +6934,16 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::inc_request(crate::metrics::Route::AddDocuments);
         let _ingest = self.claim_ingest()?;
         let addr = self.config.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
+            Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
         })?;
         let mut inbound = request.into_inner();
         let mut source = IngestSource::Plain(&mut inbound);
         let mut added = 0u64;
         let mut first_id = 0u64;
-        // Analysis dominates bulk ingest, and the only supported transport
-        // is one AnalyzeStream for the whole call, paced by the sidecar's
-        // own flow control. Documents are applied strictly in arrival
-        // order, so ids and WAL order stay deterministic.
+        // Analysis dominates bulk ingest. One analysis stream covers the
+        // whole call, using either native bounded channels or sidecar flow
+        // control. Documents are applied strictly in arrival order, so ids
+        // and WAL order stay deterministic.
         //
         // A sidecar without AnalyzeStream is REFUSED rather than served on
         // the old per-document unary path. That fallback existed and cost
@@ -7006,7 +7006,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::inc_request(crate::metrics::Route::IngestMapped);
         let _ingest = self.claim_ingest()?;
         let addr = self.config.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured for this shard (analysis_addr)")
+            Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
         })?;
         let mut inbound = request.into_inner();
         // Protocol: the first message must be the bind, and the bind

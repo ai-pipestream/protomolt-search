@@ -16,6 +16,14 @@ TurboQuant scoring and collaborative live-floor streaming.
 | [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s17` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
+The in-repository [`protomolt-analyzer`](crates/protomolt-analyzer) crate is
+the portable Rust lexical core. It runs the product's whitespace, Porter,
+normalization, and term-vector contract in-process on servers and native
+clients. OpenNLP remains the provider for embeddings, sentence and model
+analysis, and analyzer options outside that native subset. See
+[Native lexical analysis](docs/native-analysis.md) for the exact boundary and
+Android/iOS build checks.
+
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
 uses TurboVec's current `.tv` persistence format. Provider images are opaque to
 the product and are selected by manifest/config identity, never by extension.
@@ -296,25 +304,31 @@ for a real deployment are produced (shared calibration baked in).
 Each shard also carries a **BM25 postings index** next to its vector index:
 term → postings (doc id, tf, occurrence offsets in original-text
 coordinates), per-doc lengths and corpus totals, plus a doc store of raw
-texts (the highlight source). This repo deliberately contains **no query
-parser and no text analysis**: language analysis is the
+texts (the highlight source). Term identity is supplied by one of two
+interchangeable providers. The in-process Rust provider implements the
+production `ingest`/`folded` and `cased` analyzer specs. The
 [grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
-sidecar's job (`AnalysisService.Analyze` → term vectors; its proto is
-vendored at `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`, see
-the file header).
+sidecar supplies the wider OpenNLP surface, including embeddings and
+model-backed layers. Its proto is vendored at
+`proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`; see the file header.
+Both providers return offsets in original-text UTF-16 coordinates.
 
-**Ingest** (`NodeService.AddDocuments`, client-streaming): the node
-carries the whole call's documents over one sidecar `AnalyzeStream`
-(term vectors, MODE_FULL → offsets in ORIGINAL text coordinates), paced
-end to end by the sidecar's server-side flow control; results return in
-completion order and are applied in arrival order. A sidecar that
-predates the stream RPC (UNIMPLEMENTED) gets pipelined unary calls
-instead. Either way the node builds postings and stores the raw text. Doc
+Select native analysis with `--analysis-addr=native` or
+`analysis_addr = "native"`. A single-shard `both` process propagates that
+setting to its shard. Multi-shard node configurations set `analysis_addr` on
+each shard. An absent backend remains an error.
+
+**Ingest** (`NodeService.AddDocuments`, client-streaming): the node carries
+the whole call through one analyzer stream. Native analysis uses bounded
+in-process channels; OpenNLP uses `AnalyzeStream` and its server-side flow
+control. Results are applied in arrival order. A sidecar that predates the
+stream RPC is refused rather than silently downgraded. Either provider builds
+the same postings and stores the raw text. Doc
 ids share the shard's positional id space with vectors (next id =
 max(vectors, docs)). Analysis options pass through (`AnalysisSpec`:
 tokenizer/stemmer/term-vector mode+source/normalizer rungs, as the
-sidecar's enum numbers). Per-shard `analysis_addr` in the config; unset →
-UNAVAILABLE.
+sidecar's enum numbers). Unsupported native options fail explicitly. Per-shard
+`analysis_addr` in the config; unset means UNAVAILABLE.
 
 **Query** (`SearchService.Bm25Search`) — distributed correctness via the
 two-phase global-stats flow:
@@ -322,10 +336,10 @@ two-phase global-stats flow:
 ```mermaid
 sequenceDiagram
     participant C as coordinator
-    participant SC as sidecar
+    participant A as analyzer
     participant S as shards
-    C->>SC: 1. Analyze(query text, same options)
-    SC-->>C: query terms
+    C->>A: 1. Analyze(query text, same options)
+    A-->>C: query terms
     C->>S: 2. TermStats{terms}
     S-->>C: per-shard df, N, Σlen
     C->>S: 3. Bm25Query{terms, globals, k, k1, b}
