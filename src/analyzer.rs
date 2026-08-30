@@ -50,8 +50,8 @@ impl AnalysisBackend {
 /// The analysis a body-text corpus is built with, and the ONLY spec that
 /// may be used to query one.
 ///
-/// Term identity is decided entirely inside the sidecar, so an index and
-/// a query that disagree about this struct do not fail — they silently
+/// Term identity is decided by the configured analysis provider, so an index
+/// and a query that disagree about this struct do not fail — they silently
 /// score different terms. That has now cost this project twice: once
 /// when a query went out unstemmed against a stemmed index, and once
 /// when the v7 corpus was built under `SOURCE_STEMS` (below). Both times

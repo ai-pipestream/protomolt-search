@@ -76,7 +76,7 @@ pub struct CoordinatorServiceImpl {
     /// Optional replica address per shard (same data, exact same
     /// results), the target for hedged retries.
     replica_addrs: Vec<Option<String>>,
-    /// Analysis sidecar address for query analysis in Bm25Search.
+    /// Lexical analysis backend for query analysis in Bm25Search.
     analysis_addr: Option<String>,
     /// BM25 tuning sent to every shard (identical scoring everywhere).
     bm25_params: Bm25Params,

@@ -515,7 +515,7 @@ cargo run --release --example wiki_shakedown   # --data-dir, --out-dir, --sideca
 ```
 
 loads the parts, fits calibration on a sample, pushes it to every shard
-with `BroadcastVectorBackend`, starts the native analysis sidecar
+with `BroadcastVectorBackend`, starts the GraalVM-native OpenNLP sidecar
 (falls back to the in-repo mock with a loud warning), ingests documents
 (AddDocuments, PORTER stems) and vectors (AddVectors) with aligned ids,
 persists `.tv` + `.bm25` under `--out-dir` for the later two-machine
