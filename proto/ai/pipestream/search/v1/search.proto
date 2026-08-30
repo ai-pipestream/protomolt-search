@@ -290,14 +290,19 @@ service NodeService {
   // engine is append-only, so ids never move or vanish.
   rpc BrowseShard(BrowseShardRequest) returns (BrowseShardResponse);
 
+  // Resolves the product-owned filter once into a packed stable-id bitmap.
+  // The vector provider can apply this without learning CEL, columns, or the
+  // product shard layout. Bit i admits `base_label + i`.
+  rpc ResolveFilterBitmap(FilterBitmapRequest) returns (FilterBitmapResponse);
+
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
 service SearchService {
   // Fans the query out to every known shard node, merges the shard top-k
-  // lists into one global top-k (score descending; ties broken by shard
-  // index, then vector id), and returns it.
+  // lists into one global top-k (score descending; ties broken by stable
+  // vector id), and returns it. Physical shard layout never changes order.
   rpc Search(SearchRequest) returns (SearchResponse);
 
   // Distributed BM25 over the shards' postings. Flow:
@@ -485,6 +490,19 @@ message BrowseShardResponse {
   bool sort_column_known = 6;
 }
 
+message FilterBitmapRequest {
+  repeated GeoFilter geo_filters = 1;
+  FilterExpr filter = 2;
+}
+
+message FilterBitmapResponse {
+  uint64 base_label = 1;
+  uint64 label_count = 2;
+  bytes bits = 3;
+  repeated bool geo_columns_known = 4;
+  repeated bool filter_columns_known = 5;
+}
+
 // One column's aggregate over a filtered match set (docs/facets.md).
 // i64 columns aggregate through the same monotone f64 cast the column
 // metadata uses; sums are f64 by contract (an i64 sum can overflow any
@@ -565,6 +583,20 @@ message ClusterHealthResponse {
   // One entry per probed target: every primary, then every configured
   // replica, in shard order.
   repeated ShardHealth targets = 1;
+
+  // Present when vector queries use a clustered provider instead of the
+  // vector indexes on the product shard nodes.
+  ClusteredVectorHealth clustered_vector = 2;
+}
+
+message ClusteredVectorHealth {
+  string backend_kind = 1;
+  string transport = 2;
+  bool reachable = 3;
+  bool servable = 4;
+  string error = 5;
+  uint64 rows = 6;
+  uint64 topology_generation = 7;
 }
 
 // One message on the client-to-server leg of `SearchShard`. The first
@@ -1027,9 +1059,8 @@ message SearchRequest {
 message SearchResponse {
   // Echoes `SearchRequest.request_id` (or the assigned one).
   string request_id = 1;
-  // Global top-k: score descending, ties broken by shard index then vector
-  // id. Fewer than k entries when the whole corpus holds fewer than k
-  // vectors.
+  // Global top-k: score descending, ties broken by stable vector id. Fewer
+  // than k entries when the whole corpus holds fewer than k vectors.
   repeated ScoredHit hits = 2;
   // Document-mode only (`collapse_parents` on a coordinator running the
   // streaming path): one group per returned parent, parallel to `hits`

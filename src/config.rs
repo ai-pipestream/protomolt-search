@@ -117,6 +117,24 @@ pub struct ShardMap {
     pub shards: Vec<ShardMapShard>,
 }
 
+/// Product-level transport to one distributed TurboVec collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusteredTurboVecConfig {
+    /// The global heap and topology owner execute in this process; only shard
+    /// node calls cross the network.
+    InProcess {
+        /// `turbovec-grpc` node-table entries, including optional index ids,
+        /// replicas, and required durable generations.
+        nodes: Vec<String>,
+        /// Durable coordinator topology. Required unless the operator opts
+        /// into an ephemeral development collection.
+        state: Option<PathBuf>,
+        allow_ephemeral: bool,
+    },
+    /// Reach a separately managed `turbovec-coordinator` process.
+    External { endpoint: String },
+}
+
 /// Full process configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -131,6 +149,10 @@ pub struct Config {
     /// Shard node addresses (`http://host:port`) for the coordinator, in
     /// fan-out order (= shard index for merge tie-breaks).
     pub node_addrs: Vec<String>,
+    /// Optional product-level distributed TurboVec collection. When set,
+    /// vector queries use this backend instead of the vector indexes held by
+    /// the product shard nodes.
+    pub clustered_turbovec: Option<ClusteredTurboVecConfig>,
     /// Shards this process owns and serves (roles node/both).
     pub shards: Vec<ShardConfig>,
     /// Scan chunk size in SIMD blocks.
@@ -264,6 +286,7 @@ struct FileConfig {
     coord_listen: Option<String>,
     metrics_listen: Option<String>,
     nodes: Option<Vec<String>>,
+    clustered_turbovec: Option<FileClusteredTurboVec>,
     index: Option<String>,
     slot_offset: Option<u64>,
     demo_vectors: Option<usize>,
@@ -305,6 +328,17 @@ struct FileConfig {
     vocab_top_k: Option<usize>,
     shard_map: Option<String>,
     shards: Vec<FileShard>,
+}
+
+/// `[clustered_turbovec]` accepts exactly one of `coordinator` (external) or
+/// `nodes` (embedded coordinator).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileClusteredTurboVec {
+    coordinator: Option<String>,
+    nodes: Option<Vec<String>>,
+    state: Option<String>,
+    allow_ephemeral: Option<bool>,
 }
 
 /// One `[[shards]]` table in the TOML file.
@@ -450,6 +484,92 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             ),
             None => normalize_addrs(file.nodes.clone().unwrap_or_default()),
         },
+    };
+
+    let clustered_file = file.clustered_turbovec.as_ref();
+    let clustered_endpoint = opt(
+        args,
+        "turbovec-coordinator",
+        "TURBOVEC_COORDINATOR",
+        clustered_file.and_then(|config| config.coordinator.as_deref()),
+    );
+    let clustered_nodes = opt(
+        args,
+        "turbovec-cluster-nodes",
+        "TURBOVEC_CLUSTER_NODES",
+        clustered_file
+            .and_then(|config| config.nodes.as_ref())
+            .map(|nodes| nodes.join(","))
+            .as_deref(),
+    );
+    if clustered_endpoint.is_some() && clustered_nodes.is_some() {
+        return Err(
+            "clustered TurboVec accepts exactly one of coordinator or nodes, not both".to_string(),
+        );
+    }
+    let clustered_state = opt(
+        args,
+        "turbovec-cluster-state",
+        "TURBOVEC_CLUSTER_STATE",
+        clustered_file.and_then(|config| config.state.as_deref()),
+    )
+    .map(PathBuf::from);
+    let clustered_allow_ephemeral = flag_present(args, "allow-ephemeral-turbovec-cluster")
+        || match opt(
+            args,
+            "allow-ephemeral-turbovec-cluster",
+            "TURBOVEC_ALLOW_EPHEMERAL_CLUSTER",
+            None,
+        ) {
+            Some(value) => parse_env_bool(&value),
+            None => clustered_file
+                .and_then(|config| config.allow_ephemeral)
+                .unwrap_or(false),
+        };
+    let clustered_turbovec = match (clustered_endpoint, clustered_nodes) {
+        (Some(endpoint), None) => {
+            if clustered_state.is_some() || clustered_allow_ephemeral {
+                return Err(
+                    "cluster state and allow_ephemeral apply only to an in-process TurboVec coordinator"
+                        .to_string(),
+                );
+            }
+            Some(ClusteredTurboVecConfig::External {
+                endpoint: normalize_addrs(vec![endpoint]).remove(0),
+            })
+        }
+        (None, Some(nodes)) => {
+            let nodes: Vec<String> = nodes
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+            if nodes.is_empty() {
+                return Err("clustered TurboVec node table is empty".to_string());
+            }
+            if clustered_state.is_none() && !clustered_allow_ephemeral {
+                return Err(
+                    "an in-process TurboVec coordinator requires turbovec_cluster_state; set allow_ephemeral only for tests or demos"
+                        .to_string(),
+                );
+            }
+            Some(ClusteredTurboVecConfig::InProcess {
+                nodes,
+                state: clustered_state,
+                allow_ephemeral: clustered_allow_ephemeral,
+            })
+        }
+        (None, None) => {
+            if clustered_state.is_some() || clustered_allow_ephemeral {
+                return Err(
+                    "cluster state or allow_ephemeral was set without clustered TurboVec nodes"
+                        .to_string(),
+                );
+            }
+            None
+        }
+        (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
     };
 
     let dim = opt(
@@ -810,6 +930,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                 .to_string(),
         );
     }
+    if role == Role::Node && clustered_turbovec.is_some() {
+        return Err(
+            "clustered TurboVec is a product-coordinator backend and cannot be configured on a node-only process"
+                .to_string(),
+        );
+    }
     if demo_query && role == Role::Node {
         return Err("--demo-query requires the coordinator or both role".to_string());
     }
@@ -1002,6 +1128,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         coord_listen,
         metrics_listen,
         node_addrs,
+        clustered_turbovec,
         shards,
         chunk_blocks,
         share_floors,
@@ -1132,6 +1259,55 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.node_addrs.len(), 2);
         assert!(cfg.node_addrs[0].starts_with("http://"));
+    }
+
+    #[test]
+    fn clustered_turbovec_transports_are_explicit_and_exclusive() {
+        let external = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-coordinator=127.0.0.1:51050",
+        ]))
+        .unwrap();
+        assert_eq!(
+            external.clustered_turbovec,
+            Some(ClusteredTurboVecConfig::External {
+                endpoint: "http://127.0.0.1:51050".to_string(),
+            })
+        );
+
+        let missing_state = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-cluster-nodes=127.0.0.1:52051 shard-a 7",
+        ]));
+        assert!(missing_state
+            .unwrap_err()
+            .contains("requires turbovec_cluster_state"));
+
+        let embedded = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-cluster-nodes=127.0.0.1:52051 shard-a 7",
+            "--allow-ephemeral-turbovec-cluster",
+        ]))
+        .unwrap();
+        assert_eq!(
+            embedded.clustered_turbovec,
+            Some(ClusteredTurboVecConfig::InProcess {
+                nodes: vec!["127.0.0.1:52051 shard-a 7".to_string()],
+                state: None,
+                allow_ephemeral: true,
+            })
+        );
+
+        let both = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-coordinator=127.0.0.1:51050",
+            "--turbovec-cluster-nodes=127.0.0.1:52051",
+        ]));
+        assert!(both.unwrap_err().contains("not both"));
     }
 
     #[test]

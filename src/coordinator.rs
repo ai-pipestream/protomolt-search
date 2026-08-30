@@ -12,6 +12,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use crate::bm25::{Bm25Params, CorpusStats};
+use crate::clustered_turbovec::{ClusteredLabelFilter, ClusteredTurboVecBackend};
 use crate::fusion::{self, Leg};
 use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
 use crate::pb::node_service_client::NodeServiceClient;
@@ -25,11 +26,11 @@ use crate::pb::{
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse,
     CalibrationApplyResult, CascadeHit, ClusterHealthRequest, ClusterHealthResponse,
-    ConfigureVectorBackendRequest, FloorUpdate, FusionMode, HealthRequest, HybridDebug, HybridHit,
-    HybridSearchRequest, HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup,
-    ScoredHit, SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats,
-    StartShardSearch, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
+    ClusteredVectorHealth, ConfigureVectorBackendRequest, FloorUpdate, FusionMode, HealthRequest,
+    HybridDebug, HybridHit, HybridSearchRequest, HybridSearchResponse, HybridShardDebug,
+    HybridShardRequest, ParentGroup, ScoredHit, SearchRequest, SearchResponse, SearchShardDone,
+    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest,
+    ShardScanStats, StartShardSearch, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
     StreamSearchResponse, StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult,
     VectorRescoreRequest,
 };
@@ -107,6 +108,9 @@ pub struct CoordinatorServiceImpl {
     /// `stats_epoch` (src/stats_cache.rs). Sound because the nodes
     /// enforce the epoch claim on every scoring request built from it.
     stats_cache: Arc<crate::stats_cache::StatsCache>,
+    /// Optional distributed vector collection. The product coordinator calls
+    /// it once as one provider; it never learns or re-fans its shard topology.
+    clustered_vectors: Option<ClusteredTurboVecBackend>,
 }
 
 /// A process-unique, well-mixed stream token for the UDP signal lane
@@ -1114,6 +1118,7 @@ impl CoordinatorServiceImpl {
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
+            clustered_vectors: None,
         }
     }
 
@@ -1227,6 +1232,13 @@ impl CoordinatorServiceImpl {
     /// searches are exact, so either copy returns identical results.
     pub fn with_replicas(mut self, replica_addrs: Vec<Option<String>>) -> Self {
         self.replica_addrs = replica_addrs;
+        self
+    }
+
+    /// Route vector work through one distributed TurboVec collection. The
+    /// backend itself owns its only global heap and shard completion.
+    pub fn with_clustered_turbovec(mut self, backend: ClusteredTurboVecBackend) -> Self {
+        self.clustered_vectors = Some(backend);
         self
     }
 
@@ -4003,6 +4015,40 @@ impl CoordinatorServiceImpl {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+        if let Some(clustered) = &self.clustered_vectors {
+            let k = u32::try_from(ids.len()).map_err(|_| {
+                Status::resource_exhausted("dense boost candidate set does not fit u32")
+            })?;
+            let response = clustered
+                .search(
+                    vector.to_vec(),
+                    k,
+                    Some(ClusteredLabelFilter::Labels(ids.to_vec())),
+                    None,
+                    false,
+                )
+                .await?;
+            if response.results.len() != 1 {
+                return Err(Status::internal(format!(
+                    "clustered TurboVec returned {} query results for one dense boost",
+                    response.results.len()
+                )));
+            }
+            return response.results[0]
+                .neighbours
+                .iter()
+                .map(|neighbour| {
+                    neighbour
+                        .label
+                        .map(|label| (label, neighbour.score))
+                        .ok_or_else(|| {
+                            Status::failed_precondition(
+                                "clustered TurboVec dense boosts require stable labels",
+                            )
+                        })
+                })
+                .collect();
+        }
         let by_shard: HashMap<u32, Vec<u64>> = (0..self.node_addrs.len())
             .map(|s| (s as u32, ids.to_vec()))
             .collect();
@@ -4316,6 +4362,86 @@ impl CoordinatorServiceImpl {
             keys: rows.iter().map(|r| r.2).collect(),
             sorted: sort.is_some(),
         })
+    }
+
+    /// Resolve a product filter into one packed stable-id bitmap per product
+    /// shard for a vector provider that does not own document columns. No
+    /// filter remains `None` and therefore costs no shard pass. An explicitly
+    /// present empty bitmap set is an intentional match-none set and stays
+    /// distinguishable at the provider boundary.
+    async fn clustered_allowed_labels(
+        &self,
+        filters: &RequestFilters,
+    ) -> Result<Option<ClusteredLabelFilter>, Status> {
+        if filters.geo.is_empty() && filters.tree.is_none() {
+            return Ok(None);
+        }
+
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::FilterBitmapRequest {
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
+            };
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .resolve_filter_bitmap(request)
+                    .await
+                    .map(|response| response.into_inner())
+            }));
+        }
+
+        let mut known = FilterKnown::new(filters);
+        let mut bitmaps = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let response = task.await.map_err(|error| {
+                Status::internal(format!("filter bitmap task failed: {error}"))
+            })??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            if response.label_count == 0 {
+                if !response.bits.is_empty() {
+                    return Err(Status::internal(
+                        "shard answered an empty filter bitmap with payload bytes",
+                    ));
+                }
+                continue;
+            }
+            let expected_bytes =
+                usize::try_from(response.label_count.div_ceil(8)).map_err(|_| {
+                    Status::internal("shard filter bitmap length does not fit this process")
+                })?;
+            if response.bits.len() != expected_bytes {
+                return Err(Status::internal(format!(
+                    "shard answered {} filter bitmap bytes for {} labels; expected {expected_bytes}",
+                    response.bits.len(),
+                    response.label_count
+                )));
+            }
+            response
+                .base_label
+                .checked_add(response.label_count)
+                .ok_or_else(|| Status::internal("shard filter bitmap label range overflows u64"))?;
+            bitmaps.push(turbovec_grpc::proto::LabelBitmap {
+                base_label: response.base_label,
+                label_count: response.label_count,
+                bits: response.bits,
+            });
+        }
+        known.refuse_unknown(filters)?;
+        bitmaps.sort_unstable_by_key(|bitmap| bitmap.base_label);
+        for pair in bitmaps.windows(2) {
+            let previous_end = pair[0]
+                .base_label
+                .checked_add(pair[0].label_count)
+                .expect("bitmap range was validated above");
+            if pair[1].base_label < previous_end {
+                return Err(Status::internal(
+                    "product shard filter bitmap label ranges overlap",
+                ));
+            }
+        }
+        Ok(Some(ClusteredLabelFilter::Bitmaps(bitmaps)))
     }
 
     /// Aggregation fan-out (docs/aggregations.md): every shard folds
@@ -5391,6 +5517,50 @@ impl SearchService for CoordinatorServiceImpl {
         // shards execute; no shard ever sees CEL text.
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
 
+        if let Some(clustered) = &self.clustered_vectors {
+            if req.collapse_parents {
+                return Err(Status::unimplemented(
+                    "parent collapse requires provider candidate streaming and is not supported by clustered TurboVec yet",
+                ));
+            }
+            let allowed_labels = self.clustered_allowed_labels(&filters).await?;
+            let response = clustered
+                .search(req.vector, k, allowed_labels, None, false)
+                .await?;
+            if response.results.len() != 1 {
+                return Err(Status::internal(format!(
+                    "clustered TurboVec returned {} query results for one query",
+                    response.results.len()
+                )));
+            }
+            let hits = response
+                .results
+                .into_iter()
+                .next()
+                .expect("one result count checked")
+                .neighbours
+                .into_iter()
+                .map(|neighbour| {
+                    let vector_id = neighbour.label.ok_or_else(|| {
+                        Status::failed_precondition(
+                            "clustered TurboVec product backend requires stable labels on every row",
+                        )
+                    })?;
+                    Ok(ScoredHit {
+                        vector_id,
+                        score: neighbour.score,
+                        parent_id: 0,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            return Ok(Response::new(SearchResponse {
+                request_id,
+                hits,
+                groups: Vec::new(),
+                chunk_floor: 0.0,
+            }));
+        }
+
         let result = if req.collapse_parents {
             // Document mode on a streaming coordinator: parents
             // aggregate here from tagged chunk emissions, and the
@@ -5541,6 +5711,11 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
         let req = request.into_inner();
+        if self.clustered_vectors.is_some() {
+            return Err(Status::unimplemented(
+                "clustered TurboVec currently supports the exact Search vector route; hybrid routes require the provider candidate-stream contract",
+            ));
+        }
         let k = self.resolve_k(req.k)?;
         if req.text.is_empty() {
             return Err(Status::invalid_argument(
@@ -5796,7 +5971,34 @@ impl SearchService for CoordinatorServiceImpl {
                 Err(e) => return Err(Status::internal(format!("health probe task failed: {e}"))),
             }
         }
-        Ok(Response::new(ClusterHealthResponse { targets }))
+        let clustered_vector = if let Some(backend) = &self.clustered_vectors {
+            Some(match backend.health().await {
+                Ok(health) => ClusteredVectorHealth {
+                    backend_kind: "clustered-turbovec".to_string(),
+                    transport: backend.transport_name().to_string(),
+                    reachable: true,
+                    servable: health.servable,
+                    error: health.error,
+                    rows: health.rows,
+                    topology_generation: health.topology_generation,
+                },
+                Err(status) => ClusteredVectorHealth {
+                    backend_kind: "clustered-turbovec".to_string(),
+                    transport: backend.transport_name().to_string(),
+                    reachable: false,
+                    servable: false,
+                    error: status.to_string(),
+                    rows: 0,
+                    topology_generation: 0,
+                },
+            })
+        } else {
+            None
+        };
+        Ok(Response::new(ClusterHealthResponse {
+            targets,
+            clustered_vector,
+        }))
     }
 
     async fn broadcast_vector_backend(

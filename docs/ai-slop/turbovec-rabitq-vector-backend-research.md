@@ -29,6 +29,13 @@ shipped `embedded-turbovec` adapter is the only production adapter today.
 Sections describing direct `TurboQuantIndex` coupling remain as historical
 evidence for the inspected revision, not the current worktree.
 
+Implementation update, 2026-08-30: the first clustered TurboVec product
+adapter now embeds `turbovec-grpc::CoordinatorService` in-process by default
+and retains an external-coordinator tonic transport. Its initial exact scope is
+vector Search, stable-label filters, and candidate-scoped dense rescoring;
+parent collapse and hybrid fusion still require the proposed provider
+candidate stream and refuse rather than falling back to the embedded path.
+
 Local code inspected:
 
 | Checkout | Revision inspected | Role |

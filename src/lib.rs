@@ -28,6 +28,7 @@ pub mod analyzer;
 pub mod bm25;
 pub mod cel;
 pub mod chunked;
+pub mod clustered_turbovec;
 pub mod config;
 pub mod coordinator;
 pub mod demo;

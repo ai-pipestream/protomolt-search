@@ -7,6 +7,7 @@ description = "Provider-neutral distributed lexical, vector, and hybrid search"
 
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s17" }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "a3c6ca8cbe82660b05403ca0b10ccc4f2343bf23" }
 tonic = "0.12"
 prost = "0.13"
 # google.protobuf.Timestamp on the ingest wire compiles to this crate's

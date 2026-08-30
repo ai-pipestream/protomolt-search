@@ -6079,6 +6079,40 @@ impl NodeService for NodeServiceImpl {
         }))
     }
 
+    async fn resolve_filter_bitmap(
+        &self,
+        request: Request<crate::pb::FilterBitmapRequest>,
+    ) -> Result<Response<crate::pb::FilterBitmapResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::ResolveFilterBitmap);
+        let req = request.into_inner();
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let (geo_columns_known, filter_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+        let label_count = guard.bm25.as_ref().map_or(0, Bm25Shard::doc_count) as usize;
+        let (_, allow) = resolve_shard_filters(
+            guard.bm25.as_ref(),
+            label_count,
+            &req.geo_filters,
+            &geo_regions,
+            req.filter.as_ref(),
+        )?;
+        let allow = allow.unwrap_or_else(|| vec![true; label_count]);
+        let mut bits = vec![0u8; label_count.div_ceil(8)];
+        for (position, admitted) in allow.into_iter().enumerate() {
+            if admitted {
+                bits[position / 8] |= 1 << (position % 8);
+            }
+        }
+        Ok(Response::new(crate::pb::FilterBitmapResponse {
+            base_label: self.config.slot_offset,
+            label_count: label_count as u64,
+            bits,
+            geo_columns_known,
+            filter_columns_known,
+        }))
+    }
+
     async fn aggregate_shard(
         &self,
         request: Request<crate::pb::AggregateShardRequest>,

@@ -98,7 +98,7 @@ Floor flow for one query:
    next chunk.
 4. Each node ends its stream with `SearchShardDone { hits, stats }` — its
    local top-k plus scan counters. The coordinator merges the shard lists
-   (score descending; ties by shard index, then vector id) and answers the
+   (score descending; ties by stable vector id) and answers the
    client.
 
 Chunking exists because turbovec's scan is a single synchronous call with a
@@ -167,6 +167,48 @@ cargo build --release
     --coord-listen=0.0.0.0:50050 \
     --nodes=node0:50051,node1:50051,node2:50051
 ```
+
+### Clustered TurboVec backend
+
+The product coordinator can treat a complete `turbovec-grpc` collection as
+its vector backend. The recommended distributed shape embeds that crate's
+coordinator library in the Pipestream Search process, so there is no localhost
+gRPC hop before the real shard fan-out:
+
+```toml
+role = "coordinator"
+nodes = ["search-node0:50051", "search-node1:50051"] # BM25, columns, documents
+
+[clustered_turbovec]
+nodes = [
+  "vector-node0:51051 shard-id-0 12",
+  "vector-node1:51051 shard-id-1 9",
+]
+state = "/var/lib/pipestream-search/turbovec-topology.json"
+```
+
+An independently managed coordinator remains available when its lifecycle or
+authorization must be separate:
+
+```toml
+[clustered_turbovec]
+coordinator = "http://turbovec-coordinator:50050"
+```
+
+Both transports execute the same `turbovec-grpc::CoordinatorService` search
+contract. Cluster shards must carry stable labels equal to Pipestream Search
+document ids. The adapter requests stable-label tie order, carries product
+filters as packed stable-label bitmap ranges, and refuses an unlabelled
+collection. Small candidate-scoped rescoring sets use explicit labels.
+`ClusterHealth` reports the selected transport, reachability, servable state,
+row count, and topology generation.
+
+This increment serves exact vector `Search`, dense public selections, and
+candidate-scoped dense boosts. Parent collapse and hybrid fusion require the
+provider candidate-stream contract and currently return `UNIMPLEMENTED` when
+clustered TurboVec is selected. The vector collection is built and mutated
+through `turbovec-grpc`; Pipestream Search does not duplicate those writes.
+See [the clustered backend design](docs/clustered-turbovec.md).
 
 ### Cluster configuration file
 
