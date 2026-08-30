@@ -261,7 +261,7 @@ def chart_concurrency():
 
 import os
 
-out = "/work/worktrees/turbovec-workspace/turbovec-search/docs/benchmarks"
+out = "/work/worktrees/turbovec-workspace/protomolt-search/docs/benchmarks"
 os.makedirs(out, exist_ok=True)
 for name, svg in [
     ("scaling_ladder.svg", chart_scaling()),

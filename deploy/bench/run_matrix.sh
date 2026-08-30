@@ -52,7 +52,7 @@ BIN_LOCAL=${BIN_LOCAL:-$REPO/target/release/pipestream-search}
 SWEEP=${SWEEP:-$REPO/target/release/examples/cluster_sweep}
 VERIFY=${VERIFY:-$REPO/target/release/examples/v7_verify}
 # Where krick-1's own checkout would put a release binary, if it has one.
-KRICK1_CLONE_BIN=/work/worktrees/turbovec-workspace/turbovec-search/target/release/pipestream-search
+KRICK1_CLONE_BIN=/work/worktrees/turbovec-workspace/protomolt-search/target/release/pipestream-search
 
 die() { echo "run_matrix: $*" >&2; exit 1; }
 say() { echo "== $*"; }

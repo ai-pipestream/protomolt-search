@@ -13,6 +13,7 @@ This is an API and packaging migration, not a vector-format migration.
 | WAL protobuf package | `ai.pipestream.search.wal.v1` |
 | Environment prefix | `PIPESTREAM_SEARCH_*` |
 | Default vector provider | `embedded-turbovec` |
+| Repository and local checkout | `protomolt-search` |
 
 Regenerate clients from
 [`search.proto`](../proto/ai/pipestream/search/v1/search.proto). The gRPC
@@ -44,5 +45,6 @@ unchanged. Deploying the renamed binary and regenerated clients is required.
 A rebuild is still required for an actual provider, scoring fingerprint,
 analysis fingerprint, or incompatible storage-format change.
 
-The remote repository and local checkout keep their existing names until a
-separate hosting-level rename is authorized.
+The hosting-level rename is complete: the repository and canonical workspace
+checkout are `protomolt-search`. The product, crate, binary, and protocol retain
+the Pipestream Search identities above.
