@@ -43,6 +43,7 @@ pub mod merge;
 pub mod metrics;
 pub mod node;
 pub mod pb;
+pub mod phrases;
 pub mod postings;
 pub mod query;
 pub mod rankdiff;

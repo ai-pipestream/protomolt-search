@@ -122,6 +122,29 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = Vec::new();
     let mut node_services = Vec::new();
+    let phrase_index = cfg
+        .phrase_glossary
+        .as_ref()
+        .map(|path| {
+            pipestream_search::phrases::PhraseIndex::load_tsv(
+                path,
+                cfg.phrase_field.clone(),
+                cfg.entity_map_field.clone(),
+                cfg.phrase_ignore_case,
+                cfg.phrase_ner,
+            )
+            .map(std::sync::Arc::new)
+        })
+        .transpose()?;
+    if let Some(index) = &phrase_index {
+        eprintln!(
+            "phrase vocabulary: field {:?}, fingerprint {:016x}, entity map {:?}, NER {}",
+            index.phrase_field(),
+            index.fingerprint(),
+            index.entity_map_field(),
+            index.include_ner()
+        );
+    }
 
     if matches!(cfg.role, Role::Node | Role::Both) {
         for shard in &cfg.shards {
@@ -226,6 +249,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .with_bm25(bm25_store)
+            .with_phrase_index(phrase_index.clone())
             .with_generation(generation);
             // The UDP stream-signal lane shares the gRPC listener's host:port.
             node.spawn_floor_listener(addr);
@@ -277,6 +301,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     b: f64::from(cfg.bm25_b),
                 },
             )
+            .with_phrase_index(phrase_index.clone())
             .with_limits(pipestream_search::coordinator::FanoutLimits {
                 shard_deadline: to_duration(cfg.shard_deadline_ms),
                 hedge_delay: to_duration(cfg.hedge_delay_ms),

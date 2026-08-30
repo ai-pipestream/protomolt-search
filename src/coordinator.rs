@@ -111,6 +111,8 @@ pub struct CoordinatorServiceImpl {
     /// Optional distributed vector collection. The product coordinator calls
     /// it once as one provider; it never learns or re-fans its shard topology.
     clustered_vectors: Option<ClusteredTurboVecBackend>,
+    /// Product-owned phrase vocabulary used to derive canonical query terms.
+    phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
 }
 
 /// A process-unique, well-mixed stream token for the UDP signal lane
@@ -1098,6 +1100,8 @@ struct FusedGlobals {
     /// Per field: global df per term, in that field's term order.
     dfs: Vec<Vec<u32>>,
     epochs: Vec<u64>,
+    /// Number of primary shards whose field table contains each field.
+    known_shards: Vec<usize>,
 }
 
 impl CoordinatorServiceImpl {
@@ -1119,6 +1123,7 @@ impl CoordinatorServiceImpl {
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
             clustered_vectors: None,
+            phrase_index: None,
         }
     }
 
@@ -1218,6 +1223,15 @@ impl CoordinatorServiceImpl {
     pub fn with_bm25(mut self, analysis_addr: Option<String>, params: Bm25Params) -> Self {
         self.analysis_addr = analysis_addr;
         self.bm25_params = params;
+        self
+    }
+
+    /// Attach the same immutable phrase vocabulary used by every shard.
+    pub fn with_phrase_index(
+        mut self,
+        phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
+    ) -> Self {
+        self.phrase_index = phrase_index;
         self
     }
 
@@ -1793,6 +1807,7 @@ impl CoordinatorServiceImpl {
                     &field_terms,
                     &globals,
                     &claims,
+                    None,
                     min_score,
                     facet_fields,
                     map_facet_fields,
@@ -1807,6 +1822,164 @@ impl CoordinatorServiceImpl {
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
+                    self.stats_cache.invalidate_all();
+                    fresh = true;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Phrase-aware BM25 orchestration. Ordinary fields are analyzed exactly
+    /// as on the fused route; the final field is populated directly from the
+    /// product glossary and scored as a max-group on every shard.
+    async fn fanout_phrase(
+        &self,
+        base: &crate::pb::Bm25SearchRequest,
+        k: u32,
+        weight_per_token: f32,
+        max_weight: f32,
+        filter: Option<&crate::pb::FilterExpr>,
+    ) -> Result<FacetedHits, Status> {
+        crate::node::validate_range_facet_fields(&base.range_facet_fields)?;
+        crate::node::validate_geo_filters(&base.geo_filters)?;
+        if let Some(filter) = filter {
+            crate::filter::validate_filter(filter)?;
+        }
+        let phrase_index = self.phrase_index.as_ref().ok_or_else(|| {
+            Status::failed_precondition("this coordinator has no phrase glossary configured")
+        })?;
+        if !weight_per_token.is_finite() || weight_per_token <= 0.0 {
+            return Err(Status::invalid_argument(
+                "phrase weight_per_token must be finite and greater than zero",
+            ));
+        }
+        if !max_weight.is_finite() || max_weight <= 0.0 {
+            return Err(Status::invalid_argument(
+                "phrase max_weight must be finite and greater than zero",
+            ));
+        }
+        let mut fields = if base.fields.is_empty() {
+            vec![crate::pb::QueryField {
+                field: "body".to_string(),
+                analysis: base.analysis.clone(),
+                weight: 1.0,
+                k1: 0.0,
+                b: 0.0,
+            }]
+        } else {
+            if base.analysis.is_some() {
+                return Err(Status::invalid_argument(
+                    "PhraseSearch base.analysis is ignored when base.fields is set; move the spec onto each QueryField.analysis",
+                ));
+            }
+            base.fields.clone()
+        };
+        let mut seen = std::collections::HashSet::new();
+        for field in &fields {
+            if field.field.is_empty() || !seen.insert(field.field.as_str()) {
+                return Err(Status::invalid_argument(
+                    "phrase search base fields must be named and unique",
+                ));
+            }
+            if field.field == phrase_index.phrase_field() {
+                return Err(Status::invalid_argument(format!(
+                    "phrase field {:?} is derived by PhraseSearch and must not appear in base.fields",
+                    phrase_index.phrase_field()
+                )));
+            }
+            if field.weight < 0.0 || field.weight.is_nan() {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?}: weight must be non-negative",
+                    field.field
+                )));
+            }
+        }
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
+        })?;
+        let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some()
+            || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
+        let t0 = std::time::Instant::now();
+        let mut field_terms = Vec::with_capacity(fields.len() + 1);
+        for field in &fields {
+            let analyzed =
+                crate::analyzer::analyze_document(&addr, &base.text, field.analysis.as_ref())
+                    .await?;
+            let mut terms = Vec::new();
+            for (term, _, _) in analyzed.into_body().terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+            field_terms.push(terms);
+        }
+        let phrase_pairs = phrase_index.query_terms(&base.text);
+        let phrase_terms: Vec<String> = phrase_pairs.iter().map(|(term, _)| term.clone()).collect();
+        let phrase_weights: Vec<f32> = phrase_pairs
+            .iter()
+            .map(|(_, token_count)| ((*token_count as f32) * weight_per_token).min(max_weight))
+            .collect();
+        let phrase_leg = fields.len();
+        fields.push(crate::pb::QueryField {
+            field: phrase_index.phrase_field().to_string(),
+            analysis: None,
+            weight: 1.0,
+            k1: 0.0,
+            b: 0.0,
+        });
+        field_terms.push(phrase_terms);
+        if k == 0 || field_terms.iter().all(Vec::is_empty) {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let t_analyzed = t0.elapsed();
+        let stats_fields: Vec<crate::pb::FieldTerms> = fields
+            .iter()
+            .zip(&field_terms)
+            .map(|(field, terms)| crate::pb::FieldTerms {
+                field: field.field.clone(),
+                terms: terms.clone(),
+            })
+            .collect();
+        let mut fresh = false;
+        loop {
+            let globals = self.fused_stats(&stats_fields, fresh).await?;
+            if globals.known_shards[phrase_leg] != self.node_addrs.len() {
+                return Err(Status::failed_precondition(format!(
+                    "phrase field {:?} exists on only {}/{} shards; phrase search requires a complete rebuilt generation",
+                    phrase_index.phrase_field(),
+                    globals.known_shards[phrase_leg],
+                    self.node_addrs.len()
+                )));
+            }
+            let claims = if fresh {
+                vec![0; globals.epochs.len()]
+            } else {
+                globals.epochs.clone()
+            };
+            let t_stats = t0.elapsed();
+            let round = self
+                .bm25_fused_round(
+                    k,
+                    &fields,
+                    &field_terms,
+                    &globals,
+                    &claims,
+                    Some((phrase_leg, &phrase_weights, phrase_index.fingerprint())),
+                    base.min_score,
+                    &base.facet_fields,
+                    &base.map_facet_fields,
+                    &base.range_facet_fields,
+                    &base.geo_filters,
+                    filter,
+                    trace,
+                    t0,
+                    t_analyzed,
+                    t_stats,
+                )
+                .await;
+            match round {
+                Err(error) if !fresh && is_stale_stats(&error) => {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
@@ -1894,6 +2067,7 @@ impl CoordinatorServiceImpl {
             .map(|ft| vec![0u32; ft.terms.len()])
             .collect();
         let mut known_somewhere = vec![false; stats_fields.len()];
+        let mut known_shards = vec![0usize; stats_fields.len()];
         let mut epochs = Vec::with_capacity(n);
         for share in shares {
             let s = share.expect("looked up or fetched above");
@@ -1901,6 +2075,7 @@ impl CoordinatorServiceImpl {
             for (fi, fs) in s.fields.iter().enumerate() {
                 totals[fi] += fs.total_doc_length;
                 known_somewhere[fi] |= fs.known;
+                known_shards[fi] += usize::from(fs.known);
                 for (acc, df) in dfs[fi].iter_mut().zip(&fs.dfs) {
                     *acc += df;
                 }
@@ -1929,6 +2104,7 @@ impl CoordinatorServiceImpl {
             totals,
             dfs,
             epochs,
+            known_shards,
         })
     }
 
@@ -1943,6 +2119,8 @@ impl CoordinatorServiceImpl {
         field_terms: &[Vec<String>],
         globals: &FusedGlobals,
         claims: &[u64],
+        // `(field index, parallel term weights, vocabulary fingerprint)`.
+        phrase: Option<(usize, &[f32], u64)>,
         min_score: f32,
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
@@ -1984,7 +2162,12 @@ impl CoordinatorServiceImpl {
                 // The terms were analyzed under f.analysis just above,
                 // so this is the fingerprint OF THE SPEC ACTUALLY USED,
                 // not of what the caller meant.
-                analysis_fingerprint: crate::analyzer::analysis_fingerprint(f.analysis.as_ref()),
+                analysis_fingerprint: phrase
+                    .filter(|(phrase_field, _, _)| *phrase_field == fi)
+                    .map_or_else(
+                        || crate::analyzer::analysis_fingerprint(f.analysis.as_ref()),
+                        |(_, _, fingerprint)| fingerprint,
+                    ),
             })
             .collect();
         if trace {
@@ -2028,9 +2211,21 @@ impl CoordinatorServiceImpl {
                 cardinality_fields: Vec::new(),
             };
             let mut client = self.node_client(node)?;
+            let phrase_request =
+                phrase.map(
+                    |(phrase_leg, weights, _)| crate::pb::Bm25PhraseQueryRequest {
+                        query: Some(request.clone()),
+                        phrase_leg: phrase_leg as u32,
+                        phrase_term_weights: weights.to_vec(),
+                    },
+                );
             query_tasks.push(tokio::spawn(async move {
                 let started = std::time::Instant::now();
-                client.bm25_query(request).await.map(|r| {
+                let response = match phrase_request {
+                    Some(request) => client.bm25_phrase_query(request).await,
+                    None => client.bm25_query(request).await,
+                };
+                response.map(|r| {
                     let r = r.into_inner();
                     (
                         shard as u32,
@@ -5703,6 +5898,61 @@ impl SearchService for CoordinatorServiceImpl {
             range_facets,
             stats,
             cardinality,
+        }))
+    }
+
+    async fn phrase_search(
+        &self,
+        request: Request<crate::pb::PhraseSearchRequest>,
+    ) -> Result<Response<Bm25SearchResponse>, Status> {
+        let request = request.into_inner();
+        let base = request
+            .base
+            .ok_or_else(|| Status::invalid_argument("PhraseSearchRequest.base is required"))?;
+        let k = self.resolve_k(base.k)?;
+        if base.min_score.is_nan() || base.min_score == f32::NEG_INFINITY {
+            return Err(Status::invalid_argument(
+                "min_score must be finite (NaN and -inf are not valid floors)",
+            ));
+        }
+        if !base.score_stages.is_empty()
+            || !base.stats_fields.is_empty()
+            || !base.cardinality_fields.is_empty()
+            || !base.projections.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "phrase max-group scoring is not yet certified with score stages, stats, cardinality, or projections; use filters and facets, or issue an ordinary Bm25Search",
+            ));
+        }
+        let options = request.options.unwrap_or_default();
+        let weight_per_token = if options.weight_per_token == 0.0 {
+            1.0
+        } else {
+            options.weight_per_token
+        };
+        let max_weight = if options.max_weight == 0.0 {
+            3.0
+        } else {
+            options.max_weight
+        };
+        let filter = crate::cel::compile_filter(&base.filter)?;
+        let (hits, facets, range_facets) = self
+            .fanout_phrase(&base, k, weight_per_token, max_weight, filter.as_ref())
+            .await?;
+        let kth_best = if hits.len() == k as usize {
+            hits.last()
+                .map(|hit| crate::bm25::floor_seed(hit.score))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Ok(Response::new(Bm25SearchResponse {
+            hits,
+            kth_best,
+            facets,
+            range_facets,
+            stats: Vec::new(),
+            cardinality: Vec::new(),
         }))
     }
 

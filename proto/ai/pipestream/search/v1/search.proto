@@ -204,6 +204,12 @@ service NodeService {
   // select the defaults (1.2 / 0.75). Returns the shard's local top-k.
   rpc Bm25Query(Bm25QueryRequest) returns (Bm25QueryResponse);
 
+  // Exact phrase-aware BM25. `query.fields` carries the ordinary additive
+  // field legs; the selected phrase leg contributes only its strongest
+  // matching concept per document, so nested registered concepts cannot
+  // inflate a score by stacking overlapping evidence.
+  rpc Bm25PhraseQuery(Bm25PhraseQueryRequest) returns (Bm25QueryResponse);
+
   // Bm25Query with a mid-scan floor relay — the lexical twin of
   // SearchShard (docs/block-max.md, "the floor is already plumbed").
   // The first client message must be `start`; later messages raise the
@@ -316,6 +322,11 @@ service SearchService {
   // Hits carry per-term occurrence offsets in original-text coordinates;
   // fetch the raw text with NodeService.GetDocuments to highlight.
   rpc Bm25Search(Bm25SearchRequest) returns (Bm25SearchResponse);
+
+  // BM25 plus explicitly registered multiword concepts. Body terms retain
+  // ordinary recall while the configured phrase field adds the strongest
+  // exact phrase signal. This never synthesizes arbitrary n-grams.
+  rpc PhraseSearch(PhraseSearchRequest) returns (Bm25SearchResponse);
 
   // Hybrid vector + BM25 search with RRF fusion. Default
   // (FUSION_MODE_GLOBAL_RANK): shards return raw per-leg lists and the
@@ -1369,6 +1380,29 @@ message AddDocumentsRequest {
   // re-evaluates. A change to this spec mid-session is a session
   // property change, applied from the next document on.
   MaterializeSpec materialize = 14;
+  // Derived glossary phrase postings. Fresh client ingest leaves this empty;
+  // a configured node derives it from `text` before applying and writes the
+  // populated values to the WAL. Replay therefore preserves exact posting
+  // identities and original UTF-16 spans without needing the source glossary.
+  repeated PhrasePosting phrases = 15;
+  // Fingerprint of the glossary that produced `phrases`. Non-zero whenever
+  // phrases are populated and enforced against the configured vocabulary.
+  uint64 phrase_fingerprint = 16;
+  // Phrase field identity persists even when this document has no glossary
+  // matches, allowing WAL resharding to reconstruct an empty phrase column.
+  string phrase_field = 17;
+}
+
+// One canonical concept posting derived from a glossary match. Aliases share
+// `term`; repeated occurrences share one posting with multiple offsets.
+message PhrasePosting {
+  string term = 1;
+  string concept_id = 2;
+  uint32 token_count = 3;
+  repeated OffsetSpan offsets = 4;
+  // Dedicated BM25 field that owns this posting. Persisted so generic WAL
+  // resharding can rebuild the field without loading the source glossary.
+  string field = 5;
 }
 
 // Which quality columns to derive from the sidecar's model-free noise
@@ -1614,6 +1648,15 @@ message Bm25QueryRequest {
   // projection_leaves_known so the coordinator can refuse a column no
   // shard knows.
   repeated CompiledProjection projections = 19;
+}
+
+// Internal exact phrase scoring request. `phrase_leg` indexes `query.fields`.
+// Its terms remain ordinary BM25 terms for idf/tf/length normalization, but a
+// document receives only max(term_score * parallel weight) from that leg.
+message Bm25PhraseQueryRequest {
+  Bm25QueryRequest query = 1;
+  uint32 phrase_leg = 2;
+  repeated float phrase_term_weights = 3;
 }
 
 // One geo filter: a geo-point column plus the region a document's point
@@ -2280,6 +2323,24 @@ message Bm25SearchRequest {
   // A projection never selects and never scores: it annotates. Flat
   // (non-fused) route only, like stats_fields.
   repeated NamedProjection projections = 14;
+}
+
+// Client-facing phrase-aware request. `base` supplies all ordinary BM25
+// field legs, filters, and facets. The coordinator appends its configured
+// phrase field and derives concept terms from the raw query text. Score stages,
+// stats, cardinality, and projections are refused until their max-group
+// interaction is certified.
+message PhraseSearchRequest {
+  Bm25SearchRequest base = 1;
+  PhraseSearchOptions options = 2;
+}
+
+message PhraseSearchOptions {
+  // Multiplier per registered phrase token. 0 selects 1.0.
+  float weight_per_token = 1;
+  // Maximum phrase multiplier. 0 selects 3.0. The resulting multiplier is
+  // min(max_weight, token_count * weight_per_token).
+  float max_weight = 2;
 }
 
 // One field of a fused multi-field search.

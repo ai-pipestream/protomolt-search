@@ -70,6 +70,9 @@ async fn add_documents(addr: &str, texts: &[String]) {
                 geo_points: Vec::new(),
                 quality: None,
                 geography: None,
+                phrases: Vec::new(),
+                phrase_fingerprint: 0,
+                phrase_field: String::new(),
             })
             .await
             .unwrap();

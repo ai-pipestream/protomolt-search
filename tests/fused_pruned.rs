@@ -129,6 +129,7 @@ fn random_two_field_corpus(
                 fields,
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             },
         ));
     }
@@ -404,6 +405,7 @@ fn fused_ties_at_floor_and_kth_slot() {
                 ],
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             },
         );
     }
@@ -498,6 +500,7 @@ fn fused_ties_at_floor_and_kth_slot() {
                 fields,
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             },
         );
     }
@@ -590,6 +593,7 @@ fn fused_blocks_actually_skip() {
                 fields,
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             },
         );
     }
@@ -840,6 +844,7 @@ fn fused_pruned_distributed_equals_monolithic() {
             fields,
             quality: None,
             geography: None,
+            entities: Vec::new(),
         }
     }
     fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
@@ -1010,6 +1015,7 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
                 ],
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             },
         );
     }

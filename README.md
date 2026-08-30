@@ -313,6 +313,15 @@ model-backed layers. Its proto is vendored at
 `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`; see the file header.
 Both providers return offsets in original-text UTF-16 coordinates.
 
+Glossary-backed phrase and entity search is an additive product capability:
+ordinary body terms preserve recall, a dedicated phrase field stores only
+explicit registered concepts, and an optional map column exposes concepts and
+OpenNLP NER identities to CEL and facets. `PhraseSearch` adds only the strongest
+phrase signal per document, so nested concepts do not stack. See
+[`docs/phrase-search.md`](docs/phrase-search.md) for vocabulary format,
+configuration, scoring, mobile use, WAL durability, and the required reindex
+boundary.
+
 Select native analysis with `--analysis-addr=native` or
 `analysis_addr = "native"`. A single-shard `both` process propagates that
 setting to its shard. Multi-shard node configurations set `analysis_addr` on

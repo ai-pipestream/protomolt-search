@@ -13,7 +13,7 @@ The native provider implements the exact subset used by the product's named
 
 | Contract field | Native values |
 |---|---|
-| Tokenizer | `TOKENIZER_WHITESPACE` |
+| Tokenizer | `TOKENIZER_WHITESPACE`, `TOKENIZER_UAX29` |
 | Stemmer | `STEMMER_NONE`, classic `STEMMER_PORTER` |
 | Term-vector mode | `MODE_FULL`, `MODE_SCORING_ONLY` |
 | Term-vector source | `SOURCE_TOKENS`, `SOURCE_STEMS`, `SOURCE_NORMALIZED_STEMS` |
@@ -29,6 +29,19 @@ named `server` analyzer means "use the sidecar's configured defaults". Any
 unsupported tokenizer, stemmer, normalizer, optional quality layer, or
 geography layer also fails explicitly. The native analyzer does not silently
 substitute a similar algorithm.
+
+`TOKENIZER_UAX29` uses Unicode Standard Annex #29 word boundaries and the
+same punctuation-only filtering used by OpenNLP's word tokenizer. It retains
+letters, numbers, ideographs, kana, Hangul, Southeast Asian words, emoji, and
+regional-indicator flags; drops punctuation-only segments; and caps one token
+at 255 UTF-16 units without splitting a surrogate pair. The convenience
+`uax29_body_spec()` selects it. `body_spec()` remains whitespace-tokenized
+because silently changing the default would change every persisted term.
+
+The crate also owns the portable glossary matcher described in
+[`phrase-search.md`](phrase-search.md): pinned Aho-Corasick matching, Unicode
+full case folding, word boundaries, original UTF-16 spans, stable vocabulary
+fingerprints, and canonical concept posting identities.
 
 ## Server configuration
 
@@ -64,7 +77,7 @@ loopback hop.
 Keep the OpenNLP sidecar when a workload needs any of these:
 
 - static embeddings or another sidecar embedding configuration;
-- sentence detection, annotations, quality, or geography layers;
+- sentence detection, annotations, quality, geography, or model NER layers;
 - model-backed or dictionary-backed tokenizers, stemmers, and normalizers;
 - an `AnalysisSpec` outside the native table above;
 - the sidecar-configured `server` analyzer.

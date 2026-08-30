@@ -3,7 +3,9 @@
 
 mod common;
 
-use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
+use pipestream_search::analyzer::{
+    body_spec, uax29_body_spec, NATIVE_ANALYSIS_BACKEND, SOURCE_TOKENS, STEMMER_NONE,
+};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -64,4 +66,25 @@ async fn native_streamed_ingest_and_query_share_term_identity() {
     );
 
     node.abort();
+}
+
+#[tokio::test]
+async fn native_uax29_spec_preserves_opennlp_word_boundaries() {
+    let mut spec = uax29_body_spec();
+    spec.stemmer = STEMMER_NONE;
+    spec.term_vector_source = SOURCE_TOKENS;
+    let analyzed = pipestream_search::analyzer::analyze_document(
+        NATIVE_ANALYSIS_BACKEND,
+        "😀 U.S. 東京 hot-dog",
+        Some(&spec),
+    )
+    .await
+    .unwrap();
+    let terms: Vec<String> = analyzed
+        .into_body()
+        .terms
+        .into_iter()
+        .map(|(term, _, _)| term)
+        .collect();
+    assert_eq!(terms, ["😀", "u.s", "東", "京", "hot", "dog"]);
 }

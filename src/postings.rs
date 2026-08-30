@@ -618,6 +618,10 @@ pub struct AnalyzedDoc {
     /// which materializes as column ABSENCE (there is no neutral
     /// coordinate to write).
     pub geography: Option<DocGeography>,
+    /// Named-entity mentions retained from the sidecar until ingest
+    /// materializes them into an ordinary map column. They are never mixed
+    /// into body postings.
+    pub entities: Vec<crate::phrases::DocEntity>,
 }
 
 /// One document's geography reduction, derived at INGEST and stored
@@ -659,6 +663,7 @@ impl AnalyzedDoc {
             fields: vec![AnalyzedField { terms, length }],
             quality: None,
             geography: None,
+            entities: Vec::new(),
         }
     }
 
@@ -8779,6 +8784,7 @@ mod tests {
                     fields,
                     quality: None,
                     geography: None,
+                    entities: Vec::new(),
                 },
                 lineage,
             ));

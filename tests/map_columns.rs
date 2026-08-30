@@ -90,6 +90,9 @@ async fn add_documents_mapped(
             geo_points: Vec::new(),
             quality: None,
             geography: None,
+            phrases: Vec::new(),
+            phrase_fingerprint: 0,
+            phrase_field: String::new(),
         })
         .await
         .unwrap();
@@ -594,6 +597,9 @@ async fn distributed_map_stages_and_ingest_refusals() {
         geo_points: Vec::new(),
         quality: None,
         geography: None,
+        phrases: Vec::new(),
+        phrase_fingerprint: 0,
+        phrase_field: String::new(),
     };
     let send = |addr: String, req: AddDocumentsRequest| async move {
         let mut client = NodeServiceClient::connect(addr).await.unwrap();

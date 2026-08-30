@@ -24,3 +24,7 @@ icu_properties_data = "=2.0.0"
 # internally generated data and provider ABI on the same release.
 icu_locale_core = "=2.0.0"
 icu_provider = "=2.0.0"
+# Both algorithms affect persisted term identity. Exact pins make an upgrade
+# an explicit index-compatibility decision.
+unicode-segmentation = "=1.13.3"
+aho-corasick = "=1.1.4"

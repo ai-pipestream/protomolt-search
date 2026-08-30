@@ -110,6 +110,16 @@ pub fn body_spec() -> AnalysisSpec {
     }
 }
 
+/// Unicode word-boundary variant of [`body_spec`]. This is additive rather
+/// than the default because changing the tokenizer changes persisted term
+/// identity and requires a new index generation.
+pub fn uax29_body_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        tokenizer: TOKENIZER_UAX29,
+        ..body_spec()
+    }
+}
+
 /// The cased twin of [`body_spec`]: identical tokenizer and stemmer,
 /// but term identity taken from the stem of the SURFACE form, so
 /// capitalization survives into the term.
@@ -215,6 +225,8 @@ pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
 
 /// `AnalysisOptions.Tokenizer.TOKENIZER_WHITESPACE`.
 pub const TOKENIZER_WHITESPACE: i32 = 1;
+/// `AnalysisOptions.Tokenizer.TOKENIZER_UAX29`.
+pub const TOKENIZER_UAX29: i32 = 3;
 /// `AnalysisOptions.Stemmer.STEMMER_NONE`.
 pub const STEMMER_NONE: i32 = 1;
 /// `AnalysisOptions.Stemmer.STEMMER_PORTER`.
@@ -379,9 +391,10 @@ fn native_spec(spec: Option<&AnalysisSpec>) -> Result<protomolt_analyzer::Analys
     })?;
     let tokenizer = match spec.tokenizer {
         0 | TOKENIZER_WHITESPACE => Tokenizer::Whitespace,
+        TOKENIZER_UAX29 => Tokenizer::Uax29,
         value => {
             return Err(Status::invalid_argument(format!(
-                "native analysis supports only TOKENIZER_WHITESPACE (1), got {value}"
+                "native analysis supports TOKENIZER_WHITESPACE (1) and TOKENIZER_UAX29 (3), got {value}"
             )))
         }
     };
@@ -519,6 +532,9 @@ pub struct SessionLayers {
     /// The geocoding layer (`docs/geography-columns.md`). Requires the
     /// sidecar to serve NER; opening preflights that capability.
     pub geography: bool,
+    /// Named entity mentions for materialization into a product-owned map
+    /// column. Requires a configured sidecar NER model.
+    pub entities: bool,
 }
 
 /// Maps `spec` straight onto the sidecar's `AnalysisOptions`: term vectors
@@ -560,9 +576,9 @@ fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> Analy
         // to do, because what comes back becomes an ordinary column.
         noise: layers.quality,
         artifacts: layers.quality,
-        // Geocoding consumes the entity layer; setting `geo` implies
-        // `ner` on the sidecar side. Availability was preflighted at
-        // session open (see [`AnalyzeStream::open_with_vocab`]).
+        // Geocoding consumes the entity layer; explicit entity columns do as
+        // well. Availability was preflighted at session open.
+        ner: layers.entities || layers.geography,
         geo: layers.geography,
         ..Default::default()
     }
@@ -592,6 +608,23 @@ static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> AnalyzedDoc {
     let quality = layers.quality.then(|| doc_quality(&response));
     let geography = layers.geography.then(|| doc_geography(&response));
+    let entities = if layers.entities {
+        response
+            .entities
+            .iter()
+            .map(|entity| {
+                let span = entity.span.as_ref();
+                crate::phrases::DocEntity {
+                    kind: entity.r#type.clone(),
+                    text: entity.text.clone(),
+                    start: span.map_or(0, |span| span.start.max(0) as u32),
+                    end: span.map_or(0, |span| span.end.max(0) as u32),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut terms = crate::postings::DocTerms::new();
     let mut length = 0u32;
     for tv in response.term_vectors {
@@ -620,6 +653,7 @@ fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> AnalyzedDo
     AnalyzedDoc {
         quality,
         geography,
+        entities,
         ..AnalyzedDoc::body(terms, length)
     }
 }
@@ -820,14 +854,14 @@ impl AnalyzeStream {
             return Self::open_native(spec, vocab, layers);
         }
         let mut client = client(addr)?;
-        if layers.geography {
+        if layers.geography || layers.entities {
             let capabilities = client
                 .get_capabilities(crate::pb::analysis::GetCapabilitiesRequest {})
                 .await?
                 .into_inner();
             if !capabilities.ner_available {
                 return Err(Status::failed_precondition(
-                    "geography columns were requested but this sidecar has no NER model                      configured (GetCapabilities.ner_available = false); the geocoding                      layer consumes the entity layer, so it cannot be served — configure                      an NER model or drop the GeographySpec",
+                    "entity or geography columns were requested but this sidecar has no NER model configured (GetCapabilities.ner_available = false); configure an NER model or disable those columns",
                 ));
             }
         }
@@ -859,14 +893,19 @@ impl AnalyzeStream {
         layers: SessionLayers,
     ) -> Result<Self, Status> {
         if layers != SessionLayers::default() {
-            let requested = match (layers.quality, layers.geography) {
-                (true, true) => "quality and geography",
-                (true, false) => "quality",
-                (false, true) => "geography",
-                (false, false) => unreachable!(),
-            };
+            let mut requested = Vec::new();
+            if layers.quality {
+                requested.push("quality");
+            }
+            if layers.geography {
+                requested.push("geography");
+            }
+            if layers.entities {
+                requested.push("entities");
+            }
             return Err(Status::failed_precondition(format!(
-                "native lexical analysis does not provide {requested} layers; configure an OpenNLP sidecar for this ingest"
+                "native lexical analysis does not provide {} layers; configure an OpenNLP sidecar for this ingest",
+                requested.join(", ")
             )));
         }
         let spec = std::sync::Arc::new(native_spec(spec)?);
@@ -1604,6 +1643,7 @@ mod tests {
             SessionLayers {
                 quality: true,
                 geography: false,
+                entities: false,
             },
         )
         .await

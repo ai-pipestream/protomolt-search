@@ -2432,6 +2432,8 @@ pub struct NodeServiceImpl {
     /// (docs/cel-values.md): expressions compile once per spec CHANGE,
     /// never per document — the ingest analog of the query rule.
     materialize_cache: Arc<std::sync::Mutex<Option<CompiledMaterialize>>>,
+    /// Optional product-owned phrase vocabulary shared by ingest and query.
+    phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
 }
 
 /// One compiled MaterializeSpec, cached against spec equality.
@@ -2748,7 +2750,18 @@ impl NodeServiceImpl {
             stream_signals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             vocab,
             materialize_cache: Arc::new(std::sync::Mutex::new(None)),
+            phrase_index: None,
         }
+    }
+
+    /// Attach the process-wide phrase vocabulary. It is immutable and cheap
+    /// to share across every shard in a `both` process.
+    pub fn with_phrase_index(
+        mut self,
+        phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
+    ) -> Self {
+        self.phrase_index = phrase_index;
+        self
     }
 
     /// The shard's vocabulary listener, when accumulation is enabled.
@@ -3502,7 +3515,11 @@ impl NodeServiceImpl {
     /// refuses a field NO shard knows (see `fanout_bm25_fused` and
     /// `FieldStats.known`); skipping alone would turn a misspelled field
     /// into a silently different ranking.
-    fn bm25_query_fused(&self, req: &Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
+    fn bm25_query_fused(
+        &self,
+        req: &Bm25QueryRequest,
+        phrase: Option<(usize, &[f32])>,
+    ) -> Result<Bm25QueryResponse, Status> {
         if !req.projections.is_empty() {
             return Err(Status::invalid_argument(
                 "projection: projections are not certified on the fused route yet; \
@@ -3675,7 +3692,36 @@ impl NodeServiceImpl {
                 // do: the coordinator forwards them verbatim and the
                 // node applies them at the one place a filter belongs,
                 // before heap insertion (`filter_ctx`, resolved above).
-                let docs = if prunable {
+                let phrase_view = match phrase {
+                    Some((leg, weights)) => Some((
+                        leg_of_view
+                        .iter()
+                        .position(|&candidate| candidate == leg)
+                        .ok_or_else(|| {
+                            Status::failed_precondition(format!(
+                                "phrase field {:?} is absent from this shard; rebuild the complete generation",
+                                req.fields[leg].field
+                            ))
+                        })?,
+                        weights,
+                    )),
+                    None => None,
+                };
+                let docs = if let Some((phrase_view, weights)) = phrase_view {
+                    bm25::filter_fused_to_floor(
+                        bm25::top_k_phrase_exhaustive_filtered(
+                            &queries,
+                            phrase_view,
+                            &weights
+                                .iter()
+                                .map(|&value| f64::from(value))
+                                .collect::<Vec<_>>(),
+                            req.k as usize,
+                            filter_ctx,
+                        ),
+                        floor,
+                    )
+                } else if prunable {
                     let mut prune = bm25::PruneStats::default();
                     bm25::top_k_fused_pruned_filtered_stats(
                         &queries,
@@ -4319,6 +4365,7 @@ fn join_fields(
     let mut fields = vec![crate::postings::AnalyzedField::default(); n];
     let quality = body.quality;
     let geography = body.geography.clone();
+    let entities = body.entities.clone();
     fields[0] = body.into_body();
     for (fi, analyzed) in extras {
         fields[fi] = analyzed.ok_or_else(|| {
@@ -4332,6 +4379,7 @@ fn join_fields(
         fields,
         quality,
         geography,
+        entities,
     })
 }
 
@@ -4384,10 +4432,14 @@ pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> Stri
 /// The optional sidecar layers a document's specs ask its analysis
 /// session for — the session-identity companion to the reopen
 /// condition (a change to either spec reopens the session).
-fn session_layers(doc: &AddDocumentsRequest) -> crate::analyzer::SessionLayers {
+fn session_layers(
+    doc: &AddDocumentsRequest,
+    phrase_index: Option<&crate::phrases::PhraseIndex>,
+) -> crate::analyzer::SessionLayers {
     crate::analyzer::SessionLayers {
         quality: quality_wanted(doc.quality.as_ref()),
         geography: geography_wanted(doc.geography.as_ref()),
+        entities: phrase_index.is_some_and(crate::phrases::PhraseIndex::include_ner),
     }
 }
 
@@ -4515,6 +4567,16 @@ impl NodeServiceImpl {
                 return Err(Status::invalid_argument(
                     "\"body\" is the top-level text; DocumentField names extra fields only",
                 ));
+            }
+            if self
+                .phrase_index
+                .as_ref()
+                .is_some_and(|phrases| field.field == phrases.phrase_field())
+            {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?} is derived from the configured phrase glossary; clients must not supply it",
+                    field.field
+                )));
             }
             if seen.contains(&field.field.as_str()) {
                 return Err(Status::invalid_argument(format!(
@@ -4693,6 +4755,113 @@ impl NodeServiceImpl {
         Ok(doc)
     }
 
+    /// Derive or validate phrase postings, materialize entity map entries on
+    /// the first pass, and install the dedicated analyzed field. The returned
+    /// request is the durable WAL form.
+    fn materialize_phrases(
+        &self,
+        mut doc: AddDocumentsRequest,
+        mut analyzed: crate::postings::AnalyzedDoc,
+    ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
+        let Some(index) = &self.phrase_index else {
+            if !doc.phrases.is_empty()
+                || doc.phrase_fingerprint != 0
+                || !doc.phrase_field.is_empty()
+            {
+                return Err(Status::failed_precondition(
+                    "document carries derived phrase data but this node has no phrase glossary configured",
+                ));
+            }
+            return Ok((doc, analyzed));
+        };
+        let expected = index.fingerprint();
+        let fresh = doc.phrase_fingerprint == 0;
+        if fresh {
+            if !doc.phrases.is_empty() {
+                return Err(Status::invalid_argument(
+                    "client-supplied phrase postings require their non-zero vocabulary fingerprint",
+                ));
+            }
+            doc.phrases = index.postings(&doc.text);
+            doc.phrase_fingerprint = expected;
+            doc.phrase_field = index.phrase_field().to_string();
+        } else if doc.phrase_fingerprint != expected {
+            return Err(Status::failed_precondition(format!(
+                "document phrase fingerprint {:016x} differs from configured vocabulary {:016x}; rebuild or replay with the matching glossary",
+                doc.phrase_fingerprint, expected
+            )));
+        } else if doc.phrase_field != index.phrase_field() {
+            return Err(Status::failed_precondition(format!(
+                "document phrase field {:?} differs from configured field {:?}",
+                doc.phrase_field,
+                index.phrase_field()
+            )));
+        }
+        for posting in &doc.phrases {
+            if posting.term != protomolt_analyzer::phrase_posting_term(&posting.concept_id)
+                || posting.field != index.phrase_field()
+                || posting.concept_id.is_empty()
+                || posting.token_count == 0
+                || posting.offsets.is_empty()
+                || posting.offsets.iter().any(|span| span.start >= span.end)
+            {
+                return Err(Status::invalid_argument(format!(
+                    "invalid durable phrase posting for concept {:?}",
+                    posting.concept_id
+                )));
+            }
+        }
+        // A non-zero fingerprint marks a replay-ready document. Its entity
+        // entries were already derived before the WAL append, so never run a
+        // possibly changed NER model over it again.
+        if fresh {
+            let mut derived = index.glossary_entities(&doc.phrases);
+            if let Some(field) = index.entity_map_field() {
+                derived.extend(crate::phrases::ner_entities(field, &analyzed.entities));
+            }
+            for entry in derived {
+                match doc
+                    .map_facets
+                    .iter()
+                    .find(|held| held.field == entry.field && held.key == entry.key)
+                {
+                    Some(held) if held.value == entry.value => {}
+                    Some(_) => {
+                        return Err(Status::invalid_argument(format!(
+                            "derived entity map key {:?} conflicts with a client value",
+                            entry.key
+                        )))
+                    }
+                    None => doc.map_facets.push(entry),
+                }
+            }
+        }
+        let field_index = self
+            .config
+            .bm25_fields
+            .iter()
+            .position(|field| field == index.phrase_field())
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "configured phrase field {:?} is absent from this node's BM25 field table",
+                    index.phrase_field()
+                ))
+            })?;
+        if analyzed.fields.len() <= field_index {
+            analyzed
+                .fields
+                .resize_with(field_index + 1, Default::default);
+        }
+        if analyzed.fields[field_index] != crate::postings::AnalyzedField::default() {
+            return Err(Status::invalid_argument(format!(
+                "derived phrase field {:?} collides with supplied analyzed data",
+                index.phrase_field()
+            )));
+        }
+        analyzed.fields[field_index] = crate::phrases::analyzed_field(&doc.phrases);
+        Ok((doc, analyzed))
+    }
+
     /// Apply one analyzed document: id assignment, store insert, WAL
     /// append. Must be called in arrival order — both transports
     /// guarantee it.
@@ -4711,6 +4880,7 @@ impl NodeServiceImpl {
         // take the one path they already took. Clearing the spec is what
         // makes replay exact — the logged request carries the values, so
         // replay never calls the sidecar and never derives twice.
+        let (doc, analyzed) = self.materialize_phrases(doc, analyzed)?;
         let doc = materialize_quality(doc, &analyzed)?;
         let doc = materialize_geography(doc, &analyzed)?;
         let doc = self.materialize_columns(doc)?;
@@ -4848,6 +5018,17 @@ impl NodeServiceImpl {
                 let fingerprint = crate::analyzer::analysis_fingerprint(field.analysis.as_ref());
                 shard
                     .set_analysis_fingerprint(fi, fingerprint)
+                    .map_err(Status::failed_precondition)?;
+            }
+            if let Some(phrases) = &self.phrase_index {
+                let fi = self
+                    .config
+                    .bm25_fields
+                    .iter()
+                    .position(|field| field == phrases.phrase_field())
+                    .expect("phrase field validated at configuration");
+                shard
+                    .set_analysis_fingerprint(fi, phrases.fingerprint())
                     .map_err(Status::failed_precondition)?;
             }
         }
@@ -5487,7 +5668,7 @@ impl NodeServiceImpl {
                             addr,
                             doc.analysis.as_ref(),
                             self.vocab.clone(),
-                            session_layers(&doc),
+                            session_layers(&doc, self.phrase_index.as_deref()),
                         )
                         .await?;
                         spec = doc.analysis.clone();
@@ -6958,7 +7139,7 @@ impl NodeService for NodeServiceImpl {
                 &addr,
                 first.req.analysis.as_ref(),
                 self.vocab.clone(),
-                session_layers(&first.req),
+                session_layers(&first.req, self.phrase_index.as_deref()),
             )
             .await
             {
@@ -7040,7 +7221,7 @@ impl NodeService for NodeServiceImpl {
                 &addr,
                 first.req.analysis.as_ref(),
                 self.vocab.clone(),
-                session_layers(&first.req),
+                session_layers(&first.req, self.phrase_index.as_deref()),
             )
             .await
             {
@@ -7166,6 +7347,19 @@ impl NodeService for NodeServiceImpl {
         tokio::task::spawn_blocking(move || service.run_bm25_query(req))
             .await
             .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))?
+            .map(Response::new)
+    }
+
+    async fn bm25_phrase_query(
+        &self,
+        request: Request<crate::pb::Bm25PhraseQueryRequest>,
+    ) -> Result<Response<Bm25QueryResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::Bm25Query);
+        let service = self.clone();
+        let req = request.into_inner();
+        tokio::task::spawn_blocking(move || service.run_bm25_phrase_query(req))
+            .await
+            .map_err(|error| Status::internal(format!("bm25 phrase query task failed: {error}")))?
             .map(Response::new)
     }
 
@@ -7576,6 +7770,55 @@ impl NodeServiceImpl {
         self.run_bm25_query_live(req, None)
     }
 
+    fn run_bm25_phrase_query(
+        &self,
+        request: crate::pb::Bm25PhraseQueryRequest,
+    ) -> Result<Bm25QueryResponse, Status> {
+        let req = request
+            .query
+            .ok_or_else(|| Status::invalid_argument("phrase query is missing its BM25 query"))?;
+        let phrase_leg = request.phrase_leg as usize;
+        let Some(leg) = req.fields.get(phrase_leg) else {
+            return Err(Status::invalid_argument(format!(
+                "phrase_leg {} is outside {} BM25 fields",
+                request.phrase_leg,
+                req.fields.len()
+            )));
+        };
+        if request.phrase_term_weights.len() != leg.terms.len() {
+            return Err(Status::invalid_argument(
+                "phrase_term_weights must be parallel to the selected phrase leg's terms",
+            ));
+        }
+        if request
+            .phrase_term_weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+        {
+            return Err(Status::invalid_argument(
+                "phrase term weights must be finite and non-negative",
+            ));
+        }
+        let phrases = self.phrase_index.as_ref().ok_or_else(|| {
+            Status::failed_precondition("this node has no phrase glossary configured")
+        })?;
+        if leg.field != phrases.phrase_field() {
+            return Err(Status::invalid_argument(format!(
+                "phrase leg names {:?}, but this node's phrase field is {:?}",
+                leg.field,
+                phrases.phrase_field()
+            )));
+        }
+        if leg.analysis_fingerprint != phrases.fingerprint() {
+            return Err(Status::failed_precondition(format!(
+                "phrase query fingerprint {:016x} differs from configured vocabulary {:016x}",
+                leg.analysis_fingerprint,
+                phrases.fingerprint()
+            )));
+        }
+        self.bm25_query_fused(&req, Some((phrase_leg, &request.phrase_term_weights)))
+    }
+
     /// [`Self::run_bm25_query`] with a mid-scan floor exchange for the
     /// streaming route. Only the flat pruned scorer consumes the hook;
     /// the fused multi-field route and the exhaustive fallbacks ignore
@@ -7599,7 +7842,7 @@ impl NodeServiceImpl {
                      drop `fields` to use the flat route, or drop `score_stages`",
                 ));
             }
-            return self.bm25_query_fused(&req);
+            return self.bm25_query_fused(&req, None);
         }
         let stage_specs = parse_score_stages(&req.score_stages)?;
         validate_range_facet_fields(&req.range_facet_fields)?;

@@ -253,6 +253,17 @@ pub struct Config {
     /// (`--map-facet-fields=meta`, docs/map-columns.md). Same rules;
     /// one name space across all column kinds.
     pub map_facet_fields: Vec<String>,
+    /// Optional `concept-id<TAB>surface-form` glossary. When present, the
+    /// phrase field and optional entity map are derived at ingest and query.
+    pub phrase_glossary: Option<PathBuf>,
+    /// Dedicated BM25 field holding canonical glossary concept postings.
+    pub phrase_field: String,
+    /// Optional map<string,string> column holding glossary and NER identities.
+    pub entity_map_field: Option<String>,
+    /// Whether glossary matching uses Unicode full case folding.
+    pub phrase_ignore_case: bool,
+    /// Request OpenNLP NER and materialize mentions into the entity map.
+    pub phrase_ner: bool,
     /// The map<string, f64> column table for NEW shard builders
     /// (`--map-numeric-fields=attrs`). Same rules.
     pub map_numeric_fields: Vec<String>,
@@ -318,6 +329,11 @@ struct FileConfig {
     facet_fields: Option<Vec<String>>,
     numeric_fields: Option<Vec<String>>,
     map_facet_fields: Option<Vec<String>>,
+    phrase_glossary: Option<String>,
+    phrase_field: Option<String>,
+    entity_map_field: Option<String>,
+    phrase_ignore_case: Option<bool>,
+    phrase_ner: Option<bool>,
     map_numeric_fields: Option<Vec<String>>,
     integer_fields: Option<Vec<String>>,
     geo_fields: Option<Vec<String>>,
@@ -1128,6 +1144,70 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
     }
 
+    let phrase_glossary = opt(
+        args,
+        "phrase-glossary",
+        "PIPESTREAM_SEARCH_PHRASE_GLOSSARY",
+        file.phrase_glossary.as_deref(),
+    )
+    .filter(|value| !value.trim().is_empty())
+    .map(PathBuf::from);
+    let phrase_field = opt(
+        args,
+        "phrase-field",
+        "PIPESTREAM_SEARCH_PHRASE_FIELD",
+        file.phrase_field.as_deref(),
+    )
+    .unwrap_or_else(|| "phrases".to_string());
+    let entity_map_field = opt(
+        args,
+        "entity-map-field",
+        "PIPESTREAM_SEARCH_ENTITY_MAP_FIELD",
+        file.entity_map_field.as_deref(),
+    )
+    .filter(|value| !value.trim().is_empty());
+    let phrase_ignore_case = opt(
+        args,
+        "phrase-ignore-case",
+        "PIPESTREAM_SEARCH_PHRASE_IGNORE_CASE",
+        file.phrase_ignore_case
+            .map(|value| value.to_string())
+            .as_deref(),
+    )
+    .map(|value| parse_env_bool(&value))
+    .unwrap_or(true);
+    let phrase_ner = if flag_present(args, "phrase-ner") {
+        true
+    } else {
+        opt(
+            args,
+            "phrase-ner",
+            "PIPESTREAM_SEARCH_PHRASE_NER",
+            file.phrase_ner.map(|value| value.to_string()).as_deref(),
+        )
+        .map(|value| parse_env_bool(&value))
+        .unwrap_or(false)
+    };
+    if phrase_glossary.is_some() {
+        if phrase_field == "body" || !bm25_fields.contains(&phrase_field) {
+            return Err(format!(
+                "phrase glossary requires phrase field {phrase_field:?} as a non-body entry in --bm25-fields"
+            ));
+        }
+        if let Some(field) = &entity_map_field {
+            if !map_facet_fields.contains(field) {
+                return Err(format!(
+                    "entity map field {field:?} must be declared in --map-facet-fields"
+                ));
+            }
+        }
+        if phrase_ner && entity_map_field.is_none() {
+            return Err("--phrase-ner requires --entity-map-field".to_string());
+        }
+    } else if entity_map_field.is_some() || phrase_ner {
+        return Err("--entity-map-field and --phrase-ner require --phrase-glossary".to_string());
+    }
+
     Ok(Config {
         role,
         coord_listen,
@@ -1162,6 +1242,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         facet_fields,
         numeric_fields,
         map_facet_fields,
+        phrase_glossary,
+        phrase_field,
+        entity_map_field,
+        phrase_ignore_case,
+        phrase_ner,
         map_numeric_fields,
         integer_fields,
         geo_fields,
@@ -1625,5 +1710,29 @@ slot_offset = 25000000
         ]))
         .is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phrase_configuration_requires_explicit_storage_fields() {
+        let base = [
+            "--role=node",
+            "--demo-vectors=10",
+            "--node-listen=127.0.0.1:9001",
+            "--phrase-glossary=/tmp/concepts.tsv",
+        ];
+        assert!(parse(&args(&base)).unwrap_err().contains("phrase field"));
+
+        let mut configured = base.to_vec();
+        configured.extend([
+            "--bm25-fields=body,phrases",
+            "--map-facet-fields=entities",
+            "--entity-map-field=entities",
+            "--phrase-ner",
+        ]);
+        let cfg = parse(&args(&configured)).unwrap();
+        assert_eq!(cfg.phrase_field, "phrases");
+        assert_eq!(cfg.entity_map_field.as_deref(), Some("entities"));
+        assert!(cfg.phrase_ignore_case);
+        assert!(cfg.phrase_ner);
     }
 }

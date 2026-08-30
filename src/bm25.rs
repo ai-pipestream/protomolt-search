@@ -569,6 +569,75 @@ pub fn top_k_fused_exhaustive_filtered(
     docs
 }
 
+/// Exact phrase-aware fused scorer. Every non-phrase field contributes its
+/// ordinary weighted BM25 sum. The selected phrase field contributes only
+/// the strongest weighted term for a document:
+///
+/// `score(d) = sum(base fields) + max_i(weight_i * BM25(phrase_i, d))`.
+///
+/// The max prevents explicitly registered nested concepts from stacking
+/// overlapping evidence. All matching offsets are retained for highlighting,
+/// including non-winning phrase terms. This is exhaustive until a block-max
+/// upper bound for the max-group algebra is implemented.
+pub fn top_k_phrase_exhaustive_filtered(
+    fields: &[FieldQuery],
+    phrase_field: usize,
+    phrase_term_weights: &[f64],
+    k: usize,
+    filter: FilterCtx,
+) -> Vec<FusedDoc> {
+    assert!(
+        phrase_field < fields.len(),
+        "phrase field index out of range"
+    );
+    assert_eq!(
+        fields[phrase_field].terms.len(),
+        phrase_term_weights.len(),
+        "phrase weights must be parallel to phrase terms"
+    );
+    type Hits = Vec<(usize, usize, Vec<(u32, u32)>)>;
+    let mut scores = std::collections::HashMap::<u32, (f64, f64, Hits)>::new();
+    for (fi, fq) in fields.iter().enumerate() {
+        debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
+        let avgdl = fq.stats.avgdl();
+        for (ti, term) in fq.terms.iter().enumerate() {
+            if fq.stats.dfs[ti] == 0 {
+                continue;
+            }
+            let idf = idf(fq.stats.doc_count, fq.stats.dfs[ti]);
+            fq.index.for_each_posting(term, &mut |doc_id, tf, offsets| {
+                let mut contribution =
+                    fq.weight * idf * tf_norm(fq.params, tf, fq.index.doc_length(doc_id), avgdl);
+                let entry = scores.entry(doc_id).or_default();
+                if fi == phrase_field {
+                    contribution *= phrase_term_weights[ti];
+                    entry.1 = entry.1.max(contribution);
+                } else {
+                    entry.0 += contribution;
+                }
+                entry.2.push((fi, ti, offsets.to_vec()));
+            });
+        }
+    }
+    let mut docs: Vec<FusedDoc> = scores
+        .into_iter()
+        .filter(|&(doc_id, _)| passes(filter, doc_id))
+        .map(|(doc_id, (base, phrase, term_offsets))| FusedDoc {
+            doc_id,
+            score: base + phrase,
+            term_offsets,
+        })
+        .collect();
+    docs.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    docs.truncate(k);
+    docs
+}
+
 /// Skip accounting for [`top_k_pruned_stats`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PruneStats {
@@ -1831,6 +1900,7 @@ mod tests {
                 ],
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             },
         );
         // doc1: body "rust vector vector", no name
@@ -1862,6 +1932,7 @@ mod tests {
                 ],
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             },
         );
 
@@ -1965,6 +2036,7 @@ mod tests {
                 fields,
                 quality: None,
                 geography: None,
+                entities: Vec::new(),
             }
         }
         fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
@@ -2058,5 +2130,74 @@ mod tests {
             assert_eq!(w.score.to_bits(), m.score.to_bits(), "doc {}", w.doc_id);
             assert_eq!(w.term_offsets, m.term_offsets, "doc {}", w.doc_id);
         }
+    }
+
+    #[test]
+    fn phrase_group_uses_strongest_nested_concept_without_stacking() {
+        let mut store = Bm25Store::with_fields(&["body", "phrases"]);
+        store.add_document(
+            0,
+            "New York City".into(),
+            AnalyzedDoc {
+                fields: vec![
+                    AnalyzedField {
+                        terms: vec![
+                            ("new".into(), 1, vec![(0, 3)]),
+                            ("york".into(), 1, vec![(4, 8)]),
+                            ("city".into(), 1, vec![(9, 13)]),
+                        ],
+                        length: 3,
+                    },
+                    AnalyzedField {
+                        terms: vec![
+                            ("$phrase:nyc".into(), 1, vec![(0, 13)]),
+                            ("$phrase:new-york".into(), 1, vec![(0, 8)]),
+                        ],
+                        length: 2,
+                    },
+                ],
+                quality: None,
+                geography: None,
+                entities: Vec::new(),
+            },
+        );
+        let body_terms = vec!["new".to_string(), "york".to_string(), "city".to_string()];
+        let phrase_terms = vec!["$phrase:nyc".to_string(), "$phrase:new-york".to_string()];
+        let queries = [
+            FieldQuery {
+                index: &store.field(0),
+                terms: &body_terms,
+                stats: CorpusStats {
+                    doc_count: 1,
+                    total_doc_length: 3,
+                    dfs: vec![1, 1, 1],
+                },
+                params: Bm25Params::default(),
+                weight: 1.0,
+            },
+            FieldQuery {
+                index: &store.field(1),
+                terms: &phrase_terms,
+                stats: CorpusStats {
+                    doc_count: 1,
+                    total_doc_length: 2,
+                    dfs: vec![1, 1],
+                },
+                params: Bm25Params::default(),
+                weight: 1.0,
+            },
+        ];
+        let max_group = top_k_phrase_exhaustive_filtered(&queries, 1, &[1.0, 1.0], 1, None);
+        let additive = top_k_fused_exhaustive(&queries, 1);
+        assert!(max_group[0].score < additive[0].score);
+        assert_eq!(max_group[0].term_offsets.len(), 5);
+
+        let full_only = top_k_phrase_exhaustive_filtered(&queries, 1, &[3.0, 0.0], 1, None);
+        let prefix_only = top_k_phrase_exhaustive_filtered(&queries, 1, &[0.0, 2.0], 1, None);
+        let weighted = top_k_phrase_exhaustive_filtered(&queries, 1, &[3.0, 2.0], 1, None);
+        assert_eq!(
+            weighted[0].score.to_bits(),
+            full_only[0].score.max(prefix_only[0].score).to_bits()
+        );
     }
 }
