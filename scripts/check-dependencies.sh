@@ -6,13 +6,13 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
-for command in cargo git rg; do
+for command in cargo cargo-audit git rg; do
   command -v "$command" >/dev/null || {
     echo "dependency gate requires $command" >&2
     exit 2
   }
 done
-if ! audit_version=$(cargo audit --version 2>/dev/null); then
+if ! audit_version=$(cargo-audit --version 2>/dev/null); then
   echo "dependency gate requires cargo-audit 0.22.2: cargo install cargo-audit --locked --version 0.22.2" >&2
   exit 2
 fi
