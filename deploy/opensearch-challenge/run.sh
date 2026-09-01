@@ -13,6 +13,7 @@ OPENSEARCH_IMAGE=${OPENSEARCH_IMAGE:-opensearchproject/opensearch:3.8.0@sha256:3
 DOCUMENTS=4096
 DIMENSIONS=64
 TOPICS=16
+K=10
 ITERATIONS=5
 WARMUP=2
 CONCURRENCY=1,8
@@ -35,7 +36,7 @@ elapsed_ms() { awk -v start="$1" -v end="$2" 'BEGIN { printf "%.3f", (end-start)
 
 usage() {
   sed -n '2,4p' "${BASH_SOURCE[0]}" | sed 's/^# {0,1}//'
-  echo "usage: run.sh [--documents=N] [--iterations=N] [--warmup=N] [--concurrency=1,8] [--cpuset=0-7] [--out=DIR] [--keep]"
+  echo "usage: run.sh [--documents=N] [--dimensions=N] [--topics=N] [--k=N] [--iterations=N] [--warmup=N] [--concurrency=1,8] [--cpuset=0-7] [--out=DIR] [--keep]"
   exit "${1:-0}"
 }
 
@@ -44,6 +45,7 @@ for arg in "$@"; do
     --documents=*) DOCUMENTS=${arg#*=} ;;
     --dimensions=*) DIMENSIONS=${arg#*=} ;;
     --topics=*) TOPICS=${arg#*=} ;;
+    --k=*) K=${arg#*=} ;;
     --iterations=*) ITERATIONS=${arg#*=} ;;
     --warmup=*) WARMUP=${arg#*=} ;;
     --concurrency=*) CONCURRENCY=${arg#*=} ;;
@@ -61,6 +63,8 @@ done
 [[ $DOCUMENTS =~ ^[1-9][0-9]*$ ]] || die "--documents must be positive"
 [[ $DIMENSIONS =~ ^[1-9][0-9]*$ ]] || die "--dimensions must be positive"
 [[ $TOPICS =~ ^[1-9][0-9]*$ ]] || die "--topics must be positive"
+[[ $K =~ ^[1-9][0-9]*$ ]] || die "--k must be positive"
+((K <= 10000)) || die "--k must not exceed the shared 10000-result limit"
 [[ $ITERATIONS =~ ^[1-9][0-9]*$ ]] || die "--iterations must be positive"
 [[ $WARMUP =~ ^[0-9]+$ ]] || die "--warmup must be nonnegative"
 [[ $CONCURRENCY =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] ||
@@ -173,7 +177,7 @@ say "building release engine and challenge driver"
 mkdir -p "$WORK/data" "$WORK/protomolt" "$WORK/opensearch"
 chmod 0777 "$WORK/opensearch"
 "$DRIVER" generate --out="$WORK/data" --documents="$DOCUMENTS" \
-  --dimensions="$DIMENSIONS" --topics="$TOPICS" >"$WORK/generate.json"
+  --dimensions="$DIMENSIONS" --topics="$TOPICS" --k="$K" >"$WORK/generate.json"
 
 say "starting deterministic analysis service"
 "$DRIVER" serve-mock >"$WORK/mock.log" 2>&1 &

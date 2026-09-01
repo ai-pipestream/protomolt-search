@@ -26,6 +26,15 @@ retained official documentation under
   --iterations=1 --warmup=1 --concurrency=1,2
 ```
 
+`--k` controls both returned depth and judgment depth and is capped at the
+shared 10,000-result limit. For example, the high-depth vector-quality run is:
+
+```bash
+./deploy/opensearch-challenge/run.sh \
+  --documents=100000 --k=10000 --iterations=1 --warmup=0 \
+  --concurrency=1 --cpuset=0-7 --out=/path/to/results
+```
+
 Without `--out`, the runner uses a validated `mktemp` directory and removes
 it on success. `--keep` retains that temporary directory. It refuses occupied
 ports and a nonempty output directory. The container name is process-unique,
