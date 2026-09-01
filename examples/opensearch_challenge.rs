@@ -1062,7 +1062,7 @@ fn ndcg(sample: &Sample, judgments: &[Judgment]) -> f64 {
         .enumerate()
         .map(|(rank, id)| {
             let gain = f64::from(*gain.get(id).unwrap_or(&0));
-            (2f64.powf(gain) - 1.0) / ((rank + 2) as f64).log2()
+            gain / ((rank + 2) as f64).log2()
         })
         .sum::<f64>();
     let mut ideal: Vec<u32> = judgments.iter().map(|judgment| judgment.gain).collect();
@@ -1071,7 +1071,7 @@ fn ndcg(sample: &Sample, judgments: &[Judgment]) -> f64 {
         .into_iter()
         .take(sample.hit_ids.len())
         .enumerate()
-        .map(|(rank, gain)| (2f64.powf(f64::from(gain)) - 1.0) / ((rank + 2) as f64).log2())
+        .map(|(rank, gain)| f64::from(gain) / ((rank + 2) as f64).log2())
         .sum::<f64>();
     if idcg == 0.0 {
         0.0
@@ -1176,7 +1176,8 @@ fn report() -> Result<(), Error> {
         .map(|path| -> Result<Value, Error> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
         .transpose()?;
     let output = json!({
-        "format": "protomolt-opensearch-challenge-report-v1",
+        "format": "protomolt-opensearch-challenge-report-v2",
+        "ndcg_gain": "linear",
         "workload_sha256": file_digest(&workload_path)?,
         "cells": report_cells,
         "throughput_cells": cells,
@@ -1187,6 +1188,53 @@ fn report() -> Result<(), Error> {
     }
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(hit_ids: Vec<u64>) -> Sample {
+        Sample {
+            record_type: "sample".into(),
+            engine: "test".into(),
+            query_id: "q".into(),
+            workload: "vector".into(),
+            iteration: 0,
+            concurrency: 1,
+            ok: true,
+            completed: true,
+            ttfh_ms: 0.0,
+            latency_ms: 0.0,
+            hit_ids,
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn ndcg_is_finite_at_the_maximum_challenge_depth() {
+        let judgments: Vec<Judgment> = (0..10_000)
+            .map(|rank| Judgment {
+                doc_id: rank as u64,
+                gain: 10_000 - rank,
+            })
+            .collect();
+        let score = ndcg(&sample((0..10_000).collect()), &judgments);
+        assert!(score.is_finite());
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn ndcg_penalizes_a_reversed_ranking() {
+        let judgments = vec![
+            Judgment { doc_id: 1, gain: 3 },
+            Judgment { doc_id: 2, gain: 2 },
+            Judgment { doc_id: 3, gain: 1 },
+        ];
+        let score = ndcg(&sample(vec![3, 2, 1]), &judgments);
+        assert!(score.is_finite());
+        assert!(score < 1.0);
+    }
 }
 
 fn usage() -> &'static str {

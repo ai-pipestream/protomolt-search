@@ -89,6 +89,10 @@ record. `report.json` groups by engine, workload, and concurrency:
 - mean recall@k and NDCG@k against shared judgments;
 - successful terminal completion counts.
 
+NDCG uses linear graded gain divided by the usual logarithmic rank discount.
+Linear gain keeps exact-vector ordinal judgments finite at the supported
+10,000-result depth; the report records `ndcg_gain = "linear"` and format v2.
+
 For Protomolt QueryStream, first hit is the first nonempty provisional
 replacement revision. If a route has no provisional collector, it is the final
 revision. Parent collapse currently uses its unary exact route, so its first-hit
