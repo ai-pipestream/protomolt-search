@@ -137,6 +137,37 @@ This is the honest form of the existing rescore-window behavior. A caller that
 needs more recall under a strong boost increases `selection_k`; the server does
 not silently over-fetch by an undocumented factor.
 
+## Dense execution modes
+
+`DenseQuery.execution_mode` separates the traversal contract from scoring:
+
+- `UNSPECIFIED` preserves the historical exact behavior. It resolves to
+  `EXACT`, and fails if the live generation cannot prove exhaustive native
+  scoring and completion.
+- `EXACT` makes that requirement explicit.
+- `ANN` accepts a provider's configured approximate traversal. It fails on the
+  current embedded TurboVec provider because that provider exposes exhaustive
+  traversal, not a configured ANN path.
+- `AUTO` asks the coordinator to choose. It is deliberately conservative in
+  the first implementation: the current exhaustive provider resolves to
+  `EXACT`; a configured ANN provider is refused until a generation-bound,
+  benchmark-qualified adaptive policy exists. That policy must account for
+  requested k, filter selectivity, candidate depth, and provider controls such
+  as IVF `nprobe` instead of hiding one fixed approximation setting.
+
+Every successful selection containing a dense leaf returns
+`QueryResponse.dense_execution`. It records the requested and resolved modes,
+provider kind, provider quality contract, scoring fingerprint, exhaustive
+completion status, and planner reason. Mixed provider kinds, scoring spaces,
+dimensions, quality contracts, or completion capabilities across shards fail
+preflight. An approximate response therefore cannot be confused with a
+corpus-wide exact result.
+
+Execution mode and score mode are orthogonal. `execution_mode` chooses the
+candidate traversal; `score_mode = FP32_RERANK` replaces scores only inside the
+returned candidate pool. FP32 reranking never upgrades an ANN pool to a global
+exact-top-k guarantee.
+
 ## Dense FP32 rerank
 
 A single dense leaf can set `DenseQuery.score_mode` to
@@ -309,6 +340,8 @@ message SearchQuery {
 message DenseQuery {
   repeated float vector = 1;
   DenseScoreMode score_mode = 2;
+  DenseQualityPolicy quality = 3;
+  DenseExecutionMode execution_mode = 4;
 }
 
 message FilterQuery {

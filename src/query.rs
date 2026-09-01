@@ -24,9 +24,10 @@ use crate::coordinator::CoordinatorServiceImpl;
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
     search_query, selection_query, selection_score_strategy, BlendScore, Bm25SearchRequest,
-    BoostRescore, DecomposedScore, DenseQuery, DenseScoreMode, FilterQuery, FusionMode, GeoFilter,
-    HybridLegOptions, HybridSearchRequest, LexicalQuery, QueryHit, QueryRequest, QueryResponse,
-    QuerySignal, RrfScore, SearchQuery, SearchRequest, SelectionOperator, SelectionQuery,
+    BoostRescore, DecomposedScore, DenseExecutionMode, DenseQuery, DenseScoreMode, FilterQuery,
+    FusionMode, GeoFilter, HybridLegOptions, HybridSearchRequest, LexicalQuery, QueryHit,
+    QueryRequest, QueryResponse, QuerySignal, RrfScore, SearchQuery, SearchRequest,
+    SelectionOperator, SelectionQuery,
 };
 
 fn refuse(msg: impl Into<String>) -> Status {
@@ -201,6 +202,17 @@ pub async fn execute(
         .as_ref()
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
     let plan = parse_selection(selection)?;
+    let dense_execution = match &plan.shape {
+        Shape::Dense { query, .. } | Shape::Composite { dense: query, .. } => {
+            let requested = dense_execution_mode(query)?;
+            Some(
+                coordinator
+                    .resolve_dense_execution(requested, query.vector.len())
+                    .await?,
+            )
+        }
+        _ => None,
+    };
     let fp32_rerank = match &plan.shape {
         Shape::Dense { query, .. } => {
             let mode = dense_score_mode(query)?;
@@ -598,6 +610,7 @@ pub async fn execute(
                     provider_backend: resolution.provider_backend,
                     scoring_fingerprint: resolution.scoring_fingerprint,
                 });
+            response.dense_execution = dense_execution;
             Ok(response)
         }
         Shape::Composite {
@@ -733,13 +746,15 @@ pub async fn execute(
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
-            Ok(done(
+            let mut response = done(
                 response.request_id,
                 hits,
                 &executed,
                 next,
                 finish_prof(prof, t_total),
-            ))
+            );
+            response.dense_execution = dense_execution;
+            Ok(response)
         }
     }
 }
@@ -870,6 +885,7 @@ fn done(
         next_cursor,
         profile,
         dense_quality: None,
+        dense_execution: None,
     }
 }
 
@@ -987,6 +1003,15 @@ fn leaf_shape(leaf: &SearchQuery) -> Result<Shape<'_>, Status> {
 fn dense_score_mode(query: &DenseQuery) -> Result<DenseScoreMode, Status> {
     DenseScoreMode::try_from(query.score_mode)
         .map_err(|_| refuse(format!("unknown dense score_mode {}", query.score_mode)))
+}
+
+fn dense_execution_mode(query: &DenseQuery) -> Result<DenseExecutionMode, Status> {
+    DenseExecutionMode::try_from(query.execution_mode).map_err(|_| {
+        refuse(format!(
+            "unknown dense execution_mode {}",
+            query.execution_mode
+        ))
+    })
 }
 
 /// The two-leaf strategy composite: exactly one dense and one lexical

@@ -156,7 +156,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
                     query: Some(search_query::Query::Dense(DenseQuery {
                         vector: corpus[..DIM].to_vec(),
                         score_mode: DenseScoreMode::Fp32Rerank as i32,
-                        quality: None,
+                        ..Default::default()
                     })),
                 })),
             }),

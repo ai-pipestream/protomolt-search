@@ -1577,6 +1577,245 @@ impl CoordinatorServiceImpl {
         self
     }
 
+    /// Prove the dense traversal contract against every live shard before the
+    /// public query route runs. Provider identity is generation-wide: mixed
+    /// quality contracts, score spaces, or dimensions are refused rather than
+    /// hidden behind one coordinator response.
+    pub(crate) async fn resolve_dense_execution(
+        &self,
+        requested: crate::pb::DenseExecutionMode,
+        query_dim: usize,
+    ) -> Result<crate::pb::DenseExecutionOutcome, Status> {
+        let (provider, scoring_fingerprint, quality, exhaustive, dimensions) = if let Some(
+            clustered,
+        ) =
+            &self.clustered_vectors
+        {
+            let identity = clustered.quality_identity().await?;
+            (
+                "clustered-turbovec".to_string(),
+                identity.scoring_fingerprint,
+                crate::pb::VectorQualityContract::ExhaustiveNativeScore,
+                true,
+                identity.dimensions,
+            )
+        } else {
+            let mut tasks = Vec::with_capacity(self.node_addrs.len());
+            for addr in &self.node_addrs {
+                let mut client = self.node_client(addr)?;
+                tasks.push(tokio::spawn(async move {
+                    client
+                        .get_vector_backend(crate::pb::GetVectorBackendRequest {})
+                        .await
+                        .map(tonic::Response::into_inner)
+                }));
+            }
+
+            let mut provider = None;
+            let mut fingerprint = None;
+            let mut quality = None;
+            let mut exhaustive = None;
+            let mut dimensions = None;
+            for task in tasks {
+                let backend = task.await.map_err(|error| {
+                    Status::internal(format!("dense execution preflight failed: {error}"))
+                })??;
+                let descriptor = backend.descriptor.ok_or_else(|| {
+                    Status::failed_precondition(
+                        "dense execution preflight found an unconfigured vector shard",
+                    )
+                })?;
+                if descriptor.backend_kind.is_empty() {
+                    return Err(Status::failed_precondition(
+                        "dense execution preflight found an unnamed vector provider",
+                    ));
+                }
+                if descriptor.scoring_fingerprint.is_empty() {
+                    return Err(Status::failed_precondition(
+                        "dense execution preflight found an empty scoring fingerprint",
+                    ));
+                }
+                let shard_quality =
+                    crate::pb::VectorQualityContract::try_from(descriptor.quality_contract)
+                        .map_err(|_| {
+                            Status::failed_precondition(format!(
+                                "vector provider {} advertises unknown quality contract {}",
+                                descriptor.backend_kind, descriptor.quality_contract
+                            ))
+                        })?;
+                if shard_quality == crate::pb::VectorQualityContract::Unspecified {
+                    return Err(Status::failed_precondition(format!(
+                        "vector provider {} does not declare a quality contract",
+                        descriptor.backend_kind
+                    )));
+                }
+                let direction = crate::pb::VectorScoreDirection::try_from(
+                    descriptor.score_direction,
+                )
+                .map_err(|_| {
+                    Status::failed_precondition(format!(
+                        "vector provider {} advertises unknown score direction {}",
+                        descriptor.backend_kind, descriptor.score_direction
+                    ))
+                })?;
+                if direction != crate::pb::VectorScoreDirection::HigherIsBetter {
+                    return Err(Status::failed_precondition(format!(
+                            "vector provider {} is not compatible with the coordinator's higher-is-better heap",
+                            descriptor.backend_kind
+                        )));
+                }
+                if !descriptor
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "batch_query")
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "vector provider {} does not advertise batch_query",
+                        descriptor.backend_kind
+                    )));
+                }
+                let shard_exhaustive = shard_quality
+                    == crate::pb::VectorQualityContract::ExhaustiveNativeScore
+                    && descriptor
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "exhaustive_completion");
+
+                for (held, actual, mismatch) in [
+                    (
+                        &mut provider,
+                        descriptor.backend_kind,
+                        "mixed vector providers",
+                    ),
+                    (
+                        &mut fingerprint,
+                        descriptor.scoring_fingerprint,
+                        "mixed scoring fingerprints",
+                    ),
+                ] {
+                    match held {
+                        Some(value) if value != &actual => {
+                            return Err(Status::failed_precondition(format!(
+                                "dense execution preflight found {mismatch}"
+                            )))
+                        }
+                        None => *held = Some(actual),
+                        _ => {}
+                    }
+                }
+                match quality {
+                    Some(value) if value != shard_quality => {
+                        return Err(Status::failed_precondition(
+                            "dense execution preflight found mixed quality contracts",
+                        ))
+                    }
+                    None => quality = Some(shard_quality),
+                    _ => {}
+                }
+                match exhaustive {
+                    Some(value) if value != shard_exhaustive => {
+                        return Err(Status::failed_precondition(
+                            "dense execution preflight found mixed completion capabilities",
+                        ))
+                    }
+                    None => exhaustive = Some(shard_exhaustive),
+                    _ => {}
+                }
+                match dimensions {
+                    Some(value) if value != descriptor.dim => {
+                        return Err(Status::failed_precondition(
+                            "dense execution preflight found mixed vector dimensions",
+                        ))
+                    }
+                    None => dimensions = Some(descriptor.dim),
+                    _ => {}
+                }
+            }
+            (
+                provider.unwrap_or_default(),
+                fingerprint.unwrap_or_default(),
+                quality.unwrap_or(crate::pb::VectorQualityContract::Unspecified),
+                exhaustive.unwrap_or(false),
+                dimensions.unwrap_or_default(),
+            )
+        };
+
+        if dimensions as usize != query_dim {
+            return Err(Status::failed_precondition(format!(
+                "dense query dimension {query_dim} does not match live provider dimension {dimensions}"
+            )));
+        }
+
+        let exact_available =
+            quality == crate::pb::VectorQualityContract::ExhaustiveNativeScore && exhaustive;
+        let (resolved, planner_reason) = match requested {
+            crate::pb::DenseExecutionMode::Unspecified => {
+                if !exact_available {
+                    return Err(Status::failed_precondition(format!(
+                        "unspecified dense execution preserves the exact contract, but provider {provider} advertises {quality:?} without exhaustive completion; request ANN explicitly or install an exact backend"
+                    )));
+                }
+                (
+                    crate::pb::DenseExecutionMode::Exact,
+                    "legacy unspecified mode preserves exact traversal".to_string(),
+                )
+            }
+            crate::pb::DenseExecutionMode::Exact => {
+                if !exact_available {
+                    return Err(Status::failed_precondition(format!(
+                        "EXACT dense execution requires exhaustive native scoring and completion, but provider {provider} advertises {quality:?}"
+                    )));
+                }
+                (
+                    crate::pb::DenseExecutionMode::Exact,
+                    "caller required exact traversal".to_string(),
+                )
+            }
+            crate::pb::DenseExecutionMode::Ann => {
+                if exact_available {
+                    return Err(Status::failed_precondition(format!(
+                        "ANN dense execution was requested, but provider {provider} exposes only exhaustive traversal"
+                    )));
+                }
+                if !matches!(
+                    quality,
+                    crate::pb::VectorQualityContract::ConfiguredAnn
+                        | crate::pb::VectorQualityContract::ProbabilisticBound
+                ) {
+                    return Err(Status::failed_precondition(format!(
+                        "provider {provider} does not expose a configured ANN traversal"
+                    )));
+                }
+                (
+                    crate::pb::DenseExecutionMode::Ann,
+                    "caller accepted the provider's configured approximate traversal".to_string(),
+                )
+            }
+            crate::pb::DenseExecutionMode::Auto => {
+                if !exact_available {
+                    return Err(Status::failed_precondition(format!(
+                        "AUTO has no qualified adaptive policy for provider {provider} ({quality:?}); use ANN explicitly to accept its configured traversal"
+                    )));
+                }
+                (
+                    crate::pb::DenseExecutionMode::Exact,
+                    "AUTO selected exact because the live provider proves exhaustive completion"
+                        .to_string(),
+                )
+            }
+        };
+
+        Ok(crate::pb::DenseExecutionOutcome {
+            requested_mode: requested as i32,
+            resolved_mode: resolved as i32,
+            provider_backend: provider,
+            quality_contract: quality as i32,
+            scoring_fingerprint,
+            exhaustive_completion: resolved == crate::pb::DenseExecutionMode::Exact,
+            planner_reason,
+        })
+    }
+
     /// Resolve and prove one measured dense quality request against the live
     /// provider and product exact-row generation. Drift is a hard failure.
     pub(crate) async fn resolve_dense_quality(

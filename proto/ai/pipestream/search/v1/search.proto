@@ -3487,6 +3487,27 @@ enum DenseScoreMode {
   DENSE_SCORE_MODE_FP32_RERANK = 2;
 }
 
+// How the dense candidate set is selected. This is independent of
+// DenseScoreMode: FP32_RERANK may replace scores inside either an exhaustive
+// or approximate candidate pool, but it does not turn an approximate pool
+// into a corpus-wide exact result.
+enum DenseExecutionMode {
+  // Backward-compatible exact traversal. Callers that want the planner must
+  // opt into AUTO explicitly so a future backend change cannot silently
+  // weaken an existing request's quality contract.
+  DENSE_EXECUTION_MODE_UNSPECIFIED = 0;
+  // Require an exhaustive provider-native traversal and completion
+  // certificate. The request is refused if the live provider cannot prove it.
+  DENSE_EXECUTION_MODE_EXACT = 1;
+  // Accept the live provider's configured approximate traversal. The response
+  // reports the provider quality contract; it never claims corpus-wide top-k.
+  DENSE_EXECUTION_MODE_ANN = 2;
+  // Let the coordinator choose. AUTO is conservative: it uses exact traversal
+  // today and will admit ANN only after a generation-bound adaptive policy is
+  // installed and qualified for the live provider.
+  DENSE_EXECUTION_MODE_AUTO = 3;
+}
+
 message DenseQuery {
   // The query vector; length must equal the shard dimension.
   repeated float vector = 1;
@@ -3497,6 +3518,9 @@ message DenseQuery {
   // generation-bound quality profile instead of accepting two competing
   // depth authorities.
   DenseQualityPolicy quality = 3;
+  // Candidate traversal contract. Unspecified preserves the historical exact
+  // behavior; AUTO must be requested explicitly.
+  DenseExecutionMode execution_mode = 4;
 }
 
 // A request for a measured candidate depth. Recall is expressed in parts per
@@ -3768,6 +3792,10 @@ message QueryResponse {
   // timing profile data this provenance is always returned: callers can see
   // which measured contract chose the candidate depth.
   DenseQualityOutcome dense_quality = 6;
+  // Present for every selection containing a dense leaf. This is semantic
+  // provenance, not optional timing data: it states what traversal actually
+  // ran and which live provider contract justified that choice.
+  DenseExecutionOutcome dense_execution = 7;
 }
 
 message DenseQualityOutcome {
@@ -3780,6 +3808,22 @@ message DenseQualityOutcome {
   uint64 corpus_rows = 7;
   string provider_backend = 8;
   string scoring_fingerprint = 9;
+}
+
+message DenseExecutionOutcome {
+  // The wire value supplied by the caller. UNSPECIFIED is retained here even
+  // though it resolves to EXACT for backward compatibility.
+  DenseExecutionMode requested_mode = 1;
+  // The traversal that actually ran. Never UNSPECIFIED on success.
+  DenseExecutionMode resolved_mode = 2;
+  string provider_backend = 3;
+  VectorQualityContract quality_contract = 4;
+  string scoring_fingerprint = 5;
+  // True only when every shard/provider advertised and completed an
+  // exhaustive traversal contract. False is not an error for explicit ANN.
+  bool exhaustive_completion = 6;
+  // Stable, human-readable planner explanation for logs and experiments.
+  string planner_reason = 7;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the

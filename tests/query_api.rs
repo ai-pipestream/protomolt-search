@@ -13,12 +13,12 @@ use pipestream_search::pb::{
     query_stream_response, search_query, selection_query, selection_score_strategy,
     AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest, BoostQuery, BoostRescore,
     CascadeScore, CompositeScorer, CompositeSearchStrategy, DecomposedScore,
-    DeleteDocumentsRequest, DenseQualityPolicy, DenseQuery, DenseScoreMode, FilterQuery,
-    FlushRequest, FusionMode, HealthRequest, HybridLegOptions, HybridSearchRequest, IntegerValue,
-    LexicalQuery, QueryRequest, QueryResponse, QuerySort, QueryStreamCompletion, QueryStreamPhase,
-    QueryStreamRequest, QueryStreamResponse, QueryStreamRevision, RrfScore, SearchQuery,
-    SearchRequest, SelectionOperator, SelectionQuery, SelectionScoreStrategy,
-    SetCalibrationRequest,
+    DeleteDocumentsRequest, DenseExecutionMode, DenseQualityPolicy, DenseQuery, DenseScoreMode,
+    FilterQuery, FlushRequest, FusionMode, HealthRequest, HybridLegOptions, HybridSearchRequest,
+    IntegerValue, LexicalQuery, QueryRequest, QueryResponse, QuerySort, QueryStreamCompletion,
+    QueryStreamPhase, QueryStreamRequest, QueryStreamResponse, QueryStreamRevision, RrfScore,
+    SearchQuery, SearchRequest, SelectionOperator, SelectionQuery, SelectionScoreStrategy,
+    SetCalibrationRequest, VectorQualityContract,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -144,7 +144,7 @@ fn fp32_dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
                 score_mode: DenseScoreMode::Fp32Rerank as i32,
-                quality: None,
+                ..Default::default()
             })),
         })),
     }
@@ -294,6 +294,93 @@ async fn single_leaves_execute_their_ordinary_routes() {
         .collect();
     assert_eq!(got, want);
     assert_eq!(public.hits[0].doc_id, 0, "the query IS doc 0's vector");
+    let execution = public
+        .dense_execution
+        .expect("every dense result reports its execution contract");
+    assert_eq!(
+        DenseExecutionMode::try_from(execution.requested_mode).unwrap(),
+        DenseExecutionMode::Unspecified
+    );
+    assert_eq!(
+        DenseExecutionMode::try_from(execution.resolved_mode).unwrap(),
+        DenseExecutionMode::Exact
+    );
+    assert_eq!(execution.provider_backend, "embedded-turbovec");
+    assert_eq!(
+        VectorQualityContract::try_from(execution.quality_contract).unwrap(),
+        VectorQualityContract::ExhaustiveNativeScore
+    );
+    assert!(execution.exhaustive_completion);
+    assert!(!execution.scoring_fingerprint.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dense_execution_modes_are_explicit_and_fail_closed() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+
+    let run = |mode: DenseExecutionMode| QueryRequest {
+        k: 5,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "vec".into(),
+                query: Some(search_query::Query::Dense(DenseQuery {
+                    vector: qvec.clone(),
+                    execution_mode: mode as i32,
+                    ..Default::default()
+                })),
+            })),
+        }),
+        ..Default::default()
+    };
+
+    let exact = query(&coordinator, run(DenseExecutionMode::Exact))
+        .await
+        .unwrap();
+    let auto = query(&coordinator, run(DenseExecutionMode::Auto))
+        .await
+        .unwrap();
+    assert_eq!(
+        exact
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        auto.hits
+            .iter()
+            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+    for (response, requested) in [
+        (exact, DenseExecutionMode::Exact),
+        (auto, DenseExecutionMode::Auto),
+    ] {
+        let outcome = response.dense_execution.unwrap();
+        assert_eq!(outcome.requested_mode, requested as i32);
+        assert_eq!(outcome.resolved_mode, DenseExecutionMode::Exact as i32);
+        assert!(outcome.exhaustive_completion);
+        assert!(!outcome.planner_reason.is_empty());
+    }
+
+    let ann = query(&coordinator, run(DenseExecutionMode::Ann))
+        .await
+        .unwrap_err();
+    assert_eq!(ann.code(), tonic::Code::FailedPrecondition);
+    assert!(ann.message().contains("ANN"), "{}", ann.message());
+    assert!(ann.message().contains("exhaustive"), "{}", ann.message());
+
+    let mut unknown = run(DenseExecutionMode::Exact);
+    let Some(selection_query::Node::Search(leaf)) =
+        unknown.selection.as_mut().unwrap().node.as_mut()
+    else {
+        unreachable!()
+    };
+    let Some(search_query::Query::Dense(dense)) = leaf.query.as_mut() else {
+        unreachable!()
+    };
+    dense.execution_mode = i32::MAX;
+    let unknown = query(&coordinator, unknown).await.unwrap_err();
+    assert_eq!(unknown.code(), tonic::Code::InvalidArgument);
+    assert!(unknown.message().contains("execution_mode"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -417,6 +504,7 @@ candidates = {ROWS}
                         max_candidates: ROWS as u32,
                         required_profile_fingerprint: String::new(),
                     }),
+                    ..Default::default()
                 })),
             })),
         }),

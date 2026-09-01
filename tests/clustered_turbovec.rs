@@ -459,7 +459,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: public_query.clone(),
                     score_mode: DenseScoreMode::Fp32Rerank as i32,
-                    quality: None,
+                    ..Default::default()
                 })),
             })),
         }),
@@ -531,6 +531,7 @@ candidates = {ROWS}
                             max_candidates: ROWS as u32,
                             required_profile_fingerprint: String::new(),
                         }),
+                        ..Default::default()
                     })),
                 })),
             }),
