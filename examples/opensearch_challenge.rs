@@ -689,6 +689,7 @@ fn composite(
 }
 
 fn protomolt_query(workload: &Workload, request_id: String) -> QueryRequest {
+    let fusion_depth = workload.k.max(100);
     let base = match workload.kind {
         WorkloadKind::Lexical | WorkloadKind::FilteredLexical => search_leaf(workload, false),
         WorkloadKind::Vector | WorkloadKind::FilteredVector => search_leaf(workload, true),
@@ -705,6 +706,11 @@ fn protomolt_query(workload: &Workload, request_id: String) -> QueryRequest {
     QueryRequest {
         request_id,
         k: workload.k,
+        selection_k: if matches!(workload.kind, WorkloadKind::Hybrid) {
+            fusion_depth
+        } else {
+            0
+        },
         selection: Some(selection),
         ..Default::default()
     }
@@ -816,9 +822,15 @@ fn os_filter(workload: &Workload) -> Option<Value> {
 }
 
 fn os_query(workload: &Workload) -> (String, Value) {
+    let fusion_depth = workload.k.max(100);
     let lexical = || json!({"match": {"text": {"query": workload.text}}});
     let vector = || {
-        let mut body = json!({"vector": workload.vector, "k": workload.k});
+        let depth = if matches!(workload.kind, WorkloadKind::Hybrid) {
+            fusion_depth
+        } else {
+            workload.k
+        };
+        let mut body = json!({"vector": workload.vector, "k": depth});
         if let Some(filter) = os_filter(workload) {
             body["filter"] = filter;
         }
@@ -833,7 +845,7 @@ fn os_query(workload: &Workload) -> (String, Value) {
             vector()
         }
         WorkloadKind::Hybrid => json!({"hybrid": {
-            "pagination_depth": workload.k.max(100),
+            "pagination_depth": fusion_depth,
             "queries": [lexical(), vector()]
         }}),
     };

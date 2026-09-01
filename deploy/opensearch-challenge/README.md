@@ -53,7 +53,8 @@ digest are recorded.
   collapse judgments come from exact FP32 inner-product rankings generated
   before either index is built.
 - Hybrid relevance gives topic matches gain 2 and exact-vector top-k matches an
-  additional gain 1. The engines both use unweighted RRF with rank constant 60.
+  additional gain 1. The engines both use unweighted RRF with rank constant 60
+  and an explicit per-leg fusion depth of `max(k, 100)`.
 - OpenSearch setup and Protomolt calibration happen outside corpus file reading.
   Timed ingest includes Protomolt calibration fitting, all data-plane writes,
   and flush/refresh. Index/pipeline schema creation is configuration, not ingest.
