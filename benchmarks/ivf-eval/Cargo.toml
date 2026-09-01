@@ -1,0 +1,17 @@
+[package]
+name = "protomolt-ivf-eval"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep Ryan's experimental branch and its transitive lock graph out of the
+# shipping workspace until the recorded benchmark gate passes.
+[workspace]
+
+[dependencies]
+pipestream-search = { path = "../.." }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+turbovec-ivf = { package = "turbovec", git = "https://github.com/RyanCodrai/turbovec.git", rev = "1452b6e8f1eee9d071c22bd8f850cd9ada2acf7a" }
+

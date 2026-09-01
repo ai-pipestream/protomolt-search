@@ -1,0 +1,95 @@
+# Residual-IVF provider screening, 2026-09-01
+
+> **AI-GENERATED EXPERIMENT REPORT. VERIFY BEFORE RELYING ON IT.** This is a
+> bounded engineering screen of an unmerged upstream branch, not a publication
+> result, production recommendation, or claim about IVF generally.
+
+## Outcome
+
+Ryan Codrai's residual-IVF branch did **not** pass the gate for production
+lifecycle work in ProtoMolt Search. Keep it isolated from the production
+TurboVec pin. The current useful work is the provider adapter, reproducible
+matrix, and truthful `EXACT`/`ANN`/`AUTO` contract, not persistence or mobile
+support for this IVF implementation.
+
+The experiment is pure Rust. `protomolt-ivf-eval` links the upstream Rust
+`turbovec` crate at `1452b6e8f1eee9d071c22bd8f850cd9ada2acf7a`; it does not
+build or invoke `turbovec-python` or PyO3. The matrix runner now records the
+resolved Cargo dependency tree and rejects either Python binding by name.
+
+## Reproducibility boundary
+
+- Product checkout: `85f9179f153f0909cea37fca32dcc1390fc7ceeb`, with the
+  experimental benchmark files still uncommitted and recorded as such in the
+  artifact's `git-status.txt`.
+- Input: `/work/court-corpus/embeddings-full.bin`.
+- Shape: 256 dimensions, 16 corpus-distributed query rows held after each
+  indexed prefix, k = 10, 100, and 10,000.
+- Matrix: 100K, 500K, 1M, and 2M rows; IVF `nlist=floor(sqrt(rows))`;
+  `nprobe=8,16,32,64,128,256,all`; two warmups and five measured iterations.
+- Runtime: eight Rayon threads pinned to CPUs 16-23.
+- Artifact: `/work/court-corpus/bench/ivf-eval/2026-09-01-85f9179-court-matrix-r3`.
+  Its `SHA256SUMS` verifies.
+
+The 100K, 500K, and 1M cells completed before a separate Gradle wave began.
+That wave contaminated the 2M timing and build-time measurements, so the 2M
+latency numbers are not evidence. Recall and completeness are deterministic
+and remain useful. A subsequent runner change samples external CPU throughout
+each cell and automatically invalidates performance comparisons under host
+pressure; a deliberately strict smoke test proved that guard trips and is
+covered by the artifact checksum.
+
+These queries are real embedding rows, but they are not held-out user search
+judgments. Results characterize this corpus slice and build only.
+
+## One-million-row result
+
+The uncontaminated 1M cell failed every gate:
+
+| k | Flat mean / worst FP32 recall | IVF all-list mean / worst recall | Result |
+|---:|---:|---:|---|
+| 10 | 0.88125 / 0.80 | 0.86250 / 0.70 | IVF ceiling below flat |
+| 100 | 0.884375 / 0.83 | 0.868125 / 0.79 | IVF ceiling below flat |
+| 10,000 | 0.9344625 / 0.9206 | 0.93305 / 0.9198 | Close, still below flat |
+
+Lower `nprobe` values sometimes reduced latency substantially, but none met
+both the flat provider's mean and worst-query recall while also improving QPS
+and p95. At k=10,000, for example, `nprobe=256` reached mean/worst recall
+0.93123125/0.9159 at 31.54 batch QPS and 31.45 ms p95, versus the flat
+provider's 0.9344625/0.9206 at 9.89 QPS and 150.84 ms p95. The speedup is real
+for this cell, but it does not satisfy the requested quality floor.
+
+The construction and retained-memory costs independently fail the gate:
+
+| Provider | Build time | Retained RSS increment |
+|---|---:|---:|
+| Embedded TurboVec | 440 ms | 136.7 MB |
+| Experimental residual IVF | 22.61 s | 576.1 MB |
+| IVF / flat | 51.39x | 4.22x |
+
+The clean 500K cell also failed before any host contamination: 35.27x the
+flat build time and 2.19x the retained-memory increment. This is enough to
+reject lifecycle investment even without using the contaminated 2M timings.
+
+## Filter behavior
+
+The product's flat provider executed a deterministic 10% dense mask before
+scoring. The experimental IVF adapter refused the same query because the
+upstream branch does not expose dense-mask traversal. Post-filtering an ANN
+top-k would not certify the top-k of the allowed population, so the adapter
+does not fake support.
+
+## Decision
+
+Do not add this IVF branch to production pins, snapshots, WAL, resharding, or
+mobile builds. Retain the standalone adapter and negative result. Reopen the
+gate only after an upstream change addresses all three observed blockers:
+
+1. construction and memory overhead;
+2. a quality ceiling at least equal to the flat provider at every required k;
+3. filter-aware traversal or another honest way to search an allowlist.
+
+The public query API can still land now. On the current provider,
+`UNSPECIFIED` and `EXACT` require exhaustive completion, `AUTO` resolves to
+`EXACT`, and `ANN` fails closed. A future ANN backend must disclose its quality
+contract and qualify an adaptive policy before `AUTO` may select it.
