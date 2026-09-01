@@ -1,7 +1,7 @@
 //! Coordinator side: client-facing [`SearchService`] that fans queries out
 //! to shard nodes, aggregates their floors mid-scan, and merges results.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -1387,6 +1387,19 @@ pub struct BrowseRows {
     pub keys: Vec<f64>,
     /// Whether a column order was applied.
     pub sorted: bool,
+}
+
+/// One exact distributed membership bitmap decoded into stable product ids.
+/// `epochs` is populated for lexical membership, parallel to the coordinator's
+/// node order, so the scoring phase can refuse a store mutation between set
+/// planning and candidate rescoring.
+#[derive(Debug, Clone, Default)]
+pub struct MembershipSet {
+    pub ids: BTreeSet<u64>,
+    pub epochs: Vec<u64>,
+    pub wire_bytes: u64,
+    pub terms: Vec<String>,
+    pub(crate) ranges: Vec<(u64, u64)>,
 }
 
 impl RequestFilters {
@@ -4772,7 +4785,7 @@ impl CoordinatorServiceImpl {
             }
         }
         let rescored_b = self
-            .fanout_bm25_rescore_scores(terms, global, claims, rescore_ids)
+            .fanout_bm25_rescore_scores(terms, global, claims, rescore_ids, &[])
             .await?;
         for (doc, shard, v) in rescore_docs {
             // Absent from the rescore response = no query term matches
@@ -4918,6 +4931,7 @@ impl CoordinatorServiceImpl {
         global: &CorpusStats,
         claims: &[u64],
         by_shard: HashMap<u32, Vec<u64>>,
+        score_stages: &[crate::pb::ScoreStage],
     ) -> Result<HashMap<u64, f32>, Status> {
         let mut tasks = Vec::with_capacity(by_shard.len());
         for (shard, ids) in by_shard {
@@ -4930,22 +4944,39 @@ impl CoordinatorServiceImpl {
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
                 expected_stats_epoch: claims[shard as usize],
+                score_stages: score_stages.to_vec(),
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
             tasks.push(tokio::spawn(async move {
-                client
-                    .bm25_rescore(request)
-                    .await
-                    .map(|r| r.into_inner().hits)
+                client.bm25_rescore(request).await.map(|r| r.into_inner())
             }));
         }
         let mut scores = HashMap::new();
+        let mut stage_known = vec![false; score_stages.len()];
         for task in tasks {
-            let hits = task
+            let response = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??;
-            for hit in hits {
+            if response.stage_columns_known.len() != score_stages.len() {
+                return Err(Status::failed_precondition(format!(
+                    "BM25 rescore returned {} stage-known flags for {} stages",
+                    response.stage_columns_known.len(),
+                    score_stages.len()
+                )));
+            }
+            for (known, shard_known) in stage_known.iter_mut().zip(&response.stage_columns_known) {
+                *known |= shard_known;
+            }
+            for hit in response.hits {
                 scores.insert(hit.doc_id, hit.score);
+            }
+        }
+        for (stage, known) in score_stages.iter().zip(stage_known) {
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "no shard has numeric column {}: the score stage would be a silent no-op",
+                    stage.column
+                )));
             }
         }
         Ok(scores)
@@ -4980,6 +5011,7 @@ impl CoordinatorServiceImpl {
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
                 expected_stats_epoch: claims[shard as usize],
+                score_stages: Vec::new(),
             };
             let mut client = self.node_client(node)?;
             rescore_tasks.push(tokio::spawn(async move {
@@ -5933,6 +5965,32 @@ impl CoordinatorServiceImpl {
                 terms.push(term);
             }
         }
+        self.lexical_signal_terms(&terms, ids, None).await
+    }
+
+    /// Candidate-scoped lexical scoring when the planner already analyzed the
+    /// clause during membership resolution. `expected_epochs` closes the gap
+    /// between that bitmap and this rescore: any lexical mutation aborts the
+    /// plan so the caller can rebuild it once from a fresh snapshot.
+    pub async fn lexical_signal_terms(
+        &self,
+        terms: &[String],
+        ids: &[u64],
+        expected_epochs: Option<&[u64]>,
+    ) -> Result<HashMap<u64, f32>, Status> {
+        self.lexical_signal_terms_with_stages(terms, ids, expected_epochs, &[])
+            .await
+    }
+
+    /// [`Self::lexical_signal_terms`] with the ordinary lexical score-stage
+    /// chain applied on each owning shard before the final f32 conversion.
+    pub async fn lexical_signal_terms_with_stages(
+        &self,
+        terms: &[String],
+        ids: &[u64],
+        expected_epochs: Option<&[u64]>,
+        score_stages: &[crate::pb::ScoreStage],
+    ) -> Result<HashMap<u64, f32>, Status> {
         if terms.is_empty() || ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -5944,13 +6002,27 @@ impl CoordinatorServiceImpl {
         // as every other stats consumer.
         let mut fresh = false;
         loop {
-            let (global, epochs) = self.body_stats(&terms, fresh).await?;
+            let (global, epochs) = self.body_stats(terms, fresh).await?;
+            if let Some(expected) = expected_epochs {
+                if expected != epochs {
+                    self.stats_cache.invalidate_all();
+                    return Err(Status::aborted(
+                        "boolean membership epoch changed before lexical scoring",
+                    ));
+                }
+            }
             let claims = if fresh { vec![0; epochs.len()] } else { epochs };
             match self
-                .fanout_bm25_rescore_scores(&terms, &global, &claims, by_shard.clone())
+                .fanout_bm25_rescore_scores(terms, &global, &claims, by_shard.clone(), score_stages)
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
+                    if expected_epochs.is_some() {
+                        self.stats_cache.invalidate_all();
+                        return Err(Status::aborted(
+                            "boolean membership epoch changed during lexical scoring",
+                        ));
+                    }
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
@@ -6293,7 +6365,7 @@ impl CoordinatorServiceImpl {
                 let (global, epochs) = self.body_stats(&terms, fresh).await?;
                 let claims = if fresh { vec![0; epochs.len()] } else { epochs };
                 match self
-                    .fanout_bm25_rescore_scores(&terms, &global, &claims, by_shard.clone())
+                    .fanout_bm25_rescore_scores(&terms, &global, &claims, by_shard.clone(), &[])
                     .await
                 {
                     Err(e) if !fresh && is_stale_stats(&e) => {
@@ -6430,6 +6502,191 @@ impl CoordinatorServiceImpl {
             keys: rows.iter().map(|r| r.2).collect(),
             sorted: sort.is_some(),
         })
+    }
+
+    fn merge_membership_bitmap(
+        out: &mut MembershipSet,
+        response: &crate::pb::MembershipBitmapResponse,
+    ) -> Result<(), Status> {
+        let label_count = usize::try_from(response.label_count).map_err(|_| {
+            Status::resource_exhausted("membership label count does not fit this platform")
+        })?;
+        let expected = usize::try_from(response.label_count.div_ceil(8))
+            .map_err(|_| Status::resource_exhausted("membership bitmap does not fit usize"))?;
+        if response.bits.len() != expected {
+            return Err(Status::internal(format!(
+                "membership bitmap has {} bytes for {} labels; expected {expected}",
+                response.bits.len(),
+                response.label_count
+            )));
+        }
+        let end = response
+            .base_label
+            .checked_add(response.label_count)
+            .ok_or_else(|| Status::internal("membership bitmap label range overflows u64"))?;
+        if response.label_count > 0 {
+            if out
+                .ranges
+                .iter()
+                .any(|&(held_base, held_end)| response.base_label < held_end && held_base < end)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "membership label range [{}, {end}) overlaps another shard",
+                    response.base_label
+                )));
+            }
+            out.ranges.push((response.base_label, end));
+        }
+        if !response.label_count.is_multiple_of(8)
+            && response.bits.last().is_some_and(|last| {
+                let used = (response.label_count % 8) as u8;
+                *last & !((1u8 << used) - 1) != 0
+            })
+        {
+            return Err(Status::internal(
+                "membership bitmap sets padding bits beyond its label count",
+            ));
+        }
+        out.wire_bytes = out
+            .wire_bytes
+            .checked_add(response.bits.len() as u64)
+            .ok_or_else(|| Status::resource_exhausted("membership byte count overflow"))?;
+        for (byte_index, byte) in response.bits.iter().copied().enumerate() {
+            let mut held = byte;
+            while held != 0 {
+                let bit = held.trailing_zeros() as usize;
+                let position = byte_index * 8 + bit;
+                if position < label_count {
+                    let id = response
+                        .base_label
+                        .checked_add(position as u64)
+                        .ok_or_else(|| Status::internal("membership stable-id overflow"))?;
+                    if !out.ids.insert(id) {
+                        return Err(Status::failed_precondition(format!(
+                            "membership id {id} is owned by more than one shard; slot ranges overlap"
+                        )));
+                    }
+                }
+                held &= held - 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the live document universe, or one CEL/geo predicate, without
+    /// paging through `max_k`-sized browse responses.
+    pub async fn filter_membership(
+        &self,
+        filters: &RequestFilters,
+    ) -> Result<MembershipSet, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::FilterBitmapRequest {
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
+            };
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .resolve_filter_bitmap(request)
+                    .await
+                    .map(|response| response.into_inner())
+            }));
+        }
+        let mut known = FilterKnown::new(filters);
+        let mut merged = MembershipSet::default();
+        for task in tasks {
+            let response = task.await.map_err(|error| {
+                Status::internal(format!("filter membership task failed: {error}"))
+            })??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            Self::merge_membership_bitmap(
+                &mut merged,
+                &crate::pb::MembershipBitmapResponse {
+                    base_label: response.base_label,
+                    label_count: response.label_count,
+                    bits: response.bits,
+                    stats_epoch: 0,
+                },
+            )?;
+        }
+        known.refuse_unknown(filters)?;
+        Ok(merged)
+    }
+
+    /// Analyze one lexical clause and resolve its exact positive-score
+    /// membership. No score bytes cross this phase.
+    pub async fn lexical_membership(
+        &self,
+        text: &str,
+        spec: Option<&crate::pb::AnalysisSpec>,
+    ) -> Result<MembershipSet, Status> {
+        if text.is_empty() {
+            return Err(Status::invalid_argument("lexical clause text is empty"));
+        }
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
+        })?;
+        let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+        let mut terms = Vec::new();
+        for (term, _, _) in analyzed.into_body().terms {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+        if terms.is_empty() {
+            return Ok(MembershipSet {
+                epochs: vec![0; self.node_addrs.len()],
+                ..Default::default()
+            });
+        }
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let client = self.node_client(node);
+            let request = crate::pb::LexicalBitmapRequest {
+                terms: terms.clone(),
+            };
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .resolve_lexical_bitmap(request)
+                    .await
+                    .map(|response| response.into_inner())
+            }));
+        }
+        let mut merged = MembershipSet::default();
+        for task in tasks {
+            let response = task.await.map_err(|error| {
+                Status::internal(format!("lexical membership task failed: {error}"))
+            })??;
+            merged.epochs.push(response.stats_epoch);
+            Self::merge_membership_bitmap(&mut merged, &response)?;
+        }
+        merged.terms = terms;
+        Ok(merged)
+    }
+
+    /// Resolve every live provider-backed vector row. This is the membership
+    /// rule of a dense Boolean clause; native scores are fetched only for the
+    /// candidates that survive the Boolean set plan.
+    pub async fn vector_membership(&self) -> Result<MembershipSet, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .resolve_vector_bitmap(crate::pb::VectorBitmapRequest {})
+                    .await
+                    .map(|response| response.into_inner())
+            }));
+        }
+        let mut merged = MembershipSet::default();
+        for task in tasks {
+            let response = task.await.map_err(|error| {
+                Status::internal(format!("vector membership task failed: {error}"))
+            })??;
+            Self::merge_membership_bitmap(&mut merged, &response)?;
+        }
+        Ok(merged)
     }
 
     /// Resolve a product filter into one packed stable-id bitmap per product

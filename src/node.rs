@@ -50,15 +50,16 @@ use crate::pb::{
     FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
     GetDocumentsResponse, GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest,
     HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, IngestMappedRequest,
-    IngestMappedResponse, InstallSnapshotResponse, OffsetSpan, RawLegHit, ReadWalRequest,
-    ReadWalResponse, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent, ScoredHit,
-    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
-    SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk,
-    SnapshotManifest, StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
-    TermStatsResponse, VectorBackendConfig as WireVectorBackendConfig,
-    VectorBackendDescriptor as WireVectorBackendDescriptor, VectorQualityContract,
-    VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
+    IngestMappedResponse, InstallSnapshotResponse, LexicalBitmapRequest, MembershipBitmapResponse,
+    OffsetSpan, RawLegHit, ReadWalRequest, ReadWalResponse, ResolveParentsRequest,
+    ResolveParentsResponse, ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
+    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
+    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    VectorBackendConfig as WireVectorBackendConfig,
+    VectorBackendDescriptor as WireVectorBackendDescriptor, VectorBitmapRequest,
+    VectorQualityContract, VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
 use crate::vector::{
@@ -6926,6 +6927,68 @@ impl NodeService for NodeServiceImpl {
         }))
     }
 
+    async fn resolve_lexical_bitmap(
+        &self,
+        request: Request<LexicalBitmapRequest>,
+    ) -> Result<Response<MembershipBitmapResponse>, Status> {
+        let req = request.into_inner();
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let Some(shard) = guard.bm25.as_ref() else {
+            return Ok(Response::new(MembershipBitmapResponse {
+                base_label: self.config.slot_offset,
+                label_count: 0,
+                bits: Vec::new(),
+                stats_epoch: guard.stats_epoch,
+            }));
+        };
+        let index = shard.as_index().ok_or_else(|| {
+            Status::failed_precondition("bm25 bulk build in progress; Flush first")
+        })?;
+        let label_count = usize::try_from(shard.next_doc_id())
+            .map_err(|_| Status::resource_exhausted("lexical row count does not fit usize"))?;
+        let mut bits = vec![0u8; label_count.div_ceil(8)];
+        for term in req.terms {
+            index.for_each_doc_tf(&term, &mut |doc_id, _tf| {
+                let position = doc_id as usize;
+                if position < label_count && !guard.live_docs.is_deleted(position) {
+                    bits[position / 8] |= 1 << (position % 8);
+                }
+            });
+        }
+        Ok(Response::new(MembershipBitmapResponse {
+            base_label: self.config.slot_offset,
+            label_count: label_count as u64,
+            bits,
+            stats_epoch: guard.stats_epoch,
+        }))
+    }
+
+    async fn resolve_vector_bitmap(
+        &self,
+        _request: Request<VectorBitmapRequest>,
+    ) -> Result<Response<MembershipBitmapResponse>, Status> {
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let label_count = guard.index.as_ref().map_or(0, VectorIndex::len);
+        let mut bits = vec![0xffu8; label_count.div_ceil(8)];
+        if let Some(last) = bits.last_mut() {
+            let used = label_count % 8;
+            if used != 0 {
+                *last &= (1u8 << used) - 1;
+            }
+        }
+        for position in 0..label_count {
+            if guard.live_docs.is_deleted(position) {
+                bits[position / 8] &= !(1 << (position % 8));
+            }
+        }
+        Ok(Response::new(MembershipBitmapResponse {
+            base_label: self.config.slot_offset,
+            label_count: label_count as u64,
+            bits,
+            stats_epoch: 0,
+        }))
+    }
+
     async fn aggregate_shard(
         &self,
         request: Request<crate::pb::AggregateShardRequest>,
@@ -9414,6 +9477,7 @@ impl NodeServiceImpl {
                 "terms and global_doc_frequencies must have the same length",
             ));
         }
+        let stage_specs = parse_score_stages(&req.score_stages)?;
         let params = Bm25Params {
             k1: if req.k1 == 0.0 {
                 bm25::DEFAULT_K1
@@ -9434,7 +9498,7 @@ impl NodeServiceImpl {
         let offset = self.config.slot_offset;
         let guard = self.state.read().expect("shard state lock poisoned");
         guard.check_stats_epoch(req.expected_stats_epoch)?;
-        let hits = match guard.bm25.as_ref() {
+        let (hits, stage_columns_known) = match guard.bm25.as_ref() {
             Some(store) => {
                 // Route global ids to this shard's local range.
                 let local: Vec<u32> = req
@@ -9447,12 +9511,19 @@ impl NodeServiceImpl {
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
-                bm25::score_candidates(index, &req.terms, &stats, params, &local)
+                let chain = store.resolve_chain(&stage_specs);
+                let stage_columns_known = chain
+                    .stages
+                    .iter()
+                    .map(|stage| stage.column.is_some())
+                    .collect();
+                let numeric_read = ShardNumericRead(store);
+                let hits = bm25::score_candidates(index, &req.terms, &stats, params, &local)
                     .into_iter()
                     .map(|doc| Bm25Hit {
                         projected: Vec::new(),
                         doc_id: offset + u64::from(doc.doc_id),
-                        score: doc.score as f32,
+                        score: chain.eval(doc.score, doc.doc_id, &numeric_read) as f32,
                         terms: doc
                             .term_offsets
                             .into_iter()
@@ -9466,11 +9537,15 @@ impl NodeServiceImpl {
                             })
                             .collect(),
                     })
-                    .collect()
+                    .collect::<Vec<_>>();
+                (hits, stage_columns_known)
             }
-            None => Vec::new(),
+            None => (Vec::new(), vec![false; stage_specs.len()]),
         };
-        Ok(Bm25RescoreResponse { hits })
+        Ok(Bm25RescoreResponse {
+            hits,
+            stage_columns_known,
+        })
     }
 }
 

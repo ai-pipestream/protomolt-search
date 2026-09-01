@@ -328,6 +328,14 @@ service NodeService {
   // product shard layout. Bit i admits `base_label + i`.
   rpc ResolveFilterBitmap(FilterBitmapRequest) returns (FilterBitmapResponse);
 
+  // Exact membership bitmaps for the recursive Boolean planner. Lexical
+  // membership is the union of the requested analyzed term postings; vector
+  // membership contains every live row backed by a provider vector. Scores
+  // are intentionally absent: after Boolean set algebra chooses the surviving
+  // candidates, the ordinary candidate-scoped rescore RPCs produce them.
+  rpc ResolveLexicalBitmap(LexicalBitmapRequest) returns (MembershipBitmapResponse);
+  rpc ResolveVectorBitmap(VectorBitmapRequest) returns (MembershipBitmapResponse);
+
   // Export one durable WAL generation in generation-clock order for replica
   // or child catch-up. The node flushes before taking the high watermark;
   // every emitted record is therefore part of a complete durability point.
@@ -426,11 +434,8 @@ service SearchService {
   //   - cascade(gate = dense, rerank = lexical)   -> HybridSearch CASCADE
   //   - one lexical boost on any composite shape  -> BoostRescore
   //
-  // Filters attach through an AND composite wrapping the search
-  // structure (or stand alone as a browse). Everything else — nested
-  // booleans, AND over scoring leaves, multiple boosts, the generic
-  // composite scorer, profile timings — is refused by name until its
-  // ordinary engine path exists.
+  // Recursive BooleanQuery uses exact shard membership bitmaps and
+  // candidate-scoped scoring. Unsupported shapes are refused by name.
   rpc Query(QueryRequest) returns (QueryResponse);
 
   // Streaming form of Query. Revisions are complete replacement snapshots,
@@ -498,6 +503,21 @@ service SearchService {
   // parallel rule. Absence is Kleene: a document whose expression is
   // absent is skipped and counted nowhere — never a fabricated zero.
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+}
+
+// Durable cluster membership and placement authority. Query data never flows
+// through this service. Nodes lease capacity, report ready shard generations,
+// and poll idempotent placement actions; the authority alone publishes a new
+// complete query topology after the requested replicas report ready.
+service ClusterControl {
+  rpc RegisterNode(RegisterNodeRequest) returns (NodeLease);
+  rpc RenewNodeLease(RenewNodeLeaseRequest) returns (NodeLease);
+  rpc DrainNode(DrainNodeRequest) returns (ClusterPlan);
+  rpc ReportShard(ReportShardRequest) returns (ClusterPlan);
+  rpc CompletePlacementAction(CompletePlacementActionRequest) returns (ClusterPlan);
+  rpc ReconcileCluster(ReconcileClusterRequest) returns (ClusterPlan);
+  rpc GetClusterPlan(GetClusterPlanRequest) returns (ClusterPlan);
+  rpc RollbackCluster(RollbackClusterRequest) returns (ClusterPlan);
 }
 
 // One shard's slice of a filter-only browse.
@@ -579,6 +599,23 @@ message FilterBitmapResponse {
   bytes bits = 3;
   repeated bool geo_columns_known = 4;
   repeated bool filter_columns_known = 5;
+}
+
+message LexicalBitmapRequest {
+  // Coordinator-analyzed body terms. Membership is OR: a document belongs
+  // when at least one term has a posting, matching BM25's positive-score set.
+  repeated string terms = 1;
+}
+
+message VectorBitmapRequest {}
+
+message MembershipBitmapResponse {
+  uint64 base_label = 1;
+  uint64 label_count = 2;
+  bytes bits = 3;
+  // Lexical store epoch that produced the bitmap. Zero on the vector route.
+  // Candidate rescoring can echo this through expected_stats_epoch.
+  uint64 stats_epoch = 4;
 }
 
 // One column's aggregate over a filtered match set (docs/facets.md).
@@ -3136,12 +3173,18 @@ message Bm25RescoreRequest {
   // Stats-epoch claim for the global stats above; see
   // Bm25QueryRequest.expected_stats_epoch. 0 = no claim.
   uint64 expected_stats_epoch = 8;
+  // Monotonic score-function stages, applied on the shard before the
+  // final f32 conversion exactly as on the ordinary BM25 route.
+  repeated ScoreStage score_stages = 9;
 }
 
 // BM25 scores for the requested candidates, doc id ascending.
 message Bm25RescoreResponse {
   // One hit per candidate that scored above zero.
   repeated Bm25Hit hits = 1;
+  // Per requested stage, true when this shard resolved its column.
+  // The coordinator rejects a stage no shard resolves.
+  repeated bool stage_columns_known = 2;
 }
 
 // Candidate-scoped value evaluation (see NodeService.FetchValues).
@@ -3498,10 +3541,8 @@ message QueryRequest {
   // absence has no honest position in a column order.
   QuerySort sort = 9;
 
-  // Query-time projections (docs/cel-values.md), by name per hit.
-  // Increment 1 executes them on the single-lexical-leaf shape (the
-  // Bm25Search delegate); other shapes refuse by name until their
-  // ordinary route carries projections.
+  // Query-time projections (docs/cel-values.md), by name per hit. Routes
+  // without inline projection support use candidate-scoped FetchValues.
   repeated NamedProjection projections = 10;
   // Optional optimistic topology stamp. Zero accepts the coordinator's
   // current generation. A nonzero mismatch fails before analysis or fan-out,
@@ -3531,8 +3572,8 @@ message SelectionQuery {
 // compatibility shape. Membership follows
 // must/should/must_not/minimum_should_match; relevance is the sum of matching
 // positive scoring clauses unless QueryRequest.scorer explicitly replaces the
-// combination. Evaluation uses the existing candidate-scoped BM25/vector/CEL
-// seams over an exhaustive id browse, so the first implementation is exact.
+// combination. Evaluation resolves exact shard membership bitmaps, applies
+// boolean set algebra, then scores only the surviving candidates.
 message BooleanQuery {
   repeated SelectionQuery must = 1;
   repeated SelectionQuery should = 2;
@@ -3564,9 +3605,9 @@ message LexicalQuery {
   // Analysis options; MUST match ingest term identity, as everywhere.
   AnalysisSpec analysis = 2;
   // Bounded score-function chain over stored columns
-  // (docs/score-functions.md). Single-lexical-leaf selections only;
-  // a composite selection refuses it by name (stages do not ride the
-  // hybrid legs today).
+  // (docs/score-functions.md). Served by a single lexical leaf and by
+  // candidate-scoped lexical leaves in recursive BooleanQuery. Legacy
+  // CompositeSearchStrategy still refuses stages on hybrid legs.
   repeated ScoreStage score_stages = 3;
 }
 
@@ -4419,6 +4460,145 @@ message AbortTopologyCutoverRequest {
 
 message AbortTopologyCutoverResponse {
   uint64 topology_generation = 1;
+}
+
+enum ClusterNodeState {
+  CLUSTER_NODE_STATE_UNSPECIFIED = 0;
+  CLUSTER_NODE_STATE_ACTIVE = 1;
+  CLUSTER_NODE_STATE_DRAINING = 2;
+  CLUSTER_NODE_STATE_EXPIRED = 3;
+}
+
+enum ShardReplicaRole {
+  SHARD_REPLICA_ROLE_UNSPECIFIED = 0;
+  SHARD_REPLICA_ROLE_PRIMARY = 1;
+  SHARD_REPLICA_ROLE_REPLICA = 2;
+}
+
+enum PlacementActionKind {
+  PLACEMENT_ACTION_KIND_UNSPECIFIED = 0;
+  PLACEMENT_ACTION_KIND_COPY_REPLICA = 1;
+  PLACEMENT_ACTION_KIND_DROP_REPLICA = 2;
+  PLACEMENT_ACTION_KIND_PROMOTE_REPLICA = 3;
+  PLACEMENT_ACTION_KIND_SPLIT_SHARD = 4;
+  PLACEMENT_ACTION_KIND_MERGE_SHARDS = 5;
+  PLACEMENT_ACTION_KIND_COMPACT_SHARD = 6;
+}
+
+message NodeCapacity {
+  uint64 disk_bytes = 1;
+  uint64 used_disk_bytes = 2;
+  uint64 memory_bytes = 3;
+  uint32 search_threads = 4;
+  string failure_domain = 5;
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string addr = 2;
+  NodeCapacity capacity = 3;
+  // Requested lease duration. Zero selects the authority policy.
+  uint64 lease_ms = 4;
+}
+
+message RenewNodeLeaseRequest {
+  string node_id = 1;
+  uint64 lease_token = 2;
+  NodeCapacity capacity = 3;
+  uint64 lease_ms = 4;
+}
+
+message NodeLease {
+  string node_id = 1;
+  uint64 lease_token = 2;
+  uint64 expires_unix_ms = 3;
+  uint64 control_revision = 4;
+}
+
+message DrainNodeRequest {
+  string node_id = 1;
+  uint64 lease_token = 2;
+}
+
+message ShardReplicaState {
+  string shard_id = 1;
+  string node_id = 2;
+  string addr = 3;
+  uint64 generation = 4;
+  uint64 hash_lo = 5;
+  uint64 hash_hi = 6;
+  uint64 slot_offset = 7;
+  uint64 rows = 8;
+  uint64 bytes = 9;
+  ShardReplicaRole role = 10;
+  bool ready = 11;
+  string scoring_fingerprint = 12;
+  string analysis_fingerprint = 13;
+  uint32 immutable_segments = 14;
+  uint64 tombstones = 15;
+}
+
+message ReportShardRequest {
+  string node_id = 1;
+  uint64 lease_token = 2;
+  ShardReplicaState replica = 3;
+}
+
+message CompletePlacementActionRequest {
+  string node_id = 1;
+  uint64 lease_token = 2;
+  uint64 action_id = 3;
+  // Complete replacement state produced by the action. COPY and COMPACT
+  // return one replica, SPLIT returns every child, MERGE returns one merged
+  // primary, and DROP returns none.
+  repeated ShardReplicaState outputs = 4;
+}
+
+message ReconcileClusterRequest {
+  // A dry run computes and returns actions without persisting them.
+  bool dry_run = 1;
+}
+
+message GetClusterPlanRequest {}
+
+message RollbackClusterRequest {
+  // Historical topology generation to restore as a NEW generation. Zero
+  // selects the immediately previous published topology.
+  uint64 topology_generation = 1;
+}
+
+message ClusterNode {
+  string node_id = 1;
+  string addr = 2;
+  ClusterNodeState state = 3;
+  reserved 4; // Lease credentials are returned only to their registering node.
+  uint64 expires_unix_ms = 5;
+  NodeCapacity capacity = 6;
+}
+
+message PlacementAction {
+  uint64 action_id = 1;
+  PlacementActionKind kind = 2;
+  string shard_id = 3;
+  string peer_shard_id = 4;
+  string source_node_id = 5;
+  string target_node_id = 6;
+  uint64 source_generation = 7;
+  uint64 target_generation = 8;
+  uint64 hash_lo = 9;
+  uint64 hash_hi = 10;
+  string reason = 11;
+  // Exact peer generation captured when a merge was planned; zero otherwise.
+  uint64 peer_source_generation = 12;
+}
+
+message ClusterPlan {
+  uint64 control_revision = 1;
+  uint64 topology_generation = 2;
+  repeated ClusterNode nodes = 3;
+  repeated ShardReplicaState replicas = 4;
+  repeated PlacementAction actions = 5;
+  repeated uint64 topology_history = 6;
 }
 
 // ---------------------------------------------------------------------------

@@ -29,13 +29,15 @@ use pipestream_search::config::{
     load_shard_map, normalize_addr, parse, ClusteredTurboVecConfig, Config, DemoConfig, Role,
     ShardConfig, ShardMap,
 };
+use pipestream_search::control_plane::{ClusterControlService, ControlPolicy, DurableControlPlane};
 use pipestream_search::coordinator::{CoordinatorServiceImpl, TopologyRoute};
 use pipestream_search::harness;
 use pipestream_search::node::{NodeConfig, NodeServiceImpl};
+use pipestream_search::pb::cluster_control_server::ClusterControl;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{
-    ConfigureVectorBackendRequest, GetVectorBackendRequest, SearchRequest,
+    ConfigureVectorBackendRequest, GetVectorBackendRequest, ReconcileClusterRequest, SearchRequest,
 };
 use pipestream_search::vector::VectorIndex;
 use tokio::net::TcpListener;
@@ -417,6 +419,58 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 Ok::<(), tonic::transport::Error>(())
             }));
         }
+        let control_service = if let Some(path) = &cfg.control_state_path {
+            let plane = DurableControlPlane::open(
+                path,
+                ControlPolicy {
+                    lease_ms: cfg.control_lease_ms,
+                    replication_factor: cfg.control_replication_factor,
+                    split_rows: cfg.control_split_rows,
+                    merge_rows: cfg.control_merge_rows,
+                    compact_segments: cfg.control_compact_segments,
+                    compact_tombstone_ppm: cfg.control_compact_tombstone_ppm,
+                    history_limit: 32,
+                },
+            )?;
+            plane.bootstrap_topology(
+                coordinator.current_topology_generation(),
+                &coordinator.current_topology_routes(),
+            )?;
+            let control = ClusterControlService::new(plane).with_coordinator(coordinator.clone());
+            control.publish_current_topology()?;
+            if cfg.control_reconcile_ms > 0 {
+                let reconcile = control.clone();
+                let interval_ms = cfg.control_reconcile_ms;
+                let mut shutdown = shutdown_rx.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = interval.tick() => {
+                                if let Err(error) = ClusterControl::reconcile_cluster(
+                                    &reconcile,
+                                    tonic::Request::new(ReconcileClusterRequest { dry_run: false }),
+                                ).await {
+                                    eprintln!("cluster reconciliation refused: {error}");
+                                }
+                            }
+                        }
+                    }
+                    Ok::<(), tonic::transport::Error>(())
+                }));
+            }
+            eprintln!("cluster control state: {}", path.display());
+            Some(control)
+        } else {
+            None
+        };
         eprintln!(
             "SearchService listening on {addr} ({} shard nodes)",
             cfg.node_addrs.len()
@@ -427,6 +481,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             Server::builder()
                 .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                 .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
+                .add_optional_service(control_service.map(|service| service.into_server(max)))
                 .add_service(CoordinatorServiceImpl::into_server(coordinator, max))
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;

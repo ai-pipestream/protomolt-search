@@ -284,6 +284,10 @@ Built and tested:
   re-partitioning, merge with provider-configuration/geometry checks, shard-map
   emission. Split-then-search reconstructs the parent top-k bitwise;
   merge reproduces the monolithic index including BM25 identity.
+- Bucket-bounded segmented replay and atomic aligned-segment publication.
+  Peak replay holds one WAL bucket rather than a whole child; global BM25
+  statistics and vector/BM25 heaps still merge exactly. See
+  [immutable-segments.md](immutable-segments.md).
 - Stable-key baseline partitioning, incremental child tailing, durable
   checkpoints, final write barrier, count/fingerprint verification, and atomic
   live map publication.
@@ -299,8 +303,6 @@ Deliberately deferred:
   the BM25 store by document, and applying its log; today such shards are refused
   rather than mis-resharded.
 
-- **Streaming reshard** — the replay buffers vectors in memory per
-  child; spilling to disk is a follow-up if very large shards need it.
 - **Delete/replacement migration during live split** — the product is
   append-only today. Catch-up refuses these records instead of inventing an
   unverified cross-generation tombstone mapping.

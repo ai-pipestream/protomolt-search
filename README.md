@@ -297,6 +297,10 @@ the file's `[[shards]]` entirely.
   into its replica. Cursors persist beside the map by default. A WAL generation
   rotation requires installing the new base snapshot rather than guessing at
   missing history.
+- **Durable control authority.** Optional `ClusterControl` leases nodes,
+  reconciles failure-domain/capacity-aware placement, schedules compaction and
+  split/merge work, and publishes only complete generation-stamped topologies.
+  See [docs/cluster-control.md](docs/cluster-control.md).
 - **Deadlines.** `shard_deadline_ms` bounds one query's whole per-shard
   attempt (primary plus any hedge); a shard that exceeds it fails the
   query with DEADLINE_EXCEEDED instead of stalling it.
@@ -791,6 +795,9 @@ Deletes and replacements use one generation-local tombstone overlay shared by
 every read path. Updates append the new row, then atomically retire the old
 row; one-child resharding compacts tombstones into a new dense generation. See
 [docs/mutations.md](docs/mutations.md) for the consistency and cutover rules.
+Large compactions can instead publish several bounded, row-aligned immutable
+segments under one atomic catalog snapshot; see
+[docs/immutable-segments.md](docs/immutable-segments.md).
 
 ### Write log and resharding
 
@@ -1111,8 +1118,6 @@ TODO list).
 
 ## TODO
 
-- **Streaming reshard.** Replay buffers each child's vectors in memory;
-  very large shards need a spill-to-disk pass.
 - **mmap vector index.** Postings and doc text are disk-resident (page
   cache); the turbovec index is heap-resident (see above). A
   packed-bytes abstraction — owned Vec or mmap behind one accessor,

@@ -18,7 +18,7 @@
 //! unsupported construct and, where one exists, the supported way to
 //! ask for the same thing.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -41,52 +41,60 @@ struct BooleanHit {
     matched: Vec<String>,
 }
 
-type BooleanHits = BTreeMap<u64, BooleanHit>;
-
-fn merge_boolean_hit(into: &mut BooleanHit, from: &BooleanHit) {
-    into.score += from.score;
-    for signal in &from.signals {
-        if !into.signals.iter().any(|held| held.id == signal.id) {
-            into.signals.push(signal.clone());
-        }
-    }
-    for clause in &from.matched {
-        if !into.matched.contains(clause) {
-            into.matched.push(clause.clone());
-        }
-    }
+enum PlannedSearchKind {
+    Lexical {
+        terms: Vec<String>,
+        epochs: Vec<u64>,
+        score_stages: Vec<crate::pb::ScoreStage>,
+    },
+    Dense {
+        vector: Vec<f32>,
+        exact_fp32: bool,
+    },
 }
 
-async fn browse_all(
-    coordinator: &CoordinatorServiceImpl,
-    filters: &crate::coordinator::RequestFilters,
-) -> Result<Vec<u64>, Status> {
-    let mut ids = Vec::new();
-    let mut after = None;
-    loop {
-        let rows = coordinator
-            .fanout_browse(coordinator.max_k(), after, None, filters)
-            .await?;
-        let count = rows.ids.len();
-        let Some(&last) = rows.ids.last() else { break };
-        ids.extend(rows.ids);
-        if count < coordinator.max_k() as usize {
-            break;
-        }
-        after = Some(crate::coordinator::BrowseAfter {
-            id: last,
-            key_bits: 0,
-        });
-    }
-    Ok(ids)
+struct PlannedSearchLeaf {
+    id: String,
+    membership: BTreeSet<u64>,
+    kind: PlannedSearchKind,
 }
 
-fn evaluate_boolean<'a>(
+struct PlannedMatcher {
+    id: String,
+    membership: BTreeSet<u64>,
+}
+
+struct PlannedBooleanNode {
+    membership: BTreeSet<u64>,
+    searches: Vec<PlannedSearchLeaf>,
+    matchers: Vec<PlannedMatcher>,
+    membership_wire_bytes: u64,
+}
+
+fn compile_boolean_filter(
+    filter: &FilterQuery,
+) -> Result<crate::coordinator::RequestFilters, Status> {
+    let (geo, cel) = match filter.predicate.as_ref() {
+        Some(crate::pb::filter_query::Predicate::Cel(cel)) if !cel.is_empty() => {
+            (Vec::new(), cel.as_str())
+        }
+        Some(crate::pb::filter_query::Predicate::Geo(geo)) => (vec![geo.clone()], ""),
+        Some(crate::pb::filter_query::Predicate::Cel(_)) => {
+            return Err(refuse(format!(
+                "filter {:?} has an empty CEL predicate",
+                filter.id
+            )))
+        }
+        None => return Err(refuse(format!("filter {:?} has no predicate", filter.id))),
+    };
+    crate::coordinator::RequestFilters::compile(&geo, cel)
+}
+
+fn plan_boolean_selection<'a>(
     coordinator: &'a CoordinatorServiceImpl,
     selection: &'a SelectionQuery,
-    universe: &'a [u64],
     depth: usize,
-) -> Pin<Box<dyn Future<Output = Result<BooleanHits, Status>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<PlannedBooleanNode, Status>> + Send + 'a>> {
     Box::pin(async move {
         if depth > 64 {
             return Err(refuse(
@@ -98,8 +106,7 @@ fn evaluate_boolean<'a>(
                 if search.id.is_empty() {
                     return Err(refuse("a search clause needs a non-empty id"));
                 }
-                let mut scores = HashMap::new();
-                match search.query.as_ref() {
+                let (membership, kind) = match search.query.as_ref() {
                     Some(search_query::Query::Lexical(query)) => {
                         if query.text.is_empty() {
                             return Err(refuse(format!(
@@ -107,23 +114,20 @@ fn evaluate_boolean<'a>(
                                 search.id
                             )));
                         }
-                        if !query.score_stages.is_empty() {
-                            return Err(refuse(
-                                "score_stages inside recursive boolean selection are not yet candidate-scoped; use a boost/scorer dimension after boolean selection",
-                            ));
-                        }
-                        for chunk in universe.chunks(coordinator.max_k() as usize) {
-                            scores.extend(
-                                coordinator
-                                    .lexical_signal(&query.text, query.analysis.as_ref(), chunk)
-                                    .await?,
-                            );
-                        }
+                        let membership = coordinator
+                            .lexical_membership(&query.text, query.analysis.as_ref())
+                            .await?;
+                        let kind = PlannedSearchKind::Lexical {
+                            terms: membership.terms.clone(),
+                            epochs: membership.epochs.clone(),
+                            score_stages: query.score_stages.clone(),
+                        };
+                        (membership, kind)
                     }
                     Some(search_query::Query::Dense(query)) => {
                         if query.quality.is_some() {
                             return Err(refuse(
-                                "DenseQualityPolicy is not used by exhaustive boolean evaluation",
+                                "DenseQualityPolicy is not used by exact bitmap Boolean planning",
                             ));
                         }
                         let execution = dense_execution_mode(query)?;
@@ -132,20 +136,18 @@ fn evaluate_boolean<'a>(
                                 "ANN cannot establish recursive boolean membership exactly; use EXACT/AUTO or a top-level ANN selection",
                             ));
                         }
-                        if dense_score_mode(query)? == DenseScoreMode::Fp32Rerank {
-                            for chunk in universe.chunks(coordinator.max_k() as usize) {
-                                scores.extend(
-                                    coordinator
-                                        .exact_vector_scores(&query.vector, chunk)
-                                        .await?
-                                        .scores,
-                                );
-                            }
-                        } else {
-                            for chunk in universe.chunks(coordinator.max_k() as usize) {
-                                scores.extend(coordinator.dense_signal(&query.vector, chunk).await?);
-                            }
+                        if query.vector.is_empty() {
+                            return Err(refuse(format!(
+                                "dense clause {:?} has an empty vector",
+                                search.id
+                            )));
                         }
+                        let membership = coordinator.vector_membership().await?;
+                        let kind = PlannedSearchKind::Dense {
+                            vector: query.vector.clone(),
+                            exact_fp32: dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
+                        };
+                        (membership, kind)
                     }
                     None => {
                         return Err(refuse(format!(
@@ -153,63 +155,39 @@ fn evaluate_boolean<'a>(
                             search.id
                         )))
                     }
-                }
-                Ok(scores
-                    .into_iter()
-                    .map(|(id, score)| {
-                        (
-                            id,
-                            BooleanHit {
-                                score,
-                                signals: vec![QuerySignal {
-                                    id: search.id.clone(),
-                                    score,
-                                }],
-                                matched: vec![search.id.clone()],
-                            },
-                        )
-                    })
-                    .collect())
+                };
+                let ids = membership.ids;
+                Ok(PlannedBooleanNode {
+                    membership: ids.clone(),
+                    searches: vec![PlannedSearchLeaf {
+                        id: search.id.clone(),
+                        membership: ids.clone(),
+                        kind,
+                    }],
+                    matchers: vec![PlannedMatcher {
+                        id: search.id.clone(),
+                        membership: ids,
+                    }],
+                    membership_wire_bytes: membership.wire_bytes,
+                })
             }
             selection_query::Node::Filter(filter) => {
                 if filter.id.is_empty() {
                     return Err(refuse("a filter clause needs a non-empty id"));
                 }
-                let (geo, cel) = match filter.predicate.as_ref() {
-                    Some(crate::pb::filter_query::Predicate::Cel(cel)) if !cel.is_empty() => {
-                        (Vec::new(), cel.as_str())
-                    }
-                    Some(crate::pb::filter_query::Predicate::Geo(geo)) => {
-                        (vec![geo.clone()], "")
-                    }
-                    Some(crate::pb::filter_query::Predicate::Cel(_)) => {
-                        return Err(refuse(format!(
-                            "filter {:?} has an empty CEL predicate",
-                            filter.id
-                        )))
-                    }
-                    None => {
-                        return Err(refuse(format!(
-                            "filter {:?} has no predicate",
-                            filter.id
-                        )))
-                    }
-                };
-                let compiled = crate::coordinator::RequestFilters::compile(&geo, cel)?;
-                Ok(browse_all(coordinator, &compiled)
-                    .await?
-                    .into_iter()
-                    .map(|id| {
-                        (
-                            id,
-                            BooleanHit {
-                                score: 0.0,
-                                signals: Vec::new(),
-                                matched: vec![filter.id.clone()],
-                            },
-                        )
-                    })
-                    .collect())
+                let membership = coordinator
+                    .filter_membership(&compile_boolean_filter(filter)?)
+                    .await?;
+                let ids = membership.ids;
+                Ok(PlannedBooleanNode {
+                    membership: ids.clone(),
+                    searches: Vec::new(),
+                    matchers: vec![PlannedMatcher {
+                        id: filter.id.clone(),
+                        membership: ids,
+                    }],
+                    membership_wire_bytes: membership.wire_bytes,
+                })
             }
             selection_query::Node::Boolean(boolean) => {
                 if boolean.aggregate.is_some() {
@@ -217,7 +195,7 @@ fn evaluate_boolean<'a>(
                         "aggregate belongs on the root BooleanQuery, not a nested clause",
                     ));
                 }
-                evaluate_boolean_group(coordinator, boolean, universe, depth + 1).await
+                plan_boolean_group(coordinator, boolean, depth + 1).await
             }
             selection_query::Node::Composite(_) => Err(refuse(
                 "inside recursive boolean selection, express hybrid membership as dense and lexical MUST/SHOULD clauses; legacy CompositeSearchStrategy remains supported as the top-level compatibility shape",
@@ -226,12 +204,11 @@ fn evaluate_boolean<'a>(
     })
 }
 
-fn evaluate_boolean_group<'a>(
+fn plan_boolean_group<'a>(
     coordinator: &'a CoordinatorServiceImpl,
     boolean: &'a crate::pb::BooleanQuery,
-    universe: &'a [u64],
     depth: usize,
-) -> Pin<Box<dyn Future<Output = Result<BooleanHits, Status>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<PlannedBooleanNode, Status>> + Send + 'a>> {
     Box::pin(async move {
         if boolean.minimum_should_match as usize > boolean.should.len() {
             return Err(refuse(format!(
@@ -245,15 +222,15 @@ fn evaluate_boolean_group<'a>(
         }
         let mut must = Vec::with_capacity(boolean.must.len());
         for clause in &boolean.must {
-            must.push(evaluate_boolean(coordinator, clause, universe, depth).await?);
+            must.push(plan_boolean_selection(coordinator, clause, depth).await?);
         }
         let mut should = Vec::with_capacity(boolean.should.len());
         for clause in &boolean.should {
-            should.push(evaluate_boolean(coordinator, clause, universe, depth).await?);
+            should.push(plan_boolean_selection(coordinator, clause, depth).await?);
         }
         let mut must_not = Vec::with_capacity(boolean.must_not.len());
         for clause in &boolean.must_not {
-            must_not.push(evaluate_boolean(coordinator, clause, universe, depth).await?);
+            must_not.push(plan_boolean_selection(coordinator, clause, depth).await?);
         }
         let minimum_should_match = if boolean.minimum_should_match == 0
             && boolean.must.is_empty()
@@ -263,30 +240,134 @@ fn evaluate_boolean_group<'a>(
         } else {
             boolean.minimum_should_match as usize
         };
-        let mut result = BTreeMap::new();
-        for &id in universe {
-            if must.iter().any(|clause| !clause.contains_key(&id))
-                || must_not.iter().any(|clause| clause.contains_key(&id))
-            {
-                continue;
-            }
-            let should_matches = should
-                .iter()
-                .filter(|clause| clause.contains_key(&id))
-                .count();
-            if should_matches < minimum_should_match {
-                continue;
-            }
-            let mut hit = BooleanHit::default();
-            for clause in must.iter().chain(&should) {
-                if let Some(part) = clause.get(&id) {
-                    merge_boolean_hit(&mut hit, part);
+        // Seed MUST intersections from the cheapest bitmap. With no MUST,
+        // count SHOULD memberships directly; a negative-only group starts
+        // from the live-document bitmap rather than a paged browse.
+        let mut membership =
+            if let Some(seed) = must.iter().min_by_key(|clause| clause.membership.len()) {
+                let mut ids = seed.membership.clone();
+                for clause in &must {
+                    if !std::ptr::eq(clause, seed) {
+                        ids.retain(|id| clause.membership.contains(id));
+                    }
                 }
-            }
-            result.insert(id, hit);
+                ids
+            } else if minimum_should_match > 0 {
+                let mut counts = BTreeMap::<u64, usize>::new();
+                for clause in &should {
+                    for &id in &clause.membership {
+                        *counts.entry(id).or_default() += 1;
+                    }
+                }
+                counts
+                    .into_iter()
+                    .filter_map(|(id, count)| (count >= minimum_should_match).then_some(id))
+                    .collect()
+            } else {
+                let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
+                coordinator.filter_membership(&empty).await?.ids
+            };
+        if !must.is_empty() && minimum_should_match > 0 {
+            membership.retain(|id| {
+                should
+                    .iter()
+                    .filter(|clause| clause.membership.contains(id))
+                    .count()
+                    >= minimum_should_match
+            });
         }
-        Ok(result)
+        for clause in &must_not {
+            membership.retain(|id| !clause.membership.contains(id));
+        }
+
+        let membership_wire_bytes =
+            must.iter()
+                .chain(&should)
+                .chain(&must_not)
+                .try_fold(0u64, |total, node| {
+                    total
+                        .checked_add(node.membership_wire_bytes)
+                        .ok_or_else(|| {
+                            Status::resource_exhausted("Boolean membership byte count overflow")
+                        })
+                })?;
+        let mut searches = Vec::new();
+        let mut matchers = Vec::new();
+        for mut node in must.into_iter().chain(should) {
+            searches.append(&mut node.searches);
+            matchers.append(&mut node.matchers);
+        }
+        Ok(PlannedBooleanNode {
+            membership,
+            searches,
+            matchers,
+            membership_wire_bytes,
+        })
     })
+}
+
+async fn score_boolean_plan(
+    coordinator: &CoordinatorServiceImpl,
+    plan: &PlannedBooleanNode,
+) -> Result<BTreeMap<u64, BooleanHit>, Status> {
+    let mut hits: BTreeMap<u64, BooleanHit> = plan
+        .membership
+        .iter()
+        .copied()
+        .map(|id| (id, BooleanHit::default()))
+        .collect();
+    for matcher in &plan.matchers {
+        for &id in plan.membership.intersection(&matcher.membership) {
+            hits.get_mut(&id)
+                .expect("planned membership owns every matcher id")
+                .matched
+                .push(matcher.id.clone());
+        }
+    }
+    for leaf in &plan.searches {
+        let candidates: Vec<u64> = plan
+            .membership
+            .intersection(&leaf.membership)
+            .copied()
+            .collect();
+        for chunk in candidates.chunks(coordinator.max_k() as usize) {
+            let scores = match &leaf.kind {
+                PlannedSearchKind::Lexical {
+                    terms,
+                    epochs,
+                    score_stages,
+                } => {
+                    coordinator
+                        .lexical_signal_terms_with_stages(terms, chunk, Some(epochs), score_stages)
+                        .await?
+                }
+                PlannedSearchKind::Dense { vector, exact_fp32 } => {
+                    if *exact_fp32 {
+                        coordinator.exact_vector_scores(vector, chunk).await?.scores
+                    } else {
+                        coordinator.dense_signal(vector, chunk).await?
+                    }
+                }
+            };
+            for &id in chunk {
+                let Some(&score) = scores.get(&id) else {
+                    return Err(Status::failed_precondition(format!(
+                        "boolean membership selected doc {id} for scoring clause {:?}, but candidate rescore did not return it",
+                        leaf.id
+                    )));
+                };
+                let hit = hits
+                    .get_mut(&id)
+                    .expect("planned membership owns every scored id");
+                hit.score += score;
+                hit.signals.push(QuerySignal {
+                    id: leaf.id.clone(),
+                    score,
+                });
+            }
+        }
+    }
+    Ok(hits)
 }
 
 fn boolean_ids<'a>(
@@ -418,7 +499,7 @@ async fn execute_recursive_boolean(
     }
     if req.selection_k != 0 {
         return Err(refuse(
-            "selection_k is not used by exhaustive recursive boolean selection; leave it zero",
+            "selection_k is not used by exact bitmap Boolean selection; leave it zero",
         ));
     }
     let cursor = if req.cursor.is_empty() {
@@ -467,8 +548,26 @@ async fn execute_recursive_boolean(
     let boosts = parse_boolean_boosts(&req.boosts, scorer.is_some(), scored)?;
     let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
     let t_selection = std::time::Instant::now();
-    let universe = browse_all(coordinator, &empty).await?;
-    let evaluated = evaluate_boolean_group(coordinator, boolean, &universe, 1).await?;
+    let evaluated = {
+        let mut attempt = 0;
+        loop {
+            let plan = plan_boolean_group(coordinator, boolean, 1).await?;
+            let _membership_wire_bytes = plan.membership_wire_bytes;
+            match score_boolean_plan(coordinator, &plan).await {
+                Err(status) if status.code() == tonic::Code::Aborted && attempt == 0 => {
+                    attempt += 1;
+                }
+                Err(status) if status.code() == tonic::Code::Aborted => {
+                    return Err(Status::failed_precondition(format!(
+                        "the lexical generation changed twice while planning this Boolean query; retry against a stable generation: {}",
+                        status.message()
+                    )));
+                }
+                Err(status) => return Err(status),
+                Ok(hits) => break hits,
+            }
+        }
+    };
     let mut hits: Vec<QueryHit> = evaluated
         .into_iter()
         .map(|(doc_id, hit)| QueryHit {
@@ -503,7 +602,7 @@ async fn execute_recursive_boolean(
         coordinator,
         &scorer,
         &mut hits,
-        "boolean:exhaustive",
+        "boolean:bitmap",
         &mut profile,
     )
     .await?;

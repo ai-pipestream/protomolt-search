@@ -18,8 +18,8 @@ use pipestream_search::pb::{
     FilterQuery, FlushRequest, FusionMode, HealthRequest, HybridLegOptions, HybridSearchRequest,
     IntegerValue, LexicalQuery, QueryRequest, QueryResponse, QuerySort, QueryStreamCompletion,
     QueryStreamPhase, QueryStreamRequest, QueryStreamResponse, QueryStreamRevision, RrfScore,
-    SearchQuery, SearchRequest, SelectionOperator, SelectionQuery, SelectionScoreStrategy,
-    SetCalibrationRequest, VectorQualityContract,
+    ScoreOp, ScoreStage, SearchQuery, SearchRequest, SelectionOperator, SelectionQuery,
+    SelectionScoreStrategy, SetCalibrationRequest, VectorQualityContract,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -1034,7 +1034,7 @@ async fn recursive_boolean_is_exact_across_hybrid_signals_filters_aggregation_an
     )
     .await
     .unwrap();
-    assert_eq!(full.executed, "boolean:exhaustive");
+    assert_eq!(full.executed, "boolean:bitmap");
     let mut matched: Vec<u64> = full.hits.iter().map(|hit| hit.doc_id).collect();
     matched.sort_unstable();
     assert_eq!(matched, vec![1, 2, 4]);
@@ -1139,6 +1139,60 @@ async fn recursive_boolean_is_exact_across_hybrid_signals_filters_aggregation_an
             .map(|hit| (hit.doc_id, hit.score.to_bits()))
             .collect::<Vec<_>>(),
         full.hits
+            .iter()
+            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boolean_candidate_rescore_preserves_the_ordinary_score_stage_bits() {
+    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let lexical = || SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: "body".into(),
+            query: Some(search_query::Query::Lexical(LexicalQuery {
+                text: "document".into(),
+                score_stages: vec![ScoreStage {
+                    op: ScoreOp::AddLinear as i32,
+                    column: "year".into(),
+                    weight: 0.125,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        })),
+    };
+    let ordinary = query(
+        &coordinator,
+        QueryRequest {
+            k: N_DOCS as u32,
+            selection: Some(lexical()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let planned = query(
+        &coordinator,
+        QueryRequest {
+            k: N_DOCS as u32,
+            selection: Some(boolean(vec![lexical()], Vec::new(), Vec::new(), 0, None)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(planned.executed, "boolean:bitmap");
+    assert_eq!(planned.hits.len(), ordinary.hits.len());
+    assert_eq!(
+        planned
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        ordinary
+            .hits
             .iter()
             .map(|hit| (hit.doc_id, hit.score.to_bits()))
             .collect::<Vec<_>>()

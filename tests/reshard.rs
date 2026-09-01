@@ -29,12 +29,14 @@ use pipestream_search::bm25::{self, CorpusStats};
 use pipestream_search::harness::{build_monolithic, mock_analysis};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::wal::LoggedAddVectors;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, CommitReplacementsRequest,
     DeleteDocumentsRequest, FlushRequest, Replacement, SetCalibrationRequest,
 };
 use pipestream_search::phrases::PhraseIndex;
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
+use pipestream_search::segments::{SegmentCatalog, SegmentSource};
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 use pipestream_search::{analyzer, reshard};
 use tokio::sync::mpsc;
@@ -680,6 +682,67 @@ fn reshard_refuses_a_log_with_preexisting_state() {
     assert!(err.contains("preexisting"), "{err}");
 }
 
+#[test]
+fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
+    let dir = tempdir("straddled_bucket");
+    let calibration = unit_vectors(32, DIM, 0xBADD_BA7C);
+    let config =
+        VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, DIM, BIT_WIDTH, &calibration).unwrap();
+    let mut manifest = pipestream_search::wal::WalManifest {
+        dim: DIM as u32,
+        vector_backend: String::new(),
+        vector_config_format: String::new(),
+        vector_config_payload: Vec::new(),
+        bit_width: 0,
+        calibration_shift: Vec::new(),
+        calibration_scale: Vec::new(),
+        slot_offset: 0,
+        generation: 0,
+        bucket_bits: 2,
+        bucket_count: 4,
+        preexisting_vectors: 0,
+        preexisting_documents: 0,
+        format_version: pipestream_search::wal::FORMAT_VERSION,
+    };
+    manifest.set_backend_config(config);
+    let mut writer = pipestream_search::wal::WalWriter::create(&dir, manifest).unwrap();
+    let first = (0u64..)
+        .find(|id| reshard::bucket_of(*id, 4) != reshard::bucket_of(id + 1, 4))
+        .unwrap();
+    writer
+        .append(pipestream_search::pb::wal::wal_record::Op::AddVectors(
+            LoggedAddVectors {
+                first_id: first,
+                batch: Some(AddVectorsRequest {
+                    vectors: unit_vectors(2, DIM, 0xBAD0_0001),
+                    dim: DIM as u32,
+                }),
+                stable_routing_keys: Vec::new(),
+            },
+        ))
+        .unwrap();
+    writer.flush().unwrap();
+    let generation = writer.dir().to_path_buf();
+    drop(writer);
+    let mut analyze =
+        |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
+            unreachable!("invalid WAL must fail before analysis")
+        };
+    let error = reshard::split_logs_segmented(
+        &[generation],
+        1,
+        &dir.join("out"),
+        0,
+        1_000,
+        true,
+        None,
+        &mut analyze,
+    )
+    .unwrap_err();
+    assert!(error.contains("straddles WAL buckets"), "{error}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// A one-child reshard is compaction: delete and replacement records remove
 /// old physical rows, while the already-appended replacement survives under
 /// its stable source id in the child parent map.
@@ -730,6 +793,90 @@ async fn one_child_reshard_compacts_generation_tombstones() {
     assert!(!child.parent_ids.contains(&3));
     assert!(!child.parent_ids.contains(&7));
     assert!(child.parent_ids.contains(&31));
+
+    // The segmented path seals one WAL bucket at a time. The node logs one row
+    // per routed record, so each delete is applied in the same bucket as the
+    // row it retires.
+    let catalog = SegmentCatalog::open(dir.join("catalog")).unwrap();
+    catalog
+        .append(SegmentSource {
+            segment_id: "parent",
+            generation: 0,
+            base_label: 0,
+            backend_kind: EMBEDDED_TURBOVEC,
+            vector_path: &index_path,
+            exact_vector_path: &pipestream_search::node::exact_vector_sidecar_path(&index_path),
+            bm25_path: &pipestream_search::node::bm25_sidecar_path(&index_path),
+            live_docs_path: &pipestream_search::node::live_docs_sidecar_path(&index_path),
+        })
+        .unwrap();
+    let published = catalog
+        .compact_wal_generations(
+            &["parent".into()],
+            std::slice::from_ref(&gen),
+            &dir.join("compacted-segments"),
+            EMBEDDED_TURBOVEC,
+            0,
+            1_000,
+            None,
+            &mut replay_analyzer(&analysis_addr),
+        )
+        .unwrap();
+    let segmented = published.output;
+    assert_eq!(published.snapshot.manifest().segments.len(), 8);
+    assert_eq!(
+        published
+            .snapshot
+            .manifest()
+            .segments
+            .iter()
+            .map(|segment| segment.live_rows)
+            .sum::<u64>(),
+        (rows - 2) as u64
+    );
+    assert!(segmented.segments.len() > 1);
+    assert!(segmented.peak_replay_rows < rows as u64);
+    assert_eq!(
+        segmented
+            .segments
+            .iter()
+            .map(|segment| segment.image.num_vectors)
+            .sum::<u64>(),
+        (rows - 2) as u64
+    );
+    assert!(segmented.segments.iter().all(|segment| {
+        !segment.image.parent_ids.contains(&3) && !segment.image.parent_ids.contains(&7)
+    }));
+    let mut compacted = VectorIndex::load(EMBEDDED_TURBOVEC, &child.vector_path).unwrap();
+    compacted.prepare().unwrap();
+    let physical: Vec<(&reshard::ChildImage, VectorIndex)> = segmented
+        .segments
+        .iter()
+        .map(|segment| {
+            let mut index =
+                VectorIndex::load(EMBEDDED_TURBOVEC, &segment.image.vector_path).unwrap();
+            index.prepare().unwrap();
+            (&segment.image, index)
+        })
+        .collect();
+    for q in 0..4u64 {
+        let query = unit_vectors(1, DIM, 0x5E61_0000 + q);
+        let expected = topk(&compacted, &query, 10, |local| {
+            child.parent_ids[local as usize]
+        });
+        let mut got: Vec<(u64, u32)> = physical
+            .iter()
+            .flat_map(|(image, index)| {
+                topk(index, &query, 10, |local| image.parent_ids[local as usize])
+            })
+            .collect();
+        got.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        got.truncate(10);
+        assert_eq!(
+            got, expected,
+            "query {q}: segmented compaction changed top-k"
+        );
+    }
     std::fs::remove_dir_all(dir).ok();
 }
 

@@ -118,13 +118,21 @@ no node in `must_not` may match, and at least `minimum_should_match` nodes in
 clauses and to zero when a MUST clause already establishes membership. A value
 larger than the SHOULD list is invalid.
 
-The current planner enumerates the document-id universe and evaluates existing
-candidate-scoped BM25, exact vector, CEL, and geo seams against it. It is exact
-and deliberately exhaustive. ANN cannot certify recursive membership and is
-refused. The universe is the mapped document-slot space, so vector-only rows
-without corresponding document slots do not participate in this
-document-semantic query form. Matching positive search-clause scores sum unless
-the request supplies the generic composite scorer. Filter clauses and negative
+The planner resolves compact membership bitmaps at the shards. It analyzes each
+lexical clause once, intersects required clauses starting with the smallest
+estimated set, counts SHOULD membership only when needed, subtracts MUST_NOT,
+and uses the live-document bitmap only for a negative-only group. It then runs
+BM25, score stages, and vector scoring only for the surviving ids. BM25 uses the
+same global statistics as the ordinary lexical route. A shard statistics epoch
+change aborts the attempt; the coordinator retries the complete plan once and
+then fails rather than combining generations.
+
+This is exact set algebra, not a candidate-depth heuristic. ANN cannot certify
+recursive membership and is refused. Each leaf contributes its actual indexed
+domain: lexical and filter leaves contain document rows, while a dense leaf can
+also contain a live vector-only row. Intersections naturally remove rows absent
+from a required domain. Matching positive search-clause scores sum unless the
+request supplies the generic composite scorer. Filter clauses and negative
 search clauses contribute membership and provenance but no score. Dense and
 lexical clauses in the same boolean group are the recursive hybrid form; the
 older `CompositeSearchStrategy` remains a top-level compatibility route for
@@ -458,7 +466,7 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | projections on dense/composite/browse | `FetchValues` post-selection fetch, same semantics |
 | any scored shape + composite scorer | the route above, then the coordinator-side scorer (`src/ltr.rs`) |
 | projections on any other shape; stored-value dimensions | `FetchValues` candidate-scoped fan-out, post-selection |
-| recursive boolean selection | exhaustive id browse plus candidate-scoped BM25/vector/CEL evaluation |
+| recursive boolean selection | exact shard membership bitmaps plus candidate-scoped BM25/vector scoring |
 | root boolean aggregation | `AggregateShard` with an explicit exact id allowlist |
 
 `selection_k` maps to the hybrid leg depth or the FP32 rerank pool; the
@@ -486,9 +494,8 @@ logic. Vector-plus-CEL has since acquired its ordinary path
 carry `geo_filters` and a CEL `filter`, and every fusion mode applies them to
 both legs. Legacy composites cannot be nested inside `BooleanQuery`: callers
 express the same dense/lexical membership as boolean clauses. Unsupported ANN
-membership, nested aggregation, column sorting of boolean relevance, and
-candidate-scoped lexical score stages return `INVALID_ARGUMENT`; compatibility
-never authorizes a heuristic substitute.
+membership, nested aggregation, and column sorting of boolean relevance return
+`INVALID_ARGUMENT`; compatibility never authorizes a heuristic substitute.
 
 ## Paging
 
@@ -513,8 +520,8 @@ the pool is never silently deepened; exhaustion refuses and names
 always mints `next_cursor`; a short page provably has nothing after it
 at the served depth and mints none.
 
-A recursive boolean query re-evaluates its exhaustive exact order on every
-page and resumes at the same score/id boundary. Its optional aggregation is
+A recursive boolean query rebuilds its exact bitmap plan and score order on
+every page and resumes at the same score/id boundary. Its optional aggregation is
 therefore identical on every page and always describes the full match set,
 not the returned slice.
 

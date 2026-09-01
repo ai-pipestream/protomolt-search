@@ -309,6 +309,18 @@ pub struct Config {
     pub replica_sync_ms: u64,
     /// Durable per-pair WAL cursors. Required whenever replica sync is on.
     pub replica_state_path: Option<PathBuf>,
+    /// Durable autonomous membership and placement authority. When set, the
+    /// coordinator also serves ClusterControl and publishes its topology.
+    pub control_state_path: Option<PathBuf>,
+    /// Autonomous lease/placement reconciliation interval. Zero disables the
+    /// timer while retaining the explicit ReconcileCluster RPC.
+    pub control_reconcile_ms: u64,
+    pub control_lease_ms: u64,
+    pub control_replication_factor: usize,
+    pub control_split_rows: u64,
+    pub control_merge_rows: u64,
+    pub control_compact_segments: u32,
+    pub control_compact_tombstone_ppm: u32,
     /// Documents per vocabulary window before automatic rollover (only
     /// relevant to shards with `vocab` enabled).
     pub vocab_window_docs: u64,
@@ -377,6 +389,14 @@ struct FileConfig {
     shard_map_reload_ms: Option<u64>,
     replica_sync_ms: Option<u64>,
     replica_state: Option<String>,
+    control_state: Option<String>,
+    control_reconcile_ms: Option<u64>,
+    control_lease_ms: Option<u64>,
+    control_replication_factor: Option<usize>,
+    control_split_rows: Option<u64>,
+    control_merge_rows: Option<u64>,
+    control_compact_segments: Option<u32>,
+    control_compact_tombstone_ppm: Option<u32>,
     shards: Vec<FileShard>,
 }
 
@@ -996,6 +1016,89 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     if replica_sync_ms > 0 && replica_state_path.is_none() {
         return Err("automatic replica sync requires --replica-state or --shard-map".to_string());
     }
+    let control_state_path = opt(
+        args,
+        "control-state",
+        "PIPESTREAM_SEARCH_CONTROL_STATE",
+        file.control_state.as_deref(),
+    )
+    .map(PathBuf::from);
+    if control_state_path.is_some() && shard_map.is_none() {
+        return Err("--control-state requires a generation-stamped --shard-map".to_string());
+    }
+    let parse_control_u64 =
+        |key: &str, env: &str, file_value: Option<u64>, default: u64| -> Result<u64, String> {
+            opt(
+                args,
+                key,
+                env,
+                file_value.map(|value| value.to_string()).as_deref(),
+            )
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid --{key}: {error}"))
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+        };
+    let control_reconcile_ms = parse_control_u64(
+        "control-reconcile-ms",
+        "PIPESTREAM_SEARCH_CONTROL_RECONCILE_MS",
+        file.control_reconcile_ms,
+        u64::from(control_state_path.is_some()) * 1_000,
+    )?;
+    let control_lease_ms = parse_control_u64(
+        "control-lease-ms",
+        "PIPESTREAM_SEARCH_CONTROL_LEASE_MS",
+        file.control_lease_ms,
+        15_000,
+    )?;
+    let control_replication_factor = usize::try_from(parse_control_u64(
+        "control-replication-factor",
+        "PIPESTREAM_SEARCH_CONTROL_REPLICATION_FACTOR",
+        file.control_replication_factor.map(|value| value as u64),
+        2,
+    )?)
+    .map_err(|_| "--control-replication-factor does not fit usize".to_string())?;
+    let control_split_rows = parse_control_u64(
+        "control-split-rows",
+        "PIPESTREAM_SEARCH_CONTROL_SPLIT_ROWS",
+        file.control_split_rows,
+        25_000_000,
+    )?;
+    let control_merge_rows = parse_control_u64(
+        "control-merge-rows",
+        "PIPESTREAM_SEARCH_CONTROL_MERGE_ROWS",
+        file.control_merge_rows,
+        2_000_000,
+    )?;
+    let control_compact_segments = u32::try_from(parse_control_u64(
+        "control-compact-segments",
+        "PIPESTREAM_SEARCH_CONTROL_COMPACT_SEGMENTS",
+        file.control_compact_segments.map(u64::from),
+        8,
+    )?)
+    .map_err(|_| "--control-compact-segments exceeds u32".to_string())?;
+    let control_compact_tombstone_ppm = u32::try_from(parse_control_u64(
+        "control-compact-tombstone-ppm",
+        "PIPESTREAM_SEARCH_CONTROL_COMPACT_TOMBSTONE_PPM",
+        file.control_compact_tombstone_ppm.map(u64::from),
+        100_000,
+    )?)
+    .map_err(|_| "--control-compact-tombstone-ppm exceeds u32".to_string())?;
+    if control_state_path.is_some()
+        && (!matches!(role, Role::Coordinator | Role::Both)
+            || control_replication_factor == 0
+            || control_lease_ms < 1_000
+            || control_split_rows == 0
+            || control_merge_rows == 0
+            || control_compact_segments == 0
+            || control_compact_tombstone_ppm == 0
+            || control_compact_tombstone_ppm > 1_000_000)
+    {
+        return Err("control plane requires coordinator/both role, positive thresholds and replication factor, lease >= 1000ms, and tombstone ppm <= 1000000".to_string());
+    }
 
     let max_message_bytes = opt(
         args,
@@ -1382,6 +1485,14 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         shard_map_reload_ms,
         replica_sync_ms,
         replica_state_path,
+        control_state_path,
+        control_reconcile_ms,
+        control_lease_ms,
+        control_replication_factor,
+        control_split_rows,
+        control_merge_rows,
+        control_compact_segments,
+        control_compact_tombstone_ppm,
         vocab_window_docs,
         vocab_top_k,
     })
@@ -1795,6 +1906,54 @@ slot_offset = 20000
             "--rerank-parallel=65"
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn durable_control_requires_a_coordinator_map_and_parses_policy() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let map = dir.join(format!("control-map-{}.toml", std::process::id()));
+        let state = dir.join(format!("control-state-{}.json", std::process::id()));
+        std::fs::write(
+            &map,
+            "generation = 4\n\n[[shards]]\naddr = \"node:50051\"\nslot_offset = 0\n",
+        )
+        .unwrap();
+        let cfg = parse(&args(&[
+            "--role=coordinator",
+            &format!("--shard-map={}", map.display()),
+            &format!("--control-state={}", state.display()),
+            "--control-reconcile-ms=250",
+            "--control-lease-ms=5000",
+            "--control-replication-factor=3",
+            "--control-split-rows=1000",
+            "--control-merge-rows=100",
+            "--control-compact-segments=6",
+            "--control-compact-tombstone-ppm=50000",
+        ]))
+        .unwrap();
+        assert_eq!(cfg.control_state_path.as_deref(), Some(state.as_path()));
+        assert_eq!(cfg.control_reconcile_ms, 250);
+        assert_eq!(cfg.control_lease_ms, 5_000);
+        assert_eq!(cfg.control_replication_factor, 3);
+        assert_eq!(cfg.control_split_rows, 1_000);
+        assert_eq!(cfg.control_merge_rows, 100);
+        assert_eq!(cfg.control_compact_segments, 6);
+        assert_eq!(cfg.control_compact_tombstone_ppm, 50_000);
+        assert!(parse(&args(&[
+            "--role=coordinator",
+            "--nodes=node:50051",
+            &format!("--control-state={}", state.display()),
+        ]))
+        .is_err());
+        assert!(parse(&args(&[
+            "--role=coordinator",
+            &format!("--shard-map={}", map.display()),
+            &format!("--control-state={}", state.display()),
+            "--control-compact-segments=4294967296",
+        ]))
+        .is_err());
+        std::fs::remove_file(map).unwrap();
     }
 
     #[test]

@@ -127,6 +127,27 @@ pub struct StableReshardOutput {
     pub source_cutoffs: Vec<WalCutoff>,
 }
 
+/// One immutable segment emitted by bucket-bounded resharding. Several
+/// segments may belong to one logical hash shard; [`crate::segments`] opens
+/// and searches them as one snapshot with global BM25 statistics.
+#[derive(Debug)]
+pub struct SegmentedChildImage {
+    pub logical_shard: usize,
+    pub segment_ordinal: usize,
+    pub physical_rows: u64,
+    pub image: ChildImage,
+}
+
+/// Bucket-bounded reshard result. Memory holds at most one WAL bucket's live
+/// replay plus one segment build, never a whole child or corpus.
+#[derive(Debug)]
+pub struct SegmentedReshardOutput {
+    pub generation: u64,
+    pub logical_shards: usize,
+    pub segments: Vec<SegmentedChildImage>,
+    pub peak_replay_rows: u64,
+}
+
 /// Vectors and documents replayed out of bucket files, keyed by their
 /// server-assigned global ids (BTreeMap iteration IS id order).
 #[derive(Default)]
@@ -229,6 +250,12 @@ fn replay_buckets(
                             ));
                         }
                         let id = a.first_id + i as u64;
+                        if bucket_of(id, bucket_count) as u32 != bucket {
+                            return Err(format!(
+                                "replay {}: vector batch straddles WAL buckets at id {id}",
+                                path.display()
+                            ));
+                        }
                         if out.vectors.insert(id, vector.to_vec()).is_some() {
                             return Err(format!(
                                 "replay {}: duplicate vector id {}",
@@ -271,6 +298,12 @@ fn replay_buckets(
                     }
                     for (i, doc) in a.documents.into_iter().enumerate() {
                         let id = a.first_id + i as u64;
+                        if bucket_of(id, bucket_count) as u32 != bucket {
+                            return Err(format!(
+                                "replay {}: document batch straddles WAL buckets at id {id}",
+                                path.display()
+                            ));
+                        }
                         if out.documents.insert(id, doc).is_some() {
                             return Err(format!(
                                 "replay {}: duplicate document id {}",
@@ -1050,6 +1083,186 @@ pub fn split_logs(
     Ok(ReshardOutput {
         generation: top_generation + 1,
         children,
+    })
+}
+
+/// Repartition full-history WALs into immutable, bucket-sized segments.
+///
+/// This is the spillable counterpart of [`split_logs`]. The ordinary path
+/// accumulates every row of one output child before encoding it; this path
+/// replays one WAL bucket across all input generations, applies its
+/// deletes/replacements, and immediately seals each non-empty output segment.
+/// WAL writers emit one vector/document row per record; replay rejects a
+/// foreign batch that straddles buckets. A logical shard can contain many
+/// physical segments, merged exactly by [`crate::segments::OpenedSegmentSet`].
+/// WAL bucket count controls the replay bound without changing query semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn split_logs_segmented(
+    gens: &[PathBuf],
+    n: usize,
+    out_dir: &Path,
+    slot_base: u64,
+    slot_stride: u64,
+    vectors_only: bool,
+    bm25_fields: Option<&[String]>,
+    analyze: &mut Analyzer,
+) -> Result<SegmentedReshardOutput, String> {
+    if !n.is_power_of_two() {
+        return Err(format!(
+            "segmented split factor must be a positive power of two, got {n}"
+        ));
+    }
+    if slot_stride == 0 {
+        return Err("segmented split slot_stride must be positive".into());
+    }
+    let Some(first_gen) = gens.first() else {
+        return Err("segmented split requires at least one input generation".into());
+    };
+    let manifest = read_gen_manifest(first_gen)?;
+    require_backend_config(&manifest, first_gen)?;
+    require_complete_history(&manifest, first_gen)?;
+    let mut top_generation = manifest.generation;
+    for gen in gens.iter().skip(1) {
+        let current = read_gen_manifest(gen)?;
+        require_backend_config(&current, gen)?;
+        require_complete_history(&current, gen)?;
+        if !same_backend_config(&manifest, &current) {
+            return Err(format!(
+                "{}: vector backend configuration differs from the first input",
+                gen.display()
+            ));
+        }
+        if current.bucket_count != manifest.bucket_count {
+            return Err(format!(
+                "{}: bucket count {} differs from the first input's {}",
+                gen.display(),
+                current.bucket_count,
+                manifest.bucket_count
+            ));
+        }
+        top_generation = top_generation.max(current.generation);
+    }
+    let binding = read_gens_binding(gens)?;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| format!("mkdir {}: {error}", out_dir.display()))?;
+    let mut next_slots: Vec<u64> = (0..n)
+        .map(|shard| {
+            let shard = u64::try_from(shard)
+                .map_err(|_| "segmented split shard index does not fit u64".to_string())?;
+            let delta = shard
+                .checked_mul(slot_stride)
+                .ok_or_else(|| "segmented split slot base overflow".to_string())?;
+            slot_base
+                .checked_add(delta)
+                .ok_or_else(|| "segmented split slot base overflow".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let mut segment_counts = vec![0usize; n];
+    let mut segments = Vec::new();
+    let mut peak_replay_rows = 0u64;
+
+    for bucket in 0..manifest.bucket_count {
+        let mut replay = Replay::default();
+        for gen in gens {
+            replay_buckets(
+                gen,
+                bucket..bucket + 1,
+                manifest.bucket_count as usize,
+                manifest.dim as usize,
+                vectors_only,
+                &mut replay,
+            )?;
+        }
+        replay.compact();
+        let live_ids: BTreeSet<u64> = replay
+            .vectors
+            .keys()
+            .chain(replay.documents.keys())
+            .copied()
+            .collect();
+        peak_replay_rows = peak_replay_rows.max(live_ids.len() as u64);
+        if live_ids.is_empty() {
+            continue;
+        }
+        let stable_keys = replay.stable_keys;
+        let mut partitions: Vec<Replay> = (0..n).map(|_| Replay::default()).collect();
+        for (id, vector) in replay.vectors {
+            let shard = bucket_of(id, n);
+            partitions[shard].vectors.insert(id, vector);
+            if let Some(key) = stable_keys.get(&id) {
+                partitions[shard].stable_keys.insert(id, key.clone());
+            }
+        }
+        for (id, document) in replay.documents {
+            let shard = bucket_of(id, n);
+            partitions[shard].documents.insert(id, document);
+            if let Some(key) = stable_keys.get(&id) {
+                partitions[shard].stable_keys.insert(id, key.clone());
+            }
+        }
+        for (logical_shard, partition) in partitions.into_iter().enumerate() {
+            let ids: BTreeSet<u64> = partition
+                .vectors
+                .keys()
+                .chain(partition.documents.keys())
+                .copied()
+                .collect();
+            let physical_rows = ids.len() as u64;
+            if physical_rows == 0 {
+                continue;
+            }
+            let logical_ordinal = u64::try_from(logical_shard)
+                .map_err(|_| "segmented split shard index does not fit u64")?;
+            let logical_end = logical_ordinal
+                .checked_add(1)
+                .and_then(|ordinal| ordinal.checked_mul(slot_stride))
+                .and_then(|delta| slot_base.checked_add(delta))
+                .ok_or_else(|| "segmented split slot range overflow".to_string())?;
+            let end = next_slots[logical_shard]
+                .checked_add(physical_rows)
+                .ok_or_else(|| "segmented split physical row range overflow".to_string())?;
+            if end > logical_end {
+                return Err(format!(
+                    "segmented child {logical_shard} needs stable ids through {end}, above its reserved slot range ending at {logical_end}; raise slot_stride"
+                ));
+            }
+            let shift = if n == 1 { 0 } else { 64 - n.trailing_zeros() };
+            let hash_lo = if n == 1 { 0 } else { logical_ordinal << shift };
+            let hash_hi = if logical_shard + 1 == n {
+                u64::MAX
+            } else {
+                ((logical_ordinal + 1) << shift) - 1
+            };
+            let ordinal = segments.len();
+            let image = finish_child(
+                &manifest,
+                partition,
+                ordinal,
+                out_dir,
+                next_slots[logical_shard],
+                hash_lo,
+                hash_hi,
+                bm25_fields,
+                binding.as_ref(),
+                analyze,
+            )?;
+            segments.push(SegmentedChildImage {
+                logical_shard,
+                segment_ordinal: segment_counts[logical_shard],
+                physical_rows,
+                image,
+            });
+            segment_counts[logical_shard] += 1;
+            next_slots[logical_shard] = end;
+        }
+    }
+    Ok(SegmentedReshardOutput {
+        generation: top_generation
+            .checked_add(1)
+            .ok_or_else(|| "segmented reshard generation overflow".to_string())?,
+        logical_shards: n,
+        segments,
+        peak_replay_rows,
     })
 }
 
