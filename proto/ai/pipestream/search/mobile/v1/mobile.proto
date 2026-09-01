@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package ai.pipestream.search.mobile.v1;
+
+import "ai/pipestream/search/v1/search.proto";
+
+// Configuration for one private shard in an embedded mobile runtime. The
+// bridge accepts no endpoint, hostname, sidecar, or embedding-provider field:
+// all analysis and shard transport are forced in-process by EmbeddedSearch.
+message MobileShardConfig {
+  // Empty only when in_memory is true. Mobile hosts should normally pass a
+  // path inside their private application container.
+  string index_path = 1;
+  bool in_memory = 2;
+  uint64 slot_offset = 3;
+  bool allow_missing_bm25 = 4;
+
+  optional string vector_backend = 5;
+  optional uint32 bit_width = 6;
+  repeated string bm25_fields = 7;
+  repeated string facet_fields = 8;
+  repeated string numeric_fields = 9;
+  repeated string map_facet_fields = 10;
+  repeated string map_numeric_fields = 11;
+  repeated string integer_fields = 12;
+  repeated string geo_fields = 13;
+
+  optional bool wal = 14;
+  optional uint32 wal_buckets = 15;
+  optional bool vocab = 16;
+  optional uint64 vocab_window_docs = 17;
+  optional uint32 vocab_top_k = 18;
+  optional uint32 chunk_blocks = 19;
+  optional bool share_floors = 20;
+  optional bool block_max = 21;
+  optional float floor_delta = 22;
+  optional uint32 floor_warmup_chunks = 23;
+  optional uint64 floor_min_interval_ms = 24;
+  optional bool coalesce = 25;
+  optional uint32 scan_parallel = 26;
+  optional uint32 rerank_parallel = 27;
+}
+
+// The complete create/open request. Optional scalars preserve the Rust
+// engine defaults when absent, instead of assigning proto3's zero value a
+// second meaning.
+message MobileOpenRequest {
+  repeated MobileShardConfig shards = 1;
+  optional double bm25_k1 = 2;
+  optional double bm25_b = 3;
+  optional bool stream_search = 4;
+  optional bool bm25_stream = 5;
+  optional uint32 max_k = 6;
+  optional uint64 max_rerank_bytes = 7;
+  uint64 topology_generation = 8;
+}
+
+message MobileOpenResponse {
+  uint64 handle = 1;
+  uint32 shard_count = 2;
+  bool no_egress = 3;
+}
+
+// One host call can carry the ordered sequence needed by mapped ingest, for
+// example a plan bind followed by document payloads.
+message MobileIngestMappedBatch {
+  uint32 shard = 1;
+  repeated ai.pipestream.search.v1.IngestMappedRequest requests = 2;
+}
+
+message MobileFlushResponse {
+  repeated ai.pipestream.search.v1.FlushResponse shards = 1;
+}
+
+message MobileCloseResponse {
+  bool closed = 1;
+}
+
+message MobileQueryStreamOpenResponse {
+  uint64 stream_handle = 1;
+}
+
+message MobileQueryStreamNextResponse {
+  // Absent only when end is true. Every present response is the ordinary
+  // public QueryStreamResponse, including its terminal certificate.
+  ai.pipestream.search.v1.QueryStreamResponse response = 1;
+  bool end = 2;
+}
+
+enum MobileErrorCode {
+  MOBILE_ERROR_CODE_UNSPECIFIED = 0;
+  MOBILE_ERROR_CODE_INVALID_ARGUMENT = 1;
+  MOBILE_ERROR_CODE_NOT_FOUND = 2;
+  MOBILE_ERROR_CODE_ALREADY_EXISTS = 3;
+  MOBILE_ERROR_CODE_FAILED_PRECONDITION = 4;
+  MOBILE_ERROR_CODE_CANCELLED = 5;
+  MOBILE_ERROR_CODE_INTERNAL = 6;
+}
+
+message MobileError {
+  MobileErrorCode code = 1;
+  string message = 2;
+}
+
+// Every exported bridge call returns exactly one encoded MobileResponse.
+// payload is the encoded response named by that operation. Errors never
+// cross a C/JNI boundary as exceptions or Rust panics.
+message MobileResponse {
+  oneof outcome {
+    bytes payload = 1;
+    MobileError error = 2;
+  }
+}

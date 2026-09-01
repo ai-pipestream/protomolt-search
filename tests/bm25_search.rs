@@ -729,7 +729,7 @@ async fn bm25_stream_candidates_end_in_a_scoring_certificate() {
         match message.payload {
             Some(bm25_query_stream_response::Payload::CandidateBatch(batch)) => {
                 assert_eq!(batch.candidates.len() % 12, 0);
-                for record in batch.candidates.chunks_exact(12) {
+                for record in batch.candidates.as_chunks::<12>().0 {
                     candidates.push((
                         u64::from_le_bytes(record[..8].try_into().unwrap()),
                         f32::from_le_bytes(record[8..12].try_into().unwrap()).to_bits(),

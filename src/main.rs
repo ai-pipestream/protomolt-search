@@ -26,9 +26,10 @@ use std::path::Path;
 
 use pipestream_search::clustered_turbovec::ClusteredTurboVecBackend;
 use pipestream_search::config::{
-    parse, ClusteredTurboVecConfig, Config, DemoConfig, Role, ShardConfig,
+    load_shard_map, normalize_addr, parse, ClusteredTurboVecConfig, Config, DemoConfig, Role,
+    ShardConfig, ShardMap,
 };
-use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::coordinator::{CoordinatorServiceImpl, TopologyRoute};
 use pipestream_search::harness;
 use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -39,6 +40,29 @@ use pipestream_search::pb::{
 use pipestream_search::vector::VectorIndex;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
+
+fn topology_routes(map: &ShardMap) -> Result<Vec<TopologyRoute>, String> {
+    map.shards
+        .iter()
+        .enumerate()
+        .map(|(shard, entry)| {
+            let hash_range = match (entry.hash_lo, entry.hash_hi) {
+                (Some(lo), Some(hi)) => Some((lo, hi)),
+                (None, None) => None,
+                _ => {
+                    return Err(format!(
+                        "shard map entry {shard} must provide both hash_lo and hash_hi or neither"
+                    ))
+                }
+            };
+            Ok(TopologyRoute {
+                addr: normalize_addr(entry.addr.clone()),
+                replica: entry.replica.clone().map(normalize_addr),
+                hash_range,
+            })
+        })
+        .collect()
+}
 
 /// Build a demo index by fitting provider-owned state on a sample and then
 /// constructing the served generation from that state.
@@ -292,11 +316,106 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             coordinator = coordinator.with_clustered_turbovec(backend);
         }
         if let Some(map) = &cfg.shard_map {
+            let ranges = topology_routes(map)?
+                .into_iter()
+                .map(|route| route.hash_range)
+                .collect();
+            coordinator = coordinator.with_hot_topology(ranges)?;
             eprintln!(
                 "shard map generation {} ({} shards)",
                 map.generation,
                 cfg.node_addrs.len()
             );
+        }
+        if cfg.shard_map_reload_ms > 0 {
+            let path = cfg
+                .shard_map_path
+                .clone()
+                .expect("configuration validated a shard-map path");
+            let reload = coordinator.clone();
+            let reload_ms = cfg.shard_map_reload_ms;
+            let mut shutdown = shutdown_rx.clone();
+            handles.push(tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_millis(reload_ms));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        _ = interval.tick() => {
+                            let candidate = match load_shard_map(&path) {
+                                Ok(map) => map,
+                                Err(error) => {
+                                    eprintln!("shard-map reload refused: {error}");
+                                    continue;
+                                }
+                            };
+                            if candidate.generation <= reload.current_topology_generation() {
+                                continue;
+                            }
+                            let generation = candidate.generation;
+                            match topology_routes(&candidate)
+                                .and_then(|routes| reload.reload_topology(generation, routes))
+                            {
+                                Ok(()) => eprintln!(
+                                    "shard-map generation {generation} published atomically ({} shards)",
+                                    candidate.shards.len()
+                                ),
+                                Err(error) => eprintln!("shard-map reload refused: {error}"),
+                            }
+                        }
+                    }
+                }
+                Ok::<(), tonic::transport::Error>(())
+            }));
+        }
+        if cfg.replica_sync_ms > 0 {
+            let path = cfg
+                .replica_state_path
+                .clone()
+                .expect("configuration validated a replica-state path");
+            let mut state = pipestream_search::replication::ReplicaState::load(&path)?;
+            let topology = coordinator.clone();
+            let sync_ms = cfg.replica_sync_ms;
+            let mut shutdown = shutdown_rx.clone();
+            handles.push(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(sync_ms));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        _ = interval.tick() => {
+                            for route in topology.current_topology_routes() {
+                                let Some(replica) = route.replica else {
+                                    continue;
+                                };
+                                let prior = state.cursor_mut(&route.addr, &replica).clone();
+                                match pipestream_search::replication::sync_once(&prior).await {
+                                    Ok(updated) => {
+                                        *state.cursor_mut(&route.addr, &replica) = updated;
+                                        if let Err(error) = state.write(&path) {
+                                            eprintln!("replica cursor persistence failed: {error}");
+                                        }
+                                    }
+                                    Err(error) => eprintln!(
+                                        "replica catch-up {} -> {} refused: {error}",
+                                        route.addr, replica
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok::<(), tonic::transport::Error>(())
+            }));
         }
         eprintln!(
             "SearchService listening on {addr} ({} shard nodes)",

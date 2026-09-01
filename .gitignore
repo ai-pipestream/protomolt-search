@@ -20,3 +20,7 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 deploy/court-e2e/.env
+
+# Android device-test configuration caches and reports
+mobile/android/device-tests/.gradle/
+mobile/android/device-tests/build/

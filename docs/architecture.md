@@ -70,10 +70,11 @@ flowchart TB
     coord -.->|"planned"| repo["Repo service"]
 ```
 
-Membership is static in this phase: the coordinator's node list and each
-node's shard set are fixed at startup, and changing topology means editing
-configs and restarting. That is deliberate. TODO: discovery, membership
-changes without restart, and transport security are open items.
+A plain coordinator node list and each node's served shard set are fixed at
+startup. A versioned shard map is hot-swappable: each request snapshots one
+generation, stable-key ingest requires that generation, and the reshard
+control path can freeze routed writes while it publishes a newer map. Dynamic
+service discovery and transport security remain open items.
 
 ## 2. The search engine: turbovec
 

@@ -113,6 +113,20 @@ pub struct ReshardOutput {
     pub children: Vec<ChildImage>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCutoff {
+    pub generation: u64,
+    pub high_watermark: u64,
+}
+
+#[derive(Debug)]
+pub struct StableReshardOutput {
+    pub images: ReshardOutput,
+    /// Durable source prefixes included in `images`, parallel to the input
+    /// generation list. Child catch-up resumes strictly after these clocks.
+    pub source_cutoffs: Vec<WalCutoff>,
+}
+
 /// Vectors and documents replayed out of bucket files, keyed by their
 /// server-assigned global ids (BTreeMap iteration IS id order).
 #[derive(Default)]
@@ -124,6 +138,8 @@ struct Replay {
     /// Rows hidden by delete or replacement records. Build drops them,
     /// producing a dense all-live child generation.
     deleted: std::collections::BTreeSet<u64>,
+    /// Stable product identities learned from routed WAL envelopes.
+    stable_keys: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Replay {
@@ -131,6 +147,7 @@ impl Replay {
         for id in &self.deleted {
             self.vectors.remove(id);
             self.documents.remove(id);
+            self.stable_keys.remove(id);
         }
         self.deleted.clear();
     }
@@ -203,16 +220,32 @@ fn replay_buckets(
                         ));
                     }
                     for (i, vector) in batch.vectors.chunks_exact(dim).enumerate() {
-                        if out
-                            .vectors
-                            .insert(a.first_id + i as u64, vector.to_vec())
-                            .is_some()
+                        if !a.stable_routing_keys.is_empty()
+                            && a.stable_routing_keys.len() != batch.vectors.len() / dim
                         {
+                            return Err(format!(
+                                "replay {}: vector stable-key count does not match rows",
+                                path.display()
+                            ));
+                        }
+                        let id = a.first_id + i as u64;
+                        if out.vectors.insert(id, vector.to_vec()).is_some() {
                             return Err(format!(
                                 "replay {}: duplicate vector id {}",
                                 path.display(),
-                                a.first_id + i as u64
+                                id
                             ));
+                        }
+                        if let Some(key) = a.stable_routing_keys.get(i) {
+                            match out.stable_keys.insert(id, key.clone()) {
+                                Some(existing) if existing != *key => {
+                                    return Err(format!(
+                                    "replay {}: vector/document stable keys disagree for id {id}",
+                                    path.display()
+                                ))
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -228,13 +261,33 @@ fn replay_buckets(
                     if vectors_only {
                         continue;
                     }
+                    if !a.stable_routing_keys.is_empty()
+                        && a.stable_routing_keys.len() != a.documents.len()
+                    {
+                        return Err(format!(
+                            "replay {}: document stable-key count does not match rows",
+                            path.display()
+                        ));
+                    }
                     for (i, doc) in a.documents.into_iter().enumerate() {
-                        if out.documents.insert(a.first_id + i as u64, doc).is_some() {
+                        let id = a.first_id + i as u64;
+                        if out.documents.insert(id, doc).is_some() {
                             return Err(format!(
                                 "replay {}: duplicate document id {}",
                                 path.display(),
-                                a.first_id + i as u64
+                                id
                             ));
+                        }
+                        if let Some(key) = a.stable_routing_keys.get(i) {
+                            match out.stable_keys.insert(id, key.clone()) {
+                                Some(existing) if existing != *key => {
+                                    return Err(format!(
+                                    "replay {}: vector/document stable keys disagree for id {id}",
+                                    path.display()
+                                ))
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -981,6 +1034,7 @@ pub fn split_logs(
                     vectors: vectors.into_iter().collect(),
                     documents: documents.into_iter().collect(),
                     deleted: Default::default(),
+                    stable_keys: Default::default(),
                 },
                 i,
                 out_dir,
@@ -996,6 +1050,123 @@ pub fn split_logs(
     Ok(ReshardOutput {
         generation: top_generation + 1,
         children,
+    })
+}
+
+/// Repartition full-history, generation-clocked WALs by their opaque stable
+/// product keys. This is the baseline-build half of a hitless reshard: it
+/// returns the exact source high watermarks included in the child images, so
+/// the live tail can resume without a gap before an atomic map publication.
+#[allow(clippy::too_many_arguments)]
+pub fn split_stable_logs(
+    gens: &[PathBuf],
+    n: usize,
+    out_dir: &Path,
+    slot_base: u64,
+    slot_stride: u64,
+    vectors_only: bool,
+    bm25_fields: Option<&[String]>,
+    analyze: &mut Analyzer,
+) -> Result<StableReshardOutput, String> {
+    if !n.is_power_of_two() {
+        return Err(format!(
+            "stable split factor must be a positive power of two, got {n}"
+        ));
+    }
+    let Some(first_gen) = gens.first() else {
+        return Err("stable split requires at least one input generation".to_string());
+    };
+    let manifest = read_gen_manifest(first_gen)?;
+    let mut top_generation = manifest.generation;
+    let mut cutoffs = Vec::with_capacity(gens.len());
+    let mut replay = Replay::default();
+    for gen in gens {
+        let current = read_gen_manifest(gen)?;
+        require_backend_config(&current, gen)?;
+        require_complete_history(&current, gen)?;
+        if !same_backend_config(&manifest, &current) {
+            return Err(format!(
+                "{}: vector backend configuration differs from the first input",
+                gen.display()
+            ));
+        }
+        let clocked = wal::read_clocked_records(gen, 0)
+            .map_err(|error| format!("clocked replay {}: {error}", gen.display()))?;
+        cutoffs.push(WalCutoff {
+            generation: current.generation,
+            high_watermark: clocked.last().map_or(0, |record| record.clock),
+        });
+        replay_buckets(
+            gen,
+            0..current.bucket_count,
+            current.bucket_count as usize,
+            current.dim as usize,
+            vectors_only,
+            &mut replay,
+        )?;
+        top_generation = top_generation.max(current.generation);
+    }
+    replay.compact();
+    for id in replay.vectors.keys().chain(replay.documents.keys()) {
+        if replay.stable_keys.get(id).is_none_or(|key| key.is_empty()) {
+            return Err(format!(
+                "stable split requires a routed stable key for live source id {id}; rebuild legacy explicitly addressed rows before live reshard"
+            ));
+        }
+    }
+    let binding = read_gens_binding(gens)?;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| format!("mkdir {}: {error}", out_dir.display()))?;
+    let shift = 64 - n.trailing_zeros();
+    let mut buckets: Vec<Replay> = (0..n).map(|_| Replay::default()).collect();
+    let keys = replay.stable_keys;
+    for (id, vector) in replay.vectors {
+        let key = keys.get(&id).expect("validated above");
+        let shard = if n == 1 {
+            0
+        } else {
+            (crate::coordinator::stable_routing_hash(key) >> shift) as usize
+        };
+        buckets[shard].vectors.insert(id, vector);
+        buckets[shard].stable_keys.insert(id, key.clone());
+    }
+    for (id, document) in replay.documents {
+        let key = keys.get(&id).expect("validated above");
+        let shard = if n == 1 {
+            0
+        } else {
+            (crate::coordinator::stable_routing_hash(key) >> shift) as usize
+        };
+        buckets[shard].documents.insert(id, document);
+        buckets[shard].stable_keys.insert(id, key.clone());
+    }
+    let mut children = Vec::with_capacity(n);
+    for (shard, replay) in buckets.into_iter().enumerate() {
+        let hash_lo = if n == 1 { 0 } else { (shard as u64) << shift };
+        let hash_hi = if shard + 1 == n {
+            u64::MAX
+        } else {
+            ((shard as u64 + 1) << shift) - 1
+        };
+        children.push(finish_child(
+            &manifest,
+            replay,
+            shard,
+            out_dir,
+            slot_base + shard as u64 * slot_stride,
+            hash_lo,
+            hash_hi,
+            bm25_fields,
+            binding.as_ref(),
+            analyze,
+        )?);
+    }
+    Ok(StableReshardOutput {
+        images: ReshardOutput {
+            generation: top_generation + 1,
+            children,
+        },
+        source_cutoffs: cutoffs,
     })
 }
 

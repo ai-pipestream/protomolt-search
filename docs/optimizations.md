@@ -87,8 +87,8 @@ so any partition of the ranges reproduces the same cluster.
 ## Coordination
 
 **Share-nothing coordinators.** A query is owned end to end by one
-coordinator; the only cross-request state is static topology (the shard
-map). Calibration lives on shards, floors are per-query. Coordinators
+coordinator; the only cross-request state is the immutable current topology
+(the shard map). Calibration lives on shards, floors are per-query. Coordinators
 scale horizontally behind a load balancer with no shared memory, and a
 coordinator tree (coordinators implementing the node search interface)
 composes for very wide clusters because top-k merge is associative.

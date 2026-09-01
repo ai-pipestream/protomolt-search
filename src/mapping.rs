@@ -2124,8 +2124,10 @@ fn decode_leaf(
                         ));
                     }
                     floats.extend(
-                        sub.chunks_exact(4)
-                            .map(|c| f32::from_le_bytes(c.try_into().expect("chunks_exact(4)"))),
+                        sub.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| f32::from_le_bytes(*c)),
                     );
                 }
                 (NumWire::F32, 5) => floats.push(f32::from_le_bytes(read4(b, i)?)),
@@ -2139,9 +2141,12 @@ fn decode_leaf(
                             "packed double payload is not a multiple of 8 bytes",
                         ));
                     }
-                    floats.extend(sub.chunks_exact(8).map(|c| {
-                        f64::from_le_bytes(c.try_into().expect("chunks_exact(8)")) as f32
-                    }));
+                    floats.extend(
+                        sub.as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|c| f64::from_le_bytes(*c) as f32),
+                    );
                 }
                 (NumWire::F64, 1) => floats.push(f64::from_le_bytes(read8(b, i)?) as f32),
                 _ => return Err(wrong_wire(path, wire, "a packed or repeated float payload")),

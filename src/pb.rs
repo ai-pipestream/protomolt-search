@@ -6,6 +6,15 @@
 
 tonic::include_proto!("ai.pipestream.search.v1");
 
+/// Host-language-neutral embedded mobile bridge messages
+/// (`proto/ai/pipestream/search/mobile/v1/mobile.proto`).
+pub mod mobile {
+    pub mod v1 {
+        tonic::include_proto!("ai.pipestream.search.mobile.v1");
+    }
+    pub use v1::*;
+}
+
 /// The vendored analysis-sidecar API (`proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`,
 /// copied from the grpc-opennlp-analysis repo — see the file header).
 pub mod analysis {
@@ -51,5 +60,8 @@ pub mod wal {
 /// reuses as `super::super::v1::X` (their package path), while this module
 /// includes them flat — re-export the referenced ones under that name.
 pub mod v1 {
-    pub use super::{AddDocumentsRequest, AddVectorsRequest};
+    pub use super::{
+        AddDocumentsRequest, AddVectorsRequest, FlushResponse, IngestMappedRequest,
+        QueryStreamResponse,
+    };
 }

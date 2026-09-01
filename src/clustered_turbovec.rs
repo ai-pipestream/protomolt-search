@@ -139,7 +139,9 @@ impl ClusteredCandidateStream {
                 }
                 let candidates = batch
                     .candidates
-                    .chunks_exact(12)
+                    .as_chunks::<12>()
+                    .0
+                    .iter()
                     .map(|record| ClusteredCandidate {
                         label: u64::from_le_bytes(record[..8].try_into().expect("8-byte label")),
                         score: f32::from_le_bytes(record[8..12].try_into().expect("4-byte score")),

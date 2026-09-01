@@ -113,20 +113,70 @@ ingest and query time.
 for tests and disposable indexes; its flush response reports `written=false`
 like an ordinary node.
 
-## Android and iOS
+## Android and iOS packages
 
-The product-named crate is a small facade over the shared implementation:
+The product-named crate is a small facade over the shared implementation and
+emits all three forms needed by its consumers: `rlib` for Rust applications,
+`cdylib` for Android, and `staticlib` for Apple:
 
 ```toml
 [dependencies]
 protomolt-search-embedded = { path = "crates/protomolt-search-embedded" }
 ```
 
-It is an `rlib` so an application-specific Rust host bridge can expose the API
-through JNI, UniFFI, Swift/C, Flutter, or another framework without choosing a
-framework in the search engine. The host owns its async runtime and app
-lifecycle; it should call `flush_all` before normal shutdown. Dropping the
-runtime aborts only the in-memory service tasks.
+The stable mobile ABI exposes create/open, mapped ingest, `Query`, pull-based
+`QueryStream`, flush, and close. Inputs and outputs are protobuf bytes.
+`mobile.proto` owns only lifecycle envelopes and imports the ordinary
+`search.proto` request and response types, so neither host wrapper contains a
+second query or schema model. The Rust library owns its Tokio runtime; Android
+and Apple callers do not manage one.
+
+Android uses the platform JNI boundary through one Java class,
+`ai.pipestream.search.mobile.ProtomoltSearch`. The class moves whole protobuf
+messages per call, not individual hits or fields, and contains no product
+logic. The AAR manifest intentionally declares no `INTERNET` permission. Build
+the arm64 device and x86-64 emulator package on a host with the Android NDK:
+
+```bash
+scripts/build-android-aar.sh target/mobile/ProtomoltSearch.aar
+```
+
+Apple imports the same functions as the C module `ProtomoltSearch`; the
+included `ProtomoltSearch.swift` is an optional `Data` facade. Build the arm64
+device plus arm64/x86-64 simulator package for iOS 15 or newer on macOS with
+Xcode:
+
+```bash
+scripts/build-apple-xcframework.sh target/mobile/ProtomoltSearch.xcframework
+```
+
+Both scripts refuse to overwrite an existing artifact. A `mobile-v*` tag or a
+manual `mobile-sdk` GitHub workflow run builds both packages as downloadable
+artifacts. The Apple artifact contains the XCFramework, Swift facade, and both
+protobuf contracts. A branch push does not claim a mobile release.
+
+Device suites live beside each host package. Android's instrumentation suite
+loads the AAR and covers mapped ingest, unary and streaming query, flush,
+close/reopen persistence, overwrite refusal, a fixture disk budget, absence of
+the `INTERNET` permission, and before/after socket descriptors. Its
+`@RequiresDevice` probe records CPU time, wall time, and index bytes for 100
+queries. Run it with a connected arm64 device or x86-64 emulator after building
+the AAR:
+
+```bash
+mobile/android/device-tests/gradlew -p mobile/android/device-tests \
+  -PprotomoltAar=../../../target/mobile/ProtomoltSearch.aar \
+  connectedDebugAndroidTest
+```
+
+Apple's Swift package runs the same lifecycle and socket checks through the
+XCFramework. Its XCTest probe records `XCTCPUMetric`, `XCTClockMetric`, and
+`XCTStorageMetric`. Build the XCFramework, open
+`mobile/apple/device-tests/Package.swift` in Xcode, and run the
+`ProtomoltSearchDeviceTests` scheme on both an iPhone and a simulator. Power
+baselines are accepted only from repeated physical-device runs on the same
+hardware and OS; simulator measurements are functional evidence, not power
+evidence.
 
 Run every supported compile gate with:
 
@@ -138,13 +188,14 @@ The script checks:
 
 ```bash
 cargo check --locked -p protomolt-search-embedded --target aarch64-linux-android
+cargo check --locked -p protomolt-search-embedded --target x86_64-linux-android
 cargo check --locked -p protomolt-search-embedded --target aarch64-apple-ios
+cargo check --locked -p protomolt-search-embedded --target aarch64-apple-ios-sim
 cargo check --locked -p protomolt-search-embedded --target x86_64-apple-ios
 ```
 
-These are Rust compile gates. Packaging an Android AAR or Apple XCFramework
-belongs to the selected host bridge and should add device-level lifecycle,
-backgrounding, disk-quota, and power tests.
+These remain fast Rust compile gates. The package workflow performs the native
+link and archive steps with the real NDK and Xcode toolchains.
 
 ## Dependency audit
 
@@ -156,8 +207,12 @@ TurboVec `turbovec-pipestream-s17` scoring dependency.
 
 The standalone `sidecars/route-cost` crate is now explicitly excluded from the
 root workspace, matching its manifest's ownership comment. Its independent
-lockfile was also refreshed to all compatible versions and its test suite was
-run under that lock.
+lockfile was also refreshed to Arrow/Parquet 59.3 and all compatible versions,
+and its test suite was run under that lock. Forgejo and the mobile packaging
+workflow use Rust 1.98.0. Their checkout and artifact actions are on the current
+v7 lines and are pinned by full commit SHA rather than mutable tags. Android
+packaging pins stable NDK r29; the device harness pins Gradle 9.6.1 by checked
+wrapper checksum, AGP 9.2.0, API 37, and protobuf 4.36.1.
 
 Some apparent older versions are compatibility pins, not forgotten updates:
 
@@ -170,16 +225,17 @@ Some apparent older versions are compatibility pins, not forgotten updates:
 - TurboVec's random/statistical dependencies remain engine-owned exact pins
   because they affect persisted encoded bytes.
 
-`cargo update --dry-run -v` is the freshness check. A future major update must
-retain the server/embedded parity test and classify analyzer or index-format
-changes before accepting the new lockfile.
+`cargo update --locked --dry-run -v` is the freshness check. A future major
+update must retain the server/embedded parity test and classify analyzer or
+index-format changes before accepting the new lockfile.
 
 The release-level gate is `scripts/check-dependencies.sh`. It checks the root,
 independent residual-IVF experiment, and route-cost lockfiles for compatible
 updates; verifies that the locked TurboVec, distributed facade, and experimental
 IVF revisions still match their live branch tips; rejects Python bindings from
-the search/IVF graph; and audits all three lockfiles against RustSec. Forgejo
-runs this gate before the full product and experimental-provider tests in
+the search/IVF graph; verifies the exact action SHAs against the newest live
+major tags; and audits all three lockfiles against RustSec. Forgejo runs this
+gate before the full product and experimental-provider tests in
 `.forgejo/workflows/ci.yml`.
 
 The 2026-09-01 audit used cargo-audit 0.22.2 and the current RustSec database

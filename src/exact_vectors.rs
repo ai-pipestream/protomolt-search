@@ -453,8 +453,10 @@ impl ExactVectorStore {
         match &self.storage {
             Storage::Building { values, .. } => values.clone(),
             Storage::Mapped { map, .. } => map[HEADER_BYTES..]
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
         }
     }
@@ -476,9 +478,11 @@ fn dot_mapped(row: &[u8], query: &[f32]) -> f32 {
 
 #[cfg(target_endian = "big")]
 fn dot_mapped(row: &[u8], query: &[f32]) -> f32 {
-    row.chunks_exact(4)
+    row.as_chunks::<4>()
+        .0
+        .iter()
         .zip(query)
-        .map(|(bytes, q)| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")) * q)
+        .map(|(bytes, q)| f32::from_le_bytes(*bytes) * q)
         .sum()
 }
 

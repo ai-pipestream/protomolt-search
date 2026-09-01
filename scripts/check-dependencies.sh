@@ -51,6 +51,31 @@ check_live_ref() {
   printf '%s\t%s\n' "$label" "$revision"
 }
 
+check_action_pin() {
+  local label=$1
+  local url=$2
+  local ref=$3
+  local workflow=$4
+  local revision latest_ref
+  revision=$(git ls-remote "$url" "$ref" | awk 'NR == 1 { print $1 }')
+  if [[ ! $revision =~ ^[0-9a-f]{40}$ ]]; then
+    echo "$label live ref could not be resolved: $url $ref" >&2
+    return 1
+  fi
+  latest_ref=$(git ls-remote --tags "$url" 'refs/tags/v*' |
+    awk '$2 ~ /^refs\/tags\/v[0-9]+$/ { print $2 }' |
+    sort -V | tail -1)
+  if [[ $latest_ref != "$ref" ]]; then
+    echo "$label is not on the newest major action line: $latest_ref" >&2
+    return 1
+  fi
+  if ! rg -Fq "@$revision" "$workflow"; then
+    echo "$label workflow does not pin live $ref at $revision" >&2
+    return 1
+  fi
+  printf '%s\t%s\n' "$label" "$revision"
+}
+
 check_freshness "product" "$repo_dir/Cargo.toml"
 check_freshness "residual-IVF experiment" "$repo_dir/benchmarks/ivf-eval/Cargo.toml"
 check_freshness "route-cost sidecar" "$repo_dir/sidecars/route-cost/Cargo.toml"
@@ -79,6 +104,21 @@ check_live_ref \
   "https://github.com/RyanCodrai/turbovec.git" \
   "refs/heads/feat/ivf-residual" \
   "$repo_dir/benchmarks/ivf-eval/Cargo.lock"
+check_action_pin \
+  "Forgejo checkout action" \
+  "https://data.forgejo.org/actions/checkout.git" \
+  "refs/tags/v7" \
+  "$repo_dir/.forgejo/workflows/ci.yml"
+check_action_pin \
+  "GitHub checkout action" \
+  "https://github.com/actions/checkout.git" \
+  "refs/tags/v7" \
+  "$repo_dir/.github/workflows/mobile-sdk.yml"
+check_action_pin \
+  "GitHub artifact action" \
+  "https://github.com/actions/upload-artifact.git" \
+  "refs/tags/v7" \
+  "$repo_dir/.github/workflows/mobile-sdk.yml"
 
 tree_file=$(mktemp)
 trap 'rm -f "$tree_file"' EXIT

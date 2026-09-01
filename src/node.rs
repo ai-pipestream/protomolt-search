@@ -50,13 +50,13 @@ use crate::pb::{
     FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
     GetDocumentsResponse, GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest,
     HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, IngestMappedRequest,
-    IngestMappedResponse, InstallSnapshotResponse, OffsetSpan, RawLegHit, ResolveParentsRequest,
-    ResolveParentsResponse, ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
-    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
-    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
-    VectorBackendConfig as WireVectorBackendConfig,
+    IngestMappedResponse, InstallSnapshotResponse, OffsetSpan, RawLegHit, ReadWalRequest,
+    ReadWalResponse, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent, ScoredHit,
+    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
+    SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk,
+    SnapshotManifest, StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
+    TermStatsResponse, VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorQualityContract,
     VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
@@ -69,6 +69,24 @@ use crate::vector::{
 use crate::wal::{self, WalWriter};
 
 pub const MAX_RERANK_PARALLEL: usize = 64;
+const STABLE_ROUTING_KEY_METADATA: &str = "x-protomolt-stable-key-bin";
+
+fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, Status> {
+    request
+        .metadata()
+        .get_bin(STABLE_ROUTING_KEY_METADATA)
+        .map(|value| {
+            value
+                .to_bytes()
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| {
+                    Status::invalid_argument(format!(
+                        "invalid replication stable-key metadata: {error}"
+                    ))
+                })
+        })
+        .transpose()
+}
 
 fn resolved_rerank_parallel(configured: usize) -> usize {
     if configured == 0 {
@@ -3863,7 +3881,11 @@ impl NodeServiceImpl {
 
     /// Apply one ingested batch under the write lock. Returns
     /// `(added, global id of the batch's first vector)`.
-    fn apply_batch(&self, batch: AddVectorsRequest) -> Result<(u64, u64), Status> {
+    fn apply_batch(
+        &self,
+        batch: AddVectorsRequest,
+        stable_routing_key: Option<Vec<u8>>,
+    ) -> Result<(u64, u64), Status> {
         if batch.vectors.is_empty() {
             return Ok((0, 0));
         }
@@ -3891,6 +3913,11 @@ impl NodeServiceImpl {
                 "batch of {} floats is not a multiple of dim {dim}",
                 batch.vectors.len()
             )));
+        }
+        if stable_routing_key.is_some() && batch.vectors.len() / dim != 1 {
+            return Err(Status::invalid_argument(
+                "a replication stable-key metadata value may carry exactly one vector",
+            ));
         }
         if let Some((vi, ci, v)) = first_invalid_coordinate(&batch.vectors, dim) {
             return Err(Status::invalid_argument(format!(
@@ -3988,6 +4015,7 @@ impl NodeServiceImpl {
                         vectors: vector.to_vec(),
                         dim: dim as u32,
                     }),
+                    stable_routing_keys: stable_routing_key.clone().into_iter().collect(),
                 }),
             );
         }
@@ -4753,6 +4781,7 @@ struct PendingDoc {
     /// LOCKSTEP with the document, landing at the same id. `None` on
     /// the ordinary AddDocuments path.
     vector: Option<Vec<f32>>,
+    stable_routing_key: Option<Vec<u8>>,
     /// `(field table index, analysis)`, in submission order. `None` until
     /// that field's result lands.
     extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
@@ -4766,6 +4795,8 @@ struct PendingDoc {
 struct IngestDoc {
     req: AddDocumentsRequest,
     vector: Option<Vec<f32>>,
+    /// Opaque product identity supplied only by routed mapped ingest.
+    stable_routing_key: Option<Vec<u8>>,
 }
 
 /// Where the ingest pipeline's documents come from: the ordinary
@@ -4775,7 +4806,11 @@ struct IngestDoc {
 /// apply wavefront, the column validation, and the WAL records
 /// unchanged.
 enum IngestSource<'a> {
-    Plain(&'a mut Streaming<AddDocumentsRequest>),
+    Plain {
+        stream: &'a mut Streaming<AddDocumentsRequest>,
+        stable_routing_key: Option<Vec<u8>>,
+        consumed: bool,
+    },
     /// Boxed: the extractor's trie dwarfs the plain variant.
     Mapped(Box<MappedSource<'a>>),
 }
@@ -4802,10 +4837,24 @@ struct MappedSource<'a> {
 impl IngestSource<'_> {
     async fn next(&mut self) -> Result<Option<IngestDoc>, Status> {
         match self {
-            IngestSource::Plain(stream) => Ok(stream
-                .message()
-                .await?
-                .map(|req| IngestDoc { req, vector: None })),
+            IngestSource::Plain {
+                stream,
+                stable_routing_key,
+                consumed,
+            } => {
+                let request = stream.message().await?;
+                if request.is_some() && *consumed && stable_routing_key.is_some() {
+                    return Err(Status::invalid_argument(
+                        "a replication stable-key metadata value may carry exactly one document",
+                    ));
+                }
+                *consumed |= request.is_some();
+                Ok(request.map(|req| IngestDoc {
+                    req,
+                    vector: None,
+                    stable_routing_key: stable_routing_key.clone(),
+                }))
+            }
             IngestSource::Mapped(source) => source.next().await,
         }
     }
@@ -4824,7 +4873,15 @@ impl MappedSource<'_> {
                     // A zero-chunk document decodes to zero rows; loop
                     // for the next message rather than ending the
                     // stream.
-                    Some(Payload::Document(bytes)) => self.decode(&bytes)?,
+                    Some(Payload::Document(bytes)) => self.decode(&bytes, None)?,
+                    Some(Payload::RoutedDocument(document)) => {
+                        if document.stable_key.is_empty() {
+                            return Err(Status::invalid_argument(
+                                "routed mapped document has an empty stable key",
+                            ));
+                        }
+                        self.decode(&document.document, Some(document.stable_key))?;
+                    }
                     Some(Payload::Bind(_)) => {
                         return Err(Status::invalid_argument(
                             "bind repeats mid-stream; a mapped stream binds exactly once, \
@@ -4841,7 +4898,7 @@ impl MappedSource<'_> {
         }
     }
 
-    fn decode(&mut self, bytes: &[u8]) -> Result<(), Status> {
+    fn decode(&mut self, bytes: &[u8], stable_routing_key: Option<Vec<u8>>) -> Result<(), Status> {
         let position = self.position;
         self.position += 1;
         let rows = self.extractor.extract(bytes).map_err(|status| {
@@ -4858,6 +4915,7 @@ impl MappedSource<'_> {
             self.rows.push_back(IngestDoc {
                 req,
                 vector: Some(extracted.vector),
+                stable_routing_key: stable_routing_key.clone(),
             });
         }
         Ok(())
@@ -5389,6 +5447,7 @@ impl NodeServiceImpl {
         doc: AddDocumentsRequest,
         analyzed: crate::postings::AnalyzedDoc,
         vector: Option<Vec<f32>>,
+        stable_routing_key: Option<Vec<u8>>,
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
@@ -5853,6 +5912,7 @@ impl NodeServiceImpl {
             wal_record::Op::AddDocuments(LoggedAddDocuments {
                 first_id: global_id,
                 documents: vec![doc],
+                stable_routing_keys: stable_routing_key.clone().into_iter().collect(),
             }),
         );
         // The mapped document's vector, at the same id, under the same
@@ -5908,6 +5968,7 @@ impl NodeServiceImpl {
                         vectors: v,
                         dim: dim as u32,
                     }),
+                    stable_routing_keys: stable_routing_key.into_iter().collect(),
                 }),
             );
         }
@@ -6115,6 +6176,7 @@ impl NodeServiceImpl {
         let IngestDoc {
             req: first,
             vector: first_vector,
+            stable_routing_key: first_stable_routing_key,
         } = first;
         let mut spec = first.analysis.clone();
         let mut quality = first.quality.clone();
@@ -6143,6 +6205,7 @@ impl NodeServiceImpl {
             PendingDoc {
                 doc: first,
                 vector: first_vector,
+                stable_routing_key: first_stable_routing_key,
                 outstanding: first_extras.len(),
                 extras: first_extras,
             },
@@ -6179,6 +6242,7 @@ impl NodeServiceImpl {
                     let IngestDoc {
                         req: doc,
                         vector: doc_vector,
+                        stable_routing_key,
                     } = doc;
                     // Extra-field analyses are queued on arrival
                     // (validated now, so a bad field fails before the
@@ -6238,6 +6302,7 @@ impl NodeServiceImpl {
                         PendingDoc {
                             doc,
                             vector: doc_vector,
+                            stable_routing_key,
                             outstanding: extras.len(),
                             extras,
                         },
@@ -6281,7 +6346,14 @@ impl NodeServiceImpl {
             let analyzed = results.remove(next_apply).expect("readiness just checked");
             let held = pending.remove(next_apply).expect("readiness just checked");
             let analyzed = join_fields(analyzed, held.extras)?;
-            self.apply_analyzed_document(held.doc, analyzed, held.vector, added, first_id)?;
+            self.apply_analyzed_document(
+                held.doc,
+                analyzed,
+                held.vector,
+                held.stable_routing_key,
+                added,
+                first_id,
+            )?;
             *next_apply += 1;
         }
     }
@@ -6292,6 +6364,7 @@ impl NodeService for NodeServiceImpl {
     type SearchShardStream = ReceiverStream<Result<SearchShardResponse, Status>>;
     type StreamSearchStream = ReceiverStream<Result<StreamSearchResponse, Status>>;
     type Bm25QueryStreamStream = ReceiverStream<Result<Bm25QueryStreamResponse, Status>>;
+    type ReadWalStream = ReceiverStream<Result<ReadWalResponse, Status>>;
 
     async fn search_shard(
         &self,
@@ -7009,6 +7082,13 @@ impl NodeService for NodeServiceImpl {
         };
         let cols = ShardNumericRead(store);
         let n = u64::from(store.next_doc_id());
+        let id_allowlist = req.restrict_doc_ids.then(|| {
+            req.doc_ids
+                .iter()
+                .filter_map(|id| id.checked_sub(self.config.slot_offset))
+                .filter_map(|local| u32::try_from(local).ok())
+                .collect::<std::collections::HashSet<_>>()
+        });
         let mut matched = 0u64;
         let mut ungrouped = 0u64;
         // Group accumulators by facet ordinal; each holds (matched,
@@ -7020,6 +7100,12 @@ impl NodeService for NodeServiceImpl {
         // exactly this sequence on every run).
         for local in 0..n {
             let doc = local as u32;
+            if id_allowlist
+                .as_ref()
+                .is_some_and(|allowlist| !allowlist.contains(&doc))
+            {
+                continue;
+            }
             if !doc_filter.passes(doc, &cols) {
                 continue;
             }
@@ -7170,12 +7256,25 @@ impl NodeService for NodeServiceImpl {
         };
         let cols = ShardNumericRead(store);
         let n = u64::from(store.next_doc_id());
+        let id_allowlist = req.restrict_doc_ids.then(|| {
+            req.doc_ids
+                .iter()
+                .filter_map(|id| id.checked_sub(self.config.slot_offset))
+                .filter_map(|local| u32::try_from(local).ok())
+                .collect::<std::collections::HashSet<_>>()
+        });
         let mut counts = vec![0u64; req.targets.len()];
         let mut bits_of = vec![None; exprs.len()];
         // One admitted-set pass per round: each expression evaluates
         // once per document, every target reads the cached bits.
         for local in 0..n {
             let doc = local as u32;
+            if id_allowlist
+                .as_ref()
+                .is_some_and(|allowlist| !allowlist.contains(&doc))
+            {
+                continue;
+            }
             if !doc_filter.passes(doc, &cols) {
                 continue;
             }
@@ -7195,6 +7294,173 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(crate::pb::QuantileCountsResponse { counts }))
+    }
+
+    async fn read_wal(
+        &self,
+        request: Request<ReadWalRequest>,
+    ) -> Result<Response<Self::ReadWalStream>, Status> {
+        let req = request.into_inner();
+        let (generation, high_watermark, records, prefix_health) = loop {
+            let needs_flush = self
+                .state
+                .read()
+                .expect("shard state lock poisoned")
+                .wal
+                .as_ref()
+                .is_some_and(WalWriter::is_dirty);
+            if needs_flush {
+                let service = self.clone();
+                tokio::task::spawn_blocking(move || service.flush_index())
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!("WAL flush task failed: {error}"))
+                    })??;
+            }
+            let snapshot = {
+                let guard = self.state.read().expect("shard state lock poisoned");
+                let wal = guard.wal.as_ref().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "this shard has no WAL; live catch-up is unavailable",
+                    )
+                })?;
+                if req.generation != wal.generation() {
+                    return Err(Status::failed_precondition(format!(
+                        "WAL generation mismatch: requested {}, live {}",
+                        req.generation,
+                        wal.generation()
+                    )));
+                }
+                if req.after_clock > wal.high_watermark() {
+                    return Err(Status::invalid_argument(format!(
+                        "after_clock {} is beyond WAL high watermark {}",
+                        req.after_clock,
+                        wal.high_watermark()
+                    )));
+                }
+                let records = wal::read_clocked_records(wal.dir(), req.after_clock)
+                    .map_err(|error| Status::failed_precondition(format!("read WAL: {error}")))?;
+                let num_vectors = guard.index.as_ref().map_or(0, |index| index.len() as u64);
+                let document_slots = guard
+                    .bm25
+                    .as_ref()
+                    .map_or(0, |shard| u64::from(shard.next_doc_id()));
+                let physical_docs = physical_rows(&guard);
+                let deleted_docs = guard.live_docs.deleted_count().min(physical_docs);
+                let scoring_fingerprint = guard
+                    .index
+                    .as_ref()
+                    .map_or_else(String::new, |index| index.descriptor().scoring_fingerprint);
+                (
+                    wal.generation(),
+                    wal.high_watermark(),
+                    records,
+                    (
+                        num_vectors,
+                        document_slots,
+                        physical_docs - deleted_docs,
+                        deleted_docs,
+                        scoring_fingerprint,
+                    ),
+                )
+            };
+            // A writer can append after the dirty check and before the read
+            // lock. Its buffered bytes then trail the in-memory watermark.
+            // Never advertise that watermark: retry, which sees dirty=true
+            // and makes the whole index/WAL prefix durable first.
+            if snapshot.1 == req.after_clock
+                || snapshot
+                    .2
+                    .last()
+                    .is_some_and(|record| record.clock == snapshot.1)
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        };
+        let (tx, rx) = mpsc::channel(64);
+        let slot_offset = self.config.slot_offset;
+        tokio::spawn(async move {
+            for record in records {
+                if tx
+                    .send(Ok(ReadWalResponse {
+                        generation,
+                        high_watermark,
+                        record: prost::Message::encode_to_vec(&record),
+                        completed: false,
+                        ..Default::default()
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = tx
+                .send(Ok(ReadWalResponse {
+                    generation,
+                    high_watermark,
+                    record: Vec::new(),
+                    completed: true,
+                    num_vectors: prefix_health.0,
+                    document_slots: prefix_health.1,
+                    live_docs: prefix_health.2,
+                    deleted_docs: prefix_health.3,
+                    scoring_fingerprint: prefix_health.4,
+                    slot_offset,
+                }))
+                .await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn apply_wal_binding(
+        &self,
+        request: Request<crate::pb::ApplyWalBindingRequest>,
+    ) -> Result<Response<crate::pb::ApplyWalBindingResponse>, Status> {
+        let req = request.into_inner();
+        if req.plan_fingerprint.is_empty() || req.body_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "WAL binding requires plan_fingerprint and body_path",
+            ));
+        }
+        let incoming = crate::postings::StoredBinding {
+            plan_fingerprint: req.plan_fingerprint,
+            body_path: req.body_path,
+            materialize_sha: req.materialize_sha,
+        };
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        match guard.mapped_binding.as_ref() {
+            Some(bound) if *bound != incoming => Err(Status::failed_precondition(format!(
+                "replica is bound to plan {} body {:?}, source WAL requires plan {} body {:?}",
+                bound.plan_fingerprint,
+                bound.body_path,
+                incoming.plan_fingerprint,
+                incoming.body_path
+            ))),
+            Some(_) => Ok(Response::new(crate::pb::ApplyWalBindingResponse {
+                already_bound: true,
+            })),
+            None => {
+                if physical_rows(&guard) != 0 {
+                    return Err(Status::failed_precondition(
+                        "cannot apply a WAL mapping binding to a populated unbound shard; install the matching base snapshot",
+                    ));
+                }
+                wal_append_or_degrade(
+                    &mut guard.wal,
+                    wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
+                        plan_fingerprint: incoming.plan_fingerprint.clone(),
+                        body_path: incoming.body_path.clone(),
+                        materialize_sha: incoming.materialize_sha.clone(),
+                    }),
+                );
+                guard.mapped_binding = Some(incoming);
+                Ok(Response::new(crate::pb::ApplyWalBindingResponse {
+                    already_bound: false,
+                }))
+            }
+        }
     }
 
     async fn health(
@@ -7228,6 +7494,10 @@ impl NodeService for NodeServiceImpl {
             Some(shard) => (shard.doc_count(), matches!(shard, Bm25Shard::Spilling(_))),
             None => (0, false),
         };
+        let document_slots = guard
+            .bm25
+            .as_ref()
+            .map_or(0, |shard| u64::from(shard.next_doc_id()));
         let exact_vector_rows = guard.exact_vectors.as_ref().map_or(0, |s| s.len() as u64);
         let exact_vectors_available = guard.exact_vectors.as_ref().is_some_and(|exact| {
             if let Some(index) = guard.index.as_ref() {
@@ -7244,6 +7514,14 @@ impl NodeService for NodeServiceImpl {
             .is_some_and(ExactVectorStore::is_mapped);
         let physical_docs = physical_rows(&guard);
         let deleted_docs = guard.live_docs.deleted_count().min(physical_docs);
+        let (wal_generation, wal_high_watermark, wal_clocked) =
+            guard.wal.as_ref().map_or((0, 0, false), |wal| {
+                (
+                    wal.generation(),
+                    wal.high_watermark(),
+                    !wal.has_legacy_clock_records(),
+                )
+            });
         Ok(Response::new(HealthResponse {
             num_vectors,
             dim,
@@ -7261,6 +7539,10 @@ impl NodeService for NodeServiceImpl {
             live_docs: physical_docs - deleted_docs,
             deleted_docs,
             live_revision: guard.live_docs.revision(),
+            wal_generation,
+            wal_high_watermark,
+            wal_clocked,
+            document_slots,
         }))
     }
 
@@ -7615,13 +7897,22 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<AddVectorsResponse>, Status> {
         crate::metrics::inc_request(crate::metrics::Route::AddVectors);
         let _ingest = self.claim_ingest()?;
+        let stable_routing_key = replication_stable_key(&request)?;
         let mut inbound = request.into_inner();
         let mut added = 0u64;
         let mut first_id = 0u64;
+        let mut batches = 0usize;
         while let Some(batch) = inbound.message().await? {
+            batches += 1;
+            if stable_routing_key.is_some() && batches > 1 {
+                return Err(Status::invalid_argument(
+                    "a replication stable-key metadata value may carry exactly one vector batch",
+                ));
+            }
             let service = self.clone();
+            let key = stable_routing_key.clone();
             let (batch_added, batch_first_id) =
-                tokio::task::spawn_blocking(move || service.apply_batch(batch))
+                tokio::task::spawn_blocking(move || service.apply_batch(batch, key))
                     .await
                     .map_err(|e| Status::internal(format!("add task failed: {e}")))??;
             if added == 0 && batch_added > 0 {
@@ -7711,8 +8002,13 @@ impl NodeService for NodeServiceImpl {
         let addr = self.config.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
         })?;
+        let stable_routing_key = replication_stable_key(&request)?;
         let mut inbound = request.into_inner();
-        let mut source = IngestSource::Plain(&mut inbound);
+        let mut source = IngestSource::Plain {
+            stream: &mut inbound,
+            stable_routing_key,
+            consumed: false,
+        };
         let mut added = 0u64;
         let mut first_id = 0u64;
         // Analysis dominates bulk ingest. One analysis stream covers the
@@ -7974,7 +8270,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::add_ingested(added, added);
         let parents = match &source {
             IngestSource::Mapped(mapped) => mapped.parents,
-            IngestSource::Plain(_) => unreachable!("this handler built a mapped source"),
+            IngestSource::Plain { .. } => unreachable!("this handler built a mapped source"),
         };
         Ok(Response::new(IngestMappedResponse {
             added,

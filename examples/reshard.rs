@@ -8,6 +8,7 @@
 //! # Split one shard 1 -> N (N a power of two):
 //! reshard --log=/data/shard-0.vector.wal --split=2 --out-dir=/data/split \
 //!     --slot-base=0 --slot-stride=25000000 --analysis-addr=http://localhost:50051
+//!     --stable-routing
 //!
 //! # Merge several shards -> 1 (identical provider configuration required):
 //! reshard --logs=/data/shard-0.vector.wal,/data/shard-1.vector.wal --out-dir=/data/merged \
@@ -47,7 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if out_dir.is_empty() {
         return Err(
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
-             --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR]"
+             --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
+             [--stable-routing]"
                 .into(),
         );
     }
@@ -57,6 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // entirely: shard-count and routing experiments only search the
     // vector leg, and children shrink from tens of GB to provider images.
     let vectors_only = std::env::args().any(|a| a == "--vectors-only");
+    let stable_routing = std::env::args().any(|a| a == "--stable-routing");
+    if stable_routing && opt("logs").is_some() {
+        return Err(
+            "--stable-routing currently serves one live source; use --log, not --logs".into(),
+        );
+    }
     // Child BM25 field table override (docs/multi-field.md): comma list
     // starting with "body". Absent = derive from the replayed records.
     let bm25_fields: Option<Vec<String>> = opt("bm25-fields").map(|s| {
@@ -91,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
         };
 
-    let output = match opt("logs") {
+    let (output, live_cutoff) = match opt("logs") {
         Some(logs) => {
             let generations = logs
                 .split(',')
@@ -107,27 +115,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let n: usize = n.parse()?;
                     let slot_base: u64 = arg("slot-base", "0").parse()?;
                     let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
-                    reshard::split_logs(
-                        &generations,
-                        n,
-                        &out_dir,
-                        slot_base,
-                        slot_stride,
-                        vectors_only,
-                        bm25_fields.as_deref(),
-                        &mut analyze,
-                    )?
+                    (
+                        reshard::split_logs(
+                            &generations,
+                            n,
+                            &out_dir,
+                            slot_base,
+                            slot_stride,
+                            vectors_only,
+                            bm25_fields.as_deref(),
+                            &mut analyze,
+                        )?,
+                        None,
+                    )
                 }
                 None => {
                     let slot_base = opt("slot-base").map(|s| s.parse::<u64>()).transpose()?;
-                    reshard::merge(
-                        &generations,
-                        &out_dir,
-                        slot_base,
-                        vectors_only,
-                        bm25_fields.as_deref(),
-                        &mut analyze,
-                    )?
+                    (
+                        reshard::merge(
+                            &generations,
+                            &out_dir,
+                            slot_base,
+                            vectors_only,
+                            bm25_fields.as_deref(),
+                            &mut analyze,
+                        )?,
+                        None,
+                    )
                 }
             }
         }
@@ -138,16 +152,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let n: usize = arg("split", "2").parse()?;
             let slot_base: u64 = arg("slot-base", "0").parse()?;
             let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
-            reshard::split(
-                &gen,
-                n,
-                &out_dir,
-                slot_base,
-                slot_stride,
-                vectors_only,
-                bm25_fields.as_deref(),
-                &mut analyze,
-            )?
+            if stable_routing {
+                let stable = reshard::split_stable_logs(
+                    &[gen],
+                    n,
+                    &out_dir,
+                    slot_base,
+                    slot_stride,
+                    vectors_only,
+                    bm25_fields.as_deref(),
+                    &mut analyze,
+                )?;
+                let cutoff = stable.source_cutoffs[0];
+                (stable.images, Some(cutoff))
+            } else {
+                (
+                    reshard::split(
+                        &gen,
+                        n,
+                        &out_dir,
+                        slot_base,
+                        slot_stride,
+                        vectors_only,
+                        bm25_fields.as_deref(),
+                        &mut analyze,
+                    )?,
+                    None,
+                )
+            }
         }
     };
 
@@ -155,6 +187,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let map_path = out_dir.join("shard-map.toml");
     std::fs::write(&map_path, &map)?;
     eprintln!("wrote {}", map_path.display());
+    if let Some(cutoff) = live_cutoff {
+        let cutoff_path = out_dir.join("live-cutoff.toml");
+        std::fs::write(
+            &cutoff_path,
+            format!(
+                "generation = {}\nhigh_watermark = {}\n",
+                cutoff.generation, cutoff.high_watermark
+            ),
+        )?;
+        eprintln!("wrote {}", cutoff_path.display());
+    }
     for child in &output.children {
         eprintln!(
             "child {}: {} vectors, {} documents, slot_offset {}, hash [{}, {}]",

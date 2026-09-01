@@ -59,8 +59,8 @@ pub fn read_embeddings(path: &Path) -> io::Result<(Vec<f32>, usize, usize)> {
     }
 
     let mut vectors = vec![0.0f32; count * dim];
-    for (i, chunk) in bytes[HEADER_BYTES..].chunks_exact(4).enumerate() {
-        vectors[i] = f32::from_be_bytes(chunk.try_into().unwrap());
+    for (i, chunk) in bytes[HEADER_BYTES..].as_chunks::<4>().0.iter().enumerate() {
+        vectors[i] = f32::from_be_bytes(*chunk);
     }
     Ok((vectors, count, dim))
 }
@@ -101,8 +101,8 @@ pub fn read_embedding_at(path: &Path, index: usize) -> io::Result<(Vec<f32>, usi
     let mut buf = vec![0u8; dim * 4];
     file.read_exact(&mut buf)?;
     let mut vector = vec![0.0f32; dim];
-    for (i, chunk) in buf.chunks_exact(4).enumerate() {
-        vector[i] = f32::from_be_bytes(chunk.try_into().unwrap());
+    for (i, chunk) in buf.as_chunks::<4>().0.iter().enumerate() {
+        vector[i] = f32::from_be_bytes(*chunk);
     }
     Ok((vector, dim))
 }

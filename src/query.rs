@@ -18,6 +18,10 @@
 //! unsupported construct and, where one exists, the supported way to
 //! ask for the same thing.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+
 use tonic::{Request, Status};
 
 use crate::coordinator::CoordinatorServiceImpl;
@@ -29,6 +33,509 @@ use crate::pb::{
     QueryRequest, QueryResponse, QuerySignal, RrfScore, SearchQuery, SearchRequest,
     SelectionOperator, SelectionQuery,
 };
+
+#[derive(Clone, Default)]
+struct BooleanHit {
+    score: f32,
+    signals: Vec<QuerySignal>,
+    matched: Vec<String>,
+}
+
+type BooleanHits = BTreeMap<u64, BooleanHit>;
+
+fn merge_boolean_hit(into: &mut BooleanHit, from: &BooleanHit) {
+    into.score += from.score;
+    for signal in &from.signals {
+        if !into.signals.iter().any(|held| held.id == signal.id) {
+            into.signals.push(signal.clone());
+        }
+    }
+    for clause in &from.matched {
+        if !into.matched.contains(clause) {
+            into.matched.push(clause.clone());
+        }
+    }
+}
+
+async fn browse_all(
+    coordinator: &CoordinatorServiceImpl,
+    filters: &crate::coordinator::RequestFilters,
+) -> Result<Vec<u64>, Status> {
+    let mut ids = Vec::new();
+    let mut after = None;
+    loop {
+        let rows = coordinator
+            .fanout_browse(coordinator.max_k(), after, None, filters)
+            .await?;
+        let count = rows.ids.len();
+        let Some(&last) = rows.ids.last() else { break };
+        ids.extend(rows.ids);
+        if count < coordinator.max_k() as usize {
+            break;
+        }
+        after = Some(crate::coordinator::BrowseAfter {
+            id: last,
+            key_bits: 0,
+        });
+    }
+    Ok(ids)
+}
+
+fn evaluate_boolean<'a>(
+    coordinator: &'a CoordinatorServiceImpl,
+    selection: &'a SelectionQuery,
+    universe: &'a [u64],
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<BooleanHits, Status>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > 64 {
+            return Err(refuse(
+                "boolean selection exceeds the 64-level recursion limit",
+            ));
+        }
+        match selection.node.as_ref().ok_or_else(|| refuse("empty selection node"))? {
+            selection_query::Node::Search(search) => {
+                if search.id.is_empty() {
+                    return Err(refuse("a search clause needs a non-empty id"));
+                }
+                let mut scores = HashMap::new();
+                match search.query.as_ref() {
+                    Some(search_query::Query::Lexical(query)) => {
+                        if query.text.is_empty() {
+                            return Err(refuse(format!(
+                                "lexical clause {:?} has empty text",
+                                search.id
+                            )));
+                        }
+                        if !query.score_stages.is_empty() {
+                            return Err(refuse(
+                                "score_stages inside recursive boolean selection are not yet candidate-scoped; use a boost/scorer dimension after boolean selection",
+                            ));
+                        }
+                        for chunk in universe.chunks(coordinator.max_k() as usize) {
+                            scores.extend(
+                                coordinator
+                                    .lexical_signal(&query.text, query.analysis.as_ref(), chunk)
+                                    .await?,
+                            );
+                        }
+                    }
+                    Some(search_query::Query::Dense(query)) => {
+                        if query.quality.is_some() {
+                            return Err(refuse(
+                                "DenseQualityPolicy is not used by exhaustive boolean evaluation",
+                            ));
+                        }
+                        let execution = dense_execution_mode(query)?;
+                        if execution == DenseExecutionMode::Ann {
+                            return Err(refuse(
+                                "ANN cannot establish recursive boolean membership exactly; use EXACT/AUTO or a top-level ANN selection",
+                            ));
+                        }
+                        if dense_score_mode(query)? == DenseScoreMode::Fp32Rerank {
+                            for chunk in universe.chunks(coordinator.max_k() as usize) {
+                                scores.extend(
+                                    coordinator
+                                        .exact_vector_scores(&query.vector, chunk)
+                                        .await?
+                                        .scores,
+                                );
+                            }
+                        } else {
+                            for chunk in universe.chunks(coordinator.max_k() as usize) {
+                                scores.extend(coordinator.dense_signal(&query.vector, chunk).await?);
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(refuse(format!(
+                            "search clause {:?} has no query",
+                            search.id
+                        )))
+                    }
+                }
+                Ok(scores
+                    .into_iter()
+                    .map(|(id, score)| {
+                        (
+                            id,
+                            BooleanHit {
+                                score,
+                                signals: vec![QuerySignal {
+                                    id: search.id.clone(),
+                                    score,
+                                }],
+                                matched: vec![search.id.clone()],
+                            },
+                        )
+                    })
+                    .collect())
+            }
+            selection_query::Node::Filter(filter) => {
+                if filter.id.is_empty() {
+                    return Err(refuse("a filter clause needs a non-empty id"));
+                }
+                let (geo, cel) = match filter.predicate.as_ref() {
+                    Some(crate::pb::filter_query::Predicate::Cel(cel)) if !cel.is_empty() => {
+                        (Vec::new(), cel.as_str())
+                    }
+                    Some(crate::pb::filter_query::Predicate::Geo(geo)) => {
+                        (vec![geo.clone()], "")
+                    }
+                    Some(crate::pb::filter_query::Predicate::Cel(_)) => {
+                        return Err(refuse(format!(
+                            "filter {:?} has an empty CEL predicate",
+                            filter.id
+                        )))
+                    }
+                    None => {
+                        return Err(refuse(format!(
+                            "filter {:?} has no predicate",
+                            filter.id
+                        )))
+                    }
+                };
+                let compiled = crate::coordinator::RequestFilters::compile(&geo, cel)?;
+                Ok(browse_all(coordinator, &compiled)
+                    .await?
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id,
+                            BooleanHit {
+                                score: 0.0,
+                                signals: Vec::new(),
+                                matched: vec![filter.id.clone()],
+                            },
+                        )
+                    })
+                    .collect())
+            }
+            selection_query::Node::Boolean(boolean) => {
+                if boolean.aggregate.is_some() {
+                    return Err(refuse(
+                        "aggregate belongs on the root BooleanQuery, not a nested clause",
+                    ));
+                }
+                evaluate_boolean_group(coordinator, boolean, universe, depth + 1).await
+            }
+            selection_query::Node::Composite(_) => Err(refuse(
+                "inside recursive boolean selection, express hybrid membership as dense and lexical MUST/SHOULD clauses; legacy CompositeSearchStrategy remains supported as the top-level compatibility shape",
+            )),
+        }
+    })
+}
+
+fn evaluate_boolean_group<'a>(
+    coordinator: &'a CoordinatorServiceImpl,
+    boolean: &'a crate::pb::BooleanQuery,
+    universe: &'a [u64],
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<BooleanHits, Status>> + Send + 'a>> {
+    Box::pin(async move {
+        if boolean.minimum_should_match as usize > boolean.should.len() {
+            return Err(refuse(format!(
+                "minimum_should_match {} exceeds {} SHOULD clauses",
+                boolean.minimum_should_match,
+                boolean.should.len()
+            )));
+        }
+        if boolean.must.is_empty() && boolean.should.is_empty() && boolean.must_not.is_empty() {
+            return Err(refuse("an empty BooleanQuery has no membership rule"));
+        }
+        let mut must = Vec::with_capacity(boolean.must.len());
+        for clause in &boolean.must {
+            must.push(evaluate_boolean(coordinator, clause, universe, depth).await?);
+        }
+        let mut should = Vec::with_capacity(boolean.should.len());
+        for clause in &boolean.should {
+            should.push(evaluate_boolean(coordinator, clause, universe, depth).await?);
+        }
+        let mut must_not = Vec::with_capacity(boolean.must_not.len());
+        for clause in &boolean.must_not {
+            must_not.push(evaluate_boolean(coordinator, clause, universe, depth).await?);
+        }
+        let minimum_should_match = if boolean.minimum_should_match == 0
+            && boolean.must.is_empty()
+            && !boolean.should.is_empty()
+        {
+            1
+        } else {
+            boolean.minimum_should_match as usize
+        };
+        let mut result = BTreeMap::new();
+        for &id in universe {
+            if must.iter().any(|clause| !clause.contains_key(&id))
+                || must_not.iter().any(|clause| clause.contains_key(&id))
+            {
+                continue;
+            }
+            let should_matches = should
+                .iter()
+                .filter(|clause| clause.contains_key(&id))
+                .count();
+            if should_matches < minimum_should_match {
+                continue;
+            }
+            let mut hit = BooleanHit::default();
+            for clause in must.iter().chain(&should) {
+                if let Some(part) = clause.get(&id) {
+                    merge_boolean_hit(&mut hit, part);
+                }
+            }
+            result.insert(id, hit);
+        }
+        Ok(result)
+    })
+}
+
+fn boolean_ids<'a>(
+    selection: &'a SelectionQuery,
+    ids: &mut Vec<(&'a str, crate::ltr::SignalKind)>,
+    positive: bool,
+) -> Result<bool, Status> {
+    use crate::ltr::SignalKind;
+    match selection.node.as_ref().ok_or_else(|| refuse("empty selection node"))? {
+        selection_query::Node::Search(search) => {
+            ids.push((
+                &search.id,
+                if positive {
+                    SignalKind::Search
+                } else {
+                    SignalKind::Filter
+                },
+            ));
+            Ok(positive)
+        }
+        selection_query::Node::Filter(filter) => {
+            ids.push((&filter.id, SignalKind::Filter));
+            Ok(false)
+        }
+        selection_query::Node::Boolean(boolean) => {
+            let mut scored = false;
+            for child in boolean.must.iter().chain(&boolean.should) {
+                scored |= boolean_ids(child, ids, positive)?;
+            }
+            for child in &boolean.must_not {
+                boolean_ids(child, ids, false)?;
+            }
+            Ok(scored)
+        }
+        selection_query::Node::Composite(_) => Err(refuse(
+            "legacy CompositeSearchStrategy is not nested inside BooleanQuery; express its dense/lexical membership as MUST/SHOULD clauses",
+        )),
+    }
+}
+
+fn parse_boolean_boosts<'a>(
+    boosts: &'a [crate::pb::BoostQuery],
+    scorer_present: bool,
+    scored: bool,
+) -> Result<BoostPlan<'a>, Status> {
+    if boosts.is_empty() {
+        return Ok(BoostPlan::None);
+    }
+    if !scored {
+        return Err(refuse(
+            "a boost requires at least one positive scoring clause",
+        ));
+    }
+    if boosts.len() > 1 && !scorer_present {
+        return Err(refuse(
+            "multiple boolean boost signals require a composite scorer",
+        ));
+    }
+    let mut parsed = Vec::with_capacity(boosts.len());
+    for boost in boosts {
+        if scorer_present
+            && (boost.window != 0 || boost.base_weight != 0.0 || boost.boost_weight != 0.0)
+        {
+            return Err(refuse(
+                "boolean boosts are signal-only with a composite scorer; leave window/base_weight/boost_weight unset",
+            ));
+        }
+        let query = boost
+            .query
+            .as_ref()
+            .ok_or_else(|| refuse("boost has no query"))?;
+        let kind = match query.query.as_ref() {
+            Some(search_query::Query::Lexical(lexical)) => {
+                if lexical.text.is_empty() || !lexical.score_stages.is_empty() {
+                    return Err(refuse(
+                        "a boolean lexical boost needs text and does not carry score_stages",
+                    ));
+                }
+                BoostKind::Lexical {
+                    text: &lexical.text,
+                    analysis: lexical.analysis.clone(),
+                }
+            }
+            Some(search_query::Query::Dense(dense)) => {
+                if dense.vector.is_empty() || dense_score_mode(dense)? == DenseScoreMode::Fp32Rerank
+                {
+                    return Err(refuse(
+                        "a boolean dense boost needs a vector and uses provider-native candidate scoring",
+                    ));
+                }
+                BoostKind::Dense {
+                    vector: &dense.vector,
+                }
+            }
+            None => return Err(refuse(format!("boost {:?} has no query", query.id))),
+        };
+        parsed.push(ParsedBoost {
+            id: &query.id,
+            kind,
+            window: boost.window,
+            base_weight: boost.base_weight,
+            boost_weight: boost.boost_weight,
+        });
+    }
+    Ok(BoostPlan::Adapter(parsed))
+}
+
+async fn execute_recursive_boolean(
+    coordinator: &CoordinatorServiceImpl,
+    req: QueryRequest,
+    boolean: &crate::pb::BooleanQuery,
+) -> Result<QueryResponse, Status> {
+    let t_total = std::time::Instant::now();
+    if req.sort.is_some() {
+        return Err(refuse(
+            "column sort over recursive boolean relevance is not served; page its exact score order",
+        ));
+    }
+    let k = if req.k == 0 {
+        coordinator.max_k()
+    } else {
+        req.k
+    };
+    if k > coordinator.max_k() {
+        return Err(refuse(format!(
+            "k ({k}) exceeds coordinator max_k ({})",
+            coordinator.max_k()
+        )));
+    }
+    if req.selection_k != 0 {
+        return Err(refuse(
+            "selection_k is not used by exhaustive recursive boolean selection; leave it zero",
+        ));
+    }
+    let cursor = if req.cursor.is_empty() {
+        None
+    } else {
+        if req.k == 0 {
+            return Err(refuse("a cursor requires an explicit k"));
+        }
+        Some(Cursor::parse(&req.cursor)?)
+    };
+    let selection = req
+        .selection
+        .as_ref()
+        .expect("caller found the root boolean");
+    let mut namespace = Vec::new();
+    let scored = boolean_ids(selection, &mut namespace, true)?;
+    for boost in &req.boosts {
+        let query = boost
+            .query
+            .as_ref()
+            .ok_or_else(|| refuse("boost has no query"))?;
+        namespace.push((&query.id, crate::ltr::SignalKind::Boost));
+    }
+    let mut seen = HashSet::new();
+    for (id, _) in &namespace {
+        if id.is_empty() {
+            return Err(refuse(
+                "every boolean clause and boost needs a non-empty id",
+            ));
+        }
+        if !seen.insert(*id) {
+            return Err(refuse(format!("duplicate query id {id:?}")));
+        }
+    }
+    let scorer = match &req.scorer {
+        Some(scorer) if scorer.operation != 0 || !scorer.dimensions.is_empty() => {
+            if !scored {
+                return Err(refuse(
+                    "the composite scorer requires at least one positive scoring clause",
+                ));
+            }
+            Some(crate::ltr::Scorer::validate(scorer, &namespace)?)
+        }
+        _ => None,
+    };
+    let boosts = parse_boolean_boosts(&req.boosts, scorer.is_some(), scored)?;
+    let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
+    let t_selection = std::time::Instant::now();
+    let universe = browse_all(coordinator, &empty).await?;
+    let evaluated = evaluate_boolean_group(coordinator, boolean, &universe, 1).await?;
+    let mut hits: Vec<QueryHit> = evaluated
+        .into_iter()
+        .map(|(doc_id, hit)| QueryHit {
+            projected: Vec::new(),
+            doc_id,
+            score: hit.score,
+            rank: 0,
+            signals: hit.signals,
+            matched: hit.matched,
+            sort_key: 0.0,
+            dimensions: Vec::new(),
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    let mut profile: Option<crate::pb::QueryProfile> = req.profile.then(Default::default);
+    if let Some(profile) = profile.as_mut() {
+        profile.selection_ms = ms(t_selection);
+    }
+    apply_boosts(
+        coordinator,
+        &boosts,
+        &mut hits,
+        scorer.is_some(),
+        &mut profile,
+    )
+    .await?;
+    let executed = apply_scorer(
+        coordinator,
+        &scorer,
+        &mut hits,
+        "boolean:exhaustive",
+        &mut profile,
+    )
+    .await?;
+    let aggregate = if let Some(aggregate) = &boolean.aggregate {
+        if !aggregate.filter.trim().is_empty() || !aggregate.geo_filters.is_empty() {
+            return Err(refuse(
+                "BooleanQuery.aggregate uses the boolean match set; its own filter and geo_filters must be empty",
+            ));
+        }
+        let compiled = crate::coordinator::compile_aggregations(aggregate)?;
+        let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
+        Some(
+            coordinator
+                .fanout_aggregate(&empty, &compiled, Some(&ids))
+                .await?,
+        )
+    } else {
+        None
+    };
+    let (mut hits, next_cursor) = page(hits, k, cursor.as_ref())?;
+    let compiled_projections = crate::coordinator::compile_projections(&req.projections)?;
+    fill_projected(coordinator, &compiled_projections, &mut hits, &mut profile).await?;
+    let mut response = done(
+        req.request_id,
+        hits,
+        &executed,
+        next_cursor,
+        finish_prof(profile, t_total),
+    );
+    response.aggregate = aggregate;
+    Ok(response)
+}
 
 fn refuse(msg: impl Into<String>) -> Status {
     Status::invalid_argument(msg.into())
@@ -201,6 +708,10 @@ pub async fn execute(
         .selection
         .as_ref()
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
+    if let Some(selection_query::Node::Boolean(boolean)) = selection.node.as_ref() {
+        let boolean = boolean.clone();
+        return execute_recursive_boolean(coordinator, req, &boolean).await;
+    }
     let plan = parse_selection(selection)?;
     let dense_execution = match &plan.shape {
         Shape::Dense { query, .. } | Shape::Composite { dense: query, .. } => {
@@ -886,6 +1397,8 @@ fn done(
         profile,
         dense_quality: None,
         dense_execution: None,
+        served_topology_generation: 0,
+        aggregate: None,
     }
 }
 
@@ -941,6 +1454,11 @@ fn parse_selection(selection: &SelectionQuery) -> Result<Plan<'_>, Status> {
                         selection_query::Node::Filter(_) => {
                             unreachable!("filters collected above")
                         }
+                        selection_query::Node::Boolean(_) => {
+                            return Err(refuse(
+                                "BooleanQuery is a root selection shape; do not wrap it in legacy CompositeSearchStrategy",
+                            ))
+                        }
                     },
                     n => {
                         return Err(refuse(format!(
@@ -954,6 +1472,11 @@ fn parse_selection(selection: &SelectionQuery) -> Result<Plan<'_>, Status> {
             }
             SelectionOperator::Or | SelectionOperator::Unspecified => composite_shape(composite)?,
         },
+        selection_query::Node::Boolean(_) => {
+            return Err(refuse(
+                "BooleanQuery must be executed through the recursive boolean planner",
+            ))
+        }
     };
     Ok(Plan {
         shape: structure,
@@ -1061,6 +1584,11 @@ fn composite_shape(composite: &crate::pb::CompositeSearchStrategy) -> Result<Sha
                 return Err(refuse(
                     "nested scoring composites are not served yet; increment 1 supports \
                      one level: filters AND (one leaf | OR(dense, lexical))",
+                ));
+            }
+            Some(selection_query::Node::Boolean(_)) => {
+                return Err(refuse(
+                    "BooleanQuery is not nested inside legacy CompositeSearchStrategy; use it as the root selection shape",
                 ));
             }
             None => return Err(refuse("empty selection node")),

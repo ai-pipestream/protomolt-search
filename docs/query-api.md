@@ -27,9 +27,12 @@ seam serves `QueryRequest.projections` on every shape
 `QueryResponse.profile` reports per-phase timings (selection, boost,
 values, scorer, projection, total) and never alters results — the
 suite holds profiled hits bitwise to unprofiled ones. With that, every
-response requirement in this document is met except arbitrary nested
-boolean search. The phase split, the boost contract, and the refusal
-rules in this document are the binding contract.
+response requirement in this document is met. Recursive boolean selection
+landed on 2026-09-01: exact `must`/`should`/`must_not` membership,
+`minimum_should_match`, dense and lexical signals, CEL/geo filters, boosts,
+the generic scorer, projections, full-match-set aggregation, paging, and the
+same terminal response over `QueryStream`. The phase split, boost contract,
+and refusal rules in this document are the binding contract.
 
 `QueryStream` landed on 2026-08-31. It runs the same adapter and produces the
 same terminal `QueryResponse`, while exact lexical and dense collectors can
@@ -65,7 +68,7 @@ or remove candidates after selection.
 
 ## Selection
 
-A selection tree contains three node kinds:
+A selection tree contains four node kinds:
 
 - `SearchQuery`: a scoring leaf such as BM25 or dense vector relevance. Every
   search leaf has a request-unique `id`, and its raw relevance score is a named
@@ -74,6 +77,8 @@ A selection tree contains three node kinds:
   predicates it compiles to. It never contributes a relevance score.
 - `CompositeSearchStrategy`: `AND` or `OR` over child selection nodes plus an
   explicit strategy for the scoring leaves.
+- `BooleanQuery`: recursive `must`, `should`, and `must_not` clause lists plus
+  `minimum_should_match`.
 
 `AND` and `OR` apply to membership:
 
@@ -104,6 +109,32 @@ Every strategy names its exactness domain. An implementation must reject a
 shape it cannot certify. It must not translate an unsupported `AND` into a
 union, apply a filter to only one hybrid leg, replace a decomposed sum with a
 truncated blend, or return a partial shard set.
+
+### Recursive boolean execution
+
+`BooleanQuery` is the exact recursive form. Every node in `must` must match,
+no node in `must_not` may match, and at least `minimum_should_match` nodes in
+`should` must match. A zero minimum resolves to one when there are only SHOULD
+clauses and to zero when a MUST clause already establishes membership. A value
+larger than the SHOULD list is invalid.
+
+The current planner enumerates the document-id universe and evaluates existing
+candidate-scoped BM25, exact vector, CEL, and geo seams against it. It is exact
+and deliberately exhaustive. ANN cannot certify recursive membership and is
+refused. The universe is the mapped document-slot space, so vector-only rows
+without corresponding document slots do not participate in this
+document-semantic query form. Matching positive search-clause scores sum unless
+the request supplies the generic composite scorer. Filter clauses and negative
+search clauses contribute membership and provenance but no score. Dense and
+lexical clauses in the same boolean group are the recursive hybrid form; the
+older `CompositeSearchStrategy` remains a top-level compatibility route for
+RRF, score blend, decomposed, and cascade.
+
+An optional `BooleanQuery.aggregate` folds over the complete match set before
+paging. Its own filter and geo fields must be empty because the boolean tree
+already owns membership. Nested aggregations are refused. `selection_k` is
+unused and must remain zero because this planner does not truncate a candidate
+pool.
 
 ## Boost phase
 
@@ -427,6 +458,8 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | projections on dense/composite/browse | `FetchValues` post-selection fetch, same semantics |
 | any scored shape + composite scorer | the route above, then the coordinator-side scorer (`src/ltr.rs`) |
 | projections on any other shape; stored-value dimensions | `FetchValues` candidate-scoped fan-out, post-selection |
+| recursive boolean selection | exhaustive id browse plus candidate-scoped BM25/vector/CEL evaluation |
+| root boolean aggregation | `AggregateShard` with an explicit exact id allowlist |
 
 `selection_k` maps to the hybrid leg depth or the FP32 rerank pool; the
 response is the best `k` of that candidate set (`k <= selection_k` enforced;
@@ -451,11 +484,11 @@ The adapter must execute those ordinary paths rather than fork their scoring
 logic. Vector-plus-CEL has since acquired its ordinary path
 (`docs/vector-filters.md`): `SearchRequest` and `HybridSearchRequest` both
 carry `geo_filters` and a CEL `filter`, and every fusion mode applies them to
-both legs. The one shape still not represented by the table —
-arbitrary nested boolean search — remains unsupported until its
-ordinary engine path exists. The public RPC must return `INVALID_ARGUMENT` or
-`FAILED_PRECONDITION` for such a shape; compatibility never authorizes a
-heuristic substitute.
+both legs. Legacy composites cannot be nested inside `BooleanQuery`: callers
+express the same dense/lexical membership as boolean clauses. Unsupported ANN
+membership, nested aggregation, column sorting of boolean relevance, and
+candidate-scoped lexical score stages return `INVALID_ARGUMENT`; compatibility
+never authorizes a heuristic substitute.
 
 ## Paging
 
@@ -479,6 +512,11 @@ the pool is never silently deepened; exhaustion refuses and names
 `selection_k`. A full page
 always mints `next_cursor`; a short page provably has nothing after it
 at the served depth and mints none.
+
+A recursive boolean query re-evaluates its exhaustive exact order on every
+page and resumes at the same score/id boundary. Its optional aggregation is
+therefore identical on every page and always describes the full match set,
+not the returned slice.
 
 ## Response requirements
 

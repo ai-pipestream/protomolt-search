@@ -16,11 +16,14 @@ use pipestream_search::harness::{fit_calibration, start_empty_node, unit_vectors
 use pipestream_search::mapping::derive_plan;
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    ingest_mapped_request, projected_value, AddDocumentsRequest, Bm25SearchRequest,
-    IngestMappedRequest, IngestMappedResponse, MappedBind, MaterializeKind, MaterializeSpec,
-    MaterializedColumn, NamedProjection, SearchRequest, SetCalibrationRequest,
+    ingest_mapped_request, projected_value, routed_ingest_mapped_request, AddDocumentsRequest,
+    Bm25SearchRequest, FreezeTopologyWritesRequest, HealthRequest, IngestMappedRequest,
+    IngestMappedResponse, MappedBind, MaterializeKind, MaterializeSpec, MaterializedColumn,
+    NamedProjection, PublishTopologyRequest, PublishedTopologyShard, RoutedIngestMappedRequest,
+    RoutedMappedBind, RoutedMappedDocument, SearchRequest, SetCalibrationRequest,
 };
 use prost::Message as _;
 use prost_types::field_descriptor_proto::{Label, Type};
@@ -357,6 +360,449 @@ fn expect_refusal(result: Result<IngestMappedResponse, tonic::Status>, needle: &
         "refusal {:?} does not mention {needle:?}",
         status.message()
     );
+}
+
+#[tokio::test]
+async fn clocked_wal_catches_a_replica_up_idempotently() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvmapped_replication_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (primary, primary_handle) = start_empty_node(NodeConfig {
+        index_path: Some(root.join("primary.tv")),
+        wal: true,
+        ..case_node_config(analysis.clone())
+    })
+    .await;
+    let (replica, replica_handle) = start_empty_node(NodeConfig {
+        index_path: Some(root.join("replica.tv")),
+        wal: true,
+        ..case_node_config(analysis)
+    })
+    .await;
+    seed_calibration(&primary).await;
+    seed_calibration(&replica).await;
+
+    let key = b"law.v1.Case/case-0".to_vec();
+    let mut client = NodeServiceClient::connect(primary.clone()).await.unwrap();
+    let response = client
+        .ingest_mapped(tokio_stream::iter([
+            IngestMappedRequest {
+                payload: Some(ingest_mapped_request::Payload::Bind(bind())),
+            },
+            IngestMappedRequest {
+                payload: Some(ingest_mapped_request::Payload::RoutedDocument(
+                    RoutedMappedDocument {
+                        stable_key: key.clone(),
+                        document: doc(0).encode(),
+                    },
+                )),
+            },
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.added, 1);
+
+    let first =
+        pipestream_search::replication::sync_once(&pipestream_search::replication::ReplicaCursor {
+            primary: primary.clone(),
+            replica: replica.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("first catch-up");
+    assert!(first.clock > 0);
+    let replica_clock_after_first = NodeServiceClient::connect(replica.clone())
+        .await
+        .unwrap()
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .wal_high_watermark;
+    let second = pipestream_search::replication::sync_once(&first)
+        .await
+        .expect("idempotent empty catch-up");
+    assert!(second.clock >= first.clock);
+
+    let source = NodeServiceClient::connect(primary)
+        .await
+        .unwrap()
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let target = NodeServiceClient::connect(replica)
+        .await
+        .unwrap()
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(source.num_vectors, target.num_vectors);
+    assert_eq!(source.document_slots, target.document_slots);
+    assert_eq!(source.scoring_fingerprint, target.scoring_fingerprint);
+    assert_eq!(target.wal_high_watermark, replica_clock_after_first);
+    let replica_store = pipestream_search::postings::Bm25Store::load(
+        &pipestream_search::node::bm25_sidecar_path(&root.join("replica.tv")),
+    )
+    .unwrap();
+    assert_eq!(replica_store.binding(), Some(&expected_binding()));
+
+    primary_handle.abort();
+    replica_handle.abort();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let split = u64::MAX / 2;
+    let mut nodes = Vec::new();
+    let mut handles = Vec::new();
+    for offset in [0, 1_000] {
+        let (addr, handle) = start_empty_node(NodeConfig {
+            slot_offset: offset,
+            ..case_node_config(analysis.clone())
+        })
+        .await;
+        seed_calibration(&addr).await;
+        nodes.push(addr);
+        handles.push(handle);
+    }
+    let coordinator = CoordinatorServiceImpl::new(nodes.clone())
+        .with_topology_generation(10)
+        .with_bm25(Some(analysis), Default::default())
+        .with_hot_topology(vec![Some((0, split)), Some((split + 1, u64::MAX))])
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coordinator_addr = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(CoordinatorServiceImpl::into_server(
+                coordinator.clone(),
+                pipestream_search::MAX_MESSAGE_BYTES,
+            ))
+            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
+    );
+
+    let mut keys: [Option<Vec<u8>>; 2] = [None, None];
+    for candidate in 0..10_000u64 {
+        let key = format!("law.v1.Case/case-{candidate}").into_bytes();
+        let shard = usize::from(pipestream_search::coordinator::stable_routing_hash(&key) > split);
+        keys[shard].get_or_insert(key);
+        if keys.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    let mut client = SearchServiceClient::connect(coordinator_addr)
+        .await
+        .unwrap();
+    let stream = vec![
+        RoutedIngestMappedRequest {
+            payload: Some(routed_ingest_mapped_request::Payload::Bind(
+                RoutedMappedBind {
+                    required_topology_generation: 10,
+                    bind: Some(bind()),
+                },
+            )),
+        },
+        RoutedIngestMappedRequest {
+            payload: Some(routed_ingest_mapped_request::Payload::Document(
+                RoutedMappedDocument {
+                    stable_key: keys[0].clone().unwrap(),
+                    document: doc(0).encode(),
+                },
+            )),
+        },
+        RoutedIngestMappedRequest {
+            payload: Some(routed_ingest_mapped_request::Payload::Document(
+                RoutedMappedDocument {
+                    stable_key: keys[1].clone().unwrap(),
+                    document: doc(1).encode(),
+                },
+            )),
+        },
+    ];
+    let response = client
+        .routed_ingest_mapped(tokio_stream::iter(stream))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.served_topology_generation, 10);
+    assert_eq!(response.added, 2);
+    assert_eq!(response.shards.len(), 2);
+    assert!(response.shards.iter().all(|shard| shard.added == 1));
+    for addr in &nodes {
+        let health = NodeServiceClient::connect(addr.clone())
+            .await
+            .unwrap()
+            .health(HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(health.num_vectors, 1);
+        assert_eq!(health.document_slots, 1);
+    }
+
+    let error = client
+        .routed_ingest_mapped(tokio_stream::iter([RoutedIngestMappedRequest {
+            payload: Some(routed_ingest_mapped_request::Payload::Bind(
+                RoutedMappedBind {
+                    required_topology_generation: 9,
+                    bind: Some(bind()),
+                },
+            )),
+        }]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    let frozen = SearchService::freeze_topology_writes(
+        &coordinator,
+        Request::new(FreezeTopologyWritesRequest {
+            required_topology_generation: 10,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let mut waiting_client = client.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_client
+            .routed_ingest_mapped(tokio_stream::iter([RoutedIngestMappedRequest {
+                payload: Some(routed_ingest_mapped_request::Payload::Bind(
+                    RoutedMappedBind {
+                        required_topology_generation: 10,
+                        bind: Some(bind()),
+                    },
+                )),
+            }]))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!waiting.is_finished(), "routed write crossed the freeze");
+    SearchService::publish_topology(
+        &coordinator,
+        Request::new(PublishTopologyRequest {
+            cutover_token: frozen.cutover_token,
+            generation: 11,
+            shards: vec![
+                PublishedTopologyShard {
+                    addr: nodes[0].clone(),
+                    replica: String::new(),
+                    hash_lo: 0,
+                    hash_hi: split,
+                },
+                PublishedTopologyShard {
+                    addr: nodes[1].clone(),
+                    replica: String::new(),
+                    hash_lo: split + 1,
+                    hash_hi: u64::MAX,
+                },
+            ],
+        }),
+    )
+    .await
+    .unwrap();
+    let error = waiting.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("generation 11"));
+
+    server.abort();
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_reshard_catches_the_tail_and_cuts_over_without_stopping_queries() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tvmapped_live_reshard_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let source_path = root.join("source.tv");
+    let (source, source_handle) = start_empty_node(NodeConfig {
+        index_path: Some(source_path.clone()),
+        wal: true,
+        wal_buckets: 8,
+        ..case_node_config(analysis.clone())
+    })
+    .await;
+    seed_calibration(&source).await;
+    let mut source_client = NodeServiceClient::connect(source.clone()).await.unwrap();
+    let routed = |start: usize, end: usize| {
+        std::iter::once(IngestMappedRequest {
+            payload: Some(ingest_mapped_request::Payload::Bind(bind())),
+        })
+        .chain((start..end).map(|i| IngestMappedRequest {
+            payload: Some(ingest_mapped_request::Payload::RoutedDocument(
+                RoutedMappedDocument {
+                    stable_key: format!("law.v1.Case/case-{i}").into_bytes(),
+                    document: doc(i).encode(),
+                },
+            )),
+        }))
+        .collect::<Vec<_>>()
+    };
+    source_client
+        .ingest_mapped(tokio_stream::iter(routed(0, 4)))
+        .await
+        .unwrap();
+    source_client
+        .flush(pipestream_search::pb::FlushRequest {})
+        .await
+        .unwrap();
+
+    let generation =
+        pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&source_path))
+            .unwrap();
+    let handle = tokio::runtime::Handle::current();
+    let analyze_addr = analysis.clone();
+    let mut analyze = move |docs: &[(&str, Option<&pipestream_search::pb::AnalysisSpec>)]| {
+        tokio::task::block_in_place(|| {
+            handle
+                .block_on(pipestream_search::analyzer::analyze_batch_streams(
+                    &analyze_addr,
+                    docs,
+                    1,
+                ))
+                .map_err(|error| error.to_string())
+        })
+    };
+    let baseline = pipestream_search::reshard::split_stable_logs(
+        &[generation],
+        2,
+        &root.join("children"),
+        10_000,
+        10_000,
+        false,
+        Some(&["body".to_string(), "meta_author".to_string()]),
+        &mut analyze,
+    )
+    .unwrap();
+    assert_eq!(baseline.source_cutoffs.len(), 1);
+
+    let mut child_addrs = Vec::new();
+    let mut child_handles = Vec::new();
+    let mut children = Vec::new();
+    for child in &baseline.images.children {
+        let config = NodeConfig {
+            index_path: Some(child.vector_path.clone()),
+            slot_offset: child.slot_offset,
+            wal: true,
+            ..case_node_config(analysis.clone())
+        };
+        let service = pipestream_search::node::NodeServiceImpl::open(config, None, false).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
+                .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
+        );
+        children.push(pipestream_search::replication::LiveChild {
+            addr: addr.clone(),
+            replica: None,
+            hash_lo: child.hash_lo,
+            hash_hi: child.hash_hi,
+            slot_offset: child.slot_offset,
+            base_vectors: 0,
+            base_document_slots: 0,
+            applied_vectors: 0,
+            applied_documents: 0,
+        });
+        child_addrs.push(addr);
+        child_handles.push(task);
+    }
+
+    let state = pipestream_search::replication::initialize_live_reshard(
+        source.clone(),
+        baseline.source_cutoffs[0],
+        1,
+        2,
+        children,
+    )
+    .await
+    .unwrap();
+    source_client
+        .ingest_mapped(tokio_stream::iter(routed(4, 5)))
+        .await
+        .unwrap();
+    let state = pipestream_search::replication::catch_up_children_once(&state)
+        .await
+        .unwrap();
+    assert!(state.source_clock > baseline.source_cutoffs[0].high_watermark);
+
+    let coordinator = CoordinatorServiceImpl::new(vec![source.clone()])
+        .with_topology_generation(1)
+        .with_bm25(Some(analysis), Default::default())
+        .with_hot_topology(vec![Some((0, u64::MAX))])
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coordinator_addr = format!("http://{}", listener.local_addr().unwrap());
+    let coordinator_handle = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(CoordinatorServiceImpl::into_server(
+                coordinator,
+                pipestream_search::MAX_MESSAGE_BYTES,
+            ))
+            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
+    );
+    source_client
+        .ingest_mapped(tokio_stream::iter(routed(5, 6)))
+        .await
+        .unwrap();
+    let state_path = root.join("live-state.toml");
+    let map_path = root.join("shard-map.toml");
+    let final_state = pipestream_search::replication::atomic_live_cutover(
+        &coordinator_addr,
+        &state,
+        &state_path,
+        &map_path,
+    )
+    .await
+    .unwrap();
+    assert!(final_state.source_clock > state.source_clock);
+    assert_eq!(
+        pipestream_search::config::load_shard_map(&map_path)
+            .unwrap()
+            .generation,
+        2
+    );
+    let total_rows = final_state
+        .children
+        .iter()
+        .map(|child| child.base_vectors + child.applied_vectors)
+        .sum::<u64>();
+    assert_eq!(total_rows, 6);
+
+    let mut coordinator_client = SearchServiceClient::connect(coordinator_addr)
+        .await
+        .unwrap();
+    let response = coordinator_client
+        .routed_ingest_mapped(tokio_stream::iter([RoutedIngestMappedRequest {
+            payload: Some(routed_ingest_mapped_request::Payload::Bind(
+                RoutedMappedBind {
+                    required_topology_generation: 2,
+                    bind: Some(bind()),
+                },
+            )),
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.served_topology_generation, 2);
+
+    coordinator_handle.abort();
+    source_handle.abort();
+    for handle in child_handles {
+        handle.abort();
+    }
+    std::fs::remove_dir_all(root).ok();
 }
 
 // ---------------------------------------------------------------------

@@ -51,6 +51,7 @@ pub mod postings;
 pub mod quality;
 pub mod query;
 pub mod rankdiff;
+pub mod replication;
 pub mod reshard;
 pub mod scorefn;
 pub mod sha256;

@@ -3,13 +3,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::bm25::{Bm25Params, CorpusStats};
 use crate::clustered_turbovec::{
@@ -24,17 +24,21 @@ use crate::pb::{
     Bm25QueryStreamRequest, Bm25QueryStreamResponse,
 };
 use crate::pb::{
-    search_shard_request, search_shard_response, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest,
-    Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
-    BroadcastCalibrationResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse,
-    CalibrationApplyResult, CascadeHit, ClusterHealthRequest, ClusterHealthResponse,
-    ClusteredVectorHealth, ConfigureVectorBackendRequest, ExactVectorRescoreRequest, FloorUpdate,
-    FusionMode, HealthRequest, HybridDebug, HybridHit, HybridLegHit, HybridSearchRequest,
-    HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup, ScoredHit,
-    SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse,
-    SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats, StartShardSearch,
-    StartStreamSearch, StopStreamSearch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult, VectorRescoreRequest,
+    search_shard_request, search_shard_response, AbortTopologyCutoverRequest,
+    AbortTopologyCutoverResponse, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest, Bm25SearchRequest,
+    Bm25SearchResponse, BroadcastCalibrationRequest, BroadcastCalibrationResponse,
+    BroadcastVectorBackendRequest, BroadcastVectorBackendResponse, CalibrationApplyResult,
+    CascadeHit, ClusterHealthRequest, ClusterHealthResponse, ClusteredVectorHealth,
+    ConfigureVectorBackendRequest, ExactVectorRescoreRequest, FloorUpdate,
+    FreezeTopologyWritesRequest, FreezeTopologyWritesResponse, FusionMode, HealthRequest,
+    HybridDebug, HybridHit, HybridLegHit, HybridSearchRequest, HybridSearchResponse,
+    HybridShardDebug, HybridShardRequest, ParentGroup, PublishTopologyRequest,
+    PublishTopologyResponse, RoutedIngestMappedRequest, RoutedIngestMappedResponse,
+    RoutedShardIngest, ScoredHit, SearchRequest, SearchResponse, SearchShardDone,
+    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest,
+    ShardScanStats, StartShardSearch, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult,
+    VectorRescoreRequest,
 };
 use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
@@ -120,6 +124,113 @@ pub struct FanoutLimits {
     pub hedge_delay: Option<Duration>,
 }
 
+/// One immutable product-shard route in a topology generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyRoute {
+    pub addr: String,
+    pub replica: Option<String>,
+    /// Inclusive stable-key hash range. Every route must either provide a
+    /// range or omit one; mixed/ragged maps are refused.
+    pub hash_range: Option<(u64, u64)>,
+}
+
+struct CoordinatorTopology {
+    generation: u64,
+    routes: Vec<TopologyRoute>,
+    stats_cache: Arc<crate::stats_cache::StatsCache>,
+}
+
+fn build_topology(
+    generation: u64,
+    routes: Vec<TopologyRoute>,
+) -> Result<CoordinatorTopology, String> {
+    if routes.is_empty() {
+        return Err("topology requires at least one primary shard".to_string());
+    }
+    let mut addresses = std::collections::HashSet::new();
+    for (shard, route) in routes.iter().enumerate() {
+        if route.addr.is_empty() {
+            return Err(format!(
+                "topology shard {shard} has an empty primary address"
+            ));
+        }
+        if !addresses.insert(route.addr.as_str()) {
+            return Err(format!("duplicate topology endpoint {:?}", route.addr));
+        }
+        if let Some(replica) = route.replica.as_deref() {
+            if replica.is_empty() {
+                return Err(format!(
+                    "topology shard {shard} has an empty replica address"
+                ));
+            }
+            if !addresses.insert(replica) {
+                return Err(format!("duplicate topology endpoint {replica:?}"));
+            }
+        }
+        if let Some((lo, hi)) = route.hash_range {
+            if lo > hi {
+                return Err(format!(
+                    "topology shard {shard} has inverted hash range {lo}..={hi}"
+                ));
+            }
+        }
+    }
+    let ranged = routes
+        .iter()
+        .filter(|route| route.hash_range.is_some())
+        .count();
+    if ranged != 0 && ranged != routes.len() {
+        return Err("topology must provide hash ranges for every shard or none".to_string());
+    }
+    if ranged != 0 {
+        let mut ranges: Vec<(u64, u64, usize)> = routes
+            .iter()
+            .enumerate()
+            .map(|(shard, route)| {
+                let (lo, hi) = route.hash_range.expect("all routes ranged");
+                (lo, hi, shard)
+            })
+            .collect();
+        ranges.sort_by_key(|range| range.0);
+        let mut expected = 0u64;
+        for (position, (lo, hi, shard)) in ranges.iter().copied().enumerate() {
+            if lo != expected {
+                return Err(format!(
+                    "topology hash space has a gap or overlap before shard {shard}: expected {expected}, got {lo}"
+                ));
+            }
+            if position + 1 == ranges.len() {
+                if hi != u64::MAX {
+                    return Err(format!(
+                        "topology hash space ends at {hi}, not {}",
+                        u64::MAX
+                    ));
+                }
+            } else {
+                expected = hi.checked_add(1).ok_or_else(|| {
+                    format!("topology shard {shard} reaches the hash-space end too early")
+                })?;
+            }
+        }
+    }
+    Ok(CoordinatorTopology {
+        generation,
+        stats_cache: Arc::new(crate::stats_cache::StatsCache::new(routes.len())),
+        routes,
+    })
+}
+
+/// Stable FNV-1a over opaque product identity bytes. Unlike the historical
+/// WAL bucket hash, this never depends on generation-local numeric slots.
+pub fn stable_routing_hash(key: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ProductLabelRange {
     start: u64,
@@ -145,12 +256,15 @@ pub(crate) struct ExactRerankScores {
     pub tasks: u32,
 }
 
+type CutoverLease = (u64, tokio::sync::OwnedRwLockWriteGuard<()>);
+
 /// The coordinator gRPC service.
 ///
-/// Membership is static: the node address list is fixed at construction
-/// and every query fans out to every node. Connections are pooled: one
-/// lazily-established HTTP/2 channel per node address, multiplexing every
-/// concurrent query and reconnecting on its own after a node restart.
+/// Every request snapshots one immutable topology generation. A coordinator
+/// may keep its construction-time map or publish newer hot generations.
+/// Connections are pooled: one lazily-established HTTP/2 channel per node
+/// address, multiplexing every concurrent query and reconnecting on its own
+/// after a node restart.
 #[derive(Clone)]
 pub struct CoordinatorServiceImpl {
     /// Node addresses in `http://host:port` form, in stable shard order
@@ -205,6 +319,19 @@ pub struct CoordinatorServiceImpl {
     dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
     /// Product shard-map generation (zero for the implicit static list).
     topology_generation: u64,
+    /// Inclusive stable-key ranges parallel to `node_addrs`. Empty for the
+    /// legacy explicitly addressed topology.
+    hash_ranges: Vec<Option<(u64, u64)>>,
+    /// Hot topology authority. Public RPC entry points snapshot this once and
+    /// recurse into a frozen clone with this field cleared, so no request can
+    /// observe half of two generations.
+    live_topology: Option<Arc<RwLock<Arc<CoordinatorTopology>>>>,
+    /// Routed writes take a read guard. A cutover holds the owned write guard
+    /// while the final WAL tail is verified and the new map is published;
+    /// queries do not use this gate.
+    write_gate: Arc<tokio::sync::RwLock<()>>,
+    cutover_guard: Arc<Mutex<Option<CutoverLease>>>,
+    cutover_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Product-owned phrase vocabulary used to derive canonical query terms.
     phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
     /// Request-local observer installed only by public QueryStream. A watch
@@ -320,7 +447,7 @@ async fn stream_bm25_shard(
                         batch.candidates.len()
                     )));
                 }
-                if batch.candidates.chunks_exact(12).any(|rec| {
+                if batch.candidates.as_chunks::<12>().0.iter().any(|rec| {
                     !f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score")).is_finite()
                 }) {
                     break Err(Status::data_loss(format!(
@@ -330,7 +457,7 @@ async fn stream_bm25_shard(
                 received += (batch.candidates.len() / 12) as u64;
                 let mut state = global_heap.lock().expect("BM25 stream heap poisoned");
                 let mut raised = None;
-                for rec in batch.candidates.chunks_exact(12) {
+                for rec in batch.candidates.as_chunks::<12>().0 {
                     if k == 0 {
                         continue;
                     }
@@ -1365,6 +1492,11 @@ impl CoordinatorServiceImpl {
             clustered_vectors: None,
             dense_quality_profile: None,
             topology_generation: 0,
+            hash_ranges: Vec::new(),
+            live_topology: None,
+            write_gate: Arc::new(tokio::sync::RwLock::new(())),
+            cutover_guard: Arc::new(Mutex::new(None)),
+            cutover_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             phrase_index: None,
             query_progress: None,
         }
@@ -1394,10 +1526,181 @@ impl CoordinatorServiceImpl {
         self.allow_network
     }
 
+    pub fn max_k(&self) -> u32 {
+        self.max_k
+    }
+
     /// The term-stats cache, exposed for tests (`fetch_count` is how a
     /// test proves the hit path issued no RPCs).
     pub fn stats_cache(&self) -> &crate::stats_cache::StatsCache {
         &self.stats_cache
+    }
+
+    /// Enable atomic topology replacement. The current fields become the
+    /// configured generation's immutable request snapshot.
+    pub fn with_hot_topology(
+        mut self,
+        hash_ranges: Vec<Option<(u64, u64)>>,
+    ) -> Result<Self, String> {
+        if hash_ranges.len() != self.node_addrs.len() {
+            return Err(format!(
+                "topology has {} shard addresses but {} hash ranges",
+                self.node_addrs.len(),
+                hash_ranges.len()
+            ));
+        }
+        let routes = self
+            .node_addrs
+            .iter()
+            .enumerate()
+            .map(|(shard, addr)| TopologyRoute {
+                addr: addr.clone(),
+                replica: self.replica_addrs.get(shard).cloned().flatten(),
+                hash_range: hash_ranges.get(shard).copied().flatten(),
+            })
+            .collect();
+        let topology = build_topology(self.topology_generation, routes)?;
+        self.hash_ranges = hash_ranges;
+        self.live_topology = Some(Arc::new(RwLock::new(Arc::new(topology))));
+        Ok(self)
+    }
+
+    /// Atomically publish a strictly newer topology generation. Existing
+    /// requests retain their prior `Arc`; later requests snapshot this map.
+    pub fn reload_topology(
+        &self,
+        generation: u64,
+        routes: Vec<TopologyRoute>,
+    ) -> Result<(), String> {
+        if self.cutover_pending.load(AtomicOrdering::Acquire) {
+            return Err(
+                "topology cutover has frozen writes; publish or abort it first".to_string(),
+            );
+        }
+        self.publish_topology_inner(generation, routes)
+    }
+
+    fn publish_topology_inner(
+        &self,
+        generation: u64,
+        routes: Vec<TopologyRoute>,
+    ) -> Result<(), String> {
+        let authority = self
+            .live_topology
+            .as_ref()
+            .ok_or_else(|| "hot topology is not enabled".to_string())?;
+        let replacement = Arc::new(build_topology(generation, routes)?);
+        let mut current = authority
+            .write()
+            .map_err(|_| "topology authority lock is poisoned".to_string())?;
+        if generation <= current.generation {
+            return Err(format!(
+                "topology generation must increase: current {}, proposed {generation}",
+                current.generation
+            ));
+        }
+        *current = replacement;
+        Ok(())
+    }
+
+    pub fn current_topology_generation(&self) -> u64 {
+        self.live_topology
+            .as_ref()
+            .and_then(|authority| authority.read().ok().map(|topology| topology.generation))
+            .unwrap_or(self.topology_generation)
+    }
+
+    /// Current routes for control-plane workers. The returned vector is one
+    /// immutable generation snapshot; callers never borrow the live lock.
+    pub fn current_topology_routes(&self) -> Vec<TopologyRoute> {
+        if let Some(authority) = &self.live_topology {
+            return authority
+                .read()
+                .expect("topology authority lock poisoned")
+                .routes
+                .clone();
+        }
+        self.node_addrs
+            .iter()
+            .enumerate()
+            .map(|(shard, addr)| TopologyRoute {
+                addr: addr.clone(),
+                replica: self.replica_addrs.get(shard).cloned().flatten(),
+                hash_range: self.hash_ranges.get(shard).copied().flatten(),
+            })
+            .collect()
+    }
+
+    /// Resolve an opaque stable product identity under one immutable map.
+    /// Returns `(generation, shard_index)` for ingest stamping.
+    pub fn route_stable_key(&self, key: &[u8]) -> Result<(u64, usize), String> {
+        if key.is_empty() {
+            return Err("stable routing key is empty".to_string());
+        }
+        let hash = stable_routing_hash(key);
+        let (generation, ranges): (u64, Vec<Option<(u64, u64)>>) =
+            if let Some(authority) = &self.live_topology {
+                let topology = authority
+                    .read()
+                    .map_err(|_| "topology authority lock is poisoned".to_string())?
+                    .clone();
+                (
+                    topology.generation,
+                    topology
+                        .routes
+                        .iter()
+                        .map(|route| route.hash_range)
+                        .collect(),
+                )
+            } else {
+                (self.topology_generation, self.hash_ranges.clone())
+            };
+        if ranges.is_empty() || ranges.iter().any(Option::is_none) {
+            return Err("topology has no complete stable hash ranges".to_string());
+        }
+        let shard = ranges
+            .iter()
+            .position(|range| range.is_some_and(|(lo, hi)| hash >= lo && hash <= hi))
+            .ok_or_else(|| format!("stable hash {hash} is not covered by the topology"))?;
+        Ok((generation, shard))
+    }
+
+    fn request_snapshot(&self) -> Option<Self> {
+        let authority = self.live_topology.as_ref()?;
+        let topology = authority
+            .read()
+            .expect("topology authority lock poisoned")
+            .clone();
+        let mut frozen = self.clone();
+        frozen.node_addrs = topology
+            .routes
+            .iter()
+            .map(|route| route.addr.clone())
+            .collect();
+        frozen.replica_addrs = topology
+            .routes
+            .iter()
+            .map(|route| route.replica.clone())
+            .collect();
+        frozen.topology_generation = topology.generation;
+        frozen.hash_ranges = topology
+            .routes
+            .iter()
+            .map(|route| route.hash_range)
+            .collect();
+        frozen.stats_cache = topology.stats_cache.clone();
+        frozen.live_topology = None;
+        Some(frozen)
+    }
+
+    fn require_topology_generation(&self, requested: u64) -> Result<(), Status> {
+        if requested != 0 && requested != self.topology_generation {
+            return Err(Status::failed_precondition(format!(
+                "request requires topology generation {requested}, but this request was assigned generation {}",
+                self.topology_generation
+            )));
+        }
+        Ok(())
     }
 
     /// The UDP signal socket, bound once (nonblocking: a full local
@@ -4378,7 +4681,7 @@ impl CoordinatorServiceImpl {
                             ));
                             return fanout.cancel_with(status).await;
                         }
-                        for rec in batch.hits.chunks_exact(12) {
+                        for rec in batch.hits.as_chunks::<12>().0 {
                             let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
                             let v =
                                 f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score"));
@@ -4997,7 +5300,7 @@ impl CoordinatorServiceImpl {
                         ));
                         return fanout.cancel_with(status).await;
                     }
-                    for rec in batch.hits.chunks_exact(12) {
+                    for rec in batch.hits.as_chunks::<12>().0 {
                         let entry = StreamHeapEntry(MergedHit {
                             vector_id: u64::from_le_bytes(rec[..8].try_into().expect("8-byte id")),
                             shard: shard as u32,
@@ -5175,7 +5478,7 @@ impl CoordinatorServiceImpl {
                         return fanout.cancel_with(status).await;
                     }
                     let mut dirty = false;
-                    for rec in batch.hits.chunks_exact(20) {
+                    for rec in batch.hits.as_chunks::<20>().0 {
                         let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
                         let score =
                             f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score"));
@@ -6703,6 +7006,7 @@ impl CoordinatorServiceImpl {
         &self,
         filters: &RequestFilters,
         compiled: &CompiledAggregate,
+        doc_ids: Option<&[u64]>,
     ) -> Result<crate::pb::AggregateResponse, Status> {
         let CompiledAggregate {
             aggregations,
@@ -6724,6 +7028,8 @@ impl CoordinatorServiceImpl {
                 max_groups: *max_groups,
                 histograms: histograms.to_vec(),
                 percentiles: percentiles.to_vec(),
+                doc_ids: doc_ids.unwrap_or_default().to_vec(),
+                restrict_doc_ids: doc_ids.is_some(),
             };
             let client = self.node_client(node);
             tasks.push(tokio::spawn(async move {
@@ -6904,7 +7210,7 @@ impl CoordinatorServiceImpl {
             })
             .collect();
         let pct_results = self
-            .solve_percentiles(filters, percentile_specs, percentiles, &pct_merged)
+            .solve_percentiles(filters, percentile_specs, percentiles, &pct_merged, doc_ids)
             .await?;
         Ok(crate::pb::AggregateResponse {
             results,
@@ -6927,6 +7233,7 @@ impl CoordinatorServiceImpl {
         specs: &[crate::pb::PercentileSpec],
         compiled: &[crate::pb::CompiledPercentile],
         merged: &[PctMerge],
+        doc_ids: Option<&[u64]>,
     ) -> Result<Vec<crate::pb::PercentileResult>, Status> {
         struct Target {
             spec: usize,
@@ -6970,7 +7277,9 @@ impl CoordinatorServiceImpl {
                     }
                 })
                 .collect();
-            let counts = self.quantile_round(filters, compiled, &probes).await?;
+            let counts = self
+                .quantile_round(filters, compiled, &probes, doc_ids)
+                .await?;
             for (&i, (probe, count)) in active.iter().zip(probes.iter().zip(counts)) {
                 let t = &mut targets[i];
                 if count >= t.k {
@@ -7031,6 +7340,7 @@ impl CoordinatorServiceImpl {
         filters: &RequestFilters,
         exprs: &[crate::pb::CompiledPercentile],
         targets: &[crate::pb::QuantileTarget],
+        doc_ids: Option<&[u64]>,
     ) -> Result<Vec<u64>, Status> {
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
@@ -7039,6 +7349,8 @@ impl CoordinatorServiceImpl {
                 geo_filters: filters.geo.clone(),
                 exprs: exprs.to_vec(),
                 targets: targets.to_vec(),
+                doc_ids: doc_ids.unwrap_or_default().to_vec(),
+                restrict_doc_ids: doc_ids.is_some(),
             };
             let client = self.node_client(node);
             tasks.push(tokio::spawn(async move {
@@ -7745,6 +8057,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::search(&snapshot, request)).await;
+        }
         let req = request.into_inner();
         let k = self.resolve_k(req.k)?;
         if req.vector.is_empty() {
@@ -7845,6 +8160,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::bm25_search(&snapshot, request)).await;
+        }
         let req = request.into_inner();
         let k = self.resolve_k(req.k)?;
         if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
@@ -7949,6 +8267,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::PhraseSearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::phrase_search(&snapshot, request)).await;
+        }
         let request = request.into_inner();
         let base = request
             .base
@@ -8004,6 +8325,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::hybrid_search(&snapshot, request)).await;
+        }
         let req = request.into_inner();
         let k = self.resolve_k(req.k)?;
         if req.text.is_empty() {
@@ -8164,16 +8488,27 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::QueryRequest>,
     ) -> Result<Response<crate::pb::QueryResponse>, Status> {
-        crate::query::execute(self, request.into_inner())
-            .await
-            .map(Response::new)
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::query(&snapshot, request)).await;
+        }
+        let request = request.into_inner();
+        self.require_topology_generation(request.required_topology_generation)?;
+        let mut response = crate::query::execute(self, request).await?;
+        response.served_topology_generation = self.topology_generation;
+        Ok(Response::new(response))
     }
 
     async fn query_stream(
         &self,
         request: Request<crate::pb::QueryStreamRequest>,
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::query_stream(&snapshot, request)).await;
+        }
         let request = request.into_inner();
+        if let Some(query) = request.query.as_ref() {
+            self.require_topology_generation(query.required_topology_generation)?;
+        }
         let (tx, rx) = mpsc::channel::<Result<crate::pb::QueryStreamResponse, Status>>(8);
         let service = self.clone();
         tokio::spawn(async move {
@@ -8328,7 +8663,9 @@ impl SearchService for CoordinatorServiceImpl {
                             }
                         }
                         match result {
-                            Ok(response) => {
+                            Ok(mut response) => {
+                                response.served_topology_generation =
+                                    runner.topology_generation;
                                 scoring_fingerprints.sort();
                                 scoring_fingerprints.dedup();
                                 let final_scoring = combined_scoring_fingerprint(
@@ -8434,6 +8771,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::PlanIndexRequest>,
     ) -> Result<Response<crate::pb::PlanIndexResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::plan_index(&snapshot, request)).await;
+        }
         // Derivation is local and deterministic (docs/descriptor-mappings.md):
         // nothing fans out, nothing binds, and the same request returns the
         // same fingerprint on every coordinator.
@@ -8441,6 +8781,226 @@ impl SearchService for CoordinatorServiceImpl {
         let plan = crate::mapping::derive_plan(&req.descriptor_set, &req.message_type)?;
         Ok(Response::new(crate::pb::PlanIndexResponse {
             plan: Some(plan),
+        }))
+    }
+
+    async fn routed_ingest_mapped(
+        &self,
+        request: Request<Streaming<RoutedIngestMappedRequest>>,
+    ) -> Result<Response<RoutedIngestMappedResponse>, Status> {
+        // Gate before snapshotting: a write that arrived during a cutover
+        // must resume onto the new map, never retain the old snapshot while
+        // waiting behind the final-tail barrier.
+        let _write_guard = if self.live_topology.is_some() {
+            Some(self.write_gate.clone().read_owned().await)
+        } else {
+            None
+        };
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::routed_ingest_mapped(&snapshot, request)).await;
+        }
+        let mut inbound = request.into_inner();
+        let bind = match inbound.message().await? {
+            Some(RoutedIngestMappedRequest {
+                payload: Some(crate::pb::routed_ingest_mapped_request::Payload::Bind(bind)),
+            }) => bind,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first RoutedIngestMappedRequest must be a RoutedMappedBind",
+                ))
+            }
+        };
+        if bind.required_topology_generation == 0 {
+            return Err(Status::invalid_argument(
+                "routed writes require required_topology_generation; zero is not accepted",
+            ));
+        }
+        self.require_topology_generation(bind.required_topology_generation)?;
+        let mapped_bind = bind
+            .bind
+            .ok_or_else(|| Status::invalid_argument("routed mapped bind is missing bind"))?;
+        let mut batches: Vec<Vec<crate::pb::IngestMappedRequest>> =
+            vec![Vec::new(); self.node_addrs.len()];
+        while let Some(message) = inbound.message().await? {
+            let document = match message.payload {
+                Some(crate::pb::routed_ingest_mapped_request::Payload::Document(document)) => {
+                    document
+                }
+                Some(crate::pb::routed_ingest_mapped_request::Payload::Bind(_)) => {
+                    return Err(Status::invalid_argument(
+                        "routed mapped bind repeats mid-stream",
+                    ))
+                }
+                None => {
+                    return Err(Status::invalid_argument(
+                        "empty RoutedIngestMappedRequest payload",
+                    ))
+                }
+            };
+            let (_, shard) = self
+                .route_stable_key(&document.stable_key)
+                .map_err(Status::invalid_argument)?;
+            if batches[shard].is_empty() {
+                batches[shard].push(crate::pb::IngestMappedRequest {
+                    payload: Some(crate::pb::ingest_mapped_request::Payload::Bind(
+                        mapped_bind.clone(),
+                    )),
+                });
+            }
+            batches[shard].push(crate::pb::IngestMappedRequest {
+                payload: Some(crate::pb::ingest_mapped_request::Payload::RoutedDocument(
+                    document,
+                )),
+            });
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (shard, batch) in batches.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            let addr = self.node_addrs[shard].clone();
+            let mut client = self.node_client(&addr)?;
+            tasks.spawn(async move {
+                let response = client
+                    .ingest_mapped(tokio_stream::iter(batch))
+                    .await?
+                    .into_inner();
+                Ok::<_, Status>((shard, addr, response))
+            });
+        }
+        let mut shards = Vec::new();
+        let mut added = 0u64;
+        let mut parents = 0u64;
+        while let Some(result) = tasks.join_next().await {
+            let (shard, addr, response) = result.map_err(|error| {
+                Status::internal(format!("routed ingest task failed: {error}"))
+            })??;
+            added = added.saturating_add(response.added);
+            parents = parents.saturating_add(response.parents);
+            shards.push(RoutedShardIngest {
+                shard: shard as u32,
+                addr,
+                added: response.added,
+                parents: response.parents,
+                first_id: response.first_id,
+            });
+        }
+        shards.sort_by_key(|result| result.shard);
+        Ok(Response::new(RoutedIngestMappedResponse {
+            added,
+            parents,
+            served_topology_generation: self.topology_generation,
+            shards,
+        }))
+    }
+
+    async fn freeze_topology_writes(
+        &self,
+        request: Request<FreezeTopologyWritesRequest>,
+    ) -> Result<Response<FreezeTopologyWritesResponse>, Status> {
+        if self.live_topology.is_none() {
+            return Err(Status::failed_precondition(
+                "topology cutover requires a generation-stamped hot shard map",
+            ));
+        }
+        let requested = request.into_inner().required_topology_generation;
+        if requested == 0 {
+            return Err(Status::invalid_argument(
+                "freeze requires a nonzero topology generation",
+            ));
+        }
+        if requested != self.current_topology_generation() {
+            return Err(Status::failed_precondition(format!(
+                "freeze requires topology generation {requested}, live {}",
+                self.current_topology_generation()
+            )));
+        }
+        if self
+            .cutover_pending
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return Err(Status::already_exists(
+                "another topology cutover is already pending",
+            ));
+        }
+        let guard = self.write_gate.clone().write_owned().await;
+        if requested != self.current_topology_generation() {
+            self.cutover_pending.store(false, AtomicOrdering::Release);
+            drop(guard);
+            return Err(Status::failed_precondition(
+                "topology changed while the write barrier was being acquired",
+            ));
+        }
+        let token = floor_token();
+        *self
+            .cutover_guard
+            .lock()
+            .expect("cutover guard mutex poisoned") = Some((token, guard));
+        Ok(Response::new(FreezeTopologyWritesResponse {
+            topology_generation: requested,
+            cutover_token: token,
+        }))
+    }
+
+    async fn publish_topology(
+        &self,
+        request: Request<PublishTopologyRequest>,
+    ) -> Result<Response<PublishTopologyResponse>, Status> {
+        let req = request.into_inner();
+        let routes = req
+            .shards
+            .into_iter()
+            .map(|shard| TopologyRoute {
+                addr: crate::config::normalize_addr(shard.addr),
+                replica: (!shard.replica.is_empty())
+                    .then(|| crate::config::normalize_addr(shard.replica)),
+                hash_range: Some((shard.hash_lo, shard.hash_hi)),
+            })
+            .collect();
+        let mut held = self
+            .cutover_guard
+            .lock()
+            .expect("cutover guard mutex poisoned");
+        let Some((token, _)) = held.as_ref() else {
+            return Err(Status::failed_precondition(
+                "no topology cutover write freeze is active",
+            ));
+        };
+        if *token != req.cutover_token {
+            return Err(Status::permission_denied("cutover token does not match"));
+        }
+        self.publish_topology_inner(req.generation, routes)
+            .map_err(Status::invalid_argument)?;
+        held.take();
+        self.cutover_pending.store(false, AtomicOrdering::Release);
+        Ok(Response::new(PublishTopologyResponse {
+            topology_generation: req.generation,
+        }))
+    }
+
+    async fn abort_topology_cutover(
+        &self,
+        request: Request<AbortTopologyCutoverRequest>,
+    ) -> Result<Response<AbortTopologyCutoverResponse>, Status> {
+        let token = request.into_inner().cutover_token;
+        let mut held = self
+            .cutover_guard
+            .lock()
+            .expect("cutover guard mutex poisoned");
+        let Some((expected, _)) = held.as_ref() else {
+            return Err(Status::failed_precondition(
+                "no topology cutover write freeze is active",
+            ));
+        };
+        if *expected != token {
+            return Err(Status::permission_denied("cutover token does not match"));
+        }
+        held.take();
+        self.cutover_pending.store(false, AtomicOrdering::Release);
+        Ok(Response::new(AbortTopologyCutoverResponse {
+            topology_generation: self.current_topology_generation(),
         }))
     }
 
@@ -8452,10 +9012,13 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::AggregateRequest>,
     ) -> Result<Response<crate::pb::AggregateResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::aggregate(&snapshot, request)).await;
+        }
         let req = request.into_inner();
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
         let compiled = compile_aggregations(&req)?;
-        self.fanout_aggregate(&filters, &compiled)
+        self.fanout_aggregate(&filters, &compiled, None)
             .await
             .map(Response::new)
     }
@@ -8464,6 +9027,13 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         _request: Request<ClusterHealthRequest>,
     ) -> Result<Response<ClusterHealthResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::cluster_health(
+                &snapshot,
+                Request::new(ClusterHealthRequest {}),
+            ))
+            .await;
+        }
         // Probe every primary, then every configured replica. Unreachable
         // is a reported outcome, never an error; a 2s probe timeout keeps
         // one filtered port from stalling the whole report.
@@ -8555,6 +9125,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<BroadcastVectorBackendRequest>,
     ) -> Result<Response<BroadcastVectorBackendResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::broadcast_vector_backend(&snapshot, request)).await;
+        }
         let req = request.into_inner();
         if req.dim == 0 || req.config.is_none() {
             return Err(Status::invalid_argument(
@@ -8569,6 +9142,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<BroadcastCalibrationRequest>,
     ) -> Result<Response<BroadcastCalibrationResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::broadcast_calibration(&snapshot, request)).await;
+        }
         let req = request.into_inner();
         if req.shift.len() != req.dim as usize || req.scale.len() != req.dim as usize {
             return Err(Status::invalid_argument(
@@ -8583,6 +9159,9 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<VariantSearchRequest>,
     ) -> Result<Response<VariantSearchResponse>, Status> {
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::variant_search(&snapshot, request)).await;
+        }
         let req = request.into_inner();
         if req.variants.len() < 2 {
             return Err(Status::invalid_argument(format!(
@@ -8725,6 +9304,169 @@ fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
 #[cfg(test)]
 mod stream_cancel_tests {
     use super::*;
+
+    fn route(addr: &str, lo: u64, hi: u64) -> TopologyRoute {
+        TopologyRoute {
+            addr: addr.to_string(),
+            replica: None,
+            hash_range: Some((lo, hi)),
+        }
+    }
+
+    #[test]
+    fn topology_refuses_ragged_or_incomplete_hash_space() {
+        assert!(
+            build_topology(1, vec![route("a", 0, 9), route("b", 11, u64::MAX)])
+                .err()
+                .expect("gap must be refused")
+                .contains("gap or overlap")
+        );
+        assert!(
+            build_topology(1, vec![route("a", 0, 10), route("b", 10, u64::MAX)])
+                .err()
+                .expect("overlap must be refused")
+                .contains("gap or overlap")
+        );
+        assert!(build_topology(
+            1,
+            vec![
+                route("a", 0, u64::MAX),
+                TopologyRoute {
+                    addr: "b".to_string(),
+                    replica: None,
+                    hash_range: None,
+                }
+            ]
+        )
+        .err()
+        .expect("ragged ranges must be refused")
+        .contains("every shard or none"));
+        assert!(build_topology(
+            1,
+            vec![
+                TopologyRoute {
+                    addr: "a".into(),
+                    replica: Some("b".into()),
+                    hash_range: Some((0, 9)),
+                },
+                route("b", 10, u64::MAX),
+            ],
+        )
+        .err()
+        .expect("a replica cannot also serve another logical shard")
+        .contains("duplicate topology endpoint"));
+    }
+
+    #[test]
+    fn hot_topology_snapshots_one_generation_per_request() {
+        let coordinator = CoordinatorServiceImpl::new(vec!["old".to_string()])
+            .with_topology_generation(4)
+            .with_hot_topology(vec![Some((0, u64::MAX))])
+            .unwrap();
+        let old = coordinator.request_snapshot().unwrap();
+
+        coordinator
+            .reload_topology(5, vec![route("new", 0, u64::MAX)])
+            .unwrap();
+        let new = coordinator.request_snapshot().unwrap();
+
+        assert_eq!(old.topology_generation, 4);
+        assert_eq!(old.node_addrs, vec!["old"]);
+        assert_eq!(new.topology_generation, 5);
+        assert_eq!(new.node_addrs, vec!["new"]);
+        assert_eq!(coordinator.current_topology_generation(), 5);
+        assert!(coordinator
+            .reload_topology(5, vec![route("newer", 0, u64::MAX)])
+            .unwrap_err()
+            .contains("must increase"));
+    }
+
+    #[tokio::test]
+    async fn cutover_barrier_publishes_a_new_shard_count_atomically() {
+        let coordinator = CoordinatorServiceImpl::new(vec!["old".to_string()])
+            .with_topology_generation(4)
+            .with_hot_topology(vec![Some((0, u64::MAX))])
+            .unwrap();
+        let frozen = SearchService::freeze_topology_writes(
+            &coordinator,
+            Request::new(FreezeTopologyWritesRequest {
+                required_topology_generation: 4,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(coordinator
+            .reload_topology(5, vec![route("other", 0, u64::MAX)])
+            .unwrap_err()
+            .contains("frozen writes"));
+
+        let split = u64::MAX / 2;
+        SearchService::publish_topology(
+            &coordinator,
+            Request::new(PublishTopologyRequest {
+                cutover_token: frozen.cutover_token,
+                generation: 5,
+                shards: vec![
+                    crate::pb::PublishedTopologyShard {
+                        addr: "a:50051".into(),
+                        replica: String::new(),
+                        hash_lo: 0,
+                        hash_hi: split,
+                    },
+                    crate::pb::PublishedTopologyShard {
+                        addr: "b:50051".into(),
+                        replica: String::new(),
+                        hash_lo: split + 1,
+                        hash_hi: u64::MAX,
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(coordinator.current_topology_generation(), 5);
+        assert_eq!(coordinator.current_topology_routes().len(), 2);
+        let (_, routed) = coordinator.route_stable_key(b"stable-product-id").unwrap();
+        assert!(routed < 2);
+
+        let frozen = SearchService::freeze_topology_writes(
+            &coordinator,
+            Request::new(FreezeTopologyWritesRequest {
+                required_topology_generation: 5,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let aborted = SearchService::abort_topology_cutover(
+            &coordinator,
+            Request::new(AbortTopologyCutoverRequest {
+                cutover_token: frozen.cutover_token,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(aborted.topology_generation, 5);
+    }
+
+    #[test]
+    fn stable_product_keys_route_deterministically() {
+        let split = u64::MAX / 2;
+        let coordinator = CoordinatorServiceImpl::new(vec!["a".to_string(), "b".to_string()])
+            .with_topology_generation(9)
+            .with_hot_topology(vec![Some((0, split)), Some((split + 1, u64::MAX))])
+            .unwrap();
+        let key = b"courtlistener:opinion:123/chunk:7";
+        let expected = usize::from(stable_routing_hash(key) > split);
+        assert_eq!(coordinator.route_stable_key(key), Ok((9, expected)));
+        assert_eq!(coordinator.route_stable_key(key), Ok((9, expected)));
+        assert!(coordinator
+            .route_stable_key(b"")
+            .unwrap_err()
+            .contains("empty"));
+    }
 
     #[test]
     fn in_process_mode_has_no_network_fallback_or_udp_lane() {

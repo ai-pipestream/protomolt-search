@@ -60,11 +60,17 @@ log is a **folder of hash-bucketed segment files**, not one file:
 ```
 
 Every vector/document record is routed to
-`bucket = fnv1a64(id) >> (64 - bucket_bits)` — the *same* function the
-resharder partitions by. Each bucket file is therefore a
+`bucket = fnv1a64(id) >> (64 - bucket_bits)`. Each bucket file is therefore a
 pre-partitioned slice of the shard's history. This is log-level
 pre-sharding: splitting does not re-partition the log because the log
 was born partitioned.
+
+Each record also carries one generation-wide logical clock. `ReadWal` merges
+the bucket and marker files by that clock and exports an immutable flushed
+prefix, which gives replica and child catch-up one exact resume point despite
+the physical files. Routed mapped ingest additionally records the opaque stable
+product key beside every vector and document row. Live resharding partitions by
+`fnv1a64(stable_key)`, never by a generation-local slot id.
 
 Writes are applied to the in-memory indexes first and logged
 immediately after, under one lock — a failed apply must never reach the
@@ -102,7 +108,7 @@ scores share one identity. BM25 postings are
 rebuilt from the logged document records; global df/avgdl re-aggregate
 from `TermStats` at query time as usual.
 
-### Atomic swap (already existed)
+### Snapshot installation
 
 `InstallSnapshot` was designed for bulk load and is exactly phase 3 of
 the skeleton: stream an image, validate its provider and scoring fingerprint, atomically rename
@@ -110,12 +116,22 @@ generation directories, recover interrupted swaps at startup. A node
 that installs a resharded image rotates its WAL to a fresh generation
 and logs on from there.
 
-### Shard map (the metadata)
+### Hot shard map and write barrier
 
-The coordinator can load a versioned map (`--shard-map=file.toml`):
-a generation number plus per-shard address, slot range, and hash range.
-The map is the id→shard authority; `--nodes` remains as the implicit
-generation 0.
+The coordinator loads a versioned map (`--shard-map=file.toml`): a generation
+number plus per-shard primary, optional replica, slot base, and stable-key hash
+range. It polls complete newer maps and swaps one immutable `Arc`; an in-flight
+query keeps the old snapshot, and every public `Query` response reports the
+generation it served. A client may require an exact generation and receives a
+precondition failure rather than silently crossing a cutover.
+
+Routed ingest requires the old generation explicitly. Final cutover takes a
+write barrier only on that routed ingest RPC, catches children through the
+parent's last durable clock, verifies counts and scoring identity, writes the
+new map durably, swaps it in memory, and releases writes. Queries never take
+the barrier. If publication fails after the map is durable, writes remain
+frozen; restart from the durable map or retry publication rather than reopening
+the old generation and losing a tail.
 
 ## Invariants
 
@@ -156,10 +172,9 @@ image:
   provider/BM25/FP32 generation, and drops the overlay. Install that image with
   `InstallSnapshot` for the crash-safe atomic generation swap, then archive the
   parent generation.
-- The build may run while reads continue, but writes must be stopped before
-  choosing the replay point and remain stopped through install. Live WAL
-  catch-up is still deferred; calling this hitless today would lose mutations
-  appended after the replay point.
+- A legacy explicitly addressed generation still needs a write stop because it
+  has no stable product keys. A fully clocked routed generation can use the live
+  catch-up and cutover path, including for a one-child compaction.
 - **Natural triggers:** after a bulk-load phase completes, after any
   `InstallSnapshot` (rotation already happens; retiring the old
   generation is the compaction), after a reshard retires its parent,
@@ -205,12 +220,61 @@ what a generation is worth before archiving it. (Systems with an
 acknowledged-prefix WAL truncate instead; our full-history model
 archives whole generations at rotation boundaries.)
 
+## Hitless split runbook
+
+This path is intentionally limited to one append-only routed source. Legacy
+rows without stable keys, deletes/replacements, a rotated WAL, incomplete hash
+ranges, or mismatched scoring fingerprints fail loudly.
+
+1. Build the stable-key baseline while the source keeps serving:
+
+   ```bash
+   cargo run --release --example reshard -- \
+     --log=/data/source.tv.wal --split=2 --stable-routing \
+     --out-dir=/data/next --slot-base=0 --slot-stride=25000000 \
+     --analysis-addr=http://analysis:50051
+   ```
+
+   This emits child images and `live-cutoff.toml`. The source generation must
+   have full history, a fully clocked WAL, and one stable key per live row.
+
+2. Start the child images on disjoint ports. Copy the emitted shard map to a
+   staging path and replace each `addr = "TODO"`; do not place this staging
+   map at the coordinator's live `--shard-map` path.
+
+3. Capture child baselines and run background catch-up as often as needed:
+
+   ```bash
+   cargo run --release --example live_reshard -- init \
+     --source=http://old:50051 --cutoff=/data/next/live-cutoff.toml \
+     --old-generation=7 --children-map=/data/next/staging-map.toml \
+     --state=/data/next/live.toml
+   cargo run --release --example live_reshard -- catch-up \
+     --state=/data/next/live.toml
+   ```
+
+4. Cut over. This freezes only generation-7 routed writes, applies and verifies
+   the final prefix, atomically writes the live map, publishes generation 8,
+   and releases writes:
+
+   ```bash
+   cargo run --release --example live_reshard -- cutover \
+     --state=/data/next/live.toml \
+     --coordinator=http://coordinator:50050 \
+     --publish-map=/etc/protomolt-search/shard-map.toml
+   ```
+
+Keep the parent generation through soak and backup. A cutover error after the
+new map is durable deliberately leaves writes frozen; restart the coordinator
+from that map before accepting writes.
+
 ## Status
 
 Built and tested:
 
-- Bucketed WAL with manifest, CRC framing, per-file seq, torn-tail
-  recovery, generation rotation on InstallSnapshot.
+- Bucketed WAL with manifest, CRC framing, per-file sequence, a gapless
+  generation-wide logical clock, torn-tail recovery, generation rotation, and
+  server-streamed exact prefix reads.
 - Crash reconciliation (truncate at the applied tip on open),
   log-before-images fsync ordering at Flush, apply-then-log under the
   shard lock, degrade-to-unlogged on append failure, and the
@@ -220,7 +284,13 @@ Built and tested:
   re-partitioning, merge with provider-configuration/geometry checks, shard-map
   emission. Split-then-search reconstructs the parent top-k bitwise;
   merge reproduces the monolithic index including BM25 identity.
-- Versioned shard-map config at the coordinator.
+- Stable-key baseline partitioning, incremental child tailing, durable
+  checkpoints, final write barrier, count/fingerprint verification, and atomic
+  live map publication.
+- Versioned hot shard maps with request snapshots and generation requirements;
+  stable-key routed mapped ingest.
+- Automatic primary-to-replica WAL catch-up with durable per-pair cursors and
+  idempotent crash-window reconciliation.
 
 Deliberately deferred:
 
@@ -229,19 +299,8 @@ Deliberately deferred:
   the BM25 store by document, and applying its log; today such shards are refused
   rather than mis-resharded.
 
-- **Live catch-up** — children tailing the parent's log while it serves
-  (phase 2 of the skeleton). Today split/merge is offline replay +
-  atomic swap; the log format already carries everything catch-up needs.
-- **Generation flip at query time** — the coordinator reads the map at
-  startup; hot map reload and query-stamping are future work.
-- **Hash-based ingest routing** — writes currently go to explicitly
-  addressed shards; routing by `hash(doc_id)` range comes with the map.
-- **Replication** — the log + InstallSnapshot are the right substrate
-  (a replica is a node that tails a log and installs images), but no
-  replication protocol exists yet. WAL record fields 6–7 are reserved
-  for the multi-writer pieces — clock tags and recovery points, the
-  generalization of per-file seq that answers "what exactly am I
-  missing" across writers — so old logs stay readable when they
-  arrive.
 - **Streaming reshard** — the replay buffers vectors in memory per
   child; spilling to disk is a follow-up if very large shards need it.
+- **Delete/replacement migration during live split** — the product is
+  append-only today. Catch-up refuses these records instead of inventing an
+  unverified cross-generation tombstone mapping.

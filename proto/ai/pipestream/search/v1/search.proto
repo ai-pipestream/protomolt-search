@@ -328,6 +328,16 @@ service NodeService {
   // product shard layout. Bit i admits `base_label + i`.
   rpc ResolveFilterBitmap(FilterBitmapRequest) returns (FilterBitmapResponse);
 
+  // Export one durable WAL generation in generation-clock order for replica
+  // or child catch-up. The node flushes before taking the high watermark;
+  // every emitted record is therefore part of a complete durability point.
+  rpc ReadWal(ReadWalRequest) returns (stream ReadWalResponse);
+
+  // Replica-only replay of the durable mapped-plan identity carried by a WAL
+  // Bind record. It may establish an empty/unbound target or verify the exact
+  // same binding; a different binding is never accepted.
+  rpc ApplyWalBinding(ApplyWalBindingRequest) returns (ApplyWalBindingResponse);
+
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
@@ -456,6 +466,23 @@ service SearchService {
   // Binding and protobuf-native ingest are later increments; this RPC
   // is the part an operator argues with first.
   rpc PlanIndex(PlanIndexRequest) returns (PlanIndexResponse);
+
+  // Product-level mapped ingest routed by opaque stable document identity.
+  // The coordinator snapshots one topology generation for the whole stream,
+  // hashes every document key into that generation's complete range table,
+  // and forwards one ordinary IngestMapped stream per owning shard. A write
+  // must name the exact generation it was planned against; zero is refused.
+  // This prevents an automatic retry from silently crossing a reshard cutover.
+  rpc RoutedIngestMapped(stream RoutedIngestMappedRequest) returns (RoutedIngestMappedResponse);
+
+  // Control-plane cutover handshake. Freeze waits for every routed write in
+  // the required generation, then blocks new writes while queries continue.
+  rpc FreezeTopologyWrites(FreezeTopologyWritesRequest) returns (FreezeTopologyWritesResponse);
+  // Validate and atomically publish the newer complete map, then release the
+  // write barrier. The opaque token proves this process owns the freeze.
+  rpc PublishTopology(PublishTopologyRequest) returns (PublishTopologyResponse);
+  // Release a freeze without changing the map.
+  rpc AbortTopologyCutover(AbortTopologyCutoverRequest) returns (AbortTopologyCutoverResponse);
 
   // Exact aggregates of CEL value expressions over the FILTERED
   // corpus (docs/aggregations.md). The filter is the same CEL the
@@ -589,6 +616,40 @@ message FacetCardinality {
 
 message HealthRequest {}
 
+message ReadWalRequest {
+  // Required source generation. A mismatch fails instead of silently tailing
+  // a snapshot-rotated log.
+  uint64 generation = 1;
+  // Resume strictly after this generation-wide logical clock.
+  uint64 after_clock = 2;
+}
+
+message ReadWalResponse {
+  uint64 generation = 1;
+  uint64 high_watermark = 2;
+  // Encoded ai.pipestream.search.wal.v1.WalRecord. Empty only on the final
+  // completion frame.
+  bytes record = 3;
+  bool completed = 4;
+  // State described by this immutable prefix. Set on the completion frame.
+  uint64 num_vectors = 5;
+  uint64 document_slots = 6;
+  uint64 live_docs = 7;
+  uint64 deleted_docs = 8;
+  string scoring_fingerprint = 9;
+  uint64 slot_offset = 10;
+}
+
+message ApplyWalBindingRequest {
+  string plan_fingerprint = 1;
+  string body_path = 2;
+  string materialize_sha = 3;
+}
+
+message ApplyWalBindingResponse {
+  bool already_bound = 1;
+}
+
 // One shard's liveness and shape.
 message HealthResponse {
   // Vectors resident in the vector index (0 for an empty shard).
@@ -620,6 +681,14 @@ message HealthResponse {
   uint64 live_docs = 14;
   uint64 deleted_docs = 15;
   uint64 live_revision = 16;
+  // Live WAL generation and generation-wide catch-up watermark. Zero values
+  // with wal_clocked=false mean the shard has no catch-up-capable WAL.
+  uint64 wal_generation = 17;
+  uint64 wal_high_watermark = 18;
+  bool wal_clocked = 19;
+  // Next positional document id relative to slot_offset. Unlike bm25_docs,
+  // this includes allocated rows with no postings and is the replication tip.
+  uint64 document_slots = 20;
 }
 
 message ClusterHealthRequest {}
@@ -3434,6 +3503,10 @@ message QueryRequest {
   // Bm25Search delegate); other shapes refuse by name until their
   // ordinary route carries projections.
   repeated NamedProjection projections = 10;
+  // Optional optimistic topology stamp. Zero accepts the coordinator's
+  // current generation. A nonzero mismatch fails before analysis or fan-out,
+  // so a retry can never silently cross a live reshard cutover.
+  uint64 required_topology_generation = 11;
 }
 
 // A column sort order for browse.
@@ -3448,7 +3521,28 @@ message SelectionQuery {
     SearchQuery search = 1;
     FilterQuery filter = 2;
     CompositeSearchStrategy composite = 3;
+    BooleanQuery boolean = 4;
   }
+}
+
+// Recursive boolean selection. Search, filter, and nested BooleanQuery nodes
+// may appear in any clause list. Dense and lexical search clauses provide the
+// hybrid signal set; legacy CompositeSearchStrategy stays a top-level
+// compatibility shape. Membership follows
+// must/should/must_not/minimum_should_match; relevance is the sum of matching
+// positive scoring clauses unless QueryRequest.scorer explicitly replaces the
+// combination. Evaluation uses the existing candidate-scoped BM25/vector/CEL
+// seams over an exhaustive id browse, so the first implementation is exact.
+message BooleanQuery {
+  repeated SelectionQuery must = 1;
+  repeated SelectionQuery should = 2;
+  repeated SelectionQuery must_not = 3;
+  // Zero resolves to 1 when there are SHOULD clauses and no MUST clauses,
+  // otherwise 0. A value above should.size is refused.
+  uint32 minimum_should_match = 4;
+  // Optional exact aggregation over the final boolean match set. Its own
+  // filter/geo fields must be empty because selection already owns membership.
+  AggregateRequest aggregate = 5;
 }
 
 // A scoring leaf. Its raw relevance is a named signal, reported per
@@ -3796,6 +3890,11 @@ message QueryResponse {
   // provenance, not optional timing data: it states what traversal actually
   // ran and which live provider contract justified that choice.
   DenseExecutionOutcome dense_execution = 7;
+  // Immutable topology snapshot used for the whole request.
+  uint64 served_topology_generation = 8;
+  // Present when the root BooleanQuery requested an exact aggregation over
+  // its full match set (not merely the returned page).
+  AggregateResponse aggregate = 9;
 }
 
 message DenseQualityOutcome {
@@ -4185,6 +4284,9 @@ message IngestMappedRequest {
     // repeated occurrences follow protobuf merge semantics, malformed
     // bytes refuse by position.
     bytes document = 2;
+    // Routed form. The document bytes have identical mapping semantics; the
+    // stable key is copied into the ordinary document/vector WAL records.
+    RoutedMappedDocument routed_document = 3;
   }
 }
 
@@ -4246,6 +4348,77 @@ message IngestMappedResponse {
   // document and adds nothing), so `added` counts rows and this counts
   // documents.
   uint64 parents = 5;
+}
+
+// First message on a routed mapped-ingest stream.
+message RoutedMappedBind {
+  MappedBind bind = 1;
+  // Required optimistic topology stamp. Writes never interpret zero as
+  // "current": the caller must first observe the live generation.
+  uint64 required_topology_generation = 2;
+}
+
+// One source document and the stable product identity used only for routing.
+// The key is opaque, non-empty, and is not a generation-local vector/doc id.
+message RoutedMappedDocument {
+  bytes stable_key = 1;
+  bytes document = 2;
+}
+
+message RoutedIngestMappedRequest {
+  oneof payload {
+    RoutedMappedBind bind = 1;
+    RoutedMappedDocument document = 2;
+  }
+}
+
+message RoutedShardIngest {
+  uint32 shard = 1;
+  string addr = 2;
+  uint64 added = 3;
+  uint64 parents = 4;
+  uint64 first_id = 5;
+}
+
+message RoutedIngestMappedResponse {
+  uint64 added = 1;
+  uint64 parents = 2;
+  uint64 served_topology_generation = 3;
+  repeated RoutedShardIngest shards = 4;
+}
+
+message FreezeTopologyWritesRequest {
+  uint64 required_topology_generation = 1;
+}
+
+message FreezeTopologyWritesResponse {
+  uint64 topology_generation = 1;
+  uint64 cutover_token = 2;
+}
+
+message PublishedTopologyShard {
+  string addr = 1;
+  string replica = 2;
+  uint64 hash_lo = 3;
+  uint64 hash_hi = 4;
+}
+
+message PublishTopologyRequest {
+  uint64 cutover_token = 1;
+  uint64 generation = 2;
+  repeated PublishedTopologyShard shards = 3;
+}
+
+message PublishTopologyResponse {
+  uint64 topology_generation = 1;
+}
+
+message AbortTopologyCutoverRequest {
+  uint64 cutover_token = 1;
+}
+
+message AbortTopologyCutoverResponse {
+  uint64 topology_generation = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -4677,6 +4850,10 @@ message AggregateShardRequest {
 
   // Compiled percentile expressions, request order.
   repeated CompiledPercentile percentiles = 7;
+  // Exact global-id allowlist when restrict_doc_ids is true.
+  repeated uint64 doc_ids = 8;
+  // Distinguishes an intentionally empty allowlist from no allowlist.
+  bool restrict_doc_ids = 9;
 }
 
 // One compiled percentile expression.
@@ -4785,6 +4962,8 @@ message QuantileCountsRequest {
 
   // The still-unconverged targets this round probes.
   repeated QuantileTarget targets = 4;
+  repeated uint64 doc_ids = 5;
+  bool restrict_doc_ids = 6;
 }
 
 // One probe: an expression and a threshold in its order-bits domain.

@@ -1,0 +1,66 @@
+name: mobile-sdk
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "mobile-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  android-aar:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+          rustup target add aarch64-linux-android x86_64-linux-android
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Build Android AAR
+        run: scripts/build-android-aar.sh target/mobile/ProtomoltSearch.aar
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ProtomoltSearch-android
+          path: target/mobile/ProtomoltSearch.aar
+          if-no-files-found: error
+
+  apple-xcframework:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build prerequisites
+        run: |
+          brew install protobuf
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      - name: Build Apple XCFramework
+        run: scripts/build-apple-xcframework.sh target/mobile/ProtomoltSearch.xcframework
+
+      - name: Archive Apple SDK
+        run: |
+          mkdir -p target/mobile/apple-sdk/proto/ai/pipestream/search/mobile/v1
+          mkdir -p target/mobile/apple-sdk/proto/ai/pipestream/search/v1
+          cp -R target/mobile/ProtomoltSearch.xcframework target/mobile/apple-sdk/
+          cp mobile/apple/ProtomoltSearch.swift target/mobile/apple-sdk/
+          cp proto/ai/pipestream/search/mobile/v1/mobile.proto target/mobile/apple-sdk/proto/ai/pipestream/search/mobile/v1/
+          cp proto/ai/pipestream/search/v1/search.proto target/mobile/apple-sdk/proto/ai/pipestream/search/v1/
+          ditto -c -k --sequesterRsrc --keepParent target/mobile/apple-sdk target/mobile/ProtomoltSearch-apple-sdk.zip
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ProtomoltSearch-apple
+          path: target/mobile/ProtomoltSearch-apple-sdk.zip
+          if-no-files-found: error

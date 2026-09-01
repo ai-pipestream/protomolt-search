@@ -354,8 +354,10 @@ impl Iterator for EmbeddingReader {
         let opinion_id = u64::from_le_bytes(fixed[..8].try_into().unwrap());
         let ordinal = u32::from_le_bytes(fixed[8..12].try_into().unwrap());
         let vector = buf
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         Some(Ok(EmbeddingRecord {
             opinion_id,

@@ -9,3 +9,6 @@ pub use pipestream_search::coordinator::FanoutLimits;
 pub use pipestream_search::embedded::*;
 pub use pipestream_search::node::NodeConfig;
 pub use pipestream_search::{analyzer, bm25, pb, phrases, quality};
+
+mod mobile;
+pub use mobile::MobileBuffer;

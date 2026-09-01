@@ -77,8 +77,10 @@ impl LiveDocs {
             )));
         }
         let deleted = payload
-            .chunks_exact(8)
-            .map(|word| u64::from_le_bytes(word.try_into().expect("eight-byte word")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word))
             .collect::<Vec<_>>();
         if !rows.is_multiple_of(64) && deleted.last().is_some_and(|word| *word >> (rows % 64) != 0)
         {

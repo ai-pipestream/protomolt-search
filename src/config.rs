@@ -5,10 +5,9 @@
 //! `PIPESTREAM_SEARCH_CONFIG`) selects the file; every other flag is
 //! `--key=value`. Legacy `TURBOVEC_*` environment names remain fallbacks.
 //!
-//! Membership is STATIC: the coordinator's node list and each node's shard
-//! set are fixed at startup. There is no discovery, re-sharding, or
-//! failover — changing the topology means editing the configs and
-//! restarting. That is deliberate for this phase.
+//! A `--nodes` membership list is static. A generation-stamped `--shard-map`
+//! is different: the coordinator polls and atomically publishes newer complete
+//! maps, while each request remains pinned to one immutable generation.
 //!
 //! Example (`cluster.toml`):
 //!
@@ -30,7 +29,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::chunked::DEFAULT_CHUNK_BLOCKS;
 use crate::MAX_MESSAGE_BYTES;
@@ -89,7 +88,7 @@ pub struct ShardConfig {
 /// owns which id range, plus the hash range it covers when the map was
 /// produced by a hash-partitioned split (see `examples/reshard.rs`).
 /// `hash_lo`/`hash_hi` are inclusive and default to the full range.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShardMapShard {
     /// Node address (`host:port` or `http://host:port`).
     pub addr: String,
@@ -108,13 +107,26 @@ pub struct ShardMapShard {
 /// The id-to-shard authority for one cluster generation
 /// (`--shard-map=<file>`). Replaces `--nodes`; bumping `generation` is how
 /// a split/merge rollout distinguishes old topology from new.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShardMap {
     /// Topology generation (0 for the implicit `--nodes` topology).
     #[serde(default)]
     pub generation: u64,
     /// One entry per shard, in fan-out order (= merge tie-break order).
     pub shards: Vec<ShardMapShard>,
+}
+
+/// Read one complete shard-map candidate. Callers validate its routing
+/// geometry before publishing it; a parse failure never changes live state.
+pub fn load_shard_map(path: &std::path::Path) -> Result<ShardMap, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read shard map {}: {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| format!("parse shard map {}: {e}", path.display()))
+}
+
+/// Normalize one node address the same way at startup and during hot reload.
+pub fn normalize_addr(addr: String) -> String {
+    normalize_addrs(vec![addr]).remove(0)
 }
 
 /// Product-level transport to one distributed TurboVec collection.
@@ -287,6 +299,16 @@ pub struct Config {
     /// `--shard-map` was given (`None` for the implicit `--nodes`
     /// topology, generation 0).
     pub shard_map: Option<ShardMap>,
+    /// Source path retained for atomic hot reloads.
+    pub shard_map_path: Option<PathBuf>,
+    /// Coordinator polling interval for a newer complete shard map. Zero
+    /// disables reload while preserving the startup map.
+    pub shard_map_reload_ms: u64,
+    /// Poll interval for automatic primary-WAL to replica catch-up. Zero
+    /// disables synchronization.
+    pub replica_sync_ms: u64,
+    /// Durable per-pair WAL cursors. Required whenever replica sync is on.
+    pub replica_state_path: Option<PathBuf>,
     /// Documents per vocabulary window before automatic rollover (only
     /// relevant to shards with `vocab` enabled).
     pub vocab_window_docs: u64,
@@ -352,6 +374,9 @@ struct FileConfig {
     vocab_window_docs: Option<u64>,
     vocab_top_k: Option<usize>,
     shard_map: Option<String>,
+    shard_map_reload_ms: Option<u64>,
+    replica_sync_ms: Option<u64>,
+    replica_state: Option<String>,
     shards: Vec<FileShard>,
 }
 
@@ -486,21 +511,30 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
 
     // Coordinator fan-out list. A shard map (--shard-map) REPLACES
     // --nodes: it carries the same addresses plus topology metadata.
-    let shard_map = match opt(
+    let shard_map_path = opt(
         args,
         "shard-map",
         "TURBOVEC_SHARD_MAP",
         file.shard_map.as_deref(),
-    ) {
-        Some(path) => {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("read shard map {path}: {e}"))?;
-            let map: ShardMap =
-                toml::from_str(&text).map_err(|e| format!("parse shard map {path}: {e}"))?;
-            Some(map)
-        }
-        None => None,
-    };
+    )
+    .map(PathBuf::from);
+    let shard_map = shard_map_path.as_deref().map(load_shard_map).transpose()?;
+    let shard_map_reload_ms = opt(
+        args,
+        "shard-map-reload-ms",
+        "TURBOVEC_SHARD_MAP_RELOAD_MS",
+        file.shard_map_reload_ms.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|value| {
+        value
+            .parse::<u64>()
+            .map_err(|e| format!("invalid --shard-map-reload-ms: {e}"))
+    })
+    .transpose()?
+    .unwrap_or_else(|| u64::from(shard_map_path.is_some()) * 1_000);
+    if shard_map_reload_ms > 0 && shard_map_path.is_none() {
+        return Err("--shard-map-reload-ms requires --shard-map".to_string());
+    }
     let nodes_given = opt(args, "nodes", "TURBOVEC_NODES", None).is_some() || file.nodes.is_some();
     if shard_map.is_some() && nodes_given {
         return Err("--shard-map replaces --nodes; pass exactly one".to_string());
@@ -932,6 +966,36 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .collect(),
         None => Vec::new(),
     };
+    let replica_sync_ms = opt(
+        args,
+        "replica-sync-ms",
+        "TURBOVEC_REPLICA_SYNC_MS",
+        file.replica_sync_ms.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|value| {
+        value
+            .parse::<u64>()
+            .map_err(|e| format!("invalid --replica-sync-ms: {e}"))
+    })
+    .transpose()?
+    .unwrap_or_else(|| u64::from(replica_addrs.iter().any(Option::is_some)) * 1_000);
+    let replica_state_path = opt(
+        args,
+        "replica-state",
+        "TURBOVEC_REPLICA_STATE",
+        file.replica_state.as_deref(),
+    )
+    .map(PathBuf::from)
+    .or_else(|| {
+        shard_map_path.as_ref().map(|path| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".replica-sync.toml");
+            PathBuf::from(name)
+        })
+    });
+    if replica_sync_ms > 0 && replica_state_path.is_none() {
+        return Err("automatic replica sync requires --replica-state or --shard-map".to_string());
+    }
 
     let max_message_bytes = opt(
         args,
@@ -1314,6 +1378,10 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         integer_fields,
         geo_fields,
         shard_map,
+        shard_map_path,
+        shard_map_reload_ms,
+        replica_sync_ms,
+        replica_state_path,
         vocab_window_docs,
         vocab_top_k,
     })

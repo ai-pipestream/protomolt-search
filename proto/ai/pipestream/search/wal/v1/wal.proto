@@ -31,6 +31,10 @@ message LoggedAddVectors {
   uint64 first_id = 1;
   // The batch as received (flat row-major vectors, optional dim).
   ai.pipestream.search.v1.AddVectorsRequest batch = 2;
+  // Optional stable product identities parallel to the vectors in `batch`.
+  // New routed writes populate these; legacy explicitly addressed writes do
+  // not. Child-shard catch-up requires them and refuses their absence.
+  repeated bytes stable_routing_keys = 3;
 }
 
 // A logged `AddDocuments` unit with its server-assigned id base. Documents
@@ -42,6 +46,8 @@ message LoggedAddDocuments {
   uint64 first_id = 1;
   // The documents as received (raw text + analysis spec + lineage).
   repeated ai.pipestream.search.v1.AddDocumentsRequest documents = 2;
+  // Optional stable product identities parallel to `documents`.
+  repeated bytes stable_routing_keys = 3;
 }
 
 // The shard flushed its indexes to disk at this point.
@@ -63,6 +69,11 @@ message SnapshotMarker {
 message WalRecord {
   // 1-based sequence number within the segment.
   uint64 seq = 1;
+  // Generation-wide logical clock assigned by the single writer. Unlike
+  // `seq`, which is local to one bucket file, this totally orders records
+  // across the generation for replica and child catch-up. Zero identifies a
+  // legacy record that predates live catch-up and cannot be tailed safely.
+  uint64 clock = 6;
   oneof op {
     LoggedAddVectors add_vectors = 2;
     LoggedAddDocuments add_documents = 3;
@@ -77,14 +88,9 @@ message WalRecord {
     LoggedDeleteDocument delete_document = 9;
     LoggedReplacement replacement = 10;
   }
-  // Reserved for multi-writer recovery: 6 for a clock tag (writer id +
-  // logical tick per record, the generalization of per-file `seq` that
-  // replication and live catch-up need to answer "what exactly am I
-  // missing" across writers), 7 for a recovery-point marker. Per-file
-  // sequence numbers are that answer for the single-writer log we have
-  // today; reserving the numbers keeps old logs readable when clocks
-  // arrive.
-  reserved 6, 7;
+  // Reserved for a future multi-writer recovery-point marker. The current
+  // node has one writer, so `clock` is sufficient.
+  reserved 7;
 }
 
 message LoggedDeleteDocument {

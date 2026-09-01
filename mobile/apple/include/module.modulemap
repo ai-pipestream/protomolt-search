@@ -1,0 +1,4 @@
+module ProtomoltSearch {
+    header "protomolt_search.h"
+    export *
+}

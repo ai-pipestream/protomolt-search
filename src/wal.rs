@@ -92,8 +92,8 @@ const SLICE_TABLE: [[u32; 256]; 8] = {
 /// CRC32 (IEEE 802.3 polynomial, reflected) of `data`.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut c = !0u32;
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<8>();
+    for w in chunks {
         let lo = u32::from_le_bytes(w[..4].try_into().expect("4 bytes")) ^ c;
         let hi = u32::from_le_bytes(w[4..].try_into().expect("4 bytes"));
         c = SLICE_TABLE[7][(lo & 0xFF) as usize]
@@ -105,7 +105,7 @@ pub fn crc32(data: &[u8]) -> u32 {
             ^ SLICE_TABLE[1][((hi >> 16) & 0xFF) as usize]
             ^ SLICE_TABLE[0][(hi >> 24) as usize];
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         c = CRC_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
     }
     !c
@@ -480,6 +480,10 @@ impl RecordReader {
 pub struct RecordScan {
     pub last_seq: u64,
     pub valid_len: u64,
+    /// Highest generation-wide logical clock in this file.
+    pub max_clock: u64,
+    /// True when any intact record predates the logical clock field.
+    pub has_legacy_clock: bool,
 }
 
 /// Scan one file tolerantly for reopen-after-crash. Like [`RecordReader`]
@@ -490,12 +494,16 @@ pub fn scan_records(path: &Path) -> io::Result<RecordScan> {
     let mut scan = RecordScan {
         last_seq: 0,
         valid_len: 0,
+        max_clock: 0,
+        has_legacy_clock: false,
     };
     loop {
         let frame_start = reader.offset;
         match reader.next_record()? {
             Some(record) => {
                 scan.last_seq = record.seq;
+                scan.max_clock = scan.max_clock.max(record.clock);
+                scan.has_legacy_clock |= record.clock == 0;
                 scan.valid_len = reader.offset;
             }
             None => {
@@ -507,6 +515,57 @@ pub fn scan_records(path: &Path) -> io::Result<RecordScan> {
             }
         }
     }
+}
+
+/// Read one fsynced generation as a single logical stream. Per-file sequence
+/// validation still happens in [`RecordReader`]; the generation clock then
+/// proves that merging the marker and bucket files lost, duplicated, or
+/// reordered nothing.
+pub fn read_clocked_records(gen_dir: &Path, after_clock: u64) -> io::Result<Vec<WalRecord>> {
+    let mut paths = Vec::new();
+    let markers = markers_path(gen_dir);
+    if markers.exists() {
+        paths.push(markers);
+    }
+    for entry in std::fs::read_dir(gen_dir)? {
+        let entry = entry?;
+        if parse_bucket_name(&entry.file_name().to_string_lossy()).is_some() {
+            paths.push(entry.path());
+        }
+    }
+    let mut records = Vec::new();
+    for path in paths {
+        let mut reader = RecordReader::open(&path)?;
+        while let Some(record) = reader.next_record()? {
+            if record.clock == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} contains a legacy unclocked WAL record; live catch-up requires a new WAL generation",
+                        path.display()
+                    ),
+                ));
+            }
+            records.push(record);
+        }
+    }
+    records.sort_by_key(|record| record.clock);
+    for (index, record) in records.iter().enumerate() {
+        let expected = index as u64 + 1;
+        if record.clock != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL generation clock gap: expected {expected}, got {}",
+                    record.clock
+                ),
+            ));
+        }
+    }
+    Ok(records
+        .into_iter()
+        .filter(|record| record.clock > after_clock)
+        .collect())
 }
 
 /// Truncate every bucket file in `gen_dir` at its first record whose id
@@ -659,9 +718,10 @@ impl BucketWriter {
         })
     }
 
-    fn append(&mut self, op: &wal_record::Op) -> io::Result<()> {
+    fn append(&mut self, clock: u64, op: &wal_record::Op) -> io::Result<()> {
         let record = WalRecord {
             seq: self.next_seq,
+            clock,
             op: Some(op.clone()),
         };
         write_frame(&mut self.file, &record.encode_to_vec())?;
@@ -685,6 +745,9 @@ pub struct WalWriter {
     buckets: HashMap<u32, BucketWriter>,
     markers: BucketWriter,
     records_appended: u64,
+    next_clock: u64,
+    legacy_clock_records: bool,
+    dirty: bool,
 }
 
 impl WalWriter {
@@ -709,6 +772,9 @@ impl WalWriter {
             manifest,
             buckets: HashMap::new(),
             records_appended: 0,
+            next_clock: 1,
+            legacy_clock_records: false,
+            dirty: false,
         })
     }
 
@@ -751,6 +817,9 @@ impl WalWriter {
                         manifest,
                         buckets: HashMap::new(),
                         records_appended: 0,
+                        next_clock: 1,
+                        legacy_clock_records: false,
+                        dirty: false,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match read_manifest(&dir) {
@@ -770,17 +839,25 @@ impl WalWriter {
     /// truncate any torn tail and continue its sequence.
     pub fn resume(gen_dir: &Path, manifest: WalManifest) -> io::Result<Self> {
         let mut buckets = HashMap::new();
+        let mut max_clock = 0u64;
+        let mut legacy_clock_records = false;
         for entry in std::fs::read_dir(gen_dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Some(bucket) = parse_bucket_name(&name) {
                 let path = entry.path();
                 let scan = scan_records(&path)?;
+                max_clock = max_clock.max(scan.max_clock);
+                legacy_clock_records |= scan.has_legacy_clock;
                 buckets.insert(bucket, BucketWriter::open_append(&path, &scan)?);
             }
         }
         let markers = match scan_records(&markers_path(gen_dir)) {
-            Ok(scan) => BucketWriter::open_append(&markers_path(gen_dir), &scan)?,
+            Ok(scan) => {
+                max_clock = max_clock.max(scan.max_clock);
+                legacy_clock_records |= scan.has_legacy_clock;
+                BucketWriter::open_append(&markers_path(gen_dir), &scan)?
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 BucketWriter::create(&markers_path(gen_dir))?
             }
@@ -793,6 +870,9 @@ impl WalWriter {
             buckets,
             markers,
             records_appended,
+            next_clock: max_clock.saturating_add(1).max(1),
+            legacy_clock_records,
+            dirty: false,
         })
     }
 
@@ -831,6 +911,18 @@ impl WalWriter {
 
     pub fn generation(&self) -> u64 {
         self.manifest.generation
+    }
+
+    pub fn high_watermark(&self) -> u64 {
+        self.next_clock.saturating_sub(1)
+    }
+
+    pub fn has_legacy_clock_records(&self) -> bool {
+        self.legacy_clock_records
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     pub fn dir(&self) -> &Path {
@@ -874,13 +966,19 @@ impl WalWriter {
                 None
             }
         };
-        match bucket {
+        let clock = self.next_clock;
+        let result = match bucket {
             Some(b) => {
                 self.records_appended += 1;
-                self.bucket(b)?.append(&op)
+                self.bucket(b)?.append(clock, &op)
             }
-            None => self.markers.append(&op),
+            None => self.markers.append(clock, &op),
+        };
+        if result.is_ok() {
+            self.next_clock = self.next_clock.saturating_add(1);
+            self.dirty = true;
         }
+        result
     }
 
     /// Flush all buffers and fsync every open file. Called on Flush and
@@ -891,7 +989,9 @@ impl WalWriter {
                 .flush()
                 .map_err(|e| io::Error::new(e.kind(), format!("bucket {bucket}: {e}")))?;
         }
-        self.markers.flush()
+        self.markers.flush()?;
+        self.dirty = false;
+        Ok(())
     }
 }
 
@@ -965,6 +1065,7 @@ mod tests {
                 vectors: vec![1.0; 8],
                 dim: 8,
             }),
+            stable_routing_keys: Vec::new(),
         })
     }
 
@@ -996,6 +1097,7 @@ mod tests {
                 phrase_fingerprint: 0x1234_5678,
                 phrase_field: "phrases".to_string(),
             }],
+            stable_routing_keys: Vec::new(),
         })
     }
 
@@ -1007,6 +1109,39 @@ mod tests {
             out.push(record);
         }
         Ok(out)
+    }
+
+    #[test]
+    fn generation_clock_merges_bucket_and_marker_files() {
+        let dir = tempdir("clock_merge");
+        let mut writer = WalWriter::create(&dir, manifest(4)).unwrap();
+        writer.append(add_op(1)).unwrap();
+        writer
+            .append(wal_record::Op::Flush(FlushMarker {}))
+            .unwrap();
+        writer.append(add_op(2)).unwrap();
+        writer.flush().unwrap();
+        let generation = writer.dir().to_path_buf();
+        assert_eq!(writer.high_watermark(), 3);
+        drop(writer);
+
+        let records = read_clocked_records(&generation, 0).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.clock)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(matches!(records[1].op, Some(wal_record::Op::Flush(_))));
+        let tail = read_clocked_records(&generation, 2).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].clock, 3);
+
+        let resumed = WalWriter::resume(&generation, read_manifest(&generation).unwrap()).unwrap();
+        assert_eq!(resumed.high_watermark(), 3);
+        assert!(!resumed.has_legacy_clock_records());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1436,6 +1571,7 @@ mod tests {
         push(
             WalRecord {
                 seq: 1,
+                clock: 1,
                 op: Some(wal_record::Op::Flush(FlushMarker {})),
             }
             .encode_to_vec(),
@@ -1443,6 +1579,7 @@ mod tests {
         push(
             WalRecord {
                 seq: 3,
+                clock: 2,
                 op: Some(wal_record::Op::Flush(FlushMarker {})),
             }
             .encode_to_vec(),

@@ -50,9 +50,10 @@ The reproducible cross-engine gate is
 quality, latency, throughput, resources, startup, and crash recovery without
 turning a synthetic run into a marketing claim.
 
-The network binary retains three roles (`node`, `coordinator`, `both`) with
-static cluster membership. The embedded package uses the same node and
-coordinator implementations without a network listener.
+The network binary retains three roles (`node`, `coordinator`, `both`). Plain
+node lists are static; versioned shard maps hot-swap atomically. The embedded
+package uses the same node and coordinator implementations without a network
+listener.
 
 ## Quickstart: dockerized end-to-end demo (CourtListener)
 
@@ -264,9 +265,10 @@ index = "/data/turbovec/shard-1.tv"
 slot_offset = 20000
 ```
 
-Membership is **static**: the coordinator's `nodes` list and each node's
-`[[shards]]` set are fixed at startup. Changing topology means editing
-configs and restarting — deliberate for this phase. Single-shard shorthand
+The plain coordinator `nodes` list and each node's `[[shards]]` set are static.
+A `shard_map` is generation-stamped and hot-reloaded atomically; requests pin
+one immutable generation, and routed ingest requires the expected generation.
+Single-shard shorthand
 (`--index`, `--demo-vectors`, `--node-listen`, `--slot-offset`) overrides
 the file's `[[shards]]` entirely.
 
@@ -290,6 +292,11 @@ the file's `[[shards]]` entirely.
   saturation it was meant to escape. Measured both ways in Round 5 of
   TEST_RESULTS.md — a 26–37% p99 improvement against a stalled node, a
   25–40% throughput loss when hedging a healthy bandwidth-bound fleet.
+- **Replica catch-up.** With a shard map containing replicas,
+  `replica_sync_ms` defaults to 1000 and tails each primary's fully clocked WAL
+  into its replica. Cursors persist beside the map by default. A WAL generation
+  rotation requires installing the new base snapshot rather than guessing at
+  missing history.
 - **Deadlines.** `shard_deadline_ms` bounds one query's whole per-shard
   attempt (primary plus any hedge); a shard that exceeds it fails the
   query with DEADLINE_EXCEEDED instead of stalling it.
@@ -804,7 +811,7 @@ hash-bucketed files per generation:
 ```
 
 Frames are `[u32 len][u32 crc32][prost WalRecord]` with a 1-based gapless
-seq per file, written after the mutation successfully applies under the shard
+sequence per file and a generation-wide logical clock, written after the mutation successfully applies under the shard
 lock. Writes are
 buffered; only Flush and generation rotation fsync, and the log is never
 on the search path. A crash can leave a torn tail frame in any file;
@@ -842,7 +849,8 @@ The `reshard` example is the offline tool for step 2:
 # Split one shard 1 -> N (N a power of two):
 cargo run --release --example reshard -- \
     --log=/data/shard-0.vector.wal --split=2 --out-dir=/data/split \
-    --slot-base=0 --slot-stride=25000000 --analysis-addr=http://localhost:50051
+    --slot-base=0 --slot-stride=25000000 --analysis-addr=http://localhost:50051 \
+    --stable-routing
 
 # Merge several shards -> 1 (identical provider state AND bucket count):
 cargo run --release --example reshard -- \
@@ -869,6 +877,13 @@ matching `[[shards]]` node config blocks. Invariants, enforced hard:
   "Operability"), `slot_offset`, and the child's `hash_lo`/`hash_hi`
   range. The coordinator logs the generation at startup; plain `--nodes`
   keeps working as the implicit generation 0.
+
+`--stable-routing` is the hitless 1→N baseline. It partitions by the stable
+product keys recorded by routed mapped ingest and emits `live-cutoff.toml`.
+After starting the children, `examples/live_reshard.rs` initializes durable
+catch-up state, tails while the parent serves, and performs the final
+freeze/catch-up/map-publish cutover. See [docs/resharding.md](docs/resharding.md)
+for the exact commands and failure recovery.
 
 Two operational rules follow from the design:
 
@@ -1096,20 +1111,6 @@ TODO list).
 
 ## TODO
 
-- **Live resharding catch-up.** Split/merge today is offline replay
-  plus an atomic `InstallSnapshot` swap (see "Write log and
-  resharding"). Children tailing the parent's WAL while it keeps
-  serving — a hitless cutover — is the next step; the log format
-  already carries everything catch-up needs.
-- **Hot shard-map reload.** The coordinator reads its shard map at
-  startup. Mid-query generation flips and generation-stamped queries
-  are future work.
-- **Hash-based ingest routing.** Writes go to explicitly addressed
-  shards; routing by `hash(doc_id)` range lands with the map work.
-- **Replication.** A shard-map `replica` serves failover and hedged
-  reads today, but keeping it current is manual (copy or snapshot
-  install). A replica that tails the primary's WAL — the substrate
-  exists, the protocol does not.
 - **Streaming reshard.** Replay buffers each child's vectors in memory;
   very large shards need a spill-to-disk pass.
 - **mmap vector index.** Postings and doc text are disk-resident (page

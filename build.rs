@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "proto/ai/pipestream/search/v1/search.proto",
+                "proto/ai/pipestream/search/mobile/v1/mobile.proto",
                 "proto/ai/pipestream/search/wal/v1/wal.proto",
                 "proto/ai/pipestream/opennlp/analysis/v1/analysis.proto",
                 "proto/tei/v1/tei.proto",

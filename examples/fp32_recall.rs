@@ -151,8 +151,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut buf = vec![0u8; dim as usize * 4];
         file.read_exact(&mut buf)?;
         Ok(buf
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect())
     };
     let mut reranked: Vec<Vec<u64>> = Vec::with_capacity(probes.len());
