@@ -66,14 +66,30 @@ service AnalysisService {
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
 }
 
-// A half-open character span [start, end). ALWAYS in the coordinate space of
-// the original, un-normalized request text — offsets survive normalization via
-// OpenNLP's Alignment, which is what makes true highlighting possible.
+// Coordinate system for every Span in one AnalyzeResponse. This changes only
+// how original-text boundaries are numbered; tokenization and term identity do
+// not change.
+enum OffsetUnit {
+  // Legacy behavior. Servers resolve this to OFFSET_UNIT_UTF16_CODE_UNITS.
+  OFFSET_UNIT_UNSPECIFIED = 0;
+
+  // Java String/OpenNLP coordinates. A supplementary scalar occupies two
+  // units. This remains the default for backward compatibility.
+  OFFSET_UNIT_UTF16_CODE_UNITS = 1;
+
+  // Byte boundaries in the original text's UTF-8 encoding. This is directly
+  // usable to slice a Rust string after validating the returned boundary.
+  OFFSET_UNIT_UTF8_BYTES = 2;
+}
+
+// A half-open span [start, end), in AnalyzeResponse.offset_unit and
+// always relative to the original, un-normalized request text. Offsets survive
+// normalization via OpenNLP's Alignment, which enables exact highlighting.
 message Span {
-  // Start offset (inclusive), in UTF-16 code units of the original text.
+  // Start offset (inclusive).
   int32 start = 1;
 
-  // End offset (exclusive), in UTF-16 code units of the original text.
+  // End offset (exclusive).
   int32 end = 2;
 }
 
@@ -371,6 +387,11 @@ message AnalysisOptions {
   // When no NER model is configured the request still succeeds, locations and
   // regions stay empty, and a warning is returned.
   bool geo = 17;
+
+  // Coordinate system requested for every returned Span. UNSPECIFIED selects
+  // UTF16_CODE_UNITS, preserving the original contract. The resolved unit is
+  // echoed in AnalyzeResponse.offset_unit and is authoritative.
+  OffsetUnit offset_unit = 18;
 }
 
 // GlossaryOptions controls multi-word phrase matching: an Aho-Corasick
@@ -925,6 +946,11 @@ message AnalyzeResponse {
   // term_vectors span-for-span. Empty unless term_vectors.dual_cased was
   // requested.
   repeated TermVector cased_term_vectors = 18;
+
+  // Resolved coordinate system shared by every Span in this response. New
+  // servers always set this. An absent/UNSPECIFIED value from an older server
+  // means the legacy UTF16_CODE_UNITS contract.
+  OffsetUnit offset_unit = 19;
 }
 
 // One message of the AnalyzeStream request direction. The first message of a
@@ -1064,6 +1090,10 @@ message GetCapabilitiesResponse {
   // VocabularyService is registered. Reported so a client compiled against an
   // older contract can tell the feature exists on this server.
   bool vocab_listener_available = 20;
+
+  // Coordinate systems this server can return. An empty list from an older
+  // server means only the legacy UTF16_CODE_UNITS behavior is available.
+  repeated OffsetUnit supported_offset_units = 21;
 }
 
 // VocabularyService exposes the streaming vocabulary statistics collected by

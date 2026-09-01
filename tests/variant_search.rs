@@ -77,6 +77,9 @@ fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
         geo_points: Vec::new(),
         quality: None,
         geography: None,
+        phrases: Vec::new(),
+        phrase_fingerprint: 0,
+        phrase_field: String::new(),
     }
 }
 

@@ -16,6 +16,14 @@ TurboQuant scoring and collaborative live-floor streaming.
 | [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s17` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
+The in-repository [`protomolt-analyzer`](crates/protomolt-analyzer) crate is
+the portable Rust lexical core. It runs the product's whitespace, Porter,
+normalization, and term-vector contract in-process on servers and native
+clients. OpenNLP remains the provider for embeddings, sentence and model
+analysis, and analyzer options outside that native subset. See
+[Native lexical analysis](docs/native-analysis.md) for the exact boundary and
+Android/iOS build checks.
+
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
 uses TurboVec's current `.tv` persistence format. Provider images are opaque to
 the product and are selected by manifest/config identity, never by extension.
@@ -98,7 +106,7 @@ Floor flow for one query:
    next chunk.
 4. Each node ends its stream with `SearchShardDone { hits, stats }` — its
    local top-k plus scan counters. The coordinator merges the shard lists
-   (score descending; ties by shard index, then vector id) and answers the
+   (score descending; ties by stable vector id) and answers the
    client.
 
 Chunking exists because turbovec's scan is a single synchronous call with a
@@ -167,6 +175,50 @@ cargo build --release
     --coord-listen=0.0.0.0:50050 \
     --nodes=node0:50051,node1:50051,node2:50051
 ```
+
+### Clustered TurboVec backend
+
+The product coordinator can treat a complete `turbovec-grpc` collection as
+its vector backend. The recommended distributed shape embeds that crate's
+coordinator library in the Pipestream Search process, so there is no localhost
+gRPC hop before the real shard fan-out:
+
+```toml
+role = "coordinator"
+nodes = ["search-node0:50051", "search-node1:50051"] # BM25, columns, documents
+
+[clustered_turbovec]
+nodes = [
+  "vector-node0:51051 shard-id-0 12",
+  "vector-node1:51051 shard-id-1 9",
+]
+state = "/var/lib/pipestream-search/turbovec-topology.json"
+```
+
+An independently managed coordinator remains available when its lifecycle or
+authorization must be separate:
+
+```toml
+[clustered_turbovec]
+coordinator = "http://turbovec-coordinator:50050"
+```
+
+Both transports execute the same `turbovec-grpc::CoordinatorService`
+candidate-stream contract. Cluster shards must carry stable labels equal to
+Pipestream Search document ids. The adapter carries product filters as packed
+stable-label bitmap ranges, sends conflated inclusive floor raises, and
+requires an exhaustive completion certificate from every shard. Small
+candidate-scoped rescoring sets use explicit labels.
+`ClusterHealth` reports the selected transport, reachability, servable state,
+row count, and topology generation.
+
+This increment serves exact vector `Search`, dense public selections, and
+candidate-scoped dense boosts. Parent collapse and every hybrid mode also use
+the provider stream while keeping lineage, product-shard ownership, fusion,
+and public ordering in Pipestream Search. The vector collection is built and
+mutated through `turbovec-grpc`; Pipestream Search does not duplicate those
+writes.
+See [the clustered backend design](docs/clustered-turbovec.md).
 
 ### Cluster configuration file
 
@@ -254,25 +306,43 @@ for a real deployment are produced (shared calibration baked in).
 Each shard also carries a **BM25 postings index** next to its vector index:
 term → postings (doc id, tf, occurrence offsets in original-text
 coordinates), per-doc lengths and corpus totals, plus a doc store of raw
-texts (the highlight source). This repo deliberately contains **no query
-parser and no text analysis**: language analysis is the
+texts (the highlight source). Term identity is supplied by one of two
+interchangeable providers. The in-process Rust provider implements the
+production `ingest`/`folded` and `cased` analyzer specs. The
 [grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
-sidecar's job (`AnalysisService.Analyze` → term vectors; its proto is
-vendored at `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`, see
-the file header).
+sidecar supplies the wider OpenNLP surface, including embeddings and
+model-backed layers. Its proto is vendored at
+`proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`; see the file header.
+Both providers support original-text UTF-16 coordinates. The portable Rust
+analyzer and sidecar can also return UTF-8 byte offsets to direct callers.
+Protomolt Search explicitly requests and persists UTF-16 offsets so one index
+generation cannot mix coordinate systems.
 
-**Ingest** (`NodeService.AddDocuments`, client-streaming): the node
-carries the whole call's documents over one sidecar `AnalyzeStream`
-(term vectors, MODE_FULL → offsets in ORIGINAL text coordinates), paced
-end to end by the sidecar's server-side flow control; results return in
-completion order and are applied in arrival order. A sidecar that
-predates the stream RPC (UNIMPLEMENTED) gets pipelined unary calls
-instead. Either way the node builds postings and stores the raw text. Doc
+Glossary-backed phrase and entity search is an additive product capability:
+ordinary body terms preserve recall, a dedicated phrase field stores only
+explicit registered concepts, and an optional map column exposes concepts and
+OpenNLP NER identities to CEL and facets. `PhraseSearch` adds only the strongest
+phrase signal per document, so nested concepts do not stack. See
+[`docs/phrase-search.md`](docs/phrase-search.md) for vocabulary format,
+configuration, scoring, mobile use, WAL durability, and the required reindex
+boundary.
+
+Select native analysis with `--analysis-addr=native` or
+`analysis_addr = "native"`. A single-shard `both` process propagates that
+setting to its shard. Multi-shard node configurations set `analysis_addr` on
+each shard. An absent backend remains an error.
+
+**Ingest** (`NodeService.AddDocuments`, client-streaming): the node carries
+the whole call through one analyzer stream. Native analysis uses bounded
+in-process channels; OpenNLP uses `AnalyzeStream` and its server-side flow
+control. Results are applied in arrival order. A sidecar that predates the
+stream RPC is refused rather than silently downgraded. Either provider builds
+the same postings and stores the raw text. Doc
 ids share the shard's positional id space with vectors (next id =
 max(vectors, docs)). Analysis options pass through (`AnalysisSpec`:
 tokenizer/stemmer/term-vector mode+source/normalizer rungs, as the
-sidecar's enum numbers). Per-shard `analysis_addr` in the config; unset →
-UNAVAILABLE.
+sidecar's enum numbers). Unsupported native options fail explicitly. Per-shard
+`analysis_addr` in the config; unset means UNAVAILABLE.
 
 **Query** (`SearchService.Bm25Search`) — distributed correctness via the
 two-phase global-stats flow:
@@ -280,10 +350,10 @@ two-phase global-stats flow:
 ```mermaid
 sequenceDiagram
     participant C as coordinator
-    participant SC as sidecar
+    participant A as analyzer
     participant S as shards
-    C->>SC: 1. Analyze(query text, same options)
-    SC-->>C: query terms
+    C->>A: 1. Analyze(query text, same options)
+    A-->>C: query terms
     C->>S: 2. TermStats{terms}
     S-->>C: per-shard df, N, Σlen
     C->>S: 3. Bm25Query{terms, globals, k, k1, b}
@@ -459,7 +529,7 @@ cargo run --release --example wiki_shakedown   # --data-dir, --out-dir, --sideca
 ```
 
 loads the parts, fits calibration on a sample, pushes it to every shard
-with `BroadcastVectorBackend`, starts the native analysis sidecar
+with `BroadcastVectorBackend`, starts the GraalVM-native OpenNLP sidecar
 (falls back to the in-repo mock with a loud warning), ingests documents
 (AddDocuments, PORTER stems) and vectors (AddVectors) with aligned ids,
 persists `.tv` + `.bm25` under `--out-dir` for the later two-machine

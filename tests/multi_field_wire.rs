@@ -75,6 +75,9 @@ fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
         geo_points: Vec::new(),
         quality: None,
         geography: None,
+        phrases: Vec::new(),
+        phrase_fingerprint: 0,
+        phrase_field: String::new(),
     }
 }
 
@@ -367,6 +370,9 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
         geo_points: Vec::new(),
         quality: None,
         geography: None,
+        phrases: Vec::new(),
+        phrase_fingerprint: 0,
+        phrase_field: String::new(),
     };
     for (req, why) in [
         (bad("docket", "x"), "unknown field"),
@@ -488,6 +494,9 @@ async fn shard_legs_bm25_params_reach_scoring() {
             geo_points: Vec::new(),
             quality: None,
             geography: None,
+            phrases: Vec::new(),
+            phrase_fingerprint: 0,
+            phrase_field: String::new(),
         })
         .await
         .unwrap();

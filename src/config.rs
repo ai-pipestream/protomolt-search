@@ -71,7 +71,7 @@ pub struct ShardConfig {
     pub demo: Option<DemoConfig>,
     /// This shard's global id base (added to local slots).
     pub slot_offset: u64,
-    /// Analysis sidecar address for AddDocuments on this shard.
+    /// Lexical analysis backend for AddDocuments: `native` or a sidecar address.
     pub analysis_addr: Option<String>,
     /// Keep a write-ahead log at `<index path>.wal/`. Defaults on for
     /// shards with an index path, off for demo shards.
@@ -117,6 +117,24 @@ pub struct ShardMap {
     pub shards: Vec<ShardMapShard>,
 }
 
+/// Product-level transport to one distributed TurboVec collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusteredTurboVecConfig {
+    /// The global heap and topology owner execute in this process; only shard
+    /// node calls cross the network.
+    InProcess {
+        /// `turbovec-grpc` node-table entries, including optional index ids,
+        /// replicas, and required durable generations.
+        nodes: Vec<String>,
+        /// Durable coordinator topology. Required unless the operator opts
+        /// into an ephemeral development collection.
+        state: Option<PathBuf>,
+        allow_ephemeral: bool,
+    },
+    /// Reach a separately managed `turbovec-coordinator` process.
+    External { endpoint: String },
+}
+
 /// Full process configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -131,6 +149,10 @@ pub struct Config {
     /// Shard node addresses (`http://host:port`) for the coordinator, in
     /// fan-out order (= shard index for merge tie-breaks).
     pub node_addrs: Vec<String>,
+    /// Optional product-level distributed TurboVec collection. When set,
+    /// vector queries use this backend instead of the vector indexes held by
+    /// the product shard nodes.
+    pub clustered_turbovec: Option<ClusteredTurboVecConfig>,
     /// Shards this process owns and serves (roles node/both).
     pub shards: Vec<ShardConfig>,
     /// Scan chunk size in SIMD blocks.
@@ -204,8 +226,8 @@ pub struct Config {
     pub bit_width: usize,
     /// Flush shards to their index paths on graceful shutdown.
     pub save_on_shutdown: bool,
-    /// Analysis sidecar address for the coordinator's query analysis
-    /// (Bm25Search). Required for BM25 queries.
+    /// Lexical analysis backend for coordinator queries: `native` or a
+    /// sidecar address. Required for BM25 queries.
     pub analysis_addr: Option<String>,
     /// BM25 k1 parameter sent to every shard.
     pub bm25_k1: f32,
@@ -231,6 +253,17 @@ pub struct Config {
     /// (`--map-facet-fields=meta`, docs/map-columns.md). Same rules;
     /// one name space across all column kinds.
     pub map_facet_fields: Vec<String>,
+    /// Optional `concept-id<TAB>surface-form` glossary. When present, the
+    /// phrase field and optional entity map are derived at ingest and query.
+    pub phrase_glossary: Option<PathBuf>,
+    /// Dedicated BM25 field holding canonical glossary concept postings.
+    pub phrase_field: String,
+    /// Optional map<string,string> column holding glossary and NER identities.
+    pub entity_map_field: Option<String>,
+    /// Whether glossary matching uses Unicode full case folding.
+    pub phrase_ignore_case: bool,
+    /// Request OpenNLP NER and materialize mentions into the entity map.
+    pub phrase_ner: bool,
     /// The map<string, f64> column table for NEW shard builders
     /// (`--map-numeric-fields=attrs`). Same rules.
     pub map_numeric_fields: Vec<String>,
@@ -264,6 +297,7 @@ struct FileConfig {
     coord_listen: Option<String>,
     metrics_listen: Option<String>,
     nodes: Option<Vec<String>>,
+    clustered_turbovec: Option<FileClusteredTurboVec>,
     index: Option<String>,
     slot_offset: Option<u64>,
     demo_vectors: Option<usize>,
@@ -295,6 +329,11 @@ struct FileConfig {
     facet_fields: Option<Vec<String>>,
     numeric_fields: Option<Vec<String>>,
     map_facet_fields: Option<Vec<String>>,
+    phrase_glossary: Option<String>,
+    phrase_field: Option<String>,
+    entity_map_field: Option<String>,
+    phrase_ignore_case: Option<bool>,
+    phrase_ner: Option<bool>,
     map_numeric_fields: Option<Vec<String>>,
     integer_fields: Option<Vec<String>>,
     geo_fields: Option<Vec<String>>,
@@ -305,6 +344,17 @@ struct FileConfig {
     vocab_top_k: Option<usize>,
     shard_map: Option<String>,
     shards: Vec<FileShard>,
+}
+
+/// `[clustered_turbovec]` accepts exactly one of `coordinator` (external) or
+/// `nodes` (embedded coordinator).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileClusteredTurboVec {
+    coordinator: Option<String>,
+    nodes: Option<Vec<String>>,
+    state: Option<String>,
+    allow_ephemeral: Option<bool>,
 }
 
 /// One `[[shards]]` table in the TOML file.
@@ -371,6 +421,14 @@ fn normalize_addrs(addrs: Vec<String>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn normalize_analysis_backend(value: String) -> String {
+    if matches!(value.trim(), "native" | "native://") {
+        crate::analyzer::NATIVE_ANALYSIS_BACKEND.to_string()
+    } else {
+        normalize_addrs(vec![value]).remove(0)
+    }
 }
 
 /// Parse configuration from process args (excluding argv[0]).
@@ -450,6 +508,92 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             ),
             None => normalize_addrs(file.nodes.clone().unwrap_or_default()),
         },
+    };
+
+    let clustered_file = file.clustered_turbovec.as_ref();
+    let clustered_endpoint = opt(
+        args,
+        "turbovec-coordinator",
+        "TURBOVEC_COORDINATOR",
+        clustered_file.and_then(|config| config.coordinator.as_deref()),
+    );
+    let clustered_nodes = opt(
+        args,
+        "turbovec-cluster-nodes",
+        "TURBOVEC_CLUSTER_NODES",
+        clustered_file
+            .and_then(|config| config.nodes.as_ref())
+            .map(|nodes| nodes.join(","))
+            .as_deref(),
+    );
+    if clustered_endpoint.is_some() && clustered_nodes.is_some() {
+        return Err(
+            "clustered TurboVec accepts exactly one of coordinator or nodes, not both".to_string(),
+        );
+    }
+    let clustered_state = opt(
+        args,
+        "turbovec-cluster-state",
+        "TURBOVEC_CLUSTER_STATE",
+        clustered_file.and_then(|config| config.state.as_deref()),
+    )
+    .map(PathBuf::from);
+    let clustered_allow_ephemeral = flag_present(args, "allow-ephemeral-turbovec-cluster")
+        || match opt(
+            args,
+            "allow-ephemeral-turbovec-cluster",
+            "TURBOVEC_ALLOW_EPHEMERAL_CLUSTER",
+            None,
+        ) {
+            Some(value) => parse_env_bool(&value),
+            None => clustered_file
+                .and_then(|config| config.allow_ephemeral)
+                .unwrap_or(false),
+        };
+    let clustered_turbovec = match (clustered_endpoint, clustered_nodes) {
+        (Some(endpoint), None) => {
+            if clustered_state.is_some() || clustered_allow_ephemeral {
+                return Err(
+                    "cluster state and allow_ephemeral apply only to an in-process TurboVec coordinator"
+                        .to_string(),
+                );
+            }
+            Some(ClusteredTurboVecConfig::External {
+                endpoint: normalize_addrs(vec![endpoint]).remove(0),
+            })
+        }
+        (None, Some(nodes)) => {
+            let nodes: Vec<String> = nodes
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+            if nodes.is_empty() {
+                return Err("clustered TurboVec node table is empty".to_string());
+            }
+            if clustered_state.is_none() && !clustered_allow_ephemeral {
+                return Err(
+                    "an in-process TurboVec coordinator requires turbovec_cluster_state; set allow_ephemeral only for tests or demos"
+                        .to_string(),
+                );
+            }
+            Some(ClusteredTurboVecConfig::InProcess {
+                nodes,
+                state: clustered_state,
+                allow_ephemeral: clustered_allow_ephemeral,
+            })
+        }
+        (None, None) => {
+            if clustered_state.is_some() || clustered_allow_ephemeral {
+                return Err(
+                    "cluster state or allow_ephemeral was set without clustered TurboVec nodes"
+                        .to_string(),
+                );
+            }
+            None
+        }
+        (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
     };
 
     let dim = opt(
@@ -637,10 +781,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     index_path: shard.index.as_ref().map(PathBuf::from),
                     demo,
                     slot_offset: shard.slot_offset.unwrap_or(0),
-                    analysis_addr: shard
-                        .analysis_addr
-                        .clone()
-                        .map(|a| normalize_addrs(vec![a]).remove(0)),
+                    analysis_addr: shard.analysis_addr.clone().map(normalize_analysis_backend),
                 })
             })
             .collect::<Result<_, String>>()?
@@ -810,6 +951,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                 .to_string(),
         );
     }
+    if role == Role::Node && clustered_turbovec.is_some() {
+        return Err(
+            "clustered TurboVec is a product-coordinator backend and cannot be configured on a node-only process"
+                .to_string(),
+        );
+    }
     if demo_query && role == Role::Node {
         return Err("--demo-query requires the coordinator or both role".to_string());
     }
@@ -859,8 +1006,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "TURBOVEC_ANALYSIS_ADDR",
         file.analysis_addr.as_deref(),
     )
-    .map(|a| normalize_addrs(vec![a]).remove(0));
-    // A single-shard CLI setup shares the sidecar address with its shard.
+    .map(normalize_analysis_backend);
+    // A single-shard CLI setup shares the analysis backend with its shard.
     if analysis_addr.is_some() && shards.len() == 1 && shards[0].analysis_addr.is_none() {
         shards[0].analysis_addr.clone_from(&analysis_addr);
     }
@@ -997,11 +1144,76 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
     }
 
+    let phrase_glossary = opt(
+        args,
+        "phrase-glossary",
+        "PIPESTREAM_SEARCH_PHRASE_GLOSSARY",
+        file.phrase_glossary.as_deref(),
+    )
+    .filter(|value| !value.trim().is_empty())
+    .map(PathBuf::from);
+    let phrase_field = opt(
+        args,
+        "phrase-field",
+        "PIPESTREAM_SEARCH_PHRASE_FIELD",
+        file.phrase_field.as_deref(),
+    )
+    .unwrap_or_else(|| "phrases".to_string());
+    let entity_map_field = opt(
+        args,
+        "entity-map-field",
+        "PIPESTREAM_SEARCH_ENTITY_MAP_FIELD",
+        file.entity_map_field.as_deref(),
+    )
+    .filter(|value| !value.trim().is_empty());
+    let phrase_ignore_case = opt(
+        args,
+        "phrase-ignore-case",
+        "PIPESTREAM_SEARCH_PHRASE_IGNORE_CASE",
+        file.phrase_ignore_case
+            .map(|value| value.to_string())
+            .as_deref(),
+    )
+    .map(|value| parse_env_bool(&value))
+    .unwrap_or(true);
+    let phrase_ner = if flag_present(args, "phrase-ner") {
+        true
+    } else {
+        opt(
+            args,
+            "phrase-ner",
+            "PIPESTREAM_SEARCH_PHRASE_NER",
+            file.phrase_ner.map(|value| value.to_string()).as_deref(),
+        )
+        .map(|value| parse_env_bool(&value))
+        .unwrap_or(false)
+    };
+    if phrase_glossary.is_some() {
+        if phrase_field == "body" || !bm25_fields.contains(&phrase_field) {
+            return Err(format!(
+                "phrase glossary requires phrase field {phrase_field:?} as a non-body entry in --bm25-fields"
+            ));
+        }
+        if let Some(field) = &entity_map_field {
+            if !map_facet_fields.contains(field) {
+                return Err(format!(
+                    "entity map field {field:?} must be declared in --map-facet-fields"
+                ));
+            }
+        }
+        if phrase_ner && entity_map_field.is_none() {
+            return Err("--phrase-ner requires --entity-map-field".to_string());
+        }
+    } else if entity_map_field.is_some() || phrase_ner {
+        return Err("--entity-map-field and --phrase-ner require --phrase-glossary".to_string());
+    }
+
     Ok(Config {
         role,
         coord_listen,
         metrics_listen,
         node_addrs,
+        clustered_turbovec,
         shards,
         chunk_blocks,
         share_floors,
@@ -1030,6 +1242,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         facet_fields,
         numeric_fields,
         map_facet_fields,
+        phrase_glossary,
+        phrase_field,
+        entity_map_field,
+        phrase_ignore_case,
+        phrase_ner,
         map_numeric_fields,
         integer_fields,
         geo_fields,
@@ -1123,6 +1340,20 @@ mod tests {
     }
 
     #[test]
+    fn native_analysis_backend_is_not_rewritten_as_http() {
+        let cfg = parse(&args(&[
+            "--role=both",
+            "--demo-vectors=10",
+            "--nodes=127.0.0.1:9001",
+            "--node-listen=127.0.0.1:9001",
+            "--analysis-addr=native://",
+        ]))
+        .unwrap();
+        assert_eq!(cfg.analysis_addr.as_deref(), Some("native"));
+        assert_eq!(cfg.shards[0].analysis_addr.as_deref(), Some("native"));
+    }
+
+    #[test]
     fn coordinator_requires_nodes() {
         assert!(parse(&args(&["--role=coordinator"])).is_err());
         let cfg = parse(&args(&[
@@ -1132,6 +1363,55 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.node_addrs.len(), 2);
         assert!(cfg.node_addrs[0].starts_with("http://"));
+    }
+
+    #[test]
+    fn clustered_turbovec_transports_are_explicit_and_exclusive() {
+        let external = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-coordinator=127.0.0.1:51050",
+        ]))
+        .unwrap();
+        assert_eq!(
+            external.clustered_turbovec,
+            Some(ClusteredTurboVecConfig::External {
+                endpoint: "http://127.0.0.1:51050".to_string(),
+            })
+        );
+
+        let missing_state = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-cluster-nodes=127.0.0.1:52051 shard-a 7",
+        ]));
+        assert!(missing_state
+            .unwrap_err()
+            .contains("requires turbovec_cluster_state"));
+
+        let embedded = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-cluster-nodes=127.0.0.1:52051 shard-a 7",
+            "--allow-ephemeral-turbovec-cluster",
+        ]))
+        .unwrap();
+        assert_eq!(
+            embedded.clustered_turbovec,
+            Some(ClusteredTurboVecConfig::InProcess {
+                nodes: vec!["127.0.0.1:52051 shard-a 7".to_string()],
+                state: None,
+                allow_ephemeral: true,
+            })
+        );
+
+        let both = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:50051",
+            "--turbovec-coordinator=127.0.0.1:51050",
+            "--turbovec-cluster-nodes=127.0.0.1:52051",
+        ]));
+        assert!(both.unwrap_err().contains("not both"));
     }
 
     #[test]
@@ -1430,5 +1710,29 @@ slot_offset = 25000000
         ]))
         .is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phrase_configuration_requires_explicit_storage_fields() {
+        let base = [
+            "--role=node",
+            "--demo-vectors=10",
+            "--node-listen=127.0.0.1:9001",
+            "--phrase-glossary=/tmp/concepts.tsv",
+        ];
+        assert!(parse(&args(&base)).unwrap_err().contains("phrase field"));
+
+        let mut configured = base.to_vec();
+        configured.extend([
+            "--bm25-fields=body,phrases",
+            "--map-facet-fields=entities",
+            "--entity-map-field=entities",
+            "--phrase-ner",
+        ]);
+        let cfg = parse(&args(&configured)).unwrap();
+        assert_eq!(cfg.phrase_field, "phrases");
+        assert_eq!(cfg.entity_map_field.as_deref(), Some("entities"));
+        assert!(cfg.phrase_ignore_case);
+        assert!(cfg.phrase_ner);
     }
 }

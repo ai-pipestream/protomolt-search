@@ -49,6 +49,9 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
                 geo_points: Vec::new(),
                 quality: None,
                 geography: None,
+                phrases: Vec::new(),
+                phrase_fingerprint: 0,
+                phrase_field: String::new(),
             })
             .await
             .unwrap();

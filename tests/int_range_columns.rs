@@ -83,6 +83,9 @@ async fn add_documents_integer(
                 .collect(),
             quality: None,
             geography: None,
+            phrases: Vec::new(),
+            phrase_fingerprint: 0,
+            phrase_field: String::new(),
         })
         .await
         .unwrap();
@@ -864,6 +867,9 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
         geo_points: Vec::new(),
         quality: None,
         geography: None,
+        phrases: Vec::new(),
+        phrase_fingerprint: 0,
+        phrase_field: String::new(),
     };
     send(
         addr.clone(),

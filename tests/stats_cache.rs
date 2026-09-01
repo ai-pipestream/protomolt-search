@@ -47,6 +47,9 @@ async fn add_documents(addr: &str, texts: &[&str]) {
             geo_points: Vec::new(),
             quality: None,
             geography: None,
+            phrases: Vec::new(),
+            phrase_fingerprint: 0,
+            phrase_field: String::new(),
         })
         .await
         .unwrap();
@@ -341,6 +344,9 @@ async fn fused_repeated_query_reuses_cached_stats() {
                 geo_points: Vec::new(),
                 quality: None,
                 geography: None,
+                phrases: Vec::new(),
+                phrase_fingerprint: 0,
+                phrase_field: String::new(),
             })
             .await
             .unwrap();

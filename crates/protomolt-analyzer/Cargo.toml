@@ -1,0 +1,30 @@
+[package]
+name = "protomolt-analyzer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND Apache-2.0"
+description = "Cross-platform native lexical analysis for Protomolt"
+
+[dependencies]
+# Analysis output is persisted. Keep the Unicode implementation and its baked
+# data on exact versions so a dependency update is an explicit compatibility
+# event rather than an incidental lockfile refresh.
+# OpenNLP delegates normalization, category, and script data to JDK 25. Pin the
+# corresponding Unicode 16 ICU4X release so accent folding stays compatible.
+# The analyzer supplements case folding with OpenNLP's Unicode 17 additions.
+icu_casemap = "=2.0.0"
+icu_normalizer = "=2.0.0"
+icu_properties = "=2.0.0"
+# ICU crates declare their generated data with patch-compatible ranges.
+# Constrain every baked artifact so Unicode changes cannot enter via a patch.
+icu_casemap_data = "=2.0.0"
+icu_normalizer_data = "=2.0.0"
+icu_properties_data = "=2.0.0"
+# ICU4X 2.0 declared these shared internals with caret ranges. Keep the
+# internally generated data and provider ABI on the same release.
+icu_locale_core = "=2.0.0"
+icu_provider = "=2.0.0"
+# Both algorithms affect persisted term identity. Exact pins make an upgrade
+# an explicit index-compatibility decision.
+unicode-segmentation = "=1.13.3"
+aho-corasick = "=1.1.4"

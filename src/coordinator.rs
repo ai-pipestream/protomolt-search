@@ -12,6 +12,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use crate::bm25::{Bm25Params, CorpusStats};
+use crate::clustered_turbovec::{
+    ClusteredCandidateEvent, ClusteredLabelFilter, ClusteredTurboVecBackend,
+};
 use crate::fusion::{self, Leg};
 use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
 use crate::pb::node_service_client::NodeServiceClient;
@@ -25,13 +28,13 @@ use crate::pb::{
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse,
     CalibrationApplyResult, CascadeHit, ClusterHealthRequest, ClusterHealthResponse,
-    ConfigureVectorBackendRequest, FloorUpdate, FusionMode, HealthRequest, HybridDebug, HybridHit,
-    HybridSearchRequest, HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup,
-    ScoredHit, SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats,
-    StartShardSearch, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult,
-    VectorRescoreRequest,
+    ClusteredVectorHealth, ConfigureVectorBackendRequest, FloorUpdate, FusionMode, HealthRequest,
+    HybridDebug, HybridHit, HybridLegHit, HybridSearchRequest, HybridSearchResponse,
+    HybridShardDebug, HybridShardRequest, ParentGroup, ScoredHit, SearchRequest, SearchResponse,
+    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
+    ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch, StopStreamSearch,
+    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
+    VectorBackendApplyResult, VectorRescoreRequest,
 };
 use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
@@ -61,6 +64,23 @@ pub struct FanoutLimits {
     pub hedge_delay: Option<Duration>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProductLabelRange {
+    start: u64,
+    end: u64,
+    shard: u32,
+}
+
+impl ProductLabelRange {
+    fn contains(self, label: u64) -> bool {
+        label >= self.start && label < self.end
+    }
+}
+
+struct ClusteredVectorResult {
+    hits: Vec<(u64, f32)>,
+}
+
 /// The coordinator gRPC service.
 ///
 /// Membership is static: the node address list is fixed at construction
@@ -75,7 +95,7 @@ pub struct CoordinatorServiceImpl {
     /// Optional replica address per shard (same data, exact same
     /// results), the target for hedged retries.
     replica_addrs: Vec<Option<String>>,
-    /// Analysis sidecar address for query analysis in Bm25Search.
+    /// Lexical analysis backend for query analysis in Bm25Search.
     analysis_addr: Option<String>,
     /// BM25 tuning sent to every shard (identical scoring everywhere).
     bm25_params: Bm25Params,
@@ -107,6 +127,11 @@ pub struct CoordinatorServiceImpl {
     /// `stats_epoch` (src/stats_cache.rs). Sound because the nodes
     /// enforce the epoch claim on every scoring request built from it.
     stats_cache: Arc<crate::stats_cache::StatsCache>,
+    /// Optional distributed vector collection. The product coordinator calls
+    /// it once as one provider; it never learns or re-fans its shard topology.
+    clustered_vectors: Option<ClusteredTurboVecBackend>,
+    /// Product-owned phrase vocabulary used to derive canonical query terms.
+    phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
 }
 
 /// A process-unique, well-mixed stream token for the UDP signal lane
@@ -1094,6 +1119,8 @@ struct FusedGlobals {
     /// Per field: global df per term, in that field's term order.
     dfs: Vec<Vec<u32>>,
     epochs: Vec<u64>,
+    /// Number of primary shards whose field table contains each field.
+    known_shards: Vec<usize>,
 }
 
 impl CoordinatorServiceImpl {
@@ -1114,6 +1141,8 @@ impl CoordinatorServiceImpl {
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
+            clustered_vectors: None,
+            phrase_index: None,
         }
     }
 
@@ -1208,11 +1237,20 @@ impl CoordinatorServiceImpl {
         Ok(requested)
     }
 
-    /// Configure the BM25 path: analysis sidecar for query analysis and
+    /// Configure the BM25 path: lexical analyzer for query analysis and
     /// the scoring parameters every shard is told to use.
     pub fn with_bm25(mut self, analysis_addr: Option<String>, params: Bm25Params) -> Self {
         self.analysis_addr = analysis_addr;
         self.bm25_params = params;
+        self
+    }
+
+    /// Attach the same immutable phrase vocabulary used by every shard.
+    pub fn with_phrase_index(
+        mut self,
+        phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
+    ) -> Self {
+        self.phrase_index = phrase_index;
         self
     }
 
@@ -1227,6 +1265,13 @@ impl CoordinatorServiceImpl {
     /// searches are exact, so either copy returns identical results.
     pub fn with_replicas(mut self, replica_addrs: Vec<Option<String>>) -> Self {
         self.replica_addrs = replica_addrs;
+        self
+    }
+
+    /// Route vector work through one distributed TurboVec collection. The
+    /// backend itself owns its only global heap and shard completion.
+    pub fn with_clustered_turbovec(mut self, backend: ClusteredTurboVecBackend) -> Self {
+        self.clustered_vectors = Some(backend);
         self
     }
 
@@ -1371,7 +1416,7 @@ impl CoordinatorServiceImpl {
             crate::filter::validate_filter(f)?;
         }
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         // (a) Query analysis with the SAME options as ingest: query terms
         // share identity with indexed terms (stems when SOURCE_STEMS).
@@ -1716,7 +1761,7 @@ impl CoordinatorServiceImpl {
             || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
         let t0 = std::time::Instant::now();
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let mut seen: Vec<&str> = Vec::new();
         for f in fields {
@@ -1781,6 +1826,7 @@ impl CoordinatorServiceImpl {
                     &field_terms,
                     &globals,
                     &claims,
+                    None,
                     min_score,
                     facet_fields,
                     map_facet_fields,
@@ -1795,6 +1841,164 @@ impl CoordinatorServiceImpl {
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
+                    self.stats_cache.invalidate_all();
+                    fresh = true;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Phrase-aware BM25 orchestration. Ordinary fields are analyzed exactly
+    /// as on the fused route; the final field is populated directly from the
+    /// product glossary and scored as a max-group on every shard.
+    async fn fanout_phrase(
+        &self,
+        base: &crate::pb::Bm25SearchRequest,
+        k: u32,
+        weight_per_token: f32,
+        max_weight: f32,
+        filter: Option<&crate::pb::FilterExpr>,
+    ) -> Result<FacetedHits, Status> {
+        crate::node::validate_range_facet_fields(&base.range_facet_fields)?;
+        crate::node::validate_geo_filters(&base.geo_filters)?;
+        if let Some(filter) = filter {
+            crate::filter::validate_filter(filter)?;
+        }
+        let phrase_index = self.phrase_index.as_ref().ok_or_else(|| {
+            Status::failed_precondition("this coordinator has no phrase glossary configured")
+        })?;
+        if !weight_per_token.is_finite() || weight_per_token <= 0.0 {
+            return Err(Status::invalid_argument(
+                "phrase weight_per_token must be finite and greater than zero",
+            ));
+        }
+        if !max_weight.is_finite() || max_weight <= 0.0 {
+            return Err(Status::invalid_argument(
+                "phrase max_weight must be finite and greater than zero",
+            ));
+        }
+        let mut fields = if base.fields.is_empty() {
+            vec![crate::pb::QueryField {
+                field: "body".to_string(),
+                analysis: base.analysis.clone(),
+                weight: 1.0,
+                k1: 0.0,
+                b: 0.0,
+            }]
+        } else {
+            if base.analysis.is_some() {
+                return Err(Status::invalid_argument(
+                    "PhraseSearch base.analysis is ignored when base.fields is set; move the spec onto each QueryField.analysis",
+                ));
+            }
+            base.fields.clone()
+        };
+        let mut seen = std::collections::HashSet::new();
+        for field in &fields {
+            if field.field.is_empty() || !seen.insert(field.field.as_str()) {
+                return Err(Status::invalid_argument(
+                    "phrase search base fields must be named and unique",
+                ));
+            }
+            if field.field == phrase_index.phrase_field() {
+                return Err(Status::invalid_argument(format!(
+                    "phrase field {:?} is derived by PhraseSearch and must not appear in base.fields",
+                    phrase_index.phrase_field()
+                )));
+            }
+            if field.weight < 0.0 || field.weight.is_nan() {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?}: weight must be non-negative",
+                    field.field
+                )));
+            }
+        }
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
+        })?;
+        let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some()
+            || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
+        let t0 = std::time::Instant::now();
+        let mut field_terms = Vec::with_capacity(fields.len() + 1);
+        for field in &fields {
+            let analyzed =
+                crate::analyzer::analyze_document(&addr, &base.text, field.analysis.as_ref())
+                    .await?;
+            let mut terms = Vec::new();
+            for (term, _, _) in analyzed.into_body().terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+            field_terms.push(terms);
+        }
+        let phrase_pairs = phrase_index.query_terms(&base.text);
+        let phrase_terms: Vec<String> = phrase_pairs.iter().map(|(term, _)| term.clone()).collect();
+        let phrase_weights: Vec<f32> = phrase_pairs
+            .iter()
+            .map(|(_, token_count)| ((*token_count as f32) * weight_per_token).min(max_weight))
+            .collect();
+        let phrase_leg = fields.len();
+        fields.push(crate::pb::QueryField {
+            field: phrase_index.phrase_field().to_string(),
+            analysis: None,
+            weight: 1.0,
+            k1: 0.0,
+            b: 0.0,
+        });
+        field_terms.push(phrase_terms);
+        if k == 0 || field_terms.iter().all(Vec::is_empty) {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let t_analyzed = t0.elapsed();
+        let stats_fields: Vec<crate::pb::FieldTerms> = fields
+            .iter()
+            .zip(&field_terms)
+            .map(|(field, terms)| crate::pb::FieldTerms {
+                field: field.field.clone(),
+                terms: terms.clone(),
+            })
+            .collect();
+        let mut fresh = false;
+        loop {
+            let globals = self.fused_stats(&stats_fields, fresh).await?;
+            if globals.known_shards[phrase_leg] != self.node_addrs.len() {
+                return Err(Status::failed_precondition(format!(
+                    "phrase field {:?} exists on only {}/{} shards; phrase search requires a complete rebuilt generation",
+                    phrase_index.phrase_field(),
+                    globals.known_shards[phrase_leg],
+                    self.node_addrs.len()
+                )));
+            }
+            let claims = if fresh {
+                vec![0; globals.epochs.len()]
+            } else {
+                globals.epochs.clone()
+            };
+            let t_stats = t0.elapsed();
+            let round = self
+                .bm25_fused_round(
+                    k,
+                    &fields,
+                    &field_terms,
+                    &globals,
+                    &claims,
+                    Some((phrase_leg, &phrase_weights, phrase_index.fingerprint())),
+                    base.min_score,
+                    &base.facet_fields,
+                    &base.map_facet_fields,
+                    &base.range_facet_fields,
+                    &base.geo_filters,
+                    filter,
+                    trace,
+                    t0,
+                    t_analyzed,
+                    t_stats,
+                )
+                .await;
+            match round {
+                Err(error) if !fresh && is_stale_stats(&error) => {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
@@ -1882,6 +2086,7 @@ impl CoordinatorServiceImpl {
             .map(|ft| vec![0u32; ft.terms.len()])
             .collect();
         let mut known_somewhere = vec![false; stats_fields.len()];
+        let mut known_shards = vec![0usize; stats_fields.len()];
         let mut epochs = Vec::with_capacity(n);
         for share in shares {
             let s = share.expect("looked up or fetched above");
@@ -1889,6 +2094,7 @@ impl CoordinatorServiceImpl {
             for (fi, fs) in s.fields.iter().enumerate() {
                 totals[fi] += fs.total_doc_length;
                 known_somewhere[fi] |= fs.known;
+                known_shards[fi] += usize::from(fs.known);
                 for (acc, df) in dfs[fi].iter_mut().zip(&fs.dfs) {
                     *acc += df;
                 }
@@ -1917,6 +2123,7 @@ impl CoordinatorServiceImpl {
             totals,
             dfs,
             epochs,
+            known_shards,
         })
     }
 
@@ -1931,6 +2138,8 @@ impl CoordinatorServiceImpl {
         field_terms: &[Vec<String>],
         globals: &FusedGlobals,
         claims: &[u64],
+        // `(field index, parallel term weights, vocabulary fingerprint)`.
+        phrase: Option<(usize, &[f32], u64)>,
         min_score: f32,
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
@@ -1972,7 +2181,12 @@ impl CoordinatorServiceImpl {
                 // The terms were analyzed under f.analysis just above,
                 // so this is the fingerprint OF THE SPEC ACTUALLY USED,
                 // not of what the caller meant.
-                analysis_fingerprint: crate::analyzer::analysis_fingerprint(f.analysis.as_ref()),
+                analysis_fingerprint: phrase
+                    .filter(|(phrase_field, _, _)| *phrase_field == fi)
+                    .map_or_else(
+                        || crate::analyzer::analysis_fingerprint(f.analysis.as_ref()),
+                        |(_, _, fingerprint)| fingerprint,
+                    ),
             })
             .collect();
         if trace {
@@ -2016,9 +2230,21 @@ impl CoordinatorServiceImpl {
                 cardinality_fields: Vec::new(),
             };
             let mut client = self.node_client(node)?;
+            let phrase_request =
+                phrase.map(
+                    |(phrase_leg, weights, _)| crate::pb::Bm25PhraseQueryRequest {
+                        query: Some(request.clone()),
+                        phrase_leg: phrase_leg as u32,
+                        phrase_term_weights: weights.to_vec(),
+                    },
+                );
             query_tasks.push(tokio::spawn(async move {
                 let started = std::time::Instant::now();
-                client.bm25_query(request).await.map(|r| {
+                let response = match phrase_request {
+                    Some(request) => client.bm25_phrase_query(request).await,
+                    None => client.bm25_query(request).await,
+                };
+                response.map(|r| {
                     let r = r.into_inner();
                     (
                         shard as u32,
@@ -2134,7 +2360,7 @@ impl CoordinatorServiceImpl {
         let t_total = std::time::Instant::now();
         // Query analysis for the BM25 leg (same options as ingest).
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let t = std::time::Instant::now();
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
@@ -2169,7 +2395,7 @@ impl CoordinatorServiceImpl {
                 }
                 _ => {
                     self.fanout_hybrid_global_rank(
-                        vector, k, &terms, &global, &claims, legs, debug, filters,
+                        request_id, vector, k, &terms, &global, &claims, legs, debug, filters,
                     )
                     .await
                 }
@@ -2267,14 +2493,10 @@ impl CoordinatorServiceImpl {
         Ok((global, epochs))
     }
 
-    /// FUSION_MODE_GLOBAL_RANK: shards return RAW per-leg lists; the
-    /// coordinator merges each leg across shards by raw score into global
-    /// rankings and applies single-level RRF over them. With globally
-    /// comparable scores per leg this is exactly the monolithic result
-    /// for k <= leg_k (see the proto's FusionMode comments).
     #[allow(clippy::too_many_arguments)]
-    async fn fanout_hybrid_global_rank(
+    async fn clustered_hybrid_global_rank(
         &self,
+        request_id: &str,
         vector: &[f32],
         k: u32,
         terms: &[String],
@@ -2284,6 +2506,181 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        let t_legs = std::time::Instant::now();
+        let ranges = self.product_label_ranges().await?;
+        let vector_legs = if legs.vector_weight == 0.0 {
+            vec![Vec::new(); self.node_addrs.len()]
+        } else {
+            self.clustered_local_vector_legs(request_id, vector, legs.leg_k, filters, &ranges)
+                .await?
+        };
+        let mut owner: HashMap<u64, u32> = HashMap::new();
+        let mut vector_counts = vec![0u32; self.node_addrs.len()];
+        let mut vector_shards = Vec::with_capacity(vector_legs.len());
+        for (shard, hits) in vector_legs.into_iter().enumerate() {
+            vector_counts[shard] = u32::try_from(hits.len()).unwrap_or(u32::MAX);
+            for &(doc_id, _) in &hits {
+                owner.insert(doc_id, shard as u32);
+            }
+            vector_shards.push((shard as u32, hits));
+        }
+        let mut vector_global = fusion::merge_legs_by_score(vector_shards);
+
+        let (_, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
+        let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let request = ShardLegsRequest {
+                request_id: request_id.to_string(),
+                k: legs.leg_k,
+                vector: Vec::new(),
+                terms: leg_terms.clone(),
+                global_doc_count: global.doc_count,
+                global_total_doc_length: global.total_doc_length,
+                global_doc_frequencies: leg_dfs.clone(),
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
+                expected_stats_epoch: claims[shard],
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
+            };
+            let mut client = self.node_client(node)?;
+            shard_tasks.push(tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                client
+                    .shard_legs(request)
+                    .await
+                    .map(|response| (shard as u32, started.elapsed(), response.into_inner()))
+            }));
+        }
+        let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
+        let mut shard_debug = Vec::new();
+        let mut known = FilterKnown::new(filters);
+        for task in shard_tasks {
+            let (shard, elapsed, response) = task
+                .await
+                .map_err(|error| Status::internal(format!("shard legs task failed: {error}")))??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            for hit in &response.bm25_hits {
+                owner.entry(hit.doc_id).or_insert(shard);
+            }
+            if debug {
+                shard_debug.push(HybridShardDebug {
+                    shard,
+                    rpc_ms: elapsed.as_secs_f32() * 1e3,
+                    vector_hits: vector_counts[shard as usize],
+                    bm25_hits: response.bm25_hits.len() as u32,
+                    scan: None,
+                });
+            }
+            bm25_shards.push((
+                shard,
+                response
+                    .bm25_hits
+                    .into_iter()
+                    .map(|hit| (hit.doc_id, f64::from(hit.score)))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        known.refuse_unknown(filters)?;
+        let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
+        let t_fusion = std::time::Instant::now();
+        let mut bm25_global = fusion::merge_legs_by_score(bm25_shards);
+        if legs.min_vector_score > 0.0 {
+            let min = f64::from(legs.min_vector_score);
+            vector_global.retain(|&(_, score, _)| score >= min);
+            let allowed: std::collections::HashSet<u64> =
+                vector_global.iter().map(|&(id, _, _)| id).collect();
+            bm25_global.retain(|&(id, _, _)| allowed.contains(&id));
+        }
+        let leg_inputs = [
+            Leg {
+                hits: vector_global
+                    .iter()
+                    .map(|&(id, score, _)| (id, score))
+                    .collect(),
+                weight: f64::from(legs.vector_weight),
+            },
+            Leg {
+                hits: bm25_global
+                    .iter()
+                    .map(|&(id, score, _)| (id, score))
+                    .collect(),
+                weight: f64::from(legs.bm25_weight),
+            },
+        ];
+        let blend = legs.fusion_mode == FusionMode::ScoreBlend;
+        let fused = if blend {
+            fusion::blend_fuse(
+                &leg_inputs,
+                legs.leg_k as usize,
+                legs.normalization,
+                legs.combination,
+                k as usize,
+            )
+        } else {
+            fusion::rrf_fuse(&leg_inputs, legs.rrf_k, k as usize)
+        };
+        let hits = fused
+            .into_iter()
+            .map(|hit| HybridHit {
+                doc_id: hit.doc_id,
+                fused_score: hit.fused_score as f32,
+                shard: owner.get(&hit.doc_id).copied().unwrap_or(0),
+                vector_rank: hit.leg_ranks[0],
+                vector_score: hit.leg_scores[0].unwrap_or(0.0) as f32,
+                bm25_rank: hit.leg_ranks[1],
+                bm25_score: hit.leg_scores[1].unwrap_or(0.0) as f32,
+                boost_score: 0.0,
+            })
+            .collect();
+        let debug = debug.then(|| {
+            shard_debug.sort_by_key(|shard| shard.shard);
+            HybridDebug {
+                fusion_mode: if blend {
+                    FusionMode::ScoreBlend as i32
+                } else {
+                    FusionMode::GlobalRank as i32
+                },
+                leg_k: legs.leg_k,
+                terms: Vec::new(),
+                analysis_ms: 0.0,
+                stats_ms: 0.0,
+                legs_ms,
+                fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
+                total_ms: 0.0,
+                shards: shard_debug,
+                boost_ms: 0.0,
+                boost_terms: Vec::new(),
+            }
+        });
+        Ok((hits, debug))
+    }
+
+    /// FUSION_MODE_GLOBAL_RANK: shards return RAW per-leg lists; the
+    /// coordinator merges each leg across shards by raw score into global
+    /// rankings and applies single-level RRF over them. With globally
+    /// comparable scores per leg this is exactly the monolithic result
+    /// for k <= leg_k (see the proto's FusionMode comments).
+    #[allow(clippy::too_many_arguments)]
+    async fn fanout_hybrid_global_rank(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        terms: &[String],
+        global: &CorpusStats,
+        claims: &[u64],
+        legs: HybridLegs,
+        debug: bool,
+        filters: &RequestFilters,
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        if self.clustered_vectors.is_some() {
+            return self
+                .clustered_hybrid_global_rank(
+                    request_id, vector, k, terms, global, claims, legs, debug, filters,
+                )
+                .await;
+        }
         let t_legs = std::time::Instant::now();
         let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
@@ -2451,6 +2848,161 @@ impl CoordinatorServiceImpl {
         Ok((hits, dbg))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn clustered_hybrid_two_level(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        terms: &[String],
+        global: &CorpusStats,
+        claims: &[u64],
+        legs: HybridLegs,
+        debug: bool,
+        filters: &RequestFilters,
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        let t_legs = std::time::Instant::now();
+        let ranges = self.product_label_ranges().await?;
+        let vector_legs = self
+            .clustered_local_vector_legs(request_id, vector, legs.leg_k, filters, &ranges)
+            .await?;
+        let (_, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let request = ShardLegsRequest {
+                request_id: request_id.to_string(),
+                k: legs.leg_k,
+                vector: Vec::new(),
+                terms: leg_terms.clone(),
+                global_doc_count: global.doc_count,
+                global_total_doc_length: global.total_doc_length,
+                global_doc_frequencies: leg_dfs.clone(),
+                k1: self.bm25_params.k1 as f32,
+                b: self.bm25_params.b as f32,
+                expected_stats_epoch: claims[shard],
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
+            };
+            let mut client = self.node_client(node)?;
+            tasks.push(tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                client
+                    .shard_legs(request)
+                    .await
+                    .map(|response| (shard as u32, started.elapsed(), response.into_inner()))
+            }));
+        }
+        let mut shard_lists: Vec<(u32, Vec<HybridLegHit>)> = Vec::with_capacity(tasks.len());
+        let mut shard_debug = Vec::new();
+        let mut known = FilterKnown::new(filters);
+        for task in tasks {
+            let (shard, elapsed, response) = task
+                .await
+                .map_err(|error| Status::internal(format!("shard legs task failed: {error}")))??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            let vector_leg = vector_legs[shard as usize].clone();
+            let bm25_leg: Vec<(u64, f64)> = response
+                .bm25_hits
+                .iter()
+                .map(|hit| (hit.doc_id, f64::from(hit.score)))
+                .collect();
+            let mut local: Vec<HybridLegHit> = fusion::rrf_fuse(
+                &[
+                    Leg {
+                        hits: vector_leg,
+                        weight: f64::from(legs.vector_weight),
+                    },
+                    Leg {
+                        hits: bm25_leg,
+                        weight: f64::from(legs.bm25_weight),
+                    },
+                ],
+                legs.rrf_k,
+                legs.leg_k as usize,
+            )
+            .into_iter()
+            .map(|hit| HybridLegHit {
+                doc_id: hit.doc_id,
+                fused_score: hit.fused_score as f32,
+                vector_rank: hit.leg_ranks[0],
+                vector_score: hit.leg_scores[0].unwrap_or(0.0) as f32,
+                bm25_rank: hit.leg_ranks[1],
+                bm25_score: hit.leg_scores[1].unwrap_or(0.0) as f32,
+            })
+            .collect();
+            if legs.min_vector_score > 0.0 {
+                local.retain(|hit| {
+                    hit.vector_rank.is_some() && hit.vector_score >= legs.min_vector_score
+                });
+            }
+            if debug {
+                shard_debug.push(HybridShardDebug {
+                    shard,
+                    rpc_ms: elapsed.as_secs_f32() * 1e3,
+                    vector_hits: local.iter().filter(|hit| hit.vector_rank.is_some()).count()
+                        as u32,
+                    bm25_hits: local.iter().filter(|hit| hit.bm25_rank.is_some()).count() as u32,
+                    scan: None,
+                });
+            }
+            shard_lists.push((shard, local));
+        }
+        known.refuse_unknown(filters)?;
+        let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
+        let t_fusion = std::time::Instant::now();
+        let fused_legs: Vec<Leg> = shard_lists
+            .iter()
+            .map(|(_, hits)| Leg {
+                hits: hits
+                    .iter()
+                    .map(|hit| (hit.doc_id, f64::from(hit.fused_score)))
+                    .collect(),
+                weight: 1.0,
+            })
+            .collect();
+        let fused = fusion::rrf_fuse(&fused_legs, legs.rrf_k, k as usize);
+        let hits = fused
+            .into_iter()
+            .map(|hit| {
+                let (shard, source) = shard_lists
+                    .iter()
+                    .find_map(|(shard, hits)| {
+                        hits.iter()
+                            .find(|source| source.doc_id == hit.doc_id)
+                            .map(|source| (*shard, source))
+                    })
+                    .expect("fused hit comes from a product shard");
+                HybridHit {
+                    doc_id: hit.doc_id,
+                    fused_score: hit.fused_score as f32,
+                    shard,
+                    vector_rank: source.vector_rank,
+                    vector_score: source.vector_score,
+                    bm25_rank: source.bm25_rank,
+                    bm25_score: source.bm25_score,
+                    boost_score: 0.0,
+                }
+            })
+            .collect();
+        let debug = debug.then(|| {
+            shard_debug.sort_by_key(|shard| shard.shard);
+            HybridDebug {
+                fusion_mode: FusionMode::TwoLevel as i32,
+                leg_k: legs.leg_k,
+                terms: Vec::new(),
+                analysis_ms: 0.0,
+                stats_ms: 0.0,
+                legs_ms,
+                fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
+                total_ms: 0.0,
+                shards: shard_debug,
+                boost_ms: 0.0,
+                boost_terms: Vec::new(),
+            }
+        });
+        Ok((hits, debug))
+    }
+
     /// FUSION_MODE_TWO_LEVEL (fallback for incomparable scores): each
     /// shard fuses locally; the coordinator RRF-merges the shard lists.
     /// NOT partition-independent — see the proto's FusionMode comments.
@@ -2467,6 +3019,13 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        if self.clustered_vectors.is_some() {
+            return self
+                .clustered_hybrid_two_level(
+                    request_id, vector, k, terms, global, claims, legs, debug, filters,
+                )
+                .await;
+        }
         let t_legs = std::time::Instant::now();
         // Level one: per-shard local fusion.
         let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
@@ -2781,76 +3340,137 @@ impl CoordinatorServiceImpl {
         // Phase 3: the streaming vector scan, floored from the first
         // block, with re-decomposed floors chasing the rising k-th
         // best known bound.
-        let mut fanout =
-            self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
-        let mut remaining = n_nodes;
+        let mut clustered_counts = vec![0u32; n_nodes];
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
-        while remaining > 0 {
-            let (shard, msg) = match fanout.next_message(&summaries).await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => continue,
-                Err(status) => return fanout.cancel_with(status).await,
-            };
-            match msg.payload {
-                Some(stream_search_response::Payload::Batch(batch)) => {
-                    if batch.hits.len() % 12 != 0 {
-                        let status = Status::internal(format!(
-                            "shard {shard} sent a misaligned batch of {} bytes",
-                            batch.hits.len()
-                        ));
-                        return fanout.cancel_with(status).await;
-                    }
-                    for rec in batch.hits.chunks_exact(12) {
-                        let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
-                        let v = f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score"));
-                        // A re-emitted phase-2 seed carries the identical
-                        // score (one kernel); keep the first sighting.
-                        if v_seen.contains_key(&doc) {
-                            continue;
+        if let Some(backend) = &self.clustered_vectors {
+            let ranges = self.product_label_ranges().await?;
+            let allowed = self.clustered_allowed_labels(filters).await?;
+            let mut stream = backend
+                .candidate_stream(request_id, vector.to_vec(), allowed, initial_floor)
+                .await?;
+            let mut provider_labels = std::collections::HashSet::new();
+            let completion = loop {
+                match stream.next_event().await? {
+                    ClusteredCandidateEvent::Batch(batch) => {
+                        for candidate in batch {
+                            if !candidate.score.is_finite() {
+                                return Err(Status::internal(format!(
+                                    "clustered TurboVec label {} has non-finite score {}",
+                                    candidate.label, candidate.score
+                                )));
+                            }
+                            if !provider_labels.insert(candidate.label) {
+                                return Err(Status::failed_precondition(format!(
+                                    "clustered TurboVec emitted duplicate stable label {}",
+                                    candidate.label
+                                )));
+                            }
+                            let shard = Self::product_owner(&ranges, candidate.label)?;
+                            clustered_counts[shard as usize] =
+                                clustered_counts[shard as usize].saturating_add(1);
+                            // A re-emitted phase-2 seed carries the identical
+                            // score (one kernel); keep the first sighting.
+                            if v_seen.contains_key(&candidate.label) {
+                                continue;
+                            }
+                            v_seen.insert(candidate.label, (candidate.score, shard));
+                            if min_v.is_some_and(|minimum| candidate.score < minimum) {
+                                continue;
+                            }
+                            let b = bm25_of
+                                .get(&candidate.label)
+                                .map_or(0.0, |&(score, _)| score);
+                            push_flb(&mut flb_heap, fused_of(candidate.score, b));
                         }
-                        v_seen.insert(doc, (v, shard as u32));
-                        if min_v.is_some_and(|m| v < m) {
-                            continue;
-                        }
-                        let b = bm25_of.get(&doc).map_or(0.0f32, |&(s, _)| s);
-                        push_flb(&mut flb_heap, fused_of(v, b));
-                    }
-                    if flb_heap.len() == k as usize {
-                        let m = flb_heap.peek().expect("full heap").0 .0;
-                        if s_lb.is_none_or(|s| m > s) {
-                            s_lb = Some(m);
-                            let floor = decomposed_floor(m, wb_b1, w_v);
-                            if floor > last_floor {
-                                last_floor = floor;
-                                self.push_stream_floor(&fanout, floor);
+                        if flb_heap.len() == k as usize {
+                            let bound = flb_heap.peek().expect("full heap").0 .0;
+                            if s_lb.is_none_or(|score| bound > score) {
+                                s_lb = Some(bound);
+                                let floor = decomposed_floor(bound, wb_b1, w_v);
+                                if floor > last_floor {
+                                    stream.raise_floor(floor)?;
+                                    last_floor = floor;
+                                }
                             }
                         }
                     }
+                    ClusteredCandidateEvent::Completion(completion) => break completion,
                 }
-                Some(stream_search_response::Payload::Summary(summary)) => {
-                    if !summary.completed {
-                        let status = Status::internal(format!(
-                            "shard {shard} stopped before completing its scan"
-                        ));
-                        return fanout.cancel_with(status).await;
-                    }
-                    // The vector leg's half of the typo handshake: a
-                    // filter column no shard resolves must refuse even
-                    // when the stream completed cleanly.
-                    if let Err(e) =
-                        known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
-                    {
-                        return fanout.cancel_with(e).await;
-                    }
-                    summaries[shard] = Some(summary);
-                    fanout.mark_completed(shard);
-                    remaining -= 1;
-                }
-                None => {}
+            };
+            if completion.emitted != provider_labels.len() as u64 {
+                return Err(Status::internal(format!(
+                    "clustered TurboVec completion counted {} candidates but decomposed search received {}",
+                    completion.emitted,
+                    provider_labels.len()
+                )));
             }
+        } else {
+            let mut fanout =
+                self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
+            let mut remaining = n_nodes;
+            while remaining > 0 {
+                let (shard, msg) = match fanout.next_message(&summaries).await {
+                    Ok(Some(pair)) => pair,
+                    Ok(None) => continue,
+                    Err(status) => return fanout.cancel_with(status).await,
+                };
+                match msg.payload {
+                    Some(stream_search_response::Payload::Batch(batch)) => {
+                        if batch.hits.len() % 12 != 0 {
+                            let status = Status::internal(format!(
+                                "shard {shard} sent a misaligned batch of {} bytes",
+                                batch.hits.len()
+                            ));
+                            return fanout.cancel_with(status).await;
+                        }
+                        for rec in batch.hits.chunks_exact(12) {
+                            let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
+                            let v =
+                                f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score"));
+                            if v_seen.contains_key(&doc) {
+                                continue;
+                            }
+                            v_seen.insert(doc, (v, shard as u32));
+                            if min_v.is_some_and(|m| v < m) {
+                                continue;
+                            }
+                            let b = bm25_of.get(&doc).map_or(0.0f32, |&(s, _)| s);
+                            push_flb(&mut flb_heap, fused_of(v, b));
+                        }
+                        if flb_heap.len() == k as usize {
+                            let m = flb_heap.peek().expect("full heap").0 .0;
+                            if s_lb.is_none_or(|s| m > s) {
+                                s_lb = Some(m);
+                                let floor = decomposed_floor(m, wb_b1, w_v);
+                                if floor > last_floor {
+                                    last_floor = floor;
+                                    self.push_stream_floor(&fanout, floor);
+                                }
+                            }
+                        }
+                    }
+                    Some(stream_search_response::Payload::Summary(summary)) => {
+                        if !summary.completed {
+                            let status = Status::internal(format!(
+                                "shard {shard} stopped before completing its scan"
+                            ));
+                            return fanout.cancel_with(status).await;
+                        }
+                        if let Err(error) =
+                            known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
+                        {
+                            return fanout.cancel_with(error).await;
+                        }
+                        summaries[shard] = Some(summary);
+                        fanout.mark_completed(shard);
+                        remaining -= 1;
+                    }
+                    None => {}
+                }
+            }
+            known.refuse_unknown(filters)?;
         }
-        known.refuse_unknown(filters)?;
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
 
         // Close-out. Candidates with a leg score (or proven-zero b)
@@ -2934,9 +3554,9 @@ impl CoordinatorServiceImpl {
                 .map(|(shard, summary)| HybridShardDebug {
                     shard: shard as u32,
                     rpc_ms: 0.0,
-                    vector_hits: summary
-                        .as_ref()
-                        .map_or(0, |s| u32::try_from(s.emitted).unwrap_or(u32::MAX)),
+                    vector_hits: summary.as_ref().map_or(clustered_counts[shard], |s| {
+                        u32::try_from(s.emitted).unwrap_or(u32::MAX)
+                    }),
                     bm25_hits: leg_counts.get(&(shard as u32)).copied().unwrap_or(0),
                     scan: None,
                 })
@@ -2965,6 +3585,47 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         by_shard: HashMap<u32, Vec<u64>>,
     ) -> Result<HashMap<u64, f32>, Status> {
+        if let Some(clustered) = &self.clustered_vectors {
+            let mut ids: Vec<u64> = by_shard.into_values().flatten().collect();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() {
+                return Ok(HashMap::new());
+            }
+            let response = clustered
+                .search(
+                    vector.to_vec(),
+                    u32::try_from(ids.len()).map_err(|_| {
+                        Status::resource_exhausted(
+                            "clustered vector rescore candidate count exceeds u32",
+                        )
+                    })?,
+                    Some(ClusteredLabelFilter::Labels(ids)),
+                    None,
+                    false,
+                )
+                .await?;
+            if response.results.len() != 1 {
+                return Err(Status::internal(format!(
+                    "clustered TurboVec returned {} rescore results for one query",
+                    response.results.len()
+                )));
+            }
+            return response.results[0]
+                .neighbours
+                .iter()
+                .map(|neighbour| {
+                    neighbour
+                        .label
+                        .map(|label| (label, neighbour.score))
+                        .ok_or_else(|| {
+                            Status::failed_precondition(
+                                "clustered TurboVec rescore returned an unlabelled row",
+                            )
+                        })
+                })
+                .collect();
+        }
         let mut tasks = Vec::with_capacity(by_shard.len());
         for (shard, ids) in by_shard {
             let request = VectorRescoreRequest {
@@ -3792,9 +4453,32 @@ impl CoordinatorServiceImpl {
         // Phase 1 carries the filters, so the candidate gate is the
         // filtered corpus; phase 2 reranks that pool and never widens
         // it, so no unfiltered document can reappear.
-        let phase1 = self
-            .fanout_search(request_id, vector, k, true, filters)
-            .await?;
+        let phase1 = if self.clustered_vectors.is_some() {
+            let candidates = self
+                .clustered_vector_candidates(request_id, vector, k, None, true, filters)
+                .await?;
+            let ranges = self.product_label_ranges().await?;
+            let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = (0..self.node_addrs.len())
+                .map(|shard| (shard as u32, Vec::new()))
+                .collect();
+            for (doc_id, score) in candidates.hits {
+                let owner = Self::product_owner(&ranges, doc_id)?;
+                shard_hits[owner as usize].1.push((doc_id, score));
+            }
+            FanoutResult {
+                shard_stats: vec![None; self.node_addrs.len()],
+                shard_wall_ms: (0..self.node_addrs.len())
+                    .map(|shard| (shard as u32, 0.0))
+                    .collect(),
+                shard_hits,
+                hits: Vec::new(),
+                hedges_fired: 0,
+                hedge_wins: 0,
+            }
+        } else {
+            self.fanout_search(request_id, vector, k, true, filters)
+                .await?
+        };
         let phase1_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         let mut all: Vec<(u64, u32, f64)> = Vec::new(); // (doc_id, shard, score)
         for (shard, hits) in &phase1.shard_hits {
@@ -3820,7 +4504,7 @@ impl CoordinatorServiceImpl {
 
         // Query analysis + global BM25 stats for phase 2.
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let t = std::time::Instant::now();
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
@@ -3950,7 +4634,7 @@ impl CoordinatorServiceImpl {
             ));
         }
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
         let mut terms: Vec<String> = Vec::new();
@@ -4002,6 +4686,40 @@ impl CoordinatorServiceImpl {
         }
         if ids.is_empty() {
             return Ok(HashMap::new());
+        }
+        if let Some(clustered) = &self.clustered_vectors {
+            let k = u32::try_from(ids.len()).map_err(|_| {
+                Status::resource_exhausted("dense boost candidate set does not fit u32")
+            })?;
+            let response = clustered
+                .search(
+                    vector.to_vec(),
+                    k,
+                    Some(ClusteredLabelFilter::Labels(ids.to_vec())),
+                    None,
+                    false,
+                )
+                .await?;
+            if response.results.len() != 1 {
+                return Err(Status::internal(format!(
+                    "clustered TurboVec returned {} query results for one dense boost",
+                    response.results.len()
+                )));
+            }
+            return response.results[0]
+                .neighbours
+                .iter()
+                .map(|neighbour| {
+                    neighbour
+                        .label
+                        .map(|label| (label, neighbour.score))
+                        .ok_or_else(|| {
+                            Status::failed_precondition(
+                                "clustered TurboVec dense boosts require stable labels",
+                            )
+                        })
+                })
+                .collect();
         }
         let by_shard: HashMap<u32, Vec<u64>> = (0..self.node_addrs.len())
             .map(|s| (s as u32, ids.to_vec()))
@@ -4147,7 +4865,7 @@ impl CoordinatorServiceImpl {
         // Analyze the boost text with the SAME options as the main query
         // (term identity must match the index, as everywhere).
         let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis sidecar configured on the coordinator (analysis_addr)")
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let analyzed = crate::analyzer::analyze_document(&addr, &boost.text, spec).await?;
         let mut terms: Vec<String> = Vec::new();
@@ -4316,6 +5034,563 @@ impl CoordinatorServiceImpl {
             keys: rows.iter().map(|r| r.2).collect(),
             sorted: sort.is_some(),
         })
+    }
+
+    /// Resolve a product filter into one packed stable-id bitmap per product
+    /// shard for a vector provider that does not own document columns. No
+    /// filter remains `None` and therefore costs no shard pass. An explicitly
+    /// present empty bitmap set is an intentional match-none set and stays
+    /// distinguishable at the provider boundary.
+    async fn clustered_allowed_labels(
+        &self,
+        filters: &RequestFilters,
+    ) -> Result<Option<ClusteredLabelFilter>, Status> {
+        if filters.geo.is_empty() && filters.tree.is_none() {
+            return Ok(None);
+        }
+
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::FilterBitmapRequest {
+                geo_filters: filters.geo.clone(),
+                filter: filters.tree.clone(),
+            };
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .resolve_filter_bitmap(request)
+                    .await
+                    .map(|response| response.into_inner())
+            }));
+        }
+
+        let mut known = FilterKnown::new(filters);
+        let mut bitmaps = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let response = task.await.map_err(|error| {
+                Status::internal(format!("filter bitmap task failed: {error}"))
+            })??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            if response.label_count == 0 {
+                if !response.bits.is_empty() {
+                    return Err(Status::internal(
+                        "shard answered an empty filter bitmap with payload bytes",
+                    ));
+                }
+                continue;
+            }
+            let expected_bytes =
+                usize::try_from(response.label_count.div_ceil(8)).map_err(|_| {
+                    Status::internal("shard filter bitmap length does not fit this process")
+                })?;
+            if response.bits.len() != expected_bytes {
+                return Err(Status::internal(format!(
+                    "shard answered {} filter bitmap bytes for {} labels; expected {expected_bytes}",
+                    response.bits.len(),
+                    response.label_count
+                )));
+            }
+            response
+                .base_label
+                .checked_add(response.label_count)
+                .ok_or_else(|| Status::internal("shard filter bitmap label range overflows u64"))?;
+            bitmaps.push(turbovec_grpc::proto::LabelBitmap {
+                base_label: response.base_label,
+                label_count: response.label_count,
+                bits: response.bits,
+            });
+        }
+        known.refuse_unknown(filters)?;
+        bitmaps.sort_unstable_by_key(|bitmap| bitmap.base_label);
+        for pair in bitmaps.windows(2) {
+            let previous_end = pair[0]
+                .base_label
+                .checked_add(pair[0].label_count)
+                .expect("bitmap range was validated above");
+            if pair[1].base_label < previous_end {
+                return Err(Status::internal(
+                    "product shard filter bitmap label ranges overlap",
+                ));
+            }
+        }
+        Ok(Some(ClusteredLabelFilter::Bitmaps(bitmaps)))
+    }
+
+    /// Product ownership ranges, independent of vector shard cuts. Hybrid
+    /// provenance, BM25 rescoring, and lineage lookup all route by this map;
+    /// the clustered provider remains unaware of product shard meaning.
+    async fn product_label_ranges(&self) -> Result<Vec<ProductLabelRange>, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let client = self.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .health(HealthRequest {})
+                    .await
+                    .map(|response| (shard as u32, response.into_inner()))
+            }));
+        }
+        let mut ranges = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let (shard, health) = task
+                .await
+                .map_err(|error| Status::internal(format!("health task failed: {error}")))??;
+            let count = health.num_vectors.max(health.bm25_docs);
+            if count == 0 {
+                continue;
+            }
+            let end = health.slot_offset.checked_add(count).ok_or_else(|| {
+                Status::failed_precondition("product shard label range overflows u64")
+            })?;
+            ranges.push(ProductLabelRange {
+                start: health.slot_offset,
+                end,
+                shard,
+            });
+        }
+        ranges.sort_unstable_by_key(|range| range.start);
+        for pair in ranges.windows(2) {
+            if pair[1].start < pair[0].end {
+                return Err(Status::failed_precondition(format!(
+                    "product shard label ranges overlap: [{}, {}) and [{}, {})",
+                    pair[0].start, pair[0].end, pair[1].start, pair[1].end
+                )));
+            }
+        }
+        Ok(ranges)
+    }
+
+    fn product_owner(ranges: &[ProductLabelRange], label: u64) -> Result<u32, Status> {
+        ranges
+            .iter()
+            .copied()
+            .find(|range| range.contains(label))
+            .map(|range| range.shard)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "clustered TurboVec label {label} has no product shard owner"
+                ))
+            })
+    }
+
+    /// Resolve lineage in compact batches on the owning product shards. A
+    /// document without stored lineage parents itself under the same tagged
+    /// domain as the embedded path; raw document text never crosses this seam.
+    async fn product_parent_ids(
+        &self,
+        ranges: &[ProductLabelRange],
+        labels: &[u64],
+    ) -> Result<HashMap<u64, u64>, Status> {
+        let mut by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
+        for &label in labels {
+            by_shard
+                .entry(Self::product_owner(ranges, label)?)
+                .or_default()
+                .push(label);
+        }
+        let mut tasks = Vec::with_capacity(by_shard.len());
+        for (shard, labels) in by_shard {
+            let mut client = self.node_client(&self.node_addrs[shard as usize])?;
+            tasks.push(tokio::spawn(async move {
+                client
+                    .resolve_parents(crate::pb::ResolveParentsRequest {
+                        doc_ids: labels.clone(),
+                    })
+                    .await
+                    .map(|response| (labels, response.into_inner()))
+            }));
+        }
+        let mut parents = HashMap::with_capacity(labels.len());
+        for task in tasks {
+            let (requested, response) = task.await.map_err(|error| {
+                Status::internal(format!("document lineage task failed: {error}"))
+            })??;
+            let requested: std::collections::HashSet<u64> = requested.into_iter().collect();
+            for resolved in response.parents {
+                if !requested.contains(&resolved.doc_id) {
+                    return Err(Status::internal(format!(
+                        "product shard returned unrequested document {}",
+                        resolved.doc_id
+                    )));
+                }
+                if parents
+                    .insert(resolved.doc_id, resolved.parent_id)
+                    .is_some()
+                {
+                    return Err(Status::internal(format!(
+                        "product shard returned duplicate parent resolution for {}",
+                        resolved.doc_id
+                    )));
+                }
+            }
+        }
+        for &label in labels {
+            if !parents.contains_key(&label) {
+                return Err(Status::failed_precondition(format!(
+                    "product shard did not resolve parent identity for clustered label {label}"
+                )));
+            }
+        }
+        Ok(parents)
+    }
+
+    /// Collect one exact provider top-k. The product owns the only heap and
+    /// drives its inclusive live floor. Tie-complete mode retains the entire
+    /// final boundary group for cascade.
+    async fn clustered_vector_candidates(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        initial_floor: Option<f32>,
+        tie_complete: bool,
+        filters: &RequestFilters,
+    ) -> Result<ClusteredVectorResult, Status> {
+        if k == 0 {
+            return Ok(ClusteredVectorResult { hits: Vec::new() });
+        }
+        let backend = self.clustered_vectors.as_ref().ok_or_else(|| {
+            Status::failed_precondition("clustered TurboVec backend is not configured")
+        })?;
+        let allowed = self.clustered_allowed_labels(filters).await?;
+        let mut stream = backend
+            .candidate_stream(request_id, vector.to_vec(), allowed, initial_floor)
+            .await?;
+        let mut heap: std::collections::BinaryHeap<StreamHeapEntry> =
+            std::collections::BinaryHeap::with_capacity(k as usize + 1);
+        let mut tie_candidates = Vec::new();
+        let mut labels = std::collections::HashSet::new();
+        let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
+        let completion = loop {
+            match stream.next_event().await? {
+                ClusteredCandidateEvent::Batch(batch) => {
+                    for candidate in batch {
+                        if !candidate.score.is_finite() {
+                            return Err(Status::internal(format!(
+                                "clustered TurboVec label {} has non-finite score {}",
+                                candidate.label, candidate.score
+                            )));
+                        }
+                        if !labels.insert(candidate.label) {
+                            return Err(Status::failed_precondition(format!(
+                                "clustered TurboVec emitted duplicate stable label {}",
+                                candidate.label
+                            )));
+                        }
+                        let entry = StreamHeapEntry(MergedHit {
+                            vector_id: candidate.label,
+                            shard: 0,
+                            score: candidate.score,
+                        });
+                        if tie_complete {
+                            tie_candidates.push(entry.0);
+                        }
+                        if heap.len() < k as usize {
+                            heap.push(entry);
+                        } else if cmp_hits(&entry.0, &heap.peek().expect("heap is full").0)
+                            == std::cmp::Ordering::Less
+                        {
+                            heap.pop();
+                            heap.push(entry);
+                        }
+                    }
+                    if heap.len() == k as usize {
+                        let floor = heap.peek().expect("heap is full").0.score.next_down();
+                        if floor > last_floor {
+                            stream.raise_floor(floor)?;
+                            last_floor = floor;
+                            if tie_complete {
+                                tie_candidates.retain(|candidate| candidate.score >= floor);
+                            }
+                        }
+                    }
+                }
+                ClusteredCandidateEvent::Completion(completion) => break completion,
+            }
+        };
+        if completion.emitted != labels.len() as u64 {
+            return Err(Status::internal(format!(
+                "clustered TurboVec completion counted {} candidates but the product received {}",
+                completion.emitted,
+                labels.len()
+            )));
+        }
+
+        let mut hits = if tie_complete {
+            let boundary = heap.peek().map_or(f32::NEG_INFINITY, |entry| entry.0.score);
+            tie_candidates.retain(|candidate| candidate.score >= boundary);
+            tie_candidates
+        } else {
+            heap.into_iter().map(|entry| entry.0).collect()
+        };
+        hits.sort_by(cmp_hits);
+        if !tie_complete {
+            hits.truncate(k as usize);
+        }
+        Ok(ClusteredVectorResult {
+            hits: hits
+                .into_iter()
+                .map(|hit| (hit.vector_id, hit.score))
+                .collect(),
+        })
+    }
+
+    async fn clustered_parent_collapse(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        filters: &RequestFilters,
+    ) -> Result<CollapseStreamResult, Status> {
+        struct ParentAgg {
+            best_score: f32,
+            best_id: u64,
+            chunks: Vec<(u64, f32)>,
+        }
+        if k == 0 {
+            return Ok(CollapseStreamResult {
+                hits: Vec::new(),
+                groups: Vec::new(),
+                chunk_floor: f32::NEG_INFINITY,
+                summaries: Vec::new(),
+                floors_sent: 0,
+            });
+        }
+        let backend = self
+            .clustered_vectors
+            .as_ref()
+            .expect("clustered parent route is selected only with a backend");
+        let ranges = self.product_label_ranges().await?;
+        let allowed = self.clustered_allowed_labels(filters).await?;
+        let mut stream = backend
+            .candidate_stream(request_id, vector.to_vec(), allowed, None)
+            .await?;
+        let mut parents: HashMap<u64, ParentAgg> = HashMap::new();
+        let mut labels = std::collections::HashSet::new();
+        let mut kth = f32::NEG_INFINITY;
+        let mut last_floor = f32::NEG_INFINITY;
+        let mut floors_sent = 0;
+        let completion = loop {
+            match stream.next_event().await? {
+                ClusteredCandidateEvent::Batch(batch) => {
+                    let batch_labels: Vec<u64> = batch.iter().map(|item| item.label).collect();
+                    for &label in &batch_labels {
+                        if !labels.insert(label) {
+                            return Err(Status::failed_precondition(format!(
+                                "clustered TurboVec emitted duplicate stable label {label}"
+                            )));
+                        }
+                    }
+                    let parent_ids = self.product_parent_ids(&ranges, &batch_labels).await?;
+                    let mut dirty = false;
+                    for candidate in batch {
+                        if !candidate.score.is_finite() {
+                            return Err(Status::internal(format!(
+                                "clustered TurboVec label {} has non-finite score {}",
+                                candidate.label, candidate.score
+                            )));
+                        }
+                        let parent = parent_ids[&candidate.label];
+                        let agg = parents.entry(parent).or_insert_with(|| {
+                            dirty = true;
+                            ParentAgg {
+                                best_score: f32::NEG_INFINITY,
+                                best_id: u64::MAX,
+                                chunks: Vec::new(),
+                            }
+                        });
+                        agg.chunks.push((candidate.label, candidate.score));
+                        if candidate.score > agg.best_score
+                            || (candidate.score == agg.best_score && candidate.label < agg.best_id)
+                        {
+                            if candidate.score > agg.best_score && candidate.score > kth {
+                                dirty = true;
+                            }
+                            agg.best_score = candidate.score;
+                            agg.best_id = candidate.label;
+                        }
+                    }
+                    if dirty && parents.len() >= k as usize {
+                        let mut bests: Vec<f32> =
+                            parents.values().map(|parent| parent.best_score).collect();
+                        let new_kth = *bests
+                            .select_nth_unstable_by(k as usize - 1, |a, b| b.total_cmp(a))
+                            .1;
+                        if new_kth > kth {
+                            kth = new_kth;
+                            let floor = kth.next_down();
+                            if floor > last_floor {
+                                stream.raise_floor(floor)?;
+                                last_floor = floor;
+                                floors_sent += 1;
+                            }
+                        }
+                    }
+                }
+                ClusteredCandidateEvent::Completion(completion) => break completion,
+            }
+        };
+        if completion.emitted != labels.len() as u64 {
+            return Err(Status::internal(format!(
+                "clustered TurboVec completion counted {} candidates but collapse received {}",
+                completion.emitted,
+                labels.len()
+            )));
+        }
+
+        let mut ranked: Vec<(u64, ParentAgg)> = parents.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.best_score
+                .total_cmp(&a.1.best_score)
+                .then_with(|| a.1.best_id.cmp(&b.1.best_id))
+        });
+        let chunk_floor = if ranked.len() >= k as usize {
+            ranked[k as usize - 1].1.best_score.next_down()
+        } else {
+            f32::NEG_INFINITY
+        };
+        ranked.truncate(k as usize);
+        let mut hits = Vec::with_capacity(ranked.len());
+        let mut groups = Vec::with_capacity(ranked.len());
+        for (parent, agg) in ranked {
+            hits.push(ScoredHit {
+                vector_id: agg.best_id,
+                score: agg.best_score,
+                parent_id: parent,
+            });
+            let mut chunks: Vec<(u64, f32)> = agg
+                .chunks
+                .into_iter()
+                .filter(|&(_, score)| score >= chunk_floor)
+                .collect();
+            chunks.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            groups.push(ParentGroup {
+                parent_id: parent,
+                chunks: chunks
+                    .into_iter()
+                    .map(|(vector_id, score)| ScoredHit {
+                        vector_id,
+                        score,
+                        parent_id: parent,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(CollapseStreamResult {
+            hits,
+            groups,
+            chunk_floor,
+            summaries: Vec::new(),
+            floors_sent,
+        })
+    }
+
+    /// Exact product-shard-local vector legs over one provider stream. The
+    /// safe collection floor is the minimum filled local k-th score because a
+    /// lower candidate cannot enter any product shard's local list.
+    async fn clustered_local_vector_legs(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        k: u32,
+        filters: &RequestFilters,
+        ranges: &[ProductLabelRange],
+    ) -> Result<Vec<Vec<(u64, f64)>>, Status> {
+        let mut result = vec![Vec::new(); self.node_addrs.len()];
+        if k == 0 {
+            return Ok(result);
+        }
+        let backend = self
+            .clustered_vectors
+            .as_ref()
+            .expect("clustered local legs require a configured backend");
+        let allowed = self.clustered_allowed_labels(filters).await?;
+        let mut stream = backend
+            .candidate_stream(request_id, vector.to_vec(), allowed, None)
+            .await?;
+        let mut heaps: Vec<std::collections::BinaryHeap<StreamHeapEntry>> =
+            (0..self.node_addrs.len())
+                .map(|_| std::collections::BinaryHeap::with_capacity(k as usize + 1))
+                .collect();
+        let active: std::collections::HashSet<u32> =
+            ranges.iter().map(|range| range.shard).collect();
+        let mut labels = std::collections::HashSet::new();
+        let mut last_floor = f32::NEG_INFINITY;
+        let completion = loop {
+            match stream.next_event().await? {
+                ClusteredCandidateEvent::Batch(batch) => {
+                    for candidate in batch {
+                        if !candidate.score.is_finite() {
+                            return Err(Status::internal(format!(
+                                "clustered TurboVec label {} has non-finite score {}",
+                                candidate.label, candidate.score
+                            )));
+                        }
+                        if !labels.insert(candidate.label) {
+                            return Err(Status::failed_precondition(format!(
+                                "clustered TurboVec emitted duplicate stable label {}",
+                                candidate.label
+                            )));
+                        }
+                        let shard = Self::product_owner(ranges, candidate.label)? as usize;
+                        let entry = StreamHeapEntry(MergedHit {
+                            vector_id: candidate.label,
+                            shard: shard as u32,
+                            score: candidate.score,
+                        });
+                        if heaps[shard].len() < k as usize {
+                            heaps[shard].push(entry);
+                        } else if cmp_hits(
+                            &entry.0,
+                            &heaps[shard].peek().expect("local heap is full").0,
+                        ) == std::cmp::Ordering::Less
+                        {
+                            heaps[shard].pop();
+                            heaps[shard].push(entry);
+                        }
+                    }
+                    if !active.is_empty()
+                        && active
+                            .iter()
+                            .all(|&shard| heaps[shard as usize].len() == k as usize)
+                    {
+                        let floor = active
+                            .iter()
+                            .map(|&shard| {
+                                heaps[shard as usize]
+                                    .peek()
+                                    .expect("active local heap is full")
+                                    .0
+                                    .score
+                            })
+                            .min_by(f32::total_cmp)
+                            .expect("active set is non-empty")
+                            .next_down();
+                        if floor > last_floor {
+                            stream.raise_floor(floor)?;
+                            last_floor = floor;
+                        }
+                    }
+                }
+                ClusteredCandidateEvent::Completion(completion) => break completion,
+            }
+        };
+        if completion.emitted != labels.len() as u64 {
+            return Err(Status::internal(format!(
+                "clustered TurboVec completion counted {} candidates but local legs received {}",
+                completion.emitted,
+                labels.len()
+            )));
+        }
+        for (shard, heap) in heaps.into_iter().enumerate() {
+            let mut hits: Vec<MergedHit> = heap.into_iter().map(|entry| entry.0).collect();
+            hits.sort_by(cmp_hits);
+            result[shard] = hits
+                .into_iter()
+                .map(|hit| (hit.vector_id, f64::from(hit.score)))
+                .collect();
+        }
+        Ok(result)
     }
 
     /// Aggregation fan-out (docs/aggregations.md): every shard folds
@@ -5391,6 +6666,38 @@ impl SearchService for CoordinatorServiceImpl {
         // shards execute; no shard ever sees CEL text.
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
 
+        if self.clustered_vectors.is_some() {
+            if req.collapse_parents {
+                let collapsed = self
+                    .clustered_parent_collapse(&request_id, &req.vector, k, &filters)
+                    .await?;
+                return Ok(Response::new(SearchResponse {
+                    request_id,
+                    hits: collapsed.hits,
+                    groups: collapsed.groups,
+                    chunk_floor: collapsed.chunk_floor,
+                }));
+            }
+            let result = self
+                .clustered_vector_candidates(&request_id, &req.vector, k, None, false, &filters)
+                .await?;
+            let hits = result
+                .hits
+                .into_iter()
+                .map(|(vector_id, score)| ScoredHit {
+                    vector_id,
+                    score,
+                    parent_id: 0,
+                })
+                .collect();
+            return Ok(Response::new(SearchResponse {
+                request_id,
+                hits,
+                groups: Vec::new(),
+                chunk_floor: 0.0,
+            }));
+        }
+
         let result = if req.collapse_parents {
             // Document mode on a streaming coordinator: parents
             // aggregate here from tagged chunk emissions, and the
@@ -5533,6 +6840,61 @@ impl SearchService for CoordinatorServiceImpl {
             range_facets,
             stats,
             cardinality,
+        }))
+    }
+
+    async fn phrase_search(
+        &self,
+        request: Request<crate::pb::PhraseSearchRequest>,
+    ) -> Result<Response<Bm25SearchResponse>, Status> {
+        let request = request.into_inner();
+        let base = request
+            .base
+            .ok_or_else(|| Status::invalid_argument("PhraseSearchRequest.base is required"))?;
+        let k = self.resolve_k(base.k)?;
+        if base.min_score.is_nan() || base.min_score == f32::NEG_INFINITY {
+            return Err(Status::invalid_argument(
+                "min_score must be finite (NaN and -inf are not valid floors)",
+            ));
+        }
+        if !base.score_stages.is_empty()
+            || !base.stats_fields.is_empty()
+            || !base.cardinality_fields.is_empty()
+            || !base.projections.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "phrase max-group scoring is not yet certified with score stages, stats, cardinality, or projections; use filters and facets, or issue an ordinary Bm25Search",
+            ));
+        }
+        let options = request.options.unwrap_or_default();
+        let weight_per_token = if options.weight_per_token == 0.0 {
+            1.0
+        } else {
+            options.weight_per_token
+        };
+        let max_weight = if options.max_weight == 0.0 {
+            3.0
+        } else {
+            options.max_weight
+        };
+        let filter = crate::cel::compile_filter(&base.filter)?;
+        let (hits, facets, range_facets) = self
+            .fanout_phrase(&base, k, weight_per_token, max_weight, filter.as_ref())
+            .await?;
+        let kth_best = if hits.len() == k as usize {
+            hits.last()
+                .map(|hit| crate::bm25::floor_seed(hit.score))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Ok(Response::new(Bm25SearchResponse {
+            hits,
+            kth_best,
+            facets,
+            range_facets,
+            stats: Vec::new(),
+            cardinality: Vec::new(),
         }))
     }
 
@@ -5796,7 +7158,34 @@ impl SearchService for CoordinatorServiceImpl {
                 Err(e) => return Err(Status::internal(format!("health probe task failed: {e}"))),
             }
         }
-        Ok(Response::new(ClusterHealthResponse { targets }))
+        let clustered_vector = if let Some(backend) = &self.clustered_vectors {
+            Some(match backend.health().await {
+                Ok(health) => ClusteredVectorHealth {
+                    backend_kind: "clustered-turbovec".to_string(),
+                    transport: backend.transport_name().to_string(),
+                    reachable: true,
+                    servable: health.servable,
+                    error: health.error,
+                    rows: health.rows,
+                    topology_generation: health.topology_generation,
+                },
+                Err(status) => ClusteredVectorHealth {
+                    backend_kind: "clustered-turbovec".to_string(),
+                    transport: backend.transport_name().to_string(),
+                    reachable: false,
+                    servable: false,
+                    error: status.to_string(),
+                    rows: 0,
+                    topology_generation: 0,
+                },
+            })
+        } else {
+            None
+        };
+        Ok(Response::new(ClusterHealthResponse {
+            targets,
+            clustered_vector,
+        }))
     }
 
     async fn broadcast_vector_backend(

@@ -23,6 +23,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pipestream_search::bm25::{self, CorpusStats};
 use pipestream_search::harness::{build_monolithic, mock_analysis};
@@ -31,6 +32,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, FlushRequest, SetCalibrationRequest,
 };
+use pipestream_search::phrases::PhraseIndex;
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 use pipestream_search::{analyzer, reshard};
@@ -128,6 +130,9 @@ async fn ingest(
                 geo_points: Vec::new(),
                 quality: None,
                 geography: None,
+                phrases: Vec::new(),
+                phrase_fingerprint: 0,
+                phrase_field: String::new(),
             })
             .await
             .unwrap();
@@ -767,6 +772,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_preserves_multi_field_postings_and_fused_ranking() {
     use pipestream_search::pb::DocumentField;
+    use protomolt_analyzer::GlossaryEntry;
 
     let dir = tempdir("multifield");
     let n = 600usize;
@@ -777,15 +783,35 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
 
     // A two-field node: same shape as start_wal_node plus the table.
     let index_path = dir.join("shard.tv");
-    let (addr, _node) = common::start_empty_node(NodeConfig {
-        slot_offset: 0,
-        index_path: Some(index_path.clone()),
-        analysis_addr: Some(analysis_addr.to_string()),
-        bm25_fields: vec!["body".to_string(), "case_name".to_string()],
-        wal: true,
-        wal_buckets: 64,
-        ..Default::default()
-    })
+    let phrases = Arc::new(
+        PhraseIndex::new(
+            vec![GlossaryEntry {
+                id: "alpha-gamma".into(),
+                term: "alpha gamma".into(),
+            }],
+            "phrases".into(),
+            None,
+            true,
+            false,
+        )
+        .unwrap(),
+    );
+    let (addr, _node) = pipestream_search::harness::start_empty_phrase_node(
+        NodeConfig {
+            slot_offset: 0,
+            index_path: Some(index_path.clone()),
+            analysis_addr: Some(analysis_addr.to_string()),
+            bm25_fields: vec![
+                "body".to_string(),
+                "case_name".to_string(),
+                "phrases".to_string(),
+            ],
+            wal: true,
+            wal_buckets: 64,
+            ..Default::default()
+        },
+        phrases.clone(),
+    )
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
@@ -838,6 +864,9 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
                 geo_points: Vec::new(),
                 quality: None,
                 geography: None,
+                phrases: Vec::new(),
+                phrase_fingerprint: 0,
+                phrase_field: String::new(),
             })
             .await
             .unwrap();
@@ -864,8 +893,13 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     // Parent reference: the flushed two-field sidecar.
     let parent =
         Bm25Reader::open(&pipestream_search::node::bm25_sidecar_path(&index_path)).unwrap();
-    assert_eq!(parent.field_count(), 2);
+    assert_eq!(parent.field_count(), 3);
     assert_eq!(parent.field_name(1), "case_name");
+    assert_eq!(parent.field_name(2), "phrases");
+    assert_eq!(parent.analysis_fingerprint(2), phrases.fingerprint());
+    let phrase_term = protomolt_analyzer::phrase_posting_term("alpha-gamma");
+    let parent_phrase_df = parent.field(2).df(&phrase_term);
+    assert!(parent_phrase_df > 0);
 
     let output = reshard::split(
         &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
@@ -885,12 +919,22 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
         .iter()
         .map(|c| {
             let reader = Bm25Reader::open(c.bm25_path.as_ref().unwrap()).unwrap();
-            assert_eq!(reader.field_count(), 2, "children must derive both fields");
+            assert_eq!(reader.field_count(), 3, "children must derive all fields");
             assert_eq!(reader.field_name(0), "body");
             assert_eq!(reader.field_name(1), "case_name");
+            assert_eq!(reader.field_name(2), "phrases");
+            assert_eq!(reader.analysis_fingerprint(2), phrases.fingerprint());
             (c, reader)
         })
         .collect();
+    assert_eq!(
+        children
+            .iter()
+            .map(|(_, reader)| reader.field(2).df(&phrase_term))
+            .sum::<u32>(),
+        parent_phrase_df,
+        "durable phrase postings must survive WAL split"
+    );
 
     // Per-field conservation: shard shares sum to the parent's stats.
     for (f, terms) in [

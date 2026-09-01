@@ -219,6 +219,9 @@ fn ingest_request(doc: &Doc) -> AddDocumentsRequest {
             .collect(),
         quality: None,
         geography: None,
+        phrases: Vec::new(),
+        phrase_fingerprint: 0,
+        phrase_field: String::new(),
     }
 }
 

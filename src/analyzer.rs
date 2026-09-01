@@ -1,9 +1,11 @@
-//! Client for the OpenNLP analysis sidecar (vendored proto
+//! Lexical analysis providers and the OpenNLP sidecar client (vendored proto
 //! `ai.pipestream.opennlp.analysis.v1`).
 //!
-//! This is the ONLY analysis entry point: pipestream-search deliberately has
-//! no tokenizer/stemmer/normalizer of its own — text in, term vectors out,
-//! offsets always in original-text coordinates.
+//! `native` runs the same product term contract in-process through the
+//! cross-platform `protomolt-analyzer` crate. HTTP(S) values use the OpenNLP
+//! sidecar. Search configures both to produce original-text UTF-16 offsets;
+//! direct users of either analyzer can select UTF-8 instead. Embeddings and optional
+//! model-backed/structural layers remain sidecar capabilities.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -24,11 +26,33 @@ use crate::postings::AnalyzedDoc;
 /// Matches the sidecar's default text size cap.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
+/// Configuration value selecting the in-process Rust analyzer.
+pub const NATIVE_ANALYSIS_BACKEND: &str = "native";
+
+/// Resolved lexical analysis provider. The string configuration stays
+/// backward-compatible with sidecar addresses while callers that want a
+/// typed boundary can parse it once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalysisBackend {
+    Native,
+    Sidecar(String),
+}
+
+impl AnalysisBackend {
+    pub fn parse(value: &str) -> Result<Self, Status> {
+        match value.trim() {
+            "native" | "native://" => Ok(Self::Native),
+            "" => Err(Status::invalid_argument("analysis backend is empty")),
+            address => Ok(Self::Sidecar(address.to_string())),
+        }
+    }
+}
+
 /// The analysis a body-text corpus is built with, and the ONLY spec that
 /// may be used to query one.
 ///
-/// Term identity is decided entirely inside the sidecar, so an index and
-/// a query that disagree about this struct do not fail — they silently
+/// Term identity is decided by the configured analysis provider, so an index
+/// and a query that disagree about this struct do not fail — they silently
 /// score different terms. That has now cost this project twice: once
 /// when a query went out unstemmed against a stemmed index, and once
 /// when the v7 corpus was built under `SOURCE_STEMS` (below). Both times
@@ -84,6 +108,16 @@ pub fn body_spec() -> AnalysisSpec {
             CHAR_FILTER_ACCENT_FOLD,
             CHAR_FILTER_FULL_CASE_FOLD,
         ],
+    }
+}
+
+/// Unicode word-boundary variant of [`body_spec`]. This is additive rather
+/// than the default because changing the tokenizer changes persisted term
+/// identity and requires a new index generation.
+pub fn uax29_body_spec() -> AnalysisSpec {
+    AnalysisSpec {
+        tokenizer: TOKENIZER_UAX29,
+        ..body_spec()
     }
 }
 
@@ -192,12 +226,16 @@ pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
 
 /// `AnalysisOptions.Tokenizer.TOKENIZER_WHITESPACE`.
 pub const TOKENIZER_WHITESPACE: i32 = 1;
+/// `AnalysisOptions.Tokenizer.TOKENIZER_UAX29`.
+pub const TOKENIZER_UAX29: i32 = 3;
 /// `AnalysisOptions.Stemmer.STEMMER_NONE`.
 pub const STEMMER_NONE: i32 = 1;
 /// `AnalysisOptions.Stemmer.STEMMER_PORTER`.
 pub const STEMMER_PORTER: i32 = 2;
 /// `TermVectorOptions.Mode.MODE_FULL` (occurrence offsets included).
 pub const TERM_VECTOR_MODE_FULL: i32 = 1;
+/// `TermVectorOptions.Mode.MODE_SCORING_ONLY` (frequency only).
+pub const TERM_VECTOR_MODE_SCORING_ONLY: i32 = 2;
 /// `TermVectorOptions.Source.SOURCE_TOKENS` (char filters define identity).
 pub const SOURCE_TOKENS: i32 = 1;
 /// `TermVectorOptions.Source.SOURCE_STEMS` (char filters IGNORED; see
@@ -266,6 +304,9 @@ pub async fn analyze_document(
     text: &str,
     spec: Option<&AnalysisSpec>,
 ) -> Result<AnalyzedDoc, Status> {
+    if AnalysisBackend::parse(addr)? == AnalysisBackend::Native {
+        return analyze_document_native(text, spec);
+    }
     if text.is_empty() {
         return Err(Status::invalid_argument("empty document text"));
     }
@@ -285,7 +326,140 @@ pub async fn analyze_document(
     // (the channel connects lazily, so "sidecar down" surfaces HERE, not
     // at client construction), server errors keep their own codes.
     let response = client.analyze(request).await?.into_inner();
-    Ok(analyzed_from(response, SessionLayers::default()))
+    analyzed_from(response, SessionLayers::default())
+}
+
+/// Analyze one document with the in-process Rust provider.
+///
+/// Native analysis requires an explicit spec. The sidecar-only `server`
+/// analyzer has no stable client-visible default to reproduce, so guessing it
+/// here would make the same fingerprint mean different terms.
+pub fn analyze_document_native(
+    text: &str,
+    spec: Option<&AnalysisSpec>,
+) -> Result<AnalyzedDoc, Status> {
+    Ok(native_analysis(text, spec)?.doc)
+}
+
+#[derive(Debug)]
+struct NativeAnalysis {
+    doc: AnalyzedDoc,
+    tokens: Vec<String>,
+}
+
+fn native_analysis(text: &str, spec: Option<&AnalysisSpec>) -> Result<NativeAnalysis, Status> {
+    let spec = native_spec(spec)?;
+    native_analysis_with_spec(text, &spec)
+}
+
+fn native_analysis_with_spec(
+    text: &str,
+    spec: &protomolt_analyzer::AnalysisSpec,
+) -> Result<NativeAnalysis, Status> {
+    let analyzed = protomolt_analyzer::analyze(text, spec)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let terms = analyzed
+        .term_vectors
+        .into_iter()
+        .map(|vector| {
+            (
+                vector.term,
+                vector.frequency,
+                vector
+                    .occurrences
+                    .into_iter()
+                    .map(|span| (span.start, span.end))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(NativeAnalysis {
+        doc: AnalyzedDoc::body(terms, analyzed.length),
+        tokens: analyzed.tokens,
+    })
+}
+
+fn native_spec(spec: Option<&AnalysisSpec>) -> Result<protomolt_analyzer::AnalysisSpec, Status> {
+    use protomolt_analyzer::{
+        AnalysisSpec as NativeSpec, NormalizerStep, Stemmer, TermVectorMode, TermVectorSource,
+        Tokenizer,
+    };
+
+    let spec = spec.ok_or_else(|| {
+        Status::failed_precondition(
+            "native analysis requires an explicit AnalysisSpec; analyzer 'server' is sidecar-only",
+        )
+    })?;
+    let tokenizer = match spec.tokenizer {
+        0 | TOKENIZER_WHITESPACE => Tokenizer::Whitespace,
+        TOKENIZER_UAX29 => Tokenizer::Uax29,
+        value => {
+            return Err(Status::invalid_argument(format!(
+                "native analysis supports TOKENIZER_WHITESPACE (1) and TOKENIZER_UAX29 (3), got {value}"
+            )))
+        }
+    };
+    let stemmer = match spec.stemmer {
+        0 | STEMMER_NONE => Stemmer::None,
+        STEMMER_PORTER => Stemmer::Porter,
+        value => {
+            return Err(Status::invalid_argument(format!(
+                "native analysis supports only STEMMER_NONE (1) and STEMMER_PORTER (2), got {value}"
+            )))
+        }
+    };
+    let term_vector_mode = match spec.term_vector_mode {
+        0 | TERM_VECTOR_MODE_FULL => TermVectorMode::Full,
+        TERM_VECTOR_MODE_SCORING_ONLY => TermVectorMode::ScoringOnly,
+        value => {
+            return Err(Status::invalid_argument(format!(
+            "native analysis supports term vector modes FULL (1) and SCORING_ONLY (2), got {value}"
+        )))
+        }
+    };
+    let term_vector_source = match spec.term_vector_source {
+        0 | SOURCE_TOKENS => TermVectorSource::Tokens,
+        SOURCE_STEMS => TermVectorSource::Stems,
+        SOURCE_NORMALIZED_STEMS => TermVectorSource::NormalizedStems,
+        value => {
+            return Err(Status::invalid_argument(format!(
+                "native analysis supports term vector sources TOKENS (1), STEMS (2), and NORMALIZED_STEMS (3), got {value}"
+            )))
+        }
+    };
+    let mut normalizers = Vec::with_capacity(spec.char_filters.len());
+    for &value in &spec.char_filters {
+        let step = match value {
+            0 => continue,
+            CHAR_FILTER_STRIP_INVISIBLE => NormalizerStep::StripInvisible,
+            CHAR_FILTER_WHITESPACE => NormalizerStep::Whitespace,
+            CHAR_FILTER_ACCENT_FOLD => NormalizerStep::AccentFold,
+            CHAR_FILTER_FULL_CASE_FOLD => NormalizerStep::FullCaseFold,
+            unsupported => {
+                return Err(Status::invalid_argument(format!(
+                    "native analysis does not implement normalizer step {unsupported}; supported values are STRIP_INVISIBLE (1), WHITESPACE (2), FULL_CASE_FOLD (6), and ACCENT_FOLD (15)"
+                )))
+            }
+        };
+        normalizers.push(step);
+    }
+    let native = NativeSpec {
+        tokenizer,
+        stemmer,
+        term_vector_mode,
+        term_vector_source,
+        normalizers,
+    };
+    if matches!(
+        native.term_vector_source,
+        TermVectorSource::Stems | TermVectorSource::NormalizedStems
+    ) && native.stemmer == Stemmer::None
+    {
+        return Err(Status::invalid_argument(
+            "term vector source STEMS requires a stemmer other than STEMMER_NONE",
+        ));
+    }
+    Ok(native)
 }
 
 fn client(addr: &str) -> Result<AnalysisServiceClient<Channel>, Status> {
@@ -302,6 +476,11 @@ fn client(addr: &str) -> Result<AnalysisServiceClient<Channel>, Status> {
 /// through).
 pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
     use crate::pb::analysis::{embedding_options, EmbeddingOptions};
+    if AnalysisBackend::parse(addr)? == AnalysisBackend::Native {
+        return Err(Status::failed_precondition(
+            "the native lexical analyzer does not provide embeddings; configure an OpenNLP sidecar or another embedding provider",
+        ));
+    }
     if text.is_empty() {
         return Err(Status::invalid_argument("empty text"));
     }
@@ -354,6 +533,9 @@ pub struct SessionLayers {
     /// The geocoding layer (`docs/geography-columns.md`). Requires the
     /// sidecar to serve NER; opening preflights that capability.
     pub geography: bool,
+    /// Named entity mentions for materialization into a product-owned map
+    /// column. Requires a configured sidecar NER model.
+    pub entities: bool,
 }
 
 /// Maps `spec` straight onto the sidecar's `AnalysisOptions`: term vectors
@@ -395,10 +577,14 @@ fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> Analy
         // to do, because what comes back becomes an ordinary column.
         noise: layers.quality,
         artifacts: layers.quality,
-        // Geocoding consumes the entity layer; setting `geo` implies
-        // `ner` on the sidecar side. Availability was preflighted at
-        // session open (see [`AnalyzeStream::open_with_vocab`]).
+        // Geocoding consumes the entity layer; explicit entity columns do as
+        // well. Availability was preflighted at session open.
+        ner: layers.entities || layers.geography,
         geo: layers.geography,
+        // Search persistence remains one unambiguous legacy coordinate system.
+        // Offset output selection is separate from term identity and is exposed
+        // by the portable analyzer API rather than AnalysisSpec.
+        offset_unit: crate::pb::analysis::OffsetUnit::Utf16CodeUnits as i32,
         ..Default::default()
     }
 }
@@ -424,9 +610,40 @@ static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// have produced; the dropped token contributes nothing to the
 /// document length either, exactly as if the analyzer had never
 /// emitted it.
-fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> AnalyzedDoc {
+fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> Result<AnalyzedDoc, Status> {
+    match crate::pb::analysis::OffsetUnit::try_from(response.offset_unit) {
+        Ok(crate::pb::analysis::OffsetUnit::Unspecified)
+        | Ok(crate::pb::analysis::OffsetUnit::Utf16CodeUnits) => {}
+        Ok(crate::pb::analysis::OffsetUnit::Utf8Bytes) => {
+            return Err(Status::failed_precondition(
+                "analysis sidecar returned UTF-8 byte offsets after search requested UTF-16; refusing ambiguous persisted spans",
+            ));
+        }
+        Err(value) => {
+            return Err(Status::failed_precondition(format!(
+                "analysis sidecar returned unknown offset unit {value}"
+            )));
+        }
+    }
     let quality = layers.quality.then(|| doc_quality(&response));
     let geography = layers.geography.then(|| doc_geography(&response));
+    let entities = if layers.entities {
+        response
+            .entities
+            .iter()
+            .map(|entity| {
+                let span = entity.span.as_ref();
+                crate::phrases::DocEntity {
+                    kind: entity.r#type.clone(),
+                    text: entity.text.clone(),
+                    start: span.map_or(0, |span| span.start.max(0) as u32),
+                    end: span.map_or(0, |span| span.end.max(0) as u32),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut terms = crate::postings::DocTerms::new();
     let mut length = 0u32;
     for tv in response.term_vectors {
@@ -452,11 +669,12 @@ fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> AnalyzedDo
         length += tv.frequency as u32;
         terms.push((tv.term, tv.frequency as u32, offsets));
     }
-    AnalyzedDoc {
+    Ok(AnalyzedDoc {
         quality,
         geography,
+        entities,
         ..AnalyzedDoc::body(terms, length)
-    }
+    })
 }
 
 /// Fold a response's noise and artifact layers into the per-document
@@ -543,7 +761,23 @@ const SUBMIT_BUFFER: usize = 32;
 /// A cloneable submission handle for an open [`AnalyzeStream`].
 #[derive(Clone)]
 pub struct AnalyzeSubmit {
-    requests: tokio::sync::mpsc::Sender<AnalyzeStreamRequest>,
+    requests: AnalyzeRequests,
+}
+
+#[derive(Clone)]
+enum AnalyzeRequests {
+    Sidecar(tokio::sync::mpsc::Sender<AnalyzeStreamRequest>),
+    Native(tokio::sync::mpsc::Sender<NativeRequest>),
+}
+
+struct NativeRequest {
+    sequence: u64,
+    text: String,
+}
+
+struct NativeResponse {
+    sequence: u64,
+    result: Result<NativeAnalysis, Status>,
 }
 
 impl AnalyzeSubmit {
@@ -552,15 +786,24 @@ impl AnalyzeSubmit {
     /// which means the server has not granted credit yet: the await IS
     /// the backpressure. UNAVAILABLE when the stream is gone.
     pub async fn submit(&self, sequence: u64, text: &str) -> Result<(), Status> {
-        self.requests
-            .send(AnalyzeStreamRequest {
-                msg: Some(analyze_stream_request::Msg::Doc(AnalyzeStreamDoc {
+        match &self.requests {
+            AnalyzeRequests::Sidecar(requests) => requests
+                .send(AnalyzeStreamRequest {
+                    msg: Some(analyze_stream_request::Msg::Doc(AnalyzeStreamDoc {
+                        sequence,
+                        text: text.to_string(),
+                    })),
+                })
+                .await
+                .map_err(|_| Status::unavailable("analysis stream closed")),
+            AnalyzeRequests::Native(requests) => requests
+                .send(NativeRequest {
                     sequence,
                     text: text.to_string(),
-                })),
-            })
-            .await
-            .map_err(|_| Status::unavailable("analysis stream closed"))
+                })
+                .await
+                .map_err(|_| Status::unavailable("native analysis stream closed")),
+        }
     }
 }
 
@@ -570,7 +813,7 @@ impl AnalyzeSubmit {
 /// submitted sequence; callers that need arrival order reorder.
 pub struct AnalyzeStream {
     submit: Option<AnalyzeSubmit>,
-    responses: Streaming<AnalyzeStreamResponse>,
+    responses: AnalyzeResponses,
     /// The shard's vocabulary listener, when vocabulary accumulation is
     /// enabled (`None` costs one branch per response). Feeding happens
     /// HERE — the only layer where the raw response's `tokens` (surface
@@ -583,6 +826,11 @@ pub struct AnalyzeStream {
     /// "measured, found nothing" or "not requested". Fixed for the
     /// session's lifetime, like the options message that set it.
     layers: SessionLayers,
+}
+
+enum AnalyzeResponses {
+    Sidecar(Box<Streaming<AnalyzeStreamResponse>>),
+    Native(tokio::sync::mpsc::Receiver<NativeResponse>),
 }
 
 impl AnalyzeStream {
@@ -621,15 +869,18 @@ impl AnalyzeStream {
         vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
         layers: SessionLayers,
     ) -> Result<Self, Status> {
+        if AnalysisBackend::parse(addr)? == AnalysisBackend::Native {
+            return Self::open_native(spec, vocab, layers);
+        }
         let mut client = client(addr)?;
-        if layers.geography {
+        if layers.geography || layers.entities {
             let capabilities = client
                 .get_capabilities(crate::pb::analysis::GetCapabilitiesRequest {})
                 .await?
                 .into_inner();
             if !capabilities.ner_available {
                 return Err(Status::failed_precondition(
-                    "geography columns were requested but this sidecar has no NER model                      configured (GetCapabilities.ner_available = false); the geocoding                      layer consumes the entity layer, so it cannot be served — configure                      an NER model or drop the GeographySpec",
+                    "entity or geography columns were requested but this sidecar has no NER model configured (GetCapabilities.ner_available = false); configure an NER model or disable those columns",
                 ));
             }
         }
@@ -646,8 +897,66 @@ impl AnalyzeStream {
             .await?
             .into_inner();
         Ok(Self {
-            submit: Some(AnalyzeSubmit { requests }),
-            responses,
+            submit: Some(AnalyzeSubmit {
+                requests: AnalyzeRequests::Sidecar(requests),
+            }),
+            responses: AnalyzeResponses::Sidecar(Box::new(responses)),
+            vocab,
+            layers,
+        })
+    }
+
+    fn open_native(
+        spec: Option<&AnalysisSpec>,
+        vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
+        layers: SessionLayers,
+    ) -> Result<Self, Status> {
+        if layers != SessionLayers::default() {
+            let mut requested = Vec::new();
+            if layers.quality {
+                requested.push("quality");
+            }
+            if layers.geography {
+                requested.push("geography");
+            }
+            if layers.entities {
+                requested.push("entities");
+            }
+            return Err(Status::failed_precondition(format!(
+                "native lexical analysis does not provide {} layers; configure an OpenNLP sidecar for this ingest",
+                requested.join(", ")
+            )));
+        }
+        let spec = std::sync::Arc::new(native_spec(spec)?);
+        let (requests, mut feed) = tokio::sync::mpsc::channel::<NativeRequest>(SUBMIT_BUFFER);
+        let (emit, responses) = tokio::sync::mpsc::channel::<NativeResponse>(SUBMIT_BUFFER);
+        tokio::spawn(async move {
+            while let Some(request) = feed.recv().await {
+                let sequence = request.sequence;
+                let spec = spec.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    native_analysis_with_spec(&request.text, &spec)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    Err(Status::internal(format!(
+                        "native analysis worker failed: {error}"
+                    )))
+                });
+                if emit
+                    .send(NativeResponse { sequence, result })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Ok(Self {
+            submit: Some(AnalyzeSubmit {
+                requests: AnalyzeRequests::Native(requests),
+            }),
+            responses: AnalyzeResponses::Native(responses),
             vocab,
             layers,
         })
@@ -722,34 +1031,54 @@ impl AnalyzeStream {
     /// error is the stream itself failing, an inner error is one
     /// document failing on its own while the stream lives on.
     pub async fn next(&mut self) -> Result<Option<(u64, Result<AnalyzedDoc, Status>)>, Status> {
-        match self.responses.message().await? {
-            Some(response) => {
-                let sequence = response.sequence;
-                let result = match response.result {
-                    Some(analyze_stream_response::Result::Ok(ok)) => {
-                        // Vocabulary feed BEFORE the fold: `analyzed_from`
-                        // drops the raw token texts the TOKENS channel
-                        // counts. The feed never fails ingest.
+        match &mut self.responses {
+            AnalyzeResponses::Sidecar(responses) => match responses.message().await? {
+                Some(response) => {
+                    let sequence = response.sequence;
+                    let result = match response.result {
+                        Some(analyze_stream_response::Result::Ok(ok)) => {
+                            // Vocabulary feed BEFORE the fold: `analyzed_from`
+                            // drops the raw token texts the TOKENS channel
+                            // counts. The feed never fails ingest.
+                            if let Some(vocab) = &self.vocab {
+                                vocab.feed(
+                                    ok.term_vectors
+                                        .iter()
+                                        .map(|tv| (tv.term.as_str(), i64::from(tv.frequency))),
+                                    ok.tokens.iter().map(|t| t.text.as_str()),
+                                );
+                            }
+                            analyzed_from(ok, self.layers)
+                        }
+                        Some(analyze_stream_response::Result::Error(error)) => {
+                            Err(Status::new(tonic::Code::from(error.code), error.message))
+                        }
+                        None => Err(Status::internal(
+                            "stream response carries neither ok nor error",
+                        )),
+                    };
+                    Ok(Some((sequence, result)))
+                }
+                None => Ok(None),
+            },
+            AnalyzeResponses::Native(responses) => match responses.recv().await {
+                Some(response) => {
+                    let result = response.result.map(|analysis| {
                         if let Some(vocab) = &self.vocab {
+                            let body = &analysis.doc.fields[0];
                             vocab.feed(
-                                ok.term_vectors
-                                    .iter()
-                                    .map(|tv| (tv.term.as_str(), i64::from(tv.frequency))),
-                                ok.tokens.iter().map(|t| t.text.as_str()),
+                                body.terms.iter().map(|(term, frequency, _)| {
+                                    (term.as_str(), i64::from(*frequency))
+                                }),
+                                analysis.tokens.iter().map(String::as_str),
                             );
                         }
-                        Ok(analyzed_from(ok, self.layers))
-                    }
-                    Some(analyze_stream_response::Result::Error(error)) => {
-                        Err(Status::new(tonic::Code::from(error.code), error.message))
-                    }
-                    None => Err(Status::internal(
-                        "stream response carries neither ok nor error",
-                    )),
-                };
-                Ok(Some((sequence, result)))
-            }
-            None => Ok(None),
+                        analysis.doc
+                    });
+                    Ok(Some((response.sequence, result)))
+                }
+                None => Ok(None),
+            },
         }
     }
 }
@@ -1236,9 +1565,120 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            analyzed_from(with_empty, SessionLayers::default()),
-            analyzed_from(without, SessionLayers::default()),
+            analyzed_from(with_empty, SessionLayers::default()).unwrap(),
+            analyzed_from(without, SessionLayers::default()).unwrap(),
             "the empty term must vanish as if the analyzer never emitted it"
         );
+    }
+
+    #[test]
+    fn search_refuses_a_sidecar_that_violates_its_utf16_storage_request() {
+        let response = AnalyzeResponse {
+            offset_unit: crate::pb::analysis::OffsetUnit::Utf8Bytes as i32,
+            ..Default::default()
+        };
+        let error = analyzed_from(response, SessionLayers::default()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("ambiguous persisted spans"));
+    }
+
+    #[test]
+    fn native_provider_runs_the_product_specs_with_utf16_offsets() {
+        let folded =
+            analyze_document_native("😀 Running Rodríguez running", Some(&body_spec())).unwrap();
+        let body = &folded.fields[0];
+        assert_eq!(body.length, 4);
+        assert_eq!(
+            body.terms,
+            vec![
+                ("😀".to_string(), 1, vec![(0, 2)]),
+                ("run".to_string(), 2, vec![(3, 10), (21, 28)]),
+                ("rodriguez".to_string(), 1, vec![(11, 20)]),
+            ]
+        );
+
+        let cased = analyze_document_native("Running running", Some(&cased_body_spec())).unwrap();
+        assert_eq!(
+            cased.fields[0].terms,
+            vec![
+                ("Run".to_string(), 1, vec![(0, 7)]),
+                ("run".to_string(), 1, vec![(8, 15)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_provider_refuses_unknown_and_server_defined_contracts() {
+        let no_spec = analyze_document_native("court", None).unwrap_err();
+        assert_eq!(no_spec.code(), tonic::Code::FailedPrecondition);
+        assert!(no_spec.message().contains("explicit AnalysisSpec"));
+
+        let mut unsupported = body_spec();
+        unsupported.char_filters.push(CHAR_FILTER_NFKC);
+        let error = analyze_document_native("court", Some(&unsupported)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error
+            .message()
+            .contains("does not implement normalizer step 12"));
+    }
+
+    #[tokio::test]
+    async fn native_stream_uses_the_same_analysis_as_unary() {
+        let mut stream = AnalyzeStream::open(NATIVE_ANALYSIS_BACKEND, Some(&body_spec()))
+            .await
+            .unwrap();
+        let submit = stream.submitter();
+        submit.submit(41, "running runs run").await.unwrap();
+        drop(submit);
+        stream.finish();
+        let (sequence, streamed) = stream.next().await.unwrap().unwrap();
+        assert_eq!(sequence, 41);
+        assert_eq!(
+            streamed.unwrap(),
+            analyze_document_native("running runs run", Some(&body_spec())).unwrap()
+        );
+        assert!(stream.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_stream_keeps_document_errors_local() {
+        let mut stream = AnalyzeStream::open(NATIVE_ANALYSIS_BACKEND, Some(&body_spec()))
+            .await
+            .unwrap();
+        let submit = stream.submitter();
+        submit.submit(1, "running").await.unwrap();
+        submit.submit(2, "").await.unwrap();
+        submit.submit(3, "appeals").await.unwrap();
+        drop(submit);
+        stream.finish();
+
+        assert!(stream.next().await.unwrap().unwrap().1.is_ok());
+        let error = stream.next().await.unwrap().unwrap().1.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(stream.next().await.unwrap().unwrap().1.is_ok());
+        assert!(stream.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_provider_refuses_sidecar_only_capabilities() {
+        let embedding = embed_text(NATIVE_ANALYSIS_BACKEND, "court")
+            .await
+            .unwrap_err();
+        assert_eq!(embedding.code(), tonic::Code::FailedPrecondition);
+
+        let layer = AnalyzeStream::open_with_vocab(
+            NATIVE_ANALYSIS_BACKEND,
+            Some(&body_spec()),
+            None,
+            SessionLayers {
+                quality: true,
+                geography: false,
+                entities: false,
+            },
+        )
+        .await
+        .err()
+        .expect("quality must remain an OpenNLP capability");
+        assert_eq!(layer.code(), tonic::Code::FailedPrecondition);
     }
 }

@@ -465,20 +465,21 @@ under the column's min/max metadata, which is exactly the contract every
 since `VariantSearch` carries whole requests and chain-versus-no-chain is
 what it was built to compare.
 
-### 16. Glossary and entity columns, not entity terms
+### 16. Glossary phrase field and entity map column — LANDED
 
-The sidecar's glossary matcher is the multi-word entity answer, and its
-NER layers are deployed (person plus location chosen, all seven models on
-disk). Land them as **facet-ordinal columns**, not as tokens in the
-postings. As a column, "opinions mentioning this organization" is a CEL
-filter and a facet count at zero query cost and eight-ish bytes per
-document; as tokens, it grows the one structure that is already at 6.5:1
-against RAM, and it drags the analyzer's term-identity contract into
-territory where a model's miss becomes a silent zero-result query.
+**Landed 2026-08-30 (`docs/phrase-search.md`).** The portable Rust analyzer
+now owns UAX #29 tokenization and a fingerprinted, Aho-Corasick glossary with
+original UTF-16 spans. Ingest retains ordinary body terms, adds only explicitly
+registered concepts to a dedicated phrase field, and materializes glossary
+plus optional OpenNLP NER identities into one map-facet entity column.
 
-The entity-terms-as-an-A/B-column idea from `work-queue.md` section 4
-survives this as a separate, later experiment. The column comes first
-because it is cheap and cannot break matching.
+`PhraseSearch` uses global BM25 statistics and adds the maximum weighted phrase
+contribution rather than summing overlapping registered parents. Bigram and
+trigram evidence therefore helps ranking without turning every arbitrary
+n-gram into a posting or letting `New York` and `New York City` stack. The WAL
+persists derived postings, spans, field identity, entity entries, and the
+vocabulary fingerprint, so replay and resharding do not rerun a changed model
+or glossary. Enabling or changing it is an explicit new-generation rebuild.
 
 ### 17. Wire the geography layer into the geo columns that already exist — LANDED
 

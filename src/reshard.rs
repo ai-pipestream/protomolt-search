@@ -26,7 +26,7 @@
 //!   `fnv1a64(v) >> (64 - log2(N))`, so every id lands in exactly one
 //!   child and a re-split of a child bisects its range again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::pb::wal::wal_record;
@@ -396,20 +396,29 @@ fn build_child(
     if !mapped.is_empty() {
         // The child field table (docs/multi-field.md): the caller's
         // fleet table when given, else "body" plus every extra field
-        // name in this child's records in first-sight order (the replay
-        // is id-ordered, so the derivation is deterministic). Old logs
+        // name in this child's records in canonical lexical order. First-sight
+        // order is not sufficient: a sparse optional field can first appear
+        // after an always-present phrase field in one hash child and before it
+        // in another, producing incompatible positional schemas. Old logs
         // carry no extra fields and derive the single-field table.
         let table: Vec<String> = match bm25_fields {
             Some(t) => t.to_vec(),
             None => {
-                let mut t = vec!["body".to_string()];
+                let mut extras = BTreeSet::new();
                 for (_, doc) in &mapped {
                     for f in &doc.fields {
-                        if !t.iter().any(|n| n == &f.field) {
-                            t.push(f.field.clone());
-                        }
+                        extras.insert(f.field.clone());
+                    }
+                    for phrase in &doc.phrases {
+                        extras.insert(phrase.field.clone());
+                    }
+                    if !doc.phrase_field.is_empty() {
+                        extras.insert(doc.phrase_field.clone());
                     }
                 }
+                extras.remove("body");
+                let mut t = vec!["body".to_string()];
+                t.extend(extras);
                 t
             }
         };
@@ -563,6 +572,54 @@ fn build_child(
                     };
                     fields[fi] = analyzed_field;
                 }
+                if !doc.phrases.is_empty() {
+                    let phrase_field = &doc.phrases[0].field;
+                    if doc
+                        .phrases
+                        .iter()
+                        .any(|posting| &posting.field != phrase_field)
+                    {
+                        return Err(format!("record at child slot {local} mixes phrase fields"));
+                    }
+                    let Some(fi) = table.iter().position(|name| name == phrase_field) else {
+                        return Err(format!(
+                            "record at child slot {local} names phrase field {phrase_field:?} outside table {table:?}"
+                        ));
+                    };
+                    fields[fi] = crate::phrases::analyzed_field(&doc.phrases);
+                }
+                builder
+                    .set_analysis_fingerprint(
+                        0,
+                        crate::analyzer::analysis_fingerprint(doc.analysis.as_ref()),
+                    )
+                    .map_err(|error| format!("body analysis fingerprint: {error}"))?;
+                for field in &doc.fields {
+                    let fi = table
+                        .iter()
+                        .position(|name| name == &field.field)
+                        .expect("field was resolved above");
+                    builder
+                        .set_analysis_fingerprint(
+                            fi,
+                            crate::analyzer::analysis_fingerprint(field.analysis.as_ref()),
+                        )
+                        .map_err(|error| {
+                            format!("field {:?} analysis fingerprint: {error}", field.field)
+                        })?;
+                }
+                if doc.phrase_fingerprint != 0 && !doc.phrase_field.is_empty() {
+                    let phrase_field = doc.phrase_field.as_str();
+                    let fi = table
+                        .iter()
+                        .position(|name| name == phrase_field)
+                        .expect("phrase field was resolved above");
+                    builder
+                        .set_analysis_fingerprint(fi, doc.phrase_fingerprint)
+                        .map_err(|error| {
+                            format!("phrase field {phrase_field:?} fingerprint: {error}")
+                        })?;
+                }
                 let text = std::mem::take(&mut doc.text);
                 builder
                     .add_document_with_lineage(
@@ -578,6 +635,7 @@ fn build_child(
                             fields,
                             quality: None,
                             geography: None,
+                            entities: Vec::new(),
                         },
                         doc.lineage.map(|l| crate::postings::DocLineage {
                             parent_id: l.parent_id,

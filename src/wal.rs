@@ -980,6 +980,15 @@ mod tests {
                 geo_points: Vec::new(),
                 quality: None,
                 geography: None,
+                phrases: vec![crate::pb::PhrasePosting {
+                    term: protomolt_analyzer::phrase_posting_term("example"),
+                    concept_id: "example".to_string(),
+                    token_count: 2,
+                    offsets: vec![crate::pb::OffsetSpan { start: 0, end: 3 }],
+                    field: "phrases".to_string(),
+                }],
+                phrase_fingerprint: 0x1234_5678,
+                phrase_field: "phrases".to_string(),
             }],
         })
     }

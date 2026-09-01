@@ -17,33 +17,36 @@ which is deliberately still placeholders.
 The system is a distributed search cluster built from four kinds of parts.
 At the center is turbovec, an embedded vector search library, not a server.
 Around it we built pipestream-search: a single binary that can serve as a
-search node, as a coordinator, or as both at once. Text analysis lives
-outside the cluster in a separate NLP sidecar process, and document storage
-is headed toward a repo service that holds source material and derived data
-the index itself should not carry. Clients talk to a coordinator over gRPC;
-everything behind the coordinator is also gRPC, with one deliberate
-exception described later (a UDP fast lane for typed stream signals).
+search node, as a coordinator, or as both at once. Product lexical analysis
+can run inside that process; extended OpenNLP analysis and embeddings live in
+a separate sidecar. Document storage is headed toward a repo service that
+holds source material and derived data the index itself should not carry.
+Clients talk to a coordinator over gRPC; cluster traffic is also gRPC, with
+one deliberate exception described later (a UDP fast lane for typed stream
+signals).
 
 ```mermaid
 C4Context
     title System context
     Person(client, "Search client", "Any gRPC caller: console, pipelines, apps")
-    System(cluster, "pipestream-search cluster", "Coordinator + search nodes, one binary per process")
-    System_Ext(nlp, "OpenNLP analysis sidecar", "JVM gRPC service: tokenization, stemming, term identity")
+    System(cluster, "pipestream-search cluster", "Coordinator, search nodes, and native lexical analysis")
+    System_Ext(nlp, "OpenNLP analysis sidecar", "gRPC: extended analysis and embeddings")
     System_Ext(repo, "Repo service", "Claim-check document store: Postgres ledger + S3 object storage")
     Rel(client, cluster, "Search / ingest", "gRPC")
-    Rel(cluster, nlp, "Analyze text at ingest and query time", "gRPC stream")
+    Rel(cluster, nlp, "Extended analysis and embeddings", "gRPC stream")
     Rel(cluster, repo, "Fetch source documents and parsed parts", "gRPC (planned)")
 ```
 
 The responsibilities split cleanly. The engine library scores vectors and
 nothing else. The server owns everything distributed: sharding, fan-out,
 merging, floors, fusion, and the lexical (BM25) index, which is ours rather
-than the library's. The sidecar owns language: what a token is, what a term
-is, and how two spellings become one term. The repo service owns bytes at
-rest that are not needed to rank: source documents, parser output, and
-annotation payloads. The index stays lean because anything recoverable from
-the repo service does not have to live on the search path.
+than the library's. The product owns the persisted term-identity contract.
+Its native Rust provider implements the production lexical subset in-process;
+the OpenNLP sidecar implements the wider language, model, and embedding
+surface. The repo service owns bytes at rest that are not needed to rank:
+source documents, parser output, and annotation payloads. The index stays lean
+because anything recoverable from the repo service does not have to live on
+the search path.
 
 ### 1.1 The parts and the lines between them
 
@@ -54,13 +57,16 @@ flowchart TB
         n1["Search node<br/>shard 0 (.tv + .bm25)"]
         n2["Search node<br/>shard 1 (.tv + .bm25)"]
         n3["Search node<br/>shard N (.tv + .bm25)"]
+        native["Rust analyzer<br/>product lexical specs"]
     end
     client["Client"] -->|"gRPC: SearchService"| coord
     coord -->|"gRPC: NodeService<br/>+ UDP signal lane"| n1
     coord -->|"gRPC: NodeService<br/>+ UDP signal lane"| n2
     coord -->|"gRPC: NodeService<br/>+ UDP signal lane"| n3
-    n1 -->|"gRPC: AnalyzeStream"| nlp["OpenNLP sidecar"]
-    coord -->|"gRPC: AnalyzeStream<br/>(query analysis)"| nlp
+    n1 -->|"in process"| native["Rust analyzer"]
+    coord -->|"in process<br/>(query analysis)"| native
+    n1 -.->|"optional gRPC:<br/>extended analysis"| nlp["OpenNLP sidecar"]
+    coord -.->|"optional gRPC:<br/>embeddings/models"| nlp
     coord -.->|"planned"| repo["Repo service"]
 ```
 
@@ -171,9 +177,9 @@ wraps both behind one gRPC service. For vector queries it runs the engine's
 streaming scan and emits candidates above the current floor. For lexical
 queries it scores BM25 with per-field weights and the same floor-seeding
 idea. Ingestion also lands here: documents arrive over a stream, each
-field's text goes to the NLP sidecar for analysis, and the returned terms
-are written into the lexical index while embeddings land in the vector
-index. A write-ahead log makes ingestion restartable.
+field's text goes to the configured native or OpenNLP analyzer, and the
+returned terms are written into the lexical index while embeddings land in
+the vector index. A write-ahead log makes ingestion restartable.
 
 Document identity is positional. A document's id is its shard slot plus the
 shard's configured offset, which makes ids dense, cheap, and stable for the

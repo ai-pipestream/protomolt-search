@@ -24,7 +24,10 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use pipestream_search::config::{parse, Config, DemoConfig, Role, ShardConfig};
+use pipestream_search::clustered_turbovec::ClusteredTurboVecBackend;
+use pipestream_search::config::{
+    parse, ClusteredTurboVecConfig, Config, DemoConfig, Role, ShardConfig,
+};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::harness;
 use pipestream_search::node::{NodeConfig, NodeServiceImpl};
@@ -119,6 +122,29 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = Vec::new();
     let mut node_services = Vec::new();
+    let phrase_index = cfg
+        .phrase_glossary
+        .as_ref()
+        .map(|path| {
+            pipestream_search::phrases::PhraseIndex::load_tsv(
+                path,
+                cfg.phrase_field.clone(),
+                cfg.entity_map_field.clone(),
+                cfg.phrase_ignore_case,
+                cfg.phrase_ner,
+            )
+            .map(std::sync::Arc::new)
+        })
+        .transpose()?;
+    if let Some(index) = &phrase_index {
+        eprintln!(
+            "phrase vocabulary: field {:?}, fingerprint {:016x}, entity map {:?}, NER {}",
+            index.phrase_field(),
+            index.fingerprint(),
+            index.entity_map_field(),
+            index.include_ner()
+        );
+    }
 
     if matches!(cfg.role, Role::Node | Role::Both) {
         for shard in &cfg.shards {
@@ -223,6 +249,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .with_bm25(bm25_store)
+            .with_phrase_index(phrase_index.clone())
             .with_generation(generation);
             // The UDP stream-signal lane shares the gRPC listener's host:port.
             node.spawn_floor_listener(addr);
@@ -266,7 +293,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(cfg.coord_listen).await?;
         let addr: SocketAddr = listener.local_addr()?;
         let to_duration = |ms: u64| (ms > 0).then(|| std::time::Duration::from_millis(ms));
-        let coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone())
+        let mut coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone())
             .with_bm25(
                 cfg.analysis_addr.clone(),
                 pipestream_search::bm25::Bm25Params {
@@ -274,6 +301,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     b: f64::from(cfg.bm25_b),
                 },
             )
+            .with_phrase_index(phrase_index.clone())
             .with_limits(pipestream_search::coordinator::FanoutLimits {
                 shard_deadline: to_duration(cfg.shard_deadline_ms),
                 hedge_delay: to_duration(cfg.hedge_delay_ms),
@@ -282,6 +310,43 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .with_stream_search(cfg.stream_search)
             .with_bm25_stream(cfg.bm25_stream)
             .with_max_k(cfg.max_k);
+        if let Some(clustered) = &cfg.clustered_turbovec {
+            let backend = match clustered {
+                ClusteredTurboVecConfig::InProcess {
+                    nodes,
+                    state,
+                    allow_ephemeral,
+                } => {
+                    let table = turbovec_grpc::NodeTable::parse(&nodes.join("\n"))?;
+                    let limits = turbovec_grpc::CoordinatorLimits {
+                        max_k: cfg.max_k as usize,
+                        ..Default::default()
+                    };
+                    let service = match state {
+                        Some(path) => {
+                            turbovec_grpc::CoordinatorService::with_state_file_and_limits(
+                                table, path, limits,
+                            )?
+                        }
+                        None if *allow_ephemeral => {
+                            turbovec_grpc::CoordinatorService::with_limits(table, limits)
+                        }
+                        None => unreachable!(
+                            "configuration requires durable state or explicit ephemeral mode"
+                        ),
+                    };
+                    ClusteredTurboVecBackend::in_process(service)
+                }
+                ClusteredTurboVecConfig::External { endpoint } => {
+                    ClusteredTurboVecBackend::external(endpoint, cfg.max_message_bytes)?
+                }
+            };
+            eprintln!(
+                "vector backend: clustered TurboVec ({} coordinator)",
+                backend.transport_name()
+            );
+            coordinator = coordinator.with_clustered_turbovec(backend);
+        }
         if let Some(map) = &cfg.shard_map {
             eprintln!(
                 "shard map generation {} ({} shards)",

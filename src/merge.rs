@@ -14,14 +14,15 @@ pub struct MergedHit {
     pub score: f32,
 }
 
-/// Total order over hits: score descending, then shard ascending, then
-/// vector id ascending. Scores are finite by construction (turbovec rejects
-/// non-finite input), so `total_cmp` never sees NaN here.
+/// Product-level total order over hits: score descending, then stable vector
+/// id ascending. Shard is only a final defensive key for malformed input that
+/// reports the same global id from two owners. A provider's physical shard
+/// layout must not change public ranking.
 pub(crate) fn cmp_hits(a: &MergedHit, b: &MergedHit) -> Ordering {
     b.score
         .total_cmp(&a.score)
-        .then_with(|| a.shard.cmp(&b.shard))
         .then_with(|| a.vector_id.cmp(&b.vector_id))
+        .then_with(|| a.shard.cmp(&b.shard))
 }
 
 /// Merge per-shard top-k lists into the global top-k.
@@ -123,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_ties_break_by_shard_then_id() {
+    fn merge_ties_break_by_stable_id() {
         let merged = merge_topk(
             vec![
                 (2, vec![(7, 1.0), (3, 1.0)]),
@@ -133,7 +134,7 @@ mod tests {
             10,
         );
         let order: Vec<(u32, u64)> = merged.iter().map(|h| (h.shard, h.vector_id)).collect();
-        assert_eq!(order, vec![(0, 9), (1, 1), (2, 3), (2, 7)]);
+        assert_eq!(order, vec![(1, 1), (2, 3), (2, 7), (0, 9)]);
     }
 
     #[test]

@@ -209,7 +209,7 @@ pub async fn start_node(
     index: VectorIndex,
     config: NodeConfig,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
-    start_node_inner(Some(index), config).await
+    start_node_inner(Some(index), config, None).await
 }
 
 /// Start a node server with NO index (the from-scratch state: awaiting
@@ -217,16 +217,25 @@ pub async fn start_node(
 pub async fn start_empty_node(
     config: NodeConfig,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
-    start_node_inner(None, config).await
+    start_node_inner(None, config, None).await
+}
+
+/// Start an empty node with the product-owned phrase vocabulary attached.
+pub async fn start_empty_phrase_node(
+    config: NodeConfig,
+    phrases: std::sync::Arc<crate::phrases::PhraseIndex>,
+) -> (String, JoinHandle<Result<(), TransportError>>) {
+    start_node_inner(None, config, Some(phrases)).await
 }
 
 async fn start_node_inner(
     index: Option<VectorIndex>,
     config: NodeConfig,
+    phrases: Option<std::sync::Arc<crate::phrases::PhraseIndex>>,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let node = NodeServiceImpl::new(index, config);
+    let node = NodeServiceImpl::new(index, config).with_phrase_index(phrases);
     // The UDP floor lane shares the gRPC listener's host:port.
     node.spawn_floor_listener(addr);
     let handle = tokio::spawn(
