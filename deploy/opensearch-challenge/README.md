@@ -35,6 +35,24 @@ shared 10,000-result limit. For example, the high-depth vector-quality run is:
   --concurrency=1 --cpuset=0-7 --out=/path/to/results
 ```
 
+To measure candidate expansion followed by exact FP32 reranking, add a depth
+ladder whose last value is the corpus size:
+
+```bash
+./deploy/opensearch-challenge/run.sh \
+  --documents=100000 --k=10000 --iterations=1 --warmup=0 \
+  --concurrency=1 --rerank-depths=10000,11000,12500,15000,20000,30000,50000,100000 \
+  --cpuset=0-7 --out=/path/to/results
+```
+
+The Protomolt coordinator's `max_k` is raised only for this run. For each plain
+vector query, the driver retrieves the complete quantized ranking once, exact
+reranks each requested prefix from the retained corpus vectors, and emits both
+the observed ladder and the mathematically exact minimum depth needed for 95%,
+99%, 99.9%, and 100% recall. Requiring the full corpus as the last depth proves
+that no relevant neighbor is absent and verifies that full-depth FP32 reranking
+reconstructs the generated judgments exactly.
+
 Without `--out`, the runner uses a validated `mktemp` directory and removes
 it on success. `--keep` retains that temporary directory. It refuses occupied
 ports and a nonempty output directory. The container name is process-unique,

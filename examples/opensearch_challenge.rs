@@ -936,6 +936,239 @@ async fn one_opensearch(
     }
 }
 
+fn parse_depths(value: &str) -> Result<Vec<usize>, Error> {
+    let mut depths = value
+        .split(',')
+        .map(|part| {
+            part.parse::<usize>()
+                .map_err(|error| format!("invalid candidate depth {part:?}: {error}").into())
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    if depths.is_empty() || depths.contains(&0) {
+        return Err("candidate depths must be a non-empty positive integer list".into());
+    }
+    depths.sort_unstable();
+    depths.dedup();
+    Ok(depths)
+}
+
+fn rank_needed(sorted_relevant_ranks: &[usize], recall_target: f64) -> usize {
+    let needed = ((sorted_relevant_ranks.len() as f64 * recall_target).ceil() as usize)
+        .clamp(1, sorted_relevant_ranks.len());
+    sorted_relevant_ranks[needed - 1]
+}
+
+fn exact_rerank(
+    candidate_ids: &[u64],
+    corpus: &[Document],
+    query: &[f32],
+    target_k: usize,
+) -> Result<Vec<u64>, Error> {
+    let mut scored = Vec::with_capacity(candidate_ids.len());
+    for &id in candidate_ids {
+        let index = usize::try_from(id)?;
+        let doc = corpus
+            .get(index)
+            .filter(|doc| doc.id == id)
+            .ok_or_else(|| format!("candidate id {id} has no dense corpus row"))?;
+        scored.push((id, dot(&doc.vector, query)));
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(scored
+        .into_iter()
+        .take(target_k)
+        .map(|(id, _)| id)
+        .collect())
+}
+
+async fn rerank_protomolt() -> Result<(), Error> {
+    const RECALL_TARGETS: [f64; 4] = [0.95, 0.99, 0.999, 1.0];
+
+    let coordinator = normalize_addr(&required("coordinator")?);
+    let corpus = read_json_lines::<Document>(Path::new(&required("corpus")?))?;
+    for (position, doc) in corpus.iter().enumerate() {
+        if doc.id != position as u64 {
+            return Err(format!(
+                "rerank corpus must be dense by id: row {position} carries id {}",
+                doc.id
+            )
+            .into());
+        }
+    }
+    let workloads = read_json_lines::<Workload>(Path::new(&required("workload")?))?;
+    let vector_workloads: Vec<&Workload> = workloads
+        .iter()
+        .filter(|workload| matches!(workload.kind, WorkloadKind::Vector))
+        .collect();
+    let first = vector_workloads
+        .first()
+        .ok_or("workload has no vector queries")?;
+    let target_k: usize = parsed("target-k", first.k as usize)?;
+    let depths = parse_depths(&required("depths")?)?;
+    if depths[0] < target_k {
+        return Err(format!(
+            "smallest candidate depth {} is below target-k={target_k}",
+            depths[0]
+        )
+        .into());
+    }
+    let max_depth = *depths.last().expect("depths are non-empty");
+    if max_depth != corpus.len() {
+        return Err(format!(
+            "the final candidate depth must equal corpus size {} to prove the exact required depth; got {max_depth}",
+            corpus.len()
+        )
+        .into());
+    }
+    if target_k > u32::MAX as usize || max_depth > u32::MAX as usize {
+        return Err("target or candidate depth exceeds the wire's u32 range".into());
+    }
+    if vector_workloads
+        .iter()
+        .any(|workload| workload.k as usize != target_k || workload.judgments.len() != target_k)
+    {
+        return Err("every vector workload must carry target-k exact judgments".into());
+    }
+
+    let mut client = SearchServiceClient::connect(coordinator).await?;
+    let mut point_recalls = vec![Vec::<f64>::new(); depths.len()];
+    let mut point_ndcgs = vec![Vec::<f64>::new(); depths.len()];
+    let mut all_relevant_ranks = Vec::with_capacity(target_k * vector_workloads.len());
+    let mut every_query_required = vec![0usize; RECALL_TARGETS.len()];
+    let mut query_rows = Vec::with_capacity(vector_workloads.len());
+
+    for workload in vector_workloads {
+        let response = client
+            .search(SearchRequest {
+                request_id: format!("rerank-sweep-{}", workload.id),
+                vector: workload.vector.clone(),
+                k: max_depth as u32,
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        if response.hits.len() != max_depth {
+            return Err(format!(
+                "{} returned {} candidates at depth {max_depth}",
+                workload.id,
+                response.hits.len()
+            )
+            .into());
+        }
+        let candidate_ids: Vec<u64> = response.hits.iter().map(|hit| hit.vector_id).collect();
+        let rank_by_id: HashMap<u64, usize> = candidate_ids
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (*id, rank + 1))
+            .collect();
+        let mut relevant_ranks = workload
+            .judgments
+            .iter()
+            .map(|judgment| {
+                rank_by_id.get(&judgment.doc_id).copied().ok_or_else(|| {
+                    format!(
+                        "{} exact neighbor {} is absent from the complete ranking",
+                        workload.id, judgment.doc_id
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        relevant_ranks.sort_unstable();
+        all_relevant_ranks.extend_from_slice(&relevant_ranks);
+
+        let raw_ids = &candidate_ids[..target_k];
+        let raw_recall = recall_ids(raw_ids, &workload.judgments);
+        let raw_ndcg = ndcg_ids(raw_ids, &workload.judgments);
+        for (index, &depth) in depths.iter().enumerate() {
+            let reranked =
+                exact_rerank(&candidate_ids[..depth], &corpus, &workload.vector, target_k)?;
+            point_recalls[index].push(recall_ids(&reranked, &workload.judgments));
+            point_ndcgs[index].push(ndcg_ids(&reranked, &workload.judgments));
+            if depth == corpus.len() {
+                let expected: Vec<u64> = workload
+                    .judgments
+                    .iter()
+                    .map(|judgment| judgment.doc_id)
+                    .collect();
+                if reranked != expected {
+                    return Err(format!(
+                        "{} full-depth FP32 rerank differs from the exact judgments",
+                        workload.id
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let required: Vec<Value> = RECALL_TARGETS
+            .iter()
+            .enumerate()
+            .map(|(index, &target)| {
+                let depth = rank_needed(&relevant_ranks, target);
+                every_query_required[index] = every_query_required[index].max(depth);
+                json!({
+                    "recall_target": target,
+                    "candidate_depth": depth,
+                    "expansion_factor": depth as f64 / target_k as f64,
+                })
+            })
+            .collect();
+        query_rows.push(json!({
+            "query_id": workload.id,
+            "raw_recall_at_target_k": raw_recall,
+            "raw_ndcg_at_target_k": raw_ndcg,
+            "required_depths": required,
+        }));
+    }
+
+    all_relevant_ranks.sort_unstable();
+    let required_depths: Vec<Value> = RECALL_TARGETS
+        .iter()
+        .enumerate()
+        .map(|(index, &target)| {
+            let mean_depth = rank_needed(&all_relevant_ranks, target);
+            let guaranteed_depth = every_query_required[index];
+            json!({
+                "recall_target": target,
+                "mean_recall_depth": mean_depth,
+                "mean_expansion_factor": mean_depth as f64 / target_k as f64,
+                "every_query_depth": guaranteed_depth,
+                "every_query_expansion_factor": guaranteed_depth as f64 / target_k as f64,
+            })
+        })
+        .collect();
+    let points: Vec<Value> = depths
+        .iter()
+        .enumerate()
+        .map(|(index, &depth)| {
+            let recalls = &point_recalls[index];
+            let ndcgs = &point_ndcgs[index];
+            json!({
+                "candidate_depth": depth,
+                "expansion_factor": depth as f64 / target_k as f64,
+                "mean_reranked_recall": recalls.iter().sum::<f64>() / recalls.len() as f64,
+                "minimum_query_reranked_recall": recalls.iter().copied().fold(1.0, f64::min),
+                "mean_reranked_ndcg": ndcgs.iter().sum::<f64>() / ndcgs.len() as f64,
+            })
+        })
+        .collect();
+    let output = json!({
+        "format": "protomolt-exact-rerank-sweep-v1",
+        "documents": corpus.len(),
+        "dimensions": corpus.first().map_or(0, |doc| doc.vector.len()),
+        "target_k": target_k,
+        "queries": query_rows.len(),
+        "candidate_depths": points,
+        "required_depths": required_depths,
+        "per_query": query_rows,
+    });
+    if let Some(path) = option("output") {
+        std::fs::write(path, serde_json::to_vec_pretty(&output)?)?;
+    }
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
 async fn run_engine(engine: &str) -> Result<(), Error> {
     let workloads = Arc::new(read_json_lines::<Workload>(Path::new(&required(
         "workload",
@@ -1051,13 +1284,12 @@ fn percentile(values: &mut [f64], fraction: f64) -> f64 {
     values[rank - 1]
 }
 
-fn ndcg(sample: &Sample, judgments: &[Judgment]) -> f64 {
+fn ndcg_ids(hit_ids: &[u64], judgments: &[Judgment]) -> f64 {
     let gain: HashMap<u64, u32> = judgments
         .iter()
         .map(|judgment| (judgment.doc_id, judgment.gain))
         .collect();
-    let dcg = sample
-        .hit_ids
+    let dcg = hit_ids
         .iter()
         .enumerate()
         .map(|(rank, id)| {
@@ -1069,7 +1301,7 @@ fn ndcg(sample: &Sample, judgments: &[Judgment]) -> f64 {
     ideal.sort_by(|a, b| b.cmp(a));
     let idcg = ideal
         .into_iter()
-        .take(sample.hit_ids.len())
+        .take(hit_ids.len())
         .enumerate()
         .map(|(rank, gain)| f64::from(gain) / ((rank + 2) as f64).log2())
         .sum::<f64>();
@@ -1080,19 +1312,22 @@ fn ndcg(sample: &Sample, judgments: &[Judgment]) -> f64 {
     }
 }
 
-fn recall(sample: &Sample, judgments: &[Judgment]) -> f64 {
+fn ndcg(sample: &Sample, judgments: &[Judgment]) -> f64 {
+    ndcg_ids(&sample.hit_ids, judgments)
+}
+
+fn recall_ids(hit_ids: &[u64], judgments: &[Judgment]) -> f64 {
     let relevant: std::collections::HashSet<u64> =
         judgments.iter().map(|judgment| judgment.doc_id).collect();
-    let denominator = sample.hit_ids.len().min(relevant.len());
+    let denominator = hit_ids.len().min(relevant.len());
     if denominator == 0 {
         return 0.0;
     }
-    sample
-        .hit_ids
-        .iter()
-        .filter(|id| relevant.contains(id))
-        .count() as f64
-        / denominator as f64
+    hit_ids.iter().filter(|id| relevant.contains(id)).count() as f64 / denominator as f64
+}
+
+fn recall(sample: &Sample, judgments: &[Judgment]) -> f64 {
+    recall_ids(&sample.hit_ids, judgments)
 }
 
 #[derive(Serialize)]
@@ -1238,7 +1473,7 @@ mod tests {
 }
 
 fn usage() -> &'static str {
-    "usage: opensearch_challenge <generate|serve-mock|health-protomolt|ingest-protomolt|ingest-opensearch|run-protomolt|run-opensearch|report> [--key=value ...]"
+    "usage: opensearch_challenge <generate|serve-mock|health-protomolt|ingest-protomolt|ingest-opensearch|run-protomolt|run-opensearch|rerank-protomolt|report> [--key=value ...]"
 }
 
 #[tokio::main]
@@ -1251,6 +1486,7 @@ async fn main() -> Result<(), Error> {
         Some("ingest-opensearch") => ingest_opensearch().await,
         Some("run-protomolt") => run_engine("protomolt").await,
         Some("run-opensearch") => run_engine("opensearch").await,
+        Some("rerank-protomolt") => rerank_protomolt().await,
         Some("report") => report(),
         _ => Err(usage().into()),
     }

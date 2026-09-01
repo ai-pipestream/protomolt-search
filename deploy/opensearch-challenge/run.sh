@@ -17,6 +17,7 @@ K=10
 ITERATIONS=5
 WARMUP=2
 CONCURRENCY=1,8
+RERANK_DEPTHS=""
 CPUSET=${CPUSET:-0-7}
 OUT=""
 KEEP=false
@@ -36,7 +37,7 @@ elapsed_ms() { awk -v start="$1" -v end="$2" 'BEGIN { printf "%.3f", (end-start)
 
 usage() {
   sed -n '2,4p' "${BASH_SOURCE[0]}" | sed 's/^# {0,1}//'
-  echo "usage: run.sh [--documents=N] [--dimensions=N] [--topics=N] [--k=N] [--iterations=N] [--warmup=N] [--concurrency=1,8] [--cpuset=0-7] [--out=DIR] [--keep]"
+  echo "usage: run.sh [--documents=N] [--dimensions=N] [--topics=N] [--k=N] [--iterations=N] [--warmup=N] [--concurrency=1,8] [--rerank-depths=10000,20000,100000] [--cpuset=0-7] [--out=DIR] [--keep]"
   exit "${1:-0}"
 }
 
@@ -49,6 +50,7 @@ for arg in "$@"; do
     --iterations=*) ITERATIONS=${arg#*=} ;;
     --warmup=*) WARMUP=${arg#*=} ;;
     --concurrency=*) CONCURRENCY=${arg#*=} ;;
+    --rerank-depths=*) RERANK_DEPTHS=${arg#*=} ;;
     --cpuset=*) CPUSET=${arg#*=} ;;
     --out=*) OUT=${arg#*=} ;;
     --keep) KEEP=true ;;
@@ -69,6 +71,18 @@ done
 [[ $WARMUP =~ ^[0-9]+$ ]] || die "--warmup must be nonnegative"
 [[ $CONCURRENCY =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] ||
   die "--concurrency must be a comma-separated positive integer list"
+SERVICE_MAX_K=$K
+if [[ -n $RERANK_DEPTHS ]]; then
+  [[ $RERANK_DEPTHS =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] ||
+    die "--rerank-depths must be a comma-separated positive integer list"
+  for depth in ${RERANK_DEPTHS//,/ }; do
+    ((depth >= K)) || die "rerank candidate depth $depth is below k=$K"
+    ((depth <= DOCUMENTS)) || die "rerank candidate depth $depth exceeds documents=$DOCUMENTS"
+    ((depth > SERVICE_MAX_K)) && SERVICE_MAX_K=$depth
+  done
+  ((SERVICE_MAX_K == DOCUMENTS)) ||
+    die "--rerank-depths must include documents=$DOCUMENTS to prove the exact required depth"
+fi
 [[ $CONTAINER =~ ^[a-zA-Z0-9_.-]+$ ]] || die "unsafe generated container name"
 
 port_free() {
@@ -124,6 +138,7 @@ start_protomolt() {
     --nodes="127.0.0.1:$NODE_PORT" \
     --analysis-addr="$ANALYSIS_ADDR" \
     --integer-fields=year --facet-fields=group \
+    --max-k="$SERVICE_MAX_K" \
     --stream-search --bm25-stream=true \
     >>"$WORK/protomolt.log" 2>&1 &
   PROTO_PID=$!
@@ -198,6 +213,15 @@ PROTO_COLD_STARTUP_MS=$PROTO_READY_MS
 "$DRIVER" ingest-protomolt --node="127.0.0.1:$NODE_PORT" \
   --corpus="$WORK/data/corpus.jsonl" >"$WORK/protomolt-ingest.json"
 run_cells protomolt
+if [[ -n $RERANK_DEPTHS ]]; then
+  say "measuring TurboQuant candidate expansion with exact FP32 reranking"
+  "$DRIVER" rerank-protomolt \
+    --coordinator="127.0.0.1:$COORD_PORT" \
+    --corpus="$WORK/data/corpus.jsonl" \
+    --workload="$WORK/data/workload.jsonl" \
+    --target-k="$K" --depths="$RERANK_DEPTHS" \
+    --output="$WORK/protomolt-rerank.json" >"$WORK/protomolt-rerank.stdout"
+fi
 PROTO_RSS_BYTES=$(awk '/VmRSS:/ {print $2*1024}' "/proc/$PROTO_PID/status")
 ANALYSIS_RSS_BYTES=$(awk '/VmRSS:/ {print $2*1024}' "/proc/$MOCK_PID/status")
 PROTO_TOTAL_RSS_BYTES=$((PROTO_RSS_BYTES + ANALYSIS_RSS_BYTES))
@@ -302,11 +326,20 @@ result_csv=$(IFS=,; echo "${RESULT_FILES[*]}")
 "$DRIVER" report --workload="$WORK/data/workload.jsonl" \
   --results="$result_csv" --resources="$WORK/resources.json" \
   --output="$WORK/report.json" >"$WORK/report.stdout"
-sha256sum "$WORK/data/corpus.jsonl" "$WORK/data/workload.jsonl" \
-  "$WORK/resources.json" "$WORK/report.json" >"$WORK/SHA256SUMS"
+HASH_FILES=(
+  "$WORK/data/corpus.jsonl"
+  "$WORK/data/workload.jsonl"
+  "$WORK/resources.json"
+  "$WORK/report.json"
+)
+[[ ! -f $WORK/protomolt-rerank.json ]] || HASH_FILES+=("$WORK/protomolt-rerank.json")
+sha256sum "${HASH_FILES[@]}" >"$WORK/SHA256SUMS"
 
 say "challenge complete"
 jq '{hardware, software, protomolt: .protomolt, opensearch: .opensearch}' \
   "$WORK/resources.json"
 jq '{throughput_cells, cells}' "$WORK/report.json"
+if [[ -f $WORK/protomolt-rerank.json ]]; then
+  jq '{target_k, queries, candidate_depths, required_depths}' "$WORK/protomolt-rerank.json"
+fi
 echo "artifacts: $WORK"
