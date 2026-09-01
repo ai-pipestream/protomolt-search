@@ -17,7 +17,7 @@ icu_normalizer = "=2.0.0"
 icu_properties = "=2.0.0"
 # ICU crates declare their generated data with patch-compatible ranges.
 # Constrain every baked artifact so Unicode changes cannot enter via a patch.
-icu_casemap_data = "=2.0.0"
+icu_casemap_data = "=2.3.0"
 icu_normalizer_data = "=2.0.0"
 icu_properties_data = "=2.0.0"
 # ICU4X 2.0 declared these shared internals with caret ranges. Keep the
