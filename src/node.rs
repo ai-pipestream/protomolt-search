@@ -2902,6 +2902,88 @@ impl Drop for IngestGuard {
 }
 
 impl NodeServiceImpl {
+    /// Open a local shard using the same persisted-generation rules as the
+    /// network server. A missing vector/BM25 image starts an empty shard;
+    /// an unfinished BM25 spill is refused unless the caller explicitly
+    /// allows a vector-only recovery.
+    pub fn open(
+        config: NodeConfig,
+        phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
+        allow_missing_bm25: bool,
+    ) -> Result<Self, String> {
+        let generation = config
+            .index_path
+            .as_ref()
+            .and_then(|path| recover_generation(path));
+
+        let index = match config.index_path.as_ref() {
+            Some(index_path) => {
+                let path = generation
+                    .as_ref()
+                    .map_or_else(|| index_path.clone(), |dir| generation_vector(dir));
+                if path.exists() {
+                    let mut loaded = VectorIndex::load(&config.vector_backend, &path)
+                        .map_err(|error| format!("load {}: {error}", path.display()))?;
+                    loaded
+                        .prepare()
+                        .map_err(|error| format!("prepare {}: {error}", path.display()))?;
+                    Some(loaded)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        let mut exact_vectors = None;
+        let mut bm25 = None;
+        let mut live_docs = LiveDocs::default();
+        if let Some(index_path) = config.index_path.as_ref() {
+            let (_, exact_path, bm25_path) = storage_paths(index_path, generation.as_ref());
+            if exact_path.exists() {
+                exact_vectors = Some(
+                    ExactVectorStore::open(&exact_path)
+                        .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
+                );
+            }
+            if bm25_path.exists() {
+                bm25 = Some(
+                    Bm25Shard::open(&bm25_path)
+                        .map_err(|error| format!("load {}: {error}", bm25_path.display()))?,
+                );
+            } else {
+                let build_dir = bm25_build_dir(&bm25_path);
+                if build_dir.exists() && !allow_missing_bm25 {
+                    return Err(format!(
+                        "BM25 build directory {} exists but {} does not. The bulk build was \
+                         interrupted; this shard would answer lexical queries with silence, \
+                         which is indistinguishable from a corpus that genuinely lacks those \
+                         terms. Re-run ingest for this shard, or pass --allow-missing-bm25 to \
+                         serve it vector-only on purpose.",
+                        build_dir.display(),
+                        bm25_path.display()
+                    ));
+                }
+            }
+            let live_path = generation.as_ref().map_or_else(
+                || live_docs_sidecar_path(index_path),
+                |dir| generation_live_docs(dir),
+            );
+            if live_path.exists() {
+                live_docs = LiveDocs::open(&live_path)
+                    .map_err(|error| format!("load {}: {error}", live_path.display()))?;
+            }
+        }
+
+        let service = Self::new(index, config)
+            .with_bm25(bm25)
+            .with_exact_vectors(exact_vectors)?
+            .with_live_docs(live_docs)?
+            .with_phrase_index(phrase_index)
+            .with_generation(generation);
+        Ok(service)
+    }
+
     /// Wrap an optional preloaded index in a node service.
     pub fn new(index: Option<VectorIndex>, config: NodeConfig) -> Self {
         let wal = open_wal(index.as_ref(), &config);

@@ -184,6 +184,10 @@ pub struct CoordinatorServiceImpl {
     max_rerank_bytes: u64,
     /// One reusable channel per address, created on first use.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
+    /// Whether a channel cache miss may create a network connection. The
+    /// embedded runtime preloads every shard channel and keeps this false,
+    /// making a missing channel a hard error instead of a possible egress.
+    allow_network: bool,
     /// Lazily bound UDP socket for the typed stream-signal fast lane (`None`
     /// when the bind failed; signals then ride the gRPC streams alone).
     floor_socket: Arc<std::sync::OnceLock<Option<Arc<std::net::UdpSocket>>>>,
@@ -1354,6 +1358,7 @@ impl CoordinatorServiceImpl {
             max_k: DEFAULT_MAX_K,
             max_rerank_bytes: DEFAULT_MAX_RERANK_BYTES,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            allow_network: true,
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
@@ -1365,6 +1370,30 @@ impl CoordinatorServiceImpl {
         }
     }
 
+    /// A coordinator whose shard traffic is restricted to the supplied
+    /// in-process channels. Cache misses never fall back to TCP and the UDP
+    /// signal lane is disabled. The labels are diagnostic identities only;
+    /// no address parsing or name resolution occurs.
+    pub fn with_in_process_channels(channels: Vec<Channel>) -> Self {
+        let node_addrs: Vec<String> = (0..channels.len())
+            .map(|shard| format!("in-process://shard-{shard}"))
+            .collect();
+        let channel_map = node_addrs
+            .iter()
+            .cloned()
+            .zip(channels)
+            .collect::<HashMap<_, _>>();
+        let mut coordinator = Self::new(node_addrs);
+        coordinator.channels = Arc::new(Mutex::new(channel_map));
+        coordinator.allow_network = false;
+        coordinator
+    }
+
+    /// True only for coordinators that may create network transports.
+    pub fn allows_network(&self) -> bool {
+        self.allow_network
+    }
+
     /// The term-stats cache, exposed for tests (`fetch_count` is how a
     /// test proves the hit path issued no RPCs).
     pub fn stats_cache(&self) -> &crate::stats_cache::StatsCache {
@@ -1374,6 +1403,9 @@ impl CoordinatorServiceImpl {
     /// The UDP signal socket, bound once (nonblocking: a full local
     /// buffer drops the datagram, which a monotone hint tolerates).
     fn floor_socket(&self) -> Option<&Arc<std::net::UdpSocket>> {
+        if !self.allow_network {
+            return None;
+        }
         self.floor_socket
             .get_or_init(|| {
                 std::net::UdpSocket::bind(("0.0.0.0", 0)).ok().map(|s| {
@@ -1388,6 +1420,9 @@ impl CoordinatorServiceImpl {
     /// its gRPC listener, in the UDP namespace. Resolved once and
     /// cached; IPv4 preferred (the fleet pins IPv4).
     fn floor_target(&self, addr: &str) -> Option<std::net::SocketAddr> {
+        if !self.allow_network {
+            return None;
+        }
         let mut cache = self
             .floor_targets
             .lock()
@@ -1742,6 +1777,11 @@ impl CoordinatorServiceImpl {
         let mut cache = self.channels.lock().expect("channel cache mutex poisoned");
         if let Some(ch) = cache.get(addr) {
             return Ok(ch.clone());
+        }
+        if !self.allow_network {
+            return Err(Status::failed_precondition(format!(
+                "in-process coordinator has no channel for {addr}; network fallback is disabled"
+            )));
         }
         let endpoint = Endpoint::from_shared(addr.to_string())
             .map_err(|e| Status::unavailable(format!("invalid node address {addr}: {e}")))?
@@ -8446,6 +8486,20 @@ fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
 #[cfg(test)]
 mod stream_cancel_tests {
     use super::*;
+
+    #[test]
+    fn in_process_mode_has_no_network_fallback_or_udp_lane() {
+        let coordinator = CoordinatorServiceImpl::with_in_process_channels(Vec::new());
+        assert!(!coordinator.allows_network());
+        let error = coordinator
+            .channel_to("http://must-not-resolve.invalid:50051")
+            .expect_err("a missing in-process channel must not dial");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(coordinator.floor_socket().is_none());
+        assert!(coordinator
+            .floor_target("must-not-resolve.invalid:50051")
+            .is_none());
+    }
 
     #[tokio::test]
     async fn cancellation_uses_typed_udp_then_authoritative_grpc_stop() {

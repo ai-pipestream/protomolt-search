@@ -24,6 +24,13 @@ analysis, and analyzer options outside that native subset. See
 [Native lexical analysis](docs/native-analysis.md) for the exact boundary and
 Android/iOS build checks.
 
+The [`protomolt-search-embedded`](crates/protomolt-search-embedded) package
+runs the same public `SearchService` contract over private local shards through
+an in-process coordinator. It binds and dials no sockets, forces the native
+analyzer, and supports create/open, protobuf-mapped ingest, vector ingest,
+delete/replace, `Query`, `QueryStream`, health, and flush on Android, iOS, and
+desktop. See [Embedded and mobile Protomolt Search](docs/embedded-mobile.md).
+
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
 uses TurboVec's current `.tv` persistence format. Provider images are opaque to
 the product and are selected by manifest/config identity, never by extension.
@@ -43,8 +50,9 @@ The reproducible cross-engine gate is
 quality, latency, throughput, resources, startup, and crash recovery without
 turning a synthetic run into a marketing claim.
 
-Phase 1: one crate, one binary, three roles (`node`, `coordinator`, `both`),
-tonic gRPC + tokio, static cluster membership.
+The network binary retains three roles (`node`, `coordinator`, `both`) with
+static cluster membership. The embedded package uses the same node and
+coordinator implementations without a network listener.
 
 ## Quickstart: dockerized end-to-end demo (CourtListener)
 

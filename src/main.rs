@@ -148,144 +148,42 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     if matches!(cfg.role, Role::Node | Role::Both) {
         for shard in &cfg.shards {
-            // Snapshot generations take precedence over the legacy layout
-            // (and recover any interrupted swap) before anything loads.
-            let generation = shard
-                .index_path
-                .as_ref()
-                .and_then(|p| pipestream_search::node::recover_generation(p));
-            let index = load_shard_index(shard, generation.as_deref())?;
-            let mut exact_vectors = None;
-            if let Some(p) = shard.index_path.as_ref() {
-                let exact_path = match &generation {
-                    Some(dir) => pipestream_search::node::generation_exact_vectors(dir),
-                    None => pipestream_search::node::exact_vector_sidecar_path(p),
-                };
-                if exact_path.exists() {
-                    eprintln!(
-                        "shard @{}: mapping exact FP32 vectors from {}",
-                        shard.listen,
-                        exact_path.display()
-                    );
-                    exact_vectors = Some(
-                        pipestream_search::exact_vectors::ExactVectorStore::open(&exact_path)
-                            .map_err(|e| format!("load {}: {e}", exact_path.display()))?,
-                    );
-                }
-            }
-            match &index {
-                Some(index) => eprintln!(
-                    "shard @{}: {} vectors, dim {:?}, {} bits, slot offset {}",
-                    shard.listen,
-                    index.len(),
-                    index.dim_opt(),
-                    index.bits_per_dimension().unwrap_or_default(),
-                    shard.slot_offset
-                ),
-                None => eprintln!(
-                    "shard @{}: no index at {}; starting empty (awaiting ConfigureVectorBackend/AddVectors)",
-                    shard.listen,
-                    shard.index_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
-                ),
-            }
+            let node_config = NodeConfig {
+                vector_backend: shard.vector_backend.clone(),
+                slot_offset: shard.slot_offset,
+                chunk_blocks: cfg.chunk_blocks,
+                share_floors: cfg.share_floors,
+                block_max: cfg.block_max,
+                coalesce: cfg.coalesce,
+                scan_parallel: cfg.scan_parallel,
+                rerank_parallel: cfg.rerank_parallel,
+                floor_delta: cfg.floor_delta,
+                floor_warmup_chunks: cfg.floor_warmup_chunks,
+                floor_min_interval_ms: cfg.floor_min_interval_ms,
+                bit_width: cfg.bit_width,
+                index_path: shard.index_path.clone(),
+                analysis_addr: shard.analysis_addr.clone(),
+                bm25_fields: cfg.bm25_fields.clone(),
+                facet_fields: cfg.facet_fields.clone(),
+                numeric_fields: cfg.numeric_fields.clone(),
+                map_facet_fields: cfg.map_facet_fields.clone(),
+                map_numeric_fields: cfg.map_numeric_fields.clone(),
+                integer_fields: cfg.integer_fields.clone(),
+                geo_fields: cfg.geo_fields.clone(),
+                wal: shard.wal,
+                wal_buckets: shard.wal_buckets,
+                vocab: shard.vocab,
+                vocab_window_docs: cfg.vocab_window_docs,
+                vocab_top_k: cfg.vocab_top_k,
+            };
+            let node = if shard.demo.is_some() {
+                NodeServiceImpl::new(load_shard_index(shard, None)?, node_config)
+                    .with_phrase_index(phrase_index.clone())
+            } else {
+                NodeServiceImpl::open(node_config, phrase_index.clone(), cfg.allow_missing_bm25)?
+            };
             let listener = TcpListener::bind(shard.listen).await?;
             let addr: SocketAddr = listener.local_addr()?;
-            let mut bm25_store = None;
-            let mut live_docs = pipestream_search::live_docs::LiveDocs::default();
-            if let Some(p) = shard.index_path.as_ref() {
-                let bm25_path = match &generation {
-                    Some(dir) => pipestream_search::node::generation_bm25(dir),
-                    None => pipestream_search::node::bm25_sidecar_path(p),
-                };
-                if bm25_path.exists() {
-                    eprintln!(
-                        "shard @{}: loading BM25 store from {}",
-                        shard.listen,
-                        bm25_path.display()
-                    );
-                    bm25_store = Some(
-                        pipestream_search::node::Bm25Shard::open(&bm25_path)
-                            .unwrap_or_else(|e| panic!("load {}: {e}", bm25_path.display())),
-                    );
-                } else if pipestream_search::node::bm25_build_dir(&bm25_path).exists()
-                    && !cfg.allow_missing_bm25
-                {
-                    // A spill directory with no .bm25 beside it means a
-                    // bulk build was interrupted: Flush removes the
-                    // directory on success, so this state cannot be
-                    // reached by a shard that finished. Serving it anyway
-                    // is the bad kind of quiet -- the node reports
-                    // healthy, answers vector queries normally, and
-                    // contributes nothing to every lexical query, so the
-                    // fleet ranks against a corpus short one shard's
-                    // share with nothing anywhere saying so.
-                    //
-                    // A shard with no build directory and no .bm25 is NOT
-                    // refused: that is exactly what a vector-only
-                    // deployment looks like, and it is a real one.
-                    return Err(format!(
-                        "shard @{}: BM25 build directory {} exists but {} does not. \
-                         A bulk build was interrupted; this shard would answer lexical \
-                         queries with silence, which is indistinguishable from a corpus \
-                         that genuinely lacks those terms. Re-run the ingest for this \
-                         shard, or pass --allow-missing-bm25 to serve it vector-only \
-                         on purpose.",
-                        shard.listen,
-                        pipestream_search::node::bm25_build_dir(&bm25_path).display(),
-                        bm25_path.display()
-                    )
-                    .into());
-                }
-                let live_path = match &generation {
-                    Some(dir) => pipestream_search::node::generation_live_docs(dir),
-                    None => pipestream_search::node::live_docs_sidecar_path(p),
-                };
-                if live_path.exists() {
-                    eprintln!(
-                        "shard @{}: loading live-row overlay from {}",
-                        shard.listen,
-                        live_path.display()
-                    );
-                    live_docs = pipestream_search::live_docs::LiveDocs::open(&live_path)
-                        .map_err(|e| format!("load {}: {e}", live_path.display()))?;
-                }
-            }
-            let node = NodeServiceImpl::new(
-                index,
-                NodeConfig {
-                    vector_backend: shard.vector_backend.clone(),
-                    slot_offset: shard.slot_offset,
-                    chunk_blocks: cfg.chunk_blocks,
-                    share_floors: cfg.share_floors,
-                    block_max: cfg.block_max,
-                    coalesce: cfg.coalesce,
-                    scan_parallel: cfg.scan_parallel,
-                    rerank_parallel: cfg.rerank_parallel,
-                    floor_delta: cfg.floor_delta,
-                    floor_warmup_chunks: cfg.floor_warmup_chunks,
-                    floor_min_interval_ms: cfg.floor_min_interval_ms,
-                    bit_width: cfg.bit_width,
-                    index_path: shard.index_path.clone(),
-                    analysis_addr: shard.analysis_addr.clone(),
-                    bm25_fields: cfg.bm25_fields.clone(),
-                    facet_fields: cfg.facet_fields.clone(),
-                    numeric_fields: cfg.numeric_fields.clone(),
-                    map_facet_fields: cfg.map_facet_fields.clone(),
-                    map_numeric_fields: cfg.map_numeric_fields.clone(),
-                    integer_fields: cfg.integer_fields.clone(),
-                    geo_fields: cfg.geo_fields.clone(),
-                    wal: shard.wal,
-                    wal_buckets: shard.wal_buckets,
-                    vocab: shard.vocab,
-                    vocab_window_docs: cfg.vocab_window_docs,
-                    vocab_top_k: cfg.vocab_top_k,
-                },
-            )
-            .with_bm25(bm25_store)
-            .with_exact_vectors(exact_vectors)?
-            .with_live_docs(live_docs)?
-            .with_phrase_index(phrase_index.clone())
-            .with_generation(generation);
             // The UDP stream-signal lane shares the gRPC listener's host:port.
             node.spawn_floor_listener(addr);
             node_services.push(node.clone());

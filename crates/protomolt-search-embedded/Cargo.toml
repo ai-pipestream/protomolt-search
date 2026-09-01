@@ -1,0 +1,12 @@
+[package]
+name = "protomolt-search-embedded"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Embedded, no-egress Protomolt Search runtime for Android, iOS, and desktop"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+pipestream-search = { path = "../.." }
