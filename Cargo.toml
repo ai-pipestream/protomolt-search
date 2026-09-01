@@ -11,7 +11,7 @@ resolver = "2"
 
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s17" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "984669c35e34d6db673aa2be70e901469d309c4f" }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "6727061710c08ea1d8fe807dcd9998010b06a279" }
 tonic = "0.12"
 prost = "0.13"
 # google.protobuf.Timestamp on the ingest wire compiles to this crate's
