@@ -205,12 +205,11 @@ pub struct Config {
     /// holds the only top-k). Identical results, different pruning
     /// locus. Off by default.
     pub stream_search: bool,
-    /// Coordinator: run the flat Bm25Search fan-out over the
-    /// `Bm25QueryStream` floor relay — shards publish their running
-    /// k-th best, the coordinator relays the fleet maximum back, and
-    /// block-max converts every raise into blocks never read.
-    /// Identical results, less work (docs/block-max.md). Off by
-    /// default.
+    /// Coordinator: run BM25 fan-out over the exact candidate stream.
+    /// The coordinator owns the global heap and inclusive floor; every
+    /// shard must return a matching scoring fingerprint and successful
+    /// completion certificate. Enabled by default; false retains the
+    /// unary path as the correctness/performance baseline.
     pub bm25_stream: bool,
     /// Coordinator: hard cap on any client-facing `k`. Requests above it
     /// are refused (never clamped); a request omitting `k` runs at this
@@ -973,12 +972,18 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
 
-    let bm25_stream = flag_present(args, "bm25-stream")
-        || std::env::var("PIPESTREAM_SEARCH_BM25_STREAM")
-            .or_else(|_| std::env::var("TURBOVEC_BM25_STREAM"))
-            .map(|s| parse_env_bool(&s))
-            .unwrap_or(false)
-        || file.bm25_stream.unwrap_or(false);
+    let bm25_stream = if flag_present(args, "bm25-stream") {
+        true
+    } else {
+        opt(
+            args,
+            "bm25-stream",
+            "TURBOVEC_BM25_STREAM",
+            file.bm25_stream.map(|value| value.to_string()).as_deref(),
+        )
+        .map(|value| parse_env_bool(&value))
+        .unwrap_or(true)
+    };
 
     let max_k = opt(
         args,
@@ -1546,6 +1551,20 @@ slot_offset = 20000
         ]))
         .unwrap();
         assert!(!cfg.share_floors);
+    }
+
+    #[test]
+    fn bm25_candidate_stream_defaults_on_and_can_be_disabled() {
+        let defaults = parse(&args(&["--role=coordinator", "--nodes=a:1"])).unwrap();
+        assert!(defaults.bm25_stream);
+
+        let unary = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=a:1",
+            "--bm25-stream=false",
+        ]))
+        .unwrap();
+        assert!(!unary.bm25_stream);
     }
 
     #[test]

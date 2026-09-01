@@ -9,7 +9,8 @@ use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
-    AddDocumentsRequest, AnalysisSpec, Bm25Hit, Bm25QueryRequest, GetDocumentsRequest,
+    bm25_query_stream_request, bm25_query_stream_response, AddDocumentsRequest, AnalysisSpec,
+    Bm25Hit, Bm25QueryRequest, Bm25QueryStreamRequest, GetDocumentsRequest, StopBm25Query,
     TermStatsRequest,
 };
 use tokio::sync::mpsc;
@@ -659,6 +660,158 @@ async fn bm25_stream_relay_matches_unary_exactly() {
 
     for h in handles {
         h.abort();
+    }
+    mock.abort();
+}
+
+/// The shard stream itself must carry compact candidates followed by one
+/// explicit successful certificate. Closing the client-to-server half after
+/// Start is ordinary bidi usage, not cancellation; only Stop cancels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bm25_stream_candidates_end_in_a_scoring_certificate() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addrs, handles) = start_doc_shards(&analysis).await;
+    let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
+    let stats = client
+        .term_stats(TermStatsRequest {
+            terms: vec!["rust".into(), "search".into()],
+            fields: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let request = Bm25QueryRequest {
+        projections: Vec::new(),
+        filter: None,
+        map_facet_fields: Vec::new(),
+        score_stages: Vec::new(),
+        facet_fields: Vec::new(),
+        expected_stats_epoch: stats.stats_epoch,
+        terms: vec!["rust".into(), "search".into()],
+        k: 2,
+        global_doc_count: stats.doc_count,
+        global_total_doc_length: stats.total_doc_length,
+        global_doc_frequencies: stats.doc_frequencies,
+        k1: 0.0,
+        b: 0.0,
+        min_score: 0.0,
+        fields: Vec::new(),
+        range_facet_fields: Vec::new(),
+        geo_filters: Vec::new(),
+        stats_fields: Vec::new(),
+        cardinality_fields: Vec::new(),
+    };
+    let unary = client
+        .bm25_query(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Bm25QueryStreamRequest {
+        payload: Some(bm25_query_stream_request::Payload::Start(request)),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let mut stream = client
+        .bm25_query_stream(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut candidates = Vec::new();
+    let completion = loop {
+        let message = stream
+            .message()
+            .await
+            .unwrap()
+            .expect("terminal completion");
+        match message.payload {
+            Some(bm25_query_stream_response::Payload::CandidateBatch(batch)) => {
+                assert_eq!(batch.candidates.len() % 12, 0);
+                for record in batch.candidates.chunks_exact(12) {
+                    candidates.push((
+                        u64::from_le_bytes(record[..8].try_into().unwrap()),
+                        f32::from_le_bytes(record[8..12].try_into().unwrap()).to_bits(),
+                    ));
+                }
+            }
+            Some(bm25_query_stream_response::Payload::Completion(done)) => break done,
+            Some(bm25_query_stream_response::Payload::Done(_)) => {
+                panic!("server emitted obsolete uncertified Done")
+            }
+            _ => {}
+        }
+    };
+    assert!(completion.completed);
+    assert_eq!(completion.candidates_emitted as usize, candidates.len());
+    assert_eq!(completion.scoring_fingerprint.len(), 64);
+    assert!(completion
+        .scoring_fingerprint
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    let streamed = completion.response.expect("certified response");
+    assert_eq!(hit_signature(&streamed.hits), hit_signature(&unary.hits));
+    for hit in &streamed.hits {
+        assert!(candidates.contains(&(hit.doc_id, hit.score.to_bits())));
+    }
+
+    for handle in handles {
+        handle.abort();
+    }
+    mock.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bm25_stream_stop_is_an_incomplete_certificate() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let (addrs, handles) = start_doc_shards(&analysis).await;
+    let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
+    let stats = client
+        .term_stats(TermStatsRequest {
+            terms: vec!["rust".into()],
+            fields: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let request = Bm25QueryRequest {
+        terms: vec!["rust".into()],
+        k: 2,
+        global_doc_count: stats.doc_count,
+        global_total_doc_length: stats.total_doc_length,
+        global_doc_frequencies: stats.doc_frequencies,
+        expected_stats_epoch: stats.stats_epoch,
+        ..Default::default()
+    };
+    let outbound = tokio_stream::iter([
+        Bm25QueryStreamRequest {
+            payload: Some(bm25_query_stream_request::Payload::Start(request)),
+        },
+        Bm25QueryStreamRequest {
+            payload: Some(bm25_query_stream_request::Payload::Stop(StopBm25Query {})),
+        },
+    ]);
+    let mut stream = client
+        .bm25_query_stream(outbound)
+        .await
+        .unwrap()
+        .into_inner();
+    let completion = loop {
+        let event = stream
+            .message()
+            .await
+            .unwrap()
+            .expect("incomplete completion");
+        if let Some(bm25_query_stream_response::Payload::Completion(completion)) = event.payload {
+            break completion;
+        }
+    };
+    assert!(!completion.completed);
+    assert!(completion.response.is_none());
+
+    for handle in handles {
+        handle.abort();
     }
     mock.abort();
 }

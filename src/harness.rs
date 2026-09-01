@@ -279,6 +279,9 @@ pub async fn start_coordinator(
 /// Corpora are ASCII, so byte offsets == char offsets == UTF-16 units.
 pub mod mock_analysis {
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
@@ -295,6 +298,58 @@ pub mod mock_analysis {
         TermVector, TextArtifact, Token,
     };
     use crate::MAX_MESSAGE_BYTES;
+
+    /// Observable lifecycle of deliberately delayed unary analysis calls.
+    /// This keeps cancellation/deadline tests deterministic without putting
+    /// sleeps on the ordinary mock used by the rest of the suite.
+    #[derive(Clone, Default)]
+    pub struct AnalysisDelayProbe {
+        started: Arc<AtomicU64>,
+        completed: Arc<AtomicU64>,
+        cancelled: Arc<AtomicU64>,
+    }
+
+    impl AnalysisDelayProbe {
+        pub fn started(&self) -> u64 {
+            self.started.load(Ordering::Acquire)
+        }
+
+        pub fn completed(&self) -> u64 {
+            self.completed.load(Ordering::Acquire)
+        }
+
+        pub fn cancelled(&self) -> u64 {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    struct DelayedCall {
+        probe: AnalysisDelayProbe,
+        completed: bool,
+    }
+
+    impl DelayedCall {
+        fn begin(probe: AnalysisDelayProbe) -> Self {
+            probe.started.fetch_add(1, Ordering::AcqRel);
+            Self {
+                probe,
+                completed: false,
+            }
+        }
+
+        fn complete(mut self) {
+            self.probe.completed.fetch_add(1, Ordering::AcqRel);
+            self.completed = true;
+        }
+    }
+
+    impl Drop for DelayedCall {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.probe.cancelled.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
 
     /// Toy stemmer: strips a trailing "ing" (>5 chars, folding a resulting
     /// double consonant, so "running" -> "run") or trailing 's' (>3 chars)
@@ -323,11 +378,15 @@ pub mod mock_analysis {
         /// Defaults to true; [`start_mock_analysis_without_ner`] models
         /// the bare sidecar.
         pub ner: bool,
+        unary_delay: Option<(Duration, AnalysisDelayProbe)>,
     }
 
     impl Default for MockAnalysis {
         fn default() -> Self {
-            MockAnalysis { ner: true }
+            MockAnalysis {
+                ner: true,
+                unary_delay: None,
+            }
         }
     }
 
@@ -525,6 +584,11 @@ pub mod mock_analysis {
             &self,
             request: Request<AnalyzeRequest>,
         ) -> Result<Response<AnalyzeResponse>, Status> {
+            if let Some((delay, probe)) = &self.unary_delay {
+                let call = DelayedCall::begin(probe.clone());
+                tokio::time::sleep(*delay).await;
+                call.complete();
+            }
             let req = request.into_inner();
             let options = req.options.unwrap_or_default();
             Ok(Response::new(analyze_text(&req.text, &options, self.ner)?))
@@ -632,13 +696,36 @@ pub mod mock_analysis {
         start_mock(MockAnalysis::default()).await
     }
 
+    /// A normal mock whose unary `Analyze` method pauses for `delay`.
+    /// The returned probe distinguishes completed calls from futures dropped
+    /// because their client cancelled or exceeded a deadline.
+    pub async fn start_mock_analysis_delayed(
+        delay: Duration,
+    ) -> (
+        String,
+        JoinHandle<Result<(), TransportError>>,
+        AnalysisDelayProbe,
+    ) {
+        let probe = AnalysisDelayProbe::default();
+        let (address, handle) = start_mock(MockAnalysis {
+            unary_delay: Some((delay, probe.clone())),
+            ..Default::default()
+        })
+        .await;
+        (address, handle, probe)
+    }
+
     /// [`start_mock_analysis`] modeling a sidecar with NO NER model
     /// configured: `GetCapabilities.ner_available` is false, and the
     /// geocoding layer stays empty even when requested — the state the
     /// engine's geography preflight exists to refuse.
     pub async fn start_mock_analysis_without_ner(
     ) -> (String, JoinHandle<Result<(), TransportError>>) {
-        start_mock(MockAnalysis { ner: false }).await
+        start_mock(MockAnalysis {
+            ner: false,
+            ..Default::default()
+        })
+        .await
     }
 
     async fn start_mock(mock: MockAnalysis) -> (String, JoinHandle<Result<(), TransportError>>) {

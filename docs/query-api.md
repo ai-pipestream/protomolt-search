@@ -1,7 +1,8 @@
 # Public query contract
 
-Status: increment 1 is IMPLEMENTED (2026-08-24): `SearchService.Query`
-executes the shapes in the mapping table below by delegating to `Search`,
+Status: `SearchService.Query` and its certified streaming form
+`SearchService.QueryStream` are IMPLEMENTED. Increment 1 landed on 2026-08-24:
+`Query` executes the shapes in the mapping table below by delegating to `Search`,
 `Bm25Search`, and `HybridSearch` (`src/query.rs`, `tests/query_api.rs`),
 with per-signal provenance and by-name refusal of everything else. The
 generic composite scorer is IMPLEMENTED (2026-08-26, `src/ltr.rs`,
@@ -29,6 +30,12 @@ suite holds profiled hits bitwise to unprofiled ones. With that, every
 response requirement in this document is met except arbitrary nested
 boolean search. The phase split, the boost contract, and the refusal
 rules in this document are the binding contract.
+
+`QueryStream` landed on 2026-08-31. It runs the same adapter and produces the
+same terminal `QueryResponse`, while exact lexical and dense collectors can
+publish provisional replacement snapshots. See
+[`streaming-query.md`](streaming-query.md) for revision, cancellation,
+deadline, and completion semantics.
 
 The public model separates three things that are easy to conflate:
 
@@ -196,10 +203,11 @@ engine has a safe upper-bound rule. This preserves the existing rule that CEL
 selects while bounded functions score; arbitrary CEL scoring must not make
 block-max or live-floor pruning unsound.
 
-## Proposed protobuf shape
+## Protobuf shape
 
-Names and field numbers remain provisional until the RPC is implemented. The
-shape, phase ordering, and refusal rules are the stable design decisions.
+The excerpt below explains the public model. The compiled contract in
+`proto/ai/pipestream/search/v1/search.proto` is authoritative for field numbers
+and includes later paging, projection, scoring, and streaming additions.
 
 ```proto
 message QueryRequest {

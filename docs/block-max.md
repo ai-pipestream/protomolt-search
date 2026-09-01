@@ -253,7 +253,7 @@ Gates, in the project's existing style:
   leg, so a fleet sweep with pruning on is compared against pruning off
   the way sharing on/off already is.
 
-## The floor is already plumbed
+## Exact lexical candidate streaming
 
 Most of what the vector leg built for floors applies unchanged:
 
@@ -264,37 +264,54 @@ Most of what the vector leg built for floors applies unchanged:
   for free: a merge-join against a sorted candidate list becomes
   `advance(target)` over blocks instead of a full postings walk.
 
-The mid-query relay needed one structural addition: the vector relay
-rides the bidi `SearchShard` stream, while `Bm25Query` is a **unary**
-RPC with no channel to push a raised floor into an in-flight call. That
-channel now exists: `Bm25QueryStream` is a bidi RPC mirroring
-`SearchShard` — each shard publishes strict raises of its running
-k-th best (as the emission-safe `floor_seed` value, gated by the same
-`--floor-delta` / `--floor-min-interval-ms` knobs as the vector side),
-the coordinator conflates raises into one watch cell per query and
-relays the max back to every sibling, and the pruned scorer adopts
-external floors between block-bound tests via `bm25::LiveFloorHook`.
-Exactness is unchanged — an adopted floor is a proven lower bound on
-the final global k-th, so it can only skip candidates the merge would
-discard anyway; `tests/bm25_live_floor.rs` pins the hook contract
-against the seeded scorer and
-`tests/bm25_search.rs::bm25_stream_relay_matches_unary_exactly` pins
-the fleet-level hit signature, streamed vs unary, seeded and not.
+The mid-query protocol is now more than a floor relay. `Bm25QueryStream`
+is a bidirectional candidate stream:
 
-The relay is opt-in (`--bm25-stream` / `PIPESTREAM_SEARCH_BM25_STREAM` on the
-coordinator; nodes always serve the RPC). Measured on the v9 court
-fleet (8 shards, one host, 36 case-folding queries x 3): k=10 is
-noise-level either way; k=100 keeps p50 flat (71 ms) and trims the tail
-— bm25 p90 262 → 231 ms, max 360 → 298 ms. That is the expected shape:
-the relay only converts *sibling* progress into skipped blocks on
-whichever shard is slowest, so it pays in the tail and pays more the
-longer the scan (larger k, more skewed shards, real network fan-outs).
-On a single host where all shards share the same cores the win is
-modest; leave it off unless tail latency at larger k matters. The
-client-seeded unary floor is unchanged and composes with the relay:
-`Bm25SearchRequest.min_score` forwards a floor the caller already holds
-(e.g. the `kth_best` of a previous identical query, re-issued after
-appends) as the starting floor, and the relay raises it from there.
+1. The coordinator sends the ordinary globally scored request, including
+   any caller-supplied `min_score`.
+2. On the block-max path, each shard emits every fully evaluated candidate at
+   or above its current inclusive floor as packed 12-byte
+   `(u64 doc_id, f32 score)` records. An exhaustive compatibility fallback may
+   emit its complete local top-k frontier after scoring; that remains exact
+   because a global top-k winner cannot fall outside its shard's top-k.
+3. The coordinator maintains the only authoritative global top-k heap. Its
+   emission-safe k-th score is conflated into one watch cell and relayed to
+   every shard. `bm25::LiveFloorHook` adopts raises between block-bound tests.
+4. Each shard terminates with `completed=true`, a non-empty scoring
+   fingerprint, the emitted-candidate count, and its ordinary local response.
+   The coordinator rejects EOF, cancellation, an obsolete uncertified terminal
+   response, count drift, score drift, or a mismatched fingerprint.
+5. The local responses enrich the certified global winners with offsets,
+   projections, facets, and column handshakes. They do not define the global
+   result heap.
+
+Exactness is structural. A relayed floor is a proven lower bound on the final
+global k-th score, the seed is one f32 ULP below that score, and scorer tests
+use inclusive comparisons so boundary ties survive. A result exists only when
+every configured shard certifies a complete scan in the same score space.
+`tests/bm25_live_floor.rs` pins the scorer hook,
+`tests/bm25_search.rs::bm25_stream_relay_matches_unary_exactly` pins exact
+streamed-versus-unary fleet results,
+`bm25_stream_candidates_end_in_a_scoring_certificate` pins candidate and
+certificate accounting, and `bm25_stream_stop_is_an_incomplete_certificate`
+pins cancellation semantics. `tests/multi_field_wire.rs` applies the same gate
+to fused multi-field scoring.
+
+The candidate protocol is the default (`bm25_stream = true`). Operators can
+force the legacy unary route with `--bm25-stream=false` or
+`TURBOVEC_BM25_STREAM=false` for an exact A/B comparison. Nodes always serve
+the stream RPC. Phrase-aware BM25 currently remains on its unary exact scorer;
+ordinary flat and fused multi-field BM25 use the candidate stream. The earlier
+floor-only relay measurement on the v9 court fleet remains useful historical
+evidence: at k=100, BM25 p90 fell from 262 to 231 ms and max from 360 to 298 ms
+on eight same-host shards. It is not a measurement of this newer
+coordinator-only heap protocol; the OpenSearch challenge suite is the current
+measurement path.
+
+The caller-seeded floor composes with live streaming:
+`Bm25SearchRequest.min_score` forwards a lower bound the caller already holds
+(for example, the `kth_best` of a previous identical query re-issued after
+appends), and the coordinator raises it from there.
 
 Before block-max, a raised floor only skipped heap insertions, which is
 why the five-machine round measured a 51% candidate cut at cost parity: a
@@ -345,16 +362,14 @@ Landed in this order, each measurable on its own:
    remains an operational run; the gate logic and semantics are covered
    by `tests/bm25_search.rs::bm25_search_min_score_factorial_across_the_fleet`
    and the `lexical_sweep_smoke` example.
-5. **Mid-query live-floor relay** — landed, opt-in
-   (`--bm25-stream`). Bidi `Bm25QueryStream`, `bm25::LiveFloorHook`
-   polled between bound tests in the pruned scorer, coordinator-side
-   conflated relay reusing the vector path's watch-cell machinery.
-   Bit-exact by the seeded-floor argument (a relayed floor is a proven
-   global lower bound); pinned by `tests/bm25_live_floor.rs` and the
-   streamed-vs-unary fleet gate in `tests/bm25_search.rs`. Measured
-   (v9 court fleet, 8 shards, one host): k=10 noise, k=100 p50 flat
-   with bm25 p90 262 → 231 ms and max 360 → 298 ms — a tail-only win
-   that should grow with scan length and real network fan-out.
+5. **Mid-query live-floor relay** — landed first as an opt-in floor-only
+   protocol. It established the monotone `LiveFloorHook` and exactness gates.
+6. **Coordinator-owned lexical heap and certificates** — landed. The bidi
+   stream now carries compact candidates and a terminal score-space
+   certificate. The coordinator alone selects the global top-k, refuses every
+   incomplete shard set, and uses the local terminal responses only to enrich
+   winners. It is on by default for flat and fused multi-field BM25 and is the
+   collector behind public `QueryStream` lexical revisions.
 
 ## Migrating existing shards to v5
 

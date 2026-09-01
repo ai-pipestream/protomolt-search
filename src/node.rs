@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{mpsc, watch};
@@ -37,19 +38,19 @@ use crate::pb::wal::{
 use crate::pb::{
     bm25_query_stream_request, bm25_query_stream_response, search_shard_request,
     search_shard_response, snapshot_chunk, stream_search_request, stream_search_response,
-    AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse, Bm25Hit,
-    Bm25QueryRequest, Bm25QueryResponse, Bm25QueryStreamRequest, Bm25QueryStreamResponse,
-    Bm25RescoreRequest, Bm25RescoreResponse, ConfigureVectorBackendRequest,
-    ConfigureVectorBackendResponse, FloorUpdate, FlushRequest, FlushResponse,
-    GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse,
-    GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit,
-    HybridShardRequest, HybridShardResponse, IngestMappedRequest, IngestMappedResponse,
-    InstallSnapshotResponse, OffsetSpan, RawLegHit, ResolveParentsRequest, ResolveParentsResponse,
-    ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse,
-    SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse,
-    ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch, StoredDocument,
-    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
-    TermOccurrences, TermStatsRequest, TermStatsResponse,
+    AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse,
+    Bm25CandidateBatch, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse, Bm25QueryStreamRequest,
+    Bm25QueryStreamResponse, Bm25RescoreRequest, Bm25RescoreResponse, Bm25StreamCompletion,
+    ConfigureVectorBackendRequest, ConfigureVectorBackendResponse, FloorUpdate, FlushRequest,
+    FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
+    GetDocumentsResponse, GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest,
+    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, IngestMappedRequest,
+    IngestMappedResponse, InstallSnapshotResponse, OffsetSpan, RawLegHit, ResolveParentsRequest,
+    ResolveParentsResponse, ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
+    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
+    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
     VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorQualityContract,
     VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
@@ -61,6 +62,27 @@ use crate::vector::{
     EMBEDDED_TURBOVEC,
 };
 use crate::wal::{self, WalWriter};
+
+/// Identity of one BM25 score space. The canonical request keeps only
+/// fields that can change a document's score; delivery depth, floors,
+/// filters, projections, aggregations, and the per-shard epoch claim are
+/// excluded so every shard in one globally scored round reports the same
+/// value.
+fn bm25_scoring_fingerprint(req: &Bm25QueryRequest) -> String {
+    let mut canonical = req.clone();
+    canonical.k = 0;
+    canonical.min_score = 0.0;
+    canonical.expected_stats_epoch = 0;
+    canonical.facet_fields.clear();
+    canonical.map_facet_fields.clear();
+    canonical.range_facet_fields.clear();
+    canonical.geo_filters.clear();
+    canonical.filter = None;
+    canonical.stats_fields.clear();
+    canonical.cardinality_fields.clear();
+    canonical.projections.clear();
+    crate::sha256::hex_digest(&prost::Message::encode_to_vec(&canonical))
+}
 
 /// How a node scans and whether it participates in floor sharing.
 #[derive(Debug, Clone)]
@@ -3520,6 +3542,8 @@ impl NodeServiceImpl {
         &self,
         req: &Bm25QueryRequest,
         phrase: Option<(usize, &[f32])>,
+        live: Option<bm25::LiveFloorHook>,
+        mut candidate: Option<bm25::CandidateHook>,
     ) -> Result<Bm25QueryResponse, Status> {
         if !req.projections.is_empty() {
             return Err(Status::invalid_argument(
@@ -3709,7 +3733,7 @@ impl NodeServiceImpl {
                     None => None,
                 };
                 let docs = if let Some((phrase_view, weights)) = phrase_view {
-                    bm25::filter_fused_to_floor(
+                    let docs = bm25::filter_fused_to_floor(
                         bm25::top_k_phrase_exhaustive_filtered(
                             &queries,
                             phrase_view,
@@ -3721,21 +3745,35 @@ impl NodeServiceImpl {
                             filter_ctx,
                         ),
                         floor,
-                    )
+                    );
+                    if let Some(sink) = candidate.as_mut() {
+                        for doc in &docs {
+                            sink(doc.doc_id, doc.score as f32);
+                        }
+                    }
+                    docs
                 } else if prunable {
                     let mut prune = bm25::PruneStats::default();
-                    bm25::top_k_fused_pruned_filtered_stats(
+                    bm25::top_k_fused_pruned_filtered_stats_streaming(
                         &queries,
                         req.k as usize,
                         floor,
                         filter_ctx,
                         &mut prune,
+                        live,
+                        candidate,
                     )
                 } else {
-                    bm25::filter_fused_to_floor(
+                    let docs = bm25::filter_fused_to_floor(
                         bm25::top_k_fused_exhaustive_filtered(&queries, req.k as usize, filter_ctx),
                         floor,
-                    )
+                    );
+                    if let Some(sink) = candidate.as_mut() {
+                        for doc in &docs {
+                            sink(doc.doc_id, doc.score as f32);
+                        }
+                    }
+                    docs
                 };
                 docs.into_iter()
                     .map(|doc| Bm25Hit {
@@ -6819,6 +6857,12 @@ impl NodeService for NodeServiceImpl {
                             ));
                         }
                     }
+                    let scoring_fingerprint = index.descriptor().scoring_fingerprint;
+                    if scoring_fingerprint.is_empty() {
+                        return Err(Status::failed_precondition(
+                            "vector backend has no scoring fingerprint",
+                        ));
+                    }
 
                     // The request's filters as a slot allowlist, resolved
                     // under this scan's read guard so columns and index
@@ -6921,6 +6965,7 @@ impl NodeService for NodeServiceImpl {
                         floor_raises_applied: raises,
                         geo_columns_known,
                         filter_columns_known,
+                        scoring_fingerprint,
                     })
                 });
             let outcome = scan.await;
@@ -7398,6 +7443,8 @@ impl NodeService for NodeServiceImpl {
             // iteration. Updates are monotone maxes, so only raises are
             // stored — exactly the SearchShard pump.
             let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pump_cancelled = Arc::clone(&cancelled);
             tokio::spawn(async move {
                 loop {
                     match inbound.message().await {
@@ -7412,6 +7459,12 @@ impl NodeService for NodeServiceImpl {
                                     false
                                 }
                             });
+                        }
+                        Ok(Some(Bm25QueryStreamRequest {
+                            payload: Some(bm25_query_stream_request::Payload::Stop(_)),
+                        })) => {
+                            pump_cancelled.store(true, AtomicOrdering::Release);
+                            break;
                         }
                         // Duplicate Start or empty payload: ignore.
                         Ok(Some(_)) => {}
@@ -7431,9 +7484,14 @@ impl NodeService for NodeServiceImpl {
             let min_interval = (service.config.floor_min_interval_ms > 0)
                 .then(|| std::time::Duration::from_millis(service.config.floor_min_interval_ms));
             let scan_tx = tx.clone();
+            let hook_cancelled = Arc::clone(&cancelled);
             let mut last_published = f32::NEG_INFINITY;
             let mut last_at: Option<std::time::Instant> = None;
             let mut hook = move |seed: Option<f32>| -> Option<f32> {
+                if hook_cancelled.load(AtomicOrdering::Acquire) || scan_tx.is_closed() {
+                    hook_cancelled.store(true, AtomicOrdering::Release);
+                    return Some(f32::INFINITY);
+                }
                 if !share {
                     return None;
                 }
@@ -7456,19 +7514,87 @@ impl NodeService for NodeServiceImpl {
                 (f != f32::NEG_INFINITY).then_some(f)
             };
 
+            let scoring_fingerprint = bm25_scoring_fingerprint(&req);
+            let candidate_tx = tx.clone();
+            let scan_cancelled = Arc::clone(&cancelled);
             let outcome = tokio::task::spawn_blocking(move || {
-                service.run_bm25_query_live(req, Some(&mut hook))
+                // Stay below tonic's default 4 MiB even if a caller lowers
+                // the process-wide cap. 64 KiB amortizes framing without
+                // delaying the first useful candidates.
+                const BATCH_BYTES: usize = (64 * 1024 / 12) * 12;
+                let mut pending = Vec::with_capacity(BATCH_BYTES);
+                let mut emitted = 0u64;
+                let response = {
+                    let mut emit = |doc_id: u32, score: f32| {
+                        pending.extend_from_slice(
+                            &(service.config.slot_offset + u64::from(doc_id)).to_le_bytes(),
+                        );
+                        pending.extend_from_slice(&score.to_le_bytes());
+                        if pending.len() >= BATCH_BYTES {
+                            let records = (pending.len() / 12) as u64;
+                            let batch =
+                                std::mem::replace(&mut pending, Vec::with_capacity(BATCH_BYTES));
+                            if candidate_tx
+                                .blocking_send(Ok(Bm25QueryStreamResponse {
+                                    payload: Some(
+                                        bm25_query_stream_response::Payload::CandidateBatch(
+                                            Bm25CandidateBatch { candidates: batch },
+                                        ),
+                                    ),
+                                }))
+                                .is_ok()
+                            {
+                                emitted += records;
+                            } else {
+                                scan_cancelled.store(true, AtomicOrdering::Release);
+                            }
+                        }
+                    };
+                    service.run_bm25_query_live(req, Some(&mut hook), Some(&mut emit))
+                };
+                if response.is_ok() && !pending.is_empty() {
+                    let records = (pending.len() / 12) as u64;
+                    if candidate_tx
+                        .blocking_send(Ok(Bm25QueryStreamResponse {
+                            payload: Some(bm25_query_stream_response::Payload::CandidateBatch(
+                                Bm25CandidateBatch {
+                                    candidates: pending,
+                                },
+                            )),
+                        }))
+                        .is_ok()
+                    {
+                        emitted += records;
+                    } else {
+                        scan_cancelled.store(true, AtomicOrdering::Release);
+                    }
+                }
+                let completed = !scan_cancelled.load(AtomicOrdering::Acquire);
+                (response, completed, emitted)
             })
             .await
-            .unwrap_or_else(|e| Err(Status::internal(format!("bm25 stream task failed: {e}"))));
+            .unwrap_or_else(|e| {
+                (
+                    Err(Status::internal(format!("bm25 stream task failed: {e}"))),
+                    false,
+                    0,
+                )
+            });
             let _ = match outcome {
-                Ok(done) => {
+                (Ok(response), completed, candidates_emitted) => {
                     tx.send(Ok(Bm25QueryStreamResponse {
-                        payload: Some(bm25_query_stream_response::Payload::Done(done)),
+                        payload: Some(bm25_query_stream_response::Payload::Completion(
+                            Bm25StreamCompletion {
+                                completed,
+                                response: completed.then_some(response),
+                                scoring_fingerprint,
+                                candidates_emitted,
+                            },
+                        )),
                     }))
                     .await
                 }
-                Err(e) => tx.send(Err(e)).await,
+                (Err(e), _, _) => tx.send(Err(e)).await,
             };
         });
 
@@ -7800,7 +7926,7 @@ impl NodeService for NodeServiceImpl {
 // worker -- the same discipline every vector scan path follows.
 impl NodeServiceImpl {
     fn run_bm25_query(&self, req: Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
-        self.run_bm25_query_live(req, None)
+        self.run_bm25_query_live(req, None, None)
     }
 
     fn run_bm25_phrase_query(
@@ -7849,7 +7975,12 @@ impl NodeServiceImpl {
                 phrases.fingerprint()
             )));
         }
-        self.bm25_query_fused(&req, Some((phrase_leg, &request.phrase_term_weights)))
+        self.bm25_query_fused(
+            &req,
+            Some((phrase_leg, &request.phrase_term_weights)),
+            None,
+            None,
+        )
     }
 
     /// [`Self::run_bm25_query`] with a mid-scan floor exchange for the
@@ -7860,6 +7991,7 @@ impl NodeServiceImpl {
         &self,
         req: Bm25QueryRequest,
         live: Option<bm25::LiveFloorHook>,
+        candidate: Option<bm25::CandidateHook>,
     ) -> Result<Bm25QueryResponse, Status> {
         if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
             return Err(Status::invalid_argument(
@@ -7875,7 +8007,7 @@ impl NodeServiceImpl {
                      drop `fields` to use the flat route, or drop `score_stages`",
                 ));
             }
-            return self.bm25_query_fused(&req, None);
+            return self.bm25_query_fused(&req, None, live, candidate);
         }
         let stage_specs = parse_score_stages(&req.score_stages)?;
         validate_range_facet_fields(&req.range_facet_fields)?;
@@ -8094,7 +8226,7 @@ impl NodeServiceImpl {
                         });
                 let docs = if prunable {
                     let mut prune = bm25::PruneStats::default();
-                    bm25::top_k_pruned_chained_filtered_stats_live(
+                    bm25::top_k_pruned_chained_filtered_stats_streaming(
                         index,
                         &req.terms,
                         &stats,
@@ -8105,9 +8237,10 @@ impl NodeServiceImpl {
                         filter_ctx,
                         &mut prune,
                         live,
+                        candidate,
                     )
                 } else {
-                    bm25::filter_to_floor(
+                    let docs = bm25::filter_to_floor(
                         bm25::top_k_chained_filtered(
                             index,
                             &req.terms,
@@ -8118,7 +8251,13 @@ impl NodeServiceImpl {
                             filter_ctx,
                         ),
                         floor,
-                    )
+                    );
+                    if let Some(sink) = candidate {
+                        for doc in &docs {
+                            sink(doc.doc_id, doc.score as f32);
+                        }
+                    }
+                    docs
                 };
                 docs.into_iter()
                     .map(|doc| Bm25Hit {

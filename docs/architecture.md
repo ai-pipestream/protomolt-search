@@ -152,6 +152,12 @@ That proof is node-local and would still produce a node-issued
 but no remaining-range bound, so nodes currently traverse every logical scan
 chunk unless cancelled. UDP `CANCEL` can never substitute for this proof.
 
+The same ownership model now applies to ordinary lexical search. BM25 shards
+stream compact `(document id, score)` candidates, block-max scorers consume the
+coordinator's inclusive live floor, and terminal certificates bind all shards
+to one score space. The shard-local terminal top-k enriches global winners with
+offsets and projections; it never substitutes for the coordinator heap.
+
 Beyond plain vector search, the coordinator owns:
 
 - fusion: hybrid queries run a vector leg and a BM25 leg and fuse them,
@@ -164,9 +170,13 @@ Beyond plain vector search, the coordinator owns:
   request above it is refused with both numbers named rather than clamped;
   per-shard deadlines and hedged replica retries bound tail latency
 
-TODO: the public search API is not final. Facets, categories, paging,
-aggregations, and a stable external query surface are all open. What exists
-today is the internal gRPC surface the console and pipelines use.
+The public `Query` API owns selection, boosts, generic scoring, projections,
+and paging. `QueryStream` runs that same contract while exposing replacement
+revisions from exact lexical and dense collectors. Its last successful
+revision is bit-identical to unary `Query`; a separate terminal message says
+whether every shard completed and carries the observed score-space
+fingerprints. Facets, categories, and broader aggregation vocabulary can grow
+without weakening that completion rule.
 
 ## 5. Search nodes
 
@@ -174,9 +184,11 @@ A node serves one or more shards, and a shard is a pair of files: a `.tv`
 vector index owned by the turbovec library, and a `.bm25` lexical index
 owned by us, side by side on disk and covering the same documents. The node
 wraps both behind one gRPC service. For vector queries it runs the engine's
-streaming scan and emits candidates above the current floor. For lexical
-queries it scores BM25 with per-field weights and the same floor-seeding
-idea. Ingestion also lands here: documents arrive over a stream, each
+streaming scan and emits candidates above the current floor. For ordinary
+lexical queries it runs flat or fused multi-field block-max BM25, emits compact
+candidates, adopts inclusive live-floor raises, and finishes with a completion
+certificate plus scoring fingerprint. Phrase-aware lexical scoring currently
+uses the unary exact route. Ingestion also lands here: documents arrive over a stream, each
 field's text goes to the configured native or OpenNLP analyzer, and the
 returned terms are written into the lexical index while embeddings land in
 the vector index. A write-ahead log makes ingestion restartable.
@@ -300,9 +312,10 @@ first one badly.
 ## 9. Protocols, briefly
 
 Everything speaks gRPC except the one UDP lane. Client to coordinator is
-the SearchService: search, BM25 search, hybrid search, variant search, and
-ingest administration. Coordinator to node is the NodeService: the
-streaming search protocol with its floor relay, lexical queries, rescoring,
+the SearchService: public query and query stream, search, BM25 search, hybrid
+search, variant search, and ingest administration. Coordinator to node is the
+NodeService: vector and lexical candidate streams with their floor relays,
+rescoring,
 document ingestion, and snapshot install. Node and coordinator to sidecar
 is the analysis stream. The UDP signal lane shares the node's listen address
 and carries typed monotonic floor hints or advisory cancellation. The same

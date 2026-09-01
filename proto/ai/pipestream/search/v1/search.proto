@@ -210,18 +210,23 @@ service NodeService {
   // inflate a score by stacking overlapping evidence.
   rpc Bm25PhraseQuery(Bm25PhraseQueryRequest) returns (Bm25QueryResponse);
 
-  // Bm25Query with a mid-scan floor relay — the lexical twin of
-  // SearchShard (docs/block-max.md, "the floor is already plumbed").
+  // Bm25Query with a mid-scan candidate and floor relay — the lexical
+  // twin of StreamSearch (docs/block-max.md).
   // The first client message must be `start`; later messages raise the
-  // shard's score floor, applied at the scorer's next loop iteration.
-  // The shard emits its running k-th best (one f32 ULP down, the same
-  // emission-safe seed `kth_best` carries) as its heap rises, and ends
-  // the stream with exactly one `done` carrying the same response the
-  // unary RPC would have produced. Exactness is the seeded-floor
-  // contract delivered mid-scan: every relayed floor is a proven lower
-  // bound on the final global k-th best, block-max converts it into
-  // blocks never read, and ties at the floor survive. The fused
-  // multi-field route accepts the RPC but does not consume floors yet.
+  // shard's score floor, applied at the scorer's next loop iteration;
+  // Stop requests cancellation. The block-max scorer emits every fully
+  // evaluated candidate at or above the floor in compact batches; an
+  // exhaustive compatibility scorer may emit its complete local top-k
+  // frontier after scoring, which is sufficient for exact global top-k.
+  // The coordinator owns the authoritative global heap and relays its
+  // emission-safe k-th floor back to every shard. The terminal completion carries the same
+  // local top-k detail response as unary Bm25Query, which supplies offsets,
+  // projections, facets, and column handshakes without attaching those
+  // large values to every transient candidate. A result is exact only when
+  // every shard returns completed=true with the same scoring fingerprint.
+  // Cancellation, deadline, transport loss, or a missing shard therefore
+  // cannot be mistaken for a partial success. Flat and fused multi-field
+  // block-max scorers both consume the live inclusive floor.
   rpc Bm25QueryStream(stream Bm25QueryStreamRequest) returns (stream Bm25QueryStreamResponse);
 
   // Reads raw document texts from the shard's doc store (the highlight
@@ -401,6 +406,19 @@ service SearchService {
   // composite scorer, profile timings — is refused by name until its
   // ordinary engine path exists.
   rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Streaming form of Query. Revisions are complete replacement snapshots,
+  // not patches: revision numbers strictly increase, hits carry their full
+  // deterministic order, and a slower client may safely skip intermediate
+  // revisions. Lexical and dense candidate collectors publish while their
+  // exact global heaps are still moving; composite routes may additionally
+  // publish each raw leg before the final fused order. The last message is
+  // exactly one QueryStreamCompletion. Its result is usable only when
+  // completed=true. Client cancellation drops the execution future and its
+  // underlying shard streams; timeout, shard failure, analyzer drift, or an
+  // incomplete provider certificate produces completed=false, never a
+  // partial success disguised as a short result.
+  rpc QueryStream(QueryStreamRequest) returns (stream QueryStreamResponse);
 
   // Descriptor-derived mappings, dry-run increment
   // (docs/descriptor-mappings.md): derive the deterministic,
@@ -879,6 +897,9 @@ message StreamSearchSummary {
   // would otherwise read as an honest empty result set.
   repeated bool geo_columns_known = 5;
   repeated bool filter_columns_known = 6;
+  // Provider score-space identity for this exact generation. Every shard in
+  // one successful stream must report the same non-empty fingerprint.
+  string scoring_fingerprint = 7;
 }
 
 enum VectorScoreDirection {
@@ -2167,7 +2188,41 @@ message Bm25QueryStreamRequest {
     // non-raises. Values are emission-safe seeds (one f32 ULP below a
     // true k-th best), so ties at the floor survive by construction.
     FloorUpdate floor_update = 2;
+    // Authoritative cancellation. A stopped shard may emit one terminal
+    // completion with completed=false, but its response is never usable.
+    StopBm25Query stop = 3;
   }
+}
+
+message StopBm25Query {}
+
+// Packed lexical candidates sufficient to reconstruct this shard's possible
+// contribution to global top-k. Each record is exactly 12 little-endian bytes:
+// `u64 global_doc_id | f32 score`. Scores already include any certified
+// score-function chain. A batch contains no offsets or projected values;
+// those ride the terminal local top-k response only.
+message Bm25CandidateBatch {
+  bytes candidates = 1;
+}
+
+// Terminal certificate for one lexical shard scan.
+message Bm25StreamCompletion {
+  // True only when the entire shard was searched under the monotone floor
+  // contract. False after Stop or local cancellation. A coordinator must
+  // reject the whole query unless every configured shard says true.
+  bool completed = 1;
+  // The ordinary local response, present exactly when completed=true and
+  // used to enrich the winning global heap entries with offsets,
+  // projections, facets, and known-column flags.
+  Bm25QueryResponse response = 2;
+  // SHA-256 identity of the BM25 score space: analyzed terms/field order,
+  // global statistics, k1/b, field weights/fingerprints, and score stages.
+  // k, min_score, filters, projections, and stats epochs do not change a
+  // score and are deliberately excluded. Every shard must report the same
+  // non-empty value.
+  string scoring_fingerprint = 3;
+  // Number of packed candidate records emitted on this stream.
+  uint64 candidates_emitted = 4;
 }
 
 // One message on the shard-to-client leg of `Bm25QueryStream`.
@@ -2176,9 +2231,13 @@ message Bm25QueryStreamResponse {
     // The shard's running k-th best, one f32 ULP down (`floor_seed`),
     // emitted as the local heap rises. Monotone within a stream.
     FloorUpdate floor_update = 1;
-    // Terminal message, exactly one per stream: the same response the
-    // unary Bm25Query would have returned.
+    // Deprecated pre-certificate terminal shape. New servers never emit it;
+    // new coordinators reject it because it cannot prove scan completion.
     Bm25QueryResponse done = 2;
+    // Compact scored candidates as the scan progresses.
+    Bm25CandidateBatch candidate_batch = 3;
+    // Terminal message, exactly one per stream.
+    Bm25StreamCompletion completion = 4;
   }
 }
 
@@ -3600,6 +3659,72 @@ message QueryResponse {
   string next_cursor = 4;
   // Phase timings, present exactly when the request set `profile`.
   QueryProfile profile = 5;
+}
+
+// Public streaming query controls. The query itself is byte-for-byte the
+// ordinary Query contract and the terminal successful response is exactly
+// what Query would return.
+message QueryStreamRequest {
+  QueryRequest query = 1;
+  // Whole-query deadline from stream acceptance through terminal completion.
+  // 0 means no additional deadline beyond transport and shard limits.
+  uint64 timeout_ms = 2;
+}
+
+enum QueryStreamPhase {
+  QUERY_STREAM_PHASE_UNSPECIFIED = 0;
+  QUERY_STREAM_PHASE_ACCEPTED = 1;
+  QUERY_STREAM_PHASE_LEXICAL = 2;
+  QUERY_STREAM_PHASE_DENSE = 3;
+  QUERY_STREAM_PHASE_HYBRID = 4;
+  QUERY_STREAM_PHASE_FINAL = 5;
+}
+
+// One provisional ranked hit. It deliberately carries only stable identity
+// and score: highlights, projections, boosts, and scorer dimensions become
+// authoritative in the terminal QueryResponse after their phases complete.
+message QueryStreamHit {
+  uint64 doc_id = 1;
+  float score = 2;
+  uint32 rank = 3;
+}
+
+// A complete replacement snapshot. Clients apply the greatest revision they
+// have seen and discard older ones; no patch replay or arrival-order merge is
+// required. `content_fingerprint` hashes phase plus ordered (id, score-bits)
+// rows, making duplicate snapshots and deterministic retries observable.
+message QueryStreamRevision {
+  uint64 revision = 1;
+  QueryStreamPhase phase = 2;
+  repeated QueryStreamHit hits = 3;
+  string content_fingerprint = 4;
+  // Score-space identity when the collector has certified it. Empty on the
+  // accepted revision and on a provisional collector awaiting completions.
+  string scoring_fingerprint = 5;
+}
+
+// The only terminal shape. `response` is present exactly on success.
+message QueryStreamCompletion {
+  bool completed = 1;
+  QueryResponse response = 2;
+  // Last emitted revision. A successful completion is itself represented by
+  // a FINAL revision immediately before this certificate.
+  uint64 final_revision = 3;
+  // Distinct lexical/vector score-space identities observed during the run,
+  // sorted lexicographically for a stable wire representation.
+  repeated string scoring_fingerprints = 4;
+  // Canonical tonic code number and message when completed=false; both empty
+  // on success. The stream remains well-formed and terminal even on deadline
+  // or shard failure, so clients never infer completeness from EOF.
+  uint32 error_code = 5;
+  string error_message = 6;
+}
+
+message QueryStreamResponse {
+  oneof payload {
+    QueryStreamRevision revision = 1;
+    QueryStreamCompletion completion = 2;
+  }
 }
 
 // Where the request's time went, by adapter phase. Purely

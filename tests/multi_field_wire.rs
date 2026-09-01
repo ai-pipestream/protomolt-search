@@ -308,6 +308,9 @@ async fn fused_distributed_equals_monolithic_over_the_wire() {
     }
     let resident = CoordinatorServiceImpl::new(r_addrs.clone())
         .with_bm25(Some(analysis.clone()), Default::default());
+    let resident_streamed = CoordinatorServiceImpl::new(r_addrs.clone())
+        .with_bm25(Some(analysis.clone()), Default::default())
+        .with_bm25_stream(true);
     let mut i = 0;
     for text in queries {
         for k in [3u32, 6] {
@@ -319,6 +322,15 @@ async fn fused_distributed_equals_monolithic_over_the_wire() {
                 hit_signature(&got),
                 hit_signature(&heap_runs[i]),
                 "resident (pruned) shape diverged from heap shape: {text:?} k={k}"
+            );
+            let streamed = resident_streamed
+                .fanout_bm25_fused(text, k, &query_fields(2.0), 0.0)
+                .await
+                .unwrap();
+            assert_eq!(
+                hit_signature(&streamed),
+                hit_signature(&got),
+                "fused candidate stream diverged from unary: {text:?} k={k}"
             );
             i += 1;
         }

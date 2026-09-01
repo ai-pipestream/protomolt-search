@@ -666,6 +666,16 @@ pub struct PruneStats {
 /// the seeded-floor contract, delivered while the scan runs.
 pub type LiveFloorHook<'a> = &'a mut dyn FnMut(Option<f32>) -> Option<f32>;
 
+/// Compact candidate emission for the coordinator-owned lexical heap.
+/// On the block-max path, called for every fully evaluated, filter-admitted
+/// document whose final score is at or above the live inclusive floor.
+/// Exhaustive compatibility fallbacks may publish their complete local top-k
+/// frontier after scoring; that frontier is sufficient because no global
+/// top-k winner can fall outside its shard's top-k. The local scorer retains
+/// the same frontier so the terminal response can enrich global winners with
+/// offsets and projections without putting those values on the hot stream.
+pub type CandidateHook<'a> = &'a mut dyn FnMut(u32, f32);
+
 /// One heap entry: a candidate and the query-term membership mask.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HeapEntry {
@@ -850,7 +860,30 @@ pub fn top_k_pruned_chained_filtered_stats_live(
     chain: ChainCtx,
     filter: FilterCtx,
     prune: &mut PruneStats,
+    live: Option<LiveFloorHook>,
+) -> Vec<ScoredDoc> {
+    top_k_pruned_chained_filtered_stats_streaming(
+        store, terms, stats, params, k, floor, chain, filter, prune, live, None,
+    )
+}
+
+/// [`top_k_pruned_chained_filtered_stats_live`] plus compact candidate
+/// emission for the coordinator-owned global heap. Candidate delivery does
+/// not participate in scoring or cursor movement, so a silent sink is
+/// bit-identical to the ordinary live scorer.
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_pruned_chained_filtered_stats_streaming(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    floor: f64,
+    chain: ChainCtx,
+    filter: FilterCtx,
+    prune: &mut PruneStats,
     mut live: Option<LiveFloorHook>,
+    mut candidate: Option<CandidateHook>,
 ) -> Vec<ScoredDoc> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     let mut floor = floor;
@@ -918,10 +951,16 @@ pub fn top_k_pruned_chained_filtered_stats_live(
     }
     let mut state: Vec<TermState> = Vec::new();
     if terms.len() > 128 {
-        return filter_to_floor(
+        let docs = filter_to_floor(
             top_k_chained_filtered(store, terms, stats, params, k, chain, filter),
             floor,
         );
+        if let Some(sink) = candidate.as_mut() {
+            for doc in &docs {
+                sink(doc.doc_id, doc.score as f32);
+            }
+        }
+        return docs;
     }
     for (ti, term) in terms.iter().enumerate() {
         // A term absent from THIS shard contributes 0 to every document
@@ -940,10 +979,16 @@ pub fn top_k_pruned_chained_filtered_stats_live(
         let Some(cursor) = store.impacts(term) else {
             // Present here but no impact surface: a genuine format
             // limitation, and the only case that still forfeits pruning.
-            return filter_to_floor(
+            let docs = filter_to_floor(
                 top_k_chained_filtered(store, terms, stats, params, k, chain, filter),
                 floor,
             );
+            if let Some(sink) = candidate.as_mut() {
+                for doc in &docs {
+                    sink(doc.doc_id, doc.score as f32);
+                }
+            }
+            return docs;
         };
         let idf = idf(stats.doc_count, stats.dfs[ti]);
         let l1_max = idf
@@ -1204,15 +1249,20 @@ pub fn top_k_pruned_chained_filtered_stats_live(
         // fully evaluated candidate (it was scored, and the counters
         // above say so); it simply never enters the heap, and the
         // cursor advance below runs for it unchanged.
-        if passes(filter, doc) && score >= floor && (!heap_full || score > kth) {
-            if heap_full {
-                heap.pop();
+        if passes(filter, doc) && score >= floor {
+            if let Some(sink) = candidate.as_mut() {
+                sink(doc, score as f32);
             }
-            heap.push(HeapEntry {
-                score,
-                doc_id: doc,
-                mask,
-            });
+            if !heap_full || score > kth {
+                if heap_full {
+                    heap.pop();
+                }
+                heap.push(HeapEntry {
+                    score,
+                    doc_id: doc,
+                    mask,
+                });
+            }
         }
         for ts in state.iter_mut() {
             if ts.cursor.doc_id() == doc {
@@ -1316,6 +1366,23 @@ pub fn top_k_fused_pruned_filtered_stats(
     filter: FilterCtx,
     prune: &mut PruneStats,
 ) -> Vec<FusedDoc> {
+    top_k_fused_pruned_filtered_stats_streaming(fields, k, floor, filter, prune, None, None)
+}
+
+/// Fused multi-field block-max scoring with the same live floor exchange and
+/// compact candidate stream as the flat scorer. Every floor and score is on
+/// the fused final scale; the pinned field/term accumulation order remains
+/// unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn top_k_fused_pruned_filtered_stats_streaming(
+    fields: &[FieldQuery],
+    k: usize,
+    floor: f64,
+    filter: FilterCtx,
+    prune: &mut PruneStats,
+    mut live: Option<LiveFloorHook>,
+    mut candidate: Option<CandidateHook>,
+) -> Vec<FusedDoc> {
     // The pinned accumulation order: oi enumerates (field id, term
     // index) lexicographically.
     let pair_meta: Vec<(usize, usize)> = fields
@@ -1329,7 +1396,13 @@ pub fn top_k_fused_pruned_filtered_stats(
             .iter()
             .any(|fq| fq.weight < 0.0 || fq.weight.is_nan())
     {
-        return filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
+        let docs = filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
+        if let Some(sink) = candidate.as_mut() {
+            for doc in &docs {
+                sink(doc.doc_id, doc.score as f32);
+            }
+        }
+        return docs;
     }
 
     // One cursor per scored pair. Any missing impact surface falls the
@@ -1402,10 +1475,14 @@ pub fn top_k_fused_pruned_filtered_stats(
         let Some(cursor) = fq.index.impacts(&fq.terms[ti]) else {
             // Present here but no impact surface: a genuine format
             // limitation, and the only case that still forfeits pruning.
-            return filter_fused_to_floor(
-                top_k_fused_exhaustive_filtered(fields, k, filter),
-                floor,
-            );
+            let docs =
+                filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
+            if let Some(sink) = candidate.as_mut() {
+                for doc in &docs {
+                    sink(doc.doc_id, doc.score as f32);
+                }
+            }
+            return docs;
         };
         let avgdl = fq.stats.avgdl();
         let widf = fq.weight * idf(fq.stats.doc_count, fq.stats.dfs[ti]);
@@ -1436,6 +1513,7 @@ pub fn top_k_fused_pruned_filtered_stats(
         });
     }
 
+    let mut floor = floor;
     let mut heap: std::collections::BinaryHeap<HeapEntry> = std::collections::BinaryHeap::new();
     if k == 0 {
         return Vec::new();
@@ -1462,6 +1540,15 @@ pub fn top_k_fused_pruned_filtered_stats(
         } else {
             f64::NEG_INFINITY
         };
+        if let Some(hook) = live.as_mut() {
+            let seed = heap_full.then(|| floor_seed(kth as f32));
+            if let Some(external) = hook(seed) {
+                let external = f64::from(external);
+                if external > floor {
+                    floor = external;
+                }
+            }
+        }
         // Inert = cannot enter the heap; every bound sum below runs in
         // pinned pair order (see the contract).
         let inert = |acc: f64| acc < floor || (heap_full && acc <= kth);
@@ -1630,15 +1717,20 @@ pub fn top_k_fused_pruned_filtered_stats(
         // Insert on the exact contract: ties at the seed survive,
         // displacement is strictly-greater, and the document must
         // survive every geo filter first (see the flat scorer).
-        if passes(filter, doc) && score >= floor && (!heap_full || score > kth) {
-            if heap_full {
-                heap.pop();
+        if passes(filter, doc) && score >= floor {
+            if let Some(sink) = candidate.as_mut() {
+                sink(doc, score as f32);
             }
-            heap.push(HeapEntry {
-                score,
-                doc_id: doc,
-                mask,
-            });
+            if !heap_full || score > kth {
+                if heap_full {
+                    heap.pop();
+                }
+                heap.push(HeapEntry {
+                    score,
+                    doc_id: doc,
+                    mask,
+                });
+            }
         }
         for ps in state.iter_mut() {
             if ps.cursor.doc_id() == doc {

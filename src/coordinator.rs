@@ -43,6 +43,61 @@ use crate::pb::{
 use crate::pb::{stream_search_request, stream_search_response};
 use crate::rankdiff;
 
+#[derive(Clone, Debug, PartialEq)]
+struct QueryProgress {
+    phase: crate::pb::QueryStreamPhase,
+    hits: Vec<(u64, f32)>,
+    scoring_fingerprint: String,
+}
+
+fn query_stream_content_fingerprint(
+    phase: crate::pb::QueryStreamPhase,
+    hits: &[(u64, f32)],
+) -> String {
+    let mut bytes = Vec::with_capacity(32 + hits.len() * 12);
+    bytes.extend_from_slice(b"protomolt-query-revision-v1\0");
+    bytes.extend_from_slice(&(phase as i32).to_le_bytes());
+    for &(id, score) in hits {
+        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&score.to_bits().to_le_bytes());
+    }
+    crate::sha256::hex_digest(&bytes)
+}
+
+fn query_stream_revision(
+    revision: u64,
+    phase: crate::pb::QueryStreamPhase,
+    hits: Vec<(u64, f32)>,
+    scoring_fingerprint: String,
+) -> crate::pb::QueryStreamRevision {
+    let content_fingerprint = query_stream_content_fingerprint(phase, &hits);
+    crate::pb::QueryStreamRevision {
+        revision,
+        phase: phase as i32,
+        hits: hits
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (doc_id, score))| crate::pb::QueryStreamHit {
+                doc_id,
+                score,
+                rank: rank as u32 + 1,
+            })
+            .collect(),
+        content_fingerprint,
+        scoring_fingerprint,
+    }
+}
+
+fn combined_scoring_fingerprint(fingerprints: &[String], request_fallback: &str) -> String {
+    if fingerprints.is_empty() {
+        return request_fallback.to_string();
+    }
+    let mut canonical = fingerprints.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    crate::sha256::hex_digest(canonical.join("\0").as_bytes())
+}
+
 /// Process-unique request id counter for coordinator-assigned ids.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -104,11 +159,12 @@ pub struct CoordinatorServiceImpl {
     /// Serve `SearchService.Search` over the streaming protocol
     /// (`fanout_stream_search`) instead of the per-shard top-k fan-out.
     stream_search: bool,
-    /// Run the flat `Bm25Search` fan-out over the `Bm25QueryStream`
-    /// floor relay instead of the unary Bm25Query round. Identical
-    /// results (the relay only delivers the seeded-floor contract
-    /// mid-scan); block-max converts each relayed raise into blocks
-    /// never read (docs/block-max.md).
+    /// Run `Bm25Search` over the exact `Bm25QueryStream` candidate
+    /// protocol instead of the unary per-shard top-k round. The
+    /// coordinator owns the only authoritative global heap, relays its
+    /// emission-safe floor, and accepts a result only after every shard
+    /// supplies a matching score-space fingerprint and completion
+    /// certificate (docs/block-max.md).
     bm25_stream: bool,
     /// Hard upper bound on any client-facing `k`. A request above it is
     /// refused (never clamped), and a request that omits `k` (proto3 0)
@@ -132,6 +188,10 @@ pub struct CoordinatorServiceImpl {
     clustered_vectors: Option<ClusteredTurboVecBackend>,
     /// Product-owned phrase vocabulary used to derive canonical query terms.
     phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
+    /// Request-local observer installed only by public QueryStream. A watch
+    /// cell intentionally conflates intermediate snapshots: every revision
+    /// is a full replacement, so a slow client only needs the newest one.
+    query_progress: Option<watch::Sender<Option<QueryProgress>>>,
 }
 
 /// A process-unique, well-mixed stream token for the UDP signal lane
@@ -159,18 +219,31 @@ fn is_stale_stats(status: &Status) -> bool {
         && status.message().starts_with(crate::node::STALE_STATS_EPOCH)
 }
 
-/// One shard's leg of the streaming lexical fan-out (`Bm25QueryStream`,
-/// docs/block-max.md): opens the stream with the same request the unary
-/// route sends, folds the shard's published running k-th bests into the
-/// query's conflated global floor cell (monotone max), forwards raises
-/// of that cell back down, and returns the terminal response — which is
-/// exactly the unary response, so the caller's merge is unchanged.
+struct Bm25StreamHeap {
+    heap: std::collections::BinaryHeap<StreamHeapEntry>,
+    floors_sent: u64,
+    progress: Option<watch::Sender<Option<QueryProgress>>>,
+}
+
+struct Bm25StreamShardResult {
+    response: Bm25QueryResponse,
+    scoring_fingerprint: String,
+}
+
+/// One shard's leg of the exact lexical candidate stream. Compact
+/// candidates feed the coordinator-owned global heap immediately; its
+/// emission-safe k-th score shares the same conflated watch cell as local
+/// shard floors. The terminal completion supplies rich local top-k details
+/// for the global winners and certifies that the whole shard was scanned.
 async fn stream_bm25_shard(
+    shard: u32,
+    k: usize,
     mut client: NodeServiceClient<Channel>,
     request: Bm25QueryRequest,
     floor_tx: Arc<watch::Sender<f32>>,
     mut floor_rx: watch::Receiver<f32>,
-) -> Result<Bm25QueryResponse, Status> {
+    global_heap: Arc<Mutex<Bm25StreamHeap>>,
+) -> Result<Bm25StreamShardResult, Status> {
     let (out_tx, out_rx) = mpsc::channel::<Bm25QueryStreamRequest>(8);
     out_tx
         .send(Bm25QueryStreamRequest {
@@ -182,6 +255,7 @@ async fn stream_bm25_shard(
         .bm25_query_stream(ReceiverStream::new(out_rx))
         .await?
         .into_inner();
+    let control_tx = out_tx.clone();
     // Forward only raises above what this stream last saw. Conflation
     // is the watch cell itself: a burst of raises collapses to whatever
     // is newest when the forwarder wakes, and a dropped intermediate
@@ -203,6 +277,7 @@ async fn stream_bm25_shard(
             }
         }
     });
+    let mut received = 0u64;
     let result = loop {
         match inbound.message().await {
             Ok(Some(Bm25QueryStreamResponse {
@@ -218,14 +293,139 @@ async fn stream_bm25_shard(
                 });
             }
             Ok(Some(Bm25QueryStreamResponse {
-                payload: Some(bm25_query_stream_response::Payload::Done(done)),
-            })) => break Ok(done),
+                payload: Some(bm25_query_stream_response::Payload::CandidateBatch(batch)),
+            })) => {
+                if batch.candidates.len() % 12 != 0 {
+                    break Err(Status::data_loss(format!(
+                        "shard {shard}: BM25 candidate batch has {} bytes, not 12-byte records",
+                        batch.candidates.len()
+                    )));
+                }
+                if batch.candidates.chunks_exact(12).any(|rec| {
+                    !f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score")).is_finite()
+                }) {
+                    break Err(Status::data_loss(format!(
+                        "shard {shard}: BM25 candidate batch contains a non-finite score"
+                    )));
+                }
+                received += (batch.candidates.len() / 12) as u64;
+                let mut state = global_heap.lock().expect("BM25 stream heap poisoned");
+                let mut raised = None;
+                for rec in batch.candidates.chunks_exact(12) {
+                    if k == 0 {
+                        continue;
+                    }
+                    let entry = StreamHeapEntry(MergedHit {
+                        vector_id: u64::from_le_bytes(rec[..8].try_into().expect("8-byte id")),
+                        shard,
+                        score: f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score")),
+                    });
+                    if state.heap.len() < k {
+                        state.heap.push(entry);
+                    } else if cmp_hits(&entry.0, &state.heap.peek().expect("heap is full").0)
+                        == std::cmp::Ordering::Less
+                    {
+                        state.heap.pop();
+                        state.heap.push(entry);
+                    }
+                }
+                if state.heap.len() == k {
+                    let floor =
+                        crate::bm25::floor_seed(state.heap.peek().expect("heap is full").0.score);
+                    if floor > *floor_tx.borrow() {
+                        state.floors_sent += 1;
+                        raised = Some(floor);
+                    }
+                }
+                let progress = state.progress.clone();
+                let mut snapshot: Vec<(u64, f32)> = state
+                    .heap
+                    .iter()
+                    .map(|entry| (entry.0.vector_id, entry.0.score))
+                    .collect();
+                snapshot.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                drop(state);
+                if let Some(progress) = progress {
+                    let next = QueryProgress {
+                        phase: crate::pb::QueryStreamPhase::Lexical,
+                        hits: snapshot,
+                        scoring_fingerprint: String::new(),
+                    };
+                    progress.send_if_modified(|current| {
+                        if current.as_ref() == Some(&next) {
+                            false
+                        } else {
+                            *current = Some(next);
+                            true
+                        }
+                    });
+                }
+                if let Some(floor) = raised {
+                    floor_tx.send_if_modified(|cur| {
+                        if floor > *cur {
+                            *cur = floor;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+            }
+            Ok(Some(Bm25QueryStreamResponse {
+                payload: Some(bm25_query_stream_response::Payload::Completion(completion)),
+            })) => {
+                if !completion.completed {
+                    break Err(Status::cancelled(format!(
+                        "shard {shard}: BM25 scan did not complete"
+                    )));
+                }
+                if completion.scoring_fingerprint.is_empty() {
+                    break Err(Status::data_loss(format!(
+                        "shard {shard}: BM25 completion omitted scoring fingerprint"
+                    )));
+                }
+                if completion.candidates_emitted != received {
+                    break Err(Status::data_loss(format!(
+                        "shard {shard}: completion counted {} candidates but {} arrived",
+                        completion.candidates_emitted, received
+                    )));
+                }
+                let Some(response) = completion.response else {
+                    break Err(Status::data_loss(format!(
+                        "shard {shard}: BM25 completion omitted its response"
+                    )));
+                };
+                break Ok(Bm25StreamShardResult {
+                    response,
+                    scoring_fingerprint: completion.scoring_fingerprint,
+                });
+            }
+            Ok(Some(Bm25QueryStreamResponse {
+                payload: Some(bm25_query_stream_response::Payload::Done(_)),
+            })) => {
+                break Err(Status::failed_precondition(format!(
+                    "shard {shard}: BM25 stream used the obsolete uncertified terminal response"
+                )));
+            }
             // Empty payload: ignore (forward compatibility).
             Ok(Some(_)) => {}
-            Ok(None) => break Err(Status::internal("bm25 stream ended without a done message")),
+            Ok(None) => {
+                break Err(Status::data_loss(format!(
+                    "shard {shard}: BM25 stream ended without a completion certificate"
+                )))
+            }
             Err(e) => break Err(e),
         }
     };
+    if result.is_err() {
+        let _ = control_tx
+            .send(Bm25QueryStreamRequest {
+                payload: Some(bm25_query_stream_request::Payload::Stop(
+                    crate::pb::StopBm25Query {},
+                )),
+            })
+            .await;
+    }
     forwarder.abort();
     result
 }
@@ -1143,6 +1343,7 @@ impl CoordinatorServiceImpl {
             stats_cache,
             clustered_vectors: None,
             phrase_index: None,
+            query_progress: None,
         }
     }
 
@@ -1209,6 +1410,36 @@ impl CoordinatorServiceImpl {
     pub fn with_bm25_stream(mut self, on: bool) -> Self {
         self.bm25_stream = on;
         self
+    }
+
+    fn with_query_progress(mut self, progress: watch::Sender<Option<QueryProgress>>) -> Self {
+        self.query_progress = Some(progress);
+        self
+    }
+
+    fn publish_progress(
+        &self,
+        phase: crate::pb::QueryStreamPhase,
+        mut hits: Vec<(u64, f32)>,
+        scoring_fingerprint: impl Into<String>,
+    ) {
+        let Some(progress) = self.query_progress.as_ref() else {
+            return;
+        };
+        hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let next = QueryProgress {
+            phase,
+            hits,
+            scoring_fingerprint: scoring_fingerprint.into(),
+        };
+        progress.send_if_modified(|current| {
+            if current.as_ref() == Some(&next) {
+                false
+            } else {
+                *current = Some(next);
+                true
+            }
+        });
     }
 
     /// Set the hard cap on client-facing `k` (also the depth a request
@@ -1490,6 +1721,9 @@ impl CoordinatorServiceImpl {
         cardinality_fields: &[String],
         projections: &[crate::pb::CompiledProjection],
     ) -> Result<AggregatedHits, Status> {
+        if self.node_addrs.is_empty() {
+            return Err(Status::failed_precondition("no shard nodes configured"));
+        }
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
         // The streaming route's relay state: one conflated global floor
         // cell per query, seeded with the client floor. Shards' published
@@ -1500,6 +1734,13 @@ impl CoordinatorServiceImpl {
             .bm25_stream
             .then(|| watch::channel(min_score))
             .map(|(tx, rx)| (Arc::new(tx), rx));
+        let stream_heap = self.bm25_stream.then(|| {
+            Arc::new(Mutex::new(Bm25StreamHeap {
+                heap: std::collections::BinaryHeap::with_capacity(k as usize + 1),
+                floors_sent: 0,
+                progress: self.query_progress.clone(),
+            }))
+        });
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
                 projections: projections.to_vec(),
@@ -1524,23 +1765,43 @@ impl CoordinatorServiceImpl {
             };
             let mut client = self.node_client(node)?;
             if let Some((floor_tx, floor_rx)) = relay.clone() {
+                let global_heap = Arc::clone(stream_heap.as_ref().expect("relay has heap"));
+                let deadline = self.limits.shard_deadline;
                 query_tasks.push(tokio::spawn(async move {
-                    stream_bm25_shard(client, request, floor_tx, floor_rx)
-                        .await
-                        .map(|r| {
-                            (
-                                shard as u32,
-                                r.hits,
-                                r.facets,
-                                r.range_facets,
-                                r.stage_columns_known,
-                                r.geo_columns_known,
-                                r.filter_columns_known,
-                                r.stats,
-                                r.distinct,
-                                r.projection_leaves_known,
-                            )
-                        })
+                    let run = stream_bm25_shard(
+                        shard as u32,
+                        k as usize,
+                        client,
+                        request,
+                        floor_tx,
+                        floor_rx,
+                        global_heap,
+                    );
+                    let result = match deadline {
+                        Some(limit) => tokio::time::timeout(limit, run).await.map_err(|_| {
+                            Status::deadline_exceeded(format!(
+                                "BM25 shard {shard} exceeded its {}ms deadline",
+                                limit.as_millis()
+                            ))
+                        })?,
+                        None => run.await,
+                    };
+                    result.map(|r| {
+                        let response = r.response;
+                        (
+                            shard as u32,
+                            response.hits,
+                            response.facets,
+                            response.range_facets,
+                            response.stage_columns_known,
+                            response.geo_columns_known,
+                            response.filter_columns_known,
+                            response.stats,
+                            response.distinct,
+                            response.projection_leaves_known,
+                            Some(r.scoring_fingerprint),
+                        )
+                    })
                 }));
                 continue;
             }
@@ -1558,6 +1819,7 @@ impl CoordinatorServiceImpl {
                         r.stats,
                         r.distinct,
                         r.projection_leaves_known,
+                        None,
                     )
                 })
             }));
@@ -1583,10 +1845,34 @@ impl CoordinatorServiceImpl {
         let mut projection_known = vec![false; projection_leaves.len()];
         let mut shard_stats: Vec<Vec<crate::pb::ColumnStats>> = Vec::new();
         let mut shard_distinct: Vec<Vec<crate::pb::FacetDistinct>> = Vec::new();
+        let mut scoring_fingerprint: Option<String> = None;
         for task in query_tasks {
-            let (shard, hits, facets, ranges, known, geo, fknown, sstats, sdistinct, pknown) = task
+            let (
+                shard,
+                hits,
+                facets,
+                ranges,
+                known,
+                geo,
+                fknown,
+                sstats,
+                sdistinct,
+                pknown,
+                fingerprint,
+            ) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            if let Some(fingerprint) = fingerprint {
+                match scoring_fingerprint.as_ref() {
+                    Some(expected) if expected != &fingerprint => {
+                        return Err(Status::failed_precondition(format!(
+                            "BM25 shard {shard} scoring fingerprint {fingerprint} differs from {expected}"
+                        )));
+                    }
+                    None => scoring_fingerprint = Some(fingerprint),
+                    _ => {}
+                }
+            }
             if pknown.len() != projection_leaves.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} projection-leaf flags for {} leaves",
@@ -1696,13 +1982,63 @@ impl CoordinatorServiceImpl {
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         let stats = merge_column_stats(stats_fields, &shard_stats)?;
         let cardinality = merge_cardinality(cardinality_fields, &shard_distinct)?;
-        all.sort_by(|(sa, a), (sb, b)| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| sa.cmp(sb))
-                .then_with(|| a.doc_id.cmp(&b.doc_id))
-        });
-        all.truncate(k as usize);
+        if let (Some(heap), Some(fingerprint)) = (&stream_heap, scoring_fingerprint.as_ref()) {
+            let snapshot = heap
+                .lock()
+                .expect("BM25 stream heap poisoned")
+                .heap
+                .iter()
+                .map(|entry| (entry.0.vector_id, entry.0.score))
+                .collect();
+            self.publish_progress(
+                crate::pb::QueryStreamPhase::Lexical,
+                snapshot,
+                fingerprint.clone(),
+            );
+        }
+        if let Some(stream_heap) = stream_heap {
+            let winners: Vec<MergedHit> = {
+                let state = stream_heap.lock().expect("BM25 stream heap poisoned");
+                let mut winners: Vec<MergedHit> = state.heap.iter().map(|entry| entry.0).collect();
+                winners.sort_by(cmp_hits);
+                winners
+            };
+            let mut details: HashMap<(u32, u64), Bm25Hit> = all
+                .drain(..)
+                .map(|(shard, hit)| ((shard, hit.doc_id), hit))
+                .collect();
+            all = winners
+                .into_iter()
+                .map(|winner| {
+                    let hit = details
+                        .remove(&(winner.shard, winner.vector_id))
+                        .ok_or_else(|| {
+                            Status::data_loss(format!(
+                                "BM25 global winner {} from shard {} was absent from its certified local top-k",
+                                winner.vector_id, winner.shard
+                            ))
+                        })?;
+                    if hit.score.to_bits() != winner.score.to_bits() {
+                        return Err(Status::data_loss(format!(
+                            "BM25 global winner {} from shard {} changed score from {:?} in the candidate stream to {:?} in the certified response",
+                            winner.vector_id,
+                            winner.shard,
+                            winner.score,
+                            hit.score
+                        )));
+                    }
+                    Ok((winner.shard, hit))
+                })
+                .collect::<Result<_, _>>()?;
+        } else {
+            all.sort_by(|(sa, a), (sb, b)| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| sa.cmp(sb))
+                    .then_with(|| a.doc_id.cmp(&b.doc_id))
+            });
+            all.truncate(k as usize);
+        }
         Ok((
             all.into_iter().map(|(_, h)| h).collect(),
             facets,
@@ -2205,6 +2541,17 @@ impl CoordinatorServiceImpl {
             }
         }
         let mut query_tasks = Vec::with_capacity(self.node_addrs.len());
+        let stream_enabled = self.bm25_stream && phrase.is_none();
+        let relay = stream_enabled
+            .then(|| watch::channel(min_score))
+            .map(|(tx, rx)| (Arc::new(tx), rx));
+        let stream_heap = stream_enabled.then(|| {
+            Arc::new(Mutex::new(Bm25StreamHeap {
+                heap: std::collections::BinaryHeap::with_capacity(k as usize + 1),
+                floors_sent: 0,
+                progress: self.query_progress.clone(),
+            }))
+        });
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
                 projections: Vec::new(),
@@ -2238,6 +2585,43 @@ impl CoordinatorServiceImpl {
                         phrase_term_weights: weights.to_vec(),
                     },
                 );
+            if let Some((floor_tx, floor_rx)) = relay.clone() {
+                let global_heap = Arc::clone(stream_heap.as_ref().expect("relay has heap"));
+                let deadline = self.limits.shard_deadline;
+                query_tasks.push(tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let run = stream_bm25_shard(
+                        shard as u32,
+                        k as usize,
+                        client,
+                        request,
+                        floor_tx,
+                        floor_rx,
+                        global_heap,
+                    );
+                    let result = match deadline {
+                        Some(limit) => tokio::time::timeout(limit, run).await.map_err(|_| {
+                            Status::deadline_exceeded(format!(
+                                "BM25 shard {shard} exceeded its {}ms deadline",
+                                limit.as_millis()
+                            ))
+                        })?,
+                        None => run.await,
+                    }?;
+                    let response = result.response;
+                    Ok::<_, Status>((
+                        shard as u32,
+                        response.hits,
+                        response.facets,
+                        response.range_facets,
+                        response.geo_columns_known,
+                        response.filter_columns_known,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        Some(result.scoring_fingerprint),
+                    ))
+                }));
+                continue;
+            }
             query_tasks.push(tokio::spawn(async move {
                 let started = std::time::Instant::now();
                 let response = match phrase_request {
@@ -2254,6 +2638,7 @@ impl CoordinatorServiceImpl {
                         r.geo_columns_known,
                         r.filter_columns_known,
                         started.elapsed().as_secs_f64() * 1000.0,
+                        None,
                     )
                 })
             }));
@@ -2265,10 +2650,22 @@ impl CoordinatorServiceImpl {
         let mut geo_known = vec![false; geo_filters.len()];
         let filter_leaves = filter.map_or(0, crate::filter::leaf_count);
         let mut filter_known = vec![false; filter_leaves];
+        let mut scoring_fingerprint: Option<String> = None;
         for task in query_tasks {
-            let (shard, hits, facets, ranges, geo, fknown, ms) = task
+            let (shard, hits, facets, ranges, geo, fknown, ms, fingerprint) = task
                 .await
                 .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            if let Some(fingerprint) = fingerprint {
+                match scoring_fingerprint.as_ref() {
+                    Some(expected) if expected != &fingerprint => {
+                        return Err(Status::failed_precondition(format!(
+                            "BM25 shard {shard} scoring fingerprint {fingerprint} differs from {expected}"
+                        )));
+                    }
+                    None => scoring_fingerprint = Some(fingerprint),
+                    _ => {}
+                }
+            }
             per_shard.push((shard, ms));
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
@@ -2298,6 +2695,20 @@ impl CoordinatorServiceImpl {
         refuse_unknown_filter_leaves(filter, &filter_known)?;
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
+        if let (Some(heap), Some(fingerprint)) = (&stream_heap, scoring_fingerprint.as_ref()) {
+            let snapshot = heap
+                .lock()
+                .expect("BM25 stream heap poisoned")
+                .heap
+                .iter()
+                .map(|entry| (entry.0.vector_id, entry.0.score))
+                .collect();
+            self.publish_progress(
+                crate::pb::QueryStreamPhase::Lexical,
+                snapshot,
+                fingerprint.clone(),
+            );
+        }
         let t_query = t0.elapsed();
         if trace {
             eprintln!(
@@ -2309,13 +2720,49 @@ impl CoordinatorServiceImpl {
                     .join(" ")
             );
         }
-        all.sort_by(|(sa, a), (sb, b)| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| sa.cmp(sb))
-                .then_with(|| a.doc_id.cmp(&b.doc_id))
-        });
-        all.truncate(k as usize);
+        if let Some(stream_heap) = stream_heap {
+            let winners: Vec<MergedHit> = {
+                let state = stream_heap.lock().expect("BM25 stream heap poisoned");
+                let mut winners: Vec<MergedHit> = state.heap.iter().map(|entry| entry.0).collect();
+                winners.sort_by(cmp_hits);
+                winners
+            };
+            let mut details: HashMap<(u32, u64), Bm25Hit> = all
+                .drain(..)
+                .map(|(shard, hit)| ((shard, hit.doc_id), hit))
+                .collect();
+            all = winners
+                .into_iter()
+                .map(|winner| {
+                    let hit = details
+                        .remove(&(winner.shard, winner.vector_id))
+                        .ok_or_else(|| {
+                            Status::data_loss(format!(
+                                "BM25 global winner {} from shard {} was absent from its certified local top-k",
+                                winner.vector_id, winner.shard
+                            ))
+                        })?;
+                    if hit.score.to_bits() != winner.score.to_bits() {
+                        return Err(Status::data_loss(format!(
+                            "BM25 global winner {} from shard {} changed score from {:?} in the candidate stream to {:?} in the certified response",
+                            winner.vector_id,
+                            winner.shard,
+                            winner.score,
+                            hit.score
+                        )));
+                    }
+                    Ok((winner.shard, hit))
+                })
+                .collect::<Result<_, _>>()?;
+        } else {
+            all.sort_by(|(sa, a), (sb, b)| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| sa.cmp(sb))
+                    .then_with(|| a.doc_id.cmp(&b.doc_id))
+            });
+            all.truncate(k as usize);
+        }
         if trace {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
@@ -4025,6 +4472,7 @@ impl CoordinatorServiceImpl {
         let mut remaining = n_nodes;
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
         let mut floors_sent = 0u64;
+        let mut scoring_fingerprint: Option<String> = None;
         while remaining > 0 {
             let (shard, msg) = match fanout.next_message(&summaries).await {
                 Ok(Some(pair)) => pair,
@@ -4073,6 +4521,13 @@ impl CoordinatorServiceImpl {
                             self.push_stream_floor(&fanout, floor);
                         }
                     }
+                    self.publish_progress(
+                        crate::pb::QueryStreamPhase::Dense,
+                        heap.iter()
+                            .map(|entry| (entry.0.vector_id, entry.0.score))
+                            .collect(),
+                        scoring_fingerprint.clone().unwrap_or_default(),
+                    );
                 }
                 Some(stream_search_response::Payload::Summary(summary)) => {
                     if !summary.completed {
@@ -4080,6 +4535,23 @@ impl CoordinatorServiceImpl {
                             "shard {shard} stopped before completing its scan"
                         ));
                         return fanout.cancel_with(status).await;
+                    }
+                    if summary.scoring_fingerprint.is_empty() {
+                        let status = Status::failed_precondition(format!(
+                            "shard {shard} completed without a vector scoring fingerprint"
+                        ));
+                        return fanout.cancel_with(status).await;
+                    }
+                    match scoring_fingerprint.as_ref() {
+                        Some(expected) if expected != &summary.scoring_fingerprint => {
+                            let status = Status::failed_precondition(format!(
+                                "shard {shard} vector scoring fingerprint {} differs from {expected}",
+                                summary.scoring_fingerprint
+                            ));
+                            return fanout.cancel_with(status).await;
+                        }
+                        None => scoring_fingerprint = Some(summary.scoring_fingerprint.clone()),
+                        _ => {}
                     }
                     // The vector leg's half of the typo handshake: a
                     // filter column no shard resolves must refuse even
@@ -4098,6 +4570,14 @@ impl CoordinatorServiceImpl {
         }
 
         known.refuse_unknown(filters)?;
+
+        self.publish_progress(
+            crate::pb::QueryStreamPhase::Dense,
+            heap.iter()
+                .map(|entry| (entry.0.vector_id, entry.0.score))
+                .collect(),
+            scoring_fingerprint.unwrap_or_default(),
+        );
 
         let mut all: Vec<MergedHit> = heap.into_iter().map(|e| e.0).collect();
         all.sort_by(cmp_hits);
@@ -5315,6 +5795,13 @@ impl CoordinatorServiceImpl {
                 labels.len()
             )));
         }
+        self.publish_progress(
+            crate::pb::QueryStreamPhase::Dense,
+            heap.iter()
+                .map(|entry| (entry.0.vector_id, entry.0.score))
+                .collect(),
+            completion.scoring_fingerprint.clone(),
+        );
 
         let mut hits = if tie_complete {
             let boundary = heap.peek().map_or(f32::NEG_INFINITY, |entry| entry.0.score);
@@ -6639,6 +7126,8 @@ impl Ord for StreamHeapEntry {
 
 #[tonic::async_trait]
 impl SearchService for CoordinatorServiceImpl {
+    type QueryStreamStream = ReceiverStream<Result<crate::pb::QueryStreamResponse, Status>>;
+
     async fn search(
         &self,
         request: Request<SearchRequest>,
@@ -7065,6 +7554,267 @@ impl SearchService for CoordinatorServiceImpl {
         crate::query::execute(self, request.into_inner())
             .await
             .map(Response::new)
+    }
+
+    async fn query_stream(
+        &self,
+        request: Request<crate::pb::QueryStreamRequest>,
+    ) -> Result<Response<Self::QueryStreamStream>, Status> {
+        let request = request.into_inner();
+        let (tx, rx) = mpsc::channel::<Result<crate::pb::QueryStreamResponse, Status>>(8);
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut revision = 1u64;
+            let accepted = query_stream_revision(
+                revision,
+                crate::pb::QueryStreamPhase::Accepted,
+                Vec::new(),
+                String::new(),
+            );
+            if tx
+                .send(Ok(crate::pb::QueryStreamResponse {
+                    payload: Some(crate::pb::query_stream_response::Payload::Revision(
+                        accepted,
+                    )),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let Some(query) = request.query else {
+                let status = Status::invalid_argument("QueryStream requires query");
+                let _ = tx
+                    .send(Ok(crate::pb::QueryStreamResponse {
+                        payload: Some(crate::pb::query_stream_response::Payload::Completion(
+                            crate::pb::QueryStreamCompletion {
+                                completed: false,
+                                response: None,
+                                final_revision: revision,
+                                scoring_fingerprints: Vec::new(),
+                                error_code: status.code() as u32,
+                                error_message: status.message().to_string(),
+                            },
+                        )),
+                    }))
+                    .await;
+                return;
+            };
+            let request_fingerprint =
+                crate::sha256::hex_digest(&prost::Message::encode_to_vec(&query));
+            let (progress_tx, mut progress_rx) = watch::channel(None);
+            // Public streaming always takes the candidate protocols. The
+            // ordinary Query adapter still owns validation, boosts, scorer,
+            // projection, paging, and final response construction.
+            let runner = service
+                .with_stream_search(true)
+                .with_bm25_stream(true)
+                .with_query_progress(progress_tx);
+            let mut execution = Box::pin(crate::query::execute(&runner, query));
+            let timeout =
+                (request.timeout_ms > 0).then(|| Duration::from_millis(request.timeout_ms));
+            let deadline = async move {
+                match timeout {
+                    Some(duration) => tokio::time::sleep(duration).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(deadline);
+            let mut scoring_fingerprints: Vec<String> = Vec::new();
+            let mut last_content_fingerprint: Option<String> = None;
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => {
+                        // Dropping `execution` cancels every in-flight fan-out
+                        // future. Candidate stream destructors send Stop where
+                        // available; no completion is manufactured for a client
+                        // that cancelled its own response stream.
+                        return;
+                    }
+                    changed = progress_rx.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let Some(progress) = progress_rx.borrow_and_update().clone() else {
+                            continue;
+                        };
+                        if !progress.scoring_fingerprint.is_empty()
+                            && !scoring_fingerprints.contains(&progress.scoring_fingerprint)
+                        {
+                            scoring_fingerprints.push(progress.scoring_fingerprint.clone());
+                        }
+                        let next_revision = revision + 1;
+                        let snapshot = query_stream_revision(
+                            next_revision,
+                            progress.phase,
+                            progress.hits,
+                            progress.scoring_fingerprint,
+                        );
+                        if last_content_fingerprint.as_ref()
+                            == Some(&snapshot.content_fingerprint)
+                        {
+                            continue;
+                        }
+                        let content_fingerprint = snapshot.content_fingerprint.clone();
+                        let event = crate::pb::QueryStreamResponse {
+                            payload: Some(crate::pb::query_stream_response::Payload::Revision(
+                                snapshot,
+                            )),
+                        };
+                        match tx.try_send(Ok(event)) {
+                            Ok(()) => {
+                                revision = next_revision;
+                                last_content_fingerprint = Some(content_fingerprint);
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Revisions are full replacements. The watch
+                                // cell and next successful send supersede this
+                                // one without losing correctness.
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                    result = &mut execution => {
+                        // The execution and the last collector update can
+                        // become ready in the same scheduler turn. Drain the
+                        // watch cell here so every scored stream exposes at
+                        // least its last provisional collector order before
+                        // the authoritative FINAL revision.
+                        let pending_progress = progress_rx.borrow().clone();
+                        if let Some(progress) = pending_progress {
+                            if !progress.scoring_fingerprint.is_empty()
+                                && !scoring_fingerprints.contains(&progress.scoring_fingerprint)
+                            {
+                                scoring_fingerprints.push(progress.scoring_fingerprint.clone());
+                            }
+                            let next_revision = revision + 1;
+                            let snapshot = query_stream_revision(
+                                next_revision,
+                                progress.phase,
+                                progress.hits,
+                                progress.scoring_fingerprint,
+                            );
+                            if last_content_fingerprint.as_ref()
+                                != Some(&snapshot.content_fingerprint)
+                            {
+                                if tx
+                                    .send(Ok(crate::pb::QueryStreamResponse {
+                                        payload: Some(
+                                            crate::pb::query_stream_response::Payload::Revision(
+                                                snapshot,
+                                            ),
+                                        ),
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                revision = next_revision;
+                            }
+                        }
+                        match result {
+                            Ok(response) => {
+                                scoring_fingerprints.sort();
+                                scoring_fingerprints.dedup();
+                                let final_scoring = combined_scoring_fingerprint(
+                                    &scoring_fingerprints,
+                                    &request_fingerprint,
+                                );
+                                revision += 1;
+                                let final_hits = response
+                                    .hits
+                                    .iter()
+                                    .map(|hit| (hit.doc_id, hit.score))
+                                    .collect();
+                                if tx
+                                    .send(Ok(crate::pb::QueryStreamResponse {
+                                        payload: Some(
+                                            crate::pb::query_stream_response::Payload::Revision(
+                                                query_stream_revision(
+                                                    revision,
+                                                    crate::pb::QueryStreamPhase::Final,
+                                                    final_hits,
+                                                    final_scoring,
+                                                ),
+                                            ),
+                                        ),
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let _ = tx
+                                    .send(Ok(crate::pb::QueryStreamResponse {
+                                        payload: Some(
+                                            crate::pb::query_stream_response::Payload::Completion(
+                                                crate::pb::QueryStreamCompletion {
+                                                    completed: true,
+                                                    response: Some(response),
+                                                    final_revision: revision,
+                                                    scoring_fingerprints,
+                                                    error_code: 0,
+                                                    error_message: String::new(),
+                                                },
+                                            ),
+                                        ),
+                                    }))
+                                    .await;
+                            }
+                            Err(status) => {
+                                scoring_fingerprints.sort();
+                                scoring_fingerprints.dedup();
+                                let _ = tx
+                                    .send(Ok(crate::pb::QueryStreamResponse {
+                                        payload: Some(
+                                            crate::pb::query_stream_response::Payload::Completion(
+                                                crate::pb::QueryStreamCompletion {
+                                                    completed: false,
+                                                    response: None,
+                                                    final_revision: revision,
+                                                    scoring_fingerprints,
+                                                    error_code: status.code() as u32,
+                                                    error_message: status.message().to_string(),
+                                                },
+                                            ),
+                                        ),
+                                    }))
+                                    .await;
+                            }
+                        }
+                        return;
+                    }
+                    _ = &mut deadline => {
+                        let status = Status::deadline_exceeded(format!(
+                            "QueryStream exceeded its {}ms deadline",
+                            request.timeout_ms
+                        ));
+                        scoring_fingerprints.sort();
+                        scoring_fingerprints.dedup();
+                        let _ = tx
+                            .send(Ok(crate::pb::QueryStreamResponse {
+                                payload: Some(
+                                    crate::pb::query_stream_response::Payload::Completion(
+                                        crate::pb::QueryStreamCompletion {
+                                            completed: false,
+                                            response: None,
+                                            final_revision: revision,
+                                            scoring_fingerprints,
+                                            error_code: status.code() as u32,
+                                            error_message: status.message().to_string(),
+                                        },
+                                    ),
+                                ),
+                            }))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn plan_index(

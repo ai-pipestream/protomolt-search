@@ -31,12 +31,17 @@ See [the Pipestream Search migration note](docs/pipestream-search-migration.md)
 for renamed surfaces, compatibility aliases, and rebuild impact.
 
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
-The phased public query contract under design is
-[docs/query-api.md](docs/query-api.md): selection first, candidate-scoped
-boosts second, then a named-signal composite scorer.
+The implemented public query contract is [docs/query-api.md](docs/query-api.md):
+selection first, candidate-scoped boosts second, then a named-signal composite
+scorer. [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
+provisional replacement revisions and an explicit terminal certificate.
 Block-max pruning, designed for the lexical leg and measured dead on the
 vector leg: [README-block-max.md](README-block-max.md) (overview) and
 [docs/block-max.md](docs/block-max.md) (design doc).
+The reproducible cross-engine gate is
+[deploy/opensearch-challenge](deploy/opensearch-challenge/README.md); it records
+quality, latency, throughput, resources, startup, and crash recovery without
+turning a synthetic run into a marketing claim.
 
 Phase 1: one crate, one binary, three roles (`node`, `coordinator`, `both`),
 tonic gRPC + tokio, static cluster membership.
@@ -64,9 +69,10 @@ up — coordinator on `localhost:50050`, rustfs console on
 [deploy/court-e2e/README.md](deploy/court-e2e/README.md).
 
 Query it with any gRPC client generated from
-[search.proto](proto/ai/pipestream/search/v1/search.proto) — `Search`
-(vector top-k with floor sharing), `Bm25Search` (distributed lexical),
-`HybridSearch` (cascade, RRF, or score-blend fusion) — or with the
+[search.proto](proto/ai/pipestream/search/v1/search.proto) — `Query` or
+`QueryStream` for the public contract, plus `Search` (vector top-k with floor
+sharing), `Bm25Search` (distributed lexical), and `HybridSearch` (cascade,
+RRF, or score-blend fusion) — or with the
 bundled probe tool:
 
 ```bash
@@ -232,6 +238,7 @@ coord_listen = "0.0.0.0:50050"
 nodes = ["host-a:50051", "host-b:50051"]      # fan-out order = tie-break order
 chunk_blocks = 64                              # scan chunk size (SIMD blocks)
 floor_sharing = true
+bm25_stream = true                              # exact lexical candidates; false is the unary A/B route
 floor_delta = 0.0                              # min raise before a floor publishes (0 = every raise)
 vector_backend = "embedded-turbovec"            # default provider for shards
 shard_deadline_ms = 0                          # per-shard query deadline (0 = none)
@@ -344,8 +351,8 @@ tokenizer/stemmer/term-vector mode+source/normalizer rungs, as the
 sidecar's enum numbers). Unsupported native options fail explicitly. Per-shard
 `analysis_addr` in the config; unset means UNAVAILABLE.
 
-**Query** (`SearchService.Bm25Search`) — distributed correctness via the
-two-phase global-stats flow:
+**Query** (`SearchService.Bm25Search`) — distributed correctness via global
+statistics followed by an exact candidate stream:
 
 ```mermaid
 sequenceDiagram
@@ -356,17 +363,21 @@ sequenceDiagram
     A-->>C: query terms
     C->>S: 2. TermStats{terms}
     S-->>C: per-shard df, N, Σlen
-    C->>S: 3. Bm25Query{terms, globals, k, k1, b}
+    C->>S: 3. Bm25QueryStream{terms, globals, k1, b}
     Note over S: every shard scores with IDENTICAL idf/avgdl
-    S-->>C: 4. shard top-ks + offsets
-    Note over C: merge (score desc, shard, doc id)
+    S-->>C: 4. candidate batches
+    C->>S: monotone global k-th floor raises
+    S-->>C: 5. completion + fingerprint + local details
+    Note over C: only global heap selects winners
 ```
 
 Shard-local BM25 stats would make scores incomparable across shards; the
 global-stats fan-out is what keeps distributed ranking identical to a
 monolithic index (proven exactly by
 `tests/bm25_search.rs::distributed_bm25_matches_monolithic_exactly`, and
-`shard_local_stats_would_differ` guards the regression). Hits carry
+`shard_local_stats_would_differ` guards the regression). The stream is default
+on for flat and fused multi-field BM25; `--bm25-stream=false` provides an exact
+legacy-unary A/B route. Phrase-aware BM25 remains unary. Hits carry
 per-term occurrence offsets; fetch raw text with
 `NodeService.GetDocuments` to highlight. BM25 k1/b are configurable
 (`bm25_k1`/`bm25_b`, defaults 1.2/0.75) and sent to every shard with the
@@ -382,7 +393,11 @@ query's `kth_best`, re-issued after appends); `min_score` and `kth_best`
 are additive, optional, and 0 means unseeded. `--block-max=false`
 (`PIPESTREAM_SEARCH_BLOCK_MAX`) forces the exhaustive scorer for A/B; results are
 identical either way. `cluster_sweep --bm25-terms` sweeps the
-`{seeding} x {block-max}` factorial with a hit-signature gate.
+`{seeding} x {block-max}` factorial with a hit-signature gate. The coordinator
+owns the only authoritative global lexical heap, and it answers only after
+every shard returns `completed=true` with the same non-empty scoring
+fingerprint. See [docs/block-max.md](docs/block-max.md) for the proof and wire
+contract.
 
 **Persistence**: postings + doc store live in `<index path>.bm25` (custom
 versioned binary format, atomic write), flushed with `Flush` and on

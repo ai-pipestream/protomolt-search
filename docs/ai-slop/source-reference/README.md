@@ -7,7 +7,8 @@
 
 This directory preserves the sources used by
 [`../turbovec-rabitq-vector-backend-research.md`](../turbovec-rabitq-vector-backend-research.md).
-`SHA256SUMS` records the exact locally retained paper and OpenReview bytes.
+`SHA256SUMS` records the exact locally retained paper, OpenReview, and
+OpenSearch documentation bytes.
 
 ## Papers
 
@@ -42,6 +43,21 @@ At collection time both checkouts were clean on `main`. The comparison
 repository's submodules were initialized at the revisions pinned by its
 superproject. These external checkouts are convenience copies and are not part
 of this repository.
+
+## OpenSearch 3.8 documentation
+
+These official pages were retained on 2026-08-31 for the reproducible
+challenge suite in `deploy/opensearch-challenge`. They are HTML snapshots,
+not claims that the challenge results generalize beyond the pinned 3.8.0
+container.
+
+| Local file | Source | Used for |
+|---|---|---|
+| `opensearch/version-history-3.8.html` | <https://docs.opensearch.org/3.8/version-history/> | Version provenance. |
+| `opensearch/docker-install-3.8.html` | <https://docs.opensearch.org/3.8/install-and-configure/install-opensearch/docker/> | Official container setup. |
+| `opensearch/rrf-3.8.html` | <https://docs.opensearch.org/3.8/vector-search/ai-search/hybrid-search/rrf/> | Rank-constant 60 RRF pipeline and fusion-depth controls. |
+| `opensearch/knn-query-3.8.html` | <https://docs.opensearch.org/3.8/query-dsl/specialized/k-nn/index/> | k-NN request and inline-filter contract. |
+| `opensearch/knn-filtering-3.8.html` | <https://docs.opensearch.org/3.8/vector-search/filter-search-knn/index/> | Lucene HNSW efficient-filter support. |
 
 ## OpenReview collection status
 

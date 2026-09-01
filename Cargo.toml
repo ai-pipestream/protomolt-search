@@ -35,6 +35,10 @@ tonic-build = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 bzip2 = "0.4"
 csv = "1"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 # The CEL differential oracle (tests/cel_filters.rs): the reference
 # interpreter the compiled ordinal path is held to agreement with,
 # wherever stock CEL is defined. TEST-ONLY by design — the serving
