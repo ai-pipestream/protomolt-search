@@ -12,7 +12,7 @@ description = "Cross-platform native lexical analysis for Protomolt"
 # OpenNLP delegates normalization, category, and script data to JDK 25. Pin the
 # corresponding Unicode 16 ICU4X release so accent folding stays compatible.
 # The analyzer supplements case folding with OpenNLP's Unicode 17 additions.
-icu_casemap = "=2.0.0"
+icu_casemap = "=2.3.0"
 icu_normalizer = "=2.0.0"
 icu_properties = "=2.0.0"
 # ICU crates declare their generated data with patch-compatible ranges.
