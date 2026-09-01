@@ -53,6 +53,13 @@ the observed ladder and the mathematically exact minimum depth needed for 95%,
 that no relevant neighbor is absent and verifies that full-depth FP32 reranking
 reconstructs the generated judgments exactly.
 
+The JSONL challenge is intentionally inspectable, but it is not the million-row
+path. For binary provider images, exact threshold discovery at several k
+values, the real CourtListener embedding artifact, and public FP32-rerank phase
+timings, use `examples/exact_rerank_scale.rs`. The measured one-million-vector
+result and reproduction commands are in
+[`turboquant-exact-rerank-scale-1m-2026-09-01.md`](../../docs/ai-slop/turboquant-exact-rerank-scale-1m-2026-09-01.md).
+
 Without `--out`, the runner uses a validated `mktemp` directory and removes
 it on success. `--keep` retains that temporary directory. It refuses occupied
 ports and a nonempty output directory. The container name is process-unique,
