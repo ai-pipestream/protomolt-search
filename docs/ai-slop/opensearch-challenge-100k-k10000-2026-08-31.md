@@ -72,3 +72,6 @@ exact FP32 target. The next useful experiment is candidate expansion: retrieve
 more than 10,000 quantized candidates, exact-rerank them from retained FP32 or
 residual data, and measure the smallest expansion factor that closes the gap
 without surrendering the observed streaming latency.
+
+That experiment is now recorded in
+[`turboquant-exact-rerank-expansion-100k-k10000-2026-08-31.md`](turboquant-exact-rerank-expansion-100k-k10000-2026-08-31.md).
