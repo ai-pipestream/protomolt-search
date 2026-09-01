@@ -203,19 +203,21 @@ authorization must be separate:
 coordinator = "http://turbovec-coordinator:50050"
 ```
 
-Both transports execute the same `turbovec-grpc::CoordinatorService` search
-contract. Cluster shards must carry stable labels equal to Pipestream Search
-document ids. The adapter requests stable-label tie order, carries product
-filters as packed stable-label bitmap ranges, and refuses an unlabelled
-collection. Small candidate-scoped rescoring sets use explicit labels.
+Both transports execute the same `turbovec-grpc::CoordinatorService`
+candidate-stream contract. Cluster shards must carry stable labels equal to
+Pipestream Search document ids. The adapter carries product filters as packed
+stable-label bitmap ranges, sends conflated inclusive floor raises, and
+requires an exhaustive completion certificate from every shard. Small
+candidate-scoped rescoring sets use explicit labels.
 `ClusterHealth` reports the selected transport, reachability, servable state,
 row count, and topology generation.
 
 This increment serves exact vector `Search`, dense public selections, and
-candidate-scoped dense boosts. Parent collapse and hybrid fusion require the
-provider candidate-stream contract and currently return `UNIMPLEMENTED` when
-clustered TurboVec is selected. The vector collection is built and mutated
-through `turbovec-grpc`; Pipestream Search does not duplicate those writes.
+candidate-scoped dense boosts. Parent collapse and every hybrid mode also use
+the provider stream while keeping lineage, product-shard ownership, fusion,
+and public ordering in Pipestream Search. The vector collection is built and
+mutated through `turbovec-grpc`; Pipestream Search does not duplicate those
+writes.
 See [the clustered backend design](docs/clustered-turbovec.md).
 
 ### Cluster configuration file

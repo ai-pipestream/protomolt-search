@@ -229,6 +229,12 @@ service NodeService {
   // stored text are simply absent from the response.
   rpc GetDocuments(GetDocumentsRequest) returns (GetDocumentsResponse);
 
+  // Resolves parent-collapse identity for a batch of stable global document
+  // ids without returning document text. Ids outside this shard's range are
+  // absent. Rows without lineage parent themselves in the high-bit-tagged
+  // domain used by the embedded collapse path.
+  rpc ResolveParents(ResolveParentsRequest) returns (ResolveParentsResponse);
+
   // Candidate-scoped BM25 scoring (phase 2 of FUSION_MODE_CASCADE):
   // score just `candidate_ids` against this shard's postings with the
   // supplied global stats.
@@ -2229,6 +2235,19 @@ message StoredDocument {
 message GetDocumentsResponse {
   // Found documents.
   repeated StoredDocument documents = 1;
+}
+
+message ResolveParentsRequest {
+  repeated uint64 doc_ids = 1;
+}
+
+message ResolvedParent {
+  uint64 doc_id = 1;
+  uint64 parent_id = 2;
+}
+
+message ResolveParentsResponse {
+  repeated ResolvedParent parents = 1;
 }
 
 // Client-facing distributed BM25 request.

@@ -40,6 +40,7 @@ pub enum Route {
     AggregateShard,
     QuantileCounts,
     GetDocuments,
+    ResolveParents,
     AddDocuments,
     AddVectors,
     IngestMapped,
@@ -47,7 +48,7 @@ pub enum Route {
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter table.
-const REQUEST_ROUTES: [(Route, &str); 17] = [
+const REQUEST_ROUTES: [(Route, &str); 18] = [
     (Route::SearchShard, "search_shard"),
     (Route::StreamSearch, "stream_search"),
     (Route::BrowseShard, "browse_shard"),
@@ -62,6 +63,7 @@ const REQUEST_ROUTES: [(Route, &str); 17] = [
     (Route::AggregateShard, "aggregate_shard"),
     (Route::QuantileCounts, "quantile_counts"),
     (Route::GetDocuments, "get_documents"),
+    (Route::ResolveParents, "resolve_parents"),
     (Route::AddDocuments, "add_documents"),
     (Route::AddVectors, "add_vectors"),
     (Route::IngestMapped, "ingest_mapped"),

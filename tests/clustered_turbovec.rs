@@ -9,7 +9,8 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    AddDocumentsRequest, ClusterHealthRequest, FacetValue, HybridSearchRequest, SearchRequest,
+    AddDocumentsRequest, AddVectorsRequest, ClusterHealthRequest, DocLineage, FacetValue,
+    FusionMode, HybridLegOptions, HybridSearchRequest, SearchRequest, SetCalibrationRequest,
 };
 use pipestream_search::vector::{VectorIndex, VectorSearchOptions, EMBEDDED_TURBOVEC};
 use tokio::sync::mpsc;
@@ -59,6 +60,9 @@ async fn serve_product_filter_shard(
     analysis: &str,
     start: usize,
     end: usize,
+    vectors: Vec<f32>,
+    shift: &[f32],
+    scale: &[f32],
 ) -> (
     String,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
@@ -71,6 +75,15 @@ async fn serve_product_filter_shard(
     })
     .await;
     let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    client
+        .set_calibration(SetCalibrationRequest {
+            dim: DIM as u32,
+            bit_width: BITS as u32,
+            shift: shift.to_vec(),
+            scale: scale.to_vec(),
+        })
+        .await
+        .unwrap();
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         for id in start..end {
@@ -84,6 +97,12 @@ async fn serve_product_filter_shard(
                         "ca5".to_string()
                     },
                 }],
+                lineage: Some(DocLineage {
+                    parent_id: (id / 3) as u64,
+                    group_id: (id / 9) as u64,
+                    span_start: 0,
+                    span_end: 10,
+                }),
                 ..Default::default()
             })
             .await
@@ -91,6 +110,13 @@ async fn serve_product_filter_shard(
         }
     });
     client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+    client
+        .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            vectors,
+            dim: DIM as u32,
+        }]))
+        .await
+        .unwrap();
     (address, handle)
 }
 
@@ -331,18 +357,46 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let mut product_nodes = Vec::new();
     let mut _product_handles = Vec::new();
     for pair in product_cuts.windows(2) {
-        let (address, handle) = serve_product_filter_shard(&analysis, pair[0], pair[1]).await;
+        let (address, handle) = serve_product_filter_shard(
+            &analysis,
+            pair[0],
+            pair[1],
+            corpus[pair[0] * DIM..pair[1] * DIM].to_vec(),
+            &calibration.shift,
+            &calibration.scale,
+        )
+        .await;
         product_nodes.push(address);
         _product_handles.push(handle);
     }
+    let embedded_product = CoordinatorServiceImpl::new(product_nodes.clone())
+        .with_max_k(K as u32)
+        .with_stream_search(true)
+        .with_bm25(Some(analysis.clone()), Default::default());
     let product = CoordinatorServiceImpl::new(product_nodes.clone())
         .with_max_k(K as u32)
+        .with_bm25(Some(analysis.clone()), Default::default())
         .with_clustered_turbovec(in_process.clone());
-    let product_external = CoordinatorServiceImpl::new(product_nodes)
+    let product_external = CoordinatorServiceImpl::new(product_nodes.clone())
         .with_max_k(K as u32)
+        .with_bm25(Some(analysis), Default::default())
         .with_clustered_turbovec(external);
     let public_query = harness::unit_vectors(1, DIM, 0xC105_7E03);
     let expected_public = ranking(&embedded, &public_query, K, Some(&even_mask))[0].clone();
+    let routed_embedded = SearchService::search(
+        &embedded_product,
+        Request::new(SearchRequest {
+            request_id: "clustered-route".to_string(),
+            k: K as u32,
+            vector: public_query.clone(),
+            collapse_parents: false,
+            geo_filters: Vec::new(),
+            filter: r#"court == "scotus""#.to_string(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
     let routed = SearchService::search(
         &product,
         Request::new(SearchRequest {
@@ -358,6 +412,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     .unwrap()
     .into_inner();
     assert_eq!(routed.request_id, "clustered-route");
+    assert_eq!(routed.hits, routed_embedded.hits);
     assert_eq!(
         routed
             .hits
@@ -389,6 +444,27 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
         expected_public
     );
 
+    let tie_request = SearchRequest {
+        request_id: "clustered-public-ties".to_string(),
+        k: K as u32,
+        vector: vec![0.0; DIM],
+        ..Default::default()
+    };
+    let embedded_ties = SearchService::search(&embedded_product, Request::new(tie_request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let local_ties = SearchService::search(&product, Request::new(tie_request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let external_ties = SearchService::search(&product_external, Request::new(tie_request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(local_ties, embedded_ties);
+    assert_eq!(external_ties, embedded_ties);
+
     let no_matches = SearchService::search(
         &product,
         Request::new(SearchRequest {
@@ -407,7 +483,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
         &product_external,
         Request::new(SearchRequest {
             k: K as u32,
-            vector: public_query,
+            vector: public_query.clone(),
             filter: r#"kourt == "scotus""#.to_string(),
             ..Default::default()
         }),
@@ -427,17 +503,113 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     assert!(health.reachable && health.servable);
     assert_eq!(health.rows, ROWS as u64);
 
-    let unsupported = SearchService::hybrid_search(
-        &product,
-        Request::new(HybridSearchRequest {
-            text: "term".to_string(),
-            vector: vec![0.0; DIM],
-            k: K as u32,
+    let collapse_request = SearchRequest {
+        request_id: "clustered-collapse".to_string(),
+        k: 9,
+        vector: public_query.clone(),
+        collapse_parents: true,
+        ..Default::default()
+    };
+    let embedded_collapse =
+        SearchService::search(&embedded_product, Request::new(collapse_request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+    let local_collapse = SearchService::search(&product, Request::new(collapse_request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let external_collapse =
+        SearchService::search(&product_external, Request::new(collapse_request))
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(local_collapse, embedded_collapse);
+    assert_eq!(external_collapse, embedded_collapse);
+
+    for mode in [
+        FusionMode::GlobalRank,
+        FusionMode::TwoLevel,
+        FusionMode::Cascade,
+        FusionMode::ScoreBlend,
+        FusionMode::Decomposed,
+    ] {
+        let request = HybridSearchRequest {
+            request_id: format!("clustered-hybrid-{mode:?}"),
+            text: "opinion".to_string(),
+            vector: public_query.clone(),
+            k: 9,
+            filter: r#"court == "scotus""#.to_string(),
+            legs: Some(HybridLegOptions {
+                fusion_mode: mode as i32,
+                leg_k: K as u32,
+                vector_weight: Some(1.0),
+                bm25_weight: Some(1.0),
+                rrf_k: K as f32,
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        };
+        let embedded_response =
+            SearchService::hybrid_search(&embedded_product, Request::new(request.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+        let local_response = SearchService::hybrid_search(&product, Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let external_response =
+            SearchService::hybrid_search(&product_external, Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(local_response, embedded_response, "mode {mode:?}");
+        assert_eq!(external_response, embedded_response, "mode {mode:?}");
+    }
+
+    let invalid = SearchRequest {
+        k: 1,
+        vector: vec![f32::NAN; DIM],
+        ..Default::default()
+    };
+    let embedded_error = SearchService::search(&embedded_product, Request::new(invalid.clone()))
+        .await
+        .unwrap_err();
+    let local_error = SearchService::search(&product, Request::new(invalid.clone()))
+        .await
+        .unwrap_err();
+    let external_error = SearchService::search(&product_external, Request::new(invalid))
+        .await
+        .unwrap_err();
+    assert_eq!(local_error.code(), embedded_error.code());
+    assert_eq!(external_error.code(), embedded_error.code());
+
+    let dead_table = NodeTable::new(vec![ShardConfig::new("http://127.0.0.1:1")]);
+    let dead_in_process =
+        ClusteredTurboVecBackend::in_process(CoordinatorService::new(dead_table.clone()));
+    let dead_external_address = serve_coordinator(CoordinatorService::new(dead_table)).await;
+    let dead_external = ClusteredTurboVecBackend::external(
+        &dead_external_address,
+        pipestream_search::MAX_MESSAGE_BYTES,
     )
-    .await
-    .unwrap_err();
-    assert_eq!(unsupported.code(), tonic::Code::Unimplemented);
-    assert!(unsupported.message().contains("candidate-stream"));
+    .unwrap();
+    let failed_local =
+        CoordinatorServiceImpl::new(product_nodes.clone()).with_clustered_turbovec(dead_in_process);
+    let failed_external =
+        CoordinatorServiceImpl::new(product_nodes).with_clustered_turbovec(dead_external);
+    let request = SearchRequest {
+        k: 1,
+        vector: public_query,
+        ..Default::default()
+    };
+    let local_failure = SearchService::search(&failed_local, Request::new(request.clone()))
+        .await
+        .unwrap_err();
+    let external_failure = SearchService::search(&failed_external, Request::new(request))
+        .await
+        .unwrap_err();
+    assert_eq!(local_failure.code(), tonic::Code::Aborted);
+    assert_eq!(external_failure.code(), local_failure.code());
+    assert_eq!(external_failure.message(), local_failure.message());
 }

@@ -44,11 +44,12 @@ use crate::pb::{
     GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse,
     GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit,
     HybridShardRequest, HybridShardResponse, IngestMappedRequest, IngestMappedResponse,
-    InstallSnapshotResponse, OffsetSpan, RawLegHit, ScoredHit, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
-    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
-    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    InstallSnapshotResponse, OffsetSpan, RawLegHit, ResolveParentsRequest, ResolveParentsResponse,
+    ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse,
+    SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse,
+    ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch, StoredDocument,
+    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
+    TermOccurrences, TermStatsRequest, TermStatsResponse,
     VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorQualityContract,
     VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
@@ -7688,6 +7689,38 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(GetDocumentsResponse { documents }))
+    }
+
+    async fn resolve_parents(
+        &self,
+        request: Request<ResolveParentsRequest>,
+    ) -> Result<Response<ResolveParentsResponse>, Status> {
+        const SELF_PARENT_TAG: u64 = 1 << 63;
+        crate::metrics::inc_request(crate::metrics::Route::ResolveParents);
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let rows = guard
+            .index
+            .as_ref()
+            .map_or(0, |index| index.len() as u64)
+            .max(guard.bm25.as_ref().map_or(0, |store| store.doc_count()));
+        let store = guard.bm25.as_ref().and_then(|store| store.as_index());
+        let mut parents = Vec::new();
+        for doc_id in req.doc_ids {
+            let Some(local) = doc_id.checked_sub(offset) else {
+                continue;
+            };
+            if local >= rows {
+                continue;
+            }
+            let parent_id = u32::try_from(local)
+                .ok()
+                .and_then(|local| store.and_then(|store| store.lineage(local)))
+                .map_or(SELF_PARENT_TAG | doc_id, |lineage| lineage.parent_id);
+            parents.push(ResolvedParent { doc_id, parent_id });
+        }
+        Ok(Response::new(ResolveParentsResponse { parents }))
     }
 
     async fn hybrid_shard(

@@ -2,13 +2,17 @@
 
 ## Boundary
 
-Pipestream Search owns document ids, BM25, CEL, columns, hybrid behavior, and
-the public result order. `turbovec-grpc` owns one distributed TurboVec
-collection: calibration agreement, vector shard topology, the exact global
-heap, live floors, completion, and encoded row movement.
+Pipestream Search owns document ids, BM25, CEL, columns, parent lineage,
+hybrid behavior, and the public result order. `turbovec-grpc` owns one
+distributed TurboVec collection: calibration agreement, vector shard
+topology, candidate scans, live-floor delivery, completion, and encoded row
+movement. Unary provider searches retain the provider's global heap;
+candidate-stream searches place the only ranking or parent heap in the
+product coordinator.
 
 The product calls that collection once. It never expands the vector node table
-into its own fan-out or merges a second set of local vector heaps.
+into its own fan-out. When an algorithm needs candidate control, stable labels
+map back to product shard ownership without exposing vector shard placement.
 
 ```text
 Search API
@@ -27,6 +31,20 @@ The in-process transport invokes the generated coordinator trait on the
 library service directly. It performs no localhost connection and no protobuf
 serialization. The external transport sends the same request to the same
 service implementation over tonic.
+
+Both transports execute one bidirectional provider contract:
+
+```text
+product -> provider: Start, monotonic FloorUpdate*
+provider -> product: CandidateBatch*, Completion
+```
+
+Candidate batches are packed stable-label and score records. Floor updates are
+conflated and remain inclusive. A successful completion names the scoring
+fingerprint, exhaustive-quantized quality contract, pinned topology
+generation, and every completed shard. Cancellation, deadline, or a missing
+shard terminates with `completed=false`; the product rejects an absent or
+incomplete completion.
 
 ## Identity and exactness
 
@@ -58,10 +76,10 @@ request retains every row at the final k-th score.
 - a three-shard in-process `turbovec-grpc` collection;
 - the same collection behind a standalone tonic server.
 
-It requires identical ids, score bits, and order for batches, explicit-label
-and packed-bitmap filters, empty filters, and all-score-tied input. Product and
-vector shard cuts deliberately differ. It also drives the public Pipestream
-Search `Search` handler through both transports and checks health.
+It requires identical protobuf results for ordinary vector search, filters,
+parent collapse, all five hybrid modes, boundary ties, and failure cases.
+Product and vector shard cuts deliberately differ. It also checks direct and
+external transport health.
 
 ## Configuration
 
@@ -98,13 +116,16 @@ Equivalent CLI options are `--turbovec-cluster-nodes`,
 `--turbovec-cluster-state`, `--allow-ephemeral-turbovec-cluster`, and
 `--turbovec-coordinator`.
 
-## Current capability boundary
+## Product semantics over the stream
 
 Exact vector `Search`, filtered vector `Search`, public dense selections, and
 candidate-scoped dense boost rescoring use the clustered backend. Parent
-collapse and hybrid fusion need a provider-to-product candidate stream so the
-product can own parent and cross-leg bounds. They return `UNIMPLEMENTED`
-instead of silently falling back to vectors stored on product shard nodes.
+collapse resolves lineage in batches from the owning product shards and keeps
+the parent heap in the product coordinator. Global-rank RRF, score blend,
+two-level RRF, cascade, and decomposed weighted-sum fusion all use the same
+candidate stream. Two-level fusion reconstructs product-shard-local vector
+legs from stable labels, so its intentionally partition-sensitive result still
+matches the embedded backend even when vector shard cuts differ.
 
 Cluster construction, append, persistence, Split, and Join stay on the
 `turbovec-grpc` admin surface. This increment does not dual-write vector rows
