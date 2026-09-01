@@ -121,6 +121,19 @@ struct Replay {
     vectors: BTreeMap<u64, Vec<f32>>,
     /// global id -> the document as ingested.
     documents: BTreeMap<u64, AddDocumentsRequest>,
+    /// Rows hidden by delete or replacement records. Build drops them,
+    /// producing a dense all-live child generation.
+    deleted: std::collections::BTreeSet<u64>,
+}
+
+impl Replay {
+    fn compact(&mut self) {
+        for id in &self.deleted {
+            self.vectors.remove(id);
+            self.documents.remove(id);
+        }
+        self.deleted.clear();
+    }
 }
 
 /// Resolve a `--log` argument: a generation directory is used directly; a
@@ -231,6 +244,26 @@ fn replay_buckets(
                          markers.wal, so this log is corrupt or foreign",
                         path.display()
                     ));
+                }
+                Some(wal_record::Op::DeleteDocument(d)) => {
+                    if bucket_of(d.doc_id, bucket_count) as u32 != bucket {
+                        return Err(format!(
+                            "replay {}: delete id {} routes to another bucket",
+                            path.display(),
+                            d.doc_id
+                        ));
+                    }
+                    out.deleted.insert(d.doc_id);
+                }
+                Some(wal_record::Op::Replacement(r)) => {
+                    if bucket_of(r.old_doc_id, bucket_count) as u32 != bucket {
+                        return Err(format!(
+                            "replay {}: replacement old id {} routes to another bucket",
+                            path.display(),
+                            r.old_doc_id
+                        ));
+                    }
+                    out.deleted.insert(r.old_doc_id);
                 }
                 Some(wal_record::Op::Flush(_)) | Some(wal_record::Op::Snapshot(_)) | None => {}
             }
@@ -742,7 +775,7 @@ fn build_child(
 #[allow(clippy::too_many_arguments)]
 fn finish_child(
     manifest: &WalManifest,
-    replay: Replay,
+    mut replay: Replay,
     ordinal: usize,
     out_dir: &Path,
     slot_offset: u64,
@@ -752,6 +785,7 @@ fn finish_child(
     binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
+    replay.compact();
     let vector_path = out_dir.join(format!("shard-{ordinal}.vector"));
     eprintln!(
         "reshard: child {ordinal}: {} vectors, {} documents -> {}",
@@ -774,8 +808,8 @@ fn finish_child(
     Ok(child)
 }
 
-/// Split one shard's WAL generation into `n` child images (a power of
-/// two).
+/// Rewrite one or more WAL generations into `n` child images. `n = 1` is
+/// compaction; larger powers of two repartition.
 ///
 /// With `n <= bucket_count` and `bucket_count % n == 0` this is the cheap
 /// path: child `i` owns the contiguous bucket range
@@ -832,8 +866,10 @@ pub fn split_logs(
     bm25_fields: Option<&[String]>,
     analyze: &mut Analyzer,
 ) -> Result<ReshardOutput, String> {
-    if !n.is_power_of_two() || n < 2 {
-        return Err(format!("split factor must be a power of two >= 2, got {n}"));
+    if !n.is_power_of_two() {
+        return Err(format!(
+            "split factor must be a positive power of two, got {n}"
+        ));
     }
     let Some(first_gen) = gens.first() else {
         return Err("split requires at least one input generation".to_string());
@@ -922,6 +958,7 @@ pub fn split_logs(
                 &mut replay,
             )?;
         }
+        replay.compact();
         let shift = 64 - n.trailing_zeros();
         type ReshardBucket = (Vec<(u64, Vec<f32>)>, Vec<(u64, AddDocumentsRequest)>);
         let mut buckets: Vec<ReshardBucket> = (0..n).map(|_| (Vec::new(), Vec::new())).collect();
@@ -943,6 +980,7 @@ pub fn split_logs(
                 Replay {
                     vectors: vectors.into_iter().collect(),
                     documents: documents.into_iter().collect(),
+                    deleted: Default::default(),
                 },
                 i,
                 out_dir,

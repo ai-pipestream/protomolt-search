@@ -110,7 +110,8 @@ service NodeService {
   rpc Flush(FlushRequest) returns (FlushResponse);
 
   // Installs a centrally built shard image (the atomic .tv index plus its
-  // optional .bm25 sidecar) over one client stream — the bulk-load path
+  // optional exact-vector, BM25, and live-row sidecars) over one client
+  // stream — the bulk-load path
   // for pre-computed corpora. Where AddVectors builds the shard on the
   // node from streamed vectors, InstallSnapshot ships the FINISHED index:
   // build once anywhere with the cluster's seeded calibration, push the
@@ -120,10 +121,10 @@ service NodeService {
   //
   // Protocol: the first message must be `manifest`, then `data` chunks in
   // any chunking the sender likes. The first `manifest.vector_bytes` of data
-  // are the provider image; the following `manifest.bm25_bytes` are the .bm25
-  // sidecar. The node stages both files inside a generation directory
+  // are the provider image, followed by exact FP32, BM25, and live-row bytes
+  // declared by the manifest. The node stages all files inside a generation directory
   // (`<index path>.snap/`), loads and validates the image, then swaps the
-  // directory into place with ONE atomic rename — the pair can never
+  // directory into place with ONE atomic rename — the generation can never
   // tear, searches never observe a half-installed shard, and a rejected
   // install leaves both the live shard and the active generation
   // untouched. Replacing an existing generation renames it aside first;
@@ -164,6 +165,15 @@ service NodeService {
   // Fails UNAVAILABLE when the shard has no analysis sidecar configured,
   // INVALID_ARGUMENT on empty or oversized text.
   rpc AddDocuments(stream AddDocumentsRequest) returns (AddDocumentsResponse);
+
+  // Idempotently hides immutable rows from every read path. IDs are global
+  // and must belong to this shard. The overlay becomes durable at Flush.
+  rpc DeleteDocuments(DeleteDocumentsRequest) returns (DeleteDocumentsResponse);
+
+  // Atomically retires old rows for replacements that have already been
+  // appended. Both rows must exist in every active artifact, and the new row
+  // must be live before the old row is hidden.
+  rpc CommitReplacements(CommitReplacementsRequest) returns (CommitReplacementsResponse);
 
   // Protobuf-native mapped ingest (docs/descriptor-mappings.md,
   // increment 2): documents arrive as the serialized protobuf messages
@@ -607,6 +617,9 @@ message HealthResponse {
   // True when the serving representation is memory-mapped rather than a
   // mutable ingest builder.
   bool exact_vectors_mmap = 13;
+  uint64 live_docs = 14;
+  uint64 deleted_docs = 15;
+  uint64 live_revision = 16;
 }
 
 message ClusterHealthRequest {}
@@ -1052,7 +1065,7 @@ message SnapshotChunk {
     // is read from the image itself — the file is the source of truth.
     SnapshotManifest manifest = 1;
     // Opaque image bytes: provider image first, then exact FP32 vectors,
-    // then the BM25 sidecar. Senders should keep chunks around 1 MiB.
+    // BM25, and the live-row overlay. Senders should keep chunks around 1 MiB.
     bytes data = 2;
   }
 }
@@ -1067,6 +1080,8 @@ message SnapshotManifest {
   // 0 is accepted for legacy/native-only generations; FP32 rerank then
   // refuses until that generation is rebuilt or backfilled.
   uint64 exact_vector_bytes = 3;
+  // Tombstone overlay after BM25 bytes. Zero means all rows are live.
+  uint64 live_docs_bytes = 4;
 }
 
 // Result of an `InstallSnapshot` call.
@@ -1504,6 +1519,31 @@ message AddDocumentsResponse {
   uint64 total = 2;
   // Global doc id assigned to the first document of this stream.
   uint64 first_id = 3;
+}
+
+message DeleteDocumentsRequest {
+  repeated uint64 doc_ids = 1;
+}
+
+message DeleteDocumentsResponse {
+  uint64 deleted = 1;
+  uint64 already_deleted = 2;
+  uint64 live_revision = 3;
+}
+
+message Replacement {
+  uint64 old_doc_id = 1;
+  uint64 new_doc_id = 2;
+}
+
+message CommitReplacementsRequest {
+  repeated Replacement replacements = 1;
+}
+
+message CommitReplacementsResponse {
+  uint64 committed = 1;
+  uint64 already_committed = 2;
+  uint64 live_revision = 3;
 }
 
 // One field's query terms in a multi-field TermStats request.
@@ -3100,11 +3140,18 @@ message VectorRescoreResponse {
 message ExactVectorRescoreRequest {
   repeated float vector = 1;
   repeated uint64 candidate_ids = 2;
+  // Per-shard logical row-byte ceiling. Zero means the caller already
+  // enforced its own bound. A node refuses before touching row payload when
+  // its owned candidates exceed this value.
+  uint64 max_logical_bytes = 3;
 }
 
 message ExactVectorRescoreResponse {
   // One row per distinct requested id owned by this shard, in request order.
   repeated RawLegHit hits = 1;
+  uint64 logical_bytes = 2;
+  uint64 pages_touched = 3;
+  uint32 tasks = 4;
 }
 
 // One cascade hit: the two leg scores as SEPARATE fields (no fused
@@ -3444,6 +3491,26 @@ message DenseQuery {
   // The query vector; length must equal the shard dimension.
   repeated float vector = 1;
   DenseScoreMode score_mode = 2;
+  // Optional measured recall policy. This is served only with FP32_RERANK
+  // on a single dense selection. When present, QueryRequest.selection_k
+  // MUST be zero: the coordinator resolves the candidate depth from its
+  // generation-bound quality profile instead of accepting two competing
+  // depth authorities.
+  DenseQualityPolicy quality = 3;
+}
+
+// A request for a measured candidate depth. Recall is expressed in parts per
+// million so common targets are exact on the wire: 950000 = 95%, 990000 =
+// 99%, 999000 = 99.9%, and 1000000 = every held-out query in the profile.
+message DenseQualityPolicy {
+  uint32 target_recall_ppm = 1;
+  // Optional request-local hard ceiling after profile resolution. Zero uses
+  // the coordinator's configured rerank limits. A profile point above this
+  // value is refused, never clamped.
+  uint32 max_candidates = 2;
+  // Optional pin supplied by a client or experiment. When non-empty it must
+  // equal the loaded profile's content fingerprint.
+  string required_profile_fingerprint = 3;
 }
 
 // A membership-only leaf: never contributes a relevance score and
@@ -3697,6 +3764,22 @@ message QueryResponse {
   string next_cursor = 4;
   // Phase timings, present exactly when the request set `profile`.
   QueryProfile profile = 5;
+  // Present when a DenseQualityPolicy selected the FP32 rerank pool. Unlike
+  // timing profile data this provenance is always returned: callers can see
+  // which measured contract chose the candidate depth.
+  DenseQualityOutcome dense_quality = 6;
+}
+
+message DenseQualityOutcome {
+  uint32 target_recall_ppm = 1;
+  uint32 selection_k = 2;
+  string profile_fingerprint = 3;
+  string profile_id = 4;
+  string embedding_model = 5;
+  uint64 corpus_generation = 6;
+  uint64 corpus_rows = 7;
+  string provider_backend = 8;
+  string scoring_fingerprint = 9;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the
@@ -3787,6 +3870,12 @@ message QueryProfile {
   float total_ms = 6;
   // Candidate-scoped exact-vector scoring and reorder. 0 on native scoring.
   float rerank_ms = 7;
+  // Physical work of FP32 reranking. Logical bytes count row payload, while
+  // pages count distinct 4 KiB file pages touched by product shards.
+  uint64 rerank_rows = 8;
+  uint64 rerank_logical_bytes = 9;
+  uint64 rerank_pages = 10;
+  uint32 rerank_tasks = 11;
 }
 
 // One public hit with score provenance.

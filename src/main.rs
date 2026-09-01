@@ -191,6 +191,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let listener = TcpListener::bind(shard.listen).await?;
             let addr: SocketAddr = listener.local_addr()?;
             let mut bm25_store = None;
+            let mut live_docs = pipestream_search::live_docs::LiveDocs::default();
             if let Some(p) = shard.index_path.as_ref() {
                 let bm25_path = match &generation {
                     Some(dir) => pipestream_search::node::generation_bm25(dir),
@@ -235,6 +236,19 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .into());
                 }
+                let live_path = match &generation {
+                    Some(dir) => pipestream_search::node::generation_live_docs(dir),
+                    None => pipestream_search::node::live_docs_sidecar_path(p),
+                };
+                if live_path.exists() {
+                    eprintln!(
+                        "shard @{}: loading live-row overlay from {}",
+                        shard.listen,
+                        live_path.display()
+                    );
+                    live_docs = pipestream_search::live_docs::LiveDocs::open(&live_path)
+                        .map_err(|e| format!("load {}: {e}", live_path.display()))?;
+                }
             }
             let node = NodeServiceImpl::new(
                 index,
@@ -246,6 +260,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     block_max: cfg.block_max,
                     coalesce: cfg.coalesce,
                     scan_parallel: cfg.scan_parallel,
+                    rerank_parallel: cfg.rerank_parallel,
                     floor_delta: cfg.floor_delta,
                     floor_warmup_chunks: cfg.floor_warmup_chunks,
                     floor_min_interval_ms: cfg.floor_min_interval_ms,
@@ -268,6 +283,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             )
             .with_bm25(bm25_store)
             .with_exact_vectors(exact_vectors)?
+            .with_live_docs(live_docs)?
             .with_phrase_index(phrase_index.clone())
             .with_generation(generation);
             // The UDP stream-signal lane shares the gRPC listener's host:port.
@@ -328,7 +344,18 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .with_replicas(cfg.replica_addrs.clone())
             .with_stream_search(cfg.stream_search)
             .with_bm25_stream(cfg.bm25_stream)
-            .with_max_k(cfg.max_k);
+            .with_max_k(cfg.max_k)
+            .with_max_rerank_bytes(cfg.max_rerank_bytes)
+            .with_topology_generation(cfg.shard_map.as_ref().map_or(0, |map| map.generation));
+        if let Some(path) = &cfg.dense_quality_profile {
+            let profile = pipestream_search::quality::DenseQualityProfile::load(path)?;
+            eprintln!(
+                "dense quality profile: {} ({} measured queries)",
+                path.display(),
+                profile.measured_queries()
+            );
+            coordinator = coordinator.with_dense_quality_profile(profile);
+        }
         if let Some(clustered) = &cfg.clustered_turbovec {
             let backend = match clustered {
                 ClusteredTurboVecConfig::InProcess {

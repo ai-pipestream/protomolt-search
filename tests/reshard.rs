@@ -30,7 +30,8 @@ use pipestream_search::harness::{build_monolithic, mock_analysis};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
-    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, FlushRequest, SetCalibrationRequest,
+    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, CommitReplacementsRequest,
+    DeleteDocumentsRequest, FlushRequest, Replacement, SetCalibrationRequest,
 };
 use pipestream_search::phrases::PhraseIndex;
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
@@ -677,6 +678,59 @@ fn reshard_refuses_a_log_with_preexisting_state() {
     let err = reshard::merge(&[gen], &dir.join("out"), None, false, None, &mut analyze)
         .expect_err("merge must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
+}
+
+/// A one-child reshard is compaction: delete and replacement records remove
+/// old physical rows, while the already-appended replacement survives under
+/// its stable source id in the child parent map.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_child_reshard_compacts_generation_tombstones() {
+    let dir = tempdir("compact_deletes");
+    let rows = 64usize;
+    let corpus = unit_vectors(rows, DIM, 0xC0A0_AC71);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
+    let (analysis_addr, analysis) = mock_analysis::start_mock_analysis().await;
+    std::mem::forget(analysis);
+    let (mut client, index_path, _node) =
+        start_wal_node(&dir, "parent.tv", 0, 8, &analysis_addr, &shift, &scale).await;
+    ingest(&mut client, &corpus, rows, rows).await;
+    client
+        .delete_documents(DeleteDocumentsRequest { doc_ids: vec![3] })
+        .await
+        .unwrap();
+    client
+        .commit_replacements(CommitReplacementsRequest {
+            replacements: vec![Replacement {
+                old_doc_id: 7,
+                new_doc_id: 31,
+            }],
+        })
+        .await
+        .unwrap();
+    client.flush(FlushRequest {}).await.unwrap();
+
+    let gen = pipestream_search::wal::latest_gen(&pipestream_search::wal::wal_dir(&index_path))
+        .unwrap()
+        .unwrap()
+        .1;
+    let output = reshard::split(
+        &gen,
+        1,
+        &dir.join("compacted"),
+        0,
+        1_000,
+        false,
+        None,
+        &mut replay_analyzer(&analysis_addr),
+    )
+    .unwrap();
+    let child = &output.children[0];
+    assert_eq!(child.num_vectors, (rows - 2) as u64);
+    assert_eq!(child.num_documents, (rows - 2) as u64);
+    assert!(!child.parent_ids.contains(&3));
+    assert!(!child.parent_ids.contains(&7));
+    assert!(child.parent_ids.contains(&31));
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// The general N -> M reshard: two block-routed shards' logs

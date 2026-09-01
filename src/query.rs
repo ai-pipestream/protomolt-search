@@ -202,8 +202,21 @@ pub async fn execute(
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
     let plan = parse_selection(selection)?;
     let fp32_rerank = match &plan.shape {
-        Shape::Dense { query, .. } => dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
+        Shape::Dense { query, .. } => {
+            let mode = dense_score_mode(query)?;
+            if query.quality.is_some() && mode != DenseScoreMode::Fp32Rerank {
+                return Err(refuse(
+                    "DenseQualityPolicy is served only with DENSE_SCORE_MODE_FP32_RERANK",
+                ));
+            }
+            mode == DenseScoreMode::Fp32Rerank
+        }
         Shape::Composite { dense, .. } => {
+            if dense.quality.is_some() {
+                return Err(refuse(
+                    "DenseQualityPolicy is currently served on a single dense selection only",
+                ));
+            }
             if dense_score_mode(dense)? == DenseScoreMode::Fp32Rerank {
                 return Err(refuse(
                     "FP32 rerank is currently served on a single dense selection only; \
@@ -260,9 +273,31 @@ pub async fn execute(
     // alone, and the scorer refuses a browse — the two existing
     // refusals partition every request naming both.
 
-    // selection_k: the candidate-set depth. 0 = k. The response is the
-    // best k of the selection_k candidates under the final order.
-    let selection_k = if req.selection_k == 0 {
+    let quality_resolution = match &plan.shape {
+        Shape::Dense { query, .. } => match &query.quality {
+            Some(policy) => {
+                if req.selection_k != 0 {
+                    return Err(refuse(
+                        "DenseQualityPolicy and selection_k are competing depth authorities; leave selection_k zero",
+                    ));
+                }
+                Some(
+                    coordinator
+                        .resolve_dense_quality(req.k, query.vector.len(), policy)
+                        .await?,
+                )
+            }
+            None => None,
+        },
+        _ => None,
+    };
+
+    // selection_k: the candidate-set depth. 0 = k unless a measured
+    // quality profile resolved it. The response is the best k of the
+    // selection_k candidates under the final order.
+    let selection_k = if let Some(resolution) = &quality_resolution {
+        resolution.selection_k
+    } else if req.selection_k == 0 {
         req.k
     } else {
         req.selection_k
@@ -513,9 +548,9 @@ pub async fn execute(
             let route = if fp32_rerank {
                 let t0 = std::time::Instant::now();
                 let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
-                let scores = coordinator.exact_vector_scores(&query.vector, &ids).await?;
+                let reranked = coordinator.exact_vector_scores(&query.vector, &ids).await?;
                 for hit in &mut hits {
-                    let score = *scores.get(&hit.doc_id).ok_or_else(|| {
+                    let score = *reranked.scores.get(&hit.doc_id).ok_or_else(|| {
                         Status::failed_precondition(format!(
                             "FP32 rerank candidate {} has no exact score",
                             hit.doc_id
@@ -531,6 +566,10 @@ pub async fn execute(
                 });
                 if let Some(p) = prof.as_mut() {
                     p.rerank_ms = ms(t0);
+                    p.rerank_rows = reranked.rows;
+                    p.rerank_logical_bytes = reranked.logical_bytes;
+                    p.rerank_pages = reranked.pages_touched;
+                    p.rerank_tasks = reranked.tasks;
                 }
                 "search:fp32_rerank"
             } else {
@@ -540,13 +579,26 @@ pub async fn execute(
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
-            Ok(done(
+            let mut response = done(
                 response.request_id,
                 hits,
                 &executed,
                 next,
                 finish_prof(prof, t_total),
-            ))
+            );
+            response.dense_quality =
+                quality_resolution.map(|resolution| crate::pb::DenseQualityOutcome {
+                    target_recall_ppm: resolution.target_recall_ppm,
+                    selection_k: resolution.selection_k,
+                    profile_fingerprint: resolution.profile_fingerprint,
+                    profile_id: resolution.profile_id,
+                    embedding_model: resolution.embedding_model,
+                    corpus_generation: resolution.corpus_generation,
+                    corpus_rows: resolution.corpus_rows,
+                    provider_backend: resolution.provider_backend,
+                    scoring_fingerprint: resolution.scoring_fingerprint,
+                });
+            Ok(response)
         }
         Shape::Composite {
             dense_id,
@@ -817,6 +869,7 @@ fn done(
         executed: executed.to_string(),
         next_cursor,
         profile,
+        dense_quality: None,
     }
 }
 

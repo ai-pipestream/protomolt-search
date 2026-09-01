@@ -38,6 +38,18 @@ pub async fn install_snapshot_with_exact(
     exact_vector_path: Option<&Path>,
     bm25_path: Option<&Path>,
 ) -> Result<InstallSnapshotResponse, Status> {
+    install_snapshot_generation(addr, vector_path, exact_vector_path, bm25_path, None).await
+}
+
+/// Stream all files in a product generation, including its optional
+/// live-row overlay.
+pub async fn install_snapshot_generation(
+    addr: &str,
+    vector_path: &Path,
+    exact_vector_path: Option<&Path>,
+    bm25_path: Option<&Path>,
+    live_docs_path: Option<&Path>,
+) -> Result<InstallSnapshotResponse, Status> {
     let tv_bytes = std::fs::metadata(vector_path)
         .map_err(|e| Status::internal(format!("stat {}: {e}", vector_path.display())))?
         .len();
@@ -53,11 +65,22 @@ pub async fn install_snapshot_with_exact(
             .len(),
         None => 0,
     };
-    let paths: Vec<PathBuf> = [Some(vector_path), exact_vector_path, bm25_path]
-        .into_iter()
-        .flatten()
-        .map(Path::to_path_buf)
-        .collect();
+    let live_docs_bytes = match live_docs_path {
+        Some(p) => std::fs::metadata(p)
+            .map_err(|e| Status::internal(format!("stat {}: {e}", p.display())))?
+            .len(),
+        None => 0,
+    };
+    let paths: Vec<PathBuf> = [
+        Some(vector_path),
+        exact_vector_path,
+        bm25_path,
+        live_docs_path,
+    ]
+    .into_iter()
+    .flatten()
+    .map(Path::to_path_buf)
+    .collect();
 
     let (tx, rx) = mpsc::channel::<SnapshotChunk>(2);
     tokio::spawn(async move {
@@ -66,6 +89,7 @@ pub async fn install_snapshot_with_exact(
                 vector_bytes: tv_bytes,
                 bm25_bytes,
                 exact_vector_bytes,
+                live_docs_bytes,
             })),
         };
         if tx.send(manifest).await.is_err() {

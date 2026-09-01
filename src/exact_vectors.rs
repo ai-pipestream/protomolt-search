@@ -12,6 +12,15 @@ use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const PAGE_BYTES: usize = 4096;
+const MIN_ROWS_PER_TASK: usize = 256;
+
+pub(crate) fn rerank_task_count(rows: usize, parallelism: usize) -> usize {
+    parallelism
+        .max(1)
+        .min(rows.div_ceil(MIN_ROWS_PER_TASK).max(1))
+}
+
 const MAGIC: &[u8; 8] = b"PMEXACT1";
 const VERSION: u32 = 1;
 const HEADER_BYTES: usize = 80;
@@ -41,6 +50,16 @@ enum Storage {
 #[derive(Debug)]
 pub struct ExactVectorStore {
     storage: Storage,
+}
+
+/// Exact scores plus observable storage work. Rows remain in caller request
+/// order even though mmap reads are scheduled in page order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredSlots {
+    pub rows: Vec<(usize, f32)>,
+    pub logical_bytes: u64,
+    pub pages_touched: u64,
+    pub tasks: u32,
 }
 
 impl ExactVectorStore {
@@ -313,6 +332,20 @@ impl ExactVectorStore {
     /// Score local slots by FP32 dot product, returning `(slot, score)` in
     /// request order. Callers own global-id routing and final ordering.
     pub fn score_slots(&self, query: &[f32], slots: &[usize]) -> io::Result<Vec<(usize, f32)>> {
+        self.score_slots_profiled(query, slots, 1)
+            .map(|result| result.rows)
+    }
+
+    /// Score local slots after ordering reads by mmap page, using at most
+    /// `parallelism` bounded worker lanes. Every individual dot product keeps
+    /// the original scalar accumulation order, so scheduling does not change
+    /// score bits. The result is restored to request order before return.
+    pub fn score_slots_profiled(
+        &self,
+        query: &[f32],
+        slots: &[usize],
+        parallelism: usize,
+    ) -> io::Result<ScoredSlots> {
         let dim = self
             .dim()
             .ok_or_else(|| invalid("exact-vector store has no dimension"))?;
@@ -332,24 +365,88 @@ impl ExactVectorStore {
                 "query coordinate {coordinate} is not finite: {value}"
             )));
         }
-        let mut scored = Vec::with_capacity(slots.len());
-        for &slot in slots {
-            if slot >= self.len() {
-                continue;
-            }
-            let score = match &self.storage {
-                Storage::Building { values, .. } => {
-                    let row = &values[slot * dim..(slot + 1) * dim];
-                    dot(row, query)
+        let row_bytes = dim
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| invalid("exact-vector row size overflow"))?;
+        let mut scheduled: Vec<(usize, usize)> = slots
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(ordinal, slot)| (slot < self.len()).then_some((ordinal, slot)))
+            .collect();
+        scheduled.sort_unstable_by_key(|&(ordinal, slot)| {
+            let byte = HEADER_BYTES.saturating_add(slot.saturating_mul(row_bytes));
+            (byte / PAGE_BYTES, slot, ordinal)
+        });
+        let tasks = rerank_task_count(scheduled.len(), parallelism);
+        let scored_page_order: Vec<(usize, usize, f32)> = if tasks <= 1 {
+            scheduled
+                .iter()
+                .map(|&(ordinal, slot)| (ordinal, slot, self.score_one(query, slot, dim)))
+                .collect()
+        } else {
+            let chunk = scheduled.len().div_ceil(tasks);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = scheduled
+                    .chunks(chunk)
+                    .map(|part| {
+                        scope.spawn(move || {
+                            part.iter()
+                                .map(|&(ordinal, slot)| {
+                                    (ordinal, slot, self.score_one(query, slot, dim))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().expect("exact rerank worker panicked"))
+                    .collect()
+            })
+        };
+        let mut restored = scored_page_order;
+        restored.sort_unstable_by_key(|&(ordinal, _, _)| ordinal);
+        let rows = restored
+            .into_iter()
+            .map(|(_, slot, score)| (slot, score))
+            .collect::<Vec<_>>();
+        let pages_touched = if self.is_mapped() {
+            let mut pages = std::collections::BTreeSet::new();
+            for &(_, slot) in &scheduled {
+                let start = HEADER_BYTES + slot * row_bytes;
+                let end = start + row_bytes - 1;
+                for page in start / PAGE_BYTES..=end / PAGE_BYTES {
+                    pages.insert(page);
                 }
-                Storage::Mapped { map, .. } => dot_mapped(
-                    &map[HEADER_BYTES + slot * dim * 4..HEADER_BYTES + (slot + 1) * dim * 4],
-                    query,
-                ),
-            };
-            scored.push((slot, score));
+            }
+            pages.len() as u64
+        } else {
+            0
+        };
+        let logical_bytes = u64::try_from(rows.len())
+            .ok()
+            .and_then(|count| count.checked_mul(row_bytes as u64))
+            .ok_or_else(|| invalid("exact-vector logical byte count overflow"))?;
+        Ok(ScoredSlots {
+            rows,
+            logical_bytes,
+            pages_touched,
+            tasks: tasks as u32,
+        })
+    }
+
+    fn score_one(&self, query: &[f32], slot: usize, dim: usize) -> f32 {
+        match &self.storage {
+            Storage::Building { values, .. } => {
+                let row = &values[slot * dim..(slot + 1) * dim];
+                dot(row, query)
+            }
+            Storage::Mapped { map, .. } => dot_mapped(
+                &map[HEADER_BYTES + slot * dim * 4..HEADER_BYTES + (slot + 1) * dim * 4],
+                query,
+            ),
         }
-        Ok(scored)
     }
 
     fn decode_all(&self) -> Vec<f32> {
@@ -499,6 +596,39 @@ mod tests {
         bytes[16] ^= 1;
         std::fs::write(&path, &bytes).unwrap();
         assert!(ExactVectorStore::open(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn page_ordered_parallel_scoring_is_bit_identical_and_restores_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "protomolt-exact-vectors-parallel-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vectors.exact");
+        let dim = 32usize;
+        let rows = 1_024usize;
+        let values: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i * 17 % 251) as f32 - 125.0) / 127.0)
+            .collect();
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 - 15.0) / 31.0).collect();
+        let store = ExactVectorStore::from_values(dim, values)
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        let slots: Vec<usize> = (0..rows).rev().step_by(3).collect();
+        let serial = store.score_slots_profiled(&query, &slots, 1).unwrap();
+        let parallel = store.score_slots_profiled(&query, &slots, 4).unwrap();
+        assert_eq!(parallel.rows, serial.rows);
+        assert_eq!(
+            parallel.rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            slots
+        );
+        assert_eq!(parallel.logical_bytes, (slots.len() * dim * 4) as u64);
+        assert!(parallel.pages_touched > 1);
+        assert!(parallel.tasks > 1 && parallel.tasks <= 4);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

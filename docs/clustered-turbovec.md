@@ -79,7 +79,9 @@ request retains every row at the final k-th score.
 It requires identical protobuf results for ordinary vector search, filters,
 parent collapse, all five hybrid modes, boundary ties, and failure cases.
 Product and vector shard cuts deliberately differ. It also checks direct and
-external transport health.
+external transport health. FP32 candidate reranking is also parity-tested:
+the collection selects stable labels and the differently cut product shards
+read only their product-owned exact rows.
 
 ## Configuration
 

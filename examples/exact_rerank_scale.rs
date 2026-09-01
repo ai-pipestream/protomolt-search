@@ -724,6 +724,7 @@ fn fp32_request(query: &[f32], k: usize, depth: usize, sequence: usize) -> Query
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: query.to_vec(),
                     score_mode: DenseScoreMode::Fp32Rerank as i32,
+                    quality: None,
                 })),
             })),
         }),

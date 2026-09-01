@@ -69,6 +69,16 @@ fn inspect_file(path: &Path, records: bool) -> Result<(u64, u64), String> {
             Some(wal_record::Op::Bind(b)) => {
                 format!("bind plan={} body={:?}", b.plan_fingerprint, b.body_path)
             }
+            Some(wal_record::Op::DeleteDocument(d)) => {
+                id_lo = id_lo.min(d.doc_id);
+                id_hi = id_hi.max(d.doc_id);
+                format!("delete_document id={}", d.doc_id)
+            }
+            Some(wal_record::Op::Replacement(r)) => {
+                id_lo = id_lo.min(r.old_doc_id);
+                id_hi = id_hi.max(r.old_doc_id);
+                format!("replacement old={} new={}", r.old_doc_id, r.new_doc_id)
+            }
             Some(wal_record::Op::Flush(_)) => "flush".to_string(),
             Some(wal_record::Op::Snapshot(s)) => {
                 format!("snapshot source_generation={}", s.source_generation)

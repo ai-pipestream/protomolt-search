@@ -158,9 +158,54 @@ Original FP32 rows live in the product generation, one-for-one with provider
 slots. `Flush` writes and reopens the sidecar through mmap; snapshot install
 and offline resharding carry it with the provider image. A legacy generation
 without the sidecar continues to serve native queries and fails FP32 rerank
-with `FAILED_PRECONDITION`. The mode also fails explicitly with the clustered
-vector provider because product shard nodes do not own its aligned rows.
-Composite dense leaves and dense boosts remain provider-native for now.
+with `FAILED_PRECONDITION`. Clustered TurboVec uses the same terminal path:
+stable provider labels route candidates back to product shards that own the
+aligned FP32 rows, so embedded, in-process clustered, and external clustered
+transports produce the same reranked result. Composite dense leaves and dense
+boosts remain provider-native for now.
+
+Candidate depth can be request-explicit (`selection_k`) or measured. A
+`DenseQualityPolicy` supplies `(k, target_recall_ppm)` and the coordinator
+resolves that exact point from the TOML file configured by
+`--dense-quality-profile`. The profile is bound to embedding model, corpus
+generation and row count, dimensions, provider kind, and scoring fingerprint.
+Any mismatch, unmeasured target, fingerprint pin mismatch, or request cap is a
+hard error. There is no interpolation or fallback multiplier. The response's
+`dense_quality` records the selected profile and depth. The current profile
+format describes an all-live generation: any tombstone refuses the measured
+policy until compaction produces a new generation and that generation is
+remeasured.
+
+Exact rows are scheduled by 4 KiB page and scored through a bounded worker
+pool shared across concurrent requests (`--rerank-parallel`, automatic and
+capped at four by default; explicit values stop at 64), then restored to
+request order. Each dot product retains scalar accumulation order, so parallel
+and serial score bits match. `--max-rerank-mib` (256 MiB by default) bounds
+logical FP32 row bytes before fan-out; shard deadlines apply to every rescore
+RPC. Query profiles report rows, logical bytes, mmap pages, and tasks.
+
+The configured file uses this strict shape (unknown keys are refused):
+
+```toml
+format_version = 1
+profile_id = "court-held-out-v1"
+embedding_model = "bge-m3"
+corpus_generation = 42
+corpus_rows = 1000000
+dimensions = 1024
+provider_backend = "embedded-turbovec"
+scoring_fingerprint = "<GetVectorBackend descriptor fingerprint>"
+measured_queries = 128
+
+[[points]]
+k = 10000
+target_recall_ppm = 990000
+candidates = 20850
+```
+
+Each point should be the maximum candidate depth required across the declared
+held-out queries for that target. `examples/exact_rerank_scale.rs` emits the
+per-query ranks and `every_query_depth` values used to construct these points.
 
 ## Composite scorer
 

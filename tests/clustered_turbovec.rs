@@ -9,8 +9,10 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    AddDocumentsRequest, AddVectorsRequest, ClusterHealthRequest, DocLineage, FacetValue,
-    FusionMode, HybridLegOptions, HybridSearchRequest, SearchRequest, SetCalibrationRequest,
+    search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, ClusterHealthRequest,
+    DenseQualityPolicy, DenseQuery, DenseScoreMode, DocLineage, FacetValue, FusionMode,
+    HybridLegOptions, HybridSearchRequest, QueryRequest, SearchQuery, SearchRequest,
+    SelectionQuery, SetCalibrationRequest,
 };
 use pipestream_search::vector::{VectorIndex, VectorSearchOptions, EMBEDDED_TURBOVEC};
 use tokio::sync::mpsc;
@@ -370,15 +372,15 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
         _product_handles.push(handle);
     }
     let embedded_product = CoordinatorServiceImpl::new(product_nodes.clone())
-        .with_max_k(K as u32)
+        .with_max_k(ROWS as u32)
         .with_stream_search(true)
         .with_bm25(Some(analysis.clone()), Default::default());
     let product = CoordinatorServiceImpl::new(product_nodes.clone())
-        .with_max_k(K as u32)
+        .with_max_k(ROWS as u32)
         .with_bm25(Some(analysis.clone()), Default::default())
         .with_clustered_turbovec(in_process.clone());
     let product_external = CoordinatorServiceImpl::new(product_nodes.clone())
-        .with_max_k(K as u32)
+        .with_max_k(ROWS as u32)
         .with_bm25(Some(analysis), Default::default())
         .with_clustered_turbovec(external);
     let public_query = harness::unit_vectors(1, DIM, 0xC105_7E03);
@@ -443,6 +445,107 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             .collect::<Vec<_>>(),
         expected_public
     );
+
+    // Candidate ownership and exact-row ownership are deliberately separate:
+    // clustered TurboVec returns stable labels, then product shards page-local
+    // rerank their own FP32 sidecars with no provider-specific score seam.
+    let fp32_request = QueryRequest {
+        request_id: "clustered-fp32".to_string(),
+        k: 10,
+        selection_k: ROWS as u32,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "dense".to_string(),
+                query: Some(search_query::Query::Dense(DenseQuery {
+                    vector: public_query.clone(),
+                    score_mode: DenseScoreMode::Fp32Rerank as i32,
+                    quality: None,
+                })),
+            })),
+        }),
+        profile: true,
+        ..Default::default()
+    };
+    let embedded_fp32 = SearchService::query(&embedded_product, Request::new(fp32_request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let clustered_fp32 = SearchService::query(&product, Request::new(fp32_request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let external_fp32 = SearchService::query(&product_external, Request::new(fp32_request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(clustered_fp32.hits, embedded_fp32.hits);
+    assert_eq!(external_fp32.hits, embedded_fp32.hits);
+    assert_eq!(
+        clustered_fp32.profile.as_ref().unwrap().rerank_rows,
+        ROWS as u64
+    );
+
+    let identity = in_process.quality_identity().await.unwrap();
+    let profile_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("clustered-quality-{}.toml", std::process::id()));
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"format_version = 1
+profile_id = "clustered-held-out"
+embedding_model = "test-unit-vectors"
+corpus_generation = {}
+corpus_rows = {ROWS}
+dimensions = {DIM}
+provider_backend = "clustered-turbovec"
+scoring_fingerprint = "{}"
+measured_queries = 16
+
+[[points]]
+k = 10
+target_recall_ppm = 1000000
+candidates = {ROWS}
+"#,
+            identity.topology_generation, identity.scoring_fingerprint
+        ),
+    )
+    .unwrap();
+    let quality_product = CoordinatorServiceImpl::new(product_nodes.clone())
+        .with_max_k(ROWS as u32)
+        .with_clustered_turbovec(in_process.clone())
+        .with_dense_quality_profile(
+            pipestream_search::quality::DenseQualityProfile::load(&profile_path).unwrap(),
+        );
+    let measured = SearchService::query(
+        &quality_product,
+        Request::new(QueryRequest {
+            k: 10,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Search(SearchQuery {
+                    id: "dense".into(),
+                    query: Some(search_query::Query::Dense(DenseQuery {
+                        vector: public_query.clone(),
+                        score_mode: DenseScoreMode::Fp32Rerank as i32,
+                        quality: Some(DenseQualityPolicy {
+                            target_recall_ppm: 1_000_000,
+                            max_candidates: ROWS as u32,
+                            required_profile_fingerprint: String::new(),
+                        }),
+                    })),
+                })),
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(measured.hits, embedded_fp32.hits);
+    assert_eq!(
+        measured.dense_quality.as_ref().unwrap().profile_id,
+        "clustered-held-out"
+    );
+    let _ = std::fs::remove_file(profile_path);
 
     let tie_request = SearchRequest {
         request_id: "clustered-public-ties".to_string(),

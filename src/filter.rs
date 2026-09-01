@@ -492,6 +492,8 @@ impl ResolvedFilter {
 /// scorers.
 #[derive(Debug, Clone, Default)]
 pub struct DocFilter {
+    /// Generation tombstones. A set bit is rejected before any column work.
+    pub deleted: Option<std::sync::Arc<Vec<u64>>>,
     /// The `geo_filters` field, resolved (`docs/geo-columns.md`).
     pub geo: crate::geo::GeoFilters,
     /// The `filter` tree, resolved; `None` when the request sent none.
@@ -504,7 +506,11 @@ impl DocFilter {
     /// for, and admitting it would make absence a way to sneak past a
     /// predicate.
     pub fn passes(&self, doc_id: u32, cols: &dyn NumericRead) -> bool {
-        self.geo.passes(doc_id, cols)
+        !self.deleted.as_ref().is_some_and(|words| {
+            words
+                .get(doc_id as usize / 64)
+                .is_some_and(|word| word & (1u64 << (doc_id % 64)) != 0)
+        }) && self.geo.passes(doc_id, cols)
             && self
                 .pred
                 .as_ref()
@@ -1014,6 +1020,7 @@ mod tests {
         // Only True passes the gate.
         let gate = |pred: ResolvedFilter, doc: u32| {
             DocFilter {
+                deleted: None,
                 geo: crate::geo::GeoFilters::default(),
                 pred: Some(pred),
             }

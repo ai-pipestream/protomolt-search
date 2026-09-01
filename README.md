@@ -734,8 +734,9 @@ search**:
    exactly as for prebuilt indexes (proven by `tests/multiprocess.rs`).
 
 **Persistence**: `NodeService.Flush` writes the provider image to its config
-`index` path and original FP32 rows to `<index>.exact`, then reopens the exact
-sidecar through mmap. `save_on_shutdown = true` (the
+`index` path, original FP32 rows to `<index>.exact`, and the live-row overlay
+to `<index>.live`, then reopens the exact sidecar through mmap.
+`save_on_shutdown = true` (the
 default) flushes on SIGINT/SIGTERM. A shard whose index path does not
 exist at startup starts empty; after ingest + flush (or graceful
 shutdown), a restart with the same config comes back with all vectors
@@ -748,8 +749,9 @@ For pre-computed corpora, skip per-node ingest entirely: build the
 shard image once (with the cluster's shared provider configuration) and push the
 FINISHED index to every shard owner over one client stream —
 `NodeService.InstallSnapshot`. The bundled
-`snapshot::install_snapshot_with_exact(addr, vector_path, exact_path,
-bm25_path)` client sends the complete generation; the compatibility
+`snapshot::install_snapshot_generation(addr, vector_path, exact_path,
+bm25_path, live_docs_path)` client sends all four aligned artifacts;
+`install_snapshot_with_exact` sends an all-live generation; the compatibility
 `install_snapshot` helper sends a native-only generation.
 
 The node stages the image in a generation directory
@@ -767,8 +769,13 @@ Rules of thumb: configure the provider first (or let an empty shard adopt
 the image's state), replace every shard together on scoring changes, and expect
 an image without a `.bm25` sidecar to wholesale-replace the postings
 store. An image without `vectors.f32` remains valid for provider-native
-queries but cannot serve FP32 rerank. Covered by `tests/snapshot.rs` (seven
+queries but cannot serve FP32 rerank. Covered by `tests/snapshot.rs` (eight
 cases, including restart survival and crash recovery).
+
+Deletes and replacements use one generation-local tombstone overlay shared by
+every read path. Updates append the new row, then atomically retire the old
+row; one-child resharding compacts tombstones into a new dense generation. See
+[docs/mutations.md](docs/mutations.md) for the consistency and cutover rules.
 
 ### Write log and resharding
 
@@ -1097,9 +1104,6 @@ TODO list).
   exists, the protocol does not.
 - **Streaming reshard.** Replay buffers each child's vectors in memory;
   very large shards need a spill-to-disk pass.
-- **Deletes and updates.** Vectors and postings are append-only; a
-  changed document re-ingests under a new id. turbovec's `IdMapIndex`
-  removes in O(1) but lacks the masked, floor-seeded scan.
 - **mmap vector index.** Postings and doc text are disk-resident (page
   cache); the turbovec index is heap-resident (see above). A
   packed-bytes abstraction — owned Vec or mmap behind one accessor,

@@ -858,6 +858,7 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
         )),
     ]);
     let doc_filter = DocFilter {
+        deleted: None,
         geo: Default::default(),
         pred: Some(pred.clone()),
     };

@@ -105,6 +105,7 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Bounds the coordinator's heap and keeps the shared floor rising: an
 /// unbounded k would hold the floor at -inf and stream every shard dry.
 pub const DEFAULT_MAX_K: u32 = 10_000;
+pub const DEFAULT_MAX_RERANK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Per-shard timing controls for the fan-out (all off by default).
 #[derive(Debug, Clone, Copy, Default)]
@@ -134,6 +135,14 @@ impl ProductLabelRange {
 
 struct ClusteredVectorResult {
     hits: Vec<(u64, f32)>,
+}
+
+pub(crate) struct ExactRerankScores {
+    pub scores: HashMap<u64, f32>,
+    pub rows: u64,
+    pub logical_bytes: u64,
+    pub pages_touched: u64,
+    pub tasks: u32,
 }
 
 /// The coordinator gRPC service.
@@ -171,6 +180,8 @@ pub struct CoordinatorServiceImpl {
     /// runs at exactly this depth. This bounds the coordinator's heap; it is
     /// not a node quota or scan-completion signal.
     max_k: u32,
+    /// Hard request-wide logical FP32 row-byte bound for reranking.
+    max_rerank_bytes: u64,
     /// One reusable channel per address, created on first use.
     channels: Arc<Mutex<HashMap<String, Channel>>>,
     /// Lazily bound UDP socket for the typed stream-signal fast lane (`None`
@@ -186,6 +197,10 @@ pub struct CoordinatorServiceImpl {
     /// Optional distributed vector collection. The product coordinator calls
     /// it once as one provider; it never learns or re-fans its shard topology.
     clustered_vectors: Option<ClusteredTurboVecBackend>,
+    /// Optional measured candidate-depth contract for FP32 reranking.
+    dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
+    /// Product shard-map generation (zero for the implicit static list).
+    topology_generation: u64,
     /// Product-owned phrase vocabulary used to derive canonical query terms.
     phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
     /// Request-local observer installed only by public QueryStream. A watch
@@ -1337,11 +1352,14 @@ impl CoordinatorServiceImpl {
             stream_search: false,
             bm25_stream: false,
             max_k: DEFAULT_MAX_K,
+            max_rerank_bytes: DEFAULT_MAX_RERANK_BYTES,
             channels: Arc::new(Mutex::new(HashMap::new())),
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
             clustered_vectors: None,
+            dense_quality_profile: None,
+            topology_generation: 0,
             phrase_index: None,
             query_progress: None,
         }
@@ -1450,6 +1468,11 @@ impl CoordinatorServiceImpl {
         self
     }
 
+    pub fn with_max_rerank_bytes(mut self, bytes: u64) -> Self {
+        self.max_rerank_bytes = bytes;
+        self
+    }
+
     /// Resolve a request's `k` against the configured cap. Proto3 makes
     /// an omitted field 0, so 0 selects `max_k` (the documented sentinel
     /// idiom here, like `rbo_p`); anything above the cap is refused with
@@ -1504,6 +1527,211 @@ impl CoordinatorServiceImpl {
     pub fn with_clustered_turbovec(mut self, backend: ClusteredTurboVecBackend) -> Self {
         self.clustered_vectors = Some(backend);
         self
+    }
+
+    pub fn with_dense_quality_profile(
+        mut self,
+        profile: crate::quality::DenseQualityProfile,
+    ) -> Self {
+        self.dense_quality_profile = Some(Arc::new(profile));
+        self
+    }
+
+    pub fn with_topology_generation(mut self, generation: u64) -> Self {
+        self.topology_generation = generation;
+        self
+    }
+
+    /// Resolve and prove one measured dense quality request against the live
+    /// provider and product exact-row generation. Drift is a hard failure.
+    pub(crate) async fn resolve_dense_quality(
+        &self,
+        k: u32,
+        query_dim: usize,
+        policy: &crate::pb::DenseQualityPolicy,
+    ) -> Result<crate::quality::DenseQualityResolution, Status> {
+        let profile = self.dense_quality_profile.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "dense quality policy requested but this coordinator has no --dense-quality-profile",
+            )
+        })?;
+        let resolution = profile
+            .resolve(
+                k,
+                policy.target_recall_ppm,
+                &policy.required_profile_fingerprint,
+                policy.max_candidates,
+            )
+            .map_err(Status::invalid_argument)?;
+        if resolution.selection_k > self.max_k {
+            return Err(Status::failed_precondition(format!(
+                "quality profile resolves selection_k={} above coordinator max_k={}; raise --max-k or measure a bounded policy",
+                resolution.selection_k, self.max_k
+            )));
+        }
+        if resolution.dimensions as usize != query_dim {
+            return Err(Status::failed_precondition(format!(
+                "quality profile dimension {} does not match query dimension {query_dim}",
+                resolution.dimensions
+            )));
+        }
+
+        let (provider, scoring_fingerprint, rows, generation, dimensions) = if let Some(clustered) =
+            &self.clustered_vectors
+        {
+            let identity = clustered.quality_identity().await?;
+            let mut tasks = Vec::with_capacity(self.node_addrs.len());
+            for addr in &self.node_addrs {
+                let mut client = self.node_client(addr)?;
+                tasks.push(tokio::spawn(async move {
+                    client
+                        .health(HealthRequest {})
+                        .await
+                        .map(|reply| reply.into_inner())
+                }));
+            }
+            let mut exact_rows = 0u64;
+            for task in tasks {
+                let health = task.await.map_err(|error| {
+                    Status::internal(format!("quality exact-row preflight failed: {error}"))
+                })??;
+                if !health.exact_vectors_available {
+                    return Err(Status::failed_precondition(format!(
+                        "clustered quality profile requires aligned product-owned exact rows, but product shard at slot_offset={} has none",
+                        health.slot_offset
+                    )));
+                }
+                if health.deleted_docs != 0 {
+                    return Err(Status::failed_precondition(format!(
+                        "clustered quality profile was measured on an all-live generation, but product shard at slot_offset={} has {} tombstoned rows; compact and remeasure",
+                        health.slot_offset, health.deleted_docs
+                    )));
+                }
+                exact_rows = exact_rows
+                    .checked_add(health.exact_vector_rows)
+                    .ok_or_else(|| Status::internal("quality exact-row count overflow"))?;
+            }
+            if exact_rows != identity.rows {
+                return Err(Status::failed_precondition(format!(
+                    "clustered vector collection has {} rows but product shards own {exact_rows} exact rows",
+                    identity.rows
+                )));
+            }
+            (
+                "clustered-turbovec".to_string(),
+                identity.scoring_fingerprint,
+                identity.rows,
+                identity.topology_generation,
+                identity.dimensions,
+            )
+        } else {
+            let mut tasks = Vec::with_capacity(self.node_addrs.len());
+            for addr in &self.node_addrs {
+                let mut client = self.node_client(addr)?;
+                tasks.push(tokio::spawn(async move {
+                    let backend = client
+                        .get_vector_backend(crate::pb::GetVectorBackendRequest {})
+                        .await?
+                        .into_inner();
+                    let health = client.health(HealthRequest {}).await?.into_inner();
+                    Ok::<_, Status>((backend, health))
+                }));
+            }
+            let mut provider = None;
+            let mut fingerprint = None;
+            let mut rows = 0u64;
+            let mut dimensions = None;
+            for task in tasks {
+                let (backend, health) = task.await.map_err(|error| {
+                    Status::internal(format!("quality preflight task failed: {error}"))
+                })??;
+                let descriptor = backend.descriptor.ok_or_else(|| {
+                    Status::failed_precondition(
+                        "quality preflight found a shard without a vector descriptor",
+                    )
+                })?;
+                if !health.exact_vectors_available {
+                    return Err(Status::failed_precondition(format!(
+                            "quality profile requires aligned exact rows, but shard at slot_offset={} has none",
+                            health.slot_offset
+                        )));
+                }
+                if health.deleted_docs != 0 {
+                    return Err(Status::failed_precondition(format!(
+                        "quality profile was measured on an all-live generation, but shard at slot_offset={} has {} tombstoned rows; compact and remeasure",
+                        health.slot_offset, health.deleted_docs
+                    )));
+                }
+                match &provider {
+                    Some(held) if held != &descriptor.backend_kind => {
+                        return Err(Status::failed_precondition(
+                            "quality preflight found mixed vector providers",
+                        ))
+                    }
+                    None => provider = Some(descriptor.backend_kind.clone()),
+                    _ => {}
+                }
+                match &fingerprint {
+                    Some(held) if held != &descriptor.scoring_fingerprint => {
+                        return Err(Status::failed_precondition(
+                            "quality preflight found mixed scoring fingerprints",
+                        ))
+                    }
+                    None => fingerprint = Some(descriptor.scoring_fingerprint.clone()),
+                    _ => {}
+                }
+                match dimensions {
+                    Some(held) if held != descriptor.dim => {
+                        return Err(Status::failed_precondition(
+                            "quality preflight found mixed vector dimensions",
+                        ))
+                    }
+                    None => dimensions = Some(descriptor.dim),
+                    _ => {}
+                }
+                rows = rows
+                    .checked_add(backend.num_vectors)
+                    .ok_or_else(|| Status::internal("quality preflight row count overflow"))?;
+            }
+            (
+                provider.unwrap_or_default(),
+                fingerprint.unwrap_or_default(),
+                rows,
+                self.topology_generation,
+                dimensions.unwrap_or_default(),
+            )
+        };
+
+        for (name, expected, actual) in [
+            (
+                "provider_backend",
+                resolution.provider_backend.as_str(),
+                provider.as_str(),
+            ),
+            (
+                "scoring_fingerprint",
+                resolution.scoring_fingerprint.as_str(),
+                scoring_fingerprint.as_str(),
+            ),
+        ] {
+            if expected != actual {
+                return Err(Status::failed_precondition(format!(
+                    "quality profile {name} {expected:?} does not match live {actual:?}"
+                )));
+            }
+        }
+        if resolution.corpus_rows != rows
+            || resolution.corpus_generation != generation
+            || resolution.dimensions != dimensions
+        {
+            return Err(Status::failed_precondition(format!(
+                "quality profile generation mismatch: profile rows/generation/dim={}/{}/{}, live={rows}/{generation}/{dimensions}",
+                resolution.corpus_rows,
+                resolution.corpus_generation,
+                resolution.dimensions
+            )));
+        }
+        Ok(resolution)
     }
 
     /// The pooled channel for `addr`, created lazily on first use.
@@ -5209,50 +5437,82 @@ impl CoordinatorServiceImpl {
 
     /// Score a fixed candidate set against the product-owned original FP32
     /// rows. Every requested id must resolve exactly once across the product
-    /// shards. This seam is deliberately unavailable when vector selection is
-    /// delegated to a clustered provider whose rows are not stored here.
-    pub async fn exact_vector_scores(
+    /// shards. Selection may come from the embedded or clustered provider;
+    /// stable labels route back to these product-owned rows in either case.
+    pub(crate) async fn exact_vector_scores(
         &self,
         vector: &[f32],
         ids: &[u64],
-    ) -> Result<HashMap<u64, f32>, Status> {
+    ) -> Result<ExactRerankScores, Status> {
         if vector.is_empty() {
             return Err(Status::invalid_argument(
                 "FP32 rerank needs a non-empty query vector",
             ));
         }
         if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        if self.clustered_vectors.is_some() {
-            return Err(Status::failed_precondition(
-                "FP32 rerank is unavailable with the clustered vector provider: product \
-                 shard nodes do not own an aligned exact-vector generation",
-            ));
+            return Ok(ExactRerankScores {
+                scores: HashMap::new(),
+                rows: 0,
+                logical_bytes: 0,
+                pages_touched: 0,
+                tasks: 0,
+            });
         }
         let mut requested = ids.to_vec();
         requested.sort_unstable();
         requested.dedup();
+        let logical_bytes = (requested.len() as u64)
+            .checked_mul(vector.len() as u64)
+            .and_then(|bytes| bytes.checked_mul(4))
+            .ok_or_else(|| Status::resource_exhausted("FP32 rerank byte count overflow"))?;
+        if logical_bytes > self.max_rerank_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "FP32 rerank needs {logical_bytes} logical row bytes for {} candidates at dim {}, above coordinator max_rerank_bytes={}",
+                requested.len(),
+                vector.len(),
+                self.max_rerank_bytes
+            )));
+        }
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for addr in &self.node_addrs {
             let request = ExactVectorRescoreRequest {
                 vector: vector.to_vec(),
                 candidate_ids: requested.clone(),
+                max_logical_bytes: self.max_rerank_bytes,
             };
             let mut client = self.node_client(addr)?;
+            let deadline = self.limits.shard_deadline;
             tasks.push(tokio::spawn(async move {
-                client
-                    .exact_vector_rescore(request)
-                    .await
-                    .map(|r| r.into_inner().hits)
+                let call = client.exact_vector_rescore(request);
+                match deadline {
+                    Some(limit) => tokio::time::timeout(limit, call)
+                        .await
+                        .map_err(|_| {
+                            Status::deadline_exceeded(
+                                "exact vector rescore shard deadline exceeded",
+                            )
+                        })?
+                        .map(tonic::Response::into_inner),
+                    None => call.await.map(tonic::Response::into_inner),
+                }
             }));
         }
         let mut scores = HashMap::with_capacity(requested.len());
+        let mut observed_bytes = 0u64;
+        let mut pages_touched = 0u64;
+        let mut worker_tasks = 0u32;
         for task in tasks {
-            let hits = task.await.map_err(|e| {
+            let response = task.await.map_err(|e| {
                 Status::internal(format!("exact vector rescore task failed: {e}"))
             })??;
-            for hit in hits {
+            observed_bytes = observed_bytes
+                .checked_add(response.logical_bytes)
+                .ok_or_else(|| Status::internal("exact rerank byte metrics overflow"))?;
+            pages_touched = pages_touched
+                .checked_add(response.pages_touched)
+                .ok_or_else(|| Status::internal("exact rerank page metrics overflow"))?;
+            worker_tasks = worker_tasks.saturating_add(response.tasks);
+            for hit in response.hits {
                 if scores.insert(hit.doc_id, hit.score).is_some() {
                     return Err(Status::failed_precondition(format!(
                         "FP32 rerank candidate {} is owned by more than one product shard; \
@@ -5267,7 +5527,18 @@ impl CoordinatorServiceImpl {
                 "FP32 rerank candidate {missing} has no exact-vector row on any product shard"
             )));
         }
-        Ok(scores)
+        if observed_bytes != logical_bytes {
+            return Err(Status::failed_precondition(format!(
+                "FP32 rerank shards reported {observed_bytes} logical bytes, expected {logical_bytes}; exact-row dimensions or ownership disagree"
+            )));
+        }
+        Ok(ExactRerankScores {
+            scores,
+            rows: requested.len() as u64,
+            logical_bytes,
+            pages_touched,
+            tasks: worker_tasks,
+        })
     }
 
     /// Candidate-scoped value fan-out (the `FetchValues` seam),

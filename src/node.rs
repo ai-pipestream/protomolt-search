@@ -32,9 +32,11 @@ use crate::chunked::{
 };
 use crate::exact_vectors::ExactVectorStore;
 use crate::fusion::{self, Leg};
+use crate::live_docs::LiveDocs;
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::wal::{
-    wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, SnapshotMarker,
+    wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, LoggedDeleteDocument,
+    LoggedReplacement, SnapshotMarker,
 };
 use crate::pb::{
     bm25_query_stream_request, bm25_query_stream_response, search_shard_request,
@@ -42,17 +44,19 @@ use crate::pb::{
     AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse,
     Bm25CandidateBatch, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse, Bm25QueryStreamRequest,
     Bm25QueryStreamResponse, Bm25RescoreRequest, Bm25RescoreResponse, Bm25StreamCompletion,
-    ConfigureVectorBackendRequest, ConfigureVectorBackendResponse, ExactVectorRescoreRequest,
-    ExactVectorRescoreResponse, FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest,
-    GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse, GetVectorBackendRequest,
-    GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
-    HybridShardResponse, IngestMappedRequest, IngestMappedResponse, InstallSnapshotResponse,
-    OffsetSpan, RawLegHit, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent,
-    ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
-    SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk,
-    SnapshotManifest, StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
-    TermStatsResponse, VectorBackendConfig as WireVectorBackendConfig,
+    CommitReplacementsRequest, CommitReplacementsResponse, ConfigureVectorBackendRequest,
+    ConfigureVectorBackendResponse, DeleteDocumentsRequest, DeleteDocumentsResponse,
+    ExactVectorRescoreRequest, ExactVectorRescoreResponse, FloorUpdate, FlushRequest,
+    FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
+    GetDocumentsResponse, GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest,
+    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, IngestMappedRequest,
+    IngestMappedResponse, InstallSnapshotResponse, OffsetSpan, RawLegHit, ResolveParentsRequest,
+    ResolveParentsResponse, ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest,
+    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
+    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
+    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorQualityContract,
     VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
@@ -63,6 +67,18 @@ use crate::vector::{
     EMBEDDED_TURBOVEC,
 };
 use crate::wal::{self, WalWriter};
+
+pub const MAX_RERANK_PARALLEL: usize = 64;
+
+fn resolved_rerank_parallel(configured: usize) -> usize {
+    if configured == 0 {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4)
+    } else {
+        configured.min(MAX_RERANK_PARALLEL)
+    }
+}
 
 /// Identity of one BM25 score space. The canonical request keeps only
 /// fields that can change a document's score; delivery depth, floors,
@@ -196,6 +212,10 @@ pub struct NodeConfig {
     /// Concurrent batched scans (blocking threads). 0 sizes from the
     /// machine: half the available cores, at least one.
     pub scan_parallel: usize,
+    /// Bounded worker lanes for page-local FP32 candidate reranking. Zero
+    /// sizes from the machine, capped at four to avoid competing with vector
+    /// scans by default.
+    pub rerank_parallel: usize,
 }
 
 impl Default for NodeConfig {
@@ -226,6 +246,7 @@ impl Default for NodeConfig {
             vocab_top_k: crate::vocab::HeavyHitters::DEFAULT_CAPACITY,
             coalesce: true,
             scan_parallel: 0,
+            rerank_parallel: 0,
         }
     }
 }
@@ -1842,15 +1863,28 @@ pub(crate) fn agg_op_name(op: crate::pb::AggregateOp) -> &'static str {
 
 fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,
+    deleted: Option<Arc<Vec<u64>>>,
     n: usize,
     geo_filters: &[crate::pb::GeoFilter],
     geo_regions: &[crate::geo::GeoRegion],
     filter: Option<&crate::pb::FilterExpr>,
 ) -> Result<(Option<crate::filter::DocFilter>, Option<Vec<bool>>), Status> {
-    if geo_filters.is_empty() && filter.is_none() {
+    if geo_filters.is_empty() && filter.is_none() && deleted.is_none() {
         return Ok((None, None));
     }
     let Some(store) = bm25 else {
+        if geo_filters.is_empty() && filter.is_none() {
+            let allow = (0..n)
+                .map(|slot| {
+                    !deleted.as_ref().is_some_and(|words| {
+                        words
+                            .get(slot / 64)
+                            .is_some_and(|word| word & (1u64 << (slot % 64)) != 0)
+                    })
+                })
+                .collect();
+            return Ok((None, Some(allow)));
+        }
         return Ok((None, Some(vec![false; n])));
     };
     if store.as_index().is_none() {
@@ -1859,6 +1893,7 @@ fn resolve_shard_filters(
         ));
     }
     let doc_filter = crate::filter::DocFilter {
+        deleted,
         geo: store.resolve_geo_filters(geo_filters, geo_regions),
         pred: filter.map(|f| store.resolve_filter(f)),
     };
@@ -1892,6 +1927,72 @@ fn filter_known_flags(
         (_, None) => Vec::new(),
     };
     (geo, tree)
+}
+
+/// Remove generation tombstones from one postings view's corpus shares.
+fn live_field_stats(
+    index: &dyn Bm25Index,
+    terms: &[String],
+    live_docs: &LiveDocs,
+    slots: u32,
+) -> (u64, Vec<u32>) {
+    if !live_docs.has_deletes() {
+        return (
+            index.total_doc_length(),
+            terms.iter().map(|term| index.df(term)).collect(),
+        );
+    }
+    let deleted_length: u64 = (0..slots)
+        .filter(|slot| live_docs.is_deleted(*slot as usize))
+        .map(|slot| u64::from(index.doc_length(slot)))
+        .sum();
+    let dfs = terms
+        .iter()
+        .map(|term| {
+            let mut live_df = 0u32;
+            index.for_each_doc_tf(term, &mut |doc, _tf| {
+                if !live_docs.is_deleted(doc as usize) {
+                    live_df += 1;
+                }
+            });
+            live_df
+        })
+        .collect();
+    (index.total_doc_length().saturating_sub(deleted_length), dfs)
+}
+
+fn live_document_count(store: &Bm25Shard, live_docs: &LiveDocs) -> u64 {
+    if !live_docs.has_deletes() {
+        return store.doc_count();
+    }
+    let views: Vec<_> = (0..store.field_count())
+        .filter_map(|field| store.field_view(field))
+        .collect();
+    (0..store.next_doc_id())
+        .filter(|slot| {
+            !live_docs.is_deleted(*slot as usize)
+                && views.iter().any(|view| view.doc_length(*slot) > 0)
+        })
+        .count() as u64
+}
+
+fn active_artifact_rows(guard: &ShardState) -> Vec<u64> {
+    [
+        guard.index.as_ref().map(|index| index.len() as u64),
+        guard
+            .bm25
+            .as_ref()
+            .map(|store| u64::from(store.next_doc_id())),
+        guard.exact_vectors.as_ref().map(|store| store.len() as u64),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|rows| *rows != 0)
+    .collect()
+}
+
+fn physical_rows(guard: &ShardState) -> u64 {
+    active_artifact_rows(guard).into_iter().max().unwrap_or(0)
 }
 
 /// Order-preserving u64 key for an i64 value: offset binary, so the
@@ -2048,6 +2149,8 @@ struct ShardState {
     /// search remains available, while FP32 rerank refuses by name.
     exact_vectors: Option<ExactVectorStore>,
     bm25: Option<Bm25Shard>,
+    /// Generation tombstones shared by every lexical and vector read path.
+    live_docs: LiveDocs,
     /// The active snapshot generation directory, when the shard's files
     /// came from (or were replaced by) an `InstallSnapshot` image.
     /// `Flush` and the AddDocuments reload path read/write THERE, never
@@ -2115,6 +2218,13 @@ pub fn exact_vector_sidecar_path(index_path: &std::path::Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// The persisted live-row overlay beside a legacy provider image.
+pub fn live_docs_sidecar_path(index_path: &std::path::Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".live");
+    PathBuf::from(p)
+}
+
 /// Where a bulk BM25 build spills while it runs: `<bm25 path>.build`.
 ///
 /// A successful `Flush` removes it, so finding one beside a MISSING
@@ -2160,6 +2270,18 @@ pub fn generation_bm25(dir: &Path) -> PathBuf {
     } else {
         legacy
     }
+}
+
+/// Product-owned live-row overlay inside a snapshot generation.
+pub fn generation_live_docs(dir: &Path) -> PathBuf {
+    dir.join("live-docs.bin")
+}
+
+fn live_docs_storage_path(index_path: &Path, generation: Option<&PathBuf>) -> PathBuf {
+    generation.map_or_else(
+        || live_docs_sidecar_path(index_path),
+        |dir| generation_live_docs(dir),
+    )
 }
 
 /// Receive staging (`<index path>.snap-tmp/`) and swap-out
@@ -2467,6 +2589,8 @@ pub struct NodeServiceImpl {
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
     scan_jobs: Arc<std::sync::OnceLock<mpsc::Sender<ScanJob>>>,
+    /// Lane budget shared by every exact-rerank request on this node.
+    rerank_slots: Arc<tokio::sync::Semaphore>,
     /// UDP fast-lane registry: stream token -> that stream's monotone floor
     /// and advisory cancellation flag. Fed by [`Self::spawn_floor_listener`]
     /// and polled by the streaming scan before every chunk.
@@ -2711,6 +2835,7 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
         }
         let resolved = resolve_shard_filters(
             guard.bm25.as_ref(),
+            guard.live_docs.words(),
             slots,
             &job.geo_filters,
             &job.geo_regions,
@@ -2781,11 +2906,13 @@ impl NodeServiceImpl {
     pub fn new(index: Option<VectorIndex>, config: NodeConfig) -> Self {
         let wal = open_wal(index.as_ref(), &config);
         let vocab = open_vocab(&config);
+        let rerank_parallel = resolved_rerank_parallel(config.rerank_parallel);
         Self {
             state: Arc::new(RwLock::new(ShardState {
                 index,
                 exact_vectors: None,
                 bm25: None,
+                live_docs: LiveDocs::default(),
                 generation: None,
                 wal,
                 parents: None,
@@ -2795,6 +2922,7 @@ impl NodeServiceImpl {
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
+            rerank_slots: Arc::new(tokio::sync::Semaphore::new(rerank_parallel)),
             stream_signals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             vocab,
             materialize_cache: Arc::new(std::sync::Mutex::new(None)),
@@ -2977,20 +3105,44 @@ impl NodeServiceImpl {
         {
             let mut guard = self.state.write().expect("shard state lock poisoned");
             if let Some(exact) = store.as_ref() {
-                let index = guard.index.as_ref().ok_or_else(|| {
-                    "exact-vector sidecar exists but the shard has no provider index".to_string()
-                })?;
-                if exact.len() != index.len() || exact.dim() != index.dim_opt() {
-                    return Err(format!(
-                        "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
-                        exact.dim(),
-                        exact.len(),
-                        index.dim_opt(),
-                        index.len()
-                    ));
+                if let Some(index) = guard.index.as_ref() {
+                    if exact.len() != index.len() || exact.dim() != index.dim_opt() {
+                        return Err(format!(
+                            "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
+                            exact.dim(),
+                            exact.len(),
+                            index.dim_opt(),
+                            index.len()
+                        ));
+                    }
+                } else if guard
+                    .bm25
+                    .as_ref()
+                    .is_some_and(|bm25| exact.len() != bm25.next_doc_id() as usize)
+                {
+                    return Err(
+                        "exact-vector sidecar row count does not match product document rows"
+                            .to_string(),
+                    );
                 }
             }
             guard.exact_vectors = store;
+        }
+        Ok(self)
+    }
+
+    /// Attach the persisted generation overlay loaded at startup.
+    pub fn with_live_docs(self, live_docs: LiveDocs) -> Result<Self, String> {
+        {
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let rows = physical_rows(&guard);
+            if live_docs.persisted_rows() > rows {
+                return Err(format!(
+                    "live-doc overlay describes {} rows but the shard has only {rows}",
+                    live_docs.persisted_rows()
+                ));
+            }
+            guard.live_docs = live_docs;
         }
         Ok(self)
     }
@@ -3120,20 +3272,26 @@ impl NodeServiceImpl {
         // installed, else the legacy layout — never split the two.
         let (vector_path, exact_path, bm25_path) =
             storage_paths(&config_path, guard.generation.as_ref());
+        let live_docs_path = live_docs_storage_path(&config_path, guard.generation.as_ref());
         if let Some(exact) = guard.exact_vectors.as_ref() {
-            let index = guard.index.as_ref().ok_or_else(|| {
-                Status::failed_precondition(
-                    "exact-vector sidecar exists but the shard has no provider index",
-                )
-            })?;
-            if exact.len() != index.len() || exact.dim() != index.dim_opt() {
-                return Err(Status::failed_precondition(format!(
-                    "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
-                    exact.dim(),
-                    exact.len(),
-                    index.dim_opt(),
-                    index.len()
-                )));
+            if let Some(index) = guard.index.as_ref() {
+                if exact.len() != index.len() || exact.dim() != index.dim_opt() {
+                    return Err(Status::failed_precondition(format!(
+                        "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
+                        exact.dim(),
+                        exact.len(),
+                        index.dim_opt(),
+                        index.len()
+                    )));
+                }
+            } else if guard
+                .bm25
+                .as_ref()
+                .is_some_and(|bm25| exact.len() != bm25.next_doc_id() as usize)
+            {
+                return Err(Status::failed_precondition(
+                    "exact-vector sidecar row count does not match product document rows",
+                ));
             }
         }
         if let Some(index) = guard.index.as_ref() {
@@ -3147,6 +3305,11 @@ impl NodeServiceImpl {
                 .map_err(|e| Status::internal(format!("write {}: {e}", exact_path.display())))?;
             guard.exact_vectors = Some(mapped);
         }
+        let physical_rows = physical_rows(&guard);
+        guard.live_docs = guard
+            .live_docs
+            .write(&live_docs_path, physical_rows)
+            .map_err(|e| Status::internal(format!("write {}: {e}", live_docs_path.display())))?;
         // Save the builder as v3 and immediately reopen it disk-resident:
         // after Flush a shard holds no postings or texts in heap.
         // Already-resident shards have nothing to write.
@@ -3205,7 +3368,8 @@ impl NodeServiceImpl {
     }
 
     /// Receive one snapshot image into the staging generation directory
-    /// (`vector.index`, `vectors.f32`, then `documents.bm25` when declared).
+    /// (`vector.index`, `vectors.f32`, `documents.bm25`, and `live-docs.bin`
+    /// when declared).
     /// The byte counts in the manifest split the stream; every file is synced
     /// before the caller swaps anything. Returns
     /// with the staging dir complete or not at all — on error the caller
@@ -3225,6 +3389,7 @@ impl NodeServiceImpl {
         let tv_tmp = generation_vector(tmp_dir);
         let exact_tmp = generation_exact_vectors(tmp_dir);
         let bm25_tmp = generation_bm25(tmp_dir);
+        let live_tmp = generation_live_docs(tmp_dir);
         let mut tv = tokio::fs::File::create(&tv_tmp)
             .await
             .map_err(|e| io_err(&tv_tmp, e))?;
@@ -3246,7 +3411,17 @@ impl NodeServiceImpl {
         } else {
             None
         };
-        let (mut tv_written, mut exact_written, mut bm25_written) = (0u64, 0u64, 0u64);
+        let mut live = if manifest.live_docs_bytes > 0 {
+            Some(
+                tokio::fs::File::create(&live_tmp)
+                    .await
+                    .map_err(|e| io_err(&live_tmp, e))?,
+            )
+        } else {
+            None
+        };
+        let (mut tv_written, mut exact_written, mut bm25_written, mut live_written) =
+            (0u64, 0u64, 0u64, 0u64);
         while let Some(chunk) = inbound.message().await? {
             let Some(snapshot_chunk::Payload::Data(mut data)) = chunk.payload else {
                 return Err(Status::invalid_argument(
@@ -3254,7 +3429,8 @@ impl NodeServiceImpl {
                 ));
             };
             // Fill the provider image first, then the exact-vector sidecar,
-            // then BM25. A chunk may straddle either boundary.
+            // BM25, and the live-row overlay. A chunk may straddle any
+            // boundary.
             let tv_take = (manifest.vector_bytes - tv_written).min(data.len() as u64) as usize;
             if tv_take > 0 {
                 tv.write_all(&data[..tv_take])
@@ -3278,13 +3454,27 @@ impl NodeServiceImpl {
                 exact_written += exact_take as u64;
                 data.drain(..exact_take);
             }
-            if !data.is_empty() {
+            let bm25_take = (manifest.bm25_bytes - bm25_written).min(data.len() as u64) as usize;
+            if bm25_take > 0 {
                 let Some(sidecar) = bm25.as_mut() else {
                     return Err(Status::invalid_argument(
                         "snapshot carries more data than the manifest declares",
                     ));
                 };
-                if bm25_written + data.len() as u64 > manifest.bm25_bytes {
+                sidecar
+                    .write_all(&data[..bm25_take])
+                    .await
+                    .map_err(|e| io_err(&bm25_tmp, e))?;
+                bm25_written += bm25_take as u64;
+                data.drain(..bm25_take);
+            }
+            if !data.is_empty() {
+                let Some(sidecar) = live.as_mut() else {
+                    return Err(Status::invalid_argument(
+                        "snapshot carries more data than the manifest declares",
+                    ));
+                };
+                if live_written + data.len() as u64 > manifest.live_docs_bytes {
                     return Err(Status::invalid_argument(
                         "snapshot carries more data than the manifest declares",
                     ));
@@ -3292,18 +3482,22 @@ impl NodeServiceImpl {
                 sidecar
                     .write_all(&data)
                     .await
-                    .map_err(|e| io_err(&bm25_tmp, e))?;
-                bm25_written += data.len() as u64;
+                    .map_err(|e| io_err(&live_tmp, e))?;
+                live_written += data.len() as u64;
             }
         }
         if tv_written != manifest.vector_bytes
             || exact_written != manifest.exact_vector_bytes
             || bm25_written != manifest.bm25_bytes
+            || live_written != manifest.live_docs_bytes
         {
             return Err(Status::invalid_argument(format!(
-                "truncated snapshot: received {tv_written}+{exact_written}+{bm25_written} of \
-                 declared {}+{}+{} bytes",
-                manifest.vector_bytes, manifest.exact_vector_bytes, manifest.bm25_bytes
+                "truncated snapshot: received {tv_written}+{exact_written}+{bm25_written}+{live_written} of \
+                 declared {}+{}+{}+{} bytes",
+                manifest.vector_bytes,
+                manifest.exact_vector_bytes,
+                manifest.bm25_bytes,
+                manifest.live_docs_bytes
             )));
         }
         tv.sync_all().await.map_err(|e| io_err(&tv_tmp, e))?;
@@ -3316,18 +3510,21 @@ impl NodeServiceImpl {
         if let Some(sidecar) = bm25.as_mut() {
             sidecar.sync_all().await.map_err(|e| io_err(&bm25_tmp, e))?;
         }
+        if let Some(sidecar) = live.as_mut() {
+            sidecar.sync_all().await.map_err(|e| io_err(&live_tmp, e))?;
+        }
         Ok(())
     }
 
     /// Validate a received snapshot image and atomically swap it in (the
     /// blocking half of `InstallSnapshot`). Everything that can fail —
-    /// loading the index, opening the sidecar, the scoring-identity check —
+    /// loading the index, opening all sidecars, the scoring-identity check —
     /// happens BEFORE the swap, so a rejected install leaves the live
     /// shard and the on-disk generation untouched.
     ///
-    /// The swap itself is one directory rename: the vector and BM25 files
-    /// pair travels inside the staging dir, so the two files can never
-    /// tear. Replacing an existing generation renames it aside first; the
+    /// The swap itself is one directory rename: every generation artifact
+    /// travels inside the staging dir, so the files can never tear. Replacing
+    /// an existing generation renames it aside first; the
     /// crash window between the two renames is covered by
     /// [`recover_generation`] at startup.
     fn apply_snapshot(
@@ -3335,6 +3532,7 @@ impl NodeServiceImpl {
         tmp_dir: &Path,
         with_exact_vectors: bool,
         with_bm25: bool,
+        with_live_docs: bool,
     ) -> Result<InstallSnapshotResponse, Status> {
         let path = self
             .config
@@ -3347,6 +3545,7 @@ impl NodeServiceImpl {
         let tv_tmp = generation_vector(tmp_dir);
         let exact_tmp = generation_exact_vectors(tmp_dir);
         let bm25_tmp = generation_bm25(tmp_dir);
+        let live_tmp = generation_live_docs(tmp_dir);
 
         let loaded = VectorIndex::load(&self.config.vector_backend, &tv_tmp).map_err(|e| {
             Status::invalid_argument(format!("snapshot is not a valid vector backend image: {e}"))
@@ -3372,12 +3571,27 @@ impl NodeServiceImpl {
                 )));
             }
         }
-        if with_bm25 {
+        let incoming_doc_rows = if with_bm25 {
             // Open-check the sidecar (and drop it again) before the swap;
             // the live shard re-opens from the generation dir.
-            drop(Bm25Shard::open(&bm25_tmp).map_err(|e| {
+            let store = Bm25Shard::open(&bm25_tmp).map_err(|e| {
                 Status::invalid_argument(format!("snapshot sidecar is not a valid BM25 store: {e}"))
-            })?);
+            })?;
+            u64::from(store.next_doc_id())
+        } else {
+            0
+        };
+        let incoming_live_docs = if with_live_docs {
+            LiveDocs::open(&live_tmp).map_err(|e| {
+                Status::invalid_argument(format!("snapshot live-row overlay is invalid: {e}"))
+            })?
+        } else {
+            LiveDocs::default()
+        };
+        if incoming_live_docs.persisted_rows() > (loaded.len() as u64).max(incoming_doc_rows) {
+            return Err(Status::invalid_argument(
+                "snapshot live-row overlay exceeds every aligned artifact's row count",
+            ));
         }
 
         let mut guard = self.state.write().expect("shard state lock poisoned");
@@ -3452,6 +3666,7 @@ impl NodeServiceImpl {
         // would lie.
         guard.mapped_binding = guard.bm25.as_ref().and_then(|b| b.binding().cloned());
         guard.index = Some(loaded);
+        guard.live_docs = incoming_live_docs;
         guard.parents = None;
         guard.generation = Some(snap.clone());
         guard.stats_epoch += 1;
@@ -3816,15 +4031,18 @@ impl NodeServiceImpl {
                 // bit-identical to its unfiltered form.
                 let numeric_read = ShardNumericRead(store);
                 let doc_filter = crate::filter::DocFilter {
+                    deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
                     pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
                 };
-                let filter_ctx: bm25::FilterCtx =
-                    if req.geo_filters.is_empty() && doc_filter.pred.is_none() {
-                        None
-                    } else {
-                        Some((&doc_filter, &numeric_read))
-                    };
+                let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty()
+                    && doc_filter.pred.is_none()
+                    && doc_filter.deleted.is_none()
+                {
+                    None
+                } else {
+                    Some((&doc_filter, &numeric_read))
+                };
                 if !req.facet_fields.is_empty()
                     || !req.map_facet_fields.is_empty()
                     || !req.range_facet_fields.is_empty()
@@ -4047,6 +4265,7 @@ impl NodeServiceImpl {
         let slots = guard.index.as_ref().map_or(0, |index| index.len());
         let (doc_filter, allow) = resolve_shard_filters(
             guard.bm25.as_ref(),
+            guard.live_docs.words(),
             slots,
             filters.geo,
             &filters.regions,
@@ -6171,6 +6390,7 @@ impl NodeService for NodeServiceImpl {
                     // pruning math.
                     let (_, allow) = resolve_shard_filters(
                         guard.bm25.as_ref(),
+                        guard.live_docs.words(),
                         index.len(),
                         &start.geo_filters,
                         &geo_regions,
@@ -6294,6 +6514,7 @@ impl NodeService for NodeServiceImpl {
                         Self::validate_start(index, &start)?;
                         let (_, allow) = resolve_shard_filters(
                             guard.bm25.as_ref(),
+                            guard.live_docs.words(),
                             index.len(),
                             &start.geo_filters,
                             &geo_regions,
@@ -6405,7 +6626,7 @@ impl NodeService for NodeServiceImpl {
                 "bm25 bulk build in progress; Flush before browsing",
             ));
         }
-        let n = store.doc_count();
+        let n = u64::from(store.next_doc_id());
         // The exclusive floor in local id space. The first page carries
         // no floor at all (proto3 cannot distinguish after = 0 from
         // unset, so the request says which it is).
@@ -6415,6 +6636,7 @@ impl NodeService for NodeServiceImpl {
             (req.after - slot_offset + 1).min(n)
         };
         let doc_filter = crate::filter::DocFilter {
+            deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
             pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
         };
@@ -6521,9 +6743,13 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let (geo_columns_known, filter_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
-        let label_count = guard.bm25.as_ref().map_or(0, Bm25Shard::doc_count) as usize;
+        let label_count = guard
+            .bm25
+            .as_ref()
+            .map_or(0, |store| store.next_doc_id() as usize);
         let (_, allow) = resolve_shard_filters(
             guard.bm25.as_ref(),
+            guard.live_docs.words(),
             label_count,
             &req.geo_filters,
             &geo_regions,
@@ -6695,11 +6921,12 @@ impl NodeService for NodeServiceImpl {
             pcts.push((resolved, PctAcc::default()));
         }
         let doc_filter = crate::filter::DocFilter {
+            deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
             pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
         };
         let cols = ShardNumericRead(store);
-        let n = store.doc_count();
+        let n = u64::from(store.next_doc_id());
         let mut matched = 0u64;
         let mut ungrouped = 0u64;
         // Group accumulators by facet ordinal; each holds (matched,
@@ -6855,11 +7082,12 @@ impl NodeService for NodeServiceImpl {
             }
         }
         let doc_filter = crate::filter::DocFilter {
+            deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
             pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
         };
         let cols = ShardNumericRead(store);
-        let n = store.doc_count();
+        let n = u64::from(store.next_doc_id());
         let mut counts = vec![0u64; req.targets.len()];
         let mut bits_of = vec![None; exprs.len()];
         // One admitted-set pass per round: each expression evaluates
@@ -6919,17 +7147,21 @@ impl NodeService for NodeServiceImpl {
             None => (0, false),
         };
         let exact_vector_rows = guard.exact_vectors.as_ref().map_or(0, |s| s.len() as u64);
-        let exact_vectors_available = guard
-            .index
-            .as_ref()
-            .zip(guard.exact_vectors.as_ref())
-            .is_some_and(|(index, exact)| {
+        let exact_vectors_available = guard.exact_vectors.as_ref().is_some_and(|exact| {
+            if let Some(index) = guard.index.as_ref() {
                 exact.len() == index.len() && exact.dim() == index.dim_opt()
-            });
+            } else if let Some(store) = guard.bm25.as_ref() {
+                exact.len() == store.next_doc_id() as usize
+            } else {
+                true
+            }
+        });
         let exact_vectors_mmap = guard
             .exact_vectors
             .as_ref()
             .is_some_and(ExactVectorStore::is_mapped);
+        let physical_docs = physical_rows(&guard);
+        let deleted_docs = guard.live_docs.deleted_count().min(physical_docs);
         Ok(Response::new(HealthResponse {
             num_vectors,
             dim,
@@ -6944,6 +7176,9 @@ impl NodeService for NodeServiceImpl {
             exact_vectors_available,
             exact_vector_rows,
             exact_vectors_mmap,
+            live_docs: physical_docs - deleted_docs,
+            deleted_docs,
+            live_revision: guard.live_docs.revision(),
         }))
     }
 
@@ -7100,6 +7335,7 @@ impl NodeService for NodeServiceImpl {
                     // and means exactly what it meant before.
                     let (_, allow) = resolve_shard_filters(
                         guard.bm25.as_ref(),
+                        guard.live_docs.words(),
                         index.len(),
                         &start.geo_filters,
                         &geo_regions,
@@ -7370,8 +7606,9 @@ impl NodeService for NodeServiceImpl {
         let cleanup = tmp_dir.clone();
         let with_exact_vectors = manifest.exact_vector_bytes > 0;
         let with_bm25 = manifest.bm25_bytes > 0;
+        let with_live_docs = manifest.live_docs_bytes > 0;
         let result = tokio::task::spawn_blocking(move || {
-            service.apply_snapshot(&tmp_dir, with_exact_vectors, with_bm25)
+            service.apply_snapshot(&tmp_dir, with_exact_vectors, with_bm25, with_live_docs)
         })
         .await
         .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
@@ -7452,6 +7689,128 @@ impl NodeService for NodeServiceImpl {
             added,
             total,
             first_id,
+        }))
+    }
+
+    async fn delete_documents(
+        &self,
+        request: Request<DeleteDocumentsRequest>,
+    ) -> Result<Response<DeleteDocumentsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::DeleteDocuments);
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let rows = physical_rows(&guard);
+        let mut slots = Vec::with_capacity(req.doc_ids.len());
+        for id in &req.doc_ids {
+            let local = id.checked_sub(offset).ok_or_else(|| {
+                Status::invalid_argument(format!("document id {id} is below shard offset {offset}"))
+            })?;
+            if local >= rows {
+                return Err(Status::invalid_argument(format!(
+                    "document id {id} is outside this shard's {rows} physical rows"
+                )));
+            }
+            slots.push((*id, local as usize));
+        }
+        let mut deleted = 0u64;
+        let mut already_deleted = 0u64;
+        for (id, slot) in slots {
+            if guard.live_docs.delete(slot) {
+                deleted += 1;
+                wal_append_or_degrade(
+                    &mut guard.wal,
+                    wal_record::Op::DeleteDocument(LoggedDeleteDocument { doc_id: id }),
+                );
+            } else {
+                already_deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
+            guard.parents = None;
+        }
+        Ok(Response::new(DeleteDocumentsResponse {
+            deleted,
+            already_deleted,
+            live_revision: guard.live_docs.revision(),
+        }))
+    }
+
+    async fn commit_replacements(
+        &self,
+        request: Request<CommitReplacementsRequest>,
+    ) -> Result<Response<CommitReplacementsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::CommitReplacements);
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let artifact_rows = active_artifact_rows(&guard);
+        let rows = artifact_rows.iter().copied().max().unwrap_or(0);
+        let mut seen = std::collections::HashSet::new();
+        let mut pairs = Vec::with_capacity(req.replacements.len());
+        for replacement in &req.replacements {
+            if replacement.old_doc_id == replacement.new_doc_id {
+                return Err(Status::invalid_argument(
+                    "replacement old and new ids must differ",
+                ));
+            }
+            if !seen.insert(replacement.old_doc_id) || !seen.insert(replacement.new_doc_id) {
+                return Err(Status::invalid_argument(
+                    "a replacement batch may mention each id only once",
+                ));
+            }
+            let old = replacement.old_doc_id.checked_sub(offset).ok_or_else(|| {
+                Status::invalid_argument("replacement old id is below this shard's offset")
+            })?;
+            let new = replacement.new_doc_id.checked_sub(offset).ok_or_else(|| {
+                Status::invalid_argument("replacement new id is below this shard's offset")
+            })?;
+            if old >= rows || new >= rows {
+                return Err(Status::invalid_argument(
+                    "replacement ids must name existing rows on this shard",
+                ));
+            }
+            if artifact_rows
+                .iter()
+                .any(|artifact_rows| old >= *artifact_rows || new >= *artifact_rows)
+            {
+                return Err(Status::failed_precondition(
+                    "replacement ids must exist in every active provider, exact-vector, and document artifact",
+                ));
+            }
+            if guard.live_docs.is_deleted(new as usize) {
+                return Err(Status::failed_precondition(format!(
+                    "replacement row {} is already deleted",
+                    replacement.new_doc_id
+                )));
+            }
+            pairs.push((*replacement, old as usize));
+        }
+        let mut committed = 0u64;
+        let mut already_committed = 0u64;
+        for (replacement, old) in pairs {
+            if guard.live_docs.delete(old) {
+                committed += 1;
+                wal_append_or_degrade(
+                    &mut guard.wal,
+                    wal_record::Op::Replacement(LoggedReplacement {
+                        old_doc_id: replacement.old_doc_id,
+                        new_doc_id: replacement.new_doc_id,
+                    }),
+                );
+            } else {
+                already_committed += 1;
+            }
+        }
+        if committed > 0 {
+            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
+            guard.parents = None;
+        }
+        Ok(Response::new(CommitReplacementsResponse {
+            committed,
+            already_committed,
+            live_revision: guard.live_docs.revision(),
         }))
     }
 
@@ -7567,9 +7926,15 @@ impl NodeService for NodeServiceImpl {
                             let view = store
                                 .field_view(fi)
                                 .expect("as_index above proves the shard is searchable");
+                            let (total_doc_length, doc_frequencies) = live_field_stats(
+                                view.as_ref(),
+                                &ft.terms,
+                                &guard.live_docs,
+                                store.next_doc_id(),
+                            );
                             crate::pb::FieldStats {
-                                total_doc_length: view.total_doc_length(),
-                                doc_frequencies: ft.terms.iter().map(|t| view.df(t)).collect(),
+                                total_doc_length,
+                                doc_frequencies,
                                 known: true,
                             }
                         }
@@ -7580,10 +7945,12 @@ impl NodeService for NodeServiceImpl {
                         },
                     })
                     .collect();
+                let (total_doc_length, doc_frequencies) =
+                    live_field_stats(index, &req.terms, &guard.live_docs, store.next_doc_id());
                 (
-                    store.doc_count(),
-                    index.total_doc_length(),
-                    req.terms.iter().map(|t| index.df(t)).collect(),
+                    live_document_count(store, &guard.live_docs),
+                    total_doc_length,
+                    doc_frequencies,
                     field_stats,
                 )
             }
@@ -7895,12 +8262,16 @@ impl NodeService for NodeServiceImpl {
                 let chain = store.resolve_chain(&specs);
                 let stage_columns_known = chain.stages.iter().map(|s| s.column.is_some()).collect();
                 let numeric_read = ShardNumericRead(store);
-                let n = store.doc_count();
+                let n = u64::from(store.next_doc_id());
                 let mut ids: Vec<u64> = req
                     .candidate_ids
                     .iter()
                     .copied()
-                    .filter(|&id| id >= offset && id - offset < n)
+                    .filter(|&id| {
+                        id >= offset
+                            && id - offset < n
+                            && !guard.live_docs.is_deleted((id - offset) as usize)
+                    })
                     .collect();
                 ids.sort_unstable();
                 ids.dedup();
@@ -7982,7 +8353,7 @@ impl NodeService for NodeServiceImpl {
             for &id in &req.candidate_ids {
                 if id >= offset && id - offset < n as u64 {
                     let slot = (id - offset) as usize;
-                    if !mask[slot] {
+                    if !guard.live_docs.is_deleted(slot) && !mask[slot] {
                         mask[slot] = true;
                         allowed += 1;
                     }
@@ -8019,25 +8390,45 @@ impl NodeService for NodeServiceImpl {
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let state = self.state.clone();
-        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
+        let parallel = resolved_rerank_parallel(self.config.rerank_parallel);
+        let lanes = crate::exact_vectors::rerank_task_count(req.candidate_ids.len(), parallel);
+        let permits = self
+            .rerank_slots
+            .clone()
+            .acquire_many_owned(lanes as u32)
+            .await
+            .map_err(|_| Status::unavailable("exact rerank worker budget closed"))?;
+        let result = tokio::task::spawn_blocking(move || -> Result<ExactVectorRescoreResponse, Status> {
+            let _permits = permits;
             let guard = state.read().expect("shard state lock poisoned");
-            let Some(index) = guard.index.as_ref() else {
-                return Ok(Vec::new());
-            };
-            let n = index.len();
+            // Product shards may own exact rows for a clustered vector
+            // collection without also serving a local provider image. The
+            // product slot range is therefore the maximum aligned artifact,
+            // not `index.len()` alone.
+            let n = guard
+                .index
+                .as_ref()
+                .map_or(0, VectorIndex::len)
+                .max(guard.exact_vectors.as_ref().map_or(0, ExactVectorStore::len))
+                .max(
+                    guard
+                        .bm25
+                        .as_ref()
+                        .map_or(0, |store| store.next_doc_id() as usize),
+                );
             let mut slots = Vec::new();
             let mut seen = vec![false; n];
             for id in req.candidate_ids {
                 if id >= offset && id - offset < n as u64 {
                     let slot = (id - offset) as usize;
-                    if !seen[slot] {
+                    if !guard.live_docs.is_deleted(slot) && !seen[slot] {
                         seen[slot] = true;
                         slots.push(slot);
                     }
                 }
             }
             if slots.is_empty() {
-                return Ok(Vec::new());
+                return Ok(ExactVectorRescoreResponse::default());
             }
             let exact = guard.exact_vectors.as_ref().ok_or_else(|| {
                 Status::failed_precondition(format!(
@@ -8046,29 +8437,50 @@ impl NodeService for NodeServiceImpl {
                     offset + n as u64
                 ))
             })?;
-            if exact.len() != n || exact.dim() != index.dim_opt() {
-                return Err(Status::failed_precondition(format!(
-                    "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{n}",
-                    exact.dim(),
-                    exact.len(),
-                    index.dim_opt()
+            if let Some(index) = guard.index.as_ref() {
+                if exact.len() != index.len() || exact.dim() != index.dim_opt() {
+                    return Err(Status::failed_precondition(format!(
+                        "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
+                        exact.dim(),
+                        exact.len(),
+                        index.dim_opt(),
+                        index.len()
+                    )));
+                }
+            }
+            let dim = exact.dim().ok_or_else(|| {
+                Status::failed_precondition("exact-vector sidecar has no dimension")
+            })?;
+            let predicted = (slots.len() as u64)
+                .checked_mul(dim as u64)
+                .and_then(|bytes| bytes.checked_mul(4))
+                .ok_or_else(|| Status::resource_exhausted("FP32 rerank byte count overflow"))?;
+            if req.max_logical_bytes != 0 && predicted > req.max_logical_bytes {
+                return Err(Status::resource_exhausted(format!(
+                    "FP32 rerank needs {predicted} logical row bytes on this shard, above max_logical_bytes={}",
+                    req.max_logical_bytes
                 )));
             }
-            exact
-                .score_slots(&req.vector, &slots)
-                .map_err(|e| Status::invalid_argument(e.to_string()))
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|(slot, score)| RawLegHit {
+            let scored = exact
+                .score_slots_profiled(&req.vector, &slots, parallel)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            Ok(ExactVectorRescoreResponse {
+                hits: scored
+                    .rows
+                    .into_iter()
+                    .map(|(slot, score)| RawLegHit {
                             doc_id: offset + slot as u64,
                             score,
                         })
-                        .collect()
-                })
+                    .collect(),
+                logical_bytes: scored.logical_bytes,
+                pages_touched: scored.pages_touched,
+                tasks: scored.tasks,
+            })
         })
         .await
         .map_err(|e| Status::internal(format!("exact vector rescore task failed: {e}")))??;
-        Ok(Response::new(ExactVectorRescoreResponse { hits }))
+        Ok(Response::new(result))
     }
 
     async fn get_documents(
@@ -8089,6 +8501,9 @@ impl NodeService for NodeServiceImpl {
                     continue;
                 }
                 let local = (id - offset) as u32;
+                if guard.live_docs.is_deleted(local as usize) {
+                    continue;
+                }
                 if let Some(text) = store.text(local) {
                     documents.push(StoredDocument {
                         doc_id: id,
@@ -8119,7 +8534,12 @@ impl NodeService for NodeServiceImpl {
             .index
             .as_ref()
             .map_or(0, |index| index.len() as u64)
-            .max(guard.bm25.as_ref().map_or(0, |store| store.doc_count()));
+            .max(
+                guard
+                    .bm25
+                    .as_ref()
+                    .map_or(0, |store| u64::from(store.next_doc_id())),
+            );
         let store = guard.bm25.as_ref().and_then(|store| store.as_index());
         let mut parents = Vec::new();
         for doc_id in req.doc_ids {
@@ -8127,6 +8547,9 @@ impl NodeService for NodeServiceImpl {
                 continue;
             };
             if local >= rows {
+                continue;
+            }
+            if guard.live_docs.is_deleted(local as usize) {
                 continue;
             }
             let parent_id = u32::try_from(local)
@@ -8324,8 +8747,13 @@ impl NodeServiceImpl {
         // every path below is then bit-identical to its unfiltered
         // form.
         let doc_filter: Option<crate::filter::DocFilter> = match guard.bm25.as_ref() {
-            Some(store) if !req.geo_filters.is_empty() || req.filter.is_some() => {
+            Some(store)
+                if !req.geo_filters.is_empty()
+                    || req.filter.is_some()
+                    || guard.live_docs.has_deletes() =>
+            {
                 Some(crate::filter::DocFilter {
+                    deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
                     pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
                 })
@@ -8635,6 +9063,7 @@ impl NodeServiceImpl {
                     .candidate_ids
                     .iter()
                     .filter(|&&id| id >= offset && (id - offset) <= u64::from(u32::MAX))
+                    .filter(|&&id| !guard.live_docs.is_deleted((id - offset) as usize))
                     .map(|id| (id - offset) as u32)
                     .collect();
                 let index = store.as_index().ok_or_else(|| {

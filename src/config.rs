@@ -182,6 +182,9 @@ pub struct Config {
     pub coalesce: bool,
     /// Concurrent batched scans per node (0 = half the cores).
     pub scan_parallel: usize,
+    /// Bounded worker lanes per shard for page-local FP32 reranking. Zero
+    /// auto-sizes and caps itself at four.
+    pub rerank_parallel: usize,
     /// Minimum score improvement before a node publishes its next floor
     /// (0.0 = publish every raise).
     pub floor_delta: f32,
@@ -215,6 +218,10 @@ pub struct Config {
     /// are refused (never clamped); a request omitting `k` runs at this
     /// depth. Must be at least 1.
     pub max_k: u32,
+    /// Coordinator-wide logical FP32 payload bound for one rerank request.
+    pub max_rerank_bytes: u64,
+    /// Optional generation-bound measured candidate-depth profile.
+    pub dense_quality_profile: Option<PathBuf>,
     /// gRPC message size cap applied to clients and servers.
     pub max_message_bytes: usize,
     /// Issue one demo search against the coordinator at startup.
@@ -309,6 +316,7 @@ struct FileConfig {
     allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
+    rerank_parallel: Option<usize>,
     floor_delta: Option<f32>,
     floor_warmup_chunks: Option<u32>,
     floor_min_interval_ms: Option<u64>,
@@ -319,6 +327,8 @@ struct FileConfig {
     stream_search: Option<bool>,
     bm25_stream: Option<bool>,
     max_k: Option<u32>,
+    max_rerank_mib: Option<u64>,
+    dense_quality_profile: Option<String>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
     analysis_addr: Option<String>,
@@ -830,6 +840,24 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     })
     .transpose()?
     .unwrap_or(0);
+    let rerank_parallel = opt(
+        args,
+        "rerank-parallel",
+        "TURBOVEC_RERANK_PARALLEL",
+        file.rerank_parallel.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<usize>()
+            .map_err(|e| format!("invalid rerank parallel: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(0);
+    if rerank_parallel > crate::node::MAX_RERANK_PARALLEL {
+        return Err(format!(
+            "rerank parallel must be <= {}, got {rerank_parallel}",
+            crate::node::MAX_RERANK_PARALLEL
+        ));
+    }
     let floor_delta = opt(
         args,
         "floor-delta",
@@ -1004,6 +1032,33 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     })
     .transpose()?
     .unwrap_or(crate::coordinator::DEFAULT_MAX_K);
+    let max_rerank_bytes = opt(
+        args,
+        "max-rerank-mib",
+        "TURBOVEC_MAX_RERANK_MIB",
+        file.max_rerank_mib.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid max rerank MiB: {e}"))
+            .and_then(|mib| {
+                if mib == 0 {
+                    return Err("max rerank MiB must be positive".to_string());
+                }
+                mib.checked_mul(1024 * 1024)
+                    .ok_or_else(|| "max rerank MiB overflows bytes".to_string())
+            })
+    })
+    .transpose()?
+    .unwrap_or(crate::coordinator::DEFAULT_MAX_RERANK_BYTES);
+    let dense_quality_profile = opt(
+        args,
+        "dense-quality-profile",
+        "PIPESTREAM_SEARCH_DENSE_QUALITY_PROFILE",
+        file.dense_quality_profile.as_deref(),
+    )
+    .filter(|path| !path.trim().is_empty())
+    .map(PathBuf::from);
 
     let analysis_addr = opt(
         args,
@@ -1226,6 +1281,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         allow_missing_bm25,
         coalesce,
         scan_parallel,
+        rerank_parallel,
         floor_delta,
         floor_warmup_chunks,
         floor_min_interval_ms,
@@ -1237,6 +1293,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         stream_search,
         bm25_stream,
         max_k,
+        max_rerank_bytes,
+        dense_quality_profile,
         query_dim,
         bit_width,
         save_on_shutdown,
@@ -1634,6 +1692,11 @@ slot_offset = 20000
         assert_eq!(defaults.shard_deadline_ms, 0);
         assert_eq!(defaults.hedge_delay_ms, 0);
         assert!(defaults.replica_addrs.is_empty());
+        assert_eq!(defaults.rerank_parallel, 0);
+        assert_eq!(
+            defaults.max_rerank_bytes,
+            crate::coordinator::DEFAULT_MAX_RERANK_BYTES
+        );
 
         let cfg = parse(&args(&[
             "--role=node",
@@ -1641,17 +1704,27 @@ slot_offset = 20000
             "--floor-delta=0.005",
             "--shard-deadline-ms=1500",
             "--hedge-delay-ms=200",
+            "--rerank-parallel=8",
+            "--max-rerank-mib=32",
         ]))
         .unwrap();
         assert_eq!(cfg.floor_delta, 0.005);
         assert_eq!(cfg.shard_deadline_ms, 1500);
         assert_eq!(cfg.hedge_delay_ms, 200);
+        assert_eq!(cfg.rerank_parallel, 8);
+        assert_eq!(cfg.max_rerank_bytes, 32 * 1024 * 1024);
 
         // Negative or non-finite deltas are rejected.
         assert!(parse(&args(&[
             "--role=node",
             "--demo-vectors=10",
             "--floor-delta=-0.1"
+        ]))
+        .is_err());
+        assert!(parse(&args(&[
+            "--role=node",
+            "--demo-vectors=10",
+            "--rerank-parallel=65"
         ]))
         .is_err());
     }

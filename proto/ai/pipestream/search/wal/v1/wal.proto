@@ -74,6 +74,8 @@ message WalRecord {
     // that carries contradictory bindings; the serving node's durable
     // copy is the store's kind-6 column-table entry, written at flush.
     LoggedBinding bind = 8;
+    LoggedDeleteDocument delete_document = 9;
+    LoggedReplacement replacement = 10;
   }
   // Reserved for multi-writer recovery: 6 for a clock tag (writer id +
   // logical tick per record, the generalization of per-file `seq` that
@@ -83,6 +85,15 @@ message WalRecord {
   // today; reserving the numbers keeps old logs readable when clocks
   // arrive.
   reserved 6, 7;
+}
+
+message LoggedDeleteDocument {
+  uint64 doc_id = 1;
+}
+
+message LoggedReplacement {
+  uint64 old_doc_id = 1;
+  uint64 new_doc_id = 2;
 }
 
 // The mapped-plan binding as logged (see WalRecord.bind).

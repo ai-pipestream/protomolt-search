@@ -180,9 +180,10 @@ without weakening that completion rule.
 
 ## 5. Search nodes
 
-A node serves one or more shards, and a persisted shard can contain three
+A node serves one or more shards, and a persisted shard can contain four
 aligned artifacts: a provider vector image, a product-owned original-FP32
-sidecar used for candidate reranking, and a `.bm25` lexical index. The exact
+sidecar used for candidate reranking, a `.bm25` lexical index, and a compact
+live-row overlay. The exact
 sidecar and provider image have one row per vector slot; the lexical store can
 also contain document-only rows. The node
 wraps them behind one gRPC service. For vector queries it runs the engine's

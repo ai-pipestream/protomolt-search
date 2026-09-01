@@ -864,6 +864,12 @@ impl WalWriter {
             wal_record::Op::AddDocuments(a) => {
                 Some(bucket_of(a.first_id, self.manifest.bucket_count as usize) as u32)
             }
+            wal_record::Op::DeleteDocument(d) => {
+                Some(bucket_of(d.doc_id, self.manifest.bucket_count as usize) as u32)
+            }
+            wal_record::Op::Replacement(r) => {
+                Some(bucket_of(r.old_doc_id, self.manifest.bucket_count as usize) as u32)
+            }
             wal_record::Op::Flush(_) | wal_record::Op::Snapshot(_) | wal_record::Op::Bind(_) => {
                 None
             }

@@ -7,8 +7,8 @@
 mod common;
 
 use pipestream_search::node::{
-    generation_bm25, generation_dir, generation_exact_vectors, generation_vector,
-    recover_generation, Bm25Shard, NodeConfig, NodeServiceImpl,
+    generation_bm25, generation_dir, generation_exact_vectors, generation_live_docs,
+    generation_vector, recover_generation, Bm25Shard, NodeConfig, NodeServiceImpl,
 };
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
@@ -216,6 +216,7 @@ async fn seeded_install_serves_and_persists() {
         .exact_vector_rescore(ExactVectorRescoreRequest {
             vector: query.clone(),
             candidate_ids: vec![100, 101],
+            max_logical_bytes: 0,
         })
         .await
         .unwrap()
@@ -227,6 +228,66 @@ async fn seeded_install_serves_and_persists() {
 
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_live_overlay_is_installed_atomically_with_the_generation() {
+    let dir = tempdir("live-overlay");
+    let (reference, corpus, src_tv) = build_source(&dir);
+    let src_exact = build_exact_source(&dir, &corpus, N);
+    let src_bm25 = build_bm25(&dir, "hidden document");
+    let src_live = dir.join("source.live");
+    let mut live = pipestream_search::live_docs::LiveDocs::default();
+    assert!(live.delete(0));
+    live.write(&src_live, N as u64).unwrap();
+    let (shift, scale) = legacy_calibration(&reference);
+    let node_tv = dir.join("shard.tv");
+    let (addr, handle) = common::start_empty_node(NodeConfig {
+        slot_offset: 100,
+        index_path: Some(node_tv.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    seed(&mut client, &shift, &scale).await;
+    pipestream_search::snapshot::install_snapshot_generation(
+        &addr,
+        &src_tv,
+        Some(&src_exact),
+        Some(&src_bm25),
+        Some(&src_live),
+    )
+    .await
+    .unwrap();
+
+    let gen = generation_dir(&node_tv);
+    assert!(generation_live_docs(&gen).exists());
+    let health = client.health(HealthRequest {}).await.unwrap().into_inner();
+    assert_eq!((health.live_docs, health.deleted_docs), ((N - 1) as u64, 1));
+    let query = corpus[..DIM].to_vec();
+    let hits = search_topk(&mut client, query.clone(), 10).await;
+    assert!(hits.iter().all(|hit| hit.vector_id != 100));
+    assert!(client
+        .get_documents(GetDocumentsRequest { doc_ids: vec![100] })
+        .await
+        .unwrap()
+        .into_inner()
+        .documents
+        .is_empty());
+    assert!(client
+        .exact_vector_rescore(ExactVectorRescoreRequest {
+            vector: query,
+            candidate_ids: vec![100],
+            max_logical_bytes: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits
+        .is_empty());
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -305,6 +366,7 @@ async fn unseeded_node_adopts_snapshot_calibration() {
         .exact_vector_rescore(ExactVectorRescoreRequest {
             vector: query,
             candidate_ids: vec![0],
+            max_logical_bytes: 0,
         })
         .await
         .unwrap_err();
@@ -336,6 +398,7 @@ async fn truncated_stream_rejected() {
             vector_bytes: bytes.len() as u64 + 64,
             bm25_bytes: 0,
             exact_vector_bytes: 0,
+            live_docs_bytes: 0,
         })),
     })
     .await

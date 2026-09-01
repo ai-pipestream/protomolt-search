@@ -151,14 +151,19 @@ Classic WAL truncation does not apply — the log is full history, kept
 for replay. "Compaction" means collapsing history into a fresh base
 image:
 
-- **Live compaction = self-snapshot.** Dump the live index to an image,
-  `InstallSnapshot` it back onto the same node (atomic generation swap,
-  crash-safe), rotate to an empty log generation, archive the old one.
-  Reads never stop; ingest pauses only for the final swap.
+- **One-child reshard = compaction.** Run the reshard tool with `--split=1`.
+  WAL replay applies delete and replacement records, writes a dense all-live
+  provider/BM25/FP32 generation, and drops the overlay. Install that image with
+  `InstallSnapshot` for the crash-safe atomic generation swap, then archive the
+  parent generation.
+- The build may run while reads continue, but writes must be stopped before
+  choosing the replay point and remain stopped through install. Live WAL
+  catch-up is still deferred; calling this hitless today would lose mutations
+  appended after the replay point.
 - **Natural triggers:** after a bulk-load phase completes, after any
   `InstallSnapshot` (rotation already happens; retiring the old
   generation is the compaction), after a reshard retires its parent,
-  and later when removes exist (rewrite dropping removed ids).
+  and when the live-row overlay crosses an operator-selected threshold.
 - Bucket files keep compaction units small and independent.
 
 ## Cost

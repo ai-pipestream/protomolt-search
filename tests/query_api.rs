@@ -12,12 +12,13 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     query_stream_response, search_query, selection_query, selection_score_strategy,
     AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest, BoostQuery, BoostRescore,
-    CascadeScore, CompositeScorer, CompositeSearchStrategy, DecomposedScore, DenseQuery,
-    DenseScoreMode, FilterQuery, FlushRequest, FusionMode, HealthRequest, HybridLegOptions,
-    HybridSearchRequest, IntegerValue, LexicalQuery, QueryRequest, QueryResponse, QuerySort,
-    QueryStreamCompletion, QueryStreamPhase, QueryStreamRequest, QueryStreamResponse,
-    QueryStreamRevision, RrfScore, SearchQuery, SearchRequest, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, SetCalibrationRequest,
+    CascadeScore, CompositeScorer, CompositeSearchStrategy, DecomposedScore,
+    DeleteDocumentsRequest, DenseQualityPolicy, DenseQuery, DenseScoreMode, FilterQuery,
+    FlushRequest, FusionMode, HealthRequest, HybridLegOptions, HybridSearchRequest, IntegerValue,
+    LexicalQuery, QueryRequest, QueryResponse, QuerySort, QueryStreamCompletion, QueryStreamPhase,
+    QueryStreamRequest, QueryStreamResponse, QueryStreamRevision, RrfScore, SearchQuery,
+    SearchRequest, SelectionOperator, SelectionQuery, SelectionScoreStrategy,
+    SetCalibrationRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -143,6 +144,7 @@ fn fp32_dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
                 score_mode: DenseScoreMode::Fp32Rerank as i32,
+                quality: None,
             })),
         })),
     }
@@ -332,7 +334,34 @@ async fn fp32_mode_reranks_a_persisted_mmap_candidate_pool() {
     assert_eq!(health.exact_vector_rows, ROWS as u64);
     assert!(pipestream_search::node::exact_vector_sidecar_path(&index_path).exists());
 
-    let coordinator = CoordinatorServiceImpl::new(vec![addr]);
+    let profile_path = dir.join("dense-quality.toml");
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"format_version = 1
+profile_id = "held-out-64"
+embedding_model = "test-unit-vectors"
+corpus_generation = 0
+corpus_rows = {ROWS}
+dimensions = {DIM}
+provider_backend = "{}"
+scoring_fingerprint = "{}"
+measured_queries = 32
+
+[[points]]
+k = 10
+target_recall_ppm = 1000000
+candidates = {ROWS}
+"#,
+            health.vector_backend, health.scoring_fingerprint
+        ),
+    )
+    .unwrap();
+    let quality_profile =
+        pipestream_search::quality::DenseQualityProfile::load(&profile_path).unwrap();
+    let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+        .with_topology_generation(0)
+        .with_dense_quality_profile(quality_profile);
     let request = QueryRequest {
         request_id: "fp32-public".into(),
         k: 10,
@@ -343,7 +372,12 @@ async fn fp32_mode_reranks_a_persisted_mmap_candidate_pool() {
     };
     let response = query(&coordinator, request.clone()).await.unwrap();
     assert_eq!(response.executed, "search:fp32_rerank");
-    assert!(response.profile.as_ref().unwrap().rerank_ms >= 0.0);
+    let physical = response.profile.as_ref().unwrap();
+    assert!(physical.rerank_ms >= 0.0);
+    assert_eq!(physical.rerank_rows, ROWS as u64);
+    assert_eq!(physical.rerank_logical_bytes, (ROWS * DIM * 4) as u64);
+    assert!(physical.rerank_pages > 0);
+    assert!(physical.rerank_tasks > 0);
 
     let mut expected: Vec<(u64, f32)> = corpus
         .chunks_exact(DIM)
@@ -369,6 +403,68 @@ async fn fp32_mode_reranks_a_persisted_mmap_candidate_pool() {
         .collect();
     assert_eq!(actual, expected_bits);
 
+    let measured_request = QueryRequest {
+        request_id: "fp32-measured".into(),
+        k: 10,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "vec".into(),
+                query: Some(search_query::Query::Dense(DenseQuery {
+                    vector: query_vector.clone(),
+                    score_mode: DenseScoreMode::Fp32Rerank as i32,
+                    quality: Some(DenseQualityPolicy {
+                        target_recall_ppm: 1_000_000,
+                        max_candidates: ROWS as u32,
+                        required_profile_fingerprint: String::new(),
+                    }),
+                })),
+            })),
+        }),
+        ..Default::default()
+    };
+    let measured = query(&coordinator, measured_request.clone()).await.unwrap();
+    assert_eq!(
+        measured
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected_bits
+    );
+    let outcome = measured.dense_quality.expect("measured policy outcome");
+    assert_eq!(outcome.target_recall_ppm, 1_000_000);
+    assert_eq!(outcome.selection_k, ROWS as u32);
+    assert_eq!(outcome.profile_id, "held-out-64");
+    assert_eq!(outcome.corpus_rows, ROWS as u64);
+
+    let mut conflicting = measured_request.clone();
+    conflicting.selection_k = ROWS as u32;
+    let err = query(&coordinator, conflicting).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("selection_k"));
+
+    let stale_path = dir.join("dense-quality-stale.toml");
+    let stale = std::fs::read_to_string(&profile_path)
+        .unwrap()
+        .replace("corpus_rows = 64", "corpus_rows = 65");
+    std::fs::write(&stale_path, stale).unwrap();
+    let stale_coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+        .with_topology_generation(0)
+        .with_dense_quality_profile(
+            pipestream_search::quality::DenseQualityProfile::load(&stale_path).unwrap(),
+        );
+    let err = query(&stale_coordinator, measured_request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("row"), "{}", err.message());
+
+    let byte_limited =
+        CoordinatorServiceImpl::new(vec![addr]).with_max_rerank_bytes((ROWS * DIM * 4 - 1) as u64);
+    let err = query(&byte_limited, request.clone()).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    assert!(err.message().contains("bytes"), "{}", err.message());
+
     let mut stream_request = request;
     stream_request.profile = false;
     let stream_expected = query(&coordinator, stream_request.clone()).await.unwrap();
@@ -385,6 +481,17 @@ async fn fp32_mode_reranks_a_persisted_mmap_candidate_pool() {
     assert_eq!(
         QueryStreamPhase::try_from(revisions.last().unwrap().phase).unwrap(),
         QueryStreamPhase::Final
+    );
+
+    node.delete_documents(DeleteDocumentsRequest { doc_ids: vec![63] })
+        .await
+        .unwrap();
+    let err = query(&coordinator, measured_request).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("compact and remeasure"),
+        "{}",
+        err.message()
     );
 
     handle.abort();

@@ -1231,6 +1231,7 @@ fn geo_filtered_decayed_pruned_matches_exhaustive_bitwise() {
             },
         ] {
             let filters = pipestream_search::filter::DocFilter {
+                deleted: None,
                 geo: GeoFilters {
                     filters: vec![pipestream_search::geo::GeoFilter {
                         column: Some(gi),
@@ -1585,6 +1586,7 @@ fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
         },
     ] {
         let filters = pipestream_search::filter::DocFilter {
+            deleted: None,
             geo: GeoFilters {
                 filters: vec![pipestream_search::geo::GeoFilter {
                     column: Some(gi),
