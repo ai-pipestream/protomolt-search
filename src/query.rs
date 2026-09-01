@@ -24,7 +24,7 @@ use crate::coordinator::CoordinatorServiceImpl;
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
     search_query, selection_query, selection_score_strategy, BlendScore, Bm25SearchRequest,
-    BoostRescore, DecomposedScore, DenseQuery, FilterQuery, FusionMode, GeoFilter,
+    BoostRescore, DecomposedScore, DenseQuery, DenseScoreMode, FilterQuery, FusionMode, GeoFilter,
     HybridLegOptions, HybridSearchRequest, LexicalQuery, QueryHit, QueryRequest, QueryResponse,
     QuerySignal, RrfScore, SearchQuery, SearchRequest, SelectionOperator, SelectionQuery,
 };
@@ -201,6 +201,19 @@ pub async fn execute(
         .as_ref()
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
     let plan = parse_selection(selection)?;
+    let fp32_rerank = match &plan.shape {
+        Shape::Dense { query, .. } => dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
+        Shape::Composite { dense, .. } => {
+            if dense_score_mode(dense)? == DenseScoreMode::Fp32Rerank {
+                return Err(refuse(
+                    "FP32 rerank is currently served on a single dense selection only; \
+                     composite fusion still consumes provider-native dense scores",
+                ));
+            }
+            false
+        }
+        _ => false,
+    };
     check_ids(&plan, &req.boosts)?;
     // An empty scorer message is treated as absent (a set-but-empty
     // one names neither operation nor dimensions).
@@ -274,8 +287,10 @@ pub async fn execute(
     // (and the paging pool), with a scorer it is the pool the scorer
     // reorders, and with a boost it is the pool the boost rescores
     // (the honest form of the rescore window).
-    let pooled =
-        matches!(plan.shape, Shape::Composite { .. }) || scorer.is_some() || !req.boosts.is_empty();
+    let pooled = matches!(plan.shape, Shape::Composite { .. })
+        || scorer.is_some()
+        || !req.boosts.is_empty()
+        || fp32_rerank;
     if !pooled && selection_k != req.k {
         return Err(refuse(
             "selection_k differs from k but nothing on a single-leaf shape uses the \
@@ -495,9 +510,34 @@ pub async fn execute(
                     dimensions: Vec::new(),
                 })
                 .collect();
+            let route = if fp32_rerank {
+                let t0 = std::time::Instant::now();
+                let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
+                let scores = coordinator.exact_vector_scores(&query.vector, &ids).await?;
+                for hit in &mut hits {
+                    let score = *scores.get(&hit.doc_id).ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "FP32 rerank candidate {} has no exact score",
+                            hit.doc_id
+                        ))
+                    })?;
+                    hit.score = score;
+                    hit.signals[0].score = score;
+                }
+                hits.sort_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.doc_id.cmp(&b.doc_id))
+                });
+                if let Some(p) = prof.as_mut() {
+                    p.rerank_ms = ms(t0);
+                }
+                "search:fp32_rerank"
+            } else {
+                "search"
+            };
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
-            let executed =
-                apply_scorer(coordinator, &scorer, &mut hits, "search", &mut prof).await?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
             Ok(done(
@@ -891,6 +931,11 @@ fn leaf_shape(leaf: &SearchQuery) -> Result<Shape<'_>, Status> {
     }
 }
 
+fn dense_score_mode(query: &DenseQuery) -> Result<DenseScoreMode, Status> {
+    DenseScoreMode::try_from(query.score_mode)
+        .map_err(|_| refuse(format!("unknown dense score_mode {}", query.score_mode)))
+}
+
 /// The two-leaf strategy composite: exactly one dense and one lexical
 /// scoring leaf, an operator the strategy can certify, and a strategy
 /// that maps onto a fusion mode.
@@ -1162,6 +1207,12 @@ fn parse_boosts<'a>(
                 }
             }
             Some(search_query::Query::Dense(dense)) => {
+                if dense_score_mode(dense)? == DenseScoreMode::Fp32Rerank {
+                    return Err(refuse(
+                        "FP32 rerank is a selection mode, not a dense boost mode; dense boosts \
+                         continue to use provider-native candidate scoring",
+                    ));
+                }
                 if dense.vector.is_empty() {
                     return Err(refuse(format!(
                         "dense boost {:?} has an empty vector",

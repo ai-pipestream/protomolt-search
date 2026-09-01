@@ -28,13 +28,13 @@ use crate::pb::{
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse,
     CalibrationApplyResult, CascadeHit, ClusterHealthRequest, ClusterHealthResponse,
-    ClusteredVectorHealth, ConfigureVectorBackendRequest, FloorUpdate, FusionMode, HealthRequest,
-    HybridDebug, HybridHit, HybridLegHit, HybridSearchRequest, HybridSearchResponse,
-    HybridShardDebug, HybridShardRequest, ParentGroup, ScoredHit, SearchRequest, SearchResponse,
-    SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth,
-    ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch, StopStreamSearch,
-    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
-    VectorBackendApplyResult, VectorRescoreRequest,
+    ClusteredVectorHealth, ConfigureVectorBackendRequest, ExactVectorRescoreRequest, FloorUpdate,
+    FusionMode, HealthRequest, HybridDebug, HybridHit, HybridLegHit, HybridSearchRequest,
+    HybridSearchResponse, HybridShardDebug, HybridShardRequest, ParentGroup, ScoredHit,
+    SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse,
+    SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats, StartShardSearch,
+    StartStreamSearch, StopStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult, VectorRescoreRequest,
 };
 use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
@@ -5205,6 +5205,69 @@ impl CoordinatorServiceImpl {
             .map(|s| (s as u32, ids.to_vec()))
             .collect();
         self.fanout_vector_rescore(vector, by_shard).await
+    }
+
+    /// Score a fixed candidate set against the product-owned original FP32
+    /// rows. Every requested id must resolve exactly once across the product
+    /// shards. This seam is deliberately unavailable when vector selection is
+    /// delegated to a clustered provider whose rows are not stored here.
+    pub async fn exact_vector_scores(
+        &self,
+        vector: &[f32],
+        ids: &[u64],
+    ) -> Result<HashMap<u64, f32>, Status> {
+        if vector.is_empty() {
+            return Err(Status::invalid_argument(
+                "FP32 rerank needs a non-empty query vector",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if self.clustered_vectors.is_some() {
+            return Err(Status::failed_precondition(
+                "FP32 rerank is unavailable with the clustered vector provider: product \
+                 shard nodes do not own an aligned exact-vector generation",
+            ));
+        }
+        let mut requested = ids.to_vec();
+        requested.sort_unstable();
+        requested.dedup();
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for addr in &self.node_addrs {
+            let request = ExactVectorRescoreRequest {
+                vector: vector.to_vec(),
+                candidate_ids: requested.clone(),
+            };
+            let mut client = self.node_client(addr)?;
+            tasks.push(tokio::spawn(async move {
+                client
+                    .exact_vector_rescore(request)
+                    .await
+                    .map(|r| r.into_inner().hits)
+            }));
+        }
+        let mut scores = HashMap::with_capacity(requested.len());
+        for task in tasks {
+            let hits = task.await.map_err(|e| {
+                Status::internal(format!("exact vector rescore task failed: {e}"))
+            })??;
+            for hit in hits {
+                if scores.insert(hit.doc_id, hit.score).is_some() {
+                    return Err(Status::failed_precondition(format!(
+                        "FP32 rerank candidate {} is owned by more than one product shard; \
+                         slot ranges overlap",
+                        hit.doc_id
+                    )));
+                }
+            }
+        }
+        if let Some(missing) = requested.iter().find(|id| !scores.contains_key(id)) {
+            return Err(Status::failed_precondition(format!(
+                "FP32 rerank candidate {missing} has no exact-vector row on any product shard"
+            )));
+        }
+        Ok(scores)
     }
 
     /// Candidate-scoped value fan-out (the `FetchValues` seam),

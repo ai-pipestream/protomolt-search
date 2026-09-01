@@ -7,14 +7,14 @@
 mod common;
 
 use pipestream_search::node::{
-    generation_bm25, generation_dir, generation_vector, recover_generation, Bm25Shard, NodeConfig,
-    NodeServiceImpl,
+    generation_bm25, generation_dir, generation_exact_vectors, generation_vector,
+    recover_generation, Bm25Shard, NodeConfig, NodeServiceImpl,
 };
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
-    search_shard_request, search_shard_response, snapshot_chunk, FlushRequest,
-    GetCalibrationRequest, GetDocumentsRequest, ScoredHit, SearchShardRequest,
-    SetCalibrationRequest, SnapshotChunk, SnapshotManifest, StartShardSearch,
+    search_shard_request, search_shard_response, snapshot_chunk, ExactVectorRescoreRequest,
+    FlushRequest, GetCalibrationRequest, GetDocumentsRequest, HealthRequest, ScoredHit,
+    SearchShardRequest, SetCalibrationRequest, SnapshotChunk, SnapshotManifest, StartShardSearch,
 };
 use pipestream_search::postings::{AnalyzedDoc, Bm25Store, DocTerms};
 use pipestream_search::vector::{legacy_calibration_config, VectorIndex, EMBEDDED_TURBOVEC};
@@ -58,6 +58,18 @@ fn build_source(dir: &std::path::Path) -> (VectorIndex, Vec<f32>, std::path::Pat
     let tv = dir.join("source.tv");
     let index = build_image(&corpus, N, &shift, &scale, &tv);
     (index, corpus, tv)
+}
+
+fn build_exact_source(dir: &std::path::Path, corpus: &[f32], n: usize) -> std::path::PathBuf {
+    let path = dir.join("source.exact");
+    pipestream_search::exact_vectors::ExactVectorStore::from_values(
+        DIM,
+        corpus[..n * DIM].to_vec(),
+    )
+    .unwrap()
+    .write(&path)
+    .unwrap();
+    path
 }
 
 fn legacy_calibration(index: &VectorIndex) -> (Vec<f32>, Vec<f32>) {
@@ -140,6 +152,7 @@ async fn search_topk(
 async fn seeded_install_serves_and_persists() {
     let dir = tempdir("seeded");
     let (reference, corpus, src_tv) = build_source(&dir);
+    let src_exact = build_exact_source(&dir, &corpus, N);
     let (shift, scale) = legacy_calibration(&reference);
     let src_bm25 = build_bm25(&dir, "rust search engines");
 
@@ -154,9 +167,14 @@ async fn seeded_install_serves_and_persists() {
 
     // Seed the shard with the same calibration, then install the image.
     seed(&mut client, &shift, &scale).await;
-    let report = pipestream_search::snapshot::install_snapshot(&addr, &src_tv, Some(&src_bm25))
-        .await
-        .unwrap();
+    let report = pipestream_search::snapshot::install_snapshot_with_exact(
+        &addr,
+        &src_tv,
+        Some(&src_exact),
+        Some(&src_bm25),
+    )
+    .await
+    .unwrap();
     assert_eq!(report.num_vectors, N as u64);
     assert_eq!(report.num_documents, 1);
     let gen = generation_dir(&node_tv);
@@ -185,9 +203,27 @@ async fn seeded_install_serves_and_persists() {
     // Persistence without Flush: the generation holds both files, and the
     // legacy layout was never written.
     assert!(generation_vector(&gen).exists());
+    assert!(generation_exact_vectors(&gen).exists());
     assert!(generation_bm25(&gen).exists());
     assert!(!node_tv.exists());
     assert_eq!(recover_generation(&node_tv), Some(gen));
+
+    let health = client.health(HealthRequest {}).await.unwrap().into_inner();
+    assert!(health.exact_vectors_available);
+    assert!(health.exact_vectors_mmap);
+    assert_eq!(health.exact_vector_rows, N as u64);
+    let exact = client
+        .exact_vector_rescore(ExactVectorRescoreRequest {
+            vector: query.clone(),
+            candidate_ids: vec![100, 101],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(exact.hits.len(), 2);
+    let expected_dot: f32 = query.iter().map(|value| value * value).sum();
+    assert_eq!(exact.hits[0].doc_id, 100);
+    assert_eq!(exact.hits[0].score.to_bits(), expected_dot.to_bits());
 
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
@@ -263,6 +299,17 @@ async fn unseeded_node_adopts_snapshot_calibration() {
     let hits = search_topk(&mut client, query.clone(), 5).await;
     let expected = monolithic_topk(&reference, &query, 5);
     assert_eq!(hits.len(), expected.len());
+    let health = client.health(HealthRequest {}).await.unwrap().into_inner();
+    assert!(!health.exact_vectors_available);
+    let err = client
+        .exact_vector_rescore(ExactVectorRescoreRequest {
+            vector: query,
+            candidate_ids: vec![0],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("no exact-vector sidecar"));
 
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
@@ -288,6 +335,7 @@ async fn truncated_stream_rejected() {
         payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
             vector_bytes: bytes.len() as u64 + 64,
             bm25_bytes: 0,
+            exact_vector_bytes: 0,
         })),
     })
     .await

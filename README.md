@@ -733,8 +733,9 @@ search**:
 4. **Search** as before — the lossless invariant holds for ingested data
    exactly as for prebuilt indexes (proven by `tests/multiprocess.rs`).
 
-**Persistence**: `NodeService.Flush` writes the shard to its config
-`index` path (atomic `.tv` write), and `save_on_shutdown = true` (the
+**Persistence**: `NodeService.Flush` writes the provider image to its config
+`index` path and original FP32 rows to `<index>.exact`, then reopens the exact
+sidecar through mmap. `save_on_shutdown = true` (the
 default) flushes on SIGINT/SIGTERM. A shard whose index path does not
 exist at startup starts empty; after ingest + flush (or graceful
 shutdown), a restart with the same config comes back with all vectors
@@ -746,15 +747,18 @@ on shutdown. Resetting provider identity requires a new generation.
 For pre-computed corpora, skip per-node ingest entirely: build the
 shard image once (with the cluster's shared provider configuration) and push the
 FINISHED index to every shard owner over one client stream —
-`NodeService.InstallSnapshot`, with `snapshot::install_snapshot(addr,
-tv_path, bm25_path)` as the bundled client.
+`NodeService.InstallSnapshot`. The bundled
+`snapshot::install_snapshot_with_exact(addr, vector_path, exact_path,
+bm25_path)` client sends the complete generation; the compatibility
+`install_snapshot` helper sends a native-only generation.
 
 The node stages the image in a generation directory
-(`<index path>.snap/`), validates it (well-formed index, sidecar opens,
-scoring fingerprint matches the configured shard. A mismatch is rejected,
+(`<index path>.snap/`), validates it (well-formed provider image, exact-vector
+checksum and shape when present, BM25 sidecar opens, and scoring fingerprint
+matches the configured shard). A mismatch is rejected,
 keeping scores comparable cluster-wide. The node then swaps it live
-under the write lock. Both files travel inside ONE directory rename, so
-the pair is installed atomically; a crash mid-swap is recovered
+under the write lock. All files travel inside ONE directory rename, so
+the generation is installed atomically; a crash mid-swap is recovered
 deterministically at startup (see `recover_generation`). Once a shard
 serves from a generation, Flush and restart loading follow it — the
 legacy layout and the generation never split-brain.
@@ -762,8 +766,9 @@ legacy layout and the generation never split-brain.
 Rules of thumb: configure the provider first (or let an empty shard adopt
 the image's state), replace every shard together on scoring changes, and expect
 an image without a `.bm25` sidecar to wholesale-replace the postings
-store. Covered by `tests/snapshot.rs` (7 cases, incl. restart survival
-and crash recovery).
+store. An image without `vectors.f32` remains valid for provider-native
+queries but cannot serve FP32 rerank. Covered by `tests/snapshot.rs` (seven
+cases, including restart survival and crash recovery).
 
 ### Write log and resharding
 
@@ -1067,7 +1072,9 @@ the heap builder (bulk-load discipline: build in memory, flush back).
 This is what makes a corpus larger than machine memory work: the
 postings (~130 GB at full CourtListener scale) and doc text (~40 GB)
 live in page cache shared across all consumers, not per-process heap.
-The turbovec vector index remains heap-resident today. A v7 `load()` transforms
+The provider vector index remains heap-resident today. Its product-owned
+original-FP32 rerank sidecar is mmap-backed after flush or load and faults only
+the candidate rows used by reranking. A v7 `load()` transforms
 the stored sequential blocks into the native blocked search layout and retains
 that heap representation; mmap support remains a fork-level decision (see the
 TODO list).

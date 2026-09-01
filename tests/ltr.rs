@@ -127,6 +127,7 @@ fn dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
             id: id.to_string(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
+                ..Default::default()
             })),
         })),
     }
@@ -650,6 +651,7 @@ fn dense_boost(id: &str, vector: &[f32]) -> BoostQuery {
             id: id.to_string(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
+                ..Default::default()
             })),
         }),
         ..Default::default()

@@ -49,14 +49,16 @@ A useful initial quality policy would expose expansion as an explicit knob:
 - about 2.62x for at least 99.9% recall on every query;
 - 3.5777x for exact top-10,000 recovery on this fixture.
 
-Two constraints remain before this becomes a production search path. The
-current persisted `.tv` index does not itself retain the FP32 vectors used by
-this experiment, so production exact reranking needs a retained FP32 or
-equivalent residual store. This run also fetched one complete ranking per query
-to determine exact thresholds, so it does not measure end-to-end latency at
-each expansion depth. The next implementation benchmark should retain exact
-rerank data, request only the configured candidate depth, and report scan,
-rerank, first-hit, and terminal latency separately.
+At measurement time, two constraints remained. The product now retains
+original rows in a checksummed, mmap-backed FP32 sidecar and exposes
+`DENSE_SCORE_MODE_FP32_RERANK` over an explicit `selection_k` pool. Flush,
+restart, snapshot install, and offline resharding preserve that sidecar. This
+implementation does not change the measurements above. The second constraint
+remains: this run fetched one complete ranking per query to determine exact
+thresholds, so it does not measure end-to-end latency at each expansion depth.
+The next benchmark should use the public rerank mode at only the configured
+candidate depth and report scan, rerank, first-hit, and terminal latency
+separately.
 
 ## Reproduction
 

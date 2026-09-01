@@ -657,6 +657,7 @@ fn search_leaf(workload: &Workload, dense: bool) -> SelectionQuery {
     let query = if dense {
         search_query::Query::Dense(DenseQuery {
             vector: workload.vector.clone(),
+            ..Default::default()
         })
     } else {
         search_query::Query::Lexical(LexicalQuery {

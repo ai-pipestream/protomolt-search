@@ -155,6 +155,24 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .and_then(|p| pipestream_search::node::recover_generation(p));
             let index = load_shard_index(shard, generation.as_deref())?;
+            let mut exact_vectors = None;
+            if let Some(p) = shard.index_path.as_ref() {
+                let exact_path = match &generation {
+                    Some(dir) => pipestream_search::node::generation_exact_vectors(dir),
+                    None => pipestream_search::node::exact_vector_sidecar_path(p),
+                };
+                if exact_path.exists() {
+                    eprintln!(
+                        "shard @{}: mapping exact FP32 vectors from {}",
+                        shard.listen,
+                        exact_path.display()
+                    );
+                    exact_vectors = Some(
+                        pipestream_search::exact_vectors::ExactVectorStore::open(&exact_path)
+                            .map_err(|e| format!("load {}: {e}", exact_path.display()))?,
+                    );
+                }
+            }
             match &index {
                 Some(index) => eprintln!(
                     "shard @{}: {} vectors, dim {:?}, {} bits, slot offset {}",
@@ -249,6 +267,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .with_bm25(bm25_store)
+            .with_exact_vectors(exact_vectors)?
             .with_phrase_index(phrase_index.clone())
             .with_generation(generation);
             // The UDP stream-signal lane shares the gRPC listener's host:port.

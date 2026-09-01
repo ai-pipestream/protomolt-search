@@ -1,5 +1,6 @@
 //! Client side of `NodeService.InstallSnapshot`: push a centrally built
-//! shard image (opaque vector bytes plus optional `.bm25` sidecar) to a node
+//! shard image (opaque provider bytes plus optional exact-vector and BM25
+//! sidecars) to a node
 //! over one client stream. This is the bulk-load path for pre-computed corpora:
 //! build compatible provider images once, then push each artifact to its shard
 //! owner instead of re-embedding per node.
@@ -26,16 +27,33 @@ pub async fn install_snapshot(
     vector_path: &Path,
     bm25_path: Option<&Path>,
 ) -> Result<InstallSnapshotResponse, Status> {
+    install_snapshot_with_exact(addr, vector_path, None, bm25_path).await
+}
+
+/// Stream a complete product generation. The exact-vector sidecar, when
+/// present, is sent between the provider image and BM25 bytes.
+pub async fn install_snapshot_with_exact(
+    addr: &str,
+    vector_path: &Path,
+    exact_vector_path: Option<&Path>,
+    bm25_path: Option<&Path>,
+) -> Result<InstallSnapshotResponse, Status> {
     let tv_bytes = std::fs::metadata(vector_path)
         .map_err(|e| Status::internal(format!("stat {}: {e}", vector_path.display())))?
         .len();
+    let exact_vector_bytes = match exact_vector_path {
+        Some(p) => std::fs::metadata(p)
+            .map_err(|e| Status::internal(format!("stat {}: {e}", p.display())))?
+            .len(),
+        None => 0,
+    };
     let bm25_bytes = match bm25_path {
         Some(p) => std::fs::metadata(p)
             .map_err(|e| Status::internal(format!("stat {}: {e}", p.display())))?
             .len(),
         None => 0,
     };
-    let paths: Vec<PathBuf> = [Some(vector_path), bm25_path]
+    let paths: Vec<PathBuf> = [Some(vector_path), exact_vector_path, bm25_path]
         .into_iter()
         .flatten()
         .map(Path::to_path_buf)
@@ -47,6 +65,7 @@ pub async fn install_snapshot(
             payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
                 vector_bytes: tv_bytes,
                 bm25_bytes,
+                exact_vector_bytes,
             })),
         };
         if tx.send(manifest).await.is_err() {

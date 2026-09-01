@@ -137,6 +137,31 @@ This is the honest form of the existing rescore-window behavior. A caller that
 needs more recall under a strong boost increases `selection_k`; the server does
 not silently over-fetch by an undocumented factor.
 
+## Dense FP32 rerank
+
+A single dense leaf can set `DenseQuery.score_mode` to
+`DENSE_SCORE_MODE_FP32_RERANK`. The provider still selects exactly
+`selection_k` candidates. The coordinator then calls
+`ExactVectorRescore` for those ids, replaces the dense signal with the
+ordinary FP32 dot product over the original vectors, sorts by exact score
+descending and document id ascending, and returns the best `k`.
+
+This is exact within the fixed candidate pool. It is not a global exact-top-k
+claim unless `selection_k` covers the corpus. Candidate depth is therefore the
+recall knob, not a hidden expansion factor. The 100,000-vector, k=10,000
+experiment found that the tested corpus needed 35,777 TurboQuant candidates
+for 100% recall; that is evidence for that workload, not a universal default.
+See
+[`turboquant-exact-rerank-expansion-100k-k10000-2026-08-31.md`](ai-slop/turboquant-exact-rerank-expansion-100k-k10000-2026-08-31.md).
+
+Original FP32 rows live in the product generation, one-for-one with provider
+slots. `Flush` writes and reopens the sidecar through mmap; snapshot install
+and offline resharding carry it with the provider image. A legacy generation
+without the sidecar continues to serve native queries and fails FP32 rerank
+with `FAILED_PRECONDITION`. The mode also fails explicitly with the clustered
+vector provider because product shard nodes do not own its aligned rows.
+Composite dense leaves and dense boosts remain provider-native for now.
+
 ## Composite scorer
 
 Implemented 2026-08-26 (`src/ltr.rs`): the scorer runs on the
@@ -236,6 +261,11 @@ message SearchQuery {
   }
 }
 
+message DenseQuery {
+  repeated float vector = 1;
+  DenseScoreMode score_mode = 2;
+}
+
 message FilterQuery {
   string id = 1;
   oneof predicate {
@@ -306,6 +336,7 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 |---|---|
 | one lexical leaf (+ AND filters, + score stages) | `Bm25Search` |
 | one dense leaf (+ AND filters) | `Search` |
+| one dense leaf with FP32 rerank | `Search` at `selection_k`, then `ExactVectorRescore` over the fixed pool |
 | `OR(dense, lexical)` + rrf | `HybridSearch` GLOBAL_RANK |
 | `OR(dense, lexical)` + score_blend | `HybridSearch` SCORE_BLEND |
 | `OR(dense, lexical)` + decomposed | `HybridSearch` DECOMPOSED |
@@ -319,9 +350,10 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | any scored shape + composite scorer | the route above, then the coordinator-side scorer (`src/ltr.rs`) |
 | projections on any other shape; stored-value dimensions | `FetchValues` candidate-scoped fan-out, post-selection |
 
-`selection_k` maps to the hybrid leg depth; the response is the best `k`
-of that candidate set (`k <= selection_k` enforced; a `selection_k` that
-no candidate-scoped phase uses is refused as a silent no-op). Cascade
+`selection_k` maps to the hybrid leg depth or the FP32 rerank pool; the
+response is the best `k` of that candidate set (`k <= selection_k` enforced;
+a `selection_k` that no candidate-scoped phase uses is refused as a silent
+no-op). Cascade
 requires the composite operator UNSPECIFIED — membership is the gate's,
 and neither AND nor OR describes it.
 

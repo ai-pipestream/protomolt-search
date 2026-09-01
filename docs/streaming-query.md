@@ -29,6 +29,11 @@ last revision. That response is the source of truth for projections, score
 dimensions, boosts, profile data, paging, and any other phase that is not safe
 to expose provisionally.
 
+For a dense leaf using `DENSE_SCORE_MODE_FP32_RERANK`, `DENSE` revisions are
+the provider-native candidate order and remain provisional. The `FINAL`
+revision is the FP32-reranked order from the fixed `selection_k` pool. Clients
+must not compare those two score magnitudes as if they were one score space.
+
 ## Completion and failure
 
 Hits are usable as a complete answer only when the terminal message says

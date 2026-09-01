@@ -174,7 +174,9 @@ the logged AddVectors path — logging ~100M raw vectors writes more WAL
 than index. The intended shape for an initial build:
 
 1. Build shard images offline (the harness / reshard machinery) with one
-   provider configuration and scoring identity.
+   provider configuration and scoring identity. Retain the original FP32 rows
+   as each child's exact-vector sidecar when FP32 candidate reranking is part
+   of the serving contract.
 2. `InstallSnapshot` the images onto the nodes. The WAL rotates to a
    fresh generation whose manifest records the image as
    `preexisting_*` — cheap, honest, and the log stays near-empty.

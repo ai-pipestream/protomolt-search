@@ -88,6 +88,8 @@ pub fn bucket_of(id: u64, n: usize) -> usize {
 pub struct ChildImage {
     /// The written index file.
     pub vector_path: PathBuf,
+    /// Product-owned original FP32 rows aligned with `vector_path`.
+    pub exact_vector_path: PathBuf,
     /// The written BM25 sidecar (absent when the child received no
     /// documents).
     pub bm25_path: Option<PathBuf>,
@@ -370,6 +372,10 @@ fn build_child(
     index
         .write(vector_path)
         .map_err(|e| format!("write {}: {e}", vector_path.display()))?;
+    let exact_vector_path = crate::node::exact_vector_sidecar_path(vector_path);
+    crate::exact_vectors::ExactVectorStore::from_values(dim, flat)
+        .and_then(|store| store.write(&exact_vector_path))
+        .map_err(|e| format!("write {}: {e}", exact_vector_path.display()))?;
 
     // parent id -> child local slot, for the document remap.
     let slot_of: BTreeMap<u64, u32> = parent_ids
@@ -720,6 +726,7 @@ fn build_child(
 
     Ok(ChildImage {
         vector_path: vector_path.to_path_buf(),
+        exact_vector_path,
         bm25_path,
         slot_offset: 0, // filled in by the caller
         hash_lo: 0,

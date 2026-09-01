@@ -275,6 +275,20 @@ async fn split_reconstructs_parent_topk() {
             (c, index)
         })
         .collect();
+    for (child, _) in &children {
+        let exact =
+            pipestream_search::exact_vectors::ExactVectorStore::open(&child.exact_vector_path)
+                .unwrap();
+        assert!(exact.is_mapped());
+        assert_eq!(exact.len(), child.parent_ids.len());
+        exact.verify_payload().unwrap();
+        if let Some(&parent_id) = child.parent_ids.first() {
+            let query = &corpus[parent_id as usize * DIM..(parent_id as usize + 1) * DIM];
+            let score = exact.score_slots(query, &[0]).unwrap()[0].1;
+            let expected: f32 = query.iter().map(|value| value * value).sum();
+            assert_eq!(score.to_bits(), expected.to_bits());
+        }
+    }
 
     // Union of child top-k == parent top-k, bitwise (see the module docs
     // for the invariant).

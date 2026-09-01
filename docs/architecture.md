@@ -180,10 +180,12 @@ without weakening that completion rule.
 
 ## 5. Search nodes
 
-A node serves one or more shards, and a shard is a pair of files: a `.tv`
-vector index owned by the turbovec library, and a `.bm25` lexical index
-owned by us, side by side on disk and covering the same documents. The node
-wraps both behind one gRPC service. For vector queries it runs the engine's
+A node serves one or more shards, and a persisted shard can contain three
+aligned artifacts: a provider vector image, a product-owned original-FP32
+sidecar used for candidate reranking, and a `.bm25` lexical index. The exact
+sidecar and provider image have one row per vector slot; the lexical store can
+also contain document-only rows. The node
+wraps them behind one gRPC service. For vector queries it runs the engine's
 streaming scan and emits candidates above the current floor. For ordinary
 lexical queries it runs flat or fused multi-field block-max BM25, emits compact
 candidates, adopts inclusive live-floor raises, and finishes with a completion

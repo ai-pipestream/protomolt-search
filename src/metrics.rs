@@ -35,6 +35,7 @@ pub enum Route {
     Bm25Query,
     TermStats,
     VectorRescore,
+    ExactVectorRescore,
     Bm25Rescore,
     FetchValues,
     AggregateShard,
@@ -48,7 +49,7 @@ pub enum Route {
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter table.
-const REQUEST_ROUTES: [(Route, &str); 18] = [
+const REQUEST_ROUTES: [(Route, &str); 19] = [
     (Route::SearchShard, "search_shard"),
     (Route::StreamSearch, "stream_search"),
     (Route::BrowseShard, "browse_shard"),
@@ -58,6 +59,7 @@ const REQUEST_ROUTES: [(Route, &str); 18] = [
     (Route::Bm25Query, "bm25_query"),
     (Route::TermStats, "term_stats"),
     (Route::VectorRescore, "vector_rescore"),
+    (Route::ExactVectorRescore, "exact_vector_rescore"),
     (Route::Bm25Rescore, "bm25_rescore"),
     (Route::FetchValues, "fetch_values"),
     (Route::AggregateShard, "aggregate_shard"),

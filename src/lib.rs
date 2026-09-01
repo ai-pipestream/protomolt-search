@@ -32,6 +32,7 @@ pub mod clustered_turbovec;
 pub mod config;
 pub mod coordinator;
 pub mod demo;
+pub mod exact_vectors;
 pub mod filter;
 pub mod fusion;
 pub mod geo;

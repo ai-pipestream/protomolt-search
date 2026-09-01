@@ -787,13 +787,19 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     .unwrap();
     index.prepare().unwrap();
     let bm25 = pipestream_search::node::Bm25Shard::open(&bm25_path).unwrap();
+    let exact = pipestream_search::exact_vectors::ExactVectorStore::open(
+        &pipestream_search::node::exact_vector_sidecar_path(&index_path),
+    )
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = format!("http://{}", listener.local_addr().unwrap());
     let mut config = case_node_config(analysis);
     config.index_path = Some(index_path.clone());
     config.bm25_fields.push("title".into());
-    let service =
-        pipestream_search::node::NodeServiceImpl::new(Some(index), config).with_bm25(Some(bm25));
+    let service = pipestream_search::node::NodeServiceImpl::new(Some(index), config)
+        .with_bm25(Some(bm25))
+        .with_exact_vectors(Some(exact))
+        .unwrap();
     let _node2 = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))

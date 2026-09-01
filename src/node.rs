@@ -30,6 +30,7 @@ use crate::chunked::{
     chunked_topk, chunked_topk_batch, chunked_topk_collapsed, BatchQuery, ChunkHit, ScanStats,
     DEFAULT_CHUNK_BLOCKS,
 };
+use crate::exact_vectors::ExactVectorStore;
 use crate::fusion::{self, Leg};
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::wal::{
@@ -41,17 +42,17 @@ use crate::pb::{
     AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest, AddVectorsResponse,
     Bm25CandidateBatch, Bm25Hit, Bm25QueryRequest, Bm25QueryResponse, Bm25QueryStreamRequest,
     Bm25QueryStreamResponse, Bm25RescoreRequest, Bm25RescoreResponse, Bm25StreamCompletion,
-    ConfigureVectorBackendRequest, ConfigureVectorBackendResponse, FloorUpdate, FlushRequest,
-    FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
-    GetDocumentsResponse, GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest,
-    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, IngestMappedRequest,
-    IngestMappedResponse, InstallSnapshotResponse, OffsetSpan, RawLegHit, ResolveParentsRequest,
-    ResolveParentsResponse, ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
-    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
-    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
-    VectorBackendConfig as WireVectorBackendConfig,
+    ConfigureVectorBackendRequest, ConfigureVectorBackendResponse, ExactVectorRescoreRequest,
+    ExactVectorRescoreResponse, FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest,
+    GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse, GetVectorBackendRequest,
+    GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
+    HybridShardResponse, IngestMappedRequest, IngestMappedResponse, InstallSnapshotResponse,
+    OffsetSpan, RawLegHit, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent,
+    ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
+    SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk,
+    SnapshotManifest, StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary, TermOccurrences, TermStatsRequest,
+    TermStatsResponse, VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorQualityContract,
     VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
@@ -2042,6 +2043,10 @@ pub(crate) fn parse_score_stages(
 #[derive(Default)]
 struct ShardState {
     index: Option<VectorIndex>,
+    /// Original row-major FP32 vectors, aligned one-for-one with provider
+    /// slots. Legacy generations may lack this sidecar; native provider
+    /// search remains available, while FP32 rerank refuses by name.
+    exact_vectors: Option<ExactVectorStore>,
     bm25: Option<Bm25Shard>,
     /// The active snapshot generation directory, when the shard's files
     /// came from (or were replaced by) an `InstallSnapshot` image.
@@ -2103,6 +2108,13 @@ pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// The product-owned FP32 sidecar beside a legacy provider image.
+pub fn exact_vector_sidecar_path(index_path: &std::path::Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".exact");
+    PathBuf::from(p)
+}
+
 /// Where a bulk BM25 build spills while it runs: `<bm25 path>.build`.
 ///
 /// A successful `Flush` removes it, so finding one beside a MISSING
@@ -2135,6 +2147,10 @@ pub fn generation_vector(dir: &Path) -> PathBuf {
         legacy
     }
 }
+/// The product-owned FP32 sidecar inside a generation directory.
+pub fn generation_exact_vectors(dir: &Path) -> PathBuf {
+    dir.join("vectors.f32")
+}
 /// The BM25 sidecar path inside a generation directory.
 pub fn generation_bm25(dir: &Path) -> PathBuf {
     let current = dir.join("documents.bm25");
@@ -2161,11 +2177,19 @@ fn generation_old_dir(index_path: &Path) -> PathBuf {
 
 /// Where the shard's files live: the active snapshot generation when one
 /// was installed, else the legacy `<index path>` (+`.bm25`) layout.
-/// Returns `(index, bm25)` paths.
-fn storage_paths(index_path: &Path, generation: Option<&PathBuf>) -> (PathBuf, PathBuf) {
+/// Returns `(provider index, exact vectors, bm25)` paths.
+fn storage_paths(index_path: &Path, generation: Option<&PathBuf>) -> (PathBuf, PathBuf, PathBuf) {
     match generation {
-        Some(dir) => (generation_vector(dir), generation_bm25(dir)),
-        None => (index_path.to_path_buf(), bm25_sidecar_path(index_path)),
+        Some(dir) => (
+            generation_vector(dir),
+            generation_exact_vectors(dir),
+            generation_bm25(dir),
+        ),
+        None => (
+            index_path.to_path_buf(),
+            exact_vector_sidecar_path(index_path),
+            bm25_sidecar_path(index_path),
+        ),
     }
 }
 
@@ -2315,7 +2339,7 @@ fn wal_manifest(
 /// depending on attachment order.
 fn persisted_doc_tip(index_path: &Path) -> u64 {
     let generation = recover_generation(index_path);
-    let (_, bm25_path) = storage_paths(index_path, generation.as_ref());
+    let (_, _, bm25_path) = storage_paths(index_path, generation.as_ref());
     if !bm25_path.exists() {
         return 0;
     }
@@ -2760,6 +2784,7 @@ impl NodeServiceImpl {
         Self {
             state: Arc::new(RwLock::new(ShardState {
                 index,
+                exact_vectors: None,
                 bm25: None,
                 generation: None,
                 wal,
@@ -2891,7 +2916,7 @@ impl NodeServiceImpl {
         let geos: Vec<&str> = self.config.geo_fields.iter().map(String::as_str).collect();
         match self.config.index_path.as_ref() {
             Some(p) => {
-                let dir = bm25_build_dir(&storage_paths(p, generation).1);
+                let dir = bm25_build_dir(&storage_paths(p, generation).2);
                 SpillBuilder::create_with_fields(&dir, &names)
                     .map(|b| {
                         Bm25Shard::Spilling(
@@ -2944,6 +2969,30 @@ impl NodeServiceImpl {
             guard.stats_epoch += 1;
         }
         self
+    }
+
+    /// Attach the product-owned FP32 sidecar loaded at startup. The sidecar
+    /// must describe exactly the provider slots in this shard generation.
+    pub fn with_exact_vectors(self, store: Option<ExactVectorStore>) -> Result<Self, String> {
+        {
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            if let Some(exact) = store.as_ref() {
+                let index = guard.index.as_ref().ok_or_else(|| {
+                    "exact-vector sidecar exists but the shard has no provider index".to_string()
+                })?;
+                if exact.len() != index.len() || exact.dim() != index.dim_opt() {
+                    return Err(format!(
+                        "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
+                        exact.dim(),
+                        exact.len(),
+                        index.dim_opt(),
+                        index.len()
+                    ));
+                }
+            }
+            guard.exact_vectors = store;
+        }
+        Ok(self)
     }
 
     /// Mark the shard as serving from a snapshot generation directory
@@ -3069,11 +3118,34 @@ impl NodeServiceImpl {
         }
         // Flush into the active snapshot generation when one was
         // installed, else the legacy layout — never split the two.
-        let (vector_path, bm25_path) = storage_paths(&config_path, guard.generation.as_ref());
+        let (vector_path, exact_path, bm25_path) =
+            storage_paths(&config_path, guard.generation.as_ref());
+        if let Some(exact) = guard.exact_vectors.as_ref() {
+            let index = guard.index.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "exact-vector sidecar exists but the shard has no provider index",
+                )
+            })?;
+            if exact.len() != index.len() || exact.dim() != index.dim_opt() {
+                return Err(Status::failed_precondition(format!(
+                    "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
+                    exact.dim(),
+                    exact.len(),
+                    index.dim_opt(),
+                    index.len()
+                )));
+            }
+        }
         if let Some(index) = guard.index.as_ref() {
             index
                 .write(&vector_path)
                 .map_err(|e| Status::internal(format!("write {}: {e}", vector_path.display())))?;
+        }
+        if let Some(exact) = guard.exact_vectors.as_ref() {
+            let mapped = exact
+                .write(&exact_path)
+                .map_err(|e| Status::internal(format!("write {}: {e}", exact_path.display())))?;
+            guard.exact_vectors = Some(mapped);
         }
         // Save the builder as v3 and immediately reopen it disk-resident:
         // after Flush a shard holds no postings or texts in heap.
@@ -3112,7 +3184,8 @@ impl NodeServiceImpl {
             // bump is what tells a cache to come look again.
             guard.stats_epoch += 1;
         }
-        let written = guard.index.is_some() || guard.bm25.is_some();
+        let written =
+            guard.index.is_some() || guard.exact_vectors.is_some() || guard.bm25.is_some();
         // Durability point reached: the log was fsynced above, then the
         // indexes hit disk. The marker records that a flush happened;
         // its own fsync failing degrades the log rather than un-flushing
@@ -3132,9 +3205,9 @@ impl NodeServiceImpl {
     }
 
     /// Receive one snapshot image into the staging generation directory
-    /// (`vector.index`, plus `documents.bm25` when declared). The first
-    /// `manifest.vector_bytes` of data land in the provider image, the rest in the
-    /// sidecar; both are synced before the caller swaps anything. Returns
+    /// (`vector.index`, `vectors.f32`, then `documents.bm25` when declared).
+    /// The byte counts in the manifest split the stream; every file is synced
+    /// before the caller swaps anything. Returns
     /// with the staging dir complete or not at all — on error the caller
     /// removes it.
     async fn receive_image(
@@ -3150,10 +3223,20 @@ impl NodeServiceImpl {
             .await
             .map_err(|e| io_err(tmp_dir, e))?;
         let tv_tmp = generation_vector(tmp_dir);
+        let exact_tmp = generation_exact_vectors(tmp_dir);
         let bm25_tmp = generation_bm25(tmp_dir);
         let mut tv = tokio::fs::File::create(&tv_tmp)
             .await
             .map_err(|e| io_err(&tv_tmp, e))?;
+        let mut exact = if manifest.exact_vector_bytes > 0 {
+            Some(
+                tokio::fs::File::create(&exact_tmp)
+                    .await
+                    .map_err(|e| io_err(&exact_tmp, e))?,
+            )
+        } else {
+            None
+        };
         let mut bm25 = if manifest.bm25_bytes > 0 {
             Some(
                 tokio::fs::File::create(&bm25_tmp)
@@ -3163,14 +3246,15 @@ impl NodeServiceImpl {
         } else {
             None
         };
-        let (mut tv_written, mut bm25_written) = (0u64, 0u64);
+        let (mut tv_written, mut exact_written, mut bm25_written) = (0u64, 0u64, 0u64);
         while let Some(chunk) = inbound.message().await? {
             let Some(snapshot_chunk::Payload::Data(mut data)) = chunk.payload else {
                 return Err(Status::invalid_argument(
                     "SnapshotChunk after the manifest must carry data",
                 ));
             };
-            // Fill the provider image first; overflow spills into the BM25 sidecar.
+            // Fill the provider image first, then the exact-vector sidecar,
+            // then BM25. A chunk may straddle either boundary.
             let tv_take = (manifest.vector_bytes - tv_written).min(data.len() as u64) as usize;
             if tv_take > 0 {
                 tv.write_all(&data[..tv_take])
@@ -3178,6 +3262,21 @@ impl NodeServiceImpl {
                     .map_err(|e| io_err(&tv_tmp, e))?;
                 tv_written += tv_take as u64;
                 data.drain(..tv_take);
+            }
+            let exact_take =
+                (manifest.exact_vector_bytes - exact_written).min(data.len() as u64) as usize;
+            if exact_take > 0 {
+                let Some(sidecar) = exact.as_mut() else {
+                    return Err(Status::invalid_argument(
+                        "snapshot carries exact-vector data absent from its manifest",
+                    ));
+                };
+                sidecar
+                    .write_all(&data[..exact_take])
+                    .await
+                    .map_err(|e| io_err(&exact_tmp, e))?;
+                exact_written += exact_take as u64;
+                data.drain(..exact_take);
             }
             if !data.is_empty() {
                 let Some(sidecar) = bm25.as_mut() else {
@@ -3197,13 +3296,23 @@ impl NodeServiceImpl {
                 bm25_written += data.len() as u64;
             }
         }
-        if tv_written != manifest.vector_bytes || bm25_written != manifest.bm25_bytes {
+        if tv_written != manifest.vector_bytes
+            || exact_written != manifest.exact_vector_bytes
+            || bm25_written != manifest.bm25_bytes
+        {
             return Err(Status::invalid_argument(format!(
-                "truncated snapshot: received {tv_written}+{} of declared {}+{} bytes",
-                bm25_written, manifest.vector_bytes, manifest.bm25_bytes
+                "truncated snapshot: received {tv_written}+{exact_written}+{bm25_written} of \
+                 declared {}+{}+{} bytes",
+                manifest.vector_bytes, manifest.exact_vector_bytes, manifest.bm25_bytes
             )));
         }
         tv.sync_all().await.map_err(|e| io_err(&tv_tmp, e))?;
+        if let Some(sidecar) = exact.as_mut() {
+            sidecar
+                .sync_all()
+                .await
+                .map_err(|e| io_err(&exact_tmp, e))?;
+        }
         if let Some(sidecar) = bm25.as_mut() {
             sidecar.sync_all().await.map_err(|e| io_err(&bm25_tmp, e))?;
         }
@@ -3224,6 +3333,7 @@ impl NodeServiceImpl {
     fn apply_snapshot(
         &self,
         tmp_dir: &Path,
+        with_exact_vectors: bool,
         with_bm25: bool,
     ) -> Result<InstallSnapshotResponse, Status> {
         let path = self
@@ -3235,11 +3345,33 @@ impl NodeServiceImpl {
         let snap = generation_dir(&path);
         let old = generation_old_dir(&path);
         let tv_tmp = generation_vector(tmp_dir);
+        let exact_tmp = generation_exact_vectors(tmp_dir);
         let bm25_tmp = generation_bm25(tmp_dir);
 
         let loaded = VectorIndex::load(&self.config.vector_backend, &tv_tmp).map_err(|e| {
             Status::invalid_argument(format!("snapshot is not a valid vector backend image: {e}"))
         })?;
+        if with_exact_vectors {
+            let exact = ExactVectorStore::open(&exact_tmp).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "snapshot sidecar is not a valid exact-vector store: {e}"
+                ))
+            })?;
+            exact.verify_payload().map_err(|e| {
+                Status::invalid_argument(format!(
+                    "snapshot exact-vector integrity check failed: {e}"
+                ))
+            })?;
+            if exact.len() != loaded.len() || exact.dim() != loaded.dim_opt() {
+                return Err(Status::invalid_argument(format!(
+                    "snapshot exact-vector shape {:?}x{} does not match provider shape {:?}x{}",
+                    exact.dim(),
+                    exact.len(),
+                    loaded.dim_opt(),
+                    loaded.len()
+                )));
+            }
+        }
         if with_bm25 {
             // Open-check the sidecar (and drop it again) before the swap;
             // the live shard re-opens from the generation dir.
@@ -3301,6 +3433,18 @@ impl NodeServiceImpl {
             // generation.
             None
         };
+        guard.exact_vectors = if with_exact_vectors {
+            Some(
+                ExactVectorStore::open(&generation_exact_vectors(&snap)).map_err(|e| {
+                    Status::internal(format!(
+                        "open installed {}: {e}",
+                        generation_exact_vectors(&snap).display()
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let num_vectors = loaded.len() as u64;
         // Wholesale replace: the image's binding (usually none) is now
@@ -3308,6 +3452,7 @@ impl NodeServiceImpl {
         // would lie.
         guard.mapped_binding = guard.bm25.as_ref().and_then(|b| b.binding().cloned());
         guard.index = Some(loaded);
+        guard.parents = None;
         guard.generation = Some(snap.clone());
         guard.stats_epoch += 1;
         // The snapshot supersedes the log: fsync and retire the current
@@ -3385,6 +3530,11 @@ impl NodeServiceImpl {
             }
         };
         if result.is_ok() {
+            if guard.exact_vectors.is_none()
+                && guard.index.as_ref().is_some_and(VectorIndex::is_empty)
+            {
+                guard.exact_vectors = Some(ExactVectorStore::empty(Some(dim)));
+            }
             if let Some(wal) = guard.wal.as_mut() {
                 wal.update_manifest(|manifest| {
                     manifest.dim = dim as u32;
@@ -3450,7 +3600,7 @@ impl NodeServiceImpl {
                 "invalid input value at vector {vi}, coord {ci}: {v}"
             )));
         }
-        let (first_id, index_bit_width) = {
+        let (first_id, index_bit_width, index_len) = {
             let index = match guard.index.as_mut() {
                 Some(index) => index,
                 None => {
@@ -3471,8 +3621,26 @@ impl NodeServiceImpl {
             (
                 self.config.slot_offset + index.len() as u64,
                 index.bits_per_dimension().unwrap_or(self.config.bit_width),
+                index.len(),
             )
         };
+        if guard.exact_vectors.is_none() {
+            if index_len != 0 {
+                return Err(Status::failed_precondition(format!(
+                    "the shard has {index_len} provider vectors but no exact-vector sidecar; \
+                     rebuild or backfill the generation before appending"
+                )));
+            }
+            guard.exact_vectors = Some(ExactVectorStore::empty(Some(dim)));
+        }
+        let exact = guard.exact_vectors.as_ref().expect("ensured above");
+        if exact.len() != index_len || exact.dim() != Some(dim) {
+            return Err(Status::failed_precondition(format!(
+                "exact-vector sidecar shape {:?}x{} does not match provider shape {dim}x{index_len}",
+                exact.dim(),
+                exact.len()
+            )));
+        }
         // Apply first, log after, under this one lock. A failed apply
         // must never reach the log: its assigned ids would be reused by
         // the next batch and the duplicate would poison every replay.
@@ -3484,6 +3652,17 @@ impl NodeServiceImpl {
             .expect("constructed or present above")
             .add(&batch.vectors, dim)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        guard
+            .exact_vectors
+            .as_mut()
+            .expect("validated above")
+            .append(&batch.vectors, dim)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "exact-vector append failed after provider commit: {e}; refuse further \
+                     ingest and rebuild this generation"
+                ))
+            })?;
         let committed_config = guard
             .index
             .as_ref()
@@ -4932,7 +5111,7 @@ impl NodeServiceImpl {
                 .config
                 .index_path
                 .as_ref()
-                .map(|p| storage_paths(p, guard.generation.as_ref()).1)
+                .map(|p| storage_paths(p, guard.generation.as_ref()).2)
                 .ok_or_else(|| {
                     Status::failed_precondition("resident shard has no index path to reload from")
                 })?;
@@ -4975,6 +5154,24 @@ impl NodeServiceImpl {
                         )
                         .map_err(|e| Status::invalid_argument(format!("{e}")))?,
                     );
+                }
+                if guard.exact_vectors.is_none() {
+                    if vector_tip != 0 {
+                        return Err(Status::failed_precondition(format!(
+                            "the shard has {vector_tip} provider vectors but no exact-vector \
+                             sidecar; rebuild or backfill the generation before mapped ingest"
+                        )));
+                    }
+                    guard.exact_vectors = Some(ExactVectorStore::empty(Some(dim)));
+                }
+                let exact = guard.exact_vectors.as_ref().expect("ensured above");
+                if exact.len() != vector_tip as usize || exact.dim() != Some(dim) {
+                    return Err(Status::failed_precondition(format!(
+                        "exact-vector sidecar shape {:?}x{} does not match provider shape \
+                         {dim}x{vector_tip}",
+                        exact.dim(),
+                        exact.len()
+                    )));
                 }
                 Some(dim)
             }
@@ -5372,6 +5569,21 @@ impl NodeServiceImpl {
                      diverged — the next mapped document will refuse if so"
                 ))
             })?;
+            guard
+                .exact_vectors
+                .as_mut()
+                .expect("validated alongside provider index")
+                .append(&v, dim)
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "exact-vector append failed after provider commit: {e}; refuse further \
+                         ingest and rebuild this generation"
+                    ))
+                })?;
+            let index = guard
+                .index
+                .as_ref()
+                .expect("provider index remains present");
             let bit_width = index.bits_per_dimension().unwrap_or(self.config.bit_width);
             let committed_config = index.backend_config().map_err(|e| {
                 Status::internal(format!(
@@ -6706,6 +6918,18 @@ impl NodeService for NodeServiceImpl {
             Some(shard) => (shard.doc_count(), matches!(shard, Bm25Shard::Spilling(_))),
             None => (0, false),
         };
+        let exact_vector_rows = guard.exact_vectors.as_ref().map_or(0, |s| s.len() as u64);
+        let exact_vectors_available = guard
+            .index
+            .as_ref()
+            .zip(guard.exact_vectors.as_ref())
+            .is_some_and(|(index, exact)| {
+                exact.len() == index.len() && exact.dim() == index.dim_opt()
+            });
+        let exact_vectors_mmap = guard
+            .exact_vectors
+            .as_ref()
+            .is_some_and(ExactVectorStore::is_mapped);
         Ok(Response::new(HealthResponse {
             num_vectors,
             dim,
@@ -6717,6 +6941,9 @@ impl NodeService for NodeServiceImpl {
             vector_backend,
             scoring_fingerprint,
             quality_contract,
+            exact_vectors_available,
+            exact_vector_rows,
+            exact_vectors_mmap,
         }))
     }
 
@@ -7141,11 +7368,13 @@ impl NodeService for NodeServiceImpl {
 
         let service = self.clone();
         let cleanup = tmp_dir.clone();
+        let with_exact_vectors = manifest.exact_vector_bytes > 0;
         let with_bm25 = manifest.bm25_bytes > 0;
-        let result =
-            tokio::task::spawn_blocking(move || service.apply_snapshot(&tmp_dir, with_bm25))
-                .await
-                .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
+        let result = tokio::task::spawn_blocking(move || {
+            service.apply_snapshot(&tmp_dir, with_exact_vectors, with_bm25)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
         if result.is_err() {
             // Rejected AFTER receive (bad image, calibration mismatch):
             // leave no staging dir behind either.
@@ -7780,6 +8009,66 @@ impl NodeService for NodeServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
         Ok(Response::new(VectorRescoreResponse { hits }))
+    }
+
+    async fn exact_vector_rescore(
+        &self,
+        request: Request<ExactVectorRescoreRequest>,
+    ) -> Result<Response<ExactVectorRescoreResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::ExactVectorRescore);
+        let req = request.into_inner();
+        let offset = self.config.slot_offset;
+        let state = self.state.clone();
+        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
+            let guard = state.read().expect("shard state lock poisoned");
+            let Some(index) = guard.index.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let n = index.len();
+            let mut slots = Vec::new();
+            let mut seen = vec![false; n];
+            for id in req.candidate_ids {
+                if id >= offset && id - offset < n as u64 {
+                    let slot = (id - offset) as usize;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        slots.push(slot);
+                    }
+                }
+            }
+            if slots.is_empty() {
+                return Ok(Vec::new());
+            }
+            let exact = guard.exact_vectors.as_ref().ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "FP32 rerank requested for shard slots {offset}..{} but this generation \
+                     has no exact-vector sidecar; rebuild or backfill it",
+                    offset + n as u64
+                ))
+            })?;
+            if exact.len() != n || exact.dim() != index.dim_opt() {
+                return Err(Status::failed_precondition(format!(
+                    "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{n}",
+                    exact.dim(),
+                    exact.len(),
+                    index.dim_opt()
+                )));
+            }
+            exact
+                .score_slots(&req.vector, &slots)
+                .map_err(|e| Status::invalid_argument(e.to_string()))
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(slot, score)| RawLegHit {
+                            doc_id: offset + slot as u64,
+                            score,
+                        })
+                        .collect()
+                })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("exact vector rescore task failed: {e}")))??;
+        Ok(Response::new(ExactVectorRescoreResponse { hits }))
     }
 
     async fn get_documents(

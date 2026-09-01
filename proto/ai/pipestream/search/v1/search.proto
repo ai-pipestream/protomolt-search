@@ -280,6 +280,12 @@ service NodeService {
   // top docs to seed the fused floor before the vector streams open.
   rpc VectorRescore(VectorRescoreRequest) returns (VectorRescoreResponse);
 
+  // Candidate-scoped product-owned FP32 scoring. Unlike VectorRescore,
+  // this reads the original-vector sidecar and computes ordinary FP32 dot
+  // products. It is the terminal rerank seam for a fixed provider-selected
+  // pool, not a claim that the pool contains the corpus's exact top k.
+  rpc ExactVectorRescore(ExactVectorRescoreRequest) returns (ExactVectorRescoreResponse);
+
   // Runs the shard's LOCAL half of a hybrid query: the chunked vector
   // scan and the BM25 scoring (with the supplied global stats), fused
   // with RRF on the node — level one of the settled two-level fusion. The
@@ -595,6 +601,12 @@ message HealthResponse {
   string scoring_fingerprint = 9;
   // Stable spelling of the provider's declared completion semantics.
   string quality_contract = 10;
+  // Product-owned original vectors are available for every provider slot.
+  bool exact_vectors_available = 11;
+  uint64 exact_vector_rows = 12;
+  // True when the serving representation is memory-mapped rather than a
+  // mutable ingest builder.
+  bool exact_vectors_mmap = 13;
 }
 
 message ClusterHealthRequest {}
@@ -1035,13 +1047,12 @@ message FlushResponse {
 // `manifest`; `data` chunks follow in any chunking.
 message SnapshotChunk {
   oneof payload {
-    // Declares the byte split between the two image files. Everything
+    // Declares the byte split between the generation files. Everything
     // else about the shard (dim, bit width, vector count, calibration)
     // is read from the image itself — the file is the source of truth.
     SnapshotManifest manifest = 1;
-    // Opaque image bytes: the first `manifest.vector_bytes` across all data
-    // chunks are the provider image, followed by the BM25 sidecar.
-    // sidecar. Senders should keep chunks around 1 MiB.
+    // Opaque image bytes: provider image first, then exact FP32 vectors,
+    // then the BM25 sidecar. Senders should keep chunks around 1 MiB.
     bytes data = 2;
   }
 }
@@ -1052,6 +1063,10 @@ message SnapshotManifest {
   uint64 vector_bytes = 1;
   // Total .bm25 bytes following the provider bytes; 0 for a vector-only image.
   uint64 bm25_bytes = 2;
+  // Total product-owned FP32 sidecar bytes between provider and BM25 bytes.
+  // 0 is accepted for legacy/native-only generations; FP32 rerank then
+  // refuses until that generation is rebuilt or backfilled.
+  uint64 exact_vector_bytes = 3;
 }
 
 // Result of an `InstallSnapshot` call.
@@ -3080,6 +3095,18 @@ message VectorRescoreResponse {
   repeated RawLegHit hits = 1;
 }
 
+// Candidate-scoped original-vector scoring (see
+// NodeService.ExactVectorRescore).
+message ExactVectorRescoreRequest {
+  repeated float vector = 1;
+  repeated uint64 candidate_ids = 2;
+}
+
+message ExactVectorRescoreResponse {
+  // One row per distinct requested id owned by this shard, in request order.
+  repeated RawLegHit hits = 1;
+}
+
 // One cascade hit: the two leg scores as SEPARATE fields (no fused
 // score) plus the final rerank rank.
 message CascadeHit {
@@ -3403,9 +3430,20 @@ message LexicalQuery {
 }
 
 // Dense vector relevance (the Search leg).
+enum DenseScoreMode {
+  // Backward-compatible provider-native scoring.
+  DENSE_SCORE_MODE_UNSPECIFIED = 0;
+  DENSE_SCORE_MODE_NATIVE = 1;
+  // Select `selection_k` candidates with the configured provider, then
+  // replace their scores with product-owned FP32 dot products and reorder
+  // that fixed pool. Exact within the pool, not a global recall guarantee.
+  DENSE_SCORE_MODE_FP32_RERANK = 2;
+}
+
 message DenseQuery {
   // The query vector; length must equal the shard dimension.
   repeated float vector = 1;
+  DenseScoreMode score_mode = 2;
 }
 
 // A membership-only leaf: never contributes a relevance score and
@@ -3747,6 +3785,8 @@ message QueryProfile {
   float projection_ms = 5;
   // Wall time of the whole adapter call.
   float total_ms = 6;
+  // Candidate-scoped exact-vector scoring and reorder. 0 on native scoring.
+  float rerank_ms = 7;
 }
 
 // One public hit with score provenance.

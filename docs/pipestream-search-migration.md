@@ -26,7 +26,8 @@ new server without regeneration.
   when both are present.
 - Existing configured `.tv` paths still load through `embedded-turbovec`.
 - Snapshot recovery recognizes legacy `index.tv` and `index.tv.bm25` names;
-  new generations use `vector.index` and `documents.bm25`.
+  new generations use `vector.index`, optional `vectors.f32`, and
+  `documents.bm25`.
 - WAL manifests without generic provider fields are upgraded in memory from
   their legacy calibration fields. New manifests carry opaque provider state
   and retain the legacy embedded-adapter fields for older inspection tools.
