@@ -53,12 +53,16 @@ and filtered behavior. The flat provider executes a deterministic 10% dense
 mask. IVF records the current hard refusal because post-filtering an ANN top-k
 cannot certify the top-k of the allowed population.
 
-`run-matrix.sh` also samples CPU use by every other process while each cell is
-running. A cell that exceeds `MAX_EXTERNAL_CPU_PERCENT` (500% by default) keeps
-its deterministic recall evidence but is marked invalid for latency and build
-comparisons. This prevents an unrelated build or test wave from silently
-becoming benchmark evidence. `CPUSET` pins the benchmark itself; it does not
-make those CPUs exclusive from other host work.
+`run-matrix.sh` also samples CPU use while each cell is running. It reads actual
+busy-time deltas from `/proc/stat` and subtracts the benchmark process's CPU
+time. With `CPUSET`, it counts only those logical CPUs; without a set, it counts
+the whole host. A cell that exceeds
+`MAX_EXTERNAL_CPU_PERCENT` (100% by default) keeps its deterministic recall
+evidence but is marked invalid for latency and build comparisons. This prevents
+an unrelated build or test wave from silently becoming benchmark evidence.
+`CPUSET` pins the benchmark itself; it does not make those CPUs exclusive from
+other host work. Include both logical siblings of each selected physical core
+when simultaneous multithreading is enabled.
 
 ## Decision gate
 

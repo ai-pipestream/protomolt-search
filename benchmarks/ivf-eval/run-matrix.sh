@@ -15,7 +15,7 @@ NPROBES=${NPROBES:-8,16,32,64,128,256,all}
 WARMUP=${WARMUP:-2}
 ITERATIONS=${ITERATIONS:-5}
 CPUSET=${CPUSET:-}
-MAX_EXTERNAL_CPU_PERCENT=${MAX_EXTERNAL_CPU_PERCENT:-500}
+MAX_EXTERNAL_CPU_PERCENT=${MAX_EXTERNAL_CPU_PERCENT:-100}
 
 die() { echo "ivf-eval: $*" >&2; exit 1; }
 
@@ -27,6 +27,34 @@ if [[ -n $CPUSET ]]; then
   [[ $CPUSET =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] ||
     die "CPUSET must be a taskset CPU list"
 fi
+clock_ticks=$(getconf CLK_TCK)
+
+read_busy_ticks() {
+  awk -v cpuset="$CPUSET" '
+    function selected(cpu, segments, bounds, count, i) {
+      if (cpuset == "") {
+        return 1
+      }
+      count = split(cpuset, segments, ",")
+      for (i = 1; i <= count; i++) {
+        split(segments[i], bounds, "-")
+        if (cpu >= bounds[1] && cpu <= (bounds[2] == "" ? bounds[1] : bounds[2])) {
+          return 1
+        }
+      }
+      return 0
+    }
+    /^cpu[0-9]+ / && selected(substr($1, 4)) {
+      busy += $2 + $3 + $4 + $7 + $8 + $9
+    }
+    END { printf "%.0f\n", busy }
+  ' /proc/stat
+}
+
+read_process_ticks() {
+  [[ -r /proc/$benchmark_pid/stat ]] || return 1
+  awk '{ print $14 + $15 }' "/proc/$benchmark_pid/stat"
+}
 [[ -f $INPUT ]] || die "missing CourtListener embedding artifact: $INPUT"
 [[ $SIZES =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "SIZES must be comma-separated positive integers"
 [[ $QUERIES =~ ^[1-9][0-9]*$ ]] || die "QUERIES must be positive"
@@ -72,11 +100,23 @@ for size in ${SIZES//,/ }; do
   benchmark_pid=$!
   peak_external_cpu=0
   pressure_detected=false
+  busy_before=$(read_busy_ticks)
+  benchmark_before=$(read_process_ticks)
+  sample_before_ns=$(date +%s%N)
   while kill -0 "$benchmark_pid" 2>/dev/null; do
-    external_cpu=$(ps -e -o pid=,pcpu= | awk -v benchmark_pid="$benchmark_pid" '
-      $1 != benchmark_pid { sum += $2 }
-      END { printf "%d", sum + 0.5 }
-    ')
+    sleep 1
+    benchmark_after=$(read_process_ticks) || break
+    busy_after=$(read_busy_ticks)
+    sample_after_ns=$(date +%s%N)
+    busy_delta=$((busy_after - busy_before))
+    benchmark_delta=$((benchmark_after - benchmark_before))
+    external_delta=$((busy_delta - benchmark_delta))
+    (( external_delta >= 0 )) || external_delta=0
+    external_cpu=$((
+      (external_delta * 100000000000 +
+       clock_ticks * (sample_after_ns - sample_before_ns) / 2) /
+      (clock_ticks * (sample_after_ns - sample_before_ns))
+    ))
     if (( external_cpu > peak_external_cpu )); then
       peak_external_cpu=$external_cpu
     fi
@@ -86,7 +126,9 @@ for size in ${SIZES//,/ }; do
         "$(date --iso-8601=seconds)" "$external_cpu" "$MAX_EXTERNAL_CPU_PERCENT" \
         >>"$pressure_log"
     fi
-    sleep 1
+    busy_before=$busy_after
+    benchmark_before=$benchmark_after
+    sample_before_ns=$sample_after_ns
   done
   wait "$benchmark_pid"
   if [[ $pressure_detected == true ]]; then
