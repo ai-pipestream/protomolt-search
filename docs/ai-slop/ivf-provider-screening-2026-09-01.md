@@ -19,32 +19,34 @@ resolved Cargo dependency tree and rejects either Python binding by name.
 
 ## Reproducibility boundary
 
-- Product checkout: `85f9179f153f0909cea37fca32dcc1390fc7ceeb`, with the
-  experimental benchmark files still uncommitted and recorded as such in the
-  artifact's `git-status.txt`.
+- Product checkout: `28ac31e0b1a0f5e1012ae4f309718a30e28ee183`, with a clean
+  working tree recorded in each artifact's `git-status.txt`.
 - Input: `/work/court-corpus/embeddings-full.bin`.
 - Shape: 256 dimensions, 16 corpus-distributed query rows held after each
   indexed prefix, k = 10, 100, and 10,000.
 - Matrix: 100K, 500K, 1M, and 2M rows; IVF `nlist=floor(sqrt(rows))`;
   `nprobe=8,16,32,64,128,256,all`; two warmups and five measured iterations.
-- Runtime: eight Rayon threads pinned to CPUs 16-23.
-- Artifact: `/work/court-corpus/bench/ivf-eval/2026-09-01-85f9179-court-matrix-r3`.
-  Its `SHA256SUMS` verifies.
+- Runtime: four Rayon threads pinned to both logical siblings of physical cores
+  4-7 (`CPUSET=4-7,20-23`).
+- Host validity: the runner measured busy-time deltas on the selected CPUs,
+  subtracted the benchmark process, and used a declared 110% cumulative
+  external-CPU ceiling. Observed peaks were 83%, 54%, 88%, and 103% at 100K,
+  500K, 1M, and 2M. All four latency/build cells are valid under that rule.
+- Artifacts:
+  `/work/court-corpus/bench/ivf-eval/2026-09-01-28ac31e-court-small` and
+  `/work/court-corpus/bench/ivf-eval/2026-09-01-28ac31e-court-large-r3`.
+  Both `SHA256SUMS` manifests verify.
 
-The 100K, 500K, and 1M cells completed before a separate Gradle wave began.
-That wave contaminated the 2M timing and build-time measurements, so the 2M
-latency numbers are not evidence. Recall and completeness are deterministic
-and remain useful. A subsequent runner change samples external CPU throughout
-each cell and automatically invalidates performance comparisons under host
-pressure; a deliberately strict smoke test proved that guard trips and is
-covered by the artifact checksum.
+Earlier runs that overlapped unrelated build waves remain on disk and are
+marked invalid by the same guard. They were not selected for the tables below.
+A deliberately competing-process smoke test also proved that the guard trips.
 
 These queries are real embedding rows, but they are not held-out user search
 judgments. Results characterize this corpus slice and build only.
 
 ## One-million-row result
 
-The uncontaminated 1M cell failed every gate:
+The host-valid 1M cell failed every gate:
 
 | k | Flat mean / worst FP32 recall | IVF all-list mean / worst recall | Result |
 |---:|---:|---:|---|
@@ -55,21 +57,30 @@ The uncontaminated 1M cell failed every gate:
 Lower `nprobe` values sometimes reduced latency substantially, but none met
 both the flat provider's mean and worst-query recall while also improving QPS
 and p95. At k=10,000, for example, `nprobe=256` reached mean/worst recall
-0.93123125/0.9159 at 31.54 batch QPS and 31.45 ms p95, versus the flat
-provider's 0.9344625/0.9206 at 9.89 QPS and 150.84 ms p95. The speedup is real
+0.93123125/0.9159 at 27.45 batch QPS and 36.49 ms p95, versus the flat
+provider's 0.9344625/0.9206 at 9.22 QPS and 202.82 ms p95. The speedup is real
 for this cell, but it does not satisfy the requested quality floor.
 
 The construction and retained-memory costs independently fail the gate:
 
 | Provider | Build time | Retained RSS increment |
 |---|---:|---:|
-| Embedded TurboVec | 440 ms | 136.7 MB |
-| Experimental residual IVF | 22.61 s | 576.1 MB |
-| IVF / flat | 51.39x | 4.22x |
+| Embedded TurboVec | 479 ms | 140.7 MB |
+| Experimental residual IVF | 42.12 s | 647.0 MB |
+| IVF / flat | 87.84x | 4.60x |
 
-The clean 500K cell also failed before any host contamination: 35.27x the
-flat build time and 2.19x the retained-memory increment. This is enough to
-reject lifecycle investment even without using the contaminated 2M timings.
+The failure grew rather than disappeared with corpus size:
+
+| Rows | IVF / flat build | IVF / flat retained RSS | Host peak / ceiling |
+|---:|---:|---:|---:|
+| 100K | 16.04x | 1.38x | 83% / 110% |
+| 500K | 55.14x | 6.70x | 54% / 110% |
+| 1M | 87.84x | 4.60x | 88% / 110% |
+| 2M | 139.79x | 10.18x | 103% / 110% |
+
+At 2M, all-list IVF was also below flat recall at every required k. At
+k=10,000 it produced 0.9318375 mean and 0.9118 worst-query recall versus
+0.9346625 and 0.922 for flat. No scale point authorized lifecycle investment.
 
 ## Filter behavior
 
