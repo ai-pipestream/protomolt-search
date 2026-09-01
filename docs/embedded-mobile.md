@@ -174,6 +174,22 @@ Some apparent older versions are compatibility pins, not forgotten updates:
 retain the server/embedded parity test and classify analyzer or index-format
 changes before accepting the new lockfile.
 
+The release-level gate is `scripts/check-dependencies.sh`. It checks the root,
+independent residual-IVF experiment, and route-cost lockfiles for compatible
+updates; verifies that the locked TurboVec, distributed facade, and experimental
+IVF revisions still match their live branch tips; rejects Python bindings from
+the search/IVF graph; and audits all three lockfiles against RustSec. Forgejo
+runs this gate before the full product and experimental-provider tests in
+`.forgejo/workflows/ci.yml`.
+
+The 2026-09-01 audit used cargo-audit 0.22.2 and the current RustSec database
+(1,235 advisories). It found no vulnerabilities in any lockfile. It did report
+informational unmaintained warnings: `paste` through TurboVec's
+statrs/nalgebra chain and the test-only CEL oracle, plus `bincode` and
+`atomic-polyfill` entries in the independently owned route-cost lockfile.
+Those are visible upstream-dependency risks, not silently described as a clean
+bill of health; cargo-audit does not classify them as vulnerabilities.
+
 ## Verification
 
 `tests/embedded.rs` proves:

@@ -1,0 +1,39 @@
+name: rust-ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: ${{ github.server_url != 'https://github.com' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler ripgrep
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          rustup target add aarch64-linux-android aarch64-apple-ios x86_64-apple-ios
+          cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Dependency and provenance gate
+        run: scripts/check-dependencies.sh
+
+      - name: Product tests
+        run: cargo test --locked
+
+      - name: Android and iOS compile gates
+        run: scripts/check-mobile.sh
+
+      - name: Experimental provider tests
+        run: cargo test --locked --manifest-path benchmarks/ivf-eval/Cargo.toml
