@@ -1,0 +1,29 @@
+[package]
+name = "protomolt-embedder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Model2Vec static-embedding provider spike: WordPiece + table lookup, no runtime, no network"
+
+[dependencies]
+# Embedding output is persisted vector identity, exactly as analyzer output is
+# persisted term identity. Reuse protomolt-analyzer's exact ICU4X pins — the
+# two crates must move together in any Unicode upgrade, and this spike adds
+# no new Unicode data source to the audited tree.
+icu_normalizer = "=2.0.0"
+icu_properties = "=2.0.0"
+icu_normalizer_data = "=2.0.0"
+icu_properties_data = "=2.0.0"
+# icu_locale_core 2.0.0 does not compile with its `alloc` feature off (its
+# writeable macros assume alloc). protomolt-analyzer never sees this because
+# icu_casemap's defaults enable alloc in that graph; this crate has no
+# casemap, so the feature must be explicit.
+icu_locale_core = { version = "=2.0.0", features = ["alloc"] }
+# icu_locale_core/alloc uses writeable's alloc-only macro arms but does not
+# enable writeable/alloc itself — the casemap graph masks that wiring gap
+# too. Version range only: the exact revision stays lockfile-owned.
+writeable = { version = "0.6", features = ["alloc"] }
+icu_provider = "=2.0.0"
+# Table access and file parsing reuse the root product's existing versions.
+memmap2 = "0.9"
+serde_json = "1"

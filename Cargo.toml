@@ -6,7 +6,7 @@ license = "MIT"
 description = "Provider-neutral distributed lexical, vector, and hybrid search"
 
 [workspace]
-members = ["crates/protomolt-analyzer", "crates/protomolt-search-embedded"]
+members = ["crates/protomolt-analyzer", "crates/protomolt-embedder", "crates/protomolt-search-embedded"]
 exclude = ["sidecars/route-cost"]
 resolver = "2"
 
@@ -35,6 +35,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tonic-build = "0.12"
 
 [dev-dependencies]
+# The embedder loop test (tests/embedder_loop.rs) proves the provider crate
+# and the embedded runtime compose; dev-only so the product gains no
+# dependency on the provider while the ownership question stands.
+protomolt-embedder = { path = "crates/protomolt-embedder" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 bzip2 = "0.6"
 csv = "1"
