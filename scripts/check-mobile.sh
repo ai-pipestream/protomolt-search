@@ -19,5 +19,5 @@ for target in "${targets[@]}"; do
     echo "install it with: rustup target add $target" >&2
     exit 2
   fi
-  cargo check --locked -p protomolt-search-embedded --target "$target"
+  cargo check --locked -p protomolt-search-embedded -p protomolt-embedder --target "$target"
 done

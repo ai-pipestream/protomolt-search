@@ -1172,6 +1172,7 @@ dependencies = [
  "prost-reflect",
  "prost-types",
  "protomolt-analyzer",
+ "protomolt-embedder",
  "redb",
  "rustls",
  "rustls-pki-types",

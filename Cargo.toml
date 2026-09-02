@@ -111,6 +111,10 @@ required-features = ["net"]
 tonic-build = "0.12"
 
 [dev-dependencies]
+# The embedder loop test (tests/embedder_loop.rs) proves the provider crate
+# and the embedded runtime compose; dev-only so the product gains no
+# dependency on the provider while the ownership question stands.
+protomolt-embedder = { path = "crates/protomolt-embedder" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 bzip2 = "0.6"
 csv = "1"
