@@ -358,23 +358,24 @@ fn native_analysis_with_spec(
 ) -> Result<NativeAnalysis, Status> {
     let analyzed = protomolt_analyzer::analyze(text, spec)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let terms = analyzed
-        .term_vectors
-        .into_iter()
-        .map(|vector| {
-            (
-                vector.term,
-                vector.frequency,
-                vector
-                    .occurrences
-                    .into_iter()
-                    .map(|span| (span.start, span.end))
-                    .collect(),
-            )
-        })
-        .collect();
+    let mut terms = crate::postings::DocTerms::with_capacity(analyzed.term_vectors.len());
+    let mut positions = crate::postings::DocPositions::with_capacity(analyzed.term_vectors.len());
+    for vector in analyzed.term_vectors {
+        terms.push((
+            vector.term,
+            vector.frequency,
+            vector
+                .occurrences
+                .into_iter()
+                .map(|span| (span.start, span.end))
+                .collect(),
+        ));
+        positions.push(vector.positions);
+    }
+    // The native tokenizer numbers its own tokens, so positions come
+    // out of the same pass as the terms — there is no second walk.
     Ok(NativeAnalysis {
-        doc: AnalyzedDoc::body(terms, analyzed.length),
+        doc: AnalyzedDoc::body_positioned(terms, positions, analyzed.length),
         tokens: analyzed.tokens,
     })
 }
@@ -669,12 +670,77 @@ fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> Result<Ana
         length += tv.frequency as u32;
         terms.push((tv.term, tv.frequency as u32, offsets));
     }
-    Ok(AnalyzedDoc {
-        quality,
-        geography,
-        entities,
-        ..AnalyzedDoc::body(terms, length)
-    })
+    let positions = token_positions(&response.tokens, &terms)?;
+    let mut doc = AnalyzedDoc::body(terms, length);
+    doc.fields[0].positions = positions;
+    doc.quality = quality;
+    doc.geography = geography;
+    doc.entities = entities;
+    Ok(doc)
+}
+
+/// Token ordinals for every occurrence in `terms`, read off the
+/// response's token layer (`docs/phrase-proximity.md`). This is the ONE
+/// sidecar call ingest already makes: the token layer rides the same
+/// response as the term vectors, so positions cost no round trip.
+///
+/// The sidecar's contract makes each occurrence span a token span, and
+/// the ordinal of a token is its index in document order. The match is
+/// a single merge over both lists sorted by start offset (no hashing,
+/// no per-occurrence scan). A response without a token layer yields
+/// `None`; a positional field then refuses the document by name rather
+/// than guessing adjacency from the spans. An occurrence that is not a
+/// token span is a contract break and refuses outright.
+fn token_positions(
+    tokens: &[crate::pb::analysis::Token],
+    terms: &crate::postings::DocTerms,
+) -> Result<Option<crate::postings::DocPositions>, Status> {
+    let occurrences: usize = terms.iter().map(|(_, _, offsets)| offsets.len()).sum();
+    if occurrences == 0 {
+        // Nothing to place: scoring-only vectors, or an empty document.
+        return Ok(Some(terms.iter().map(|_| Vec::new()).collect()));
+    }
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    // (start, end, term index, occurrence index), sorted by start; ties
+    // cannot happen for distinct tokens, and two terms cannot share one.
+    let mut wanted: Vec<(u32, u32, usize, usize)> = Vec::with_capacity(occurrences);
+    for (ti, (_, _, offsets)) in terms.iter().enumerate() {
+        for (oi, &(start, end)) in offsets.iter().enumerate() {
+            wanted.push((start, end, ti, oi));
+        }
+    }
+    wanted.sort_unstable();
+    let mut positions: crate::postings::DocPositions = terms
+        .iter()
+        .map(|(_, _, offsets)| vec![0u32; offsets.len()])
+        .collect();
+    let mut cursor = 0usize;
+    for (start, end, ti, oi) in wanted {
+        while cursor < tokens.len() {
+            let span = tokens[cursor].span.as_ref();
+            let token_start = span.map_or(0, |s| s.start.max(0) as u32);
+            if token_start >= start {
+                break;
+            }
+            cursor += 1;
+        }
+        let matched = tokens
+            .get(cursor)
+            .and_then(|t| t.span.as_ref())
+            .is_some_and(|s| s.start.max(0) as u32 == start && s.end.max(0) as u32 == end);
+        if !matched {
+            return Err(Status::failed_precondition(format!(
+                "analysis sidecar reported occurrence [{start}, {end}) of {:?} that is not a \
+                 token span; token positions cannot be derived from this response",
+                terms[ti].0
+            )));
+        }
+        positions[ti][oi] = u32::try_from(cursor).expect("token count fits u32 under the text cap");
+        cursor += 1;
+    }
+    Ok(Some(positions))
 }
 
 /// Fold a response's noise and artifact layers into the per-document

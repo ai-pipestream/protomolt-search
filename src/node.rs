@@ -206,6 +206,18 @@ pub struct NodeConfig {
     /// (`docs/geo-columns.md`). Same rules as `facet_fields`; the
     /// columns geo FILTERS and distance-decay stages read.
     pub geo_fields: Vec<String>,
+    /// BM25 fields that keep token positions per occurrence
+    /// (`docs/phrase-proximity.md`), each a name from `bm25_fields`. New
+    /// builders declare them; a shard loaded from a file keeps the
+    /// file's own declaration, and ingest refuses a positional field the
+    /// active file never declared rather than storing a half-positional
+    /// column.
+    pub position_fields: Vec<String>,
+    /// Source fields whose adjacent-token pairs are derived into a
+    /// bigram column named `<source>.bigrams`, which must itself be in
+    /// `bm25_fields`. Derived at ingest from the source's positions, so
+    /// clients never supply the column.
+    pub bigram_fields: Vec<String>,
     /// Keep a write-ahead log at `<index path>.wal/` (see [`crate::wal`]).
     /// Requires `index_path`; the config layer defaults this on for
     /// persisted shards and off for demo shards.
@@ -258,6 +270,8 @@ impl Default for NodeConfig {
             map_numeric_fields: Vec::new(),
             integer_fields: Vec::new(),
             geo_fields: Vec::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
             vocab: false,
@@ -368,6 +382,17 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
             Bm25Shard::Spilling(s) => s.analysis_fingerprint(f),
             Bm25Shard::Resident(r) => r.analysis_fingerprint(f),
+        }
+    }
+
+    /// Whether field `f` keeps token positions (`docs/phrase-proximity.md`)
+    /// in this shard's active storage — the declaration on a builder,
+    /// the kind-7 entry on a file.
+    fn field_has_positions(&self, f: usize) -> bool {
+        match self {
+            Bm25Shard::Building(s) => s.field_has_positions(f),
+            Bm25Shard::Spilling(s) => s.field_has_positions(f),
+            Bm25Shard::Resident(r) => r.field_has_positions(f),
         }
     }
 
@@ -1887,7 +1912,7 @@ fn resolve_shard_filters(
     geo_filters: &[crate::pb::GeoFilter],
     geo_regions: &[crate::geo::GeoRegion],
     filter: Option<&crate::pb::FilterExpr>,
-) -> Result<(Option<crate::filter::DocFilter>, Option<Vec<bool>>), Status> {
+) -> Result<(Option<crate::filter::DocFilter<'static>>, Option<Vec<bool>>), Status> {
     if geo_filters.is_empty() && filter.is_none() && deleted.is_none() {
         return Ok((None, None));
     }
@@ -1915,6 +1940,7 @@ fn resolve_shard_filters(
         deleted,
         geo: store.resolve_geo_filters(geo_filters, geo_regions),
         pred: filter.map(|f| store.resolve_filter(f)),
+        phrase: Vec::new(),
     };
     let allow = {
         let cols = ShardNumericRead(store);
@@ -3143,6 +3169,19 @@ impl NodeServiceImpl {
             .map(String::as_str)
             .collect();
         let geos: Vec<&str> = self.config.geo_fields.iter().map(String::as_str).collect();
+        let positions: Vec<&str> = self
+            .config
+            .position_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for name in &positions {
+            if !names.contains(name) {
+                return Err(Status::failed_precondition(format!(
+                    "positional field {name:?} is not in this shard's BM25 field table {names:?}"
+                )));
+            }
+        }
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).2);
@@ -3154,7 +3193,8 @@ impl NodeServiceImpl {
                                 .with_map_facet_fields(&map_facets)
                                 .with_map_numeric_fields(&map_numerics)
                                 .with_integer_fields(&integers)
-                                .with_geo_fields(&geos),
+                                .with_geo_fields(&geos)
+                                .with_position_fields(&positions),
                         )
                     })
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
@@ -3166,7 +3206,8 @@ impl NodeServiceImpl {
                     .with_map_facets(&map_facets)
                     .with_map_numerics(&map_numerics)
                     .with_integers(&integers)
-                    .with_geos(&geos),
+                    .with_geos(&geos)
+                    .with_positions(&positions),
             )),
         }
     }
@@ -4141,14 +4182,61 @@ impl NodeServiceImpl {
                 // filters the ctx is None and every path below is
                 // bit-identical to its unfiltered form.
                 let numeric_read = ShardNumericRead(store);
+                // Phrase gates (docs/phrase-proximity.md): a leg's
+                // ordered window, checked at the same heap gate as every
+                // other filter. The field must be on this shard and must
+                // carry positions; a shard cannot approximate the window
+                // from spans, so it refuses by name instead of scoring
+                // the terms unconstrained.
+                let mut phrase_gates: Vec<crate::filter::PhraseGate<'_>> = Vec::new();
+                for (li, leg) in req.fields.iter().enumerate() {
+                    let Some(phrase) = leg.phrase.as_ref() else {
+                        continue;
+                    };
+                    let Some(vi) = leg_of_view.iter().position(|&candidate| candidate == li) else {
+                        return Err(Status::failed_precondition(format!(
+                            "phrase field {:?} is absent from this shard; a phrase cannot be \
+                             served on part of the fleet",
+                            leg.field
+                        )));
+                    };
+                    if !views[vi].has_positions() {
+                        return Err(Status::failed_precondition(format!(
+                            "field {:?} has no token positions on this shard; a phrase or slop \
+                             query needs --position-fields={} and a rebuilt generation",
+                            leg.field, leg.field
+                        )));
+                    }
+                    if phrase.sequence.len() < 2
+                        || phrase
+                            .sequence
+                            .iter()
+                            .any(|&i| i as usize >= leg.terms.len())
+                    {
+                        return Err(Status::invalid_argument(format!(
+                            "field {:?}: phrase sequence must name at least two of the leg's {} \
+                             terms",
+                            leg.field,
+                            leg.terms.len()
+                        )));
+                    }
+                    phrase_gates.push(crate::filter::PhraseGate {
+                        index: views[vi].as_ref(),
+                        terms: &leg.terms,
+                        sequence: phrase.sequence.iter().map(|&i| i as usize).collect(),
+                        slop: phrase.slop,
+                    });
+                }
                 let doc_filter = crate::filter::DocFilter {
                     deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
                     pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+                    phrase: phrase_gates,
                 };
                 let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty()
                     && doc_filter.pred.is_none()
                     && doc_filter.deleted.is_none()
+                    && doc_filter.phrase.is_empty()
                 {
                     None
                 } else {
@@ -5156,6 +5244,17 @@ impl NodeServiceImpl {
                     field.field
                 )));
             }
+            if let Some(source) = self
+                .config
+                .bigram_fields
+                .iter()
+                .find(|source| crate::proximity::bigram_field_name(source) == field.field)
+            {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?} is the bigram column derived from {source:?}; clients must not supply it",
+                    field.field
+                )));
+            }
             if seen.contains(&field.field.as_str()) {
                 return Err(Status::invalid_argument(format!(
                     "field {:?} repeats in one document",
@@ -5440,6 +5539,176 @@ impl NodeServiceImpl {
         Ok((doc, analyzed))
     }
 
+    /// Derive the proximity payloads (`docs/phrase-proximity.md`) and pin
+    /// the document's durable proximity record: which fields keep token
+    /// positions, and which bigram columns derive from which sources.
+    ///
+    /// Fresh ingest (an empty record) fills both from this node's
+    /// configuration; a record that already names them — a replayed WAL
+    /// entry, a resharded child, a client that copied one — must agree
+    /// with the configuration exactly, or the document refuses by name:
+    /// a column that is positional on some documents and not on others
+    /// is a phrase index that lies about half the corpus.
+    ///
+    /// A positional field needs the analysis to have carried token
+    /// positions (the native tokenizer always does; a sidecar response
+    /// without a token layer cannot), and needs FULL term vectors — a
+    /// scoring-only field has no occurrences to place, so a phrase over
+    /// it could never match and would silently return nothing. Bigram
+    /// columns derive from the source's positions by the same rule.
+    fn materialize_proximity(
+        &self,
+        mut doc: AddDocumentsRequest,
+        mut analyzed: crate::postings::AnalyzedDoc,
+    ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
+        use crate::proximity::{bigram_field_name, derive_bigrams};
+        let configured_bigrams: Vec<crate::pb::BigramField> = self
+            .config
+            .bigram_fields
+            .iter()
+            .map(|source| crate::pb::BigramField {
+                source: source.clone(),
+                field: bigram_field_name(source),
+            })
+            .collect();
+        let fresh = doc.position_fields.is_empty() && doc.bigram_fields.is_empty();
+        if fresh {
+            doc.position_fields = self.config.position_fields.clone();
+            doc.bigram_fields = configured_bigrams.clone();
+        } else {
+            let mut held: Vec<&str> = doc.position_fields.iter().map(String::as_str).collect();
+            let mut want: Vec<&str> = self
+                .config
+                .position_fields
+                .iter()
+                .map(String::as_str)
+                .collect();
+            held.sort_unstable();
+            want.sort_unstable();
+            if held != want {
+                return Err(Status::failed_precondition(format!(
+                    "document records token positions on {held:?} but this node keeps them on \
+                     {want:?}; rebuild or replay with the matching --position-fields"
+                )));
+            }
+            let mut held: Vec<(&str, &str)> = doc
+                .bigram_fields
+                .iter()
+                .map(|b| (b.source.as_str(), b.field.as_str()))
+                .collect();
+            let mut want: Vec<(&str, &str)> = configured_bigrams
+                .iter()
+                .map(|b| (b.source.as_str(), b.field.as_str()))
+                .collect();
+            held.sort_unstable();
+            want.sort_unstable();
+            if held != want {
+                return Err(Status::failed_precondition(format!(
+                    "document records bigram columns {held:?} but this node derives {want:?}; \
+                     rebuild or replay with the matching --bigram-fields"
+                )));
+            }
+        }
+        if doc.position_fields.is_empty() && doc.bigram_fields.is_empty() {
+            return Ok((doc, analyzed));
+        }
+        let table = &self.config.bm25_fields;
+        let field_index = |name: &str| -> Result<usize, Status> {
+            table.iter().position(|n| n == name).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "proximity field {name:?} is absent from this node's BM25 field table {table:?}"
+                ))
+            })
+        };
+        // The spec a field was analyzed under: the body's, or the extra
+        // field's own. Positions need FULL vectors.
+        let scoring_only = |fi: usize| -> bool {
+            let spec = if fi == 0 {
+                doc.analysis.as_ref()
+            } else {
+                doc.fields
+                    .iter()
+                    .find(|f| f.field == table[fi])
+                    .and_then(|f| f.analysis.as_ref())
+            };
+            spec.is_some_and(|s| {
+                s.term_vector_mode == crate::analyzer::TERM_VECTOR_MODE_SCORING_ONLY
+            })
+        };
+        let require_positions = |analyzed: &crate::postings::AnalyzedDoc,
+                                 fi: usize,
+                                 role: &str|
+         -> Result<(), Status> {
+            let Some(field) = analyzed.fields.get(fi) else {
+                // The document does not carry this field at all: there
+                // is nothing to position and nothing to derive.
+                return Ok(());
+            };
+            if field.terms.is_empty() {
+                return Ok(());
+            }
+            if scoring_only(fi) {
+                return Err(Status::invalid_argument(format!(
+                    "{role} {:?} requires FULL term vectors: a SCORING_ONLY analysis has no \
+                     occurrences to place, so no phrase could ever match it",
+                    table[fi]
+                )));
+            }
+            if field.positions.is_none() {
+                return Err(Status::failed_precondition(format!(
+                    "{role} {:?} needs token positions, but the analysis of this document carried \
+                     no token layer to derive them from; positions are never guessed from spans",
+                    table[fi]
+                )));
+            }
+            field.check_positions().map_err(|error| {
+                Status::invalid_argument(format!(
+                    "{role} {:?}: malformed token positions: {error}",
+                    table[fi]
+                ))
+            })
+        };
+        for name in &doc.position_fields {
+            let fi = field_index(name)?;
+            require_positions(&analyzed, fi, "positional field")?;
+        }
+        for bigram in &doc.bigram_fields {
+            let source = field_index(&bigram.source)?;
+            let derived = field_index(&bigram.field)?;
+            if bigram.field != bigram_field_name(&bigram.source) {
+                return Err(Status::invalid_argument(format!(
+                    "bigram column {:?} must be named {:?}",
+                    bigram.field,
+                    bigram_field_name(&bigram.source)
+                )));
+            }
+            require_positions(&analyzed, source, "bigram source field")?;
+            let Some(source_field) = analyzed.fields.get(source) else {
+                continue;
+            };
+            if source_field.terms.is_empty() {
+                continue;
+            }
+            let column = derive_bigrams(source_field).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "bigram column {:?} from {:?}: {error}",
+                    bigram.field, bigram.source
+                ))
+            })?;
+            if analyzed.fields.len() <= derived {
+                analyzed.fields.resize_with(derived + 1, Default::default);
+            }
+            if analyzed.fields[derived] != crate::postings::AnalyzedField::default() {
+                return Err(Status::invalid_argument(format!(
+                    "bigram column {:?} collides with supplied analyzed data",
+                    bigram.field
+                )));
+            }
+            analyzed.fields[derived] = column;
+        }
+        Ok((doc, analyzed))
+    }
+
     /// Apply one analyzed document: id assignment, store insert, WAL
     /// append. Must be called in arrival order — both transports
     /// guarantee it.
@@ -5459,6 +5728,7 @@ impl NodeServiceImpl {
         // take the one path they already took. Clearing the spec is what
         // makes replay exact — the logged request carries the values, so
         // replay never calls the sidecar and never derives twice.
+        let (doc, analyzed) = self.materialize_proximity(doc, analyzed)?;
         let (doc, analyzed) = self.materialize_phrases(doc, analyzed)?;
         let doc = materialize_quality(doc, &analyzed)?;
         let doc = materialize_geography(doc, &analyzed)?;
@@ -5591,6 +5861,41 @@ impl NodeServiceImpl {
                 }
             }
         }
+        // Positions agree between the record and the ACTIVE storage
+        // (docs/phrase-proximity.md). A file the node loaded declares
+        // its own positional fields; a document that keeps positions on
+        // a field the file never declared would build a column that is
+        // positional for new documents only, and a document without
+        // positions into a field that keeps them would leave a hole the
+        // store cannot represent. Both refuse here, before anything
+        // mutates, naming the field and the fix.
+        {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            for name in &doc.position_fields {
+                let Some(fi) = self.config.bm25_fields.iter().position(|n| n == name) else {
+                    continue; // refused upstream
+                };
+                if fi < shard.field_count() && !shard.field_has_positions(fi) {
+                    return Err(Status::failed_precondition(format!(
+                        "shard field {name:?} predates token positions (its storage declares \
+                         none); rebuild or reshard the generation before positional ingest"
+                    )));
+                }
+            }
+            for (fi, field) in analyzed.fields.iter().enumerate() {
+                if fi < shard.field_count()
+                    && shard.field_has_positions(fi)
+                    && !field.terms.is_empty()
+                    && field.positions.is_none()
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "shard field {:?} keeps token positions but this document's analysis \
+                         carried none; positions are never guessed from spans",
+                        shard.field_name(fi)
+                    )));
+                }
+            }
+        }
         // Record which analyzer produced each column, and refuse a
         // document that contradicts one already recorded. Field NAME
         // agreement (just above) does not catch this: two documents can
@@ -5627,6 +5932,32 @@ impl NodeServiceImpl {
                 shard
                     .set_analysis_fingerprint(fi, phrases.fingerprint())
                     .map_err(Status::failed_precondition)?;
+            }
+            // A bigram column's identity is its source's analyzer plus
+            // the derivation: two columns built from differently
+            // analyzed sources hold different pairs under one name.
+            for bigram in &doc.bigram_fields {
+                let (Some(source), Some(derived)) = (
+                    self.config
+                        .bm25_fields
+                        .iter()
+                        .position(|n| *n == bigram.source),
+                    self.config
+                        .bm25_fields
+                        .iter()
+                        .position(|n| *n == bigram.field),
+                ) else {
+                    continue; // refused upstream
+                };
+                let source_fingerprint = shard.analysis_fingerprint(source);
+                if source_fingerprint != 0 {
+                    shard
+                        .set_analysis_fingerprint(
+                            derived,
+                            crate::proximity::bigram_fingerprint(source_fingerprint),
+                        )
+                        .map_err(Status::failed_precondition)?;
+                }
             }
         }
         // Facet values: refuse unknown fields, repeats, and empty
@@ -6795,6 +7126,7 @@ impl NodeService for NodeServiceImpl {
             deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
             pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+            phrase: Vec::new(),
         };
         let cols = ShardNumericRead(store);
         if let Some(sort) = &req.sort {
@@ -7142,6 +7474,7 @@ impl NodeService for NodeServiceImpl {
             deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
             pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+            phrase: Vec::new(),
         };
         let cols = ShardNumericRead(store);
         let n = u64::from(store.next_doc_id());
@@ -7316,6 +7649,7 @@ impl NodeService for NodeServiceImpl {
             deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
             pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+            phrase: Vec::new(),
         };
         let cols = ShardNumericRead(store);
         let n = u64::from(store.next_doc_id());
@@ -8377,12 +8711,14 @@ impl NodeService for NodeServiceImpl {
                                 total_doc_length,
                                 doc_frequencies,
                                 known: true,
+                                positions: store.field_has_positions(fi),
                             }
                         }
                         None => crate::pb::FieldStats {
                             total_doc_length: 0,
                             doc_frequencies: vec![0; ft.terms.len()],
                             known: false,
+                            positions: false,
                         },
                     })
                     .collect();
@@ -8407,6 +8743,7 @@ impl NodeService for NodeServiceImpl {
                         total_doc_length: 0,
                         doc_frequencies: vec![0; ft.terms.len()],
                         known: false,
+                        positions: false,
                     })
                     .collect(),
             ),
@@ -9187,16 +9524,50 @@ impl NodeServiceImpl {
         // docs/cel-filters.md). `None` when the request has none, and
         // every path below is then bit-identical to its unfiltered
         // form.
-        let doc_filter: Option<crate::filter::DocFilter> = match guard.bm25.as_ref() {
+        let doc_filter: Option<crate::filter::DocFilter<'_>> = match guard.bm25.as_ref() {
             Some(store)
                 if !req.geo_filters.is_empty()
                     || req.filter.is_some()
+                    || req.phrase.is_some()
                     || guard.live_docs.has_deletes() =>
             {
+                // The flat route's phrase gate over the body
+                // (docs/phrase-proximity.md); same contract as the fused
+                // route's per-leg gate.
+                let mut phrase = Vec::new();
+                if let Some(constraint) = req.phrase.as_ref() {
+                    let index = store.as_index().ok_or_else(|| {
+                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                    })?;
+                    if !index.has_positions() {
+                        return Err(Status::failed_precondition(
+                            "field \"body\" has no token positions on this shard; a phrase or \
+                             slop query needs --position-fields=body and a rebuilt generation",
+                        ));
+                    }
+                    if constraint.sequence.len() < 2
+                        || constraint
+                            .sequence
+                            .iter()
+                            .any(|&i| i as usize >= req.terms.len())
+                    {
+                        return Err(Status::invalid_argument(format!(
+                            "phrase sequence must name at least two of the query's {} terms",
+                            req.terms.len()
+                        )));
+                    }
+                    phrase.push(crate::filter::PhraseGate {
+                        index,
+                        terms: &req.terms,
+                        sequence: constraint.sequence.iter().map(|&i| i as usize).collect(),
+                        slop: constraint.slop,
+                    });
+                }
                 Some(crate::filter::DocFilter {
                     deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
                     pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+                    phrase,
                 })
             }
             _ => None,

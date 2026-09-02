@@ -282,6 +282,18 @@ pub struct Config {
     pub phrase_ignore_case: bool,
     /// Request OpenNLP NER and materialize mentions into the entity map.
     pub phrase_ner: bool,
+    /// BM25 fields that keep token positions per occurrence
+    /// (`--position-fields=body`, docs/phrase-proximity.md): the opt-in
+    /// payload behind exact phrase and proximity queries. Each name must
+    /// be in `bm25_fields`. Shards loaded from existing files keep the
+    /// declaration they were written with; ingest refuses a positional
+    /// field the file never declared.
+    pub position_fields: Vec<String>,
+    /// Source fields whose adjacent-token pairs are derived into a
+    /// bigram column (`--bigram-fields=body`, docs/phrase-proximity.md).
+    /// The column is the BM25 field named `<source>.bigrams`, which must
+    /// be declared in `bm25_fields`; clients never supply it.
+    pub bigram_fields: Vec<String>,
     /// The map<string, f64> column table for NEW shard builders
     /// (`--map-numeric-fields=attrs`). Same rules.
     pub map_numeric_fields: Vec<String>,
@@ -377,6 +389,8 @@ struct FileConfig {
     entity_map_field: Option<String>,
     phrase_ignore_case: Option<bool>,
     phrase_ner: Option<bool>,
+    position_fields: Option<Vec<String>>,
+    bigram_fields: Option<Vec<String>>,
     map_numeric_fields: Option<Vec<String>>,
     integer_fields: Option<Vec<String>>,
     geo_fields: Option<Vec<String>>,
@@ -1435,6 +1449,82 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         return Err("--entity-map-field and --phrase-ner require --phrase-glossary".to_string());
     }
 
+    // Proximity payloads (docs/phrase-proximity.md). Both are explicit
+    // storage declarations, like the phrase field: a positional field
+    // must be in the table, and a bigram column is a declared table
+    // entry named after its source, never an implicit extra field.
+    let list = |name: &str, env: &str, file: Option<&Vec<String>>| -> Vec<String> {
+        match opt(args, name, env, None) {
+            Some(s) => s
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            None => file.cloned().unwrap_or_default(),
+        }
+    };
+    let position_fields = list(
+        "position-fields",
+        "PIPESTREAM_SEARCH_POSITION_FIELDS",
+        file.position_fields.as_ref(),
+    );
+    let bigram_fields = list(
+        "bigram-fields",
+        "PIPESTREAM_SEARCH_BIGRAM_FIELDS",
+        file.bigram_fields.as_ref(),
+    );
+    for (i, name) in position_fields.iter().enumerate() {
+        if position_fields[..i].contains(name) {
+            return Err(format!(
+                "positional field {name:?} repeats in --position-fields"
+            ));
+        }
+        if !bm25_fields.contains(name) {
+            return Err(format!(
+                "positional field {name:?} must be declared in --bm25-fields"
+            ));
+        }
+        if phrase_glossary.is_some() && *name == phrase_field {
+            return Err(format!(
+                "phrase field {name:?} holds glossary concepts, not tokens; it cannot keep token positions"
+            ));
+        }
+    }
+    for (i, source) in bigram_fields.iter().enumerate() {
+        let derived = crate::proximity::bigram_field_name(source);
+        if bigram_fields[..i].contains(source) {
+            return Err(format!(
+                "bigram source {source:?} repeats in --bigram-fields"
+            ));
+        }
+        if !bm25_fields.contains(source) {
+            return Err(format!(
+                "bigram source field {source:?} must be declared in --bm25-fields"
+            ));
+        }
+        if !bm25_fields.contains(&derived) {
+            return Err(format!(
+                "bigram column {derived:?} (derived from {source:?}) must be declared in --bm25-fields"
+            ));
+        }
+        if crate::proximity::bigram_source(source).is_some() {
+            return Err(format!(
+                "bigram source {source:?} is itself a bigram column; columns derive from analyzed fields only"
+            ));
+        }
+        if position_fields.contains(&derived) {
+            return Err(format!(
+                "bigram column {derived:?} cannot keep token positions; it is a term column derived from {source:?}"
+            ));
+        }
+        if phrase_glossary.is_some() && (*source == phrase_field || derived == phrase_field) {
+            return Err(format!(
+                "bigram source {source:?} and the phrase field {phrase_field:?} must be distinct"
+            ));
+        }
+    }
+
     Ok(Config {
         role,
         coord_listen,
@@ -1477,6 +1567,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         entity_map_field,
         phrase_ignore_case,
         phrase_ner,
+        position_fields,
+        bigram_fields,
         map_numeric_fields,
         integer_fields,
         geo_fields,

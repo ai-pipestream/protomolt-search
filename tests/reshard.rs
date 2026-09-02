@@ -136,6 +136,8 @@ async fn ingest(
                 phrases: Vec::new(),
                 phrase_fingerprint: 0,
                 phrase_field: String::new(),
+                position_fields: Vec::new(),
+                bigram_fields: Vec::new(),
             })
             .await
             .unwrap();
@@ -1082,6 +1084,8 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
                 phrases: Vec::new(),
                 phrase_fingerprint: 0,
                 phrase_field: String::new(),
+                position_fields: Vec::new(),
+                bigram_fields: Vec::new(),
             })
             .await
             .unwrap();

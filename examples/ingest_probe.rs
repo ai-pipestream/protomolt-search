@@ -98,6 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 phrases: Vec::new(),
                 phrase_fingerprint: 0,
                 phrase_field: String::new(),
+                position_fields: Vec::new(),
+                bigram_fields: Vec::new(),
             })
             .await
             .map_err(|e| format!("feeder send: {e}"))?;

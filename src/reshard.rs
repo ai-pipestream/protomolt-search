@@ -540,6 +540,9 @@ fn build_child(
                     if !doc.phrase_field.is_empty() {
                         extras.insert(doc.phrase_field.clone());
                     }
+                    for bigram in &doc.bigram_fields {
+                        extras.insert(bigram.field.clone());
+                    }
                 }
                 extras.remove("body");
                 let mut t = vec!["body".to_string()];
@@ -645,6 +648,26 @@ fn build_child(
         let map_numeric_names: Vec<&str> = map_numeric_table.iter().map(String::as_str).collect();
         let integer_names: Vec<&str> = integer_table.iter().map(String::as_str).collect();
         let geo_names: Vec<&str> = geo_table.iter().map(String::as_str).collect();
+        // The child's positional fields (docs/phrase-proximity.md) come
+        // from the records' proximity record, which every record of one
+        // generation carries identically; a field it names outside the
+        // table is a corrupt record, refused.
+        let position_table: Vec<String> = {
+            let mut t = BTreeSet::new();
+            for (local, doc) in &mapped {
+                for name in &doc.position_fields {
+                    if !table.contains(name) {
+                        return Err(format!(
+                            "record at child slot {local} keeps positions on {name:?} outside the \
+                             table {table:?}"
+                        ));
+                    }
+                    t.insert(name.clone());
+                }
+            }
+            t.into_iter().collect()
+        };
+        let position_names: Vec<&str> = position_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
             .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
             .with_facet_fields(&facet_names)
@@ -652,7 +675,8 @@ fn build_child(
             .with_map_facet_fields(&map_facet_names)
             .with_map_numeric_fields(&map_numeric_names)
             .with_integer_fields(&integer_names)
-            .with_geo_fields(&geo_names);
+            .with_geo_fields(&geo_names)
+            .with_position_fields(&position_names);
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -713,6 +737,46 @@ fn build_child(
                     };
                     fields[fi] = crate::phrases::analyzed_field(&doc.phrases);
                 }
+                // Proximity payloads (docs/phrase-proximity.md): the
+                // re-analysis carries token positions from the same
+                // fingerprinted tokenizer, so a positional field takes
+                // them and a bigram column derives from its source
+                // exactly as at first ingest. A field that needs
+                // positions and got none is refused, never re-indexed
+                // without them.
+                for name in &doc.position_fields {
+                    let fi = table.iter().position(|n| n == name).expect("checked above");
+                    if !fields[fi].terms.is_empty() && fields[fi].positions.is_none() {
+                        return Err(format!(
+                            "record at child slot {local}: field {name:?} keeps token positions \
+                             but the replay analysis carried none"
+                        ));
+                    }
+                }
+                for bigram in &doc.bigram_fields {
+                    let Some(source) = table.iter().position(|n| n == &bigram.source) else {
+                        return Err(format!(
+                            "record at child slot {local} derives {:?} from {:?}, which is outside \
+                             the table {table:?}",
+                            bigram.field, bigram.source
+                        ));
+                    };
+                    let derived = table
+                        .iter()
+                        .position(|n| n == &bigram.field)
+                        .expect("bigram columns joined the table above");
+                    if fields[source].terms.is_empty() {
+                        continue;
+                    }
+                    fields[derived] = crate::proximity::derive_bigrams(&fields[source]).map_err(
+                        |error| {
+                            format!(
+                                "record at child slot {local}: bigram column {:?} from {:?}: {error}",
+                                bigram.field, bigram.source
+                            )
+                        },
+                    )?;
+                }
                 builder
                     .set_analysis_fingerprint(
                         0,
@@ -744,6 +808,27 @@ fn build_child(
                         .map_err(|error| {
                             format!("phrase field {phrase_field:?} fingerprint: {error}")
                         })?;
+                }
+                for bigram in &doc.bigram_fields {
+                    let source = table
+                        .iter()
+                        .position(|n| n == &bigram.source)
+                        .expect("bigram source was resolved above");
+                    let derived = table
+                        .iter()
+                        .position(|n| n == &bigram.field)
+                        .expect("bigram column was resolved above");
+                    let source_fingerprint = builder.analysis_fingerprint(source);
+                    if source_fingerprint != 0 {
+                        builder
+                            .set_analysis_fingerprint(
+                                derived,
+                                crate::proximity::bigram_fingerprint(source_fingerprint),
+                            )
+                            .map_err(|error| {
+                                format!("bigram column {:?} fingerprint: {error}", bigram.field)
+                            })?;
+                    }
                 }
                 let text = std::mem::take(&mut doc.text);
                 builder

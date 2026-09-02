@@ -180,11 +180,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 weight: 1.0,
                 k1: 0.0,
                 b,
+                phrase: None,
             }],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })
         .await?
         .into_inner();

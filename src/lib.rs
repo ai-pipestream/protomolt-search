@@ -49,6 +49,7 @@ pub mod node;
 pub mod pb;
 pub mod phrases;
 pub mod postings;
+pub mod proximity;
 pub mod quality;
 pub mod query;
 pub mod rankdiff;

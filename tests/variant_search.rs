@@ -80,6 +80,8 @@ fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
         phrases: Vec::new(),
         phrase_fingerprint: 0,
         phrase_field: String::new(),
+        position_fields: Vec::new(),
+        bigram_fields: Vec::new(),
     }
 }
 
@@ -146,11 +148,13 @@ fn body_only(text: &str) -> SearchVariant {
                 weight: 1.0,
                 k1: 0.0,
                 b: 0.0,
+                phrase: None,
             }],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })),
     }
 }
@@ -176,6 +180,7 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
                     weight: 1.0,
                     k1: 0.0,
                     b: 0.0,
+                    phrase: None,
                 },
                 QueryField {
                     field: "case_name".to_string(),
@@ -183,12 +188,14 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
                     weight: w_name,
                     k1: 0.0,
                     b: 0.0,
+                    phrase: None,
                 },
             ],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })),
     }
 }
@@ -527,6 +534,7 @@ async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),
         cardinality_fields: Vec::new(),
+        phrase: None,
     };
 
     // Omitted k runs at the default cap: deep enough to find every

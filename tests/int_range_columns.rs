@@ -86,6 +86,8 @@ async fn add_documents_integer(
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await
         .unwrap();
@@ -484,6 +486,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         }),
     )
     .await
@@ -498,6 +501,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         weight: 1.0,
         k1: 0.0,
         b: 0.0,
+        phrase: None,
     }];
     let (_, _, fused_ranges) = coordinator
         .fanout_bm25_fused_faceted("rust", 10, &fields, 0.0, &[], &[], &want, &[], None)
@@ -870,6 +874,8 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
         phrases: Vec::new(),
         phrase_fingerprint: 0,
         phrase_field: String::new(),
+        position_fields: Vec::new(),
+        bigram_fields: Vec::new(),
     };
     send(
         addr.clone(),

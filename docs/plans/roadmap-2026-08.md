@@ -177,7 +177,33 @@ in this engine keys on epoch or does not ship.
 
 ## B. Query features the engine cannot currently express
 
-### 5. Phrase and proximity queries
+### 5. Phrase and proximity queries — LANDED
+
+**Landed 2026-09-02 (`docs/phrase-proximity.md`, `src/proximity.rs`,
+`tests/phrase_proximity.rs`).** Both routes this item priced were
+built: a **bigram column** (`--bigram-fields`, an ordinary derived BM25
+field whose terms are adjacent-ordinal pairs, so a two-term exact
+phrase is one term lookup with no new scorer) and **token positions**
+as an opt-in per-field payload (`--position-fields`, a kind-7 entry of
+the v7 column table, one `u32` per occurrence, served by the mmap
+reader without loading it). Ordinals count every token the tokenizer
+produced, emitted or not — the native analyzer numbers its own, the
+sidecar's `tokens` layer rides the one Analyze ingest already makes —
+which is what a soft hyphen between `new` and `york` proves the spans
+cannot: the pair is not adjacent, and slop 1 admits it. The query-side
+window is a removal-only gate at the shared heap gate, so pruning and
+facets stay exact and distributed equals monolithic bitwise on both
+routes. A field with neither payload refuses by name; so does a mixed
+fleet, a three-term phrase on a bigram-only field, and slop on one.
+The cost gate holds the encodings to their formulas, and
+`examples/bigram_cost.rs` priced both on 20,000 real chunks — with the
+opposite result from the one predicted below: positions cost 847 B/doc
+(+22% of the body index) while the bigram column costs 9,146 B/doc
+(+240%), because a chunk's pairs are nearly all distinct and each is a
+dictionary entry. Positions are the payload to enable on a corpus body;
+the bigram column is a phrase-heavy-workload trade.
+
+The original rationale, kept:
 
 The largest missing *retrieval* feature, and the one where the honest
 answer costs something. Postings store occurrence spans in

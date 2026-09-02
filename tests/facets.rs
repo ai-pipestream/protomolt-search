@@ -83,6 +83,8 @@ async fn add_documents_faceted(
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await
         .unwrap();
@@ -316,6 +318,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
         weight: 1.0,
         k1: 0.0,
         b: 0.0,
+        phrase: None,
     }];
     let (fused_hits, fused_facets, _) = coordinator
         .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[], &[], &[], None)
@@ -356,6 +359,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         }),
     )
     .await
@@ -383,6 +387,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         }),
     )
     .await
@@ -497,6 +502,7 @@ async fn spilled_shard_serves_facets_after_flush() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })
         .await
         .unwrap()

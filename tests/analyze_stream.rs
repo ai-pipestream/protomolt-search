@@ -205,6 +205,8 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await
         .unwrap();

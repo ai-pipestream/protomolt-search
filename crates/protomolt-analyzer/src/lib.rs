@@ -117,6 +117,15 @@ pub struct TermVector {
     pub term: String,
     pub frequency: u32,
     pub occurrences: Vec<Span>,
+    /// Token ordinal of each occurrence, parallel to `occurrences`: the
+    /// index of the token in the tokenizer's complete output, counting
+    /// every token the tokenizer produced, including ones whose term
+    /// identity normalized to nothing and were therefore never emitted.
+    /// Two occurrences are adjacent exactly when their ordinals differ by
+    /// one, which is what a phrase or proximity query asks. Character
+    /// spans cannot answer that: a dropped token and a run of whitespace
+    /// look identical between two spans. Empty in [`TermVectorMode::ScoringOnly`].
+    pub positions: Vec<u32>,
 }
 
 /// Native analysis result.
@@ -398,28 +407,31 @@ pub fn analyze_with_offset_unit(
     let mut vectors = Vec::<TermVector>::new();
     let mut positions = HashMap::<String, usize>::new();
 
-    for token in &tokens {
+    // The ordinal counts every token, emitted or not: a token whose
+    // identity normalizes to nothing still occupies a position, so the
+    // terms on either side of it are not adjacent.
+    for (ordinal, token) in tokens.iter().enumerate() {
         let term = term_identity(token.surface, spec);
         if term.is_empty() {
             continue;
         }
+        let ordinal = u32::try_from(ordinal).expect("token count fits u32 under the 1 MiB cap");
         if let Some(&index) = positions.get(&term) {
             let vector = &mut vectors[index];
             vector.frequency += 1;
             if spec.term_vector_mode == TermVectorMode::Full {
                 vector.occurrences.push(token.span);
+                vector.positions.push(ordinal);
             }
         } else {
             let index = vectors.len();
             positions.insert(term.clone(), index);
+            let full = spec.term_vector_mode == TermVectorMode::Full;
             vectors.push(TermVector {
                 term,
                 frequency: 1,
-                occurrences: if spec.term_vector_mode == TermVectorMode::Full {
-                    vec![token.span]
-                } else {
-                    Vec::new()
-                },
+                occurrences: if full { vec![token.span] } else { Vec::new() },
+                positions: if full { vec![ordinal] } else { Vec::new() },
             });
         }
     }
@@ -825,20 +837,49 @@ mod tests {
                     term: "😀".into(),
                     frequency: 1,
                     occurrences: vec![Span { start: 0, end: 2 }],
+                    positions: vec![0],
                 },
                 TermVector {
                     term: "run".into(),
                     frequency: 2,
                     occurrences: vec![Span { start: 3, end: 10 }, Span { start: 21, end: 28 }],
+                    positions: vec![1, 3],
                 },
                 TermVector {
                     term: "rodriguez".into(),
                     frequency: 1,
                     occurrences: vec![Span { start: 11, end: 20 }],
+                    positions: vec![2],
                 },
             ]
         );
         assert_eq!(doc.length, 4);
+    }
+
+    #[test]
+    fn positions_count_dropped_tokens_so_spans_cannot_fake_adjacency() {
+        // The soft hyphen token normalizes to nothing under STRIP_INVISIBLE
+        // and is never emitted as a term, yet it occupies ordinal 1: "new"
+        // and "york" are NOT adjacent here, while their character spans are
+        // separated by exactly the whitespace a plain "new york" would have.
+        let doc = analyze("new \u{00AD} york", &folded()).unwrap();
+        let by_term: std::collections::HashMap<_, _> = doc
+            .term_vectors
+            .iter()
+            .map(|vector| (vector.term.as_str(), vector.positions.clone()))
+            .collect();
+        assert_eq!(by_term["new"], vec![0]);
+        assert_eq!(by_term["york"], vec![2]);
+        assert_eq!(doc.tokens.len(), 3);
+        assert_eq!(doc.length, 2, "the dropped token adds no length");
+
+        let adjacent = analyze("new york", &folded()).unwrap();
+        let york = adjacent
+            .term_vectors
+            .iter()
+            .find(|vector| vector.term == "york")
+            .unwrap();
+        assert_eq!(york.positions, vec![1]);
     }
 
     #[test]
@@ -916,6 +957,7 @@ mod tests {
         assert_eq!(doc.term_vectors[0].term, "run");
         assert_eq!(doc.term_vectors[0].frequency, 3);
         assert!(doc.term_vectors[0].occurrences.is_empty());
+        assert!(doc.term_vectors[0].positions.is_empty());
     }
 
     #[test]

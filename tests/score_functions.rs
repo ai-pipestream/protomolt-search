@@ -75,6 +75,8 @@ async fn add_documents_numeric(
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await
         .unwrap();
@@ -437,6 +439,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         }),
     )
     .await
@@ -541,6 +544,7 @@ async fn stage_and_ingest_refusals_are_loud() {
                 weight: 1.0,
                 k1: 0.0,
                 b: 0.0,
+                phrase: None,
             }],
             facet_fields: Vec::new(),
             score_stages: vec![decay_stage(300.0, 100.0)],
@@ -548,6 +552,7 @@ async fn stage_and_ingest_refusals_are_loud() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         }),
     )
     .await

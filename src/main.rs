@@ -201,6 +201,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 vocab: shard.vocab,
                 vocab_window_docs: cfg.vocab_window_docs,
                 vocab_top_k: cfg.vocab_top_k,
+                position_fields: cfg.position_fields.clone(),
+                bigram_fields: cfg.bigram_fields.clone(),
             };
             let node = if shard.demo.is_some() {
                 NodeServiceImpl::new(load_shard_index(shard, None)?, node_config)

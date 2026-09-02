@@ -50,6 +50,8 @@ async fn add_documents(addr: &str, texts: &[&str]) {
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await
         .unwrap();
@@ -174,6 +176,7 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),
         cardinality_fields: Vec::new(),
+        phrase: None,
     };
 
     let with_claim = client
@@ -347,6 +350,8 @@ async fn fused_repeated_query_reuses_cached_stats() {
                 phrases: Vec::new(),
                 phrase_fingerprint: 0,
                 phrase_field: String::new(),
+                position_fields: Vec::new(),
+                bigram_fields: Vec::new(),
             })
             .await
             .unwrap();
@@ -365,6 +370,7 @@ async fn fused_repeated_query_reuses_cached_stats() {
             weight: 1.0,
             k1: 0.0,
             b: 0.0,
+            phrase: None,
         },
         QueryField {
             field: "case_name".to_string(),
@@ -372,6 +378,7 @@ async fn fused_repeated_query_reuses_cached_stats() {
             weight: 2.0,
             k1: 0.0,
             b: 0.0,
+            phrase: None,
         },
     ];
 

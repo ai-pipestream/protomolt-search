@@ -183,6 +183,7 @@ impl Arm {
                 geo_filters: Vec::new(),
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
+                phrase: None,
             }),
         };
         SearchVariant {
@@ -353,6 +354,7 @@ fn parse_arm(spec: &str) -> Result<Arm, String> {
             weight,
             k1,
             b,
+            phrase: None,
         });
     }
     // The scale identity includes k1/b: the same field at two different

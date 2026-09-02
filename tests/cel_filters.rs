@@ -222,6 +222,8 @@ fn ingest_request(doc: &Doc) -> AddDocumentsRequest {
         phrases: Vec::new(),
         phrase_fingerprint: 0,
         phrase_field: String::new(),
+        position_fields: Vec::new(),
+        bigram_fields: Vec::new(),
     }
 }
 
@@ -861,6 +863,7 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
         deleted: None,
         geo: Default::default(),
         pred: Some(pred.clone()),
+        phrase: Vec::new(),
     };
     let filter_ctx: bm25::FilterCtx = Some((&doc_filter, &cols as &dyn NumericRead));
 

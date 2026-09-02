@@ -108,6 +108,29 @@ const COLUMN_KIND_GEO: u8 = 5;
 const COLUMN_KIND_BINDING: u8 = 6;
 /// The binding record's reserved entry name.
 const BINDING_ENTRY_NAME: &str = "plan-binding";
+/// Kind 7 (`docs/phrase-proximity.md`): one BM25 field's token
+/// positions, the opt-in payload behind exact phrase and proximity
+/// queries. The entry is named `positions:<field>` (the prefix keeps it
+/// out of the column name space, where a facet may legitimately share
+/// the field's name) and carries `u64 section_off | u64 total`, where
+/// `total` is the field's occurrence count. Its section is
+/// `u32 n_terms | (n_terms + 1) x u32 base | total x u32 ordinal`: `base[i]`
+/// is the cumulative occurrence count before directory entry `i`, so a
+/// posting's ordinals sit at `base[i] + occ_start .. base[i] + occ_end`,
+/// parallel to its occurrence-run slice, and a lookup is the same
+/// binary search the occurrence read already does plus one slice.
+/// A file without the entry serves every old query and refuses
+/// phrase/slop on that field by name; a binary predating kind 7 refuses
+/// the file by number, as the kinded table intends.
+const COLUMN_KIND_POSITIONS: u8 = 7;
+/// Name prefix of a kind-7 entry; the remainder is the field name.
+const POSITIONS_ENTRY_PREFIX: &str = "positions:";
+
+/// Byte size of a kind-7 section for `n_terms` terms holding `total`
+/// occurrences.
+fn positions_section_size(n_terms: u64, total: u64) -> u64 {
+    4 + 4 * (n_terms + 1) + 4 * total
+}
 
 /// v8 layout: a v6 or v7 payload, byte-identical, wearing integrity.
 /// The leading magic becomes `TVBM2508`; after the last payload byte
@@ -379,6 +402,10 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:vals"), u64_at(base + 32)));
                     cursor = base + 40;
                 }
+                COLUMN_KIND_POSITIONS => {
+                    starts.push((format!("column:{name}:vals"), u64_at(base)));
+                    cursor = base + 16;
+                }
                 COLUMN_KIND_BINDING => {
                     // Inline payload only: three length-prefixed
                     // strings, no sections to name.
@@ -552,6 +579,22 @@ pub trait Bm25Index {
     fn text(&self, doc_id: u32) -> Option<String>;
     /// The lineage of a document, if ingested with one.
     fn lineage(&self, doc_id: u32) -> Option<DocLineage>;
+    /// Whether this field keeps token positions
+    /// (`docs/phrase-proximity.md`). A phrase or proximity query on a
+    /// field answering false is refused by name; nothing approximates
+    /// it from character offsets.
+    fn has_positions(&self) -> bool {
+        false
+    }
+    /// The token ordinals of `term`'s occurrences in `doc_id`, ascending,
+    /// or `None` when the document has no posting for the term. Only
+    /// meaningful when [`Self::has_positions`] is true; a field without
+    /// positions answers `Some(empty)` for a present posting, so callers
+    /// check the flag first and never read absence as "no positions".
+    fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        let _ = (term, doc_id);
+        None
+    }
 }
 
 /// One posting: a term occurrence set within one document.
@@ -564,11 +607,23 @@ pub struct Posting {
     /// Occurrence spans `(start, end)` in original-text UTF-16 code units.
     /// (half-open). Empty when ingested with SCORING_ONLY term vectors.
     pub offsets: Vec<(u32, u32)>,
+    /// Token ordinal per occurrence, parallel to `offsets`
+    /// (`docs/phrase-proximity.md`). Populated only in a field declared
+    /// positional; every other field stores none, so the payload costs
+    /// nothing where nobody asked for it.
+    pub positions: Vec<u32>,
 }
 
 /// Term data for one document, as produced from the sidecar's term
 /// vectors: `(term, tf, original-text offsets)`.
 pub type DocTerms = Vec<(String, u32, Vec<(u32, u32)>)>;
+
+/// Token ordinals per occurrence, parallel to a [`DocTerms`] table:
+/// `positions[i][j]` is the ordinal of `terms[i].2[j]`. An ordinal counts
+/// every token the tokenizer produced, emitted or not, so ordinal
+/// adjacency is token adjacency — the fact a phrase query needs and a
+/// pair of character spans cannot state.
+pub type DocPositions = Vec<Vec<u32>>;
 
 /// Where a document came from in the source corpus (court pipeline).
 /// Persisted with the doc store; `None` for documents ingested without
@@ -594,6 +649,46 @@ pub struct AnalyzedField {
     pub terms: DocTerms,
     /// Field length in terms.
     pub length: u32,
+    /// Token ordinals parallel to `terms` (see [`DocPositions`]), or
+    /// `None` when the analysis carried no token layer to derive them
+    /// from. A positional field refuses a `None` document by name rather
+    /// than indexing it without positions, because half a column with
+    /// positions is a phrase index that lies about the other half.
+    pub positions: Option<DocPositions>,
+}
+
+impl AnalyzedField {
+    /// Check that `positions`, when present, is shaped exactly like the
+    /// term table: one list per term, one ordinal per occurrence, each
+    /// list strictly ascending (occurrences are in text order, and two
+    /// occurrences cannot share a token).
+    pub fn check_positions(&self) -> Result<(), String> {
+        let Some(positions) = &self.positions else {
+            return Ok(());
+        };
+        if positions.len() != self.terms.len() {
+            return Err(format!(
+                "positions table has {} entries for {} terms",
+                positions.len(),
+                self.terms.len()
+            ));
+        }
+        for ((term, _, offsets), ordinals) in self.terms.iter().zip(positions) {
+            if ordinals.len() != offsets.len() {
+                return Err(format!(
+                    "term {term:?} has {} occurrences but {} positions",
+                    offsets.len(),
+                    ordinals.len()
+                ));
+            }
+            if ordinals.windows(2).any(|pair| pair[1] <= pair[0]) {
+                return Err(format!(
+                    "term {term:?} positions are not strictly ascending"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One analyzed document ready to be indexed: one entry per field,
@@ -660,7 +755,25 @@ impl AnalyzedDoc {
     /// path.
     pub fn body(terms: DocTerms, length: u32) -> Self {
         Self {
-            fields: vec![AnalyzedField { terms, length }],
+            fields: vec![AnalyzedField {
+                terms,
+                length,
+                positions: None,
+            }],
+            quality: None,
+            geography: None,
+            entities: Vec::new(),
+        }
+    }
+
+    /// [`Self::body`] with the token positions the analysis produced.
+    pub fn body_positioned(terms: DocTerms, positions: DocPositions, length: u32) -> Self {
+        Self {
+            fields: vec![AnalyzedField {
+                terms,
+                length,
+                positions: Some(positions),
+            }],
             quality: None,
             geography: None,
             entities: Vec::new(),
@@ -692,6 +805,11 @@ struct FieldStore {
     doc_lengths: Vec<u32>,
     /// Sum of this field's document lengths (for avgdl).
     total_length: u64,
+    /// Whether this field keeps token positions per occurrence
+    /// (`docs/phrase-proximity.md`). Declared at construction (or read
+    /// from the file's kind-7 entry); a positional field refuses a
+    /// document without positions instead of storing a hole.
+    positions: bool,
 }
 
 impl FieldStore {
@@ -702,6 +820,7 @@ impl FieldStore {
             postings: HashMap::new(),
             doc_lengths: Vec::new(),
             total_length: 0,
+            positions: false,
         }
     }
 }
@@ -1358,6 +1477,41 @@ impl Bm25Store {
         }
     }
 
+    /// Declare which fields keep token positions
+    /// (`docs/phrase-proximity.md`). Must precede any document: a field
+    /// that changes its mind mid-corpus would hold a phrase index over
+    /// half its documents. Every name must be in the field table, and a
+    /// positional store persists as v7 (the kind-7 entry lives in the
+    /// column table). Panics on either violation, like the other
+    /// declaration builders.
+    pub fn with_positions(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "positional fields must be declared before documents are added"
+        );
+        for name in names {
+            let fi = self
+                .field_index(name)
+                .unwrap_or_else(|| panic!("positional field {name:?} is not in the field table"));
+            self.fields[fi].positions = true;
+        }
+        self
+    }
+
+    /// Whether field `f` keeps token positions. Panics when out of range.
+    pub fn field_has_positions(&self, f: usize) -> bool {
+        self.fields[f].positions
+    }
+
+    /// Names of the fields that keep token positions, field-id order.
+    pub fn positional_fields(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|f| f.positions)
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+
     /// Declare the facet field table, in facet-id order (builder style:
     /// `Bm25Store::with_fields(&["body"]).with_facets(&["court"])`).
     /// Must be called before any document is added. A store with facet
@@ -1798,11 +1952,39 @@ impl Bm25Store {
             let field = &mut self.fields[fi];
             field.doc_lengths[slot] = analyzed.length;
             field.total_length += u64::from(analyzed.length);
-            for (term, tf, offsets) in analyzed.terms {
+            // A positional field takes the document's ordinals verbatim;
+            // every other field drops them, which is the whole opt-in:
+            // the payload exists only where it was asked for. The shape
+            // check and the refusal of a positionless document into a
+            // positional field happened upstream (the node), so here a
+            // violation is a programming error, not an input error.
+            let positions = if field.positions {
+                Some(analyzed.positions.unwrap_or_else(|| {
+                    panic!(
+                        "field {:?} keeps positions but the document carried none",
+                        field.name
+                    )
+                }))
+            } else {
+                None
+            };
+            for (ti, (term, tf, offsets)) in analyzed.terms.into_iter().enumerate() {
+                let positions = match &positions {
+                    Some(table) => {
+                        assert_eq!(
+                            table[ti].len(),
+                            offsets.len(),
+                            "positions must be parallel to offsets"
+                        );
+                        table[ti].clone()
+                    }
+                    None => Vec::new(),
+                };
                 field.postings.entry(term).or_default().push(Posting {
                     doc_id,
                     tf,
                     offsets,
+                    positions,
                 });
             }
         }
@@ -2076,6 +2258,12 @@ impl Bm25Store {
                 "v5 carries no columns; column-bearing stores write v7",
             ));
         }
+        if self.fields[0].positions {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v5 carries no token positions; positional stores write v7",
+            ));
+        }
         let field = &self.fields[0];
         let n_slots = self.texts.len() as u64;
         let header_size = 8 + 8 + 8 * 4 + 4;
@@ -2149,7 +2337,8 @@ impl Bm25Store {
             || !self.map_numerics.is_empty()
             || !self.integers.is_empty()
             || !self.geos.is_empty()
-            || self.binding.is_some();
+            || self.binding.is_some()
+            || self.fields.iter().any(|f| f.positions);
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -2182,6 +2371,12 @@ impl Bm25Store {
                     .geos
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 5)
+                    .sum::<u64>()
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.positions)
+                    .map(|f| 2 + (POSITIONS_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
         };
@@ -2277,6 +2472,26 @@ impl Bm25Store {
             geo_offs.push(cursor);
             cursor += 16 * n_slots;
         }
+        // (field id, section_off, total occurrences) per positional
+        // field, last in table order: kind 7 appends after every
+        // earlier kind for the same reason kinds 4 and 5 did.
+        let mut positions_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, field) in self.fields.iter().enumerate() {
+            if !field.positions {
+                continue;
+            }
+            let total: u64 = field_terms[fi]
+                .iter()
+                .map(|t| {
+                    field.postings[*t]
+                        .iter()
+                        .map(|p| p.positions.len() as u64)
+                        .sum::<u64>()
+                })
+                .sum();
+            positions_offs.push((fi, cursor, total));
+            cursor += positions_section_size(field_terms[fi].len() as u64, total);
+        }
 
         w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
         write_u32(w, self.fields.len() as u32)?;
@@ -2302,6 +2517,7 @@ impl Bm25Store {
                     + self.map_numerics.len()
                     + self.integers.len()
                     + self.geos.len()
+                    + positions_offs.len()
                     + usize::from(self.binding.is_some())) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
@@ -2364,6 +2580,14 @@ impl Bm25Store {
                 write_u64(w, min_lon.to_bits())?;
                 write_u64(w, max_lon.to_bits())?;
                 write_u64(w, vals_off)?;
+            }
+            for &(fi, off, total) in &positions_offs {
+                let name = format!("{POSITIONS_ENTRY_PREFIX}{}", self.fields[fi].name);
+                write_u16(w, name.len() as u16)?;
+                w.write_all(name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_POSITIONS])?;
+                write_u64(w, off)?;
+                write_u64(w, total)?;
             }
             write_binding_entry(w, self.binding.as_ref())?;
         }
@@ -2438,6 +2662,31 @@ impl Bm25Store {
                 write_u64(w, lon.to_bits())?;
             }
         }
+        for &(fi, _, total) in &positions_offs {
+            let field = &self.fields[fi];
+            let terms = &field_terms[fi];
+            write_u32(w, terms.len() as u32)?;
+            // base[i]: occurrences before directory entry i, in the
+            // directory's (sorted) term order — the order the occurrence
+            // runs were laid out in, so the two stay parallel.
+            let mut base = 0u64;
+            for term in terms.iter() {
+                write_u32(w, u32::try_from(base).expect("positions exceed u32"))?;
+                base += field.postings[*term]
+                    .iter()
+                    .map(|p| p.positions.len() as u64)
+                    .sum::<u64>();
+            }
+            write_u32(w, u32::try_from(base).expect("positions exceed u32"))?;
+            debug_assert_eq!(base, total);
+            for term in terms.iter() {
+                for p in &field.postings[*term] {
+                    for &ordinal in &p.positions {
+                        write_u32(w, ordinal)?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2467,6 +2716,12 @@ impl Bm25Store {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "v4 carries exactly one field",
+            ));
+        }
+        if self.fields[0].positions {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v4 carries no token positions; positional stores write v7",
             ));
         }
         if !self.facets.is_empty() || !self.numerics.is_empty() {
@@ -2564,6 +2819,7 @@ impl Bm25Store {
                 postings,
                 doc_lengths,
                 total_length,
+                positions: false,
             }],
             texts,
             lineages,
@@ -2681,6 +2937,7 @@ impl Bm25Store {
                     doc_id,
                     tf,
                     offsets,
+                    positions: Vec::new(),
                 });
             }
             postings.insert(term, plist);
@@ -3005,6 +3262,16 @@ impl Bm25Index for StoreFieldView<'_> {
     fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
         self.store.lineage(doc_id)
     }
+    fn has_positions(&self) -> bool {
+        self.field.positions
+    }
+    fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        let postings = self.field.postings.get(term)?;
+        postings
+            .binary_search_by_key(&doc_id, |p| p.doc_id)
+            .ok()
+            .map(|i| postings[i].positions.clone())
+    }
 }
 
 /// The store itself scores as its body field (field 0) — the surface
@@ -3037,6 +3304,12 @@ impl Bm25Index for Bm25Store {
     }
     fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
         self.field(0).lineage(doc_id)
+    }
+    fn has_positions(&self) -> bool {
+        self.field(0).has_positions()
+    }
+    fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        self.field(0).posting_positions(term, doc_id)
     }
 }
 
@@ -3113,6 +3386,7 @@ impl Bm25Store {
                     doc_id,
                     tf,
                     offsets,
+                    positions: Vec::new(),
                 });
             }
             postings.insert(term, plist);
@@ -3137,6 +3411,7 @@ impl Bm25Store {
         all: &[u8],
         directory_off: u64,
         run_base: u64,
+        positions_off: Option<u64>,
     ) -> io::Result<HashMap<String, Vec<Posting>>> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let at = |off: u64, len: u64| -> io::Result<&[u8]> {
@@ -3154,6 +3429,19 @@ impl Bm25Store {
         };
         let n_terms = u32_at(directory_off)? as usize;
         let blob_start = directory_off + 4 + 34 * n_terms as u64;
+        // A kind-7 section: its base table starts past the term count,
+        // its ordinals past the base table (see COLUMN_KIND_POSITIONS).
+        let positions = match positions_off {
+            Some(off) => {
+                if u32_at(off)? as usize != n_terms {
+                    return Err(invalid(
+                        "positions section term count differs from directory",
+                    ));
+                }
+                Some((off + 4, off + 4 + 4 * (n_terms as u64 + 1)))
+            }
+            None => None,
+        };
         let mut postings = HashMap::with_capacity(n_terms);
         for i in 0..n_terms {
             let e = directory_off + 4 + 34 * i as u64;
@@ -3166,6 +3454,10 @@ impl Bm25Store {
             ));
             let term = String::from_utf8(at(blob_start + blob_off, term_len)?.to_vec())
                 .map_err(|_| invalid("invalid utf-8 in term"))?;
+            let term_base = match positions {
+                Some((bases, data)) => Some((u64::from(u32_at(bases + 4 * i as u64)?), data)),
+                None => None,
+            };
             let mut plist = Vec::with_capacity(df);
             for j in 0..df {
                 let p = doc_run_off + 12 * j as u64;
@@ -3186,10 +3478,18 @@ impl Bm25Store {
                         u32_at(occ_run_off + 8 * o + 4)?,
                     ));
                 }
+                let mut positions = Vec::new();
+                if let Some((base, data)) = term_base {
+                    positions.reserve((occ_end - occ_start) as usize);
+                    for o in occ_start..occ_end {
+                        positions.push(u32_at(data + 4 * (base + o))?);
+                    }
+                }
                 plist.push(Posting {
                     doc_id,
                     tf,
                     offsets,
+                    positions,
                 });
             }
             postings.insert(term, plist);
@@ -3247,7 +3547,7 @@ impl Bm25Store {
             }
         }
         // postings: locate each term's runs through the directory.
-        let postings = Self::read_v5_shaped_postings(all, directory_off, 0)?;
+        let postings = Self::read_v5_shaped_postings(all, directory_off, 0, None)?;
         Ok(Self::from_single_field(
             postings,
             doc_lengths,
@@ -3314,6 +3614,8 @@ impl Bm25Store {
         let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
         let mut integer_metas: Vec<(String, u64)> = Vec::new();
         let mut geo_metas: Vec<(String, u64)> = Vec::new();
+        // (field name, section_off) per kind-7 entry.
+        let mut positions_metas: Vec<(String, u64)> = Vec::new();
         let mut binding_meta: Option<StoredBinding> = None;
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
@@ -3367,6 +3669,16 @@ impl Bm25Store {
                     COLUMN_KIND_GEO => {
                         geo_metas.push((name, u64_at(base + 32)?));
                         cursor = base + 40;
+                    }
+                    COLUMN_KIND_POSITIONS => {
+                        let field = name
+                            .strip_prefix(POSITIONS_ENTRY_PREFIX)
+                            .ok_or_else(|| {
+                                invalid("kind-7 entry name lacks the positions: prefix")
+                            })?
+                            .to_string();
+                        positions_metas.push((field, u64_at(base)?));
+                        cursor = base + 16;
                     }
                     COLUMN_KIND_BINDING => {
                         let mut vals: Vec<String> = Vec::with_capacity(3);
@@ -3436,13 +3748,20 @@ impl Bm25Store {
             for slot in 0..n_slots as u64 {
                 doc_lengths.push(u32_at(dl_off + 4 * slot)?);
             }
-            let postings = Self::read_v5_shaped_postings(all, d_off, p_off)?;
+            // Validation already tied every kind-7 entry to a field in
+            // the table; an entry naming no field cannot reach here.
+            let positions_off = positions_metas
+                .iter()
+                .find(|(field, _)| *field == name)
+                .map(|(_, off)| *off);
+            let postings = Self::read_v5_shaped_postings(all, d_off, p_off, positions_off)?;
             fields.push(FieldStore {
                 name,
                 analysis_fingerprint: fingerprint,
                 postings,
                 doc_lengths,
                 total_length,
+                positions: positions_off.is_some(),
             });
         }
         // Facet columns (v7 only): dict then per-slot ordinals.
@@ -3605,7 +3924,7 @@ impl Bm25Store {
 /// One field's slice of a [`SpillBuilder`]: its pending postings
 /// buffer, spilled runs, and per-document lengths — the spill-side
 /// mirror of [`FieldStore`].
-type PendingPosting = (String, u32, u32, Vec<(u32, u32)>);
+type PendingPosting = (String, u32, u32, Vec<(u32, u32)>, Vec<u32>);
 type PostingDirectoryEntry = (String, u64, u64, u64, u32);
 
 struct FieldSpill {
@@ -3613,11 +3932,16 @@ struct FieldSpill {
     /// Hash of the field's AnalysisSpec, persisted in the v6 field
     /// table. 0 until the ingest layer wires real fingerprints.
     analysis_fingerprint: u64,
-    /// Pending postings: (term, doc_id, tf, offsets).
+    /// Pending postings: (term, doc_id, tf, offsets, positions).
     buf: Vec<PendingPosting>,
     runs: Vec<PathBuf>,
     doc_lengths: Vec<u32>,
     total_length: u64,
+    /// Whether this field keeps token positions (the spill-side mirror
+    /// of `FieldStore::positions`): runs then carry one ordinal per
+    /// occurrence after the offset pairs, and `finish` writes the
+    /// field's kind-7 section.
+    positions: bool,
 }
 
 impl FieldSpill {
@@ -3629,6 +3953,7 @@ impl FieldSpill {
             runs: Vec::new(),
             doc_lengths: Vec::new(),
             total_length: 0,
+            positions: false,
         }
     }
 }
@@ -3766,6 +4091,31 @@ impl SpillBuilder {
         validate_facet_names(names);
         self.facets = names.iter().map(|n| FacetStore::new(n)).collect();
         self
+    }
+
+    /// Declare which fields keep token positions; same contract as
+    /// [`Bm25Store::with_positions`]. Must be called before any
+    /// document is added; makes `finish` write v7.
+    pub fn with_position_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "positional fields must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no token positions");
+        for name in names {
+            let fi = self
+                .fields
+                .iter()
+                .position(|f| f.name == *name)
+                .unwrap_or_else(|| panic!("positional field {name:?} is not in the field table"));
+            self.fields[fi].positions = true;
+        }
+        self
+    }
+
+    /// Whether field `f` keeps token positions. Panics when out of range.
+    pub fn field_has_positions(&self, f: usize) -> bool {
+        self.fields[f].positions
     }
 
     /// Number of facet fields in the facet table.
@@ -4046,9 +4396,34 @@ impl SpillBuilder {
             lengths[fi] = analyzed.length;
             let field = &mut self.fields[fi];
             field.total_length += u64::from(analyzed.length);
-            for (term, tf, offsets) in analyzed.terms {
-                self.buf_bytes += term.len() + 24 + 16 * offsets.len();
-                field.buf.push((term, doc_id, tf, offsets));
+            // Same opt-in rule as the heap store: a positional field
+            // takes the document's ordinals, every other field drops
+            // them. The node validated the shape and refused a
+            // positionless document into a positional field upstream.
+            let positions = if field.positions {
+                Some(analyzed.positions.unwrap_or_else(|| {
+                    panic!(
+                        "field {:?} keeps positions but the document carried none",
+                        field.name
+                    )
+                }))
+            } else {
+                None
+            };
+            for (ti, (term, tf, offsets)) in analyzed.terms.into_iter().enumerate() {
+                let positions = match &positions {
+                    Some(table) => {
+                        assert_eq!(
+                            table[ti].len(),
+                            offsets.len(),
+                            "positions must be parallel to offsets"
+                        );
+                        table[ti].clone()
+                    }
+                    None => Vec::new(),
+                };
+                self.buf_bytes += term.len() + 24 + 16 * offsets.len() + 4 * positions.len();
+                field.buf.push((term, doc_id, tf, offsets, positions));
             }
         }
         if lengths.iter().any(|&l| l > 0) {
@@ -4087,13 +4462,22 @@ impl SpillBuilder {
                 write_u16(&mut w, term.len() as u16)?;
                 w.write_all(term.as_bytes())?;
                 write_u32(&mut w, (group_end - i) as u32)?;
-                for (_, doc_id, tf, offsets) in &field.buf[i..group_end] {
+                for (_, doc_id, tf, offsets, positions) in &field.buf[i..group_end] {
                     write_u32(&mut w, *doc_id)?;
                     write_u32(&mut w, *tf)?;
                     write_u32(&mut w, offsets.len() as u32)?;
                     for &(start, end) in offsets {
                         write_u32(&mut w, start)?;
                         write_u32(&mut w, end)?;
+                    }
+                    // A positional field's run carries one ordinal per
+                    // occurrence right after the pairs; the run reader
+                    // knows the field's flag and reads them back.
+                    if field.positions {
+                        debug_assert_eq!(positions.len(), offsets.len());
+                        for &ordinal in positions {
+                            write_u32(&mut w, ordinal)?;
+                        }
                     }
                 }
                 i = group_end;
@@ -4149,12 +4533,15 @@ impl SpillBuilder {
         doc_lengths: &[u32],
         body_path: &Path,
         occ_stage_path: &Path,
+        positions: Option<&mut PositionsStage>,
     ) -> io::Result<Vec<PostingDirectoryEntry>> {
         let mut directory: Vec<PostingDirectoryEntry> = Vec::new();
         let mut out = io::BufWriter::new(std::fs::File::create(body_path)?);
         let mut heads: Vec<RunHead> = Vec::new();
+        let positional = positions.is_some();
+        let mut positions = positions;
         for run in runs {
-            if let Some(head) = RunHead::open(run)? {
+            if let Some(head) = RunHead::open(run, positional)? {
                 heads.push(head);
             }
         }
@@ -4174,20 +4561,32 @@ impl SpillBuilder {
             let mut occ_start = 0u32;
             let mut skip_l0: Vec<u8> = Vec::new();
             let mut skip = SkipRunBuilder::new();
+            // The kind-7 base of this term: occurrences merged so far, in
+            // the same (sorted) term order the directory will have.
+            if let Some(stage) = positions.as_deref_mut() {
+                stage
+                    .bases
+                    .push(u32::try_from(stage.total).expect("positions exceed u32"));
+            }
             {
                 let mut occ_stage = io::BufWriter::new(std::fs::File::create(occ_stage_path)?);
                 let mut idx = 0;
                 while idx < heads.len() {
                     if heads[idx].term == term {
                         for _ in 0..heads[idx].n_postings {
-                            let (doc_id, tf, offsets) = heads[idx].next_posting_raw()?;
+                            let (doc_id, tf, offsets, ordinals) = heads[idx].next_posting_raw()?;
                             let dl = doc_lengths[doc_id as usize];
                             write_u32(&mut out, doc_id)?;
                             write_u32(&mut out, tf)?;
                             write_u32(&mut out, occ_start)?;
                             // The run encoding's offset bytes are
-                            // exactly the occurrence-run pairs.
+                            // exactly the occurrence-run pairs, and its
+                            // ordinal bytes exactly the kind-7 entries.
                             occ_stage.write_all(&offsets)?;
+                            if let Some(stage) = positions.as_deref_mut() {
+                                stage.writer.write_all(&ordinals)?;
+                                stage.total += ordinals.len() as u64 / 4;
+                            }
                             skip.push(tf, dl, doc_id, &mut skip_l0)?;
                             occ_start += offsets.len() as u32 / 8;
                             occ_bytes += offsets.len() as u64;
@@ -4233,17 +4632,37 @@ impl SpillBuilder {
             Vec::with_capacity(self.fields.len());
         let mut body_paths: Vec<PathBuf> = Vec::with_capacity(self.fields.len());
         let mut body_lens: Vec<u64> = Vec::with_capacity(self.fields.len());
+        // Per positional field: its kind-7 stage (ordinals streamed to
+        // a file during the merge, bases kept in heap at 4 B per term).
+        let mut position_stages: Vec<Option<PositionsStage>> =
+            Vec::with_capacity(self.fields.len());
         for (fi, field) in self.fields.iter().enumerate() {
             let body_path = self.dir.join(format!("postings-f{fi:03}.body"));
+            let mut stage = if field.positions {
+                let path = self.dir.join(format!("positions-f{fi:03}.stage"));
+                Some(PositionsStage {
+                    writer: io::BufWriter::new(std::fs::File::create(&path)?),
+                    path,
+                    bases: Vec::new(),
+                    total: 0,
+                })
+            } else {
+                None
+            };
             let directory = Self::merge_field_runs(
                 &field.runs,
                 &field.doc_lengths,
                 &body_path,
                 &occ_stage_path,
+                stage.as_mut(),
             )?;
+            if let Some(stage) = stage.as_mut() {
+                stage.writer.flush()?;
+            }
             body_lens.push(std::fs::metadata(&body_path)?.len());
             body_paths.push(body_path);
             directories.push(directory);
+            position_stages.push(stage);
         }
 
         // Section geometry, identical to Bm25Store::write_v6_to.
@@ -4254,7 +4673,8 @@ impl SpillBuilder {
             || !self.map_numerics.is_empty()
             || !self.integers.is_empty()
             || !self.geos.is_empty()
-            || self.binding.is_some();
+            || self.binding.is_some()
+            || self.fields.iter().any(|f| f.positions);
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -4287,6 +4707,12 @@ impl SpillBuilder {
                     .geos
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 5)
+                    .sum::<u64>()
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.positions)
+                    .map(|f| 2 + (POSITIONS_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
         };
@@ -4378,6 +4804,16 @@ impl SpillBuilder {
             geo_offs.push(cursor);
             cursor += 16 * n_slots;
         }
+        // (field id, section_off, total) per positional field, last in
+        // table order — identical geometry to Bm25Store::write_v6_to.
+        let mut positions_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, stage) in position_stages.iter().enumerate() {
+            let Some(stage) = stage else {
+                continue;
+            };
+            positions_offs.push((fi, cursor, stage.total));
+            cursor += positions_section_size(directories[fi].len() as u64, stage.total);
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
@@ -4406,6 +4842,7 @@ impl SpillBuilder {
                         + self.map_numerics.len()
                         + self.integers.len()
                         + self.geos.len()
+                        + positions_offs.len()
                         + usize::from(self.binding.is_some())) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
@@ -4468,6 +4905,14 @@ impl SpillBuilder {
                     write_u64(&mut w, min_lon.to_bits())?;
                     write_u64(&mut w, max_lon.to_bits())?;
                     write_u64(&mut w, vals_off)?;
+                }
+                for &(fi, off, total) in &positions_offs {
+                    let name = format!("{POSITIONS_ENTRY_PREFIX}{}", self.fields[fi].name);
+                    write_u16(&mut w, name.len() as u16)?;
+                    w.write_all(name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_POSITIONS])?;
+                    write_u64(&mut w, off)?;
+                    write_u64(&mut w, total)?;
                 }
                 write_binding_entry(&mut w, self.binding.as_ref())?;
             }
@@ -4594,6 +5039,19 @@ impl SpillBuilder {
                     write_u64(&mut w, lon.to_bits())?;
                 }
             }
+            for &(fi, _, total) in &positions_offs {
+                let stage = position_stages[fi]
+                    .as_ref()
+                    .expect("positional field has a stage");
+                write_u32(&mut w, directories[fi].len() as u32)?;
+                debug_assert_eq!(stage.bases.len(), directories[fi].len());
+                for &base in &stage.bases {
+                    write_u32(&mut w, base)?;
+                }
+                write_u32(&mut w, u32::try_from(total).expect("positions exceed u32"))?;
+                let mut ordinals = std::fs::File::open(&stage.path)?;
+                io::copy(&mut ordinals, &mut w)?;
+            }
             w.flush()?;
         }
         finalize_v8(&tmp)?;
@@ -4606,6 +5064,12 @@ impl SpillBuilder {
     /// Merge the runs and assemble the v4 file at `path` (the pre-v5
     /// behavior, kept for benchmarking and migration checks).
     fn finish_v4(&mut self, path: &Path) -> io::Result<()> {
+        if self.fields[0].positions {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the v4 oracle format cannot carry token positions",
+            ));
+        }
         self.spill_run()?;
         self.texts.flush()?;
 
@@ -4617,7 +5081,7 @@ impl SpillBuilder {
             let mut out = io::BufWriter::new(std::fs::File::create(&postings_body)?);
             let mut heads: Vec<RunHead> = Vec::new();
             for run in &self.fields[0].runs {
-                if let Some(head) = RunHead::open(run)? {
+                if let Some(head) = RunHead::open(run, false)? {
                     heads.push(head);
                 }
             }
@@ -4741,21 +5205,36 @@ impl SpillBuilder {
     }
 }
 
+/// The merge-time stage of one positional field's kind-7 section:
+/// ordinals stream to a file in directory order as the merge emits
+/// occurrences, and the per-term bases accumulate in heap (4 B per
+/// term, never the memory ceiling the spill exists for).
+struct PositionsStage {
+    writer: io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    bases: Vec<u32>,
+    total: u64,
+}
+
 /// One run's read cursor for the merge: the current term group's header
 /// plus a reader positioned at its postings.
 struct RunHead {
     reader: io::BufReader<std::fs::File>,
     term: String,
     n_postings: u32,
+    /// Whether each posting is followed by one ordinal per occurrence
+    /// (a positional field's run encoding).
+    positional: bool,
 }
 
 impl RunHead {
-    fn open(path: &Path) -> io::Result<Option<Self>> {
+    fn open(path: &Path, positional: bool) -> io::Result<Option<Self>> {
         let reader = io::BufReader::new(std::fs::File::open(path)?);
         let mut head = Self {
             reader,
             term: String::new(),
             n_postings: 0,
+            positional,
         };
         Ok(if head.advance()? { Some(head) } else { None })
     }
@@ -4782,6 +5261,12 @@ impl RunHead {
     /// Copy this group's postings to `out` in the final v3 encoding
     /// (which is the run encoding), returning bytes written.
     fn copy_postings<W: Write>(&mut self, out: &mut W) -> io::Result<u64> {
+        if self.positional {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the v4 encoding cannot copy a positional run",
+            ));
+        }
         let mut written = 0u64;
         for _ in 0..self.n_postings {
             let mut fixed = [0u8; 12];
@@ -4797,9 +5282,11 @@ impl RunHead {
     }
 
     /// Read one posting of the current group as `(doc_id, tf, raw offset
-    /// bytes)` — the v5 merge splits the runs, and the run encoding's
-    /// offset bytes are already the v5 occurrence-run pairs.
-    fn next_posting_raw(&mut self) -> io::Result<(u32, u32, Vec<u8>)> {
+    /// bytes, raw ordinal bytes)` — the v5 merge splits the runs, and
+    /// the run encoding's offset bytes are already the v5 occurrence-run
+    /// pairs, its ordinal bytes already the kind-7 entries (empty on a
+    /// field without positions).
+    fn next_posting_raw(&mut self) -> io::Result<(u32, u32, Vec<u8>, Vec<u8>)> {
         let mut fixed = [0u8; 12];
         self.reader.read_exact(&mut fixed)?;
         let doc_id = u32::from_le_bytes(fixed[0..4].try_into().expect("4 bytes"));
@@ -4807,7 +5294,12 @@ impl RunHead {
         let n_offsets = u32::from_le_bytes(fixed[8..12].try_into().expect("4 bytes")) as usize;
         let mut offsets = vec![0u8; 8 * n_offsets];
         self.reader.read_exact(&mut offsets)?;
-        Ok((doc_id, tf, offsets))
+        let mut ordinals = Vec::new();
+        if self.positional {
+            ordinals = vec![0u8; 4 * n_offsets];
+            self.reader.read_exact(&mut ordinals)?;
+        }
+        Ok((doc_id, tf, offsets, ordinals))
     }
 }
 
@@ -5404,6 +5896,8 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let mut integers: Vec<(u64, u64, u64)> = Vec::new();
     // (min_lat, max_lat, min_lon, max_lon bits, vals)
     let mut geos: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
+    // (field name, section_off, total occurrences) per kind-7 entry.
+    let mut positions: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     if v7 {
         let n_columns = u64::from(u32_at(cursor)?);
         if n_columns == 0 {
@@ -5470,6 +5964,34 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     ));
                     cursor = base + 40;
                 }
+                COLUMN_KIND_POSITIONS => {
+                    // The entry names a field of THIS file's table; a
+                    // positions section for a field that does not exist
+                    // is bytes nobody can read, refused here by name.
+                    let name = column_names.last().expect("pushed above");
+                    let field = name
+                        .strip_prefix(POSITIONS_ENTRY_PREFIX.as_bytes())
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "column {i}: kind {COLUMN_KIND_POSITIONS} must be named \
+                                 {POSITIONS_ENTRY_PREFIX}<field>"
+                            ))
+                        })?;
+                    if !names.iter().any(|n| n == field) {
+                        return Err(invalid(format!(
+                            "column {i}: positions for field {:?}, which the field table lacks",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    if positions.iter().any(|(f, _, _)| f == field) {
+                        return Err(invalid(format!(
+                            "column {i}: field {:?} has two positions entries",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    positions.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    cursor = base + 16;
+                }
                 COLUMN_KIND_BINDING => {
                     // The reserved binding record: pinned name, inline
                     // payload, no sections. Duplicates fall to the
@@ -5526,6 +6048,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         .or_else(|| map_numerics.first().map(|c| c.1))
         .or_else(|| integers.first().map(|c| c.2))
         .or_else(|| geos.first().map(|c| c.4))
+        .or_else(|| positions.first().map(|p| p.1))
         .unwrap_or(file_len);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
@@ -5588,6 +6111,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| map_numerics.first().map(|c| c.1))
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
+            .or_else(|| positions.first().map(|p| p.1))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -5624,6 +6148,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| map_numerics.first().map(|c| c.1))
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
+            .or_else(|| positions.first().map(|p| p.1))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -5702,6 +6227,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| map_numerics.first().map(|c| c.1))
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
+            .or_else(|| positions.first().map(|p| p.1))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -5772,6 +6298,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .map(|c| c.1)
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
+            .or_else(|| positions.first().map(|p| p.1))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -5846,6 +6373,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .get(i + 1)
             .map(|c| c.2)
             .or_else(|| geos.first().map(|c| c.4))
+            .or_else(|| positions.first().map(|p| p.1))
             .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
@@ -5892,7 +6420,11 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             )));
         }
         let group_end = vals_off + 16 * n_slots;
-        let expected_end = geos.get(i + 1).map_or(file_len, |c| c.4);
+        let expected_end = geos
+            .get(i + 1)
+            .map(|c| c.4)
+            .or_else(|| positions.first().map(|p| p.1))
+            .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "geo field {i}: vals section does not end at the next section's start"
@@ -5944,6 +6476,56 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         }
         expected_start = group_end;
     }
+    // Positions groups (docs/phrase-proximity.md), last, tiling to EOF.
+    // Structure is checked here: the section belongs to a field, its
+    // term count matches that field's directory, the base table is
+    // monotone from 0 and ends at the declared total, and the section
+    // is exactly the size that geometry implies. The ordinals themselves
+    // are payload (CRC-covered, checked by the deep pass); reading all
+    // of them at open would fault in the whole section, which is the
+    // paging model this file exists to preserve.
+    for (i, (field_name, off, total)) in positions.iter().enumerate() {
+        if *off != expected_start {
+            return Err(invalid(format!(
+                "positions {i}: section does not start at the previous section's end"
+            )));
+        }
+        let fi = names
+            .iter()
+            .position(|n| n == field_name)
+            .expect("kind-7 entries were tied to a field above");
+        let (_, _, _, directory_off) = fields[fi];
+        let n_terms = u64::from(u32_at(directory_off)?);
+        if u64::from(u32_at(*off)?) != n_terms {
+            return Err(invalid(format!(
+                "positions {i}: term count disagrees with field {:?}'s directory",
+                String::from_utf8_lossy(field_name)
+            )));
+        }
+        let mut prev = 0u64;
+        for t in 0..=n_terms {
+            let base = u64::from(u32_at(off + 4 + 4 * t)?);
+            if base < prev {
+                return Err(invalid(format!(
+                    "positions {i}: base table not monotone at term {t}"
+                )));
+            }
+            prev = base;
+        }
+        if prev != *total {
+            return Err(invalid(format!(
+                "positions {i}: base table ends at {prev} but the entry declares {total}"
+            )));
+        }
+        let group_end = off + positions_section_size(n_terms, *total);
+        let expected_end = positions.get(i + 1).map_or(file_len, |p| p.1);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "positions {i}: section does not end at the next section's start"
+            )));
+        }
+        expected_start = group_end;
+    }
     Ok(())
 }
 
@@ -5973,6 +6555,10 @@ struct FieldSlice {
     /// entries), the field's postings section offset for v6
     /// (section-relative entries).
     run_base: u64,
+    /// Start of this field's kind-7 positions section, when the file
+    /// carries one (`docs/phrase-proximity.md`); `None` is a field
+    /// without token positions, which refuses phrase and slop by name.
+    positions_off: Option<u64>,
 }
 
 /// Per-facet read state of one open v7 file: the decoded value
@@ -6125,6 +6711,25 @@ impl Bm25Reader {
     /// is an error naming the section; a pre-v8 file is an error
     /// saying there is nothing to verify, so "unverifiable" can never
     /// be mistaken for "verified".
+    /// The names of the v8 integrity sections, in file order (empty
+    /// for a pre-v8 file, which has no table).
+    pub fn integrity_section_names(&self) -> Vec<String> {
+        self.integrity_sections()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The v8 integrity sections as `(name, byte length)`, in file
+    /// order — the per-section cost accounting a payload's price is
+    /// measured from (empty for a pre-v8 file).
+    pub fn integrity_sections(&self) -> Vec<(String, u64)> {
+        self.integrity
+            .as_ref()
+            .map(|t| t.entries.iter().map(|e| (e.name.clone(), e.len)).collect())
+            .unwrap_or_default()
+    }
+
     pub fn verify_integrity(&self) -> io::Result<(usize, u64)> {
         let Some(table) = &self.integrity else {
             return Err(io::Error::new(
@@ -6603,6 +7208,7 @@ impl Bm25Reader {
                 directory_off,
                 n_terms,
                 run_base: 0,
+                positions_off: None,
             }],
             facets: Vec::new(),
             numerics: Vec::new(),
@@ -6673,6 +7279,7 @@ impl Bm25Reader {
                 directory_off,
                 n_terms,
                 run_base: postings_off,
+                positions_off: None,
             });
             cursor = base + 40;
         }
@@ -6803,6 +7410,19 @@ impl Bm25Reader {
                         });
                         cursor = base + 40;
                     }
+                    COLUMN_KIND_POSITIONS => {
+                        // Validation tied the entry to a field of this
+                        // table and checked the section's geometry.
+                        let field = name
+                            .strip_prefix(POSITIONS_ENTRY_PREFIX)
+                            .expect("validation checked the kind-7 name");
+                        let fi = fields
+                            .iter()
+                            .position(|f| f.name == field)
+                            .expect("validation tied the kind-7 entry to a field");
+                        fields[fi].positions_off = Some(u64_at(base));
+                        cursor = base + 16;
+                    }
                     COLUMN_KIND_BINDING => {
                         let mut vals: Vec<String> = Vec::with_capacity(3);
                         let mut cur = base;
@@ -6912,6 +7532,14 @@ impl Bm25Reader {
     /// `(doc_run_off, skip_run_off, occ_run_off, df)` for `term` in
     /// `field`, or `None` when the term is absent. v5-shaped files only.
     fn directory_lookup_v5(&self, field: &FieldSlice, term: &str) -> Option<(u64, u64, u64, u32)> {
+        let i = self.directory_index_v5(field, term)?;
+        let (_, doc, skip, occ, df) = self.directory_entry_v5(field, i);
+        Some((doc, skip, occ, df))
+    }
+
+    /// The directory entry index of `term` in `field` (v5-shaped files),
+    /// by binary search over the byte-sorted term directory.
+    fn directory_index_v5(&self, field: &FieldSlice, term: &str) -> Option<u32> {
         let (mut lo, mut hi) = (0u32, field.n_terms);
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -6919,13 +7547,30 @@ impl Bm25Reader {
             match bytes.cmp(term.as_bytes()) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    let (_, doc, skip, occ, df) = self.directory_entry_v5(field, mid);
-                    return Some((doc, skip, occ, df));
-                }
+                std::cmp::Ordering::Equal => return Some(mid),
             }
         }
         None
+    }
+
+    /// Index of the posting for `doc_id` in a term's fixed-stride doc
+    /// run (doc ids ascending), or `None` when absent.
+    fn v5_posting_index(&self, doc_run_off: usize, df: u32, doc_id: u32) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, df as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.u32_at(doc_run_off + 12 * mid) < doc_id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo < df as usize && self.u32_at(doc_run_off + 12 * lo) == doc_id).then_some(lo)
+    }
+
+    /// Whether field `f` carries a kind-7 positions section.
+    pub fn field_has_positions(&self, f: usize) -> bool {
+        self.fields[f].positions_off.is_some()
     }
 
     fn u32_at(&self, off: usize) -> u32 {
@@ -7542,6 +8187,34 @@ impl Bm25Index for FieldView<'_> {
     fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
         self.reader.read_lineage(doc_id)
     }
+    fn has_positions(&self) -> bool {
+        self.field.positions_off.is_some()
+    }
+    fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        let r = self.reader;
+        if !r.v5_runs {
+            return None;
+        }
+        let i = r.directory_index_v5(self.field, term)?;
+        let (_, doc_run_off, _, _, df) = r.directory_entry_v5(self.field, i);
+        let doc_run_off = doc_run_off as usize;
+        let j = r.v5_posting_index(doc_run_off, df, doc_id)?;
+        let Some(section) = self.field.positions_off else {
+            return Some(Vec::new());
+        };
+        // base[i] + occ_start .. base[i] + occ_end, past the term count
+        // and the base table (see COLUMN_KIND_POSITIONS).
+        let section = section as usize;
+        let base = r.u32_at(section + 4 + 4 * i as usize) as usize;
+        let data = section + 4 + 4 * (self.field.n_terms as usize + 1);
+        let occ_start = r.u32_at(doc_run_off + 12 * j + 8) as usize;
+        let occ_end = r.v5_occ_start(doc_run_off, df as usize, j + 1) as usize;
+        Some(
+            (occ_start..occ_end)
+                .map(|o| r.u32_at(data + 4 * (base + o)))
+                .collect(),
+        )
+    }
 }
 
 /// The reader itself scores as its body field (field 0) — the surface
@@ -7568,6 +8241,12 @@ impl Bm25Index for Bm25Reader {
     }
     fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
         self.field(0).posting_offsets(term, doc_id)
+    }
+    fn has_positions(&self) -> bool {
+        self.field(0).has_positions()
+    }
+    fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        self.field(0).posting_positions(term, doc_id)
     }
     fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
         self.field(0).impacts_inner(term)
@@ -7882,6 +8561,272 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A two-field corpus where the body keeps token positions and the
+    /// second field does not (`docs/phrase-proximity.md`). Ordinals are
+    /// deliberately NOT derivable from the spans: doc 2 has a gap
+    /// ordinal (a dropped token) between adjacent-looking spans.
+    fn positioned_corpus() -> Vec<(u32, String, AnalyzedDoc)> {
+        let doc = |body: &[(&str, &[u32])], name: &[(&str, u32)]| -> AnalyzedDoc {
+            let terms: DocTerms = body
+                .iter()
+                .map(|(t, ords)| {
+                    (
+                        t.to_string(),
+                        ords.len() as u32,
+                        ords.iter().map(|&o| (o * 5, o * 5 + 4)).collect(),
+                    )
+                })
+                .collect();
+            let positions: DocPositions = body.iter().map(|(_, ords)| ords.to_vec()).collect();
+            let length = terms.iter().map(|(_, tf, _)| *tf).sum();
+            let mut fields = vec![AnalyzedField {
+                terms,
+                length,
+                positions: Some(positions),
+            }];
+            fields.push(AnalyzedField {
+                terms: name
+                    .iter()
+                    .map(|(t, tf)| (t.to_string(), *tf, Vec::new()))
+                    .collect(),
+                length: name.iter().map(|(_, tf)| *tf).sum(),
+                positions: None,
+            });
+            AnalyzedDoc {
+                fields,
+                quality: None,
+                geography: None,
+                entities: Vec::new(),
+            }
+        };
+        vec![
+            (
+                0,
+                "new york city".into(),
+                doc(
+                    &[("new", &[0]), ("york", &[1]), ("citi", &[2])],
+                    &[("smith", 1)],
+                ),
+            ),
+            (
+                1,
+                "york new york".into(),
+                doc(&[("york", &[0, 2]), ("new", &[1])], &[("jones", 1)]),
+            ),
+            (
+                2,
+                "new \u{00AD} york".into(),
+                doc(&[("new", &[0]), ("york", &[2])], &[]),
+            ),
+            // A gap slot (vector-only id 3), then a positional document
+            // past it, so the base table spans a sparse slot.
+            (
+                4,
+                "city new york new york".into(),
+                doc(
+                    &[("citi", &[0]), ("new", &[1, 3]), ("york", &[2, 4])],
+                    &[("smith", 2)],
+                ),
+            ),
+        ]
+    }
+
+    /// Positions round-trip through both writers, the mmap reader, and
+    /// the heap reload, bitwise, and the file is byte-identical between
+    /// writers — the dual-writer contract extended to kind 7.
+    #[test]
+    fn positions_round_trip_through_both_writers_and_both_readers() {
+        let base = std::env::temp_dir().join(format!("positions-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut store = Bm25Store::with_fields(&["body", "name"]).with_positions(&["body"]);
+        let mut builder = SpillBuilder::create_with_fields(&base.join("build"), &["body", "name"])
+            .unwrap()
+            .with_position_fields(&["body"])
+            .with_buffer_bytes(64);
+        for (id, text, doc) in positioned_corpus() {
+            store.add_document(id, text.clone(), doc.clone());
+            builder
+                .add_document_with_lineage(id, text, doc, None)
+                .unwrap();
+        }
+        assert!(store.field_has_positions(0));
+        assert!(!store.field_has_positions(1));
+        assert_eq!(store.positional_fields(), vec!["body"]);
+
+        let store_path = base.join("store.bm25");
+        let spill_path = base.join("spill.bm25");
+        store.save(&store_path).unwrap();
+        builder.finish(&spill_path).unwrap();
+        let a = std::fs::read(&store_path).unwrap();
+        let b = std::fs::read(&spill_path).unwrap();
+        assert!(
+            a == b,
+            "positional spill output is not byte-identical to the store"
+        );
+
+        // Every reader answers the store's ordinals bitwise.
+        let reader = Bm25Reader::open(&spill_path).unwrap();
+        let reloaded = Bm25Store::load(&store_path).unwrap();
+        assert!(reader.field_has_positions(0) && !reader.field_has_positions(1));
+        assert!(reloaded.field_has_positions(0) && !reloaded.field_has_positions(1));
+        assert!(reader.field(0).has_positions() && !reader.field(1).has_positions());
+        for (term, doc_id) in [
+            ("new", 0),
+            ("york", 0),
+            ("citi", 0),
+            ("york", 1),
+            ("new", 1),
+            ("new", 2),
+            ("york", 2),
+            ("new", 4),
+            ("york", 4),
+            ("citi", 4),
+        ] {
+            let want = store.field(0).posting_positions(term, doc_id);
+            assert!(
+                want.as_ref().is_some_and(|p| !p.is_empty()),
+                "{term}@{doc_id}"
+            );
+            assert_eq!(
+                reader.field(0).posting_positions(term, doc_id),
+                want,
+                "reader {term}@{doc_id}"
+            );
+            assert_eq!(
+                reloaded.field(0).posting_positions(term, doc_id),
+                want,
+                "reload {term}@{doc_id}"
+            );
+            // Positions are parallel to the offsets, in the same order.
+            assert_eq!(
+                reader.field(0).posting_offsets(term, doc_id).len(),
+                want.unwrap().len()
+            );
+        }
+        assert_eq!(
+            reader.field(0).posting_positions("new", 4),
+            Some(vec![1, 3])
+        );
+        assert_eq!(
+            reader.field(0).posting_positions("york", 2),
+            Some(vec![2]),
+            "the dropped token keeps its ordinal"
+        );
+        // Absent posting is None; absent term is None; a present posting
+        // of a positionless field is Some(empty).
+        assert_eq!(
+            reader.field(0).posting_positions("new", 3),
+            None,
+            "gap slot"
+        );
+        assert_eq!(reader.field(0).posting_positions("absent", 0), None);
+        assert_eq!(
+            reader.field(1).posting_positions("smith", 0),
+            Some(Vec::new())
+        );
+        assert_eq!(reader.field(1).posting_positions("smith", 1), None);
+        // The section is named in the integrity table like every other.
+        assert!(reader
+            .integrity_section_names()
+            .iter()
+            .any(|n| n == "column:positions:body:vals"));
+
+        // Reloaded store re-saves to the identical bytes: positions
+        // survive the heap round trip exactly.
+        let again = base.join("again.bm25");
+        reloaded.save(&again).unwrap();
+        assert!(std::fs::read(&again).unwrap() == a);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A file written without positions (the entire pre-kind-7 fleet)
+    /// opens, serves its old queries, and simply reports no positions —
+    /// nothing is converted or invented on open.
+    #[test]
+    fn files_without_positions_open_and_report_none() {
+        let base = std::env::temp_dir().join(format!("positions-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut store = Bm25Store::with_fields(&["body", "name"]);
+        for (id, text, mut doc) in positioned_corpus() {
+            // The analysis carried positions, but the field never asked.
+            doc.fields[0].positions = None;
+            store.add_document(id, text, doc);
+        }
+        let path = base.join("old.bm25");
+        store.save(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+        assert!(!reader.field_has_positions(0));
+        assert!(!reader.field(0).has_positions());
+        assert_eq!(
+            reader.field(0).posting_positions("new", 0),
+            Some(Vec::new())
+        );
+        assert_eq!(reader.field(0).df("new"), 4);
+        assert!(!reader
+            .integrity_section_names()
+            .iter()
+            .any(|n| n.starts_with("column:positions:")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The open-time validator refuses a positions section whose base
+    /// table lies, and a kind-7 entry naming a field the table lacks.
+    #[test]
+    fn positions_validation_refuses_a_lying_base_table_and_an_orphan_entry() {
+        let base = std::env::temp_dir().join(format!("positions-val-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut store = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
+        for (id, text, mut doc) in positioned_corpus() {
+            doc.fields.truncate(1);
+            store.add_document(id, text, doc);
+        }
+        // Write the raw v7 payload (no integrity envelope) so the doctored
+        // bytes reach the structural validator rather than the CRC check.
+        let mut bytes = Vec::new();
+        store.write_v6_to(&mut bytes).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V7);
+        let good = base.join("good.bm25");
+        std::fs::write(&good, &bytes).unwrap();
+        Bm25Reader::open(&good).unwrap();
+
+        // Locate the kind-7 section through the header walk and break
+        // its base table's monotonicity.
+        let starts = v6v7_section_starts(&bytes, true).unwrap();
+        let (_, off) = starts
+            .iter()
+            .find(|(name, _)| name == "column:positions:body:vals")
+            .expect("the positions section is named")
+            .clone();
+        let mut broken = bytes.clone();
+        let second_base = off as usize + 4 + 4;
+        broken[second_base..second_base + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bad = base.join("bad.bm25");
+        std::fs::write(&bad, &broken).unwrap();
+        let error = Bm25Reader::open(&bad).err().expect("refused").to_string();
+        assert!(error.contains("base table"), "{error}");
+
+        // Rename the entry's field to one the table lacks.
+        let name_at = bytes
+            .windows(b"positions:body".len())
+            .position(|w| w == b"positions:body")
+            .expect("entry name in header");
+        let mut orphan = bytes.clone();
+        orphan[name_at + "positions:".len()..name_at + "positions:".len() + 4]
+            .copy_from_slice(b"nope");
+        let orphan_path = base.join("orphan.bm25");
+        std::fs::write(&orphan_path, &orphan).unwrap();
+        let error = Bm25Reader::open(&orphan_path)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains("field table lacks"), "{error}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Same byte-identity contract on the legacy v4 path (bench/migration
     /// writer): the store and the spill builder must agree there too.
     #[test]
@@ -7950,7 +8895,8 @@ mod tests {
             Posting {
                 doc_id: 0,
                 tf: 2,
-                offsets: vec![(0, 4), (10, 14)]
+                offsets: vec![(0, 4), (10, 14)],
+                positions: Vec::new(),
             }
         );
         assert_eq!(store.postings("vector").unwrap()[0].tf, 2);
@@ -8758,6 +9704,7 @@ mod tests {
             let mut fields = vec![AnalyzedField {
                 terms: body,
                 length: body_len,
+                positions: None,
             }];
             if i % 3 != 2 {
                 // "smith" and "court" appear in BOTH fields, with
@@ -8769,6 +9716,7 @@ mod tests {
                         (format!("n{}", i % 4), 1, Vec::new()),
                     ],
                     length: 3,
+                    positions: None,
                 });
             }
             let lineage = (i % 4 == 0).then_some(DocLineage {

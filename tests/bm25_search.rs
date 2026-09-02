@@ -54,6 +54,8 @@ async fn add_documents(
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await
         .unwrap();
@@ -150,6 +152,7 @@ async fn ingest_through_mock_builds_postings() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })
         .await
         .unwrap()
@@ -310,6 +313,7 @@ async fn bm25_query_min_score_seeds_floor() {
                 geo_filters: Vec::new(),
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
+                phrase: None,
             })
             .await
             .unwrap()
@@ -401,6 +405,7 @@ async fn bm25_query_min_score_seeds_floor() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })
         .await
         .unwrap()
@@ -432,6 +437,7 @@ async fn bm25_query_min_score_seeds_floor() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })
         .await
         .unwrap()
@@ -463,6 +469,7 @@ async fn bm25_query_min_score_seeds_floor() {
                 geo_filters: Vec::new(),
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
+                phrase: None,
             })
             .await
             .expect_err("non-finite min_score must be rejected");
@@ -491,6 +498,7 @@ async fn bm25_query_min_score_seeds_floor() {
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         })
         .await
         .unwrap()
@@ -700,6 +708,7 @@ async fn bm25_stream_candidates_end_in_a_scoring_certificate() {
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),
         cardinality_fields: Vec::new(),
+        phrase: None,
     };
     let unary = client
         .bm25_query(request.clone())
@@ -866,6 +875,7 @@ async fn shard_local_stats_would_differ() {
                 geo_filters: Vec::new(),
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
+                phrase: None,
             })
             .await
             .unwrap()

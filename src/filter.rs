@@ -491,20 +491,51 @@ impl ResolvedFilter {
 /// filterless query takes a path bit-identical to the unfiltered
 /// scorers.
 #[derive(Debug, Clone, Default)]
-pub struct DocFilter {
+pub struct DocFilter<'a> {
     /// Generation tombstones. A set bit is rejected before any column work.
     pub deleted: Option<std::sync::Arc<Vec<u64>>>,
     /// The `geo_filters` field, resolved (`docs/geo-columns.md`).
     pub geo: crate::geo::GeoFilters,
     /// The `filter` tree, resolved; `None` when the request sent none.
     pub pred: Option<ResolvedFilter>,
+    /// Ordered-window phrase constraints (`docs/phrase-proximity.md`),
+    /// one per constrained field, all of which must hold. Evaluated
+    /// last: the cheaper predicates above reject most documents before
+    /// a positions read is paid. Empty when the request carried none.
+    pub phrase: Vec<PhraseGate<'a>>,
 }
 
-impl DocFilter {
-    /// Whether both filter families pass. The tree passes only on
+/// One field's phrase constraint, resolved for one shard: the field's
+/// index view (which must carry positions — the node refused the leg
+/// otherwise), the leg's terms, and the query's term sequence with its
+/// slop. A document passes when [`crate::proximity::phrase_matches`]
+/// finds the window; the gate only ever REMOVES documents, so every
+/// block-max bound over the survivors stays a bound.
+#[derive(Clone)]
+pub struct PhraseGate<'a> {
+    pub index: &'a dyn crate::postings::Bm25Index,
+    pub terms: &'a [String],
+    pub sequence: Vec<usize>,
+    pub slop: u32,
+}
+
+impl std::fmt::Debug for PhraseGate<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhraseGate")
+            .field("terms", &self.terms)
+            .field("sequence", &self.sequence)
+            .field("slop", &self.slop)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DocFilter<'_> {
+    /// Whether every filter family passes. The tree passes only on
     /// [`Tri::True`] — Unknown is a document the filter cannot vouch
     /// for, and admitting it would make absence a way to sneak past a
-    /// predicate.
+    /// predicate. Phrase gates are checked last, after the column
+    /// predicates have had their chance to reject without a positions
+    /// read.
     pub fn passes(&self, doc_id: u32, cols: &dyn NumericRead) -> bool {
         !self.deleted.as_ref().is_some_and(|words| {
             words
@@ -515,6 +546,15 @@ impl DocFilter {
                 .pred
                 .as_ref()
                 .is_none_or(|p| p.eval(doc_id, cols) == Tri::True)
+            && self.phrase.iter().all(|gate| {
+                crate::proximity::phrase_matches(
+                    gate.index,
+                    gate.terms,
+                    &gate.sequence,
+                    gate.slop,
+                    doc_id,
+                )
+            })
     }
 }
 
@@ -1023,6 +1063,7 @@ mod tests {
                 deleted: None,
                 geo: crate::geo::GeoFilters::default(),
                 pred: Some(pred),
+                phrase: Vec::new(),
             }
             .passes(doc, &cols)
         };

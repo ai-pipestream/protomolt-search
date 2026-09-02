@@ -71,6 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await?;
     }
@@ -126,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 geo_filters: Vec::new(),
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
+                phrase: None,
             })
             .await?
             .into_inner();

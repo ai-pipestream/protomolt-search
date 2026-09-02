@@ -114,6 +114,15 @@ fn plan_boolean_selection<'a>(
                                 search.id
                             )));
                         }
+                        if query.phrase.is_some() {
+                            return Err(refuse(format!(
+                                "lexical clause {:?}: a phrase constraint is not served inside \
+                                 BooleanQuery yet (membership there is resolved from term \
+                                 bitmaps, which carry no positions); use a single lexical leaf \
+                                 selection for a phrase",
+                                search.id
+                            )));
+                        }
                         let membership = coordinator
                             .lexical_membership(&query.text, query.analysis.as_ref())
                             .await?;
@@ -441,9 +450,13 @@ fn parse_boolean_boosts<'a>(
             .ok_or_else(|| refuse("boost has no query"))?;
         let kind = match query.query.as_ref() {
             Some(search_query::Query::Lexical(lexical)) => {
-                if lexical.text.is_empty() || !lexical.score_stages.is_empty() {
+                if lexical.text.is_empty()
+                    || !lexical.score_stages.is_empty()
+                    || lexical.phrase.is_some()
+                {
                     return Err(refuse(
-                        "a boolean lexical boost needs text and does not carry score_stages",
+                        "a boolean lexical boost needs text and carries neither score_stages \
+                         nor a phrase constraint",
                     ));
                 }
                 BoostKind::Lexical {
@@ -1095,6 +1108,7 @@ pub async fn execute(
                     k: fetch_k,
                     analysis: query.analysis.clone(),
                     score_stages: query.score_stages.clone(),
+                    phrase: query.phrase.clone(),
                     geo_filters: plan.geo_filters.clone(),
                     filter,
                     projections: req.projections.clone(),
@@ -1654,6 +1668,13 @@ fn composite_shape(composite: &crate::pb::CompositeSearchStrategy) -> Result<Sha
                     }
                 }
                 Some(search_query::Query::Lexical(q)) => {
+                    if q.phrase.is_some() {
+                        return Err(refuse(
+                            "a phrase constraint on a composite's lexical leaf is not served: \
+                             the hybrid legs carry no phrase gate yet. Use a \
+                             single-lexical-leaf selection for a phrase",
+                        ));
+                    }
                     if !q.score_stages.is_empty() {
                         return Err(refuse(
                             "score_stages on a composite's lexical leaf are not served: \
@@ -1883,6 +1904,12 @@ fn parse_boosts<'a>(
         }
         let kind = match query.query.as_ref() {
             Some(search_query::Query::Lexical(lexical)) => {
+                if lexical.phrase.is_some() {
+                    return Err(refuse(
+                        "a phrase constraint on a boost query is not served; a boost scores \
+                         a fixed candidate set, and the phrase gate belongs to selection",
+                    ));
+                }
                 if !lexical.score_stages.is_empty() {
                     return Err(refuse(
                         "score_stages on a boost query are not served; stages ride the \

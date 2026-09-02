@@ -111,6 +111,8 @@ async fn start_fixture() -> Fixture {
                     phrases: Vec::new(),
                     phrase_fingerprint: 0,
                     phrase_field: String::new(),
+                    position_fields: Vec::new(),
+                    bigram_fields: Vec::new(),
                 })
                 .await
                 .unwrap();

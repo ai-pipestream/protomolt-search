@@ -102,6 +102,8 @@ async fn add_documents_geo(
             phrases: Vec::new(),
             phrase_fingerprint: 0,
             phrase_field: String::new(),
+            position_fields: Vec::new(),
+            bigram_fields: Vec::new(),
         })
         .await
         .unwrap();
@@ -829,6 +831,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
         weight: 1.0,
         k1: 0.0,
         b: 0.0,
+        phrase: None,
     }];
     let (hits, _, _) = coordinator
         .fanout_bm25_fused_faceted(
@@ -864,6 +867,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
             geo_filters: vec![bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
+            phrase: None,
         }),
     )
     .await
@@ -1019,6 +1023,7 @@ async fn geo_filter_refusals_are_loud() {
         weight: 1.0,
         k1: 0.0,
         b: 0.0,
+        phrase: None,
     }];
     let err = coordinator
         .fanout_bm25_fused_faceted("", 10, &fields, 0.0, &[], &[], &[], bad_one, None)
@@ -1239,6 +1244,7 @@ fn geo_filtered_decayed_pruned_matches_exhaustive_bitwise() {
                     }],
                 },
                 pred: None,
+                phrase: Vec::new(),
             };
             let filter_ctx = Some((&filters, &cols as &dyn NumericRead));
             for k in [1usize, 5, 50] {
@@ -1594,6 +1600,7 @@ fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
                 }],
             },
             pred: None,
+            phrase: Vec::new(),
         };
         let filter_ctx = Some((&filters, &cols as &dyn NumericRead));
         for k in [1usize, 5, 50] {

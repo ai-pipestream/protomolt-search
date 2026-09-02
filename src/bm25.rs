@@ -34,7 +34,7 @@ pub type ChainCtx<'a> = Option<(
 /// SURVIVOR, which rises no faster than the unfiltered one, so the
 /// floor stays conservative.
 pub type FilterCtx<'a> = Option<(
-    &'a crate::filter::DocFilter,
+    &'a crate::filter::DocFilter<'a>,
     &'a dyn crate::scorefn::NumericRead,
 )>;
 
@@ -445,6 +445,7 @@ pub fn top_k_exhaustive_chained_filtered(
                 doc_id,
                 tf,
                 offsets: offsets.to_vec(),
+                positions: Vec::new(),
             };
             let contribution = score_posting(params, stats, ti, &posting, doc_len);
             let entry = scores.entry(doc_id).or_default();
@@ -1984,10 +1985,12 @@ mod tests {
                             ("search".into(), 1, vec![]),
                         ],
                         length: 3,
+                        positions: None,
                     },
                     AnalyzedField {
                         terms: vec![("smith".into(), 1, vec![(0, 5)])],
                         length: 1,
+                        positions: None,
                     },
                 ],
                 quality: None,
@@ -2013,6 +2016,7 @@ mod tests {
                     AnalyzedField {
                         terms: vec![("search".into(), 1, vec![])],
                         length: 1,
+                        positions: None,
                     },
                     AnalyzedField {
                         terms: vec![
@@ -2020,6 +2024,7 @@ mod tests {
                             ("smith".into(), 1, vec![]),
                         ],
                         length: 2,
+                        positions: None,
                     },
                 ],
                 quality: None,
@@ -2114,6 +2119,7 @@ mod tests {
             let mut fields = vec![AnalyzedField {
                 terms: body,
                 length: body_len,
+                positions: None,
             }];
             if g % 3 != 1 {
                 fields.push(AnalyzedField {
@@ -2122,6 +2128,7 @@ mod tests {
                         (format!("n{}", g % 2), 1, vec![]),
                     ],
                     length: 2,
+                    positions: None,
                 });
             }
             AnalyzedDoc {
@@ -2239,6 +2246,7 @@ mod tests {
                             ("city".into(), 1, vec![(9, 13)]),
                         ],
                         length: 3,
+                        positions: None,
                     },
                     AnalyzedField {
                         terms: vec![
@@ -2246,6 +2254,7 @@ mod tests {
                             ("$phrase:new-york".into(), 1, vec![(0, 8)]),
                         ],
                         length: 2,
+                        positions: None,
                     },
                 ],
                 quality: None,

@@ -1554,6 +1554,18 @@ message AddDocumentsRequest {
   // Phrase field identity persists even when this document has no glossary
   // matches, allowing WAL resharding to reconstruct an empty phrase column.
   string phrase_field = 17;
+  // The proximity record (docs/phrase-proximity.md): which BM25 fields
+  // keep token positions for this document. Fresh client ingest leaves
+  // it empty and the node fills it from its configuration before the
+  // WAL append; a replayed record must name the same fields the node is
+  // configured with, or it is refused by name. Ordinals themselves are
+  // not stored here: replay re-analyzes under the fingerprinted spec
+  // and the same tokenizer numbers the same tokens.
+  repeated string position_fields = 18;
+  // Which bigram columns derive from which source fields. Same fill and
+  // agreement rules as `position_fields`; resharding rebuilds the derived
+  // field table from this record.
+  repeated BigramField bigram_fields = 19;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share
@@ -1691,6 +1703,11 @@ message FieldStats {
   // refuses a field NO shard knows, and tolerates one that only some
   // know (a genuinely heterogeneous fleet).
   bool known = 3;
+  // Whether this shard's field carries token positions
+  // (docs/phrase-proximity.md). The coordinator serves a positional
+  // phrase on a field only when EVERY shard answers true; a mixed fleet
+  // refuses rather than matching the phrase on half the corpus.
+  bool positions = 4;
 }
 
 // This shard's share of the global BM25 corpus stats.
@@ -1836,6 +1853,9 @@ message Bm25QueryRequest {
   // projection_leaves_known so the coordinator can refuse a column no
   // shard knows.
   repeated CompiledProjection projections = 19;
+  // Positional phrase constraint over `terms` on the flat body route;
+  // same contract as Bm25FieldLeg.phrase.
+  PhraseLeg phrase = 20;
 }
 
 // Internal exact phrase scoring request. `phrase_leg` indexes `query.fields`.
@@ -2235,6 +2255,23 @@ message Bm25FieldLeg {
   // check; a shard whose column predates fingerprints is 0 on its side
   // and also does not enforce.
   uint64 analysis_fingerprint = 8;
+  // Positional phrase constraint over `terms` (docs/phrase-proximity.md),
+  // applied by the shard at the heap gate: a document enters the heap
+  // only when it holds the window. Absent on an ordinary leg and on a
+  // leg the coordinator already rewrote onto a bigram column. A shard
+  // whose field has no token positions REFUSES the leg
+  // (FAILED_PRECONDITION) rather than scoring the terms unconstrained.
+  PhraseLeg phrase = 9;
+}
+
+// The shard-side form of PhraseMatch: the query's term SEQUENCE (with
+// repeats, in token order) as indexes into the leg's deduplicated
+// `terms`, plus the slop.
+message PhraseLeg {
+  // Indexes into the leg's `terms`, one per query token, in order.
+  repeated uint32 sequence = 1;
+  // See PhraseMatch.slop.
+  uint32 slop = 2;
 }
 
 // A half-open span [start, end) in original-text UTF-16 code units. Search
@@ -2564,6 +2601,62 @@ message Bm25SearchRequest {
   // A projection never selects and never scores: it annotates. Flat
   // (non-fused) route only, like stats_fields.
   repeated NamedProjection projections = 14;
+  // Ordered-window constraint over `text`'s analyzed terms on the body
+  // (docs/phrase-proximity.md). Flat route only; on the fused route
+  // each QueryField carries its own. See PhraseMatch for what a field
+  // must have declared to serve it, and Bm25SearchResponse.phrase_routing
+  // for what served it.
+  PhraseMatch phrase = 15;
+}
+
+// An ordered-window constraint over a lexical query's analyzed terms
+// (docs/phrase-proximity.md): the terms must occur in the field in query
+// order, and the window they occupy may contain at most `slop` token
+// positions beyond the phrase's own length. `slop = 0` is an exact
+// phrase. Positions are token ORDINALS from the ingest analysis, never
+// character offsets, so a dropped token between two terms counts as a
+// gap exactly as a visible one does.
+//
+// A field serves this only through a payload it declared at ingest: a
+// two-term exact phrase can ride the field's bigram column (one term
+// lookup); anything else needs the field's token positions. A field
+// with neither is refused BY NAME (INVALID_ARGUMENT) naming what it
+// lacks — the engine never narrows a phrase to "all terms present" or
+// guesses adjacency from spans. A single-term phrase is the ordinary term
+// query. The constraint only REMOVES documents, so block-max pruning
+// and facet counts stay exact; the score is the ordinary BM25 of what
+// matched (the bigram term on the bigram route, the constituent terms
+// otherwise), reported per field in the hit's occurrences.
+message PhraseMatch {
+  // Maximum number of extra token positions the ordered window may span.
+  uint32 slop = 1;
+}
+
+// Which payload served one field's PhraseMatch, reported on the
+// response so a caller can tell a bigram-column answer from a
+// positional one without inferring it from field names.
+message PhraseRouting {
+  // The field the request named.
+  string field = 1;
+  // The field actually scored: the bigram column, or `field` itself
+  // when its token positions served the window.
+  string served_field = 2;
+  // True when the bigram column served it; false for token positions.
+  bool bigram_column = 3;
+  // The slop the window was checked at (0 on the bigram route).
+  uint32 slop = 4;
+}
+
+// One derived bigram column, as recorded on a document's durable ingest
+// record (AddDocumentsRequest.bigram_fields): `field` is derived from
+// `source`'s adjacent token pairs. Replay and resharding rebuild the
+// column from this record and the re-analysis; they never guess which
+// field a column came from.
+message BigramField {
+  // The analyzed source field ("body" for the body).
+  string source = 1;
+  // The derived BM25 field holding the pairs (`<source>.bigrams`).
+  string field = 2;
 }
 
 // Client-facing phrase-aware request. `base` supplies all ordinary BM25
@@ -2599,6 +2692,11 @@ message QueryField {
   // This field's BM25 b; 0 selects the coordinator's configured
   // default.
   float b = 5;
+  // Ordered-window constraint over this field's analyzed query terms
+  // (docs/phrase-proximity.md). The coordinator routes it to the
+  // field's bigram column or token positions and refuses by name when
+  // the fleet declared neither for this field.
+  PhraseMatch phrase = 6;
 }
 
 // Client-facing distributed BM25 response.
@@ -2634,6 +2732,10 @@ message Bm25SearchResponse {
   // (values unioned across shards). The per-shard value lists are not
   // echoed.
   repeated FacetCardinality cardinality = 6;
+  // One entry per field the request constrained with a PhraseMatch,
+  // saying which payload served it (docs/phrase-proximity.md). Empty
+  // when the request carried no phrase.
+  repeated PhraseRouting phrase_routing = 7;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.
@@ -3609,6 +3711,10 @@ message LexicalQuery {
   // candidate-scoped lexical leaves in recursive BooleanQuery. Legacy
   // CompositeSearchStrategy still refuses stages on hybrid legs.
   repeated ScoreStage score_stages = 3;
+  // Ordered-window constraint over the analyzed terms
+  // (docs/phrase-proximity.md); served on the single lexical leaf through
+  // Bm25Search's phrase route, refused by name elsewhere until certified.
+  PhraseMatch phrase = 4;
 }
 
 // Dense vector relevance (the Search leg).

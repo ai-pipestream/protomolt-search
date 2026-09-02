@@ -1096,6 +1096,8 @@ mod tests {
                 }],
                 phrase_fingerprint: 0x1234_5678,
                 phrase_field: "phrases".to_string(),
+                position_fields: Vec::new(),
+                bigram_fields: Vec::new(),
             }],
             stable_routing_keys: Vec::new(),
         })

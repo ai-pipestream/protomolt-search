@@ -30,6 +30,9 @@ use std::sync::Mutex;
 struct FieldShare {
     total_len: u64,
     known: bool,
+    /// Whether the node's field carries token positions
+    /// (docs/phrase-proximity.md); a store property like `known`.
+    positions: bool,
     dfs: HashMap<String, u32>,
 }
 
@@ -64,6 +67,8 @@ pub struct BodyShare {
 pub struct FusedFieldShare {
     pub total_doc_length: u64,
     pub known: bool,
+    /// Whether the field carries token positions on this node.
+    pub positions: bool,
     /// Per requested term, in request order.
     pub dfs: Vec<u32>,
 }
@@ -139,6 +144,7 @@ impl StatsCache {
             out.push(FusedFieldShare {
                 total_doc_length: fs.total_len,
                 known: fs.known,
+                positions: fs.positions,
                 dfs,
             });
         }
@@ -189,6 +195,7 @@ impl StatsCache {
             let entry = share.fields.entry(ft.field.clone()).or_default();
             entry.total_len = fs.total_doc_length;
             entry.known = fs.known;
+            entry.positions = fs.positions;
             if entry.dfs.len() + ft.terms.len() > MAX_TERMS_PER_CHANNEL {
                 entry.dfs.clear();
             }

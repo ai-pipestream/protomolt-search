@@ -226,6 +226,9 @@ pub fn analyzed_field(postings: &[PhrasePosting]) -> crate::postings::AnalyzedFi
             .iter()
             .map(|posting| posting.offsets.len() as u32)
             .sum(),
+        // Concept postings are glossary matches over the raw text, not
+        // tokens of the body analysis, so they have no token ordinals.
+        positions: None,
     }
 }
 

@@ -353,6 +353,17 @@ phrase signal per document, so nested concepts do not stack. See
 configuration, scoring, mobile use, WAL durability, and the required reindex
 boundary.
 
+Phrase and proximity queries (`PhraseMatch` on `Bm25Search` and on the
+single lexical leaf of `Query`) are served by two opt-in per-field
+payloads: a derived bigram column (`--bigram-fields=body`) answers
+two-term exact phrases as one term, and token positions
+(`--position-fields=body`) answer longer phrases and slop exactly at the
+shared heap gate. Positions are token ordinals from the ingest analysis,
+never character offsets, and a field that declared neither refuses the
+query by name. See [`docs/phrase-proximity.md`](docs/phrase-proximity.md)
+for the format, the routing table, the measured cost, and the reindex
+boundary.
+
 Select native analysis with `--analysis-addr=native` or
 `analysis_addr = "native"`. A single-shard `both` process propagates that
 setting to its shard. Multi-shard node configurations set `analysis_addr` on

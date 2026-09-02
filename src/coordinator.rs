@@ -1480,6 +1480,9 @@ struct FusedGlobals {
     epochs: Vec<u64>,
     /// Number of primary shards whose field table contains each field.
     known_shards: Vec<usize>,
+    /// Number of primary shards whose field carries token positions
+    /// (docs/phrase-proximity.md); a positional phrase needs every one.
+    positions_shards: Vec<usize>,
 }
 
 impl CoordinatorServiceImpl {
@@ -2585,6 +2588,7 @@ impl CoordinatorServiceImpl {
                 filter: filter.cloned(),
                 stats_fields: stats_fields.to_vec(),
                 cardinality_fields: cardinality_fields.to_vec(),
+                phrase: None,
             };
             let mut client = self.node_client(node)?;
             if let Some((floor_tx, floor_rx)) = relay.clone() {
@@ -2905,6 +2909,45 @@ impl CoordinatorServiceImpl {
         geo_filters: &[crate::pb::GeoFilter],
         filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
+        self.fanout_bm25_fused_routed(
+            text,
+            k,
+            fields,
+            min_score,
+            facet_fields,
+            map_facet_fields,
+            range_facet_fields,
+            geo_filters,
+            filter,
+        )
+        .await
+        .map(|(hits, _)| hits)
+    }
+
+    /// [`Self::fanout_bm25_fused_faceted`] that also reports which
+    /// payload served each field's PhraseMatch (docs/phrase-proximity.md).
+    ///
+    /// A field with a phrase is analyzed like any other, and its query's
+    /// TOKEN ORDER is read off the positioned analysis. The fleet's
+    /// capabilities then pick the route from the stats round: a two-term
+    /// exact phrase whose bigram column every shard indexes becomes one
+    /// term of that column; anything else rides the field's token
+    /// positions as a shard-side gate, and only when every shard carries
+    /// them. Neither being true refuses by name — the query is never
+    /// narrowed to "all terms present" and adjacency is never guessed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fanout_bm25_fused_routed(
+        &self,
+        text: &str,
+        k: u32,
+        fields: &[crate::pb::QueryField],
+        min_score: f32,
+        facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
+        range_facet_fields: &[crate::pb::RangeFacetField],
+        geo_filters: &[crate::pb::GeoFilter],
+        filter: Option<&crate::pb::FilterExpr>,
+    ) -> Result<(FacetedHits, Vec<crate::pb::PhraseRouting>), Status> {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
         crate::node::validate_range_facet_fields(range_facet_fields)?;
@@ -2941,27 +2984,70 @@ impl CoordinatorServiceImpl {
             }
             seen.push(&f.field);
         }
-        // (a) Query analysis per field, each under its own spec.
+        // (a) Query analysis per field, each under its own spec. A
+        // field with a phrase also needs the query's token ORDER, which
+        // the positioned analysis carries (docs/phrase-proximity.md).
         let mut field_terms: Vec<Vec<String>> = Vec::with_capacity(fields.len());
+        // Per field: the phrase's term sequence (indexes into that
+        // field's terms) and slop, when the field carries a PhraseMatch.
+        let mut phrase_requests: Vec<Option<(Vec<usize>, u32)>> = Vec::with_capacity(fields.len());
         for f in fields {
-            let analyzed =
-                crate::analyzer::analyze_document(&addr, text, f.analysis.as_ref()).await?;
+            let analyzed = crate::analyzer::analyze_document(&addr, text, f.analysis.as_ref())
+                .await?
+                .into_body();
+            // The analysis already lists each distinct term once, in
+            // first-occurrence order; `remap` keeps the sequence honest
+            // should a provider ever repeat one.
             let mut terms: Vec<String> = Vec::new();
-            for (term, _, _) in analyzed.into_body().terms {
-                if !terms.contains(&term) {
-                    terms.push(term);
-                }
+            let mut remap: Vec<usize> = Vec::with_capacity(analyzed.terms.len());
+            for (term, _, _) in &analyzed.terms {
+                let at = match terms.iter().position(|t| t == term) {
+                    Some(i) => i,
+                    None => {
+                        terms.push(term.clone());
+                        terms.len() - 1
+                    }
+                };
+                remap.push(at);
             }
+            let phrase = match f.phrase.as_ref() {
+                Some(m) => {
+                    if terms.is_empty() {
+                        return Err(Status::invalid_argument(format!(
+                            "field {:?}: the phrase text analyzed to no terms; there is no \
+                             window to match",
+                            f.field
+                        )));
+                    }
+                    let Some(positions) = analyzed.positions.as_ref() else {
+                        return Err(Status::failed_precondition(format!(
+                            "field {:?}: the query analysis carried no token positions, so the \
+                             phrase's token order cannot be established; the analysis backend \
+                             must return its token layer",
+                            f.field
+                        )));
+                    };
+                    let sequence = crate::proximity::query_sequence(&analyzed.terms, positions)
+                        .map_err(|error| Status::internal(format!("query positions: {error}")))?;
+                    Some((
+                        sequence.into_iter().map(|ti| remap[ti]).collect::<Vec<_>>(),
+                        m.slop,
+                    ))
+                }
+                None => None,
+            };
             field_terms.push(terms);
+            phrase_requests.push(phrase);
         }
         let t_analyzed = t0.elapsed();
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
-            return Ok((Vec::new(), Vec::new(), Vec::new()));
+            return Ok(((Vec::new(), Vec::new(), Vec::new()), Vec::new()));
         }
-        // (b) every field's stats, served from the per-node cache;
-        // (c)+(d) run as a round so a stale-stats refusal can rerun
-        // them once against fresh stats with no claim.
-        let stats_fields: Vec<crate::pb::FieldTerms> = fields
+        // (b) every field's stats, served from the per-node cache, plus
+        // one PROBE per two-term exact phrase for its bigram column: the
+        // route is decided from what the fleet answers, and a column no
+        // shard has is an answer, not a typo.
+        let mut stats_fields: Vec<crate::pb::FieldTerms> = fields
             .iter()
             .zip(&field_terms)
             .map(|(f, terms)| crate::pb::FieldTerms {
@@ -2969,23 +3055,138 @@ impl CoordinatorServiceImpl {
                 terms: terms.clone(),
             })
             .collect();
+        let probe_from = stats_fields.len();
+        let mut bigram_probe: Vec<Option<usize>> = vec![None; fields.len()];
+        for (fi, f) in fields.iter().enumerate() {
+            if let Some((sequence, 0)) = phrase_requests[fi].as_ref().map(|(s, slop)| (s, *slop)) {
+                if sequence.len() == 2 {
+                    let bigram = crate::proximity::bigram_term(
+                        &field_terms[fi][sequence[0]],
+                        &field_terms[fi][sequence[1]],
+                    );
+                    bigram_probe[fi] = Some(stats_fields.len());
+                    stats_fields.push(crate::pb::FieldTerms {
+                        field: crate::proximity::bigram_field_name(&f.field),
+                        terms: vec![bigram],
+                    });
+                }
+            }
+        }
+        // (c)+(d) run as a round so a stale-stats refusal can rerun
+        // them once against fresh stats with no claim.
+        let n_shards = self.node_addrs.len();
         let mut fresh = false;
         loop {
-            let globals = self.fused_stats(&stats_fields, fresh).await?;
+            let globals = self
+                .fused_stats_probing(&stats_fields, fresh, probe_from)
+                .await?;
             let claims = if fresh {
                 vec![0; globals.epochs.len()]
             } else {
                 globals.epochs.clone()
             };
             let t_stats = t0.elapsed();
+            // Resolve every field's route against what the fleet
+            // answered, producing the leg list the round scores.
+            let mut resolved_fields: Vec<crate::pb::QueryField> = Vec::with_capacity(fields.len());
+            let mut resolved_terms: Vec<Vec<String>> = Vec::with_capacity(fields.len());
+            let mut resolved = FusedGlobals {
+                doc_count: globals.doc_count,
+                totals: Vec::with_capacity(fields.len()),
+                dfs: Vec::with_capacity(fields.len()),
+                epochs: globals.epochs.clone(),
+                known_shards: Vec::with_capacity(fields.len()),
+                positions_shards: Vec::with_capacity(fields.len()),
+            };
+            let mut phrase_legs: Vec<Option<crate::pb::PhraseLeg>> =
+                Vec::with_capacity(fields.len());
+            let mut fingerprints: Vec<u64> = Vec::with_capacity(fields.len());
+            let mut routing: Vec<crate::pb::PhraseRouting> = Vec::new();
+            for (fi, f) in fields.iter().enumerate() {
+                let base_fingerprint = crate::analyzer::analysis_fingerprint(f.analysis.as_ref());
+                let mut take = |source: usize| {
+                    resolved.totals.push(globals.totals[source]);
+                    resolved.dfs.push(globals.dfs[source].clone());
+                    resolved.known_shards.push(globals.known_shards[source]);
+                    resolved
+                        .positions_shards
+                        .push(globals.positions_shards[source]);
+                };
+                match phrase_requests[fi].as_ref() {
+                    // A one-term "phrase" is the ordinary term query and
+                    // constrains nothing, so it reports no routing.
+                    Some((sequence, slop)) if sequence.len() >= 2 => {
+                        let bigram_everywhere =
+                            bigram_probe[fi].is_some_and(|pi| globals.known_shards[pi] == n_shards);
+                        let positions_everywhere = globals.known_shards[fi] == n_shards
+                            && globals.positions_shards[fi] == n_shards;
+                        match crate::proximity::choose_route(
+                            &f.field,
+                            sequence.len(),
+                            *slop,
+                            bigram_everywhere,
+                            positions_everywhere,
+                        ) {
+                            Ok(crate::proximity::PhraseRoute::BigramColumn(column)) => {
+                                let pi = bigram_probe[fi].expect("bigram route implies a probe");
+                                resolved_fields.push(crate::pb::QueryField {
+                                    field: column.clone(),
+                                    phrase: None,
+                                    ..f.clone()
+                                });
+                                resolved_terms.push(stats_fields[pi].terms.clone());
+                                take(pi);
+                                phrase_legs.push(None);
+                                fingerprints
+                                    .push(crate::proximity::bigram_fingerprint(base_fingerprint));
+                                routing.push(crate::pb::PhraseRouting {
+                                    field: f.field.clone(),
+                                    served_field: column,
+                                    bigram_column: true,
+                                    slop: 0,
+                                });
+                            }
+                            Ok(crate::proximity::PhraseRoute::Positions) => {
+                                resolved_fields.push(f.clone());
+                                resolved_terms.push(field_terms[fi].clone());
+                                take(fi);
+                                phrase_legs.push(Some(crate::pb::PhraseLeg {
+                                    sequence: sequence.iter().map(|&i| i as u32).collect(),
+                                    slop: *slop,
+                                }));
+                                fingerprints.push(base_fingerprint);
+                                routing.push(crate::pb::PhraseRouting {
+                                    field: f.field.clone(),
+                                    served_field: f.field.clone(),
+                                    bigram_column: false,
+                                    slop: *slop,
+                                });
+                            }
+                            Err(reason) => return Err(Status::invalid_argument(reason)),
+                        }
+                    }
+                    _ => {
+                        resolved_fields.push(crate::pb::QueryField {
+                            phrase: None,
+                            ..f.clone()
+                        });
+                        resolved_terms.push(field_terms[fi].clone());
+                        take(fi);
+                        phrase_legs.push(None);
+                        fingerprints.push(base_fingerprint);
+                    }
+                }
+            }
             match self
                 .bm25_fused_round(
                     k,
-                    fields,
-                    &field_terms,
-                    &globals,
+                    &resolved_fields,
+                    &resolved_terms,
+                    &resolved,
                     &claims,
                     None,
+                    &phrase_legs,
+                    &fingerprints,
                     min_score,
                     facet_fields,
                     map_facet_fields,
@@ -3003,7 +3204,7 @@ impl CoordinatorServiceImpl {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
-                other => return other,
+                other => return other.map(|hits| (hits, routing)),
             }
         }
     }
@@ -3044,6 +3245,7 @@ impl CoordinatorServiceImpl {
                 weight: 1.0,
                 k1: 0.0,
                 b: 0.0,
+                phrase: None,
             }]
         } else {
             if base.analysis.is_some() {
@@ -3105,6 +3307,7 @@ impl CoordinatorServiceImpl {
             weight: 1.0,
             k1: 0.0,
             b: 0.0,
+            phrase: None,
         });
         field_terms.push(phrase_terms);
         if k == 0 || field_terms.iter().all(Vec::is_empty) {
@@ -3136,6 +3339,18 @@ impl CoordinatorServiceImpl {
                 globals.epochs.clone()
             };
             let t_stats = t0.elapsed();
+            let fingerprints: Vec<u64> = fields
+                .iter()
+                .enumerate()
+                .map(|(fi, f)| {
+                    if fi == phrase_leg {
+                        phrase_index.fingerprint()
+                    } else {
+                        crate::analyzer::analysis_fingerprint(f.analysis.as_ref())
+                    }
+                })
+                .collect();
+            let phrase_legs: Vec<Option<crate::pb::PhraseLeg>> = vec![None; fields.len()];
             let round = self
                 .bm25_fused_round(
                     k,
@@ -3144,6 +3359,8 @@ impl CoordinatorServiceImpl {
                     &globals,
                     &claims,
                     Some((phrase_leg, &phrase_weights, phrase_index.fingerprint())),
+                    &phrase_legs,
+                    &fingerprints,
                     base.min_score,
                     &base.facet_fields,
                     &base.map_facet_fields,
@@ -3181,6 +3398,22 @@ impl CoordinatorServiceImpl {
         &self,
         stats_fields: &[crate::pb::FieldTerms],
         fresh: bool,
+    ) -> Result<FusedGlobals, Status> {
+        self.fused_stats_probing(stats_fields, fresh, stats_fields.len())
+            .await
+    }
+
+    /// [`Self::fused_stats`] where entries from `probe_from` on are
+    /// PROBES: fields the query may route onto if the fleet has them
+    /// (a phrase's bigram column, docs/phrase-proximity.md). A probe no
+    /// shard knows is answered, not refused — the typo rule still
+    /// applies to every entry before `probe_from`, which the caller
+    /// named on purpose.
+    async fn fused_stats_probing(
+        &self,
+        stats_fields: &[crate::pb::FieldTerms],
+        fresh: bool,
+        probe_from: usize,
     ) -> Result<FusedGlobals, Status> {
         let n = self.node_addrs.len();
         let mut shares: Vec<Option<crate::stats_cache::FusedShare>> = vec![None; n];
@@ -3233,6 +3466,7 @@ impl CoordinatorServiceImpl {
                     .map(|fs| crate::stats_cache::FusedFieldShare {
                         total_doc_length: fs.total_doc_length,
                         known: fs.known,
+                        positions: fs.positions,
                         dfs: fs.doc_frequencies.clone(),
                     })
                     .collect(),
@@ -3246,6 +3480,7 @@ impl CoordinatorServiceImpl {
             .collect();
         let mut known_somewhere = vec![false; stats_fields.len()];
         let mut known_shards = vec![0usize; stats_fields.len()];
+        let mut positions_shards = vec![0usize; stats_fields.len()];
         let mut epochs = Vec::with_capacity(n);
         for share in shares {
             let s = share.expect("looked up or fetched above");
@@ -3254,6 +3489,7 @@ impl CoordinatorServiceImpl {
                 totals[fi] += fs.total_doc_length;
                 known_somewhere[fi] |= fs.known;
                 known_shards[fi] += usize::from(fs.known);
+                positions_shards[fi] += usize::from(fs.positions);
                 for (acc, df) in dfs[fi].iter_mut().zip(&fs.dfs) {
                     *acc += df;
                 }
@@ -3263,6 +3499,7 @@ impl CoordinatorServiceImpl {
         let unknown: Vec<&str> = stats_fields
             .iter()
             .zip(&known_somewhere)
+            .take(probe_from)
             .filter(|(_, known)| !**known)
             .map(|(f, _)| f.field.as_str())
             .collect();
@@ -3283,6 +3520,7 @@ impl CoordinatorServiceImpl {
             dfs,
             epochs,
             known_shards,
+            positions_shards,
         })
     }
 
@@ -3299,6 +3537,14 @@ impl CoordinatorServiceImpl {
         claims: &[u64],
         // `(field index, parallel term weights, vocabulary fingerprint)`.
         phrase: Option<(usize, &[f32], u64)>,
+        // Per field: the positional phrase constraint the shard applies
+        // at its heap gate (docs/phrase-proximity.md), `None` on an
+        // ordinary leg or one already rewritten onto a bigram column.
+        phrase_legs: &[Option<crate::pb::PhraseLeg>],
+        // Per field: the analyzer fingerprint the shard is told its
+        // terms came from (a bigram column's is derived from its
+        // source's; a glossary field's is the vocabulary's).
+        fingerprints: &[u64],
         min_score: f32,
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
@@ -3337,17 +3583,15 @@ impl CoordinatorServiceImpl {
                 },
                 // Declare which analyzer produced these terms so the
                 // shard can refuse a column built under a different one.
-                // The terms were analyzed under f.analysis just above,
-                // so this is the fingerprint OF THE SPEC ACTUALLY USED,
-                // not of what the caller meant.
-                analysis_fingerprint: phrase
-                    .filter(|(phrase_field, _, _)| *phrase_field == fi)
-                    .map_or_else(
-                        || crate::analyzer::analysis_fingerprint(f.analysis.as_ref()),
-                        |(_, _, fingerprint)| fingerprint,
-                    ),
+                // The caller computed it from THE SPEC ACTUALLY USED,
+                // not from what the caller meant.
+                analysis_fingerprint: fingerprints[fi],
+                phrase: phrase_legs[fi].clone(),
             })
             .collect();
+        debug_assert_eq!(phrase_legs.len(), fields.len());
+        debug_assert_eq!(fingerprints.len(), fields.len());
+        let _ = phrase.map(|(leg, _, _)| leg);
         if trace {
             for l in &legs {
                 eprintln!(
@@ -3398,6 +3642,7 @@ impl CoordinatorServiceImpl {
                 filter: filter.cloned(),
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
+                phrase: None,
             };
             let mut client = self.node_client(node)?;
             let phrase_request =
@@ -4509,6 +4754,7 @@ impl CoordinatorServiceImpl {
                     filter: filters.tree.clone(),
                     stats_fields: Vec::new(),
                     cardinality_fields: Vec::new(),
+                    phrase: None,
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -8434,72 +8680,126 @@ impl SearchService for CoordinatorServiceImpl {
         // Projection text compiles ONCE, here, into the ValueExpr IR
         // the shards resolve and evaluate (docs/cel-values.md).
         let projections = compile_projections(&req.projections)?;
-        let (hits, facets, range_facets, stats, cardinality) = if req.fields.is_empty() {
-            self.fanout_bm25_aggregated(
-                &req.text,
-                k,
-                req.analysis.as_ref(),
-                req.min_score,
-                &req.facet_fields,
-                &req.map_facet_fields,
-                &req.range_facet_fields,
-                &req.score_stages,
-                &req.geo_filters,
-                filter.as_ref(),
-                &req.stats_fields,
-                &req.cardinality_fields,
-                &projections,
-            )
-            .await?
-        } else {
-            if !req.score_stages.is_empty() {
-                return Err(Status::invalid_argument(
-                    "score stages are not yet supported on the fused multi-field route; \
-                     drop `fields` to use the flat route, or drop `score_stages`",
+        let mut phrase_routing = Vec::new();
+        let (hits, facets, range_facets, stats, cardinality) =
+            if req.fields.is_empty() && req.phrase.is_some() {
+                // A phrase on the flat route is the body field's phrase on
+                // the fused route (docs/phrase-proximity.md); the fused
+                // route's uncertified combinations refuse by name here too.
+                if !req.score_stages.is_empty() {
+                    return Err(Status::invalid_argument(
+                    "score stages are not yet certified with a phrase constraint; drop `phrase` \
+                     or drop `score_stages`",
                 ));
-            }
-            if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
-                return Err(Status::invalid_argument(
-                    "stats/cardinality are not yet supported on the fused multi-field \
-                     route; drop `fields` to use the flat route, or drop the aggregations",
+                }
+                if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "stats/cardinality are not yet certified with a phrase constraint; drop \
+                     `phrase` or drop the aggregations",
+                    ));
+                }
+                if !req.projections.is_empty() {
+                    return Err(Status::invalid_argument(
+                    "projections are not yet certified with a phrase constraint; drop `phrase` \
+                     or drop the projections",
                 ));
-            }
-            if !req.projections.is_empty() {
-                return Err(Status::invalid_argument(
-                    "projections are not yet supported on the fused multi-field route; \
-                     drop `fields` to use the flat route, or drop the projections",
-                ));
-            }
-            // `analysis` is documented as ignored once `fields` is set,
-            // because term identity is per field. Ignoring it QUIETLY is
-            // the trap: the caller believes it asked for the ingest
-            // analysis, every field falls back to the sidecar default,
-            // and the query runs against terms that do not exist in the
-            // index. That returns a confident ranking over whichever
-            // tokens happened to survive, so it does not look like a
-            // failure -- it looks like bad relevance.
-            if req.analysis.is_some() {
-                return Err(Status::invalid_argument(
-                    "Bm25SearchRequest.analysis is ignored when `fields` is set (term identity \
-                     is per field). Move the spec onto each QueryField.analysis, or drop \
-                     `fields` to use the single-field route.",
-                ));
-            }
-            let (hits, facets, ranges) = self
-                .fanout_bm25_fused_faceted(
+                }
+                let body = vec![crate::pb::QueryField {
+                    field: "body".to_string(),
+                    analysis: req.analysis.clone(),
+                    weight: 1.0,
+                    k1: 0.0,
+                    b: 0.0,
+                    phrase: req.phrase.clone(),
+                }];
+                let ((hits, facets, ranges), routing) = self
+                    .fanout_bm25_fused_routed(
+                        &req.text,
+                        k,
+                        &body,
+                        req.min_score,
+                        &req.facet_fields,
+                        &req.map_facet_fields,
+                        &req.range_facet_fields,
+                        &req.geo_filters,
+                        filter.as_ref(),
+                    )
+                    .await?;
+                phrase_routing = routing;
+                (hits, facets, ranges, Vec::new(), Vec::new())
+            } else if req.fields.is_empty() {
+                self.fanout_bm25_aggregated(
                     &req.text,
                     k,
-                    &req.fields,
+                    req.analysis.as_ref(),
                     req.min_score,
                     &req.facet_fields,
                     &req.map_facet_fields,
                     &req.range_facet_fields,
+                    &req.score_stages,
                     &req.geo_filters,
                     filter.as_ref(),
+                    &req.stats_fields,
+                    &req.cardinality_fields,
+                    &projections,
                 )
-                .await?;
-            (hits, facets, ranges, Vec::new(), Vec::new())
-        };
+                .await?
+            } else {
+                if !req.score_stages.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "score stages are not yet supported on the fused multi-field route; \
+                     drop `fields` to use the flat route, or drop `score_stages`",
+                    ));
+                }
+                if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "stats/cardinality are not yet supported on the fused multi-field \
+                     route; drop `fields` to use the flat route, or drop the aggregations",
+                    ));
+                }
+                if !req.projections.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "projections are not yet supported on the fused multi-field route; \
+                     drop `fields` to use the flat route, or drop the projections",
+                    ));
+                }
+                // `analysis` is documented as ignored once `fields` is set,
+                // because term identity is per field. Ignoring it QUIETLY is
+                // the trap: the caller believes it asked for the ingest
+                // analysis, every field falls back to the sidecar default,
+                // and the query runs against terms that do not exist in the
+                // index. That returns a confident ranking over whichever
+                // tokens happened to survive, so it does not look like a
+                // failure -- it looks like bad relevance.
+                if req.analysis.is_some() {
+                    return Err(Status::invalid_argument(
+                    "Bm25SearchRequest.analysis is ignored when `fields` is set (term identity \
+                     is per field). Move the spec onto each QueryField.analysis, or drop \
+                     `fields` to use the single-field route.",
+                ));
+                }
+                if req.phrase.is_some() {
+                    return Err(Status::invalid_argument(
+                    "Bm25SearchRequest.phrase is the flat route's constraint; with `fields` set, \
+                     put the PhraseMatch on the QueryField it constrains",
+                ));
+                }
+                let ((hits, facets, ranges), routing) = self
+                    .fanout_bm25_fused_routed(
+                        &req.text,
+                        k,
+                        &req.fields,
+                        req.min_score,
+                        &req.facet_fields,
+                        &req.map_facet_fields,
+                        &req.range_facet_fields,
+                        &req.geo_filters,
+                        filter.as_ref(),
+                    )
+                    .await?;
+                phrase_routing = routing;
+                (hits, facets, ranges, Vec::new(), Vec::new())
+            };
         // The merged k-th best: one f32 ULP below the last hit's score
         // when k hits were returned (see `bm25::floor_seed` — a later
         // seed can never exceed the true k-th best), 0 otherwise.
@@ -8517,6 +8817,7 @@ impl SearchService for CoordinatorServiceImpl {
             range_facets,
             stats,
             cardinality,
+            phrase_routing,
         }))
     }
 
@@ -8575,6 +8876,7 @@ impl SearchService for CoordinatorServiceImpl {
             range_facets,
             stats: Vec::new(),
             cardinality: Vec::new(),
+            phrase_routing: Vec::new(),
         }))
     }
 

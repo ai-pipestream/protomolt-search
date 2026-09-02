@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),
         cardinality_fields: Vec::new(),
+        phrase: None,
     };
     // Exactly what `fanout_bm25_fused` sends: the per-field stats move
     // into the leg and the flat fields go empty.
@@ -100,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // did not use would refuse valid probes against a column
             // built any other way.
             analysis_fingerprint: 0,
+            phrase: None,
         }],
         // Same reasoning as the fingerprint: hand-typed stats carry no
         // epoch claim.
@@ -108,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),
         cardinality_fields: Vec::new(),
+        phrase: None,
     };
 
     println!("{node}  terms {terms:?}  k={k}");

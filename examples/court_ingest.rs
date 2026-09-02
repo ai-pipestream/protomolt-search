@@ -443,6 +443,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         phrases: Vec::new(),
                         phrase_fingerprint: 0,
                         phrase_field: String::new(),
+                        position_fields: Vec::new(),
+                        bigram_fields: Vec::new(),
                     })
                     .await
                     .unwrap();
@@ -796,6 +798,8 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                         phrases: Vec::new(),
                         phrase_fingerprint: 0,
                         phrase_field: String::new(),
+                        position_fields: Vec::new(),
+                        bigram_fields: Vec::new(),
                     })
                     .map_err(|e| e.to_string())?;
                     sent += 1;
