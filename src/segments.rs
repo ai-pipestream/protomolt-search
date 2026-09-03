@@ -80,10 +80,21 @@ pub struct SegmentSource<'a> {
     pub generation: u64,
     pub base_label: u64,
     pub backend_kind: &'a str,
-    pub vector_path: &'a Path,
-    pub exact_vector_path: &'a Path,
+    /// `None` seals a documents-only segment: no vector rows, and the
+    /// exact rows must be absent too.
+    pub vector_path: Option<&'a Path>,
+    pub exact_vector_path: Option<&'a Path>,
     pub bm25_path: &'a Path,
     pub live_docs_path: &'a Path,
+}
+
+/// The artifact record of an artifact a segment does not have.
+pub fn absent_artifact() -> SegmentArtifact {
+    SegmentArtifact {
+        file: String::new(),
+        bytes: 0,
+        sha256: String::new(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +112,8 @@ pub struct WalCompactionResult {
 
 struct OpenedSegment {
     metadata: SegmentMetadata,
-    vector: VectorIndex,
+    /// `None` for a documents-only segment (an empty `vector` artifact).
+    vector: Option<VectorIndex>,
     bm25: Bm25Reader,
     live_docs: LiveDocs,
 }
@@ -168,22 +180,42 @@ impl OpenedSegmentSet {
         let mut analysis_fingerprints: Option<&[u64]> = None;
         for metadata in &manifest.segments {
             let directory = root.join("segments").join(&metadata.segment_id);
-            verify_artifact(&directory, &metadata.vector)?;
-            verify_artifact(&directory, &metadata.exact_vectors)?;
+            let has_vectors = !metadata.vector.file.is_empty();
+            if has_vectors {
+                verify_artifact(&directory, &metadata.vector)?;
+                verify_artifact(&directory, &metadata.exact_vectors)?;
+            } else if !metadata.exact_vectors.file.is_empty() {
+                return Err(format!(
+                    "segment {:?} has exact rows but no vector artifact",
+                    metadata.segment_id
+                ));
+            }
             verify_artifact(&directory, &metadata.bm25)?;
             verify_artifact(&directory, &metadata.live_docs)?;
-            let mut vector = VectorIndex::load(
-                &metadata.backend_kind,
-                &directory.join(&metadata.vector.file),
-            )
-            .map_err(|error| format!("open vector segment {:?}: {error}", metadata.segment_id))?;
-            vector.prepare().map_err(|error| {
-                format!("prepare vector segment {:?}: {error}", metadata.segment_id)
-            })?;
-            let exact = ExactVectorStore::open(&directory.join(&metadata.exact_vectors.file))
+            let vector = if has_vectors {
+                let mut vector = VectorIndex::load(
+                    &metadata.backend_kind,
+                    &directory.join(&metadata.vector.file),
+                )
                 .map_err(|error| {
-                    format!("open exact segment {:?}: {error}", metadata.segment_id)
+                    format!("open vector segment {:?}: {error}", metadata.segment_id)
                 })?;
+                vector.prepare().map_err(|error| {
+                    format!("prepare vector segment {:?}: {error}", metadata.segment_id)
+                })?;
+                Some(vector)
+            } else {
+                None
+            };
+            let exact_rows = if has_vectors {
+                ExactVectorStore::open(&directory.join(&metadata.exact_vectors.file))
+                    .map_err(|error| {
+                        format!("open exact segment {:?}: {error}", metadata.segment_id)
+                    })?
+                    .len()
+            } else {
+                0
+            };
             let bm25 = Bm25Reader::open(&directory.join(&metadata.bm25.file))
                 .map_err(|error| format!("open BM25 segment {:?}: {error}", metadata.segment_id))?;
             let live_docs =
@@ -192,18 +224,27 @@ impl OpenedSegmentSet {
                 })?;
             let rows = usize::try_from(metadata.rows)
                 .map_err(|_| format!("segment {:?} rows do not fit usize", metadata.segment_id))?;
-            if vector.len() != rows
-                || exact.len() != rows
-                || bm25.next_doc_id() as usize != rows
+            // Row alignment (docs/immutable-segments.md): every artifact
+            // a segment has covers the same rows; a documents-only
+            // segment has no vector rows at all.
+            let vector_rows = vector.as_ref().map_or(0, VectorIndex::len);
+            let bm25_rows = bm25.next_doc_id() as usize;
+            let aligned = |n: usize| n == 0 || n == rows;
+            if rows == 0
+                || !aligned(vector_rows)
+                || !aligned(exact_rows)
+                || exact_rows != vector_rows
+                || !aligned(bm25_rows)
+                || (vector_rows == 0 && bm25_rows == 0)
                 || live_docs.persisted_rows() != metadata.rows
             {
                 return Err(format!(
                     "segment {:?} is not aligned: manifest rows {}, vector {}, exact {}, BM25 {}, live-doc {}",
                     metadata.segment_id,
                     metadata.rows,
-                    vector.len(),
-                    exact.len(),
-                    bm25.next_doc_id(),
+                    vector_rows,
+                    exact_rows,
+                    bm25_rows,
                     live_docs.persisted_rows()
                 ));
             }
@@ -225,22 +266,24 @@ impl OpenedSegmentSet {
                     metadata.segment_id
                 ));
             }
-            let descriptor = vector.descriptor();
-            if descriptor.scoring_fingerprint != metadata.scoring_fingerprint
-                || descriptor.score_direction != ScoreDirection::HigherIsBetter
-                || descriptor.quality_contract != QualityContract::ExhaustiveQuantized
-            {
-                return Err(format!(
-                    "segment {:?} vector scoring contract differs from its aligned manifest or is not exhaustive",
-                    metadata.segment_id
-                ));
-            }
-            match scoring_fingerprint {
-                Some(held) if held != metadata.scoring_fingerprint => {
-                    return Err("segment set mixes vector scoring fingerprints".into())
+            if let Some(vector) = &vector {
+                let descriptor = vector.descriptor();
+                if descriptor.scoring_fingerprint != metadata.scoring_fingerprint
+                    || descriptor.score_direction != ScoreDirection::HigherIsBetter
+                    || descriptor.quality_contract != QualityContract::ExhaustiveQuantized
+                {
+                    return Err(format!(
+                        "segment {:?} vector scoring contract differs from its aligned manifest or is not exhaustive",
+                        metadata.segment_id
+                    ));
                 }
-                None => scoring_fingerprint = Some(&metadata.scoring_fingerprint),
-                _ => {}
+                match scoring_fingerprint {
+                    Some(held) if held != metadata.scoring_fingerprint => {
+                        return Err("segment set mixes vector scoring fingerprints".into())
+                    }
+                    None => scoring_fingerprint = Some(&metadata.scoring_fingerprint),
+                    _ => {}
+                }
             }
             match analysis_fingerprints {
                 Some(held) if held != metadata.analysis_fingerprints => {
@@ -265,6 +308,37 @@ impl OpenedSegmentSet {
 
     pub fn manifest(&self) -> &SegmentSetManifest {
         &self.manifest
+    }
+
+    /// The catalog root this set was opened from.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Number of segments in the set, in ascending base order.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    pub fn metadata(&self, i: usize) -> &SegmentMetadata {
+        &self.segments[i].metadata
+    }
+
+    pub fn bm25(&self, i: usize) -> &Bm25Reader {
+        &self.segments[i].bm25
+    }
+
+    /// Segment `i`'s vector image, `None` for a documents-only segment.
+    pub fn vector(&self, i: usize) -> Option<&VectorIndex> {
+        self.segments[i].vector.as_ref()
+    }
+
+    pub fn live_docs(&self, i: usize) -> &LiveDocs {
+        &self.segments[i].live_docs
     }
 
     pub fn global_bm25_stats(&self, terms: &[String]) -> Result<CorpusStats, String> {
@@ -344,12 +418,17 @@ impl OpenedSegmentSet {
         }
         let mut all = Vec::new();
         for segment in &self.segments {
-            let rows = segment.vector.len();
+            let Some(image) = segment.vector.as_ref() else {
+                continue;
+            };
+            let rows = image.len();
+            if rows == 0 {
+                continue;
+            }
             let allow: Vec<bool> = (0..rows)
                 .map(|row| !segment.live_docs.is_deleted(row))
                 .collect();
-            let result = segment
-                .vector
+            let result = image
                 .try_search(
                     vector,
                     k.min(rows),
@@ -697,8 +776,8 @@ impl SegmentCatalog {
                 generation: output.generation,
                 base_label: segment.image.slot_offset,
                 backend_kind,
-                vector_path: &segment.image.vector_path,
-                exact_vector_path: &segment.image.exact_vector_path,
+                vector_path: Some(&segment.image.vector_path),
+                exact_vector_path: Some(&segment.image.exact_vector_path),
                 bm25_path: segment.image.bm25_path.as_deref().expect("validated above"),
                 live_docs_path,
             })
@@ -763,12 +842,21 @@ fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
             }
         }
         previous_end = Some(segment.end_label_exclusive()?);
-        for artifact in [
-            &segment.vector,
-            &segment.exact_vectors,
-            &segment.bm25,
-            &segment.live_docs,
-        ] {
+        // A documents-only segment records no vector and no exact rows
+        // (both absent, or both present).
+        let has_vectors = !segment.vector.file.is_empty();
+        if has_vectors != !segment.exact_vectors.file.is_empty() {
+            return Err(format!(
+                "segment {:?} records a vector image without exact rows, or the reverse",
+                segment.segment_id
+            ));
+        }
+        let mut artifacts: Vec<&SegmentArtifact> = vec![&segment.bm25, &segment.live_docs];
+        if has_vectors {
+            artifacts.push(&segment.vector);
+            artifacts.push(&segment.exact_vectors);
+        }
+        for artifact in artifacts {
             validate_relative_file(&artifact.file)?;
             if artifact.sha256.len() != 64
                 || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -865,56 +953,91 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
     std::fs::create_dir_all(&temp_dir)
         .map_err(|error| format!("mkdir stage {}: {error}", temp_dir.display()))?;
     let result = (|| {
-        let vector_artifact = copy_artifact(source.vector_path, &temp_dir, "vector.index")?;
-        let exact_artifact = copy_artifact(source.exact_vector_path, &temp_dir, "vectors.f32")?;
+        // A documents-only segment (docs/immutable-segments.md) has no
+        // vector rows; the exact rows go with the vector rows.
+        let (vector_artifact, exact_artifact) =
+            match (source.vector_path, source.exact_vector_path) {
+                (Some(vector_path), Some(exact_path)) => (
+                    copy_artifact(vector_path, &temp_dir, "vector.index")?,
+                    copy_artifact(exact_path, &temp_dir, "vectors.f32")?,
+                ),
+                (None, None) => (absent_artifact(), absent_artifact()),
+                _ => return Err(
+                    "a segment carries its vector image and its exact rows together, or neither"
+                        .to_string(),
+                ),
+            };
         let bm25_artifact = copy_artifact(source.bm25_path, &temp_dir, "documents.bm25")?;
         let live_artifact = copy_artifact(source.live_docs_path, &temp_dir, "live-docs.bin")?;
 
-        let mut vector = VectorIndex::load(source.backend_kind, &temp_dir.join("vector.index"))
-            .map_err(|error| format!("open staged vector: {error}"))?;
-        vector
-            .prepare()
-            .map_err(|error| format!("prepare staged vector: {error}"))?;
-        let exact = ExactVectorStore::open(&temp_dir.join("vectors.f32"))
-            .map_err(|error| format!("open staged exact vectors: {error}"))?;
-        exact
-            .verify_payload()
-            .map_err(|error| format!("verify staged exact vectors: {error}"))?;
+        let vector = if source.vector_path.is_some() {
+            let mut vector = VectorIndex::load(source.backend_kind, &temp_dir.join("vector.index"))
+                .map_err(|error| format!("open staged vector: {error}"))?;
+            vector
+                .prepare()
+                .map_err(|error| format!("prepare staged vector: {error}"))?;
+            Some(vector)
+        } else {
+            None
+        };
+        let exact_rows = if source.exact_vector_path.is_some() {
+            let exact = ExactVectorStore::open(&temp_dir.join("vectors.f32"))
+                .map_err(|error| format!("open staged exact vectors: {error}"))?;
+            exact
+                .verify_payload()
+                .map_err(|error| format!("verify staged exact vectors: {error}"))?;
+            exact.len()
+        } else {
+            0
+        };
         let bm25 = Bm25Reader::open(&temp_dir.join("documents.bm25"))
             .map_err(|error| format!("open staged BM25: {error}"))?;
         bm25.verify_integrity()
             .map_err(|error| format!("verify staged BM25: {error}"))?;
         let live_docs = LiveDocs::open(&temp_dir.join("live-docs.bin"))
             .map_err(|error| format!("open staged live docs: {error}"))?;
-        let rows = vector.len();
+        let vector_rows = vector.as_ref().map_or(0, VectorIndex::len);
+        let bm25_rows = bm25.next_doc_id() as usize;
+        let rows = vector_rows.max(bm25_rows);
+        let aligned = |n: usize| n == 0 || n == rows;
         if rows == 0
-            || exact.len() != rows
-            || bm25.next_doc_id() as usize != rows
+            || !aligned(vector_rows)
+            || exact_rows != vector_rows
+            || !aligned(bm25_rows)
             || live_docs.persisted_rows() != rows as u64
         {
             return Err(format!(
-                "staged segment is not aligned: vector {rows}, exact {}, BM25 {}, live-doc {}",
-                exact.len(),
-                bm25.next_doc_id(),
+                "staged segment is not aligned: vector {vector_rows}, exact {exact_rows}, BM25 \
+                 {bm25_rows}, live-doc {}",
                 live_docs.persisted_rows()
             ));
         }
-        let descriptor = vector.descriptor();
-        if descriptor.score_direction != ScoreDirection::HigherIsBetter
-            || descriptor.quality_contract != QualityContract::ExhaustiveQuantized
-        {
-            return Err(
-                "aligned segments currently require an exhaustive higher-is-better provider".into(),
-            );
-        }
+        let (backend_kind, scoring_fingerprint) = match &vector {
+            Some(vector) => {
+                let descriptor = vector.descriptor();
+                if descriptor.score_direction != ScoreDirection::HigherIsBetter
+                    || descriptor.quality_contract != QualityContract::ExhaustiveQuantized
+                {
+                    return Err(
+                        "aligned segments currently require an exhaustive higher-is-better provider"
+                            .into(),
+                    );
+                }
+                (
+                    source.backend_kind.to_string(),
+                    descriptor.scoring_fingerprint,
+                )
+            }
+            None => (String::new(), String::new()),
+        };
         let metadata = SegmentMetadata {
             segment_id: source.segment_id.to_string(),
             generation: source.generation,
             base_label: source.base_label,
             rows: rows as u64,
             live_rows: rows as u64 - live_docs.deleted_count(),
-            backend_kind: source.backend_kind.to_string(),
-            scoring_fingerprint: descriptor.scoring_fingerprint,
+            backend_kind,
+            scoring_fingerprint,
             analysis_fingerprints: (0..bm25.field_count())
                 .map(|field| bm25.analysis_fingerprint(field))
                 .collect(),
@@ -1071,8 +1194,8 @@ mod tests {
             generation,
             base_label: base,
             backend_kind: EMBEDDED_TURBOVEC,
-            vector_path: &fixture.vector,
-            exact_vector_path: &fixture.exact,
+            vector_path: Some(&fixture.vector),
+            exact_vector_path: Some(&fixture.exact),
             bm25_path: &fixture.bm25,
             live_docs_path: &fixture.live_docs,
         }

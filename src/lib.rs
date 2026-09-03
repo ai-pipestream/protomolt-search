@@ -59,6 +59,8 @@ pub mod replication;
 pub mod reshard;
 pub mod scorefn;
 pub mod security;
+pub mod segmented;
+pub mod segmented_vectors;
 pub mod segments;
 pub mod sha256;
 pub mod snapshot;

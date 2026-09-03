@@ -449,6 +449,29 @@ impl ExactVectorStore {
         }
     }
 
+    /// The FP32 rows `[from, to)`, flat, for sealing a segment
+    /// (`docs/immutable-segments.md`); empty when the store has no
+    /// dimension yet.
+    pub fn row_values(&self, from: usize, to: usize) -> Vec<f32> {
+        let Some(dim) = self.dim() else {
+            return Vec::new();
+        };
+        let (from, to) = (from.min(self.len()), to.min(self.len()));
+        if from >= to {
+            return Vec::new();
+        }
+        match &self.storage {
+            Storage::Building { values, .. } => values[from * dim..to * dim].to_vec(),
+            Storage::Mapped { map, .. } => map
+                [HEADER_BYTES + from * dim * 4..HEADER_BYTES + to * dim * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
+                .collect(),
+        }
+    }
+
     fn decode_all(&self) -> Vec<f32> {
         match &self.storage {
             Storage::Building { values, .. } => values.clone(),

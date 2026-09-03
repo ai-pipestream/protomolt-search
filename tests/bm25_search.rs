@@ -236,6 +236,8 @@ async fn bm25_store_persists_through_flush() {
     let (addr, node) = start_empty_node(NodeConfig {
         analysis_addr: Some(analysis),
         index_path: Some(index_path.clone()),
+        // This test pins the single-image file the flush writes.
+        layout: pipestream_search::node::Layout::SingleImage,
         ..Default::default()
     })
     .await;

@@ -444,6 +444,7 @@ async fn the_shard_rpc_reports_counts_and_unknown_fields() {
     let index_path = dir.join("shard.tv");
     let (addr, handle) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
         ..config(0)
     })
     .await;

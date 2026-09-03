@@ -378,6 +378,7 @@ async fn clocked_wal_catches_a_replica_up_idempotently() {
     .await;
     let (replica, replica_handle) = start_empty_node(NodeConfig {
         index_path: Some(root.join("replica.tv")),
+        layout: pipestream_search::node::Layout::SingleImage,
         wal: true,
         ..case_node_config(analysis)
     })
@@ -1209,6 +1210,7 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
 
     let (addr, node) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
         ..case_node_config(analysis.clone())
     })
     .await;

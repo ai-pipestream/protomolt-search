@@ -470,6 +470,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     let (addr, node) = start_empty_node(NodeConfig {
         analysis_addr: Some(analysis),
         index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
         facet_fields: vec!["court".to_string(), "year".to_string()],
         ..Default::default()
     })

@@ -252,6 +252,14 @@ pub trait VectorProvider: Send + Sync {
         sink: &mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
         control: &mut dyn FnMut() -> VectorStreamControl,
     ) -> Result<VectorStreamSummary, VectorError>;
+    /// The segmented provider behind this index, when it is one
+    /// (`src/segmented_vectors.rs`): the node seals its tail through it.
+    fn as_segmented(&self) -> Option<&crate::segmented_vectors::SegmentedProvider> {
+        None
+    }
+    fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {
+        None
+    }
 }
 
 /// Sized product-side handle around an arbitrary vector engine.
@@ -270,6 +278,15 @@ impl fmt::Debug for VectorIndex {
 
 impl VectorIndex {
     /// Wrap a provider supplied by another module or downstream crate.
+    /// The segmented provider behind this index, when it is one.
+    pub fn as_segmented(&self) -> Option<&crate::segmented_vectors::SegmentedProvider> {
+        self.engine.as_segmented()
+    }
+
+    pub fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {
+        self.engine.as_segmented_mut()
+    }
+
     pub fn from_provider(provider: impl VectorProvider + 'static) -> Self {
         Self {
             engine: Box::new(provider),

@@ -1,10 +1,76 @@
 # Immutable aligned segments
 
-Status: the segment catalog, exact cross-segment vector/BM25 collectors,
-atomic publication, and WAL-backed compaction API are implemented in
-`src/segments.rs`. The historical single-image `NodeService` layout remains
-the default. A node worker opts into the catalog and reports the resulting
-generation to `ClusterControl`; startup does not silently convert an index.
+Status (2026-09-02): the segment catalog is the **default layout of a new
+persisted shard**. `NodeService` serves a `SegmentedShard`
+(`src/segmented.rs`): the catalog's sealed segments plus one heap tail, read
+as one shard, with the vector side as a `SegmentedProvider`
+(`src/segmented_vectors.rs`) over the segments' images plus a tail image.
+The single-image layout remains available (`--layout=single-image`) and
+every existing single-image shard keeps it: a shard has the layout its files
+have, and nothing converts on open — a path with both a single image and a
+catalog refuses by name.
+
+## The node's segmented shard
+
+Local document ids are one positional space: segment `i` covers
+`[base_i, base_i + rows_i)` in catalog order and the tail starts where the
+last segment ends. Every read routes a document id to its part; every
+aggregate (document count, total length, df) sums the parts, so global BM25
+statistics are exact across segments. Column dictionaries are the one place
+a union needs state of its own: each segment's facet, map-key, and map-value
+ordinals are local to its file, so the shard keeps one global dictionary per
+column (byte-sorted over the sealed parts, with the tail's new values after
+it) and a remap from each part's ordinals. Callers see global ordinals
+everywhere, so filters, facets, projections, highlights, and prefix
+expansion work unchanged over a segmented shard.
+
+Block-max pruning survives sealing: a term's impacts across the sealed
+segments chain into one `ImpactCursor` with cumulative block and level-1
+numbering and per-part document bases. A term the tail holds has no impacts
+until the next seal; the scorer takes its exact heap path for that query and
+regains pruning on the next flush.
+
+**Sealing.** A seal turns the tail into one new segment in three steps.
+Under the shard's write lock the tail freezes into a read-only part and a
+fresh tail starts after it (a cheap swap). With no lock held, the frozen
+part's documents, live-bitmap slice, and — when it has vectors — its vector
+image and FP32 rows are written, hashed, fsynced, and appended to the catalog
+with one manifest swap; the FP32 rows are copied out of the exact-vector
+sidecar under a read lock first, a sequential copy. Under the write lock
+again the shard adopts the published snapshot. Queries serve the frozen part
+throughout (it answers as the tail it was: exact heap path, global
+dictionaries, positions, sentences) and ingest continues into the new tail.
+Seals on one shard run one at a time; a seal that failed after freezing is
+finished by the next attempt. The WAL is untouched by a seal: it changes the
+on-disk layout, not the log's history, so reshard, replication catch-up, and
+compaction read the same full-history generation they always did.
+
+A flush seals whatever the tail has. `--seal-tail-docs` (default 500,000)
+bounds a segment: the ingest loop checks the tail between documents and
+seals a full tail before applying the next one, so one long AddDocuments
+stream produces segments of at most that many rows without waiting for the
+stream's end (a vectors-only stream checks between batches). 0 seals on
+flush only. A tail whose document and vector rows disagree refuses to seal
+by name (a segment's artifacts cover the same rows); mapped ingest keeps
+them aligned. A documents-only shard seals documents-only segments (no
+vector artifact); the catalog and its collectors accept them.
+
+The node's whole-shard live bitmap and exact-vector sidecar remain the
+serving copies; each sealed segment carries its own slice of both for
+compaction, split, and merge. Deletes after sealing go to the node bitmap
+and the WAL, and compaction replays the WAL, so a segment's own bitmap is its
+state at seal time by design.
+
+`tests/segment_layout.rs` pins: a fresh shard writes a catalog and no single
+image; two sealed segments plus a tail answer every probe (df, live bitmap
+after a delete, facets, CEL ranges over the union dictionary, sentence
+highlights, prefix expansion, phrases) bitwise as one image of the same rows,
+before and after reopening from disk; an old single-image fixture serves
+under the default and is never converted; both layouts on one path refuse;
+the tail auto-seals at the bound; one stream longer than twice the bound
+seals as it goes and every segment stays within it; and the union read
+surface (df, postings, positions, sentences, the chained cursor,
+dictionaries) equals one store, through a frozen part included.
 
 ## Unit of publication
 

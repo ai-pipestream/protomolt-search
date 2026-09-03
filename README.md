@@ -389,6 +389,14 @@ manifest, and in health). Unknown names refuse, and an unnamed request
 gets to a named collection only through a configured default. See
 [`docs/collections.md`](docs/collections.md).
 
+Segments are the default layout of a new persisted shard
+(`docs/immutable-segments.md`): the catalog under `<index>.segments/` plus
+a heap tail that each flush (or `--seal-tail-docs`) seals into a new
+immutable segment; queries read every segment and the tail as one shard
+with global statistics, chained block-max cursors, and union
+dictionaries. `--layout=single-image` keeps the one-file layout, existing
+single-image shards keep theirs, and nothing converts on open.
+
 Security (`docs/security.md`): `--tls-cert`/`--tls-key` put every
 listener on TLS (rustls; plaintext is then refused, and off loopback it
 needs `--allow-plaintext`), node listeners require a client certificate

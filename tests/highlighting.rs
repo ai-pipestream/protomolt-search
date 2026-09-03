@@ -876,6 +876,7 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
     let index_path = dir.join("shard.tv");
     let config = NodeConfig {
         index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
         wal: true,
         wal_buckets: 8,
         ..config(0, true)

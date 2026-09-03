@@ -369,6 +369,12 @@ pub struct Config {
     /// The key that authenticates UDP floor and cancel datagrams
     /// (`--udp-hmac-key=<file>`).
     pub udp_hmac_key: Option<crate::security::UdpKey>,
+    /// The layout a NEW persisted shard gets (`--layout=segments|single-image`,
+    /// docs/immutable-segments.md); an existing shard keeps its own.
+    pub layout: crate::node::Layout,
+    /// Documents a segmented shard's tail may hold before it seals a
+    /// segment on its own (`--seal-tail-docs`); 0 seals on flush only.
+    pub seal_tail_docs: u32,
     /// Documents per vocabulary window before automatic rollover (only
     /// relevant to shards with `vocab` enabled).
     pub vocab_window_docs: u64,
@@ -424,6 +430,8 @@ struct FileConfig {
     allow_plaintext: Option<bool>,
     bearer_tokens: Option<String>,
     udp_hmac_key: Option<String>,
+    layout: Option<String>,
+    seal_tail_docs: Option<u32>,
     role: Option<String>,
     node_listen: Option<String>,
     coord_listen: Option<String>,
@@ -1883,6 +1891,34 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     )
     .map(|path| crate::security::UdpKey::load(&path))
     .transpose()?;
+    let layout = match opt(
+        args,
+        "layout",
+        "PIPESTREAM_SEARCH_LAYOUT",
+        file.layout.as_deref(),
+    )
+    .as_deref()
+    {
+        None | Some("segments") => crate::node::Layout::Segments,
+        Some("single-image") => crate::node::Layout::SingleImage,
+        Some(other) => {
+            return Err(format!(
+                "--layout={other:?} is not a layout; use segments (the default) or single-image"
+            ))
+        }
+    };
+    let seal_tail_docs = opt(
+        args,
+        "seal-tail-docs",
+        "PIPESTREAM_SEARCH_SEAL_TAIL_DOCS",
+        file.seal_tail_docs.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|v| {
+        v.parse::<u32>()
+            .map_err(|e| format!("invalid --seal-tail-docs: {e}"))
+    })
+    .transpose()?
+    .unwrap_or(500_000);
     let default_collection = file.default_collection.clone();
     if let Some(name) = &default_collection {
         if !collections.iter().any(|c| &c.name == name) {
@@ -1979,6 +2015,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         allow_plaintext,
         principals,
         udp_hmac_key,
+        layout,
+        seal_tail_docs,
         vocab_window_docs,
         vocab_top_k,
     })

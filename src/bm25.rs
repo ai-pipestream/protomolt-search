@@ -942,8 +942,8 @@ pub fn top_k_pruned_chained_filtered_stats_streaming(
     fn retain_live(state: &mut Vec<TermState>, skips: &mut (u64, u64)) {
         state.retain(|ts| {
             if ts.cursor.exhausted() {
-                skips.0 += ts.cursor.blocks_skipped;
-                skips.1 += ts.cursor.l1_groups_skipped;
+                skips.0 += ts.cursor.blocks_skipped();
+                skips.1 += ts.cursor.l1_groups_skipped();
                 false
             } else {
                 true
@@ -1273,12 +1273,15 @@ pub fn top_k_pruned_chained_filtered_stats_streaming(
         }
         retain_live(&mut state, &mut finished);
     }
-    prune.blocks_skipped =
-        finished.0 + state.iter().map(|ts| ts.cursor.blocks_skipped).sum::<u64>();
+    prune.blocks_skipped = finished.0
+        + state
+            .iter()
+            .map(|ts| ts.cursor.blocks_skipped())
+            .sum::<u64>();
     prune.l1_groups_skipped = finished.1
         + state
             .iter()
-            .map(|ts| ts.cursor.l1_groups_skipped)
+            .map(|ts| ts.cursor.l1_groups_skipped())
             .sum::<u64>();
 
     let mut out: Vec<HeapEntry> = heap.into_vec();
@@ -1453,8 +1456,8 @@ pub fn top_k_fused_pruned_filtered_stats_streaming(
     fn retain_live(state: &mut Vec<PairState>, skips: &mut (u64, u64)) {
         state.retain(|ps| {
             if ps.cursor.exhausted() {
-                skips.0 += ps.cursor.blocks_skipped;
-                skips.1 += ps.cursor.l1_groups_skipped;
+                skips.0 += ps.cursor.blocks_skipped();
+                skips.1 += ps.cursor.l1_groups_skipped();
                 false
             } else {
                 true
@@ -1741,12 +1744,15 @@ pub fn top_k_fused_pruned_filtered_stats_streaming(
         }
         retain_live(&mut state, &mut finished);
     }
-    prune.blocks_skipped =
-        finished.0 + state.iter().map(|ps| ps.cursor.blocks_skipped).sum::<u64>();
+    prune.blocks_skipped = finished.0
+        + state
+            .iter()
+            .map(|ps| ps.cursor.blocks_skipped())
+            .sum::<u64>();
     prune.l1_groups_skipped = finished.1
         + state
             .iter()
-            .map(|ps| ps.cursor.l1_groups_skipped)
+            .map(|ps| ps.cursor.l1_groups_skipped())
             .sum::<u64>();
 
     let mut out: Vec<HeapEntry> = heap.into_vec();

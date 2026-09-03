@@ -553,6 +553,7 @@ async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
     let index_path = dir.join("shard.tv");
     let config = NodeConfig {
         index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
         wal: true,
         wal_buckets: 8,
         ..proximity_config(0, NATIVE_ANALYSIS_BACKEND)
@@ -712,6 +713,7 @@ async fn ingest_refuses_a_positional_field_the_active_file_never_declared() {
     let index_path = dir.join("shard.tv");
     let old = NodeConfig {
         index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         bm25_fields: vec!["body".to_string()],
         ..Default::default()
@@ -739,6 +741,7 @@ async fn ingest_refuses_a_positional_field_the_active_file_never_declared() {
         None,
         NodeConfig {
             index_path: Some(index_path.clone()),
+            layout: pipestream_search::node::Layout::SingleImage,
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
             bm25_fields: vec!["body".to_string()],
             position_fields: vec!["body".to_string()],

@@ -62,6 +62,8 @@ use crate::pb::{
     VectorQualityContract, VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
+use crate::segmented::SegmentedShard;
+use crate::segmented_vectors::SegmentedProvider;
 use crate::vector::{
     embedded_turbovec_config, first_invalid_coordinate, legacy_calibration_config, QualityContract,
     ScoreDirection, VectorBackendConfig, VectorIndex, VectorSearchOptions, VectorStreamControl,
@@ -118,6 +120,19 @@ fn bm25_scoring_fingerprint(req: &Bm25QueryRequest) -> String {
     canonical.cardinality_fields.clear();
     canonical.projections.clear();
     crate::sha256::hex_digest(&prost::Message::encode_to_vec(&canonical))
+}
+
+/// How a persisted shard lays out its documents and vectors
+/// (`docs/immutable-segments.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// The segment catalog under `<index>.segments/` plus a heap tail
+    /// sealed into a new segment on every flush: the default for a new
+    /// persisted shard.
+    #[default]
+    Segments,
+    /// One vector image, one `.bm25` file, rewritten on every flush.
+    SingleImage,
 }
 
 /// How a node scans and whether it participates in floor sharing.
@@ -227,6 +242,14 @@ pub struct NodeConfig {
     /// fresh sequence are applied; without one, unsigned datagrams are
     /// accepted on a loopback listener only.
     pub udp_hmac_key: Option<crate::security::UdpKey>,
+    /// The layout a NEW persisted shard gets (`docs/immutable-segments.md`).
+    /// An existing shard keeps the layout its files have; nothing
+    /// converts on open.
+    pub layout: Layout,
+    /// On a segmented shard, seal the tail into a segment once it holds
+    /// this many documents, so a bulk ingest stays bounded in heap
+    /// without waiting for a flush. 0 seals only on flush.
+    pub seal_tail_docs: u32,
     /// Source fields whose adjacent-token pairs are derived into a
     /// bigram column named `<source>.bigrams`, which must itself be in
     /// `bm25_fields`. Derived at ingest from the source's positions, so
@@ -288,6 +311,8 @@ impl Default for NodeConfig {
             sentence_fields: Vec::new(),
             collection: String::new(),
             udp_hmac_key: None,
+            layout: Layout::Segments,
+            seal_tail_docs: 500_000,
             bigram_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
@@ -336,6 +361,9 @@ pub enum Bm25Shard {
     Spilling(SpillBuilder),
     /// Disk-resident mmap reader over the v3 file.
     Resident(Bm25Reader),
+    /// The segment catalog plus a heap tail (`docs/immutable-segments.md`):
+    /// the default layout of a new persisted shard.
+    Segmented(SegmentedShard),
 }
 
 impl Bm25Shard {
@@ -346,6 +374,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => Some(s),
             Bm25Shard::Spilling(_) => None,
             Bm25Shard::Resident(r) => Some(r),
+            Bm25Shard::Segmented(g) => Some(g),
         }
     }
 
@@ -354,6 +383,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.next_doc_id(),
             Bm25Shard::Spilling(s) => s.next_doc_id(),
             Bm25Shard::Resident(r) => r.next_doc_id(),
+            Bm25Shard::Segmented(g) => g.next_doc_id(),
         }
     }
 
@@ -362,6 +392,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.doc_count(),
             Bm25Shard::Spilling(s) => s.doc_count(),
             Bm25Shard::Resident(r) => Bm25Index::doc_count(r),
+            Bm25Shard::Segmented(g) => Bm25Index::doc_count(g),
         }
     }
 
@@ -371,6 +402,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.field_count(),
             Bm25Shard::Spilling(s) => s.field_count(),
             Bm25Shard::Resident(r) => r.field_count(),
+            Bm25Shard::Segmented(g) => g.field_count(),
         }
     }
 
@@ -380,6 +412,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.field_name(f),
             Bm25Shard::Spilling(s) => s.field_name(f),
             Bm25Shard::Resident(r) => r.field_name(f),
+            Bm25Shard::Segmented(g) => g.field_name(f),
         }
     }
 
@@ -391,6 +424,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.binding(),
             Bm25Shard::Spilling(s) => s.binding(),
             Bm25Shard::Resident(r) => r.binding(),
+            Bm25Shard::Segmented(g) => g.binding(),
         }
     }
 
@@ -399,6 +433,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
             Bm25Shard::Spilling(s) => s.analysis_fingerprint(f),
             Bm25Shard::Resident(r) => r.analysis_fingerprint(f),
+            Bm25Shard::Segmented(g) => g.analysis_fingerprint(f),
         }
     }
 
@@ -410,6 +445,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.field_has_positions(f),
             Bm25Shard::Spilling(s) => s.field_has_positions(f),
             Bm25Shard::Resident(r) => r.field_has_positions(f),
+            Bm25Shard::Segmented(g) => g.field_has_positions(f),
         }
     }
 
@@ -421,6 +457,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.field_has_sentences(f),
             Bm25Shard::Spilling(s) => s.field_has_sentences(f),
             Bm25Shard::Resident(r) => r.field_has_sentences(f),
+            Bm25Shard::Segmented(g) => g.field_has_sentences(f),
         }
     }
 
@@ -432,6 +469,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.set_analysis_fingerprint(f, fingerprint),
             Bm25Shard::Spilling(s) => s.set_analysis_fingerprint(f, fingerprint),
             Bm25Shard::Resident(_) => Ok(()),
+            Bm25Shard::Segmented(g) => g.set_analysis_fingerprint(f, fingerprint),
         }
     }
 
@@ -442,6 +480,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.field_index(name),
             Bm25Shard::Spilling(_) => None,
             Bm25Shard::Resident(r) => r.field_index(name),
+            Bm25Shard::Segmented(g) => g.field_index(name),
         }
     }
 
@@ -452,6 +491,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.facet_index(name),
             Bm25Shard::Spilling(s) => s.facet_index(name),
             Bm25Shard::Resident(r) => r.facet_index(name),
+            Bm25Shard::Segmented(g) => g.facet_index(name),
         }
     }
 
@@ -463,6 +503,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.facet_value_count(fi),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.facet_value_count(fi),
+            Bm25Shard::Segmented(g) => g.facet_value_count(fi),
         }
     }
 
@@ -472,6 +513,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.facet_value(fi, ord),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.facet_value(fi, ord),
+            Bm25Shard::Segmented(g) => g.facet_value(fi, ord),
         }
     }
 
@@ -481,6 +523,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.facet_ord(fi, doc_id),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.facet_ord(fi, doc_id),
+            Bm25Shard::Segmented(g) => g.facet_ord(fi, doc_id),
         }
     }
 
@@ -491,6 +534,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.facet_value_ord_of(fi, value),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.facet_value_ord_of(fi, value),
+            Bm25Shard::Segmented(g) => g.facet_value_ord_of(fi, value),
         }
     }
 
@@ -501,6 +545,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.numeric_index(name),
             Bm25Shard::Spilling(s) => s.numeric_index(name),
             Bm25Shard::Resident(r) => r.numeric_index(name),
+            Bm25Shard::Segmented(g) => g.numeric_index(name),
         }
     }
 
@@ -511,6 +556,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.numeric_min_max(ni),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.numeric_min_max(ni),
+            Bm25Shard::Segmented(g) => g.numeric_min_max(ni),
         }
     }
 
@@ -520,6 +566,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.numeric_value(ni, doc_id),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.numeric_value(ni, doc_id),
+            Bm25Shard::Segmented(g) => g.numeric_value(ni, doc_id),
         }
     }
 
@@ -530,6 +577,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.integer_index(name),
             Bm25Shard::Spilling(s) => s.integer_index(name),
             Bm25Shard::Resident(r) => r.integer_index(name),
+            Bm25Shard::Segmented(g) => g.integer_index(name),
         }
     }
 
@@ -541,6 +589,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.integer_min_max(ii),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.integer_min_max(ii),
+            Bm25Shard::Segmented(g) => g.integer_min_max(ii),
         }
     }
 
@@ -550,6 +599,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.integer_value(ii, doc_id),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.integer_value(ii, doc_id),
+            Bm25Shard::Segmented(g) => g.integer_value(ii, doc_id),
         }
     }
 
@@ -560,6 +610,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.geo_index(name),
             Bm25Shard::Spilling(s) => s.geo_index(name),
             Bm25Shard::Resident(r) => r.geo_index(name),
+            Bm25Shard::Segmented(g) => g.geo_index(name),
         }
     }
 
@@ -570,6 +621,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.geo_value(gi, doc_id),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.geo_value(gi, doc_id),
+            Bm25Shard::Segmented(g) => g.geo_value(gi, doc_id),
         }
     }
 
@@ -842,6 +894,28 @@ impl Bm25Shard {
                         })
                     }
                 }
+                Bm25Shard::Segmented(g) => {
+                    if g.facet_dictionary_sorted(fi) {
+                        let (lo, hi) = ord_range(g.facet_dictionary(fi));
+                        Ok(ResolvedLeaf::FacetOrdRange {
+                            column: Some(fi),
+                            lo,
+                            hi,
+                        })
+                    } else {
+                        let ords = g
+                            .facet_dictionary(fi)
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| admits(v))
+                            .map(|(ord, _)| ord as u32)
+                            .collect();
+                        Ok(ResolvedLeaf::Facet {
+                            column: Some(fi),
+                            ords,
+                        })
+                    }
+                }
                 Bm25Shard::Resident(r) => {
                     if !r.facet_dictionary_sorted(fi) {
                         return Err(unordered(format!("facet column {column:?}")));
@@ -879,6 +953,28 @@ impl Bm25Shard {
                     })
                 } else {
                     let ords = s
+                        .map_facet_values(ci)
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| admits(v))
+                        .map(|(ord, _)| ord as u32)
+                        .collect();
+                    Ok(ResolvedLeaf::MapFacet {
+                        target: Some((ci, key_ord)),
+                        ords,
+                    })
+                }
+            }
+            Bm25Shard::Segmented(g) => {
+                if g.map_facet_values_sorted(ci) {
+                    let (lo, hi) = ord_range(g.map_facet_values(ci));
+                    Ok(ResolvedLeaf::MapFacetOrdRange {
+                        target: Some((ci, key_ord)),
+                        lo,
+                        hi,
+                    })
+                } else {
+                    let ords = g
                         .map_facet_values(ci)
                         .iter()
                         .enumerate()
@@ -970,6 +1066,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_facet_index(name),
             Bm25Shard::Spilling(s) => s.map_facet_index(name),
             Bm25Shard::Resident(r) => r.map_facet_index(name),
+            Bm25Shard::Segmented(g) => g.map_facet_index(name),
         }
     }
 
@@ -979,6 +1076,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_facet_key_ord(ci, key),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_facet_key_ord(ci, key),
+            Bm25Shard::Segmented(g) => g.map_facet_key_ord(ci, key),
         }
     }
 
@@ -988,6 +1086,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_facet_value_count(ci),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_facet_value_count(ci),
+            Bm25Shard::Segmented(g) => g.map_facet_value_count(ci),
         }
     }
 
@@ -997,6 +1096,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_facet_value(ci, ord),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_facet_value(ci, ord),
+            Bm25Shard::Segmented(g) => g.map_facet_value(ci, ord),
         }
     }
 
@@ -1007,6 +1107,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_facet_value_ord(ci, key_ord, doc_id),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_facet_value_ord(ci, key_ord, doc_id),
+            Bm25Shard::Segmented(g) => g.map_facet_value_ord(ci, key_ord, doc_id),
         }
     }
 
@@ -1017,6 +1118,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_facet_value_ord_of(ci, value),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_facet_value_ord_of(ci, value),
+            Bm25Shard::Segmented(g) => g.map_facet_value_ord_of(ci, value),
         }
     }
 
@@ -1026,6 +1128,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_numeric_index(name),
             Bm25Shard::Spilling(s) => s.map_numeric_index(name),
             Bm25Shard::Resident(r) => r.map_numeric_index(name),
+            Bm25Shard::Segmented(g) => g.map_numeric_index(name),
         }
     }
 
@@ -1035,6 +1138,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_numeric_key_ord(ci, key),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_numeric_key_ord(ci, key),
+            Bm25Shard::Segmented(g) => g.map_numeric_key_ord(ci, key),
         }
     }
 
@@ -1044,6 +1148,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_numeric_key_min_max(ci, key_ord),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_numeric_key_min_max(ci, key_ord),
+            Bm25Shard::Segmented(g) => g.map_numeric_key_min_max(ci, key_ord),
         }
     }
 
@@ -1053,6 +1158,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.map_numeric_value(ci, key_ord, doc_id),
             Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
             Bm25Shard::Resident(r) => r.map_numeric_value(ci, key_ord, doc_id),
+            Bm25Shard::Segmented(g) => g.map_numeric_value(ci, key_ord, doc_id),
         }
     }
 
@@ -1063,6 +1169,7 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => Some(Box::new(s.field(f))),
             Bm25Shard::Spilling(_) => None,
             Bm25Shard::Resident(r) => Some(Box::new(r.field(f))),
+            Bm25Shard::Segmented(g) => Some(Box::new(g.field(f))),
         }
     }
 
@@ -2488,6 +2595,51 @@ impl ShardState {
 }
 
 /// The persistence path of a shard's BM25 store: `<index path>.bm25`.
+/// The segment catalog root of a persisted shard: `<index>.segments/`
+/// (`docs/immutable-segments.md`).
+pub fn segments_root(index_path: &std::path::Path) -> PathBuf {
+    let mut name = index_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".segments");
+    index_path.with_file_name(name)
+}
+
+/// The heap store a node's configuration declares: the tail of a
+/// segmented shard, or the whole store of an in-memory one.
+fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
+    let names: Vec<&str> = config.bm25_fields.iter().map(String::as_str).collect();
+    for name in config.position_fields.iter().chain(&config.sentence_fields) {
+        if !names.contains(&name.as_str()) {
+            return Err(format!(
+                "field {name:?} is not in this shard's BM25 field table {names:?}"
+            ));
+        }
+    }
+    let facets: Vec<&str> = config.facet_fields.iter().map(String::as_str).collect();
+    let numerics: Vec<&str> = config.numeric_fields.iter().map(String::as_str).collect();
+    let map_facets: Vec<&str> = config.map_facet_fields.iter().map(String::as_str).collect();
+    let map_numerics: Vec<&str> = config
+        .map_numeric_fields
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let integers: Vec<&str> = config.integer_fields.iter().map(String::as_str).collect();
+    let geos: Vec<&str> = config.geo_fields.iter().map(String::as_str).collect();
+    let positions: Vec<&str> = config.position_fields.iter().map(String::as_str).collect();
+    let sentences: Vec<&str> = config.sentence_fields.iter().map(String::as_str).collect();
+    Ok(Bm25Store::with_fields(&names)
+        .with_facets(&facets)
+        .with_numerics(&numerics)
+        .with_map_facets(&map_facets)
+        .with_map_numerics(&map_numerics)
+        .with_integers(&integers)
+        .with_geos(&geos)
+        .with_positions(&positions)
+        .with_sentences(&sentences))
+}
+
 pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".bm25");
@@ -2875,6 +3027,22 @@ fn wal_append_or_degrade(wal_slot: &mut Option<WalWriter>, op: wal_record::Op) {
 }
 
 /// The shard-owner gRPC service. Cheap to clone (state is shared).
+/// What a seal in flight writes out (`NodeServiceImpl::seal_tail`):
+/// the frozen part's rows and shared artifacts, gathered under the
+/// write lock, written with no lock held.
+struct SealPlan {
+    base: usize,
+    rows: usize,
+    documents: Arc<Bm25Store>,
+    live: LiveDocs,
+    image: Option<Arc<VectorIndex>>,
+    backend_kind: String,
+    catalog: crate::segments::SegmentCatalog,
+    stage: PathBuf,
+    segment_id: String,
+    generation: u64,
+}
+
 #[derive(Clone)]
 pub struct NodeServiceImpl {
     /// Locked shard state; see [`ShardState`].
@@ -2904,6 +3072,9 @@ pub struct NodeServiceImpl {
     materialize_cache: Arc<std::sync::Mutex<Option<CompiledMaterialize>>>,
     /// Optional product-owned phrase vocabulary shared by ingest and query.
     phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
+    /// Seals on this shard run one at a time; the frozen part of a seal
+    /// in flight is the reason (`docs/immutable-segments.md`).
+    seal_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// One compiled MaterializeSpec, cached against spec equality.
@@ -3252,7 +3423,7 @@ impl NodeServiceImpl {
             .as_ref()
             .and_then(|path| recover_generation(path));
 
-        let index = match config.index_path.as_ref() {
+        let mut index = match config.index_path.as_ref() {
             Some(index_path) => {
                 let path = generation
                     .as_ref()
@@ -3282,11 +3453,48 @@ impl NodeServiceImpl {
                         .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
                 );
             }
+            let root = segments_root(index_path);
+            let catalog_exists = root.join("segments.json").exists();
             if bm25_path.exists() {
+                if catalog_exists && generation.is_none() {
+                    return Err(format!(
+                        "{} has both a single-image file and a segment catalog at {}; a shard has \
+                         one layout, and nothing converts on open",
+                        bm25_path.display(),
+                        root.display()
+                    ));
+                }
                 bm25 = Some(
                     Bm25Shard::open(&bm25_path)
                         .map_err(|error| format!("load {}: {error}", bm25_path.display()))?,
                 );
+            } else if generation.is_none()
+                && (catalog_exists
+                    || (config.layout == Layout::Segments
+                        && !bm25_build_dir(&bm25_path).exists()
+                        && index.is_none()))
+            {
+                // The segment layout: an existing catalog, or a fresh
+                // persisted shard under the default. Never a conversion —
+                // a single-image file above took the other branch.
+                let tail = heap_store(&config)?;
+                let shard = SegmentedShard::open(&root, tail)
+                    .map_err(|error| format!("segment catalog {}: {error}", root.display()))?;
+                let set = shard.snapshot().clone();
+                if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
+                    let backend = first
+                        .backend_config()
+                        .map_err(|error| format!("segment vector backend: {error}"))?;
+                    let dim = first
+                        .dim_opt()
+                        .ok_or_else(|| "segment vector image has no dimension".to_string())?;
+                    let tail_image = VectorIndex::from_backend_config(dim, &backend)
+                        .map_err(|error| format!("segment tail image: {error}"))?;
+                    let provider = SegmentedProvider::open(set, tail_image)
+                        .map_err(|error| format!("segment vectors: {error}"))?;
+                    index = Some(VectorIndex::from_provider(provider));
+                }
+                bm25 = Some(Bm25Shard::Segmented(shard));
             } else {
                 let build_dir = bm25_build_dir(&bm25_path);
                 if build_dir.exists() && !allow_missing_bm25 {
@@ -3338,6 +3546,7 @@ impl NodeServiceImpl {
                 stats_epoch: 1,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seal_lock: Arc::new(std::sync::Mutex::new(())),
             config,
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
             rerank_slots: Arc::new(tokio::sync::Semaphore::new(rerank_parallel)),
@@ -3498,6 +3707,18 @@ impl NodeServiceImpl {
             }
         }
         match self.config.index_path.as_ref() {
+            // A new persisted shard under the segment layout: the tail is a
+            // heap store, searchable at once, sealed into the catalog on
+            // flush (docs/immutable-segments.md).
+            Some(p) if self.config.layout == Layout::Segments && generation.is_none() => {
+                let root = segments_root(p);
+                let tail = heap_store(&self.config).map_err(Status::failed_precondition)?;
+                SegmentedShard::open(&root, tail)
+                    .map(Bm25Shard::Segmented)
+                    .map_err(|e| {
+                        Status::internal(format!("segment catalog {}: {e}", root.display()))
+                    })
+            }
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).2);
                 SpillBuilder::create_with_fields(&dir, &names)
@@ -3706,15 +3927,262 @@ impl NodeServiceImpl {
 
     /// Persist the index to its configured path, if any. Shared by the
     /// `Flush` RPC and save-on-shutdown in the binary.
-    pub fn flush_index(&self) -> Result<FlushResponse, Status> {
+    /// A new provider image for `dim`: wrapped as the tail of a
+    /// segmented provider when the shard is segmented, so every row the
+    /// node adds joins the catalog's positional space.
+    fn fresh_index(&self, bm25: Option<&Bm25Shard>, dim: usize) -> Result<VectorIndex, Status> {
+        let created = VectorIndex::create(&self.config.vector_backend, dim, self.config.bit_width)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        match bm25 {
+            Some(Bm25Shard::Segmented(g)) => {
+                let provider = SegmentedProvider::open(g.snapshot().clone(), created)
+                    .map_err(|e| Status::failed_precondition(format!("{e}")))?;
+                Ok(VectorIndex::from_provider(provider))
+            }
+            _ => Ok(created),
+        }
+    }
+
+    /// Seal a segmented shard's tail into a new catalog segment
+    /// (`docs/immutable-segments.md`) in three steps. Under the shard's
+    /// write lock the tail freezes into a read-only part and a fresh
+    /// tail starts after it. With no lock held, the frozen part's
+    /// documents, vectors, FP32 rows, and live bitmap are written,
+    /// hashed, fsynced, and appended to the catalog with one manifest
+    /// swap. Under the write lock again the shard adopts the published
+    /// snapshot. Queries serve the frozen part throughout and ingest
+    /// continues into the new tail. Seals on one shard run one at a
+    /// time, and a seal that failed after freezing is finished by the
+    /// next attempt. The WAL is untouched: sealing changes the on-disk
+    /// layout, not the log's history. Returns whether a segment was
+    /// written.
+    fn seal_tail(&self) -> Result<bool, Status> {
+        let _one_at_a_time = self.seal_lock.lock().expect("seal lock poisoned");
+        let Some(plan) = self.freeze_tail()? else {
+            return Ok(false);
+        };
+        let outcome = self.write_segment(&plan);
+        let _ = std::fs::remove_dir_all(&plan.stage);
+        let published = outcome?;
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
-        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_mut() else {
+            return Err(Status::internal(
+                "the segmented shard changed layout while a seal was in flight",
+            ));
+        };
+        shard
+            .republish(published.clone())
+            .map_err(|e| Status::internal(format!("republish segments: {e}")))?;
+        if let Some(provider) = guard.index.as_mut().and_then(VectorIndex::as_segmented_mut) {
+            provider
+                .republish(published)
+                .map_err(|e| Status::internal(format!("republish vectors: {e}")))?;
+        }
+        guard.stats_epoch += 1;
+        Ok(true)
+    }
+
+    /// Step one of a seal, under the write lock: freeze the tail (or
+    /// pick up the frozen part a failed seal left) and gather what the
+    /// writer needs. `None` when there is nothing to seal.
+    fn freeze_tail(&self) -> Result<Option<SealPlan>, Status> {
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let ShardState {
+            bm25,
+            index,
+            live_docs,
+            mapped_binding,
+            ..
+        } = &mut *guard;
+        let Some(Bm25Shard::Segmented(shard)) = bm25.as_mut() else {
+            return Ok(None);
+        };
+        let provider = index.as_mut().and_then(VectorIndex::as_segmented_mut);
+        let (base, rows, documents) = match shard.frozen() {
+            Some((base, rows, store)) => (base as usize, rows as usize, Arc::clone(store)),
+            None => {
+                let base = shard.tail_base() as usize;
+                let docs = shard.tail().next_doc_id() as usize;
+                let vectors = provider.as_deref().map_or(0, |p| p.tail().len());
+                if docs == 0 && vectors == 0 {
+                    return Ok(None);
+                }
+                if docs != 0 && vectors != 0 && docs != vectors {
+                    return Err(Status::failed_precondition(format!(
+                        "the tail has {docs} documents and {vectors} vectors; a segment's \
+                         artifacts cover the same rows, so ingest through the mapped path, \
+                         which keeps them aligned, or run this shard with --layout=single-image"
+                    )));
+                }
+                let fresh = heap_store(&self.config).map_err(Status::failed_precondition)?;
+                shard.tail_mut().set_binding(mapped_binding.clone());
+                let store = shard.freeze_tail(fresh).map_err(Status::internal)?;
+                (base, docs.max(vectors), store)
+            }
+        };
+        let image = match provider {
+            Some(provider) => match provider.frozen() {
+                Some((_, frozen_rows, image)) => (frozen_rows > 0).then(|| Arc::clone(image)),
+                None => {
+                    let held = provider.tail().len();
+                    let backend = provider
+                        .tail()
+                        .backend_config()
+                        .map_err(|e| Status::internal(format!("tail backend: {e}")))?;
+                    let dim = provider
+                        .tail()
+                        .dim_opt()
+                        .ok_or_else(|| Status::internal("segmented tail image has no dimension"))?;
+                    let fresh = VectorIndex::from_backend_config(dim, &backend)
+                        .map_err(|e| Status::internal(format!("fresh tail image: {e}")))?;
+                    let image = provider
+                        .freeze_tail(fresh, rows)
+                        .map_err(|e| Status::internal(format!("freeze vectors: {e}")))?;
+                    (held > 0).then_some(image)
+                }
+            },
+            None => None,
+        };
+        let backend_kind = image
+            .as_ref()
+            .map(|i| i.descriptor().backend_kind)
+            .unwrap_or_default();
+        let set = shard.snapshot();
+        Ok(Some(SealPlan {
+            base,
+            rows,
+            documents,
+            live: live_docs.slice(base, rows),
+            image,
+            backend_kind,
+            catalog: shard.catalog().clone(),
+            stage: shard.stage_dir(&format!("{:08}", shard.sealed_parts())),
+            segment_id: format!("seg-{:08}", shard.sealed_parts()),
+            generation: set.manifest().epoch + 1,
+        }))
+    }
+
+    /// Step two of a seal, with no lock held: write the frozen part's
+    /// artifacts into the stage directory and append them to the
+    /// catalog, which hashes, fsyncs, and publishes them. The FP32 rows
+    /// are copied out of the exact-vector sidecar under a read lock (a
+    /// sequential copy); their file is written, hashed, and fsynced
+    /// after that lock is released.
+    fn write_segment(
+        &self,
+        plan: &SealPlan,
+    ) -> Result<Arc<crate::segments::OpenedSegmentSet>, Status> {
+        let _ = std::fs::remove_dir_all(&plan.stage);
+        std::fs::create_dir_all(&plan.stage)
+            .map_err(|e| Status::internal(format!("stage {}: {e}", plan.stage.display())))?;
+        let io = |what: &str, e: std::io::Error| Status::internal(format!("seal {what}: {e}"));
+        let bm25_path = plan.stage.join("documents.bm25");
+        plan.documents
+            .save(&bm25_path)
+            .map_err(|e| io("documents", e))?;
+        let live_path = plan.stage.join("live-docs.bin");
+        plan.live
+            .write(&live_path, plan.rows as u64)
+            .map_err(|e| io("live docs", e))?;
+        let (vector_path, exact_path) = match plan.image.as_deref() {
+            Some(image) => {
+                let vector_path = plan.stage.join("vector.index");
+                image
+                    .write(&vector_path)
+                    .map_err(|e| Status::internal(format!("seal vectors: {e}")))?;
+                let (dim, values) = {
+                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let exact = guard.exact_vectors.as_ref().ok_or_else(|| {
+                        Status::failed_precondition(
+                            "sealing a segment with vectors needs the exact-vector sidecar for \
+                             its FP32 rows; the node has none",
+                        )
+                    })?;
+                    if exact.len() < plan.base + plan.rows {
+                        return Err(Status::failed_precondition(format!(
+                            "the exact-vector sidecar has {} rows, fewer than the {} the seal \
+                             covers",
+                            exact.len(),
+                            plan.base + plan.rows
+                        )));
+                    }
+                    let dim = exact.dim().ok_or_else(|| {
+                        Status::failed_precondition("exact-vector sidecar has no dim")
+                    })?;
+                    (dim, exact.row_values(plan.base, plan.base + plan.rows))
+                };
+                let exact_path = plan.stage.join("vectors.f32");
+                ExactVectorStore::from_values(dim, values)
+                    .and_then(|store| store.write(&exact_path))
+                    .map_err(|e| io("exact rows", e))?;
+                (Some(vector_path), Some(exact_path))
+            }
+            None => (None, None),
+        };
+        let source = crate::segments::SegmentSource {
+            segment_id: &plan.segment_id,
+            generation: plan.generation,
+            base_label: plan.base as u64,
+            backend_kind: &plan.backend_kind,
+            vector_path: vector_path.as_deref(),
+            exact_vector_path: exact_path.as_deref(),
+            bm25_path: &bm25_path,
+            live_docs_path: &live_path,
+        };
+        plan.catalog
+            .append(source)
+            .map_err(|e| Status::internal(format!("seal segment: {e}")))
+    }
+
+    /// Whether the tail reached `--seal-tail-docs` (documents or
+    /// vectors; the mapped path grows them together).
+    fn tail_full(&self) -> bool {
+        if self.config.seal_tail_docs == 0 || self.config.index_path.is_none() {
+            return false;
+        }
+        let bound = self.config.seal_tail_docs;
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            return false;
+        };
+        shard.tail().next_doc_id() >= bound
+            || guard
+                .index
+                .as_ref()
+                .and_then(VectorIndex::as_segmented)
+                .is_some_and(|p| p.tail().len() >= bound as usize)
+    }
+
+    /// Seal the tail when it reached the configured size, so a long
+    /// ingest stays bounded without a flush. Blocking; the ingest loops
+    /// call it through [`Self::seal_if_due`].
+    fn seal_if_due_blocking(&self) -> Result<bool, Status> {
+        if self.tail_full() {
+            self.seal_tail()
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The async face of the due-check for the ingest loops: the seal
+    /// itself runs on a blocking thread, with the shard lock free.
+    async fn seal_if_due(&self) -> Result<bool, Status> {
+        if !self.tail_full() {
+            return Ok(false);
+        }
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.seal_if_due_blocking())
+            .await
+            .map_err(|e| Status::internal(format!("seal task failed: {e}")))?
+    }
+
+    pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let Some(config_path) = self.config.index_path.clone() else {
+            let guard = self.state.read().expect("shard state lock poisoned");
             return Ok(FlushResponse {
                 path: String::new(),
-                num_vectors,
-                num_documents,
+                num_vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
+                num_documents: guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
                 written: false,
             });
         };
@@ -3723,12 +4191,20 @@ impl NodeServiceImpl {
         // of the on-disk indexes — never the reverse. An index image
         // whose records the log lost would silently drop those records
         // from every future replay (reshard, recovery).
-        if let Some(wal) = guard.wal.as_mut() {
-            wal.flush()
-                .map_err(|e| Status::internal(format!("wal fsync {}: {e}", wal.dir().display())))?;
+        {
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            if let Some(wal) = guard.wal.as_mut() {
+                wal.flush().map_err(|e| {
+                    Status::internal(format!("wal fsync {}: {e}", wal.dir().display()))
+                })?;
+            }
         }
-        // Flush into the active snapshot generation when one was
-        // installed, else the legacy layout — never split the two.
+        // A segmented shard seals its tail with the lock free (see
+        // `seal_tail`); the single-image writes below hold it.
+        let sealed = self.seal_tail()?;
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
+        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let (vector_path, exact_path, bm25_path) =
             storage_paths(&config_path, guard.generation.as_ref());
         let live_docs_path = live_docs_storage_path(&config_path, guard.generation.as_ref());
@@ -3754,9 +4230,11 @@ impl NodeServiceImpl {
             }
         }
         if let Some(index) = guard.index.as_ref() {
-            index
-                .write(&vector_path)
-                .map_err(|e| Status::internal(format!("write {}: {e}", vector_path.display())))?;
+            if index.as_segmented().is_none() {
+                index.write(&vector_path).map_err(|e| {
+                    Status::internal(format!("write {}: {e}", vector_path.display()))
+                })?;
+            }
         }
         if let Some(exact) = guard.exact_vectors.as_ref() {
             let mapped = exact
@@ -3806,8 +4284,10 @@ impl NodeServiceImpl {
             // bump is what tells a cache to come look again.
             guard.stats_epoch += 1;
         }
-        let written =
-            guard.index.is_some() || guard.exact_vectors.is_some() || guard.bm25.is_some();
+        let written = sealed
+            || guard.index.is_some()
+            || guard.exact_vectors.is_some()
+            || guard.bm25.is_some();
         // Durability point reached: the log was fsynced above, then the
         // indexes hit disk. The marker records that a flush happened;
         // its own fsync failing degrades the log rather than un-flushing
@@ -4290,14 +4770,8 @@ impl NodeServiceImpl {
                     // From-scratch: create the configured provider. Explicit
                     // provisioning is the multi-shard path; this remains the
                     // single-shard convenience path.
-                    guard.index = Some(
-                        VectorIndex::create(
-                            &self.config.vector_backend,
-                            dim,
-                            self.config.bit_width,
-                        )
-                        .map_err(|e| Status::invalid_argument(format!("{e}")))?,
-                    );
+                    let created = self.fresh_index(guard.bm25.as_ref(), dim)?;
+                    guard.index = Some(created);
                     guard.index.as_mut().expect("just constructed")
                 }
             };
@@ -6277,14 +6751,8 @@ impl NodeServiceImpl {
                 if guard.index.is_none() {
                     // From-scratch: same single-shard convenience the
                     // AddVectors path allows.
-                    guard.index = Some(
-                        VectorIndex::create(
-                            &self.config.vector_backend,
-                            dim,
-                            self.config.bit_width,
-                        )
-                        .map_err(|e| Status::invalid_argument(format!("{e}")))?,
-                    );
+                    let created = self.fresh_index(guard.bm25.as_ref(), dim)?;
+                    guard.index = Some(created);
                 }
                 if guard.exact_vectors.is_none() {
                     if vector_tip != 0 {
@@ -6702,6 +7170,30 @@ impl NodeServiceImpl {
             span_end: l.span_end,
         });
         match guard.bm25.as_mut().expect("builder just ensured") {
+            Bm25Shard::Segmented(g) => {
+                let local = doc_id - g.tail_base();
+                let store = g.tail_mut();
+                store.add_document_with_lineage(local, doc.text.clone(), analyzed, lineage);
+                for (fi, value) in &facet_slots {
+                    store.set_facet(*fi, local, value);
+                }
+                for &(ni, value) in &numeric_slots {
+                    store.set_numeric(ni, local, value);
+                }
+                for &(ci, key, value) in &map_facet_slots {
+                    store.set_map_facet(ci, local, key, value);
+                }
+                for &(ci, key, value) in &map_numeric_slots {
+                    store.set_map_numeric(ci, local, key, value);
+                }
+                for &(ii, value) in &integer_slots {
+                    store.set_integer(ii, local, value);
+                }
+                for &(gi, lat, lon) in &geo_slots {
+                    store.set_geo(gi, local, lat, lon);
+                }
+                g.sync_tail();
+            }
             Bm25Shard::Building(store) => {
                 store.add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage);
                 for (fi, value) in &facet_slots {
@@ -7058,6 +7550,11 @@ impl NodeServiceImpl {
         let mut inbound_open = true;
         loop {
             self.advance_apply(&mut pending, &mut results, &mut next_apply, added, first_id)?;
+            // A full tail seals here, between documents, so one long
+            // stream never grows a segment past --seal-tail-docs.
+            if self.seal_if_due().await? {
+                continue;
+            }
             if pending.is_empty() && !inbound_open {
                 break;
             }
@@ -7187,7 +7684,7 @@ impl NodeServiceImpl {
         loop {
             let ready = results.contains_key(next_apply)
                 && pending.get(next_apply).is_some_and(|p| p.outstanding == 0);
-            if !ready {
+            if !ready || self.tail_full() {
                 return Ok(());
             }
             let analyzed = results.remove(next_apply).expect("readiness just checked");
@@ -8845,6 +9342,7 @@ impl NodeService for NodeServiceImpl {
                 first_id = batch_first_id;
             }
             added += batch_added;
+            self.seal_if_due().await?;
         }
         let total = self
             .state
@@ -8993,6 +9491,7 @@ impl NodeService for NodeServiceImpl {
             .as_ref()
             .map_or(0, |b| b.doc_count());
         crate::metrics::add_ingested(added, 0);
+        self.seal_if_due().await?;
         Ok(Response::new(AddDocumentsResponse {
             added,
             total,

@@ -83,10 +83,39 @@ async fn start_wal_node(
     PathBuf,
     JoinHandle<Result<(), TransportError>>,
 ) {
+    start_wal_node_with_layout(
+        pipestream_search::node::Layout::default(),
+        dir,
+        name,
+        slot_offset,
+        wal_buckets,
+        analysis_addr,
+        shift,
+        scale,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_wal_node_with_layout(
+    layout: pipestream_search::node::Layout,
+    dir: &Path,
+    name: &str,
+    slot_offset: u64,
+    wal_buckets: u32,
+    analysis_addr: &str,
+    shift: &[f32],
+    scale: &[f32],
+) -> (
+    NodeServiceClient<tonic::transport::Channel>,
+    PathBuf,
+    JoinHandle<Result<(), TransportError>>,
+) {
     let index_path = dir.join(name);
     let (addr, handle) = common::start_empty_node(NodeConfig {
         slot_offset,
         index_path: Some(index_path.clone()),
+        layout,
         analysis_addr: Some(analysis_addr.to_string()),
         wal: true,
         wal_buckets,
@@ -761,8 +790,18 @@ async fn one_child_reshard_compacts_generation_tombstones() {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
     let (analysis_addr, analysis) = mock_analysis::start_mock_analysis().await;
     std::mem::forget(analysis);
-    let (mut client, index_path, _node) =
-        start_wal_node(&dir, "parent.tv", 0, 8, &analysis_addr, &shift, &scale).await;
+    // The parent's single image is what this test appends into a catalog.
+    let (mut client, index_path, _node) = start_wal_node_with_layout(
+        pipestream_search::node::Layout::SingleImage,
+        &dir,
+        "parent.tv",
+        0,
+        8,
+        &analysis_addr,
+        &shift,
+        &scale,
+    )
+    .await;
     ingest(&mut client, &corpus, rows, rows).await;
     client
         .delete_documents(DeleteDocumentsRequest { doc_ids: vec![3] })
@@ -811,8 +850,10 @@ async fn one_child_reshard_compacts_generation_tombstones() {
             generation: 0,
             base_label: 0,
             backend_kind: EMBEDDED_TURBOVEC,
-            vector_path: &index_path,
-            exact_vector_path: &pipestream_search::node::exact_vector_sidecar_path(&index_path),
+            vector_path: Some(&index_path),
+            exact_vector_path: Some(&pipestream_search::node::exact_vector_sidecar_path(
+                &index_path,
+            )),
             bm25_path: &pipestream_search::node::bm25_sidecar_path(&index_path),
             live_docs_path: &pipestream_search::node::live_docs_sidecar_path(&index_path),
         })
@@ -1022,6 +1063,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
         NodeConfig {
             slot_offset: 0,
             index_path: Some(index_path.clone()),
+            layout: pipestream_search::node::Layout::SingleImage,
             analysis_addr: Some(analysis_addr.to_string()),
             bm25_fields: vec![
                 "body".to_string(),
