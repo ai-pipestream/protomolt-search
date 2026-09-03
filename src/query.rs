@@ -844,17 +844,43 @@ pub async fn execute(
         return execute_recursive_boolean(coordinator, req, &boolean).await;
     }
     let plan = parse_selection(selection)?;
-    let dense_execution = match &plan.shape {
+    let filter = plan
+        .cel
+        .iter()
+        .map(|c| format!("({c})"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let mut dense_execution = match &plan.shape {
         Shape::Dense { query, .. } | Shape::Composite { dense: query, .. } => {
             let requested = dense_execution_mode(query)?;
+            // The policy key AUTO is judged on: k as sent, the named
+            // candidate depth, and the request's filters (their live
+            // selectivity is measured only when a policy is consulted).
+            let filters = (!plan.geo_filters.is_empty() || !plan.cel.is_empty())
+                .then(|| crate::coordinator::RequestFilters::compile(&plan.geo_filters, &filter))
+                .transpose()?;
             Some(
                 coordinator
-                    .resolve_dense_execution(requested, query.vector.len())
+                    .resolve_dense_execution(
+                        requested,
+                        query.vector.len(),
+                        crate::coordinator::DenseRequestKey {
+                            k: req.k,
+                            candidate_depth: req.selection_k,
+                            filters: filters.as_ref(),
+                        },
+                    )
                     .await?,
             )
         }
         _ => None,
     };
+    // A policy point fixes the candidate depth AUTO runs at; it is the
+    // depth that was measured, reported back, and never widened.
+    let policy_depth: Option<u32> = dense_execution
+        .as_ref()
+        .filter(|o| o.resolved_mode == DenseExecutionMode::Ann as i32 && o.policy_point.is_some())
+        .map(|o| o.candidate_depth);
     let fp32_rerank = match &plan.shape {
         Shape::Dense { query, .. } => {
             let mode = dense_score_mode(query)?;
@@ -952,7 +978,7 @@ pub async fn execute(
     let selection_k = if let Some(resolution) = &quality_resolution {
         resolution.selection_k
     } else if req.selection_k == 0 {
-        req.k
+        policy_depth.unwrap_or(req.k)
     } else {
         req.selection_k
     };
@@ -980,7 +1006,7 @@ pub async fn execute(
         || scorer.is_some()
         || !req.boosts.is_empty()
         || fp32_rerank;
-    if !pooled && selection_k != req.k {
+    if !pooled && policy_depth.is_none() && selection_k != req.k {
         return Err(refuse(
             "selection_k differs from k but nothing on a single-leaf shape uses the \
              extra depth; naming it would be a silent no-op",
@@ -1017,16 +1043,22 @@ pub async fn execute(
             }
             selection_k
         }
-        (_, Some(c)) => c.rank + req.k,
-        (_, None) => req.k,
+        (_, Some(c)) => match policy_depth {
+            Some(depth) => {
+                if u64::from(c.rank) + u64::from(req.k) > u64::from(depth) {
+                    return Err(Status::failed_precondition(format!(
+                        "the policy candidate depth = {depth} is exhausted at rank {}; a deeper \
+                         traversal is a different measured point; re-run from the first page \
+                         with a selection_k the policy measured",
+                        c.rank
+                    )));
+                }
+                depth
+            }
+            None => c.rank + req.k,
+        },
+        (_, None) => policy_depth.unwrap_or(req.k),
     };
-
-    let filter = plan
-        .cel
-        .iter()
-        .map(|c| format!("({c})"))
-        .collect::<Vec<_>>()
-        .join(" && ");
 
     match &plan.shape {
         Shape::Browse => {
@@ -1258,6 +1290,16 @@ pub async fn execute(
                     provider_backend: resolution.provider_backend,
                     scoring_fingerprint: resolution.scoring_fingerprint,
                 });
+            if fp32_rerank {
+                if let Some(outcome) = dense_execution.as_mut() {
+                    if outcome.resolved_mode == DenseExecutionMode::Ann as i32 {
+                        outcome.planner_reason.push_str(
+                            "; FP32 rerank rescored that candidate pool without widening it, so \
+                             the traversal stays approximate",
+                        );
+                    }
+                }
+            }
             response.dense_execution = dense_execution;
             Ok(response)
         }

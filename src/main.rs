@@ -437,6 +437,7 @@ struct CorpusSpec<'a> {
     bm25_k1: f32,
     bm25_b: f32,
     dense_quality_profile: Option<&'a Path>,
+    dense_execution_policy: Option<&'a Path>,
     replica_state_path: Option<&'a Path>,
     control_state_path: Option<&'a Path>,
     clustered_turbovec: Option<&'a ClusteredTurboVecConfig>,
@@ -489,6 +490,17 @@ async fn build_corpus(
             profile.measured_queries()
         );
         coordinator = coordinator.with_dense_quality_profile(profile);
+    }
+    if let Some(path) = dataset.dense_execution_policy {
+        let policy = pipestream_search::dense_policy::DenseExecutionPolicy::load(path)?;
+        eprintln!(
+            "dense execution policy: {} ({}, {} measured queries, {} points)",
+            path.display(),
+            policy.policy_id(),
+            policy.measured_queries(),
+            policy.points().len()
+        );
+        coordinator = coordinator.with_dense_execution_policy(policy);
     }
     if let Some(clustered) = dataset.clustered_turbovec {
         let backend = match clustered {
@@ -711,6 +723,7 @@ async fn build_collections(
                 bm25_k1: cfg.bm25_k1,
                 bm25_b: cfg.bm25_b,
                 dense_quality_profile: cfg.dense_quality_profile.as_deref(),
+                dense_execution_policy: cfg.dense_execution_policy.as_deref(),
                 replica_state_path: cfg.replica_state_path.as_deref(),
                 control_state_path: cfg.control_state_path.as_deref(),
                 clustered_turbovec: cfg.clustered_turbovec.as_ref(),
@@ -746,6 +759,7 @@ async fn build_collections(
                     bm25_k1: c.bm25_k1,
                     bm25_b: c.bm25_b,
                     dense_quality_profile: c.dense_quality_profile.as_deref(),
+                    dense_execution_policy: c.dense_execution_policy.as_deref(),
                     replica_state_path: c.replica_state_path.as_deref(),
                     control_state_path: c.control_state_path.as_deref(),
                     clustered_turbovec: None,

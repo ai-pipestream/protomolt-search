@@ -34,6 +34,7 @@ pub mod config;
 pub mod control_plane;
 pub mod coordinator;
 pub mod demo;
+pub mod dense_policy;
 pub mod embedded;
 pub mod exact_vectors;
 pub mod filter;

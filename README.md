@@ -42,6 +42,11 @@ The implemented public query contract is [docs/query-api.md](docs/query-api.md):
 selection first, candidate-scoped boosts second, then a named-signal composite
 scorer. [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
 provisional replacement revisions and an explicit terminal certificate.
+`DENSE_EXECUTION_MODE_AUTO` chooses a dense traversal only through the
+generation-bound policy in
+[docs/dense-execution-policy.md](docs/dense-execution-policy.md): exhaustive
+providers resolve to `EXACT`, a configured ANN provider only at a measured
+point, and the response reports which.
 Block-max pruning, designed for the lexical leg and measured dead on the
 vector leg: [README-block-max.md](README-block-max.md) (overview) and
 [docs/block-max.md](docs/block-max.md) (design doc).

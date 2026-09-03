@@ -187,17 +187,26 @@ not silently over-fetch by an undocumented factor.
 - `ANN` accepts a provider's configured approximate traversal. It fails on the
   current embedded TurboVec provider because that provider exposes exhaustive
   traversal, not a configured ANN path.
-- `AUTO` asks the coordinator to choose. It is deliberately conservative in
-  the first implementation: the current exhaustive provider resolves to
-  `EXACT`; a configured ANN provider is refused until a generation-bound,
-  benchmark-qualified adaptive policy exists. That policy must account for
-  requested k, filter selectivity, candidate depth, and provider controls such
-  as IVF `nprobe` instead of hiding one fixed approximation setting.
+- `AUTO` asks the coordinator to choose, and it chooses only through
+  evidence. An exhaustive provider resolves to `EXACT`, bitwise the same
+  response as `EXACT`. A configured ANN provider resolves to `ANN` only
+  through the generation-bound policy installed with
+  `--dense-execution-policy` (`docs/dense-execution-policy.md`): the policy's
+  identity (embedding model, corpus generation and row count, dimensions,
+  provider kind, scoring fingerprint) must match the live cluster, and the
+  request must match a measured point exactly on `k`, the filter's live
+  selectivity band, and the candidate depth. No policy, a mismatched
+  identity, or an unmeasured key refuses by name; nothing is interpolated
+  and no provider control is hidden behind a default.
 
 Every successful selection containing a dense leaf returns
 `QueryResponse.dense_execution`. It records the requested and resolved modes,
 provider kind, provider quality contract, scoring fingerprint, exhaustive
-completion status, and planner reason. Mixed provider kinds, scoring spaces,
+completion status, and planner reason, and — when AUTO went through a
+policy — the policy id and fingerprint, the point it matched, the live
+filter selectivity, and the candidate depth the providers were asked for.
+An `ANN` resolution stays `ANN` under `DENSE_SCORE_MODE_FP32_RERANK`: the
+rerank rescores the candidate pool, it does not widen it. Mixed provider kinds, scoring spaces,
 dimensions, quality contracts, or completion capabilities across shards fail
 preflight. An approximate response therefore cannot be confused with a
 corpus-wide exact result.

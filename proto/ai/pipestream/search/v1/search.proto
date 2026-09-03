@@ -4335,6 +4335,28 @@ message DenseExecutionOutcome {
   bool exhaustive_completion = 6;
   // Stable, human-readable planner explanation for logs and experiments.
   string planner_reason = 7;
+  // AUTO provenance: the generation-bound policy that admitted the resolved
+  // traversal, and the point it matched. Empty when AUTO resolved to EXACT on
+  // an exhaustive provider, and for explicit EXACT/ANN requests.
+  string policy_id = 8;
+  string policy_fingerprint = 9;
+  DensePolicyPoint policy_point = 10;
+  // The live request key AUTO was judged on: filter selectivity in parts per
+  // million of the corpus (1,000,000 when unfiltered) and the candidate depth
+  // the providers were asked for. Set whenever a policy was consulted.
+  uint32 filter_selectivity_ppm = 11;
+  uint32 candidate_depth = 12;
+}
+
+// One measured point of a dense execution policy
+// (docs/dense-execution-policy.md): the exact key a request must match and
+// the recall measured there against the exhaustive traversal.
+message DensePolicyPoint {
+  uint32 k = 1;
+  uint32 filter_selectivity_ppm_min = 2;
+  uint32 filter_selectivity_ppm_max = 3;
+  uint32 candidates = 4;
+  uint32 measured_recall_ppm = 5;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the
