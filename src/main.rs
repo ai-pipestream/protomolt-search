@@ -13,7 +13,7 @@
 //! ```text
 //! # Single-process demo: coordinator + node + random demo corpus,
 //! # then one self-issued search against itself.
-//! pipestream-search --role=both --demo-vectors=20000 \
+//! pipestream-search --role=both --demo-vectors=20000 --allow-plaintext \
 //!     --nodes=127.0.0.1:50051 --demo-query
 //!
 //! # Static two-machine cluster (see README "Two-machine runbook").
@@ -141,6 +141,7 @@ async fn shutdown_signal() {
 }
 
 async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
+    pipestream_search::security::install_client_tls(cfg.client_tls.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -177,6 +178,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         for shard in &cfg.shards {
             let node_config = NodeConfig {
                 collection: shard.collection.clone(),
+                udp_hmac_key: cfg.udp_hmac_key.clone(),
                 vector_backend: shard.vector_backend.clone(),
                 slot_offset: shard.slot_offset,
                 chunk_blocks: cfg.chunk_blocks,
@@ -222,7 +224,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let max = cfg.max_message_bytes;
             let mut shutdown = shutdown_rx.clone();
             handles.push(tokio::spawn(
-                Server::builder()
+                secured_server(cfg.tls.as_ref(), true)?
                     .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                     .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                     .add_service(NodeServiceImpl::into_server(node, max))
@@ -261,7 +263,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         let max = cfg.max_message_bytes;
         let mut shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(
-            Server::builder()
+            secured_server(cfg.tls.as_ref(), false)?
                 .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                 .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                 .add_optional_service(control_set.map(|set| set.into_server(max)))
@@ -351,7 +353,7 @@ async fn configure_backend(args: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err("configure-backend requires at least one --apply-to node".into());
     }
 
-    let mut source = NodeServiceClient::connect(fit_from.clone()).await?;
+    let mut source = NodeServiceClient::new(secure_channel(&fit_from).await?);
     let backend = source
         .get_vector_backend(GetVectorBackendRequest {})
         .await?
@@ -371,7 +373,7 @@ async fn configure_backend(args: &[String]) -> Result<(), Box<dyn std::error::Er
     );
 
     for addr in &apply_to {
-        let mut client = NodeServiceClient::connect(addr.clone()).await?;
+        let mut client = NodeServiceClient::new(secure_channel(addr).await?);
         let resp = client
             .configure_vector_backend(ConfigureVectorBackendRequest {
                 dim: descriptor.dim,
@@ -389,6 +391,35 @@ async fn configure_backend(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
     }
     Ok(())
+}
+
+/// A server builder under the configured listener TLS (`docs/security.md`):
+/// node listeners demand a client certificate, the coordinator listener
+/// accepts one and lets cluster control demand it per call.
+fn secured_server(
+    tls: Option<&pipestream_search::security::ServerTls>,
+    require_client: bool,
+) -> Result<Server, Box<dyn std::error::Error>> {
+    match tls {
+        None => Ok(Server::builder()),
+        #[cfg(feature = "tls")]
+        Some(tls) => Ok(Server::builder().tls_config(tls.server_config(require_client))?),
+        #[cfg(not(feature = "tls"))]
+        Some(_) => {
+            let _ = require_client;
+            Err("this build has no TLS support (feature `tls` is off)".into())
+        }
+    }
+}
+
+/// A channel to a cluster member under the process-wide client TLS
+/// material when installed (`docs/security.md`).
+async fn secure_channel(
+    addr: &str,
+) -> Result<tonic::transport::Channel, Box<dyn std::error::Error>> {
+    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())?;
+    let endpoint = pipestream_search::security::secure_endpoint(endpoint)?;
+    Ok(endpoint.connect().await?)
 }
 
 /// One dataset's coordinator settings (`docs/collections.md`): the
@@ -442,6 +473,12 @@ async fn build_corpus(
         .with_max_rerank_bytes(cfg.max_rerank_bytes)
         .with_topology_generation(dataset.shard_map.map_or(0, |map| map.generation))
         .with_collection(dataset.name);
+    if let Some(tls) = &cfg.client_tls {
+        coordinator = coordinator.with_client_tls(tls.clone());
+    }
+    if let Some(key) = &cfg.udp_hmac_key {
+        coordinator = coordinator.with_udp_hmac_key(key.clone());
+    }
     if let Some(path) = dataset.dense_quality_profile {
         let profile = pipestream_search::quality::DenseQualityProfile::load(path)?;
         eprintln!(
@@ -606,7 +643,9 @@ async fn build_corpus(
             coordinator.current_topology_generation(),
             &coordinator.current_topology_routes(),
         )?;
-        let control = ClusterControlService::new(plane).with_coordinator(coordinator.clone());
+        let control = ClusterControlService::new(plane)
+            .with_coordinator(coordinator.clone())
+            .with_client_cert_required(cfg.tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()));
         control.publish_current_topology()?;
         if cfg.control_reconcile_ms > 0 {
             let reconcile = control.clone();
@@ -683,10 +722,12 @@ async fn build_collections(
             "SearchService listening on {addr} ({} shard nodes)",
             cfg.node_addrs.len()
         );
-        (
-            CollectionSet::single(coordinator),
-            control.map(ClusterControlSet::single),
-        )
+        let set = CollectionSet::single(coordinator);
+        let set = match &cfg.principals {
+            Some(p) => set.with_principals(p.clone()),
+            None => set,
+        };
+        (set, control.map(ClusterControlSet::single))
     } else {
         let mut members = Vec::with_capacity(cfg.collections.len());
         let mut controls = Vec::new();
@@ -728,6 +769,10 @@ async fn build_collections(
             }
         }
         let set = CollectionSet::named(members, cfg.default_collection.clone())?;
+        let set = match &cfg.principals {
+            Some(p) => set.with_principals(p.clone()),
+            None => set,
+        };
         let control = if controls.is_empty() {
             None
         } else {

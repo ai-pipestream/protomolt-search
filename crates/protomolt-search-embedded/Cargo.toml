@@ -9,7 +9,7 @@ description = "Embedded, no-egress Protomolt Search runtime for Android, iOS, an
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
-pipestream-search = { path = "../.." }
+pipestream-search = { path = "../..", default-features = false }
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tokio-stream = "0.1"

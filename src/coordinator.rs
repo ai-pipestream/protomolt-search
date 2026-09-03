@@ -275,6 +275,13 @@ pub struct CoordinatorServiceImpl {
     /// collection is refused by `admit`; a node reporting another is
     /// refused by `verify_collection_membership` and flagged in health.
     collection: String,
+    /// TLS material for the channels to shards (`docs/security.md`);
+    /// `None` uses the process-wide material when installed, plaintext
+    /// otherwise.
+    client_tls: Option<crate::security::ClientTls>,
+    /// The key that signs UDP floor and cancel datagrams; without one
+    /// the datagrams are plain, which a node accepts on loopback only.
+    udp_hmac_key: Option<crate::security::UdpKey>,
     /// Optional replica address per shard (same data, exact same
     /// results), the target for hedged retries.
     replica_addrs: Vec<Option<String>>,
@@ -1526,6 +1533,8 @@ impl CoordinatorServiceImpl {
         Self {
             node_addrs,
             collection: String::new(),
+            client_tls: None,
+            udp_hmac_key: None,
             replica_addrs: Vec::new(),
             analysis_addr: None,
             bm25_params: Bm25Params::default(),
@@ -1940,6 +1949,20 @@ impl CoordinatorServiceImpl {
     /// single dataset.
     pub fn collection(&self) -> &str {
         &self.collection
+    }
+
+    /// TLS material for every channel this coordinator opens to a shard
+    /// (`docs/security.md`).
+    pub fn with_client_tls(mut self, tls: crate::security::ClientTls) -> Self {
+        self.client_tls = Some(tls);
+        self
+    }
+
+    /// The key that signs this coordinator's UDP floor and cancel
+    /// datagrams (`docs/security.md`).
+    pub fn with_udp_hmac_key(mut self, key: crate::security::UdpKey) -> Self {
+        self.udp_hmac_key = Some(key);
+        self
     }
 
     /// The shard addresses this coordinator fans out to, in shard order.
@@ -2450,6 +2473,13 @@ impl CoordinatorServiceImpl {
             // window-update round trips (see H2_STREAM_WINDOW).
             .initial_stream_window_size(crate::H2_STREAM_WINDOW)
             .initial_connection_window_size(crate::H2_CONN_WINDOW);
+        let endpoint = crate::security::apply_client_tls(
+            endpoint,
+            self.client_tls
+                .as_ref()
+                .or(crate::security::process_client_tls()),
+        )
+        .map_err(Status::failed_precondition)?;
         let ch = endpoint.connect_lazy();
         cache.insert(addr.to_string(), ch.clone());
         Ok(ch)
@@ -5711,6 +5741,8 @@ impl CoordinatorServiceImpl {
             floor_txs,
             udp_lanes,
             udp_socket,
+            udp_key: self.udp_hmac_key.clone(),
+            udp_seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
     }
 
@@ -5732,8 +5764,11 @@ impl CoordinatorServiceImpl {
             if let (Some(socket), Some((token, target))) =
                 (fanout.udp_socket.as_deref(), fanout.udp_lanes[si])
             {
-                let dgram = crate::stream_signal::encode_floor(token, floor);
-                let _ = socket.send_to(&dgram, target);
+                fanout.send_signal(
+                    socket,
+                    target,
+                    crate::stream_signal::encode_floor(token, floor),
+                );
             }
             let _ = tx.try_send(update.clone());
         }
@@ -8360,9 +8395,36 @@ struct StreamFanout {
     floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>>,
     udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>>,
     udp_socket: Option<Arc<std::net::UdpSocket>>,
+    /// The signing key and a sequence shared by every lane of this
+    /// fan-out (docs/security.md); a node ignores a sequence at or
+    /// behind the newest it applied, so each token sees them ascend.
+    udp_key: Option<crate::security::UdpKey>,
+    udp_seq: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl StreamFanout {
+    /// Send one typed frame to a lane, signed when a key is configured.
+    fn send_signal(
+        &self,
+        socket: &std::net::UdpSocket,
+        target: std::net::SocketAddr,
+        frame: [u8; crate::stream_signal::FRAME_LEN],
+    ) {
+        match &self.udp_key {
+            Some(key) => {
+                let seq = self
+                    .udp_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    + 1;
+                let signed = crate::stream_signal::sign(key, seq, &frame);
+                let _ = socket.send_to(&signed, target);
+            }
+            None => {
+                let _ = socket.send_to(&frame, target);
+            }
+        }
+    }
+
     fn send_udp_cancel(&self) {
         let Some(socket) = self.udp_socket.as_deref() else {
             return;
@@ -8372,8 +8434,7 @@ impl StreamFanout {
                 continue;
             }
             if let Some((token, target)) = self.udp_lanes[shard] {
-                let frame = crate::stream_signal::encode_cancel(token);
-                let _ = socket.send_to(&frame, target);
+                self.send_signal(socket, target, crate::stream_signal::encode_cancel(token));
             }
         }
     }
@@ -8791,9 +8852,10 @@ impl CoordinatorServiceImpl {
     /// the bind: it names the collection the whole stream writes into
     /// (`docs/collections.md`).
     pub async fn routed_bind(
-        inbound: &mut Streaming<RoutedIngestMappedRequest>,
+        inbound: &mut (impl tokio_stream::Stream<Item = Result<RoutedIngestMappedRequest, Status>>
+                  + Unpin),
     ) -> Result<crate::pb::RoutedMappedBind, Status> {
-        match inbound.message().await? {
+        match tokio_stream::StreamExt::next(inbound).await.transpose()? {
             Some(RoutedIngestMappedRequest {
                 payload: Some(crate::pb::routed_ingest_mapped_request::Payload::Bind(bind)),
             }) => Ok(bind),
@@ -8806,11 +8868,14 @@ impl CoordinatorServiceImpl {
     /// Routed mapped ingest after its bind was read (and, on a collection
     /// set, resolved): the write gate, the topology snapshot, and the
     /// per-shard fan-out.
-    pub async fn routed_ingest_mapped_bound(
+    pub async fn routed_ingest_mapped_bound<S>(
         &self,
         bind: crate::pb::RoutedMappedBind,
-        mut inbound: Streaming<RoutedIngestMappedRequest>,
-    ) -> Result<RoutedIngestMappedResponse, Status> {
+        mut inbound: S,
+    ) -> Result<RoutedIngestMappedResponse, Status>
+    where
+        S: tokio_stream::Stream<Item = Result<RoutedIngestMappedRequest, Status>> + Unpin + Send,
+    {
         // Gate before snapshotting: a write that arrived during a cutover
         // must resume into the new map, never retain the old snapshot while
         // waiting behind the final-tail barrier.
@@ -8833,7 +8898,10 @@ impl CoordinatorServiceImpl {
             .ok_or_else(|| Status::invalid_argument("routed mapped bind is missing bind"))?;
         let mut batches: Vec<Vec<crate::pb::IngestMappedRequest>> =
             vec![Vec::new(); self.node_addrs.len()];
-        while let Some(message) = inbound.message().await? {
+        while let Some(message) = tokio_stream::StreamExt::next(&mut inbound)
+            .await
+            .transpose()?
+        {
             let document = match message.payload {
                 Some(crate::pb::routed_ingest_mapped_request::Payload::Document(document)) => {
                     document
@@ -10370,6 +10438,8 @@ mod stream_cancel_tests {
             floor_txs: vec![Some(request_tx)],
             udp_lanes: vec![Some((token, target))],
             udp_socket: Some(udp_tx),
+            udp_key: None,
+            udp_seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         fanout.cancel().await;
@@ -10411,6 +10481,8 @@ mod stream_cancel_tests {
             floor_txs: vec![Some(request_tx)],
             udp_lanes: vec![Some((token, target))],
             udp_socket: Some(udp_tx),
+            udp_key: None,
+            udp_seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
 
         let request = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())

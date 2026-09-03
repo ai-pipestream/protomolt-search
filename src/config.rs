@@ -352,6 +352,23 @@ pub struct Config {
     /// The collection an unnamed request gets to, when configured; with
     /// named collections and no default, unnamed requests refuse.
     pub default_collection: Option<String>,
+    /// Listener TLS (`docs/security.md`): `--tls-cert`, `--tls-key`, and
+    /// the cluster CA (`--tls-client-ca`) client certificates chain to.
+    /// Once set, every listener speaks TLS and plaintext is refused.
+    pub tls: Option<crate::security::ServerTls>,
+    /// What this process presents and trusts on cluster-internal
+    /// channels (`--tls-ca`, `--tls-client-cert`, `--tls-client-key`,
+    /// `--tls-domain`).
+    pub client_tls: Option<crate::security::ClientTls>,
+    /// Serve plaintext gRPC on a non-loopback listener without TLS
+    /// (`--allow-plaintext`). Loopback listeners never need it.
+    pub allow_plaintext: bool,
+    /// Bearer principals for the public search surface
+    /// (`--bearer-tokens=<toml>`); unset serves anonymous callers.
+    pub principals: Option<std::sync::Arc<crate::security::Principals>>,
+    /// The key that authenticates UDP floor and cancel datagrams
+    /// (`--udp-hmac-key=<file>`).
+    pub udp_hmac_key: Option<crate::security::UdpKey>,
     /// Documents per vocabulary window before automatic rollover (only
     /// relevant to shards with `vocab` enabled).
     pub vocab_window_docs: u64,
@@ -397,6 +414,16 @@ struct FileCollection {
 struct FileConfig {
     collections: Vec<FileCollection>,
     default_collection: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_client_ca: Option<String>,
+    tls_ca: Option<String>,
+    tls_client_cert: Option<String>,
+    tls_client_key: Option<String>,
+    tls_domain: Option<String>,
+    allow_plaintext: Option<bool>,
+    bearer_tokens: Option<String>,
+    udp_hmac_key: Option<String>,
     role: Option<String>,
     node_listen: Option<String>,
     coord_listen: Option<String>,
@@ -1734,6 +1761,128 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             });
         }
     }
+    // The security surface (docs/security.md). Files are read here so a
+    // missing certificate refuses at startup, not at the first connection.
+    let path_opt = |key: &str, env: &str, file_value: Option<&str>| {
+        opt(args, key, env, file_value).map(PathBuf::from)
+    };
+    let tls_cert = path_opt(
+        "tls-cert",
+        "PIPESTREAM_SEARCH_TLS_CERT",
+        file.tls_cert.as_deref(),
+    );
+    let tls_key = path_opt(
+        "tls-key",
+        "PIPESTREAM_SEARCH_TLS_KEY",
+        file.tls_key.as_deref(),
+    );
+    let tls_client_ca = path_opt(
+        "tls-client-ca",
+        "PIPESTREAM_SEARCH_TLS_CLIENT_CA",
+        file.tls_client_ca.as_deref(),
+    );
+    let tls = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => Some(crate::security::ServerTls::load(
+            &cert,
+            &key,
+            tls_client_ca.as_deref(),
+        )?),
+        (None, None) => {
+            if tls_client_ca.is_some() {
+                return Err("--tls-client-ca needs --tls-cert and --tls-key".to_string());
+            }
+            None
+        }
+        _ => return Err("TLS needs both --tls-cert and --tls-key".to_string()),
+    };
+    let tls_ca = path_opt("tls-ca", "PIPESTREAM_SEARCH_TLS_CA", file.tls_ca.as_deref());
+    let tls_client_cert = path_opt(
+        "tls-client-cert",
+        "PIPESTREAM_SEARCH_TLS_CLIENT_CERT",
+        file.tls_client_cert.as_deref(),
+    );
+    let tls_client_key = path_opt(
+        "tls-client-key",
+        "PIPESTREAM_SEARCH_TLS_CLIENT_KEY",
+        file.tls_client_key.as_deref(),
+    );
+    let tls_domain = opt(
+        args,
+        "tls-domain",
+        "PIPESTREAM_SEARCH_TLS_DOMAIN",
+        file.tls_domain.as_deref(),
+    );
+    let client_tls = match tls_ca {
+        Some(ca) => Some(crate::security::ClientTls::load(
+            &ca,
+            tls_client_cert.as_deref(),
+            tls_client_key.as_deref(),
+            tls_domain,
+        )?),
+        None => {
+            if tls_client_cert.is_some() || tls_client_key.is_some() || tls_domain.is_some() {
+                return Err(
+                    "--tls-client-cert / --tls-client-key / --tls-domain need --tls-ca".to_string(),
+                );
+            }
+            None
+        }
+    };
+    let allow_plaintext = flag_present(args, "allow-plaintext")
+        || std::env::var("PIPESTREAM_SEARCH_ALLOW_PLAINTEXT")
+            .map(|s| parse_env_bool(&s))
+            .unwrap_or(false)
+        || file.allow_plaintext.unwrap_or(false);
+    if tls.is_some() && allow_plaintext {
+        return Err(
+            "--allow-plaintext contradicts --tls-cert: once TLS is set, plaintext is refused"
+                .to_string(),
+        );
+    }
+    if tls.is_none() && !allow_plaintext {
+        let mut listeners: Vec<SocketAddr> = shards.iter().map(|s| s.listen).collect();
+        if matches!(role, Role::Coordinator | Role::Both) {
+            listeners.push(coord_listen);
+        }
+        if let Some(addr) = listeners
+            .iter()
+            .find(|addr| !crate::security::is_loopback(addr))
+        {
+            return Err(format!(
+                "listener {addr} is not loopback and no TLS is configured; pass --tls-cert and \
+                 --tls-key, or --allow-plaintext to serve plaintext gRPC there on purpose"
+            ));
+        }
+    }
+    if matches!(role, Role::Node | Role::Both)
+        && tls.as_ref().is_some_and(|t| t.client_ca_pem.is_none())
+    {
+        return Err(
+            "node listeners run mTLS: --tls-client-ca (the cluster CA) is required with --tls-cert"
+                .to_string(),
+        );
+    }
+    if matches!(role, Role::Coordinator | Role::Both) && tls.is_some() && client_tls.is_none() {
+        return Err(
+            "a TLS coordinator needs --tls-ca (and --tls-client-cert / --tls-client-key, its \
+             membership) to reach its nodes"
+                .to_string(),
+        );
+    }
+    let principals = path_opt(
+        "bearer-tokens",
+        "PIPESTREAM_SEARCH_BEARER_TOKENS",
+        file.bearer_tokens.as_deref(),
+    )
+    .map(|path| crate::security::Principals::load(&path).map(std::sync::Arc::new))
+    .transpose()?;
+    let udp_hmac_key = path_opt(
+        "udp-hmac-key",
+        "PIPESTREAM_SEARCH_UDP_HMAC_KEY",
+        file.udp_hmac_key.as_deref(),
+    )
+    .map(|path| crate::security::UdpKey::load(&path))
+    .transpose()?;
     let default_collection = file.default_collection.clone();
     if let Some(name) = &default_collection {
         if !collections.iter().any(|c| &c.name == name) {
@@ -1825,6 +1974,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         control_compact_tombstone_ppm,
         collections,
         default_collection,
+        tls,
+        client_tls,
+        allow_plaintext,
+        principals,
+        udp_hmac_key,
         vocab_window_docs,
         vocab_top_k,
     })
@@ -1834,7 +1988,21 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
 mod tests {
     use super::*;
 
+    /// The arguments of one test plus `--allow-plaintext`: these tests
+    /// bind the non-loopback defaults and are about other knobs, and
+    /// plaintext off loopback needs the explicit flag (docs/security.md).
     fn args(pairs: &[&str]) -> Vec<String> {
+        let mut v = args_raw(pairs);
+        if !pairs
+            .iter()
+            .any(|p| p.starts_with("--tls-") || *p == "--allow-plaintext")
+        {
+            v.push("--allow-plaintext".to_string());
+        }
+        v
+    }
+
+    fn args_raw(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
     }
 

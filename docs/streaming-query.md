@@ -92,3 +92,13 @@ must keep that presentation marked provisional. Commit the result, cache a
 page token, or make an automated decision only from a successful terminal
 response. On `completed=false`, discard every provisional revision from that
 request.
+
+## The UDP fast lane and its key
+
+Floor raises and cancels are duplicated on UDP to shorten the time a
+shard takes to notice them; the gRPC stream stays authoritative. Since
+2026-09-02 (`docs/security.md`) the datagrams carry an HMAC-SHA256 tag
+and a sequence under `--udp-hmac-key`: a node with the key ignores a
+datagram that does not verify or that repeats or precedes the newest
+sequence it applied, and a node without the key opens the lane on a
+loopback listener only.

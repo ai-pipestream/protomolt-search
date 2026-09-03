@@ -222,6 +222,11 @@ pub struct NodeConfig {
     /// on every logged document, checked on every bind, and matched
     /// against the WAL manifest at open.
     pub collection: String,
+    /// The key that authenticates UDP floor and cancel datagrams
+    /// (`docs/security.md`). With a key, only signed datagrams with a
+    /// fresh sequence are applied; without one, unsigned datagrams are
+    /// accepted on a loopback listener only.
+    pub udp_hmac_key: Option<crate::security::UdpKey>,
     /// Source fields whose adjacent-token pairs are derived into a
     /// bigram column named `<source>.bigrams`, which must itself be in
     /// `bm25_fields`. Derived at ingest from the source's positions, so
@@ -282,6 +287,7 @@ impl Default for NodeConfig {
             position_fields: Vec::new(),
             sentence_fields: Vec::new(),
             collection: String::new(),
+            udp_hmac_key: None,
             bigram_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
@@ -2960,6 +2966,9 @@ fn raise_floor_cell(cell: &std::sync::atomic::AtomicU32, floor: f32) {
 struct StreamSignals {
     floor: std::sync::atomic::AtomicU32,
     cancelled: std::sync::atomic::AtomicBool,
+    /// The newest signed sequence applied to this stream; a datagram
+    /// at or behind it is a replay and is ignored.
+    last_seq: std::sync::atomic::AtomicU32,
 }
 
 impl StreamSignals {
@@ -2967,6 +2976,26 @@ impl StreamSignals {
         Self {
             floor: std::sync::atomic::AtomicU32::new(initial_floor.to_bits()),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            last_seq: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Accept `seq` when it is newer than the last applied one.
+    fn accept_seq(&self, seq: u32) -> bool {
+        let mut current = self.last_seq.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if seq <= current {
+                return false;
+            }
+            match self.last_seq.compare_exchange_weak(
+                current,
+                seq,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(seen) => current = seen,
+            }
         }
     }
 }
@@ -2977,9 +3006,18 @@ impl StreamSignals {
 /// stream carries the matching `StopStreamSearch`.
 fn apply_stream_datagram(
     signals: &std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>>,
+    key: Option<&crate::security::UdpKey>,
     datagram: &[u8],
 ) {
-    let signal = crate::stream_signal::decode(datagram);
+    // With a key configured only a signed datagram is read at all
+    // (docs/security.md); the plain frame is for loopback lanes.
+    let (signal, seq) = match key {
+        Some(key) => match crate::stream_signal::decode_signed(key, datagram) {
+            Some((signal, seq)) => (Some(signal), Some(seq)),
+            None => return,
+        },
+        None => (crate::stream_signal::decode(datagram), None),
+    };
     let token = match signal {
         Some(crate::stream_signal::StreamSignal::RaiseFloor { token, .. })
         | Some(crate::stream_signal::StreamSignal::Cancel { token }) => token,
@@ -2993,6 +3031,11 @@ fn apply_stream_datagram(
     let Some(state) = state else {
         return;
     };
+    if let Some(seq) = seq {
+        if !state.accept_seq(seq) {
+            return;
+        }
+    }
     match signal.expect("validated above") {
         crate::stream_signal::StreamSignal::RaiseFloor { floor, .. } => {
             raise_floor_cell(&state.floor, floor);
@@ -3336,6 +3379,17 @@ impl NodeServiceImpl {
     /// every stream's authoritative gRPC leg.
     pub fn spawn_floor_listener(&self, addr: std::net::SocketAddr) {
         let signals = Arc::clone(&self.stream_signals);
+        let key = self.config.udp_hmac_key.clone();
+        // Unsigned floors are accepted on loopback only: off loopback, a
+        // forged floor could cut candidates, so the lane stays closed
+        // without a key and the gRPC streams carry every signal.
+        if key.is_none() && !crate::security::is_loopback(&addr) {
+            eprintln!(
+                "stream-signal UDP lane on {addr} stays closed: no --udp-hmac-key, and unsigned \
+                 datagrams are accepted on loopback only; signals ride the gRPC streams"
+            );
+            return;
+        }
         tokio::spawn(async move {
             let socket = match tokio::net::UdpSocket::bind(addr).await {
                 Ok(socket) => socket,
@@ -3349,7 +3403,7 @@ impl NodeServiceImpl {
             let mut buf = [0u8; 64];
             loop {
                 match socket.recv_from(&mut buf).await {
-                    Ok((n, _peer)) => apply_stream_datagram(&signals, &buf[..n]),
+                    Ok((n, _peer)) => apply_stream_datagram(&signals, key.as_ref(), &buf[..n]),
                     Err(_) => continue,
                 }
             }
@@ -10503,21 +10557,21 @@ mod floor_lane_tests {
             .unwrap()
             .insert(7, Arc::new(StreamSignals::new(f32::NEG_INFINITY)));
 
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.25));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_floor(7, 0.25));
         assert_eq!(floor_of(&signals, 7), 0.25);
         // Lower and equal floors are ignored.
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.10));
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.25));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_floor(7, 0.10));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_floor(7, 0.25));
         assert_eq!(floor_of(&signals, 7), 0.25);
         // Duplicated and reordered raises: max wins regardless.
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.75));
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.50));
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(7, 0.75));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_floor(7, 0.75));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_floor(7, 0.50));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_floor(7, 0.75));
         assert_eq!(floor_of(&signals, 7), 0.75);
 
         let state = state_of(&signals, 7);
         assert!(!state.cancelled.load(Ordering::Acquire));
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_cancel(7));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_cancel(7));
         assert!(state.cancelled.load(Ordering::Acquire));
         assert_eq!(
             floor_of(&signals, 7),
@@ -10526,15 +10580,74 @@ mod floor_lane_tests {
         );
 
         // Unknown tokens, malformed frames, and empty datagrams are dropped.
-        apply_stream_datagram(&signals, &crate::stream_signal::encode_floor(8, 9.0));
+        apply_stream_datagram(&signals, None, &crate::stream_signal::encode_floor(8, 9.0));
         apply_stream_datagram(
             &signals,
+            None,
             &crate::stream_signal::encode_floor(7, 9.0)[..crate::stream_signal::FRAME_LEN - 1],
         );
-        apply_stream_datagram(&signals, &[0u8; crate::stream_signal::FRAME_LEN + 1]);
-        apply_stream_datagram(&signals, &[]);
+        apply_stream_datagram(&signals, None, &[0u8; crate::stream_signal::FRAME_LEN + 1]);
+        apply_stream_datagram(&signals, None, &[]);
         assert_eq!(floor_of(&signals, 7), 0.75);
         assert!(state.cancelled.load(Ordering::Acquire));
         assert_eq!(signals.lock().unwrap().len(), 1);
+    }
+
+    /// With a key, only a signed datagram with a fresh sequence moves the
+    /// floor (docs/security.md): a plain frame, a foreign key, a damaged
+    /// tag, a replay, and a stale sequence all leave it where it was, so
+    /// a forger cannot cut candidates. The gRPC twin still governs.
+    #[test]
+    fn signed_floor_lane_ignores_forgeries_and_replays() {
+        use crate::security::UdpKey;
+        use crate::stream_signal::{encode_cancel, encode_floor, sign};
+        let key = UdpKey::from_bytes(&[1u8; 32]).unwrap();
+        let other = UdpKey::from_bytes(&[2u8; 32]).unwrap();
+        let signals: std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>> =
+            std::sync::Mutex::new(HashMap::new());
+        signals
+            .lock()
+            .unwrap()
+            .insert(7, Arc::new(StreamSignals::new(f32::NEG_INFINITY)));
+        let state = state_of(&signals, 7);
+
+        // An authentic raise applies.
+        apply_stream_datagram(&signals, Some(&key), &sign(&key, 1, &encode_floor(7, 0.25)));
+        assert_eq!(floor_of(&signals, 7), 0.25);
+        // A plain frame is not read when a key is configured.
+        apply_stream_datagram(&signals, Some(&key), &encode_floor(7, 9.0));
+        // A foreign key does not verify.
+        apply_stream_datagram(
+            &signals,
+            Some(&key),
+            &sign(&other, 2, &encode_floor(7, 9.0)),
+        );
+        // A damaged tag does not verify.
+        let mut damaged = sign(&key, 2, &encode_floor(7, 9.0));
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        apply_stream_datagram(&signals, Some(&key), &damaged);
+        // A replay of the authentic datagram, and a stale sequence with a
+        // higher floor, are both behind the newest applied sequence.
+        apply_stream_datagram(&signals, Some(&key), &sign(&key, 1, &encode_floor(7, 0.25)));
+        apply_stream_datagram(&signals, Some(&key), &sign(&key, 1, &encode_floor(7, 9.0)));
+        apply_stream_datagram(&signals, Some(&key), &sign(&key, 0, &encode_floor(7, 9.0)));
+        assert_eq!(floor_of(&signals, 7), 0.25, "no forgery moved the floor");
+        assert!(!state.cancelled.load(Ordering::Acquire));
+        // A forged cancel is ignored the same way; an authentic one lands.
+        apply_stream_datagram(&signals, Some(&key), &encode_cancel(7));
+        apply_stream_datagram(&signals, Some(&key), &sign(&other, 3, &encode_cancel(7)));
+        assert!(!state.cancelled.load(Ordering::Acquire));
+        apply_stream_datagram(&signals, Some(&key), &sign(&key, 2, &encode_floor(7, 0.5)));
+        assert_eq!(floor_of(&signals, 7), 0.5);
+        apply_stream_datagram(&signals, Some(&key), &sign(&key, 3, &encode_cancel(7)));
+        assert!(state.cancelled.load(Ordering::Acquire));
+        // Sequences are per stream: a fresh token starts at zero.
+        signals
+            .lock()
+            .unwrap()
+            .insert(8, Arc::new(StreamSignals::new(f32::NEG_INFINITY)));
+        apply_stream_datagram(&signals, Some(&key), &sign(&key, 1, &encode_floor(8, 0.1)));
+        assert_eq!(floor_of(&signals, 8), 0.1);
     }
 }

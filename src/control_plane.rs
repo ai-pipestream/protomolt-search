@@ -1576,6 +1576,10 @@ impl DurableControlPlane {
 pub struct ClusterControlService {
     plane: DurableControlPlane,
     coordinator: Option<CoordinatorServiceImpl>,
+    /// Whether every call must present a client certificate from the
+    /// cluster CA (`docs/security.md`): membership, which a bearer
+    /// token is not. Set when the listener runs TLS with a client CA.
+    require_client_cert: bool,
 }
 
 impl ClusterControlService {
@@ -1583,7 +1587,32 @@ impl ClusterControlService {
         Self {
             plane,
             coordinator: None,
+            require_client_cert: false,
         }
+    }
+
+    /// Demand a client certificate on every call.
+    pub fn with_client_cert_required(mut self, required: bool) -> Self {
+        self.require_client_cert = required;
+        self
+    }
+
+    /// Cluster membership: a client certificate the listener verified
+    /// against the cluster CA. A missing one refuses by name.
+    fn membership<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if !self.require_client_cert {
+            return Ok(());
+        }
+        #[cfg(feature = "tls")]
+        if request.peer_certs().is_some_and(|certs| !certs.is_empty()) {
+            return Ok(());
+        }
+        #[cfg(not(feature = "tls"))]
+        let _ = request;
+        Err(Status::unauthenticated(
+            "cluster control requires a client certificate from the cluster CA; a bearer \
+             token is not membership",
+        ))
     }
 
     pub fn with_coordinator(mut self, coordinator: CoordinatorServiceImpl) -> Self {
@@ -1655,6 +1684,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<NodeLease>, Status> {
+        self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane
             .register(request.into_inner(), now_ms())
@@ -1665,6 +1695,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<RenewNodeLeaseRequest>,
     ) -> Result<Response<NodeLease>, Status> {
+        self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane
             .renew(request.into_inner(), now_ms())
@@ -1675,6 +1706,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane.drain(request.into_inner(), now_ms())?;
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
@@ -1686,6 +1718,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<ReportShardRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         let req = request.into_inner();
         if let Some(replica) = &req.replica {
@@ -1701,6 +1734,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<CompletePlacementActionRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane.complete_action(request.into_inner(), now_ms())?;
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
@@ -1712,6 +1746,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<ReconcileClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         let request = request.into_inner();
         let (plan, _changed) = self.plane.reconcile(request.dry_run, now_ms())?;
@@ -1725,6 +1760,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         _request: Request<GetClusterPlanRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.membership(&_request)?;
         self.admit(&_request.get_ref().collection)?;
         self.plane.plan().map(Response::new)
     }
@@ -1733,6 +1769,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<RollbackClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         let (plan, _changed) = self
             .plane

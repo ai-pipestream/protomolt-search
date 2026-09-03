@@ -58,6 +58,7 @@ pub mod rankdiff;
 pub mod replication;
 pub mod reshard;
 pub mod scorefn;
+pub mod security;
 pub mod segments;
 pub mod sha256;
 pub mod snapshot;

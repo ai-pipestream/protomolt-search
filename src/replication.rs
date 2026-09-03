@@ -164,6 +164,7 @@ fn client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
         .tcp_nodelay(true)
         .initial_stream_window_size(crate::H2_STREAM_WINDOW)
         .initial_connection_window_size(crate::H2_CONN_WINDOW);
+    let endpoint = crate::security::secure_endpoint(endpoint)?;
     Ok(NodeServiceClient::new(endpoint.connect_lazy())
         .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
@@ -775,6 +776,7 @@ pub async fn atomic_live_cutover(
 ) -> Result<LiveReshardState, String> {
     let endpoint = tonic::transport::Endpoint::from_shared(coordinator.to_string())
         .map_err(|error| format!("invalid coordinator address: {error}"))?;
+    let endpoint = crate::security::secure_endpoint(endpoint)?;
     let mut control = SearchServiceClient::new(endpoint.connect_lazy())
         .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);

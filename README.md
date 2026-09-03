@@ -177,7 +177,7 @@ cargo build --release
 # Single-process demo: both roles, random demo corpus (calibration fitted
 # on a 20% sample and seeded), one self-issued search at the end.
 ./target/release/pipestream-search --role=both \
-    --demo-vectors=20000 --dim=128 --bit-width=4 \
+    --demo-vectors=20000 --dim=128 --bit-width=4 --allow-plaintext \
     --nodes=127.0.0.1:50051 --demo-query
 
 # A real shard node over a persisted embedded-TurboVec image.
@@ -388,6 +388,15 @@ serves only one (`--collection`, checked at ingest, in the WAL
 manifest, and in health). Unknown names refuse, and an unnamed request
 gets to a named collection only through a configured default. See
 [`docs/collections.md`](docs/collections.md).
+
+Security (`docs/security.md`): `--tls-cert`/`--tls-key` put every
+listener on TLS (rustls; plaintext is then refused, and off loopback it
+needs `--allow-plaintext`), node listeners require a client certificate
+from `--tls-client-ca`, cluster control demands one per call, the
+coordinator presents `--tls-client-cert` to its nodes, `--bearer-tokens`
+declares public principals with `max_k`, concurrency, and ingest-rate
+quotas that refuse by name, and `--udp-hmac-key` signs the UDP floor and
+cancel datagrams.
 
 Select native analysis with `--analysis-addr=native` or
 `analysis_addr = "native"`. A single-shard `both` process propagates that

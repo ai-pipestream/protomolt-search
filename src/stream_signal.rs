@@ -37,6 +37,43 @@ fn encode(token: u64, opcode: u8, value: f32) -> [u8; FRAME_LEN] {
     frame
 }
 
+/// A signed datagram (docs/security.md): the plain frame, a 4-byte
+/// sequence number, and a 16-byte HMAC-SHA256 tag over both. The
+/// receiver ignores a tag that does not verify and a sequence at or
+/// behind the newest it accepted for the stream, so a forged, damaged,
+/// or replayed datagram changes nothing; the gRPC twin still governs.
+pub(crate) const SIGNED_FRAME_LEN: usize = FRAME_LEN + 4 + 16;
+
+pub(crate) fn sign(
+    key: &crate::security::UdpKey,
+    seq: u32,
+    frame: &[u8; FRAME_LEN],
+) -> [u8; SIGNED_FRAME_LEN] {
+    let mut out = [0u8; SIGNED_FRAME_LEN];
+    out[..FRAME_LEN].copy_from_slice(frame);
+    out[FRAME_LEN..FRAME_LEN + 4].copy_from_slice(&seq.to_le_bytes());
+    let tag = key.tag(&out[..FRAME_LEN + 4]);
+    out[FRAME_LEN + 4..].copy_from_slice(&tag);
+    out
+}
+
+/// Verify and decode a signed datagram: `(signal, sequence)` when the
+/// tag matches and the frame is well formed, `None` otherwise.
+pub(crate) fn decode_signed(
+    key: &crate::security::UdpKey,
+    datagram: &[u8],
+) -> Option<(StreamSignal, u32)> {
+    if datagram.len() != SIGNED_FRAME_LEN {
+        return None;
+    }
+    let (body, tag) = datagram.split_at(FRAME_LEN + 4);
+    if !key.verify(body, tag) {
+        return None;
+    }
+    let seq = u32::from_le_bytes(body[FRAME_LEN..].try_into().expect("4-byte sequence"));
+    decode(&body[..FRAME_LEN]).map(|signal| (signal, seq))
+}
+
 pub(crate) fn decode(frame: &[u8]) -> Option<StreamSignal> {
     if frame.len() != FRAME_LEN || frame[..4] != MAGIC || frame[5..8] != [0; 3] {
         return None;
@@ -86,5 +123,40 @@ mod tests {
         assert_eq!(decode(&nan), None);
         assert_eq!(decode(&[0; FRAME_LEN]), None);
         assert_eq!(decode(&encode_cancel(7)[..FRAME_LEN - 1]), None);
+    }
+
+    #[test]
+    fn signed_frames_verify_and_reject_forgeries() {
+        let key = crate::security::UdpKey::from_bytes(&[9u8; 32]).unwrap();
+        let other = crate::security::UdpKey::from_bytes(&[8u8; 32]).unwrap();
+        let signed = sign(&key, 42, &encode_floor(7, 0.5));
+        assert_eq!(
+            decode_signed(&key, &signed),
+            Some((
+                StreamSignal::RaiseFloor {
+                    token: 7,
+                    floor: 0.5
+                },
+                42
+            ))
+        );
+        assert_eq!(decode_signed(&other, &signed), None, "wrong key");
+        assert_eq!(
+            decode_signed(&key, &signed[..SIGNED_FRAME_LEN - 1]),
+            None,
+            "truncated"
+        );
+        let mut flipped = signed;
+        flipped[17] ^= 1;
+        assert_eq!(decode_signed(&key, &flipped), None, "damaged floor");
+        let mut reseq = signed;
+        reseq[FRAME_LEN] ^= 1;
+        assert_eq!(decode_signed(&key, &reseq), None, "damaged sequence");
+        assert_eq!(decode(&signed), None, "a signed frame is not a plain frame");
+        assert_eq!(
+            decode_signed(&key, &encode_floor(7, 0.5)),
+            None,
+            "a plain frame is not signed"
+        );
     }
 }

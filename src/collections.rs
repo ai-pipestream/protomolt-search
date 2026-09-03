@@ -29,6 +29,8 @@ use std::collections::BTreeMap;
 
 use tonic::{Request, Response, Status, Streaming};
 
+use std::sync::Arc;
+
 use crate::control_plane::ClusterControlService;
 use crate::coordinator::CoordinatorServiceImpl;
 use crate::pb::cluster_control_server::{ClusterControl, ClusterControlServer};
@@ -46,6 +48,7 @@ use crate::pb::{
     RollbackClusterRequest, RoutedIngestMappedRequest, RoutedIngestMappedResponse, SearchRequest,
     SearchResponse, VariantSearchRequest, VariantSearchResponse,
 };
+use crate::security::{Guarded, MeteredIngest, Permit, Principal, Principals};
 
 /// The membership and naming rules, shared by the search and control
 /// sets.
@@ -154,10 +157,73 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The `k` a public request asks for, when it has one: the field a
+/// principal's `max_k` quota is checked against (`docs/security.md`).
+trait RequestK {
+    fn k(&self) -> Option<u32> {
+        None
+    }
+    /// Resolve an unset `k` (0, "the default") to the principal's cap:
+    /// a default, not a clamp — the caller asked for no number.
+    fn default_k(&mut self, _k: u32) {}
+}
+
+macro_rules! request_k {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl RequestK for $ty {
+                fn k(&self) -> Option<u32> {
+                    Some(self.k)
+                }
+                fn default_k(&mut self, k: u32) {
+                    if self.k == 0 {
+                        self.k = k;
+                    }
+                }
+            }
+        )*
+    };
+}
+
+request_k!(
+    SearchRequest,
+    Bm25SearchRequest,
+    HybridSearchRequest,
+    VariantSearchRequest,
+    QueryRequest
+);
+
+impl RequestK for QueryStreamRequest {
+    fn k(&self) -> Option<u32> {
+        self.query.as_ref().map(|q| q.k)
+    }
+    fn default_k(&mut self, k: u32) {
+        if let Some(q) = self.query.as_mut() {
+            if q.k == 0 {
+                q.k = k;
+            }
+        }
+    }
+}
+
+impl RequestK for PhraseSearchRequest {}
+impl RequestK for AggregateRequest {}
+impl RequestK for PlanIndexRequest {}
+impl RequestK for BroadcastVectorBackendRequest {}
+impl RequestK for BroadcastCalibrationRequest {}
+impl RequestK for FreezeTopologyWritesRequest {}
+impl RequestK for PublishTopologyRequest {}
+impl RequestK for AbortTopologyCutoverRequest {}
+impl RequestK for ClusterHealthRequest {}
+impl RequestK for Streaming<RoutedIngestMappedRequest> {}
+
 /// The public search surface over one or more collections.
 #[derive(Clone)]
 pub struct CollectionSet {
     members: Members<CoordinatorServiceImpl>,
+    /// Bearer principals (`docs/security.md`); `None` serves anonymous
+    /// callers with no quotas.
+    principals: Option<Arc<Principals>>,
 }
 
 impl CollectionSet {
@@ -165,7 +231,38 @@ impl CollectionSet {
     pub fn single(coordinator: CoordinatorServiceImpl) -> Self {
         CollectionSet {
             members: Members::single(coordinator),
+            principals: None,
         }
+    }
+
+    /// Require a bearer token on every public call and apply each
+    /// principal's quotas (`docs/security.md`).
+    pub fn with_principals(mut self, principals: Arc<Principals>) -> Self {
+        self.principals = Some(principals);
+        self
+    }
+
+    /// Authenticate a request and admit it under its principal's quotas:
+    /// `k` against `max_k` (an unset `k` resolves to the cap), and one
+    /// in-flight slot, held by the returned permit for the request's
+    /// life. Anonymous when no principals are configured.
+    fn admit<T: RequestK>(
+        &self,
+        request: &mut Request<T>,
+    ) -> Result<(Option<Permit>, Option<Arc<Principal>>), Status> {
+        let Some(principals) = &self.principals else {
+            return Ok((None, None));
+        };
+        let principal = principals.authenticate(request.metadata())?;
+        if let Some(k) = request.get_ref().k() {
+            if k == 0 && principal.max_k != 0 {
+                request.get_mut().default_k(principal.max_k);
+            } else {
+                principal.admit_k(k)?;
+            }
+        }
+        let permit = principal.admit_request()?;
+        Ok((Some(permit), Some(principal)))
     }
 
     /// Named collections. Each coordinator must have been built for the
@@ -199,6 +296,7 @@ impl CollectionSet {
         }
         Ok(CollectionSet {
             members: Members::named(members, default, "collections")?,
+            principals: None,
         })
     }
 
@@ -251,13 +349,15 @@ macro_rules! search_service_over_collections {
     ($( $name:ident : $req:ty => $resp:ty ),* $(,)?) => {
         #[tonic::async_trait]
         impl SearchService for CollectionSet {
-            type QueryStreamStream = <CoordinatorServiceImpl as SearchService>::QueryStreamStream;
+            type QueryStreamStream =
+                Guarded<<CoordinatorServiceImpl as SearchService>::QueryStreamStream>;
 
             $(
                 async fn $name(
                     &self,
                     mut request: Request<$req>,
                 ) -> Result<Response<$resp>, Status> {
+                    let (_permit, _) = self.admit(&mut request)?;
                     let (name, target) = self.members.resolve(&request.get_ref().collection)?;
                     let target = target.clone();
                     request.get_mut().collection = name;
@@ -269,17 +369,20 @@ macro_rules! search_service_over_collections {
                 &self,
                 mut request: Request<QueryStreamRequest>,
             ) -> Result<Response<Self::QueryStreamStream>, Status> {
+                let (permit, _) = self.admit(&mut request)?;
                 let (name, target) = self.members.resolve(&request.get_ref().collection)?;
                 let target = target.clone();
                 request.get_mut().collection = name;
-                SearchService::query_stream(&target, request).await
+                let response = SearchService::query_stream(&target, request).await?;
+                Ok(response.map(|stream| Guarded::new(stream, permit)))
             }
 
             async fn routed_ingest_mapped(
                 &self,
-                request: Request<Streaming<RoutedIngestMappedRequest>>,
+                mut request: Request<Streaming<RoutedIngestMappedRequest>>,
             ) -> Result<Response<RoutedIngestMappedResponse>, Status> {
-                let mut inbound = request.into_inner();
+                let (_permit, principal) = self.admit(&mut request)?;
+                let mut inbound = MeteredIngest::new(request.into_inner(), principal);
                 let mut bind = CoordinatorServiceImpl::routed_bind(&mut inbound).await?;
                 let (name, target) = self.members.resolve(&bind.collection)?;
                 let target = target.clone();
@@ -294,6 +397,7 @@ macro_rules! search_service_over_collections {
                 &self,
                 mut request: Request<ClusterHealthRequest>,
             ) -> Result<Response<ClusterHealthResponse>, Status> {
+                let (_permit, _) = self.admit(&mut request)?;
                 let requested = request.get_ref().collection.clone();
                 // An unnamed health request on a named set lists every
                 // collection separately; counts are never summed across them.

@@ -104,9 +104,16 @@ pub async fn install_snapshot_generation(
         }
     });
 
-    let mut client = NodeServiceClient::connect(addr.to_string())
-        .await
+    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
         .map_err(|e| Status::unavailable(format!("node at {addr}: {e}")))?;
+    let endpoint =
+        crate::security::secure_endpoint(endpoint).map_err(Status::failed_precondition)?;
+    let mut client = NodeServiceClient::new(
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| Status::unavailable(format!("node at {addr}: {e}")))?,
+    );
     Ok(client
         .install_snapshot(ReceiverStream::new(rx))
         .await?

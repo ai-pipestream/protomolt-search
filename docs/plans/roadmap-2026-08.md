@@ -415,7 +415,17 @@ the real version (multiple column tables and vocabularies per node) are
 very different amounts of work, and which one is right depends on whether
 item 19 lands. A descriptor-bound index has a natural identity already.
 
-### 12. The operational surface: metrics, TLS, membership, quotas — METRICS LANDED
+### 12. The operational surface: metrics, TLS, membership, quotas — LANDED
+
+**TLS, membership, and quotas landed 2026-09-02 (`docs/security.md`,
+`tests/security.rs`):** rustls on every listener once `--tls-cert` is
+set (plaintext refused; loopback plaintext otherwise, off-loopback
+plaintext only behind `--allow-plaintext`), mTLS on node listeners and
+per-call client-certificate membership for cluster control, bearer
+principals with `max_k`, concurrency, and ingest-rate quotas on the
+public surface (refused by name, never clamped), and HMAC-SHA256 tags
+with sequences on the UDP floor and cancel datagrams under a key of
+their own. The embedded runtime builds without the TLS stack.
 
 **Metrics landed 2026-08-24 (`docs/metrics.md`):** a hand-rolled
 Prometheus text exporter on `--metrics-listen` — request counters by

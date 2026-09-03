@@ -629,9 +629,11 @@ async fn health_lists_collections_without_mixing_and_flags_a_foreign_node() {
 #[test]
 fn configuration_declares_collections_and_refuses_ambiguity() {
     let dir = tempdir("config");
+    // The defaults bind off loopback; plaintext there needs the explicit
+    // flag (docs/security.md), which is not what these cases are about.
     let write = |name: &str, body: &str| {
         let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(&path, format!("allow_plaintext = true\n{body}")).unwrap();
         path.display().to_string()
     };
     let good = write(

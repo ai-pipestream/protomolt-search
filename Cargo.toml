@@ -31,6 +31,14 @@ protomolt-analyzer = { path = "crates/protomolt-analyzer" }
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
+[features]
+# TLS/mTLS on the gRPC listeners and the cluster-internal channels
+# (docs/security.md): rustls through tonic. On by default for the serving
+# binary; the embedded runtime turns it off, because it speaks over an
+# in-process duplex and must not carry a TLS stack onto a phone.
+default = ["tls"]
+tls = ["tonic/tls"]
+
 [build-dependencies]
 tonic-build = "0.12"
 
