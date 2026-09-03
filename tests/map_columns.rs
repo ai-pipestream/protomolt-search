@@ -356,6 +356,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await

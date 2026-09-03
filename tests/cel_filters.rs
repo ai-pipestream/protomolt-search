@@ -1014,6 +1014,29 @@ async fn compiled_filters_agree_with_reference_cel_interpreter() {
         r#"!(court == "dcc")"#,
         r#"(court == "scotus" || year > 2030) && score >= 0.0"#,
         r#"court != "ca5" && !(tags["status"] == "dead") && year in [1980, 2000, 2020, 2040]"#,
+        // String ordering and prefixes over the byte-sorted dictionaries
+        // (docs/prefix-terms.md): stock CEL compares strings by code
+        // point, which is byte order over UTF-8.
+        r#"court < "dcc""#,
+        r#"court <= "ca5""#,
+        r#"court > "ca5""#,
+        r#"court >= "ca9""#,
+        r#""ca9" > court"#,
+        r#""dcc" <= court"#,
+        r#"court >= "ca5" && court < "dcc""#,
+        r#"court.startsWith("ca")"#,
+        r#"court.startsWith("ca9")"#,
+        r#"court.startsWith("s")"#,
+        r#"court.startsWith("zz")"#,
+        r#"!court.startsWith("ca")"#,
+        r#"court < "a""#,
+        r#"court >= "zzz""#,
+        r#"tags["color"] < "green""#,
+        r#"tags["color"] >= "green""#,
+        r#"tags["color"].startsWith("r")"#,
+        r#"tags["status"].startsWith("li")"#,
+        r#"tags["color"] > "blue" && court.startsWith("ca")"#,
+        r#"court.startsWith("ca") || year > 2030"#,
     ];
 
     for expr in expressions {

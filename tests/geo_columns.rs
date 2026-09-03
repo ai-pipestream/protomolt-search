@@ -832,6 +832,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
         k1: 0.0,
         b: 0.0,
         phrase: None,
+        prefixes: Vec::new(),
     }];
     let (hits, _, _) = coordinator
         .fanout_bm25_fused_faceted(
@@ -868,6 +869,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await
@@ -1024,6 +1026,7 @@ async fn geo_filter_refusals_are_loud() {
         k1: 0.0,
         b: 0.0,
         phrase: None,
+        prefixes: Vec::new(),
     }];
     let err = coordinator
         .fanout_bm25_fused_faceted("", 10, &fields, 0.0, &[], &[], &[], bad_one, None)

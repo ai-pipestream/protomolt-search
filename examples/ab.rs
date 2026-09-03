@@ -184,6 +184,7 @@ impl Arm {
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
                 phrase: None,
+                prefixes: Vec::new(),
             }),
         };
         SearchVariant {
@@ -355,6 +356,7 @@ fn parse_arm(spec: &str) -> Result<Arm, String> {
             k1,
             b,
             phrase: None,
+            prefixes: Vec::new(),
         });
     }
     // The scale identity includes k1/b: the same field at two different

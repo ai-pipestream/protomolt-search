@@ -487,6 +487,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await
@@ -502,6 +503,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         k1: 0.0,
         b: 0.0,
         phrase: None,
+        prefixes: Vec::new(),
     }];
     let (_, _, fused_ranges) = coordinator
         .fanout_bm25_fused_faceted("rust", 10, &fields, 0.0, &[], &[], &want, &[], None)

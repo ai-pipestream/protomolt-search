@@ -132,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stats_fields: Vec::new(),
                     cardinality_fields: Vec::new(),
                     phrase: None,
+                    prefixes: Vec::new(),
                 })
                 .await?
                 .into_inner();

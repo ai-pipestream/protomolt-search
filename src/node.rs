@@ -585,7 +585,10 @@ impl Bm25Shard {
     /// resolves to the absent case for every document — exact, the
     /// same argument as [`Self::resolve_geo_filters`] — and the
     /// coordinator refuses a leaf NO shard resolves.
-    fn resolve_filter(&self, expr: &crate::pb::FilterExpr) -> crate::filter::ResolvedFilter {
+    fn resolve_filter(
+        &self,
+        expr: &crate::pb::FilterExpr,
+    ) -> Result<crate::filter::ResolvedFilter, Status> {
         use crate::filter::{MapKeyRef, ResolvedFilter, ResolvedLeaf};
         use crate::pb::filter_expr::Expr;
         let sorted_ords = |mut ords: Vec<u32>| {
@@ -593,96 +596,287 @@ impl Bm25Shard {
             ords.dedup();
             ords
         };
-        match expr.expr.as_ref().expect("filter validated before resolve") {
-            Expr::And(list) => {
-                ResolvedFilter::And(list.exprs.iter().map(|e| self.resolve_filter(e)).collect())
-            }
-            Expr::Or(list) => {
-                ResolvedFilter::Or(list.exprs.iter().map(|e| self.resolve_filter(e)).collect())
-            }
-            Expr::Not(child) => ResolvedFilter::Not(Box::new(self.resolve_filter(child))),
-            Expr::Facet(p) => {
-                let column = self.facet_index(&p.column);
-                let ords = match column {
-                    None => Vec::new(),
-                    Some(fi) => sorted_ords(
-                        p.values
-                            .iter()
-                            .filter_map(|v| self.facet_value_ord_of(fi, v))
-                            .collect(),
-                    ),
-                };
-                ResolvedFilter::Leaf(ResolvedLeaf::Facet { column, ords })
-            }
-            Expr::Number(p) => {
-                let lo = p.min.as_ref().and_then(crate::filter::edge_of);
-                let hi = p.max.as_ref().and_then(crate::filter::edge_of);
-                // i64 first, then f64 — the RangeFacetField resolution
-                // order, so the two number surfaces can never disagree
-                // about which table a name means.
-                let leaf = if let Some(ii) = self.integer_index(&p.column) {
-                    let (lo, hi) = crate::filter::int_range(&lo, &hi);
-                    ResolvedLeaf::IntRange { column: ii, lo, hi }
-                } else if let Some(ni) = self.numeric_index(&p.column) {
-                    ResolvedLeaf::F64Range { column: ni, lo, hi }
+        Ok(
+            match expr.expr.as_ref().expect("filter validated before resolve") {
+                Expr::And(list) => ResolvedFilter::And(
+                    list.exprs
+                        .iter()
+                        .map(|e| self.resolve_filter(e))
+                        .collect::<Result<_, _>>()?,
+                ),
+                Expr::Or(list) => ResolvedFilter::Or(
+                    list.exprs
+                        .iter()
+                        .map(|e| self.resolve_filter(e))
+                        .collect::<Result<_, _>>()?,
+                ),
+                Expr::Not(child) => ResolvedFilter::Not(Box::new(self.resolve_filter(child)?)),
+                Expr::StringRange(p) => ResolvedFilter::Leaf(self.resolve_string_predicate(
+                    &p.column,
+                    &p.key,
+                    p.min.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
+                    p.max.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
+                    None,
+                )?),
+                Expr::StringPrefix(p) => ResolvedFilter::Leaf(self.resolve_string_predicate(
+                    &p.column,
+                    &p.key,
+                    None,
+                    None,
+                    Some(p.prefix.as_str()),
+                )?),
+                Expr::Facet(p) => {
+                    let column = self.facet_index(&p.column);
+                    let ords = match column {
+                        None => Vec::new(),
+                        Some(fi) => sorted_ords(
+                            p.values
+                                .iter()
+                                .filter_map(|v| self.facet_value_ord_of(fi, v))
+                                .collect(),
+                        ),
+                    };
+                    ResolvedFilter::Leaf(ResolvedLeaf::Facet { column, ords })
+                }
+                Expr::Number(p) => {
+                    let lo = p.min.as_ref().and_then(crate::filter::edge_of);
+                    let hi = p.max.as_ref().and_then(crate::filter::edge_of);
+                    // i64 first, then f64 — the RangeFacetField resolution
+                    // order, so the two number surfaces can never disagree
+                    // about which table a name means.
+                    let leaf = if let Some(ii) = self.integer_index(&p.column) {
+                        let (lo, hi) = crate::filter::int_range(&lo, &hi);
+                        ResolvedLeaf::IntRange { column: ii, lo, hi }
+                    } else if let Some(ni) = self.numeric_index(&p.column) {
+                        ResolvedLeaf::F64Range { column: ni, lo, hi }
+                    } else {
+                        ResolvedLeaf::NumberUnknown
+                    };
+                    ResolvedFilter::Leaf(leaf)
+                }
+                Expr::MapFacet(p) => {
+                    let target = self
+                        .map_facet_index(&p.column)
+                        .and_then(|ci| self.map_facet_key_ord(ci, &p.key).map(|k| (ci, k)));
+                    let ords = match target {
+                        None => Vec::new(),
+                        Some((ci, _)) => sorted_ords(
+                            p.values
+                                .iter()
+                                .filter_map(|v| self.map_facet_value_ord_of(ci, v))
+                                .collect(),
+                        ),
+                    };
+                    ResolvedFilter::Leaf(ResolvedLeaf::MapFacet { target, ords })
+                }
+                Expr::MapNumber(p) => {
+                    let target = self
+                        .map_numeric_index(&p.column)
+                        .and_then(|ci| self.map_numeric_key_ord(ci, &p.key).map(|k| (ci, k)));
+                    ResolvedFilter::Leaf(ResolvedLeaf::MapNumber {
+                        target,
+                        lo: p.min.as_ref().and_then(crate::filter::edge_of),
+                        hi: p.max.as_ref().and_then(crate::filter::edge_of),
+                    })
+                }
+                Expr::MapHasKey(p) => {
+                    // Map-facet first, then map-numeric: the one order,
+                    // shared with `filter_columns_known` below.
+                    let target = if let Some(ci) = self.map_facet_index(&p.column) {
+                        MapKeyRef::Facet {
+                            column: ci,
+                            key_ord: self.map_facet_key_ord(ci, &p.key),
+                        }
+                    } else if let Some(ci) = self.map_numeric_index(&p.column) {
+                        MapKeyRef::Numeric {
+                            column: ci,
+                            key_ord: self.map_numeric_key_ord(ci, &p.key),
+                        }
+                    } else {
+                        MapKeyRef::Unknown
+                    };
+                    ResolvedFilter::Leaf(ResolvedLeaf::MapHasKey(target))
+                }
+                Expr::Has(p) => ResolvedFilter::Leaf(ResolvedLeaf::Has {
+                    facet: self.facet_index(&p.column),
+                    numeric: self.numeric_index(&p.column),
+                    integer: self.integer_index(&p.column),
+                    geo: self.geo_index(&p.column),
+                }),
+                Expr::Geo(g) => ResolvedFilter::Leaf(ResolvedLeaf::Geo {
+                    column: self.geo_index(&g.column),
+                    region: validate_geo_filter(g).expect("filter validated before resolve"),
+                }),
+            },
+        )
+    }
+
+    /// Resolve a string range (`min`/`max`, each `(value, exclusive)`)
+    /// or a `prefix` over a facet column (`key` empty) or a map-facet
+    /// value (`docs/prefix-terms.md`), to an ORDINAL RANGE when the
+    /// column's dictionary is in byte order — every file this writer
+    /// produces, checked at open — and to plain ordinal membership on
+    /// the heap builder, whose first-seen dictionary is in heap and
+    /// scanned once per request. A disk-resident dictionary in the
+    /// older first-seen order refuses by name: an ordinal range over
+    /// it would be a lie, and a per-document string walk is the thing
+    /// this predicate exists not to do.
+    fn resolve_string_predicate(
+        &self,
+        column: &str,
+        key: &str,
+        min: Option<(&str, bool)>,
+        max: Option<(&str, bool)>,
+        prefix: Option<&str>,
+    ) -> Result<crate::filter::ResolvedLeaf, Status> {
+        use crate::filter::ResolvedLeaf;
+        let admits = |value: &str| -> bool {
+            let v = value.as_bytes();
+            let above = min.is_none_or(|(b, exclusive)| {
+                if exclusive {
+                    v > b.as_bytes()
                 } else {
-                    ResolvedLeaf::NumberUnknown
-                };
-                ResolvedFilter::Leaf(leaf)
-            }
-            Expr::MapFacet(p) => {
-                let target = self
-                    .map_facet_index(&p.column)
-                    .and_then(|ci| self.map_facet_key_ord(ci, &p.key).map(|k| (ci, k)));
-                let ords = match target {
-                    None => Vec::new(),
-                    Some((ci, _)) => sorted_ords(
-                        p.values
+                    v >= b.as_bytes()
+                }
+            });
+            let below = max.is_none_or(|(b, exclusive)| {
+                if exclusive {
+                    v < b.as_bytes()
+                } else {
+                    v <= b.as_bytes()
+                }
+            });
+            above && below && prefix.is_none_or(|p| v.starts_with(p.as_bytes()))
+        };
+        // The contiguous ordinal range of a byte-sorted dictionary.
+        let ord_range = |dict: &[String]| -> (u32, u32) {
+            let lo = dict.partition_point(|v| {
+                let v = v.as_bytes();
+                let under_min = min.is_some_and(|(b, exclusive)| {
+                    if exclusive {
+                        v <= b.as_bytes()
+                    } else {
+                        v < b.as_bytes()
+                    }
+                });
+                under_min || prefix.is_some_and(|p| v < p.as_bytes())
+            });
+            let hi = dict.partition_point(|v| {
+                let v = v.as_bytes();
+                let in_prefix =
+                    prefix.is_none_or(|p| v < p.as_bytes() || v.starts_with(p.as_bytes()));
+                let under_max = max.is_none_or(|(b, exclusive)| {
+                    if exclusive {
+                        v < b.as_bytes()
+                    } else {
+                        v <= b.as_bytes()
+                    }
+                });
+                in_prefix && under_max
+            });
+            (lo as u32, hi.max(lo) as u32)
+        };
+        let unordered = |what: String| {
+            Status::failed_precondition(format!(
+                "{what} was written with a first-seen (unordered) dictionary; string ordering \
+                 and prefixes need a dictionary in byte order, which this version writes at \
+                 flush — rebuild or reshard the generation"
+            ))
+        };
+        if key.is_empty() {
+            let Some(fi) = self.facet_index(column) else {
+                return Ok(ResolvedLeaf::FacetOrdRange {
+                    column: None,
+                    lo: 0,
+                    hi: 0,
+                });
+            };
+            return match self {
+                Bm25Shard::Building(s) => {
+                    if s.facet_dictionary_sorted(fi) {
+                        let (lo, hi) = ord_range(s.facet_dictionary(fi));
+                        Ok(ResolvedLeaf::FacetOrdRange {
+                            column: Some(fi),
+                            lo,
+                            hi,
+                        })
+                    } else {
+                        let ords = s
+                            .facet_dictionary(fi)
                             .iter()
-                            .filter_map(|v| self.map_facet_value_ord_of(ci, v))
-                            .collect(),
-                    ),
-                };
-                ResolvedFilter::Leaf(ResolvedLeaf::MapFacet { target, ords })
+                            .enumerate()
+                            .filter(|(_, v)| admits(v))
+                            .map(|(ord, _)| ord as u32)
+                            .collect();
+                        Ok(ResolvedLeaf::Facet {
+                            column: Some(fi),
+                            ords,
+                        })
+                    }
+                }
+                Bm25Shard::Resident(r) => {
+                    if !r.facet_dictionary_sorted(fi) {
+                        return Err(unordered(format!("facet column {column:?}")));
+                    }
+                    let (lo, hi) = ord_range(r.facet_dictionary(fi));
+                    Ok(ResolvedLeaf::FacetOrdRange {
+                        column: Some(fi),
+                        lo,
+                        hi,
+                    })
+                }
+                Bm25Shard::Spilling(_) => Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush first",
+                )),
+            };
+        }
+        let Some((ci, key_ord)) = self
+            .map_facet_index(column)
+            .and_then(|ci| self.map_facet_key_ord(ci, key).map(|k| (ci, k)))
+        else {
+            return Ok(ResolvedLeaf::MapFacetOrdRange {
+                target: None,
+                lo: 0,
+                hi: 0,
+            });
+        };
+        match self {
+            Bm25Shard::Building(s) => {
+                if s.map_facet_values_sorted(ci) {
+                    let (lo, hi) = ord_range(s.map_facet_values(ci));
+                    Ok(ResolvedLeaf::MapFacetOrdRange {
+                        target: Some((ci, key_ord)),
+                        lo,
+                        hi,
+                    })
+                } else {
+                    let ords = s
+                        .map_facet_values(ci)
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| admits(v))
+                        .map(|(ord, _)| ord as u32)
+                        .collect();
+                    Ok(ResolvedLeaf::MapFacet {
+                        target: Some((ci, key_ord)),
+                        ords,
+                    })
+                }
             }
-            Expr::MapNumber(p) => {
-                let target = self
-                    .map_numeric_index(&p.column)
-                    .and_then(|ci| self.map_numeric_key_ord(ci, &p.key).map(|k| (ci, k)));
-                ResolvedFilter::Leaf(ResolvedLeaf::MapNumber {
-                    target,
-                    lo: p.min.as_ref().and_then(crate::filter::edge_of),
-                    hi: p.max.as_ref().and_then(crate::filter::edge_of),
+            Bm25Shard::Resident(r) => {
+                if !r.map_facet_values_sorted(ci) {
+                    return Err(unordered(format!("map-facet column {column:?} (values)")));
+                }
+                let (lo, hi) = ord_range(r.map_facet_values(ci));
+                Ok(ResolvedLeaf::MapFacetOrdRange {
+                    target: Some((ci, key_ord)),
+                    lo,
+                    hi,
                 })
             }
-            Expr::MapHasKey(p) => {
-                // Map-facet first, then map-numeric: the one order,
-                // shared with `filter_columns_known` below.
-                let target = if let Some(ci) = self.map_facet_index(&p.column) {
-                    MapKeyRef::Facet {
-                        column: ci,
-                        key_ord: self.map_facet_key_ord(ci, &p.key),
-                    }
-                } else if let Some(ci) = self.map_numeric_index(&p.column) {
-                    MapKeyRef::Numeric {
-                        column: ci,
-                        key_ord: self.map_numeric_key_ord(ci, &p.key),
-                    }
-                } else {
-                    MapKeyRef::Unknown
-                };
-                ResolvedFilter::Leaf(ResolvedLeaf::MapHasKey(target))
-            }
-            Expr::Has(p) => ResolvedFilter::Leaf(ResolvedLeaf::Has {
-                facet: self.facet_index(&p.column),
-                numeric: self.numeric_index(&p.column),
-                integer: self.integer_index(&p.column),
-                geo: self.geo_index(&p.column),
-            }),
-            Expr::Geo(g) => ResolvedFilter::Leaf(ResolvedLeaf::Geo {
-                column: self.geo_index(&g.column),
-                region: validate_geo_filter(g).expect("filter validated before resolve"),
-            }),
+            Bm25Shard::Spilling(_) => Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush first",
+            )),
         }
     }
 
@@ -721,9 +915,25 @@ impl Bm25Shard {
                         || self.geo_index(&p.column).is_some()
                 }
                 LeafRef::Geo(g) => self.geo_index(&g.column).is_some(),
+                LeafRef::StringRange(p) => self.string_target_known(&p.column, &p.key),
+                LeafRef::StringPrefix(p) => self.string_target_known(&p.column, &p.key),
             });
         });
         known
+    }
+
+    /// The known rule of a string range / prefix: the facet column, or
+    /// the map-facet column and its key (the FacetPredicate /
+    /// MapFacetPredicate rules, since the predicate reads the same
+    /// dictionaries).
+    fn string_target_known(&self, column: &str, key: &str) -> bool {
+        if key.is_empty() {
+            self.facet_index(column).is_some()
+        } else {
+            self.map_facet_index(column)
+                .and_then(|ci| self.map_facet_key_ord(ci, key))
+                .is_some()
+        }
     }
 
     /// The index of the map-facet column named `name`.
@@ -1939,7 +2149,7 @@ fn resolve_shard_filters(
     let doc_filter = crate::filter::DocFilter {
         deleted,
         geo: store.resolve_geo_filters(geo_filters, geo_regions),
-        pred: filter.map(|f| store.resolve_filter(f)),
+        pred: filter.map(|f| store.resolve_filter(f)).transpose()?,
         phrase: Vec::new(),
     };
     let allow = {
@@ -4230,7 +4440,11 @@ impl NodeServiceImpl {
                 let doc_filter = crate::filter::DocFilter {
                     deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                    pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+                    pred: req
+                        .filter
+                        .as_ref()
+                        .map(|f| store.resolve_filter(f))
+                        .transpose()?,
                     phrase: phrase_gates,
                 };
                 let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty()
@@ -7125,7 +7339,11 @@ impl NodeService for NodeServiceImpl {
         let doc_filter = crate::filter::DocFilter {
             deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-            pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+            pred: req
+                .filter
+                .as_ref()
+                .map(|f| store.resolve_filter(f))
+                .transpose()?,
             phrase: Vec::new(),
         };
         let cols = ShardNumericRead(store);
@@ -7473,7 +7691,11 @@ impl NodeService for NodeServiceImpl {
         let doc_filter = crate::filter::DocFilter {
             deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-            pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+            pred: req
+                .filter
+                .as_ref()
+                .map(|f| store.resolve_filter(f))
+                .transpose()?,
             phrase: Vec::new(),
         };
         let cols = ShardNumericRead(store);
@@ -7648,7 +7870,11 @@ impl NodeService for NodeServiceImpl {
         let doc_filter = crate::filter::DocFilter {
             deleted: guard.live_docs.words(),
             geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-            pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+            pred: req
+                .filter
+                .as_ref()
+                .map(|f| store.resolve_filter(f))
+                .transpose()?,
             phrase: Vec::new(),
         };
         let cols = ShardNumericRead(store);
@@ -8757,6 +8983,52 @@ impl NodeService for NodeServiceImpl {
         }))
     }
 
+    async fn expand_term_prefix(
+        &self,
+        request: Request<crate::pb::ExpandTermPrefixRequest>,
+    ) -> Result<Response<crate::pb::ExpandTermPrefixResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::TermStats);
+        let req = request.into_inner();
+        if req.prefix.is_empty() {
+            return Err(Status::invalid_argument("a term prefix must be non-empty"));
+        }
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let Some(store) = guard.bm25.as_ref() else {
+            return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
+                terms: Vec::new(),
+                count: 0,
+                known: false,
+            }));
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush first",
+            ));
+        }
+        let Some(fi) = store.field_index(&req.field) else {
+            return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
+                terms: Vec::new(),
+                count: 0,
+                known: false,
+            }));
+        };
+        let view = store
+            .field_view(fi)
+            .expect("as_index above proves the shard is searchable");
+        let (terms, count) = match view.expand_prefix(&req.prefix, req.cap as usize) {
+            Ok(terms) => {
+                let count = terms.len() as u64;
+                (terms, count)
+            }
+            Err(count) => (Vec::new(), count as u64),
+        };
+        Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
+            terms,
+            count,
+            known: true,
+        }))
+    }
+
     async fn bm25_query(
         &self,
         request: Request<Bm25QueryRequest>,
@@ -9566,7 +9838,11 @@ impl NodeServiceImpl {
                 Some(crate::filter::DocFilter {
                     deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                    pred: req.filter.as_ref().map(|f| store.resolve_filter(f)),
+                    pred: req
+                        .filter
+                        .as_ref()
+                        .map(|f| store.resolve_filter(f))
+                        .transpose()?,
                     phrase,
                 })
             }

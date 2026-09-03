@@ -1471,6 +1471,34 @@ impl FilterKnown {
 
 /// Merged global stats for a fused multi-field query, with the per-node
 /// epochs the shares were valid at (parallel to the node list).
+/// Default expansion cap of a [`crate::pb::TermPrefix`] with
+/// `max_expansions` unset (`docs/prefix-terms.md`).
+pub const DEFAULT_PREFIX_EXPANSIONS: usize = 128;
+/// The largest cap a request may ask for; every expansion is a scored
+/// term, and past this a prefix is a scan, not a query.
+pub const MAX_PREFIX_EXPANSIONS: usize = 1024;
+
+/// Query analysis for one field, or the empty analysis for a
+/// prefix-only query (docs/prefix-terms.md). `cour*` has no text to
+/// analyze — its terms are the expansions alone — so empty text with a
+/// prefix present skips the analyzer rather than refusing. Empty text
+/// with no prefixes keeps the analyzer's refusal: a query with no terms
+/// and no prefixes has nothing to match, and saying so beats an empty
+/// result that looks like a miss.
+async fn analyze_query(
+    addr: &str,
+    text: &str,
+    spec: Option<&crate::pb::AnalysisSpec>,
+    prefixes: &[crate::pb::TermPrefix],
+) -> Result<crate::postings::AnalyzedField, Status> {
+    if text.is_empty() && !prefixes.is_empty() {
+        return Ok(crate::postings::AnalyzedDoc::body(Vec::new(), 0).into_body());
+    }
+    Ok(crate::analyzer::analyze_document(addr, text, spec)
+        .await?
+        .into_body())
+}
+
 struct FusedGlobals {
     doc_count: u64,
     /// Per field: global sum of that field's document lengths.
@@ -2431,6 +2459,8 @@ impl CoordinatorServiceImpl {
             &[],
             &[],
             &[],
+            &[],
+            &mut Vec::new(),
         )
         .await
         .map(|r| (r.0, r.1, r.2))
@@ -2456,6 +2486,8 @@ impl CoordinatorServiceImpl {
         stats_fields: &[String],
         cardinality_fields: &[String],
         projections: &[crate::pb::CompiledProjection],
+        prefixes: &[crate::pb::TermPrefix],
+        expansions: &mut Vec<crate::pb::PrefixExpansion>,
     ) -> Result<AggregatedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -2477,13 +2509,18 @@ impl CoordinatorServiceImpl {
         })?;
         // (a) Query analysis with the SAME options as ingest: query terms
         // share identity with indexed terms (stems when SOURCE_STEMS).
-        let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+        let analyzed = analyze_query(&addr, text, spec, prefixes).await?;
         let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.into_body().terms {
+        for (term, _, _) in analyzed.terms {
             if !terms.contains(&term) {
                 terms.push(term);
             }
         }
+        // Term prefixes join the analyzed terms (docs/prefix-terms.md).
+        expansions.extend(
+            self.expand_prefixes("body", spec, prefixes, &mut terms)
+                .await?,
+        );
         if terms.is_empty() || k == 0 {
             return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
         }
@@ -2919,6 +2956,7 @@ impl CoordinatorServiceImpl {
             range_facet_fields,
             geo_filters,
             filter,
+            &mut Vec::new(),
         )
         .await
         .map(|(hits, _)| hits)
@@ -2947,6 +2985,7 @@ impl CoordinatorServiceImpl {
         range_facet_fields: &[crate::pb::RangeFacetField],
         geo_filters: &[crate::pb::GeoFilter],
         filter: Option<&crate::pb::FilterExpr>,
+        expansions: &mut Vec<crate::pb::PrefixExpansion>,
     ) -> Result<(FacetedHits, Vec<crate::pb::PhraseRouting>), Status> {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
@@ -2992,9 +3031,7 @@ impl CoordinatorServiceImpl {
         // field's terms) and slop, when the field carries a PhraseMatch.
         let mut phrase_requests: Vec<Option<(Vec<usize>, u32)>> = Vec::with_capacity(fields.len());
         for f in fields {
-            let analyzed = crate::analyzer::analyze_document(&addr, text, f.analysis.as_ref())
-                .await?
-                .into_body();
+            let analyzed = analyze_query(&addr, text, f.analysis.as_ref(), &f.prefixes).await?;
             // The analysis already lists each distinct term once, in
             // first-occurrence order; `remap` keeps the sequence honest
             // should a provider ever repeat one.
@@ -3036,6 +3073,12 @@ impl CoordinatorServiceImpl {
                 }
                 None => None,
             };
+            // Term prefixes join this field's terms after the phrase
+            // sequence was taken, so the sequence's indexes stay put.
+            expansions.extend(
+                self.expand_prefixes(&f.field, f.analysis.as_ref(), &f.prefixes, &mut terms)
+                    .await?,
+            );
             field_terms.push(terms);
             phrase_requests.push(phrase);
         }
@@ -3246,6 +3289,7 @@ impl CoordinatorServiceImpl {
                 k1: 0.0,
                 b: 0.0,
                 phrase: None,
+                prefixes: Vec::new(),
             }]
         } else {
             if base.analysis.is_some() {
@@ -3261,6 +3305,13 @@ impl CoordinatorServiceImpl {
                 return Err(Status::invalid_argument(
                     "phrase search base fields must be named and unique",
                 ));
+            }
+            if field.phrase.is_some() || !field.prefixes.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?}: PhraseSearch scores glossary concepts; PhraseMatch and \
+                     TermPrefix constraints are served by Bm25Search",
+                    field.field
+                )));
             }
             if field.field == phrase_index.phrase_field() {
                 return Err(Status::invalid_argument(format!(
@@ -3308,6 +3359,7 @@ impl CoordinatorServiceImpl {
             k1: 0.0,
             b: 0.0,
             phrase: None,
+            prefixes: Vec::new(),
         });
         field_terms.push(phrase_terms);
         if k == 0 || field_terms.iter().all(Vec::is_empty) {
@@ -3394,6 +3446,103 @@ impl CoordinatorServiceImpl {
     /// scoring it as "contributes nothing" would silently return the
     /// ranking of the REMAINING fields, so a misspelled arm of an A/B
     /// reads as "no difference". Refused instead.
+    /// Expand every [`crate::pb::TermPrefix`] of `field` across the fleet
+    /// (`docs/prefix-terms.md`) and add the expansions to `terms`. The
+    /// prefix is normalized under the field's char filters (never
+    /// stemmed), every shard answers from its byte-sorted directory, and
+    /// the fleet-wide union is the term list — the same list a monolith
+    /// would expand, so distributed scoring equals monolithic scoring.
+    /// Past the cap on any shard or in the union, the request is
+    /// INVALID_ARGUMENT naming the count: a prefix is never silently
+    /// truncated to a quieter match set.
+    async fn expand_prefixes(
+        &self,
+        field: &str,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        prefixes: &[crate::pb::TermPrefix],
+        terms: &mut Vec<String>,
+    ) -> Result<Vec<crate::pb::PrefixExpansion>, Status> {
+        let mut out = Vec::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            let cap = match prefix.max_expansions {
+                0 => DEFAULT_PREFIX_EXPANSIONS,
+                n if n as usize > MAX_PREFIX_EXPANSIONS => {
+                    return Err(Status::invalid_argument(format!(
+                        "prefix {:?}: max_expansions {n} exceeds the maximum \
+                         {MAX_PREFIX_EXPANSIONS}",
+                        prefix.prefix
+                    )))
+                }
+                n => n as usize,
+            };
+            let normalized = crate::analyzer::normalize_prefix(&prefix.prefix, spec)?;
+            let mut tasks = Vec::with_capacity(self.node_addrs.len());
+            for (i, node) in self.node_addrs.iter().enumerate() {
+                let mut client = self.node_client(node)?;
+                let request = crate::pb::ExpandTermPrefixRequest {
+                    field: field.to_string(),
+                    prefix: normalized.clone(),
+                    cap: cap as u32,
+                };
+                tasks.push((
+                    i,
+                    tokio::spawn(async move {
+                        client
+                            .expand_term_prefix(request)
+                            .await
+                            .map(|r| r.into_inner())
+                    }),
+                ));
+            }
+            let mut union = std::collections::BTreeSet::new();
+            let mut known = false;
+            for (shard, task) in tasks {
+                let resp = task.await.map_err(|e| {
+                    Status::internal(format!("prefix expansion task failed: {e}"))
+                })??;
+                if !resp.known {
+                    continue;
+                }
+                known = true;
+                if resp.count as usize > cap {
+                    return Err(Status::invalid_argument(format!(
+                        "prefix {normalized:?} on field {field:?} expands to {} terms on shard \
+                         {shard}; the cap is {cap} (raise max_expansions up to \
+                         {MAX_PREFIX_EXPANSIONS}, or lengthen the prefix)",
+                        resp.count
+                    )));
+                }
+                union.extend(resp.terms);
+            }
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary \
+                     to expand in"
+                )));
+            }
+            if union.len() > cap {
+                return Err(Status::invalid_argument(format!(
+                    "prefix {normalized:?} on field {field:?} expands to {} terms across the \
+                     fleet; the cap is {cap} (raise max_expansions up to \
+                     {MAX_PREFIX_EXPANSIONS}, or lengthen the prefix)",
+                    union.len()
+                )));
+            }
+            let expanded: Vec<String> = union.into_iter().collect();
+            for term in &expanded {
+                if !terms.contains(term) {
+                    terms.push(term.clone());
+                }
+            }
+            out.push(crate::pb::PrefixExpansion {
+                field: field.to_string(),
+                prefix: normalized,
+                terms: expanded,
+            });
+        }
+        Ok(out)
+    }
+
     async fn fused_stats(
         &self,
         stats_fields: &[crate::pb::FieldTerms],
@@ -8681,6 +8830,7 @@ impl SearchService for CoordinatorServiceImpl {
         // the shards resolve and evaluate (docs/cel-values.md).
         let projections = compile_projections(&req.projections)?;
         let mut phrase_routing = Vec::new();
+        let mut prefix_expansions = Vec::new();
         let (hits, facets, range_facets, stats, cardinality) =
             if req.fields.is_empty() && req.phrase.is_some() {
                 // A phrase on the flat route is the body field's phrase on
@@ -8710,7 +8860,8 @@ impl SearchService for CoordinatorServiceImpl {
                     weight: 1.0,
                     k1: 0.0,
                     b: 0.0,
-                    phrase: req.phrase.clone(),
+                    phrase: req.phrase,
+                    prefixes: req.prefixes.clone(),
                 }];
                 let ((hits, facets, ranges), routing) = self
                     .fanout_bm25_fused_routed(
@@ -8723,6 +8874,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.range_facet_fields,
                         &req.geo_filters,
                         filter.as_ref(),
+                        &mut prefix_expansions,
                     )
                     .await?;
                 phrase_routing = routing;
@@ -8742,6 +8894,8 @@ impl SearchService for CoordinatorServiceImpl {
                     &req.stats_fields,
                     &req.cardinality_fields,
                     &projections,
+                    &req.prefixes,
+                    &mut prefix_expansions,
                 )
                 .await?
             } else {
@@ -8784,6 +8938,12 @@ impl SearchService for CoordinatorServiceImpl {
                      put the PhraseMatch on the QueryField it constrains",
                 ));
                 }
+                if !req.prefixes.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "Bm25SearchRequest.prefixes expand in the body; with `fields` set, put \
+                         the prefixes on the QueryField whose dictionary they expand in",
+                    ));
+                }
                 let ((hits, facets, ranges), routing) = self
                     .fanout_bm25_fused_routed(
                         &req.text,
@@ -8795,6 +8955,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.range_facet_fields,
                         &req.geo_filters,
                         filter.as_ref(),
+                        &mut prefix_expansions,
                     )
                     .await?;
                 phrase_routing = routing;
@@ -8818,6 +8979,7 @@ impl SearchService for CoordinatorServiceImpl {
             stats,
             cardinality,
             phrase_routing,
+            prefix_expansions,
         }))
     }
 
@@ -8877,6 +9039,7 @@ impl SearchService for CoordinatorServiceImpl {
             stats: Vec::new(),
             cardinality: Vec::new(),
             phrase_routing: Vec::new(),
+            prefix_expansions: Vec::new(),
         }))
     }
 

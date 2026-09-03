@@ -273,6 +273,40 @@ pub const CHAR_FILTER_DEHYPHENATE: i32 = 24;
 /// a fresh TCP+h2 connection per Analyze (the previous behavior) buried
 /// the sidecar under connection churn — its listener died after ~28k
 /// rapid-fire calls while the process stayed alive.
+/// Bring a term prefix into a field's term identity for dictionary
+/// expansion (`docs/prefix-terms.md`): the spec's normalizer chain, and
+/// never its stemmer. Under `SOURCE_STEMS` the chain is ignored at ingest,
+/// so the prefix is compared as written. An absent spec cannot be
+/// honored — the sidecar's default chain is not known here, and a
+/// prefix normalized under the wrong chain matches the wrong terms — so
+/// it refuses by name, as does a chain the native normalizer does not
+/// implement.
+pub fn normalize_prefix(prefix: &str, spec: Option<&AnalysisSpec>) -> Result<String, Status> {
+    if prefix.is_empty() {
+        return Err(Status::invalid_argument(
+            "a term prefix must be non-empty; an empty prefix is every term",
+        ));
+    }
+    let Some(spec) = spec else {
+        return Err(Status::invalid_argument(
+            "term prefixes need an explicit AnalysisSpec: the prefix is normalized under \
+             the field's char filters before it is compared against the dictionary, and \
+             the sidecar's default chain is not known to the coordinator",
+        ));
+    };
+    if spec.term_vector_source == SOURCE_STEMS {
+        return Ok(prefix.to_string());
+    }
+    let native = native_spec(Some(spec))?;
+    let normalized = protomolt_analyzer::normalize_term(prefix, &native.normalizers);
+    if normalized.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "term prefix {prefix:?} normalizes to nothing under the field's char filters"
+        )));
+    }
+    Ok(normalized)
+}
+
 pub fn shared_channel(addr: &str) -> Result<Channel, Status> {
     static CHANNELS: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
     let map = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));

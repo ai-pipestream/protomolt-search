@@ -350,6 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         })
         .await?
         .into_inner();
@@ -384,12 +385,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 k1: 0.0,
                 b: 0.0,
                 phrase: None,
+                prefixes: Vec::new(),
             }],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         })
         .await?
         .into_inner();
@@ -425,6 +428,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     k1: 0.0,
                     b: 0.0,
                     phrase: None,
+                    prefixes: Vec::new(),
                 },
                 QueryField {
                     field: "case_name".to_string(),
@@ -433,6 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     k1: 0.0,
                     b: 0.0,
                     phrase: None,
+                    prefixes: Vec::new(),
                 },
             ],
             range_facet_fields: Vec::new(),
@@ -440,6 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         })
         .await?
         .into_inner();
@@ -596,6 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         })),
     };
     let body_field = || QueryField {
@@ -605,6 +612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         k1: 0.0,
         b: 0.0,
         phrase: None,
+        prefixes: Vec::new(),
     };
     let name_field = |w: f32| QueryField {
         field: "case_name".to_string(),
@@ -613,6 +621,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         k1: 0.0,
         b: 0.0,
         phrase: None,
+        prefixes: Vec::new(),
     };
     let variants = client
         .variant_search(VariantSearchRequest {

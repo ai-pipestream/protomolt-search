@@ -1065,14 +1065,38 @@ fn compile_string_relation(col: &Side, op: RelOp, value: &str) -> Result<pb::Fil
         }
         _ => unreachable!("callers pass a column side"),
     };
+    let (column, key) = match col {
+        Side::Column(name) => (name.clone(), String::new()),
+        Side::MapAccess(name, key) => (name.clone(), key.clone()),
+        _ => unreachable!("callers pass a column side"),
+    };
+    // String ordering compiles to a dictionary ordinal range
+    // (docs/prefix-terms.md): dictionaries are written in byte order,
+    // which is the order stock CEL compares strings in.
+    let bound = |exclusive: bool| {
+        Some(pb::StringBound {
+            value: value.to_string(),
+            exclusive,
+        })
+    };
+    let range = |min: Option<pb::StringBound>, max: Option<pb::StringBound>| {
+        wrap(pb::filter_expr::Expr::StringRange(
+            pb::StringRangePredicate {
+                column: column.clone(),
+                key: key.clone(),
+                min,
+                max,
+            },
+        ))
+    };
     match op {
         RelOp::Eq => Ok(eq),
         RelOp::Ne => Ok(not_of(eq)),
-        other => Err(refuse(format!(
-            "string ordering (`{}`) does not compile; facet dictionaries are unordered \
-             (equality and `in` are the string predicates)",
-            other.name()
-        ))),
+        RelOp::Lt => Ok(range(None, bound(true))),
+        RelOp::Le => Ok(range(None, bound(false))),
+        RelOp::Gt => Ok(range(bound(true), None)),
+        RelOp::Ge => Ok(range(bound(false), None)),
+        RelOp::In => unreachable!("`in` is compiled by compile_in"),
     }
 }
 
@@ -1248,9 +1272,45 @@ fn compile_call(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, Status> {
              predicates, and a regex engine is a dependency this engine deliberately \
              does not link",
         )),
-        "startsWith" | "endsWith" | "contains" => Err(refuse(format!(
-            "{name}() does not compile: facet dictionaries resolve whole values \
-             (equality and `in`), not substrings"
+        // Method-call syntax puts the receiver first: `court.startsWith("ca")`
+        // is Call("startsWith", [court, "ca"]). A prefix is a dictionary
+        // range on a byte-sorted dictionary (docs/prefix-terms.md).
+        "startsWith" => {
+            if args.len() != 2 {
+                return Err(refuse(
+                    "startsWith() takes a column receiver and one string",
+                ));
+            }
+            let (column, key) = match side_of(&args[0])? {
+                Side::Column(name) => (name, String::new()),
+                Side::MapAccess(name, key) => (name, key),
+                _ => {
+                    return Err(refuse(
+                        "startsWith() reads a facet column or a map entry; the receiver \
+                         must be a column",
+                    ))
+                }
+            };
+            let prefix = match &args[1] {
+                Ast::Str(v) => v.clone(),
+                _ => return Err(refuse("startsWith() takes a string literal prefix")),
+            };
+            if prefix.is_empty() {
+                return Err(refuse(
+                    "startsWith(\"\") matches every value; presence is has(column)",
+                ));
+            }
+            Ok(wrap(pb::filter_expr::Expr::StringPrefix(
+                pb::StringPrefixPredicate {
+                    column,
+                    key,
+                    prefix,
+                },
+            )))
+        }
+        "endsWith" | "contains" => Err(refuse(format!(
+            "{name}() does not compile: a byte-sorted dictionary resolves prefixes \
+             (startsWith) and ranges, not suffixes or substrings"
         ))),
         "all" | "exists" | "exists_one" | "filter" | "map" => Err(refuse(format!(
             "the {name}() macro (a comprehension) does not compile to an index predicate"
@@ -2333,6 +2393,80 @@ mod tests {
         }
     }
 
+    fn string_range(
+        column: &str,
+        key: &str,
+        min: Option<(&str, bool)>,
+        max: Option<(&str, bool)>,
+    ) -> pb::FilterExpr {
+        let bound = |b: Option<(&str, bool)>| {
+            b.map(|(value, exclusive)| pb::StringBound {
+                value: value.into(),
+                exclusive,
+            })
+        };
+        pb::FilterExpr {
+            expr: Some(pb::filter_expr::Expr::StringRange(
+                pb::StringRangePredicate {
+                    column: column.into(),
+                    key: key.into(),
+                    min: bound(min),
+                    max: bound(max),
+                },
+            )),
+        }
+    }
+
+    /// String ordering and prefixes compile to dictionary ranges
+    /// (docs/prefix-terms.md); the mirrored forms orient the column.
+    #[test]
+    fn string_ordering_and_prefixes_compile_to_dictionary_ranges() {
+        assert_eq!(
+            compiled("court < \"b\""),
+            string_range("court", "", None, Some(("b", true)))
+        );
+        assert_eq!(
+            compiled("court <= \"b\""),
+            string_range("court", "", None, Some(("b", false)))
+        );
+        assert_eq!(
+            compiled("court > \"b\""),
+            string_range("court", "", Some(("b", true)), None)
+        );
+        assert_eq!(
+            compiled("\"b\" <= court"),
+            string_range("court", "", Some(("b", false)), None)
+        );
+        assert_eq!(
+            compiled("tags[\"color\"] >= \"m\""),
+            string_range("tags", "color", Some(("m", false)), None)
+        );
+        assert_eq!(
+            compiled("court.startsWith(\"ca\")"),
+            pb::FilterExpr {
+                expr: Some(pb::filter_expr::Expr::StringPrefix(
+                    pb::StringPrefixPredicate {
+                        column: "court".into(),
+                        key: String::new(),
+                        prefix: "ca".into(),
+                    }
+                )),
+            }
+        );
+        assert_eq!(
+            compiled("tags[\"color\"].startsWith(\"re\")"),
+            pb::FilterExpr {
+                expr: Some(pb::filter_expr::Expr::StringPrefix(
+                    pb::StringPrefixPredicate {
+                        column: "tags".into(),
+                        key: "color".into(),
+                        prefix: "re".into(),
+                    }
+                )),
+            }
+        );
+    }
+
     /// Everything outside the vocabulary refuses BY NAME.
     #[test]
     fn refusals_name_the_construct() {
@@ -2341,7 +2475,10 @@ mod tests {
         refused("year * 2 > 1990", "arithmetic (`*`)");
         refused("court == \"a\" ? has(x) : has(y)", "ternary");
         refused("court.matches(\"sco.*\")", "matches() (regex)");
-        refused("court.startsWith(\"sco\")", "startsWith()");
+        refused("court.endsWith(\"sco\")", "endsWith()");
+        refused("court.contains(\"sco\")", "contains()");
+        refused("court.startsWith(\"\")", "matches every value");
+        refused("court.startsWith(year)", "string literal prefix");
         refused("tags.all(t, t == \"x\")", "all() macro");
         refused("size(court) > 2", "size()");
         refused("int(year) == 1990", "int() conversion");
@@ -2351,7 +2488,6 @@ mod tests {
         refused("true", "boolean literal");
         refused("court == true", "boolean literal");
         refused("court == null", "null");
-        refused("court < \"b\"", "string ordering");
         refused("year in []", "empty list");
         refused("year in [1990, \"x\"]", "mixes strings and numbers");
         refused("has(tags[\"color\"])", "'color' in tags");

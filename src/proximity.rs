@@ -261,7 +261,10 @@ mod tests {
     use super::*;
     use crate::postings::{AnalyzedDoc, Bm25Store};
 
-    fn positioned(terms: &[(&str, &[u32], &[(u32, u32)])]) -> AnalyzedField {
+    /// One query term: its text, its token ordinals, and its spans.
+    type PositionedTerm<'a> = (&'a str, &'a [u32], &'a [(u32, u32)]);
+
+    fn positioned(terms: &[PositionedTerm<'_>]) -> AnalyzedField {
         AnalyzedField {
             terms: terms
                 .iter()

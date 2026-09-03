@@ -532,6 +532,15 @@ pub fn unicode_case_fold(text: &str) -> String {
     full_case_fold(text)
 }
 
+/// Run the normalizer chain alone over one token: what a term prefix
+/// must go through to be compared against the dictionary of a field
+/// whose identity is normalized tokens or normalized stems. Stemming is
+/// deliberately not applied — a prefix of a stem is what the dictionary
+/// holds, and stemming a fragment would change the fragment.
+pub fn normalize_term(token: &str, steps: &[NormalizerStep]) -> String {
+    normalize(token, steps)
+}
+
 fn tokenize_whitespace(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
     let mut tokens = Vec::new();
     let mut start_byte = None;

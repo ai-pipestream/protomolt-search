@@ -359,6 +359,27 @@ pub enum ResolvedLeaf {
         /// The region (validated at request parse).
         region: crate::geo::GeoRegion,
     },
+    /// A string range or prefix over a facet column resolved to the
+    /// ordinal range `[lo, hi)` of a byte-sorted dictionary
+    /// (`docs/prefix-terms.md`); `lo >= hi` is the empty range.
+    FacetOrdRange {
+        /// Index into the shard's facet table.
+        column: Option<usize>,
+        /// Inclusive lower ordinal.
+        lo: u32,
+        /// Exclusive upper ordinal.
+        hi: u32,
+    },
+    /// The same over one key of a map-facet column, on its value
+    /// dictionary.
+    MapFacetOrdRange {
+        /// (column, key ordinal), `None` as in [`ResolvedLeaf::MapFacet`].
+        target: Option<(usize, u32)>,
+        /// Inclusive lower ordinal.
+        lo: u32,
+        /// Exclusive upper ordinal.
+        hi: u32,
+    },
 }
 
 impl ResolvedLeaf {
@@ -432,6 +453,20 @@ impl ResolvedLeaf {
                 Some(gi) => match cols.geo_value(*gi, doc_id) {
                     None => Tri::Unknown,
                     Some((lat, lon)) => Tri::from(region.contains(lat, lon)),
+                },
+            },
+            ResolvedLeaf::FacetOrdRange { column, lo, hi } => match column {
+                None => Tri::Unknown,
+                Some(fi) => match cols.facet_ord(*fi, doc_id) {
+                    None => Tri::Unknown,
+                    Some(ord) => Tri::from(*lo <= ord && ord < *hi),
+                },
+            },
+            ResolvedLeaf::MapFacetOrdRange { target, lo, hi } => match target {
+                None => Tri::Unknown,
+                Some((ci, key_ord)) => match cols.map_facet_value_ord(*ci, *key_ord, doc_id) {
+                    None => Tri::Unknown,
+                    Some(ord) => Tri::from(*lo <= ord && ord < *hi),
                 },
             },
         }
@@ -579,6 +614,10 @@ pub enum LeafRef<'a> {
     Has(&'a crate::pb::HasPredicate),
     /// A geo leaf.
     Geo(&'a crate::pb::GeoFilter),
+    /// A string range on a facet column or map-facet value.
+    StringRange(&'a crate::pb::StringRangePredicate),
+    /// A string prefix on a facet column or map-facet value.
+    StringPrefix(&'a crate::pb::StringPrefixPredicate),
 }
 
 impl LeafRef<'_> {
@@ -595,7 +634,17 @@ impl LeafRef<'_> {
             LeafRef::MapHasKey(p) => format!("map column {:?}", p.column),
             LeafRef::Has(p) => format!("column {:?}", p.column),
             LeafRef::Geo(g) => format!("geo column {:?}", g.column),
+            LeafRef::StringRange(p) => describe_string_target(&p.column, &p.key),
+            LeafRef::StringPrefix(p) => describe_string_target(&p.column, &p.key),
         }
+    }
+}
+
+fn describe_string_target(column: &str, key: &str) -> String {
+    if key.is_empty() {
+        format!("facet column {column:?}")
+    } else {
+        format!("map-facet column {column:?} key {key:?}")
     }
 }
 
@@ -618,6 +667,8 @@ pub fn walk_leaves<'a>(expr: &'a crate::pb::FilterExpr, visit: &mut dyn FnMut(Le
         Some(Expr::MapHasKey(p)) => visit(LeafRef::MapHasKey(p)),
         Some(Expr::Has(p)) => visit(LeafRef::Has(p)),
         Some(Expr::Geo(g)) => visit(LeafRef::Geo(g)),
+        Some(Expr::StringRange(p)) => visit(LeafRef::StringRange(p)),
+        Some(Expr::StringPrefix(p)) => visit(LeafRef::StringPrefix(p)),
         None => {}
     }
 }
@@ -779,6 +830,38 @@ fn validate_node(
         Some(Expr::Geo(g)) => {
             *leaves += 1;
             crate::node::validate_geo_filter(g).map(|_| ())
+        }
+        Some(Expr::StringRange(p)) => {
+            *leaves += 1;
+            if p.column.is_empty() {
+                return Err(Status::invalid_argument(
+                    "filter string-range predicate: a predicate names the column it reads",
+                ));
+            }
+            if p.min.is_none() && p.max.is_none() {
+                return Err(Status::invalid_argument(format!(
+                    "filter string-range predicate on {:?}: at least one bound; bare \
+                     presence is has({})",
+                    p.column, p.column
+                )));
+            }
+            Ok(())
+        }
+        Some(Expr::StringPrefix(p)) => {
+            *leaves += 1;
+            if p.column.is_empty() {
+                return Err(Status::invalid_argument(
+                    "filter string-prefix predicate: a predicate names the column it reads",
+                ));
+            }
+            if p.prefix.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "filter string-prefix predicate on {:?}: an empty prefix matches every \
+                     value, which is has({})",
+                    p.column, p.column
+                )));
+            }
+            Ok(())
         }
     }
 }

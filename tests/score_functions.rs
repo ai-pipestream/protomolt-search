@@ -440,6 +440,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await
@@ -545,6 +546,7 @@ async fn stage_and_ingest_refusals_are_loud() {
                 k1: 0.0,
                 b: 0.0,
                 phrase: None,
+                prefixes: Vec::new(),
             }],
             facet_fields: Vec::new(),
             score_stages: vec![decay_stage(300.0, 100.0)],
@@ -553,6 +555,7 @@ async fn stage_and_ingest_refusals_are_loud() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await

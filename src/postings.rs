@@ -595,6 +595,14 @@ pub trait Bm25Index {
         let _ = (term, doc_id);
         None
     }
+    /// Every term of this field starting with `prefix`, in byte order,
+    /// when there are at most `cap` of them; `Err(count)` with the exact
+    /// count otherwise (`docs/prefix-terms.md`). The heap store walks its
+    /// ordered map, the file reader binary-searches its byte-sorted
+    /// directory and scans while the prefix holds — never the whole
+    /// dictionary. A prefix past the cap is refused with the count, never
+    /// truncated to a quieter match set.
+    fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize>;
 }
 
 /// One posting: a term occurrence set within one document.
@@ -797,8 +805,11 @@ struct FieldStore {
     /// Hash of the field's AnalysisSpec, persisted in the v6 field
     /// table. 0 until the ingest layer wires real fingerprints.
     analysis_fingerprint: u64,
-    /// term → postings, kept ascending by doc id (append-only).
-    postings: HashMap<String, Vec<Posting>>,
+    /// term → postings, kept ascending by doc id (append-only), in a
+    /// map ordered by term bytes: the heap store's dictionary is the same
+    /// byte-sorted order the on-disk directory has, so prefix expansion is
+    /// a range walk here and a binary search there (`docs/prefix-terms.md`).
+    postings: std::collections::BTreeMap<String, Vec<Posting>>,
     /// Per-document length in terms, indexed by local doc id. Sparse
     /// slots (ids consumed by the vector side) hold 0. Every field's
     /// table has the same length (the shared slot count).
@@ -817,7 +828,7 @@ impl FieldStore {
         Self {
             name: name.to_string(),
             analysis_fingerprint: 0,
-            postings: HashMap::new(),
+            postings: std::collections::BTreeMap::new(),
             doc_lengths: Vec::new(),
             total_length: 0,
             positions: false,
@@ -1321,6 +1332,159 @@ fn write_map_offsets_and_pairs<W: Write, T>(
     Ok(())
 }
 
+/// A dictionary's byte order: `(order, remap)` where `order[new] = old`
+/// and `remap[old] = new`. Every dictionary is written in this order at
+/// flush (`docs/prefix-terms.md`): a reader can then resolve a string
+/// range or prefix to ONE ordinal range, while the heap store keeps its
+/// first-seen ordinals and remaps at write time. Byte order is the
+/// order stock CEL compares strings in, so the two never disagree.
+fn sorted_dictionary(dict: &[String]) -> (Vec<u32>, Vec<u32>) {
+    let mut order: Vec<u32> = (0..dict.len() as u32).collect();
+    order.sort_by(|&a, &b| dict[a as usize].as_bytes().cmp(dict[b as usize].as_bytes()));
+    let mut remap = vec![0u32; dict.len()];
+    for (new, &old) in order.iter().enumerate() {
+        remap[old as usize] = new as u32;
+    }
+    (order, remap)
+}
+
+/// One value's ordinal in a dictionary: a binary search when the
+/// dictionary is in byte order, a linear scan otherwise.
+fn dictionary_lookup(dict: &[String], sorted: bool, value: &str) -> Option<u32> {
+    if sorted {
+        dict.binary_search_by(|v| v.as_bytes().cmp(value.as_bytes()))
+            .ok()
+            .map(|p| p as u32)
+    } else {
+        dict.iter().position(|v| v == value).map(|p| p as u32)
+    }
+}
+
+/// [`sorted_dictionary`], or the identity order (first-seen ordinals, the
+/// layout every file before 2026-09-02 has) for the legacy oracle
+/// writer the tests use to prove old files still open and refuse string
+/// ordering by name.
+fn dictionary_order(dict: &[String], byte_order: bool) -> (Vec<u32>, Vec<u32>) {
+    if byte_order {
+        sorted_dictionary(dict)
+    } else {
+        let identity: Vec<u32> = (0..dict.len() as u32).collect();
+        (identity.clone(), identity)
+    }
+}
+
+/// Whether a dictionary is in strict byte order — what the reader checks
+/// at open to know an ordinal range is meaningful, and what the heap
+/// store answers about its first-seen order.
+fn dictionary_sorted(dict: &[String]) -> bool {
+    dict.windows(2)
+        .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+}
+
+/// Write a facet column's sections: the dictionary in byte order, then
+/// the per-slot ordinals remapped to it. Shared by both writers.
+fn write_facet_column<W: Write>(
+    w: &mut W,
+    facet: &FacetStore,
+    n_slots: usize,
+    byte_order: bool,
+) -> io::Result<()> {
+    let (order, remap) = dictionary_order(&facet.dict, byte_order);
+    for &old in &order {
+        let value = &facet.dict[old as usize];
+        write_u16(w, value.len() as u16)?;
+        w.write_all(value.as_bytes())?;
+    }
+    for slot in 0..n_slots {
+        let ord = facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT);
+        write_u32(
+            w,
+            if ord == FACET_ABSENT {
+                FACET_ABSENT
+            } else {
+                remap[ord as usize]
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Write a map-facet column's sections with both dictionaries in byte
+/// order and every pair list remapped and re-sorted by the new key
+/// ordinal (the reader binary-searches pairs by key ordinal).
+fn write_map_facet_column<W: Write>(
+    w: &mut W,
+    c: &MapFacetStore,
+    n_slots: usize,
+    byte_order: bool,
+) -> io::Result<()> {
+    let (key_order, key_remap) = dictionary_order(&c.keys, byte_order);
+    let (value_order, value_remap) = dictionary_order(&c.values, byte_order);
+    for &old in &key_order {
+        let key = &c.keys[old as usize];
+        write_u16(w, key.len() as u16)?;
+        w.write_all(key.as_bytes())?;
+    }
+    for &old in &value_order {
+        let value = &c.values[old as usize];
+        write_u16(w, value.len() as u16)?;
+        w.write_all(value.as_bytes())?;
+    }
+    let pairs: Vec<Vec<(u32, u32)>> = c
+        .pairs
+        .iter()
+        .map(|list| {
+            let mut remapped: Vec<(u32, u32)> = list
+                .iter()
+                .map(|&(k, v)| (key_remap[k as usize], value_remap[v as usize]))
+                .collect();
+            remapped.sort_unstable();
+            remapped
+        })
+        .collect();
+    write_map_offsets_and_pairs(w, n_slots, &pairs, |w, &(k, v)| {
+        write_u32(w, k)?;
+        write_u32(w, v)
+    })
+}
+
+/// Write a map-numeric column's sections with the key dictionary in
+/// byte order (each entry carrying ITS key's min/max) and every pair
+/// list remapped and re-sorted.
+fn write_map_numeric_column<W: Write>(
+    w: &mut W,
+    c: &MapNumericStore,
+    n_slots: usize,
+    byte_order: bool,
+) -> io::Result<()> {
+    let (key_order, key_remap) = dictionary_order(&c.keys, byte_order);
+    let mm = c.key_min_max();
+    for &old in &key_order {
+        let key = &c.keys[old as usize];
+        let (min, max) = mm[old as usize];
+        write_u16(w, key.len() as u16)?;
+        w.write_all(key.as_bytes())?;
+        write_u64(w, min.to_bits())?;
+        write_u64(w, max.to_bits())?;
+    }
+    let pairs: Vec<Vec<(u32, f64)>> = c
+        .pairs
+        .iter()
+        .map(|list| {
+            let mut remapped: Vec<(u32, f64)> = list
+                .iter()
+                .map(|&(k, v)| (key_remap[k as usize], v))
+                .collect();
+            remapped.sort_by_key(|&(k, _)| k);
+            remapped
+        })
+        .collect();
+    write_map_offsets_and_pairs(w, n_slots, &pairs, |w, &(k, v)| {
+        write_u32(w, k)?;
+        write_u64(w, v.to_bits())
+    })
+}
+
 /// Intern `value` into a dictionary, returning its ordinal.
 fn intern(dict: &mut Vec<String>, index: &mut HashMap<String, u32>, value: &str, col: &str) -> u32 {
     match index.get(value) {
@@ -1570,6 +1734,27 @@ impl Bm25Store {
     /// data).
     pub fn facet_value_ord_of(&self, fi: usize, value: &str) -> Option<u32> {
         self.facets[fi].index.get(value).copied()
+    }
+
+    /// Facet field `fi`'s dictionary in ordinal (first-seen) order.
+    pub fn facet_dictionary(&self, fi: usize) -> &[String] {
+        &self.facets[fi].dict
+    }
+
+    /// Whether facet field `fi`'s first-seen dictionary happens to be in
+    /// byte order (it is after a reload of a file this writer produced).
+    pub fn facet_dictionary_sorted(&self, fi: usize) -> bool {
+        dictionary_sorted(&self.facets[fi].dict)
+    }
+
+    /// Map-facet column `ci`'s value dictionary in ordinal order.
+    pub fn map_facet_values(&self, ci: usize) -> &[String] {
+        &self.map_facets[ci].values
+    }
+
+    /// Whether map-facet column `ci`'s value dictionary is in byte order.
+    pub fn map_facet_values_sorted(&self, ci: usize) -> bool {
+        dictionary_sorted(&self.map_facets[ci].values)
     }
 
     /// Record `doc_id`'s value for facet field `fi`, interning it in
@@ -2008,6 +2193,21 @@ impl Bm25Store {
         fsync_parent(path)
     }
 
+    /// Persist with first-seen dictionaries under the ordinary v8
+    /// envelope: the exact file a pre-2026-09 build wrote. Legacy oracle
+    /// for the tests only (see [`Self::write_v6_first_seen_dictionaries`]).
+    pub fn save_first_seen_dictionaries(&self, path: &Path) -> io::Result<()> {
+        let tmp: PathBuf = path.with_extension("bm25tmp");
+        {
+            let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
+            self.write_v6_first_seen_dictionaries(&mut w)?;
+            w.flush()?;
+        }
+        finalize_v8(&tmp)?;
+        std::fs::rename(&tmp, path)?;
+        fsync_parent(path)
+    }
+
     /// Persist in the v5 format. Correctness oracle only — the
     /// v5-vs-v6 section-parity and query-identity tests; production
     /// saves are v6 and multi-field stores are refused here.
@@ -2046,11 +2246,10 @@ impl Bm25Store {
         (texts_size, 12 * self.texts.len() as u64, lineages_size)
     }
 
-    /// One field's term list, sorted (the on-disk directory order).
+    /// One field's term list in byte order — the on-disk directory
+    /// order, which the heap map already keeps.
     fn sorted_terms(field: &FieldStore) -> Vec<&String> {
-        let mut terms: Vec<&String> = field.postings.keys().collect();
-        terms.sort();
-        terms
+        field.postings.keys().collect()
     }
 
     /// Per-term `(occurrence, skip)` run byte sizes of one field — the
@@ -2329,6 +2528,19 @@ impl Bm25Store {
     /// column-less byte is identical to the v6 writer's, by
     /// construction (the additions are gated, not forked).
     pub fn write_v6_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        self.write_v6_ordered(w, true)
+    }
+
+    /// [`Self::write_v6_to`] with dictionaries in first-seen order — the
+    /// layout every file before 2026-09-02 has. A legacy oracle for the
+    /// tests that prove such files still open and serve, and refuse
+    /// string ordering by name (`docs/prefix-terms.md`); production
+    /// writes always use byte order.
+    pub fn write_v6_first_seen_dictionaries<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        self.write_v6_ordered(w, false)
+    }
+
+    fn write_v6_ordered<W: Write>(&self, w: &mut W, byte_order: bool) -> io::Result<()> {
         let n_slots = self.texts.len() as u64;
         let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
         let has_columns = !self.facets.is_empty()
@@ -2599,13 +2811,7 @@ impl Bm25Store {
             Self::write_field_directory(w, &field_terms[fi], &directory)?;
         }
         for facet in &self.facets {
-            for value in &facet.dict {
-                write_u16(w, value.len() as u16)?;
-                w.write_all(value.as_bytes())?;
-            }
-            for slot in 0..n_slots as usize {
-                write_u32(w, facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT))?;
-            }
+            write_facet_column(w, facet, n_slots as usize, byte_order)?;
         }
         for numeric in &self.numerics {
             for slot in 0..n_slots as usize {
@@ -2621,31 +2827,10 @@ impl Bm25Store {
             }
         }
         for c in &self.map_facets {
-            for key in &c.keys {
-                write_u16(w, key.len() as u16)?;
-                w.write_all(key.as_bytes())?;
-            }
-            for value in &c.values {
-                write_u16(w, value.len() as u16)?;
-                w.write_all(value.as_bytes())?;
-            }
-            write_map_offsets_and_pairs(w, n_slots as usize, &c.pairs, |w, &(k, v)| {
-                write_u32(w, k)?;
-                write_u32(w, v)
-            })?;
+            write_map_facet_column(w, c, n_slots as usize, byte_order)?;
         }
         for c in &self.map_numerics {
-            let mm = c.key_min_max();
-            for (key, &(min, max)) in c.keys.iter().zip(&mm) {
-                write_u16(w, key.len() as u16)?;
-                w.write_all(key.as_bytes())?;
-                write_u64(w, min.to_bits())?;
-                write_u64(w, max.to_bits())?;
-            }
-            write_map_offsets_and_pairs(w, n_slots as usize, &c.pairs, |w, &(k, v)| {
-                write_u32(w, k)?;
-                write_u64(w, v.to_bits())
-            })?;
+            write_map_numeric_column(w, c, n_slots as usize, byte_order)?;
         }
         for c in &self.integers {
             for slot in 0..n_slots as usize {
@@ -2806,7 +2991,7 @@ impl Bm25Store {
     /// A single-field ("body") store from already-decoded parts — the
     /// shape every pre-v6 read path produces.
     fn from_single_field(
-        postings: HashMap<String, Vec<Posting>>,
+        postings: std::collections::BTreeMap<String, Vec<Posting>>,
         doc_lengths: Vec<u32>,
         total_length: u64,
         texts: Vec<Option<String>>,
@@ -2918,7 +3103,7 @@ impl Bm25Store {
             }
         }
         let n_terms = read_u32(r)? as usize;
-        let mut postings = HashMap::with_capacity(n_terms);
+        let mut postings = std::collections::BTreeMap::new();
         for _ in 0..n_terms {
             let term_len = read_u32(r)? as usize;
             let term = String::from_utf8(take(r, term_len)?.to_vec())
@@ -3272,6 +3457,20 @@ impl Bm25Index for StoreFieldView<'_> {
             .ok()
             .map(|i| postings[i].positions.clone())
     }
+    fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
+        let matches: Vec<&String> = self
+            .field
+            .postings
+            .range(prefix.to_string()..)
+            .map(|(term, _)| term)
+            .take_while(|term| term.starts_with(prefix))
+            .collect();
+        if matches.len() > cap {
+            Err(matches.len())
+        } else {
+            Ok(matches.into_iter().cloned().collect())
+        }
+    }
 }
 
 /// The store itself scores as its body field (field 0) — the surface
@@ -3310,6 +3509,9 @@ impl Bm25Index for Bm25Store {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         self.field(0).posting_positions(term, doc_id)
+    }
+    fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
+        self.field(0).expand_prefix(prefix, cap)
     }
 }
 
@@ -3367,7 +3569,7 @@ impl Bm25Store {
             }
         }
         let n_terms = read_u32(r)? as usize;
-        let mut postings = HashMap::with_capacity(n_terms);
+        let mut postings = std::collections::BTreeMap::new();
         for _ in 0..n_terms {
             let term_len = read_u32(r)? as usize;
             let term = String::from_utf8(take(r, term_len)?.to_vec())
@@ -3412,7 +3614,7 @@ impl Bm25Store {
         directory_off: u64,
         run_base: u64,
         positions_off: Option<u64>,
-    ) -> io::Result<HashMap<String, Vec<Posting>>> {
+    ) -> io::Result<std::collections::BTreeMap<String, Vec<Posting>>> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let at = |off: u64, len: u64| -> io::Result<&[u8]> {
             let i = (off as usize)
@@ -3442,7 +3644,7 @@ impl Bm25Store {
             }
             None => None,
         };
-        let mut postings = HashMap::with_capacity(n_terms);
+        let mut postings = std::collections::BTreeMap::new();
         for i in 0..n_terms {
             let e = directory_off + 4 + 34 * i as u64;
             let doc_run_off = u64_at(e)? + run_base;
@@ -4973,16 +5175,7 @@ impl SpillBuilder {
                 }
             }
             for facet in &self.facets {
-                for value in &facet.dict {
-                    write_u16(&mut w, value.len() as u16)?;
-                    w.write_all(value.as_bytes())?;
-                }
-                for slot in 0..n_slots as usize {
-                    write_u32(
-                        &mut w,
-                        facet.ords.get(slot).copied().unwrap_or(FACET_ABSENT),
-                    )?;
-                }
+                write_facet_column(&mut w, facet, n_slots as usize, true)?;
             }
             for numeric in &self.numerics {
                 for slot in 0..n_slots as usize {
@@ -4998,31 +5191,10 @@ impl SpillBuilder {
                 }
             }
             for c in &self.map_facets {
-                for key in &c.keys {
-                    write_u16(&mut w, key.len() as u16)?;
-                    w.write_all(key.as_bytes())?;
-                }
-                for value in &c.values {
-                    write_u16(&mut w, value.len() as u16)?;
-                    w.write_all(value.as_bytes())?;
-                }
-                write_map_offsets_and_pairs(&mut w, n_slots as usize, &c.pairs, |w, &(k, v)| {
-                    write_u32(w, k)?;
-                    write_u32(w, v)
-                })?;
+                write_map_facet_column(&mut w, c, n_slots as usize, true)?;
             }
             for c in &self.map_numerics {
-                let mm = c.key_min_max();
-                for (key, &(min, max)) in c.keys.iter().zip(&mm) {
-                    write_u16(&mut w, key.len() as u16)?;
-                    w.write_all(key.as_bytes())?;
-                    write_u64(&mut w, min.to_bits())?;
-                    write_u64(&mut w, max.to_bits())?;
-                }
-                write_map_offsets_and_pairs(&mut w, n_slots as usize, &c.pairs, |w, &(k, v)| {
-                    write_u32(w, k)?;
-                    write_u64(w, v.to_bits())
-                })?;
+                write_map_numeric_column(&mut w, c, n_slots as usize, true)?;
             }
             for c in &self.integers {
                 for slot in 0..n_slots as usize {
@@ -6568,6 +6740,11 @@ struct FacetSlice {
     name: String,
     /// Values in ordinal order, decoded eagerly at open.
     dict: Vec<String>,
+    /// Whether `dict` is in strict byte order, checked at open: true
+    /// for every file this writer produces, and what makes an ordinal
+    /// range an exact string range (`docs/prefix-terms.md`). A file
+    /// written with first-seen ordinals refuses string ordering by name.
+    sorted: bool,
     /// Absolute offset of the ords section (n_slots x u32).
     ords_off: u64,
 }
@@ -6594,6 +6771,10 @@ struct MapFacetSlice {
     keys: Vec<String>,
     /// Values in ordinal order.
     values: Vec<String>,
+    /// Whether `keys` / `values` are in strict byte order (see
+    /// `FacetSlice::sorted`).
+    keys_sorted: bool,
+    values_sorted: bool,
     /// Absolute offset of the offsets section ((n_slots + 1) x u32).
     offsets_off: u64,
     /// Absolute offset of the pairs section (8 B (key_ord, value_ord)
@@ -6823,17 +7004,33 @@ impl Bm25Reader {
     }
 
     /// The ordinal of `value` in facet field `fi`'s dictionary, `None`
-    /// when this file never ingested it. A linear dictionary scan, the
-    /// reader's [`Self::map_facet_key_ord`] pattern: resolution runs
-    /// once per request, not per document, and the on-disk dictionary
-    /// is in first-seen order (the sorted layout stays in the back
-    /// pocket, `docs/map-columns.md`).
+    /// when this file never ingested it. A binary search on a file
+    /// whose dictionary is in byte order (every file this writer
+    /// produces), a linear scan on an older first-seen file; either
+    /// way resolution runs once per request, not per document.
     pub fn facet_value_ord_of(&self, fi: usize, value: &str) -> Option<u32> {
-        self.facets[fi]
-            .dict
-            .iter()
-            .position(|v| v == value)
-            .map(|p| p as u32)
+        dictionary_lookup(&self.facets[fi].dict, self.facets[fi].sorted, value)
+    }
+
+    /// Facet field `fi`'s dictionary, in ordinal order.
+    pub fn facet_dictionary(&self, fi: usize) -> &[String] {
+        &self.facets[fi].dict
+    }
+
+    /// Whether facet field `fi`'s dictionary is in byte order, so an
+    /// ordinal range is a string range (`docs/prefix-terms.md`).
+    pub fn facet_dictionary_sorted(&self, fi: usize) -> bool {
+        self.facets[fi].sorted
+    }
+
+    /// Map-facet column `ci`'s value dictionary, in ordinal order.
+    pub fn map_facet_values(&self, ci: usize) -> &[String] {
+        &self.map_facets[ci].values
+    }
+
+    /// Whether map-facet column `ci`'s value dictionary is in byte order.
+    pub fn map_facet_values_sorted(&self, ci: usize) -> bool {
+        self.map_facets[ci].values_sorted
     }
 
     /// The ordinal of `doc_id`'s value for facet field `fi`, `None`
@@ -7006,11 +7203,11 @@ impl Bm25Reader {
 
     /// The key ordinal of `key` in map-facet column `ci`.
     pub fn map_facet_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
-        self.map_facets[ci]
-            .keys
-            .iter()
-            .position(|k| k == key)
-            .map(|p| p as u32)
+        dictionary_lookup(
+            &self.map_facets[ci].keys,
+            self.map_facets[ci].keys_sorted,
+            key,
+        )
     }
 
     /// Number of distinct values map-facet column `ci` holds.
@@ -7027,11 +7224,11 @@ impl Bm25Reader {
     /// dictionary, `None` when never ingested — the linear scan
     /// [`Self::facet_value_ord_of`] explains.
     pub fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32> {
-        self.map_facets[ci]
-            .values
-            .iter()
-            .position(|v| v == value)
-            .map(|p| p as u32)
+        dictionary_lookup(
+            &self.map_facets[ci].values,
+            self.map_facets[ci].values_sorted,
+            value,
+        )
     }
 
     /// The value ordinal of `doc_id`'s entry under `key_ord` in
@@ -7323,9 +7520,11 @@ impl Bm25Reader {
                         let dict_off = u64_at(base + 4) as usize;
                         let ords_off = u64_at(base + 12);
                         let (dict, _) = read_dict(dict_off, n_values);
+                        let sorted = dictionary_sorted(&dict);
                         facets.push(FacetSlice {
                             name,
                             dict,
+                            sorted,
                             ords_off,
                         });
                         cursor = base + 20;
@@ -7348,10 +7547,14 @@ impl Bm25Reader {
                         let pairs_off = u64_at(base + 32);
                         let (keys, _) = read_dict(keys_off, n_keys);
                         let (values, _) = read_dict(values_off, n_values);
+                        let keys_sorted = dictionary_sorted(&keys);
+                        let values_sorted = dictionary_sorted(&values);
                         map_facets.push(MapFacetSlice {
                             name,
                             keys,
                             values,
+                            keys_sorted,
+                            values_sorted,
                             offsets_off,
                             pairs_off,
                         });
@@ -8215,6 +8418,47 @@ impl Bm25Index for FieldView<'_> {
                 .collect(),
         )
     }
+    fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
+        let r = self.reader;
+        // Lower bound of `prefix` in the byte-sorted directory, then a
+        // scan while the prefix holds: O(log n) plus O(matches).
+        let n = self.field.n_terms;
+        let term_at = |i: u32| -> &[u8] {
+            if r.v5_runs {
+                r.directory_entry_v5(self.field, i).0
+            } else {
+                r.directory_entry(self.field, i).0
+            }
+        };
+        let (mut lo, mut hi) = (0u32, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if term_at(mid) < prefix.as_bytes() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut matches = Vec::new();
+        let mut count = 0usize;
+        let mut i = lo;
+        while i < n {
+            let bytes = term_at(i);
+            if !bytes.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            count += 1;
+            if count <= cap {
+                matches.push(String::from_utf8_lossy(bytes).into_owned());
+            }
+            i += 1;
+        }
+        if count > cap {
+            Err(count)
+        } else {
+            Ok(matches)
+        }
+    }
 }
 
 /// The reader itself scores as its body field (field 0) — the surface
@@ -8247,6 +8491,9 @@ impl Bm25Index for Bm25Reader {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         self.field(0).posting_positions(term, doc_id)
+    }
+    fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
+        self.field(0).expand_prefix(prefix, cap)
     }
     fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
         self.field(0).impacts_inner(term)

@@ -371,6 +371,7 @@ async fn fused_repeated_query_reuses_cached_stats() {
             k1: 0.0,
             b: 0.0,
             phrase: None,
+            prefixes: Vec::new(),
         },
         QueryField {
             field: "case_name".to_string(),
@@ -379,6 +380,7 @@ async fn fused_repeated_query_reuses_cached_stats() {
             k1: 0.0,
             b: 0.0,
             phrase: None,
+            prefixes: Vec::new(),
         },
     ];
 

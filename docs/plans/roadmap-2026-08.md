@@ -234,7 +234,23 @@ an afternoon, and treat positions as the increment that follows only if
 the measurement says the corpus needs slop. Either way, a field without
 positions must **refuse** a phrase query rather than approximate it.
 
-### 6. Prefix terms, and the sorted term dictionary underneath
+### 6. Prefix terms, and the sorted term dictionary underneath — LANDED
+
+**Landed 2026-09-02 (`docs/prefix-terms.md`, `tests/prefix_terms.rs`).**
+The term directory was already byte-sorted; facet, map-key, and
+map-value dictionaries are now written in byte order at flush too,
+checked at open, so a string range or prefix resolves to ONE ordinal
+range per shard. `TermPrefix` on `Bm25Search`, `QueryField`, and the
+single lexical leaf expands on every shard (binary search plus a
+bounded scan, `NodeService.ExpandTermPrefix`), the fleet-wide union is
+the term list a monolith would expand, and past the cap (default 128,
+at most 1024) the request refuses naming the count — never a truncated
+set. CEL `court < "b"`, `>=`, and `startsWith` compile to
+`StringRangePredicate` / `StringPrefixPredicate`; `endsWith`, `contains`,
+regex, and fuzzy stay refused. Files with first-seen dictionaries open,
+serve, and refuse string ordering by name; nothing converts on open.
+
+The original rationale, kept:
 
 Prefix queries need an ordered term dictionary. So do string range
 filters, which `docs/cel-filters.md` already records as blocked on

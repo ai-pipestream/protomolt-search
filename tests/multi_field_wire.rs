@@ -122,6 +122,7 @@ fn query_fields(w_name: f32) -> Vec<QueryField> {
             k1: 0.0,
             b: 0.0,
             phrase: None,
+            prefixes: Vec::new(),
         },
         QueryField {
             field: "case_name".to_string(),
@@ -130,6 +131,7 @@ fn query_fields(w_name: f32) -> Vec<QueryField> {
             k1: 0.0,
             b: 0.0,
             phrase: None,
+            prefixes: Vec::new(),
         },
     ]
 }
@@ -683,6 +685,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await
@@ -708,6 +711,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await

@@ -64,6 +64,8 @@ differential oracle below.
 | `timestamp("RFC3339")` | an i64 bound in epoch micros | exact civil-date integer math |
 | `within_bbox(col, s, n, w, e)` | `GeoFilter` bbox leaf | geo table |
 | `within_radius(col, lat, lon, m)` (+ `_manhattan`) | `GeoFilter` radius leaf | geo table |
+| `court < "b"`, `<=`, `>`, `>=` | `StringRangePredicate` | one ordinal range of the byte-sorted dictionary (`docs/prefix-terms.md`) |
+| `court.startsWith("ca")`, `tags["k"].startsWith("re")` | `StringPrefixPredicate` | the dictionary's prefix range |
 | `&&`, `\|\|`, `!`, `(...)` | and / or / not nodes | Kleene three-valued |
 
 Dots are ordinary characters in this engine's flat column namespace:
@@ -72,14 +74,16 @@ access requires a string-literal key; computed keys do not compile.
 
 Refused by name, with the reason in the message: arithmetic (`+ - * /
 %`), the ternary, `matches()` (a regex engine is a CVE class this
-codebase deliberately does not link), `startsWith`/`endsWith`/
-`contains` (dictionaries resolve whole values), the comprehension
-macros (`all`/`exists`/`filter`/`map`), `size()`, type conversions,
-`duration()`, cross-column comparisons, constant comparisons, string
-ordering (`court < "b"` — dictionaries are unordered; the sorted-dict
-layout `docs/map-columns.md` keeps in the back pocket would unlock
-it), bare columns and literals in boolean position, uint/raw/bytes
-literals, and unknown functions.
+codebase deliberately does not link), `endsWith`/`contains` (a
+byte-sorted dictionary resolves prefixes and ranges, not suffixes or
+substrings), the comprehension macros (`all`/`exists`/`filter`/`map`),
+`size()`, type conversions, `duration()`, cross-column comparisons,
+constant comparisons, bare columns and literals in boolean position,
+uint/raw/bytes literals, and unknown functions. String ordering and
+`startsWith` compile since 2026-09-02 (`docs/prefix-terms.md`): every
+dictionary is written in byte order at flush, and a file whose
+dictionary predates that refuses them by name rather than walking
+strings per document.
 
 ## Three-valued semantics: the one deliberate deviation
 
@@ -203,8 +207,8 @@ also carries facet counts.
   and has since landed (`docs/vector-filters.md`).
 - **Filter-only browse** — the BM25 routes still require query terms;
   a match-all + filter route is public-API work.
-- **String ranges** (`court < "b"`) — wait for the sorted dictionary
-  layout.
+- **String ranges** (`court < "b"`) — landed 2026-09-02 with the
+  sorted dictionary layout (`docs/prefix-terms.md`).
 - **Filter caching** — compiled trees are per-request; caching
   resolved predicates by (filter, stats_epoch) is a measurement away
   if it ever shows up in a profile.

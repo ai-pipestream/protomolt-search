@@ -319,6 +319,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
         k1: 0.0,
         b: 0.0,
         phrase: None,
+        prefixes: Vec::new(),
     }];
     let (fused_hits, fused_facets, _) = coordinator
         .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[], &[], &[], None)
@@ -360,6 +361,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await
@@ -388,6 +390,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             stats_fields: Vec::new(),
             cardinality_fields: Vec::new(),
             phrase: None,
+            prefixes: Vec::new(),
         }),
     )
     .await
@@ -510,7 +513,10 @@ async fn spilled_shard_serves_facets_after_flush() {
     assert_eq!(resp.hits.len(), 2);
     assert_eq!(resp.facets.len(), 1);
     assert!(resp.facets[0].known);
-    assert_eq!(counts_of(&resp.facets[0]), vec![("scotus", 1), ("ca9", 1)]);
+    // Node responses list counts in dictionary order, and a flushed
+    // file's dictionary is in byte order (docs/prefix-terms.md): "ca9"
+    // before "scotus", whatever order they were ingested in.
+    assert_eq!(counts_of(&resp.facets[0]), vec![("ca9", 1), ("scotus", 1)]);
 
     node.abort();
     mock.abort();

@@ -207,6 +207,11 @@ service NodeService {
   // with (see Bm25Query), which is what makes BM25 scores comparable
   // across shards.
   rpc TermStats(TermStatsRequest) returns (TermStatsResponse);
+  // Expand a term prefix in one field's dictionary
+  // (docs/prefix-terms.md): a binary search plus a bounded scan over
+  // the byte-sorted directory, reporting the terms up to the cap and
+  // the exact count.
+  rpc ExpandTermPrefix(ExpandTermPrefixRequest) returns (ExpandTermPrefixResponse);
 
   // Scores BM25 for the given query terms against this shard's postings,
   // using the GLOBAL corpus stats supplied by the coordinator (never
@@ -1992,6 +1997,16 @@ message FilterExpr {
     // Geo containment: the existing filter family as a leaf, so one
     // expression can mix regions with scalar predicates.
     GeoFilter geo = 10;
+    // String ordering on a facet column or one key of a map-facet
+    // column (docs/prefix-terms.md): CEL `court < "b"`, `>=`, and both
+    // bounds ANDed. Resolves per shard to ONE ordinal range over a
+    // dictionary written in byte order; a shard whose dictionary is in
+    // the older first-seen order refuses by name.
+    StringRangePredicate string_range = 11;
+    // Prefix on a facet column or map-facet value (CEL
+    // `court.startsWith("ca")`): the ordinal range of the dictionary
+    // entries sharing the prefix, same resolution and refusal rules.
+    StringPrefixPredicate string_prefix = 12;
   }
 }
 
@@ -2092,6 +2107,48 @@ message MapKeyPredicate {
   string column = 1;
   // The key whose presence is tested.
   string key = 2;
+}
+
+// One bound of a StringRangePredicate: a string compared in byte order
+// (the order stock CEL compares strings in, and the order every
+// dictionary is written in at flush).
+message StringBound {
+  // The bound value; the empty string is a legal lower bound.
+  string value = 1;
+  // When true the bound itself is outside the range (`<` / `>`).
+  bool exclusive = 2;
+}
+
+// String ordering on a facet column (`key` empty) or on one key of a
+// map-facet column (`key` set): TRUE when the document's value lies in
+// the range, FALSE when it holds some other value, UNKNOWN when it
+// holds none. At least one bound is required. Known = the facet table
+// has the column (and, for a map entry, its key dictionary has the
+// key), like FacetPredicate / MapFacetPredicate.
+message StringRangePredicate {
+  // Column name.
+  string column = 1;
+  // For a map-facet column, the key whose value is tested; empty for
+  // a plain facet column.
+  string key = 2;
+  // Lower bound, absent = unbounded below.
+  StringBound min = 3;
+  // Upper bound, absent = unbounded above.
+  StringBound max = 4;
+}
+
+// Prefix on a facet column or map-facet value: TRUE when the
+// document's value starts with `prefix`, same absence and known rules
+// as StringRangePredicate. The prefix must be non-empty (an empty
+// prefix is presence, which is has()).
+message StringPrefixPredicate {
+  // Column name.
+  string column = 1;
+  // For a map-facet column, the key whose value is tested; empty for
+  // a plain facet column.
+  string key = 2;
+  // The prefix, compared in bytes.
+  string prefix = 3;
 }
 
 // Value presence under a name (CEL `has(col)`): TRUE when the document
@@ -2607,6 +2664,57 @@ message Bm25SearchRequest {
   // must have declared to serve it, and Bm25SearchResponse.phrase_routing
   // for what served it.
   PhraseMatch phrase = 15;
+  // Term prefixes expanded in the body's dictionary and added to the
+  // query's terms (docs/prefix-terms.md). Flat route only; on the
+  // fused route each QueryField carries its own.
+  repeated TermPrefix prefixes = 16;
+}
+
+// A prefix over a field's term dictionary (docs/prefix-terms.md): every
+// term starting with `prefix` joins the query's terms, each scored as
+// the ordinary term it is (BM25 sums their contributions). The
+// coordinator applies the field's analysis normalizer chain to the
+// prefix (never the stemmer: a prefix of a stem is what the dictionary
+// holds) and expands it on every shard, where the byte-sorted
+// directory answers with a binary search plus a bounded scan. The
+// fleet-wide union past the cap is INVALID_ARGUMENT naming the term
+// count — never a silently narrower set.
+message TermPrefix {
+  // The prefix, in the field's surface form; non-empty.
+  string prefix = 1;
+  // Expansion cap; 0 selects the default (128). Values above the
+  // absolute maximum (1024) are refused.
+  uint32 max_expansions = 2;
+}
+
+// What one TermPrefix expanded to, reported on the response so the
+// terms actually scored are never a guess.
+message PrefixExpansion {
+  // The field the prefix was expanded in.
+  string field = 1;
+  // The prefix as matched (normalized).
+  string prefix = 2;
+  // The expanded terms, in byte order.
+  repeated string terms = 3;
+}
+
+// Shard-side prefix expansion (docs/prefix-terms.md).
+message ExpandTermPrefixRequest {
+  // The field whose dictionary is searched ("body" for the body).
+  string field = 1;
+  // The prefix, already normalized by the coordinator.
+  string prefix = 2;
+  // Expansion cap; past it the shard reports the count and no terms.
+  uint32 cap = 3;
+}
+
+message ExpandTermPrefixResponse {
+  // Matching terms in byte order; empty when past the cap.
+  repeated string terms = 1;
+  // Exact number of matching terms on this shard.
+  uint64 count = 2;
+  // Whether this shard's field table has the field at all.
+  bool known = 3;
 }
 
 // An ordered-window constraint over a lexical query's analyzed terms
@@ -2697,6 +2805,9 @@ message QueryField {
   // field's bigram column or token positions and refuses by name when
   // the fleet declared neither for this field.
   PhraseMatch phrase = 6;
+  // Term prefixes expanded in this field's dictionary and added to
+  // its query terms (docs/prefix-terms.md).
+  repeated TermPrefix prefixes = 7;
 }
 
 // Client-facing distributed BM25 response.
@@ -2736,6 +2847,9 @@ message Bm25SearchResponse {
   // saying which payload served it (docs/phrase-proximity.md). Empty
   // when the request carried no phrase.
   repeated PhraseRouting phrase_routing = 7;
+  // One entry per TermPrefix the request carried, in request order:
+  // the terms it expanded to and was scored over.
+  repeated PrefixExpansion prefix_expansions = 8;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.
@@ -3715,6 +3829,9 @@ message LexicalQuery {
   // (docs/phrase-proximity.md); served on the single lexical leaf through
   // Bm25Search's phrase route, refused by name elsewhere until certified.
   PhraseMatch phrase = 4;
+  // Term prefixes expanded in the field's dictionary
+  // (docs/prefix-terms.md); served on the single lexical leaf.
+  repeated TermPrefix prefixes = 5;
 }
 
 // Dense vector relevance (the Search leg).

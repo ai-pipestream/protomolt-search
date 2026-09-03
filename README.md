@@ -364,6 +364,14 @@ query by name. See [`docs/phrase-proximity.md`](docs/phrase-proximity.md)
 for the format, the routing table, the measured cost, and the reindex
 boundary.
 
+Prefix terms (`TermPrefix` on `Bm25Search`, on a `QueryField`, and on the
+single lexical leaf of `Query`) expand against each shard's byte-sorted
+term directory and refuse past a cap naming the count, never truncating.
+Facet and map dictionaries are written in byte order too, so CEL string
+ordering (`court < "b"`) and `startsWith` compile to one ordinal range;
+a file with an older first-seen dictionary serves equality and refuses
+ordering by name. See [`docs/prefix-terms.md`](docs/prefix-terms.md).
+
 Select native analysis with `--analysis-addr=native` or
 `analysis_addr = "native"`. A single-shard `both` process propagates that
 setting to its shard. Multi-shard node configurations set `analysis_addr` on
