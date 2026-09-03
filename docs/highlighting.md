@@ -1,6 +1,6 @@
 # Server-side highlighting
 
-Landed 2026-09-02 (roadmap item 9). A hit already carried every
+Implemented on branch 2026-09-02 (roadmap item 9). A hit already carried every
 occurrence span of every query term in original-text coordinates, and
 the texts are in the index. What was missing was snippet assembly on the
 shard: window selection, merging of overlapping spans, and a boundary

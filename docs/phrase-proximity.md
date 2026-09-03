@@ -1,6 +1,6 @@
 # Phrase and proximity queries
 
-Landed 2026-09-02 (roadmap item 5). A `PhraseMatch` on a lexical query
+Implemented on branch 2026-09-02 (roadmap item 5). A `PhraseMatch` on a lexical query
 requires its analyzed terms to occur in the field **in order**, inside a
 window that may contain at most `slop` token positions beyond the phrase's
 own length. `slop = 0` is an exact phrase. The constraint only removes

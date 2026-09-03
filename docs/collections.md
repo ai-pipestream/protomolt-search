@@ -1,6 +1,6 @@
 # Collections
 
-Landed 2026-09-02 (roadmap item 11). One cluster serves many datasets,
+Implemented on branch 2026-09-02 (roadmap item 11). One cluster serves many datasets,
 and no request, statistic, floor, fusion, facet, aggregation, browse, or
 placement ever crosses from one to another. This is the real version
 the roadmap distinguished from "a name on every request, validated

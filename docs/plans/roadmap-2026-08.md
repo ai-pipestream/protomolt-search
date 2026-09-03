@@ -177,9 +177,9 @@ in this engine keys on epoch or does not ship.
 
 ## B. Query features the engine cannot currently express
 
-### 5. Phrase and proximity queries — LANDED
+### 5. Phrase and proximity queries — IMPLEMENTED ON BRANCH
 
-**Landed 2026-09-02 (`docs/phrase-proximity.md`, `src/proximity.rs`,
+**Implemented on branch 2026-09-02 (`docs/phrase-proximity.md`, `src/proximity.rs`,
 `tests/phrase_proximity.rs`).** Both routes this item priced were
 built: a **bigram column** (`--bigram-fields`, an ordinary derived BM25
 field whose terms are adjacent-ordinal pairs, so a two-term exact
@@ -234,9 +234,9 @@ an afternoon, and treat positions as the increment that follows only if
 the measurement says the corpus needs slop. Either way, a field without
 positions must **refuse** a phrase query rather than approximate it.
 
-### 6. Prefix terms, and the sorted term dictionary underneath — LANDED
+### 6. Prefix terms, and the sorted term dictionary underneath — IMPLEMENTED ON BRANCH
 
-**Landed 2026-09-02 (`docs/prefix-terms.md`, `tests/prefix_terms.rs`).**
+**Implemented on branch 2026-09-02 (`docs/prefix-terms.md`, `tests/prefix_terms.rs`).**
 The term directory was already byte-sorted; facet, map-key, and
 map-value dictionaries are now written in byte order at flush too,
 checked at open, so a string range or prefix resolves to ONE ordinal
@@ -337,9 +337,9 @@ bitmap union, or declare the estimator and its error in the response. The
 project's stance argues for the first with the cost made visible, which is
 the same argument that settled count-then-rank.
 
-### 9. Server-side highlighting — LANDED
+### 9. Server-side highlighting — IMPLEMENTED ON BRANCH
 
-**Landed 2026-09-02 (`docs/highlighting.md`, `tests/highlighting.rs`).**
+**Implemented on branch 2026-09-02 (`docs/highlighting.md`, `tests/highlighting.rs`).**
 Sentence spans are stored at ingest as a kind-8 column
 (`--sentence-fields=body`, 4 B per slot plus 8 B per sentence, the
 sidecar's own sentence layer in original-text UTF-16 units — the same
@@ -388,9 +388,9 @@ still sit in df and in the length normalizer until the next compaction,
 so the response says so, and compaction is the rebuild habit this project
 already has, now scoped to a shard.
 
-### 11. Collections, or at least a namespace — LANDED
+### 11. Collections, or at least a namespace — IMPLEMENTED ON BRANCH
 
-**Landed 2026-09-02 (`docs/collections.md`, `tests/collections.rs`).**
+**Implemented on branch 2026-09-02 (`docs/collections.md`, `tests/collections.rs`).**
 The real version, not the cheap one: a collection is one
 `CoordinatorServiceImpl` — its own shard set, topology, statistics
 cache, calibration, analysis backend, BM25 parameters, control plane —
@@ -415,9 +415,9 @@ the real version (multiple column tables and vocabularies per node) are
 very different amounts of work, and which one is right depends on whether
 item 19 lands. A descriptor-bound index has a natural identity already.
 
-### 12. The operational surface: metrics, TLS, membership, quotas — LANDED
+### 12. The operational surface: metrics, TLS, membership, quotas — IMPLEMENTED ON BRANCH
 
-**TLS, membership, and quotas landed 2026-09-02 (`docs/security.md`,
+**TLS, membership, and quotas implemented on branch 2026-09-02 (`docs/security.md`,
 `tests/security.rs`):** rustls on every listener once `--tls-cert` is
 set (plaintext refused; loopback plaintext otherwise, off-loopback
 plaintext only behind `--allow-plaintext`), mTLS on node listeners and

@@ -1,6 +1,6 @@
 # Security: TLS, mTLS, bearer principals, signed datagrams, quotas
 
-Landed 2026-09-02 (the rest of roadmap item 12). Three rules shape it,
+Implemented on branch 2026-09-02 (the rest of roadmap item 12). Three rules shape it,
 stated once:
 
 - **Refuse, do not clamp.** A request over its principal's quota is a
@@ -85,7 +85,7 @@ known before any shard is asked.
 
 | quota | rule | on exceed |
 |---|---|---|
-| `max_k` | `k` above it refuses; `k = 0` ("the default") resolves to the cap, which is a default, not a clamp | `RESOURCE_EXHAUSTED` naming the principal, `k`, and the cap |
+| `max_k` | `k` above it refuses; `k = 0` keeps its meaning (the coordinator's default) and refuses when that resolved value is above the cap — the request is never rewritten to the cap | `RESOURCE_EXHAUSTED` naming the principal, the resolved `k`, and the cap |
 | `concurrency` | requests in flight at once; a streaming query holds its slot until the client is done reading | `RESOURCE_EXHAUSTED` naming the principal and the limit; nothing queues |
 | `ingest_docs_per_sec` | a token bucket with one second of burst, charged one token per routed document as it streams | the stream ends with `RESOURCE_EXHAUSTED` naming the rate; the batch is not trimmed |
 
@@ -149,7 +149,8 @@ not membership". The collection set applies the same rule per member.
 cluster CA and rejects plaintext, a certificate-less client, and a
 foreign CA's certificate; a coordinator with its identity reaches TLS
 nodes and serves bearer clients over TLS; the bearer table (missing,
-wrong, right); `max_k` and the `k = 0` default; concurrency held by an
+wrong, right); `max_k`, with `k = 0` refused under a cap below the
+coordinator default and served under one above it; concurrency held by an
 in-flight request (a delayed analysis sidecar keeps one open); the
 ingest meter; cluster control with and without membership; the metrics
 listener alongside TLS; the embedded crate's dependency gate; the

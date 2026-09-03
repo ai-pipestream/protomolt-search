@@ -254,7 +254,8 @@ async fn the_coordinator_presents_its_identity_and_serves_bearer_clients() {
         .hits;
     assert_eq!(hits.len(), 3, "served end to end over TLS in both hops");
 
-    // max_k: over the cap refuses by name; k = 0 resolves to the cap.
+    // max_k: over the cap refuses by name; k = 0 keeps its meaning (the
+    // coordinator default) and is judged as that value, never rewritten.
     let error = client
         .bm25_search(bearer(search("court", 6), Some(CONSOLE)))
         .await
@@ -265,15 +266,15 @@ async fn the_coordinator_presents_its_identity_and_serves_bearer_clients() {
         "{}",
         error.message()
     );
-    let capped = client
+    let error = client
         .bm25_search(bearer(search("court", 0), Some(CONSOLE)))
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        capped.hits.len(),
-        5,
-        "the unset k became the principal's cap"
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(
+        error.message().contains("k is unset") && error.message().contains("max_k=5"),
+        "{}",
+        error.message()
     );
     let unlimited = client
         .bm25_search(bearer(search("court", 0), Some(BATCH)))

@@ -163,9 +163,6 @@ trait RequestK {
     fn k(&self) -> Option<u32> {
         None
     }
-    /// Resolve an unset `k` (0, "the default") to the principal's cap:
-    /// a default, not a clamp — the caller asked for no number.
-    fn default_k(&mut self, _k: u32) {}
 }
 
 macro_rules! request_k {
@@ -174,11 +171,6 @@ macro_rules! request_k {
             impl RequestK for $ty {
                 fn k(&self) -> Option<u32> {
                     Some(self.k)
-                }
-                fn default_k(&mut self, k: u32) {
-                    if self.k == 0 {
-                        self.k = k;
-                    }
                 }
             }
         )*
@@ -196,13 +188,6 @@ request_k!(
 impl RequestK for QueryStreamRequest {
     fn k(&self) -> Option<u32> {
         self.query.as_ref().map(|q| q.k)
-    }
-    fn default_k(&mut self, k: u32) {
-        if let Some(q) = self.query.as_mut() {
-            if q.k == 0 {
-                q.k = k;
-            }
-        }
     }
 }
 
@@ -242,27 +227,46 @@ impl CollectionSet {
         self
     }
 
-    /// Authenticate a request and admit it under its principal's quotas:
-    /// `k` against `max_k` (an unset `k` resolves to the cap), and one
-    /// in-flight slot, held by the returned permit for the request's
-    /// life. Anonymous when no principals are configured.
+    /// Authenticate a request: its principal, or `None` when no
+    /// principals are configured (anonymous service).
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<Option<Arc<Principal>>, Status> {
+        match &self.principals {
+            Some(principals) => principals.authenticate(request.metadata()).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Admit an authenticated request under its principal's quotas: `k`
+    /// against `max_k`, and one in-flight slot, held by the returned
+    /// permit for the request's life. An unset `k` keeps its meaning —
+    /// the target coordinator's default, `default_k` — and is refused
+    /// when that resolved value is above the cap; the request is never
+    /// rewritten to the cap.
+    fn admit_under<T: RequestK>(
+        principal: Option<&Arc<Principal>>,
+        request: &Request<T>,
+        default_k: u32,
+    ) -> Result<Option<Permit>, Status> {
+        let Some(principal) = principal else {
+            return Ok(None);
+        };
+        match request.get_ref().k() {
+            Some(0) => principal.admit_default_k(default_k)?,
+            Some(k) => principal.admit_k(k)?,
+            None => {}
+        }
+        principal.admit_request().map(Some)
+    }
+
+    /// [`Self::authenticate`] then [`Self::admit_under`] for requests
+    /// without a `k`.
     fn admit<T: RequestK>(
         &self,
-        request: &mut Request<T>,
+        request: &Request<T>,
     ) -> Result<(Option<Permit>, Option<Arc<Principal>>), Status> {
-        let Some(principals) = &self.principals else {
-            return Ok((None, None));
-        };
-        let principal = principals.authenticate(request.metadata())?;
-        if let Some(k) = request.get_ref().k() {
-            if k == 0 && principal.max_k != 0 {
-                request.get_mut().default_k(principal.max_k);
-            } else {
-                principal.admit_k(k)?;
-            }
-        }
-        let permit = principal.admit_request()?;
-        Ok((Some(permit), Some(principal)))
+        let principal = self.authenticate(request)?;
+        let permit = Self::admit_under(principal.as_ref(), request, 0)?;
+        Ok((permit, principal))
     }
 
     /// Named collections. Each coordinator must have been built for the
@@ -357,9 +361,11 @@ macro_rules! search_service_over_collections {
                     &self,
                     mut request: Request<$req>,
                 ) -> Result<Response<$resp>, Status> {
-                    let (_permit, _) = self.admit(&mut request)?;
+                    let principal = self.authenticate(&request)?;
                     let (name, target) = self.members.resolve(&request.get_ref().collection)?;
                     let target = target.clone();
+                    let _permit =
+                        Self::admit_under(principal.as_ref(), &request, target.max_k())?;
                     request.get_mut().collection = name;
                     SearchService::$name(&target, request).await
                 }
@@ -369,9 +375,10 @@ macro_rules! search_service_over_collections {
                 &self,
                 mut request: Request<QueryStreamRequest>,
             ) -> Result<Response<Self::QueryStreamStream>, Status> {
-                let (permit, _) = self.admit(&mut request)?;
+                let principal = self.authenticate(&request)?;
                 let (name, target) = self.members.resolve(&request.get_ref().collection)?;
                 let target = target.clone();
+                let permit = Self::admit_under(principal.as_ref(), &request, target.max_k())?;
                 request.get_mut().collection = name;
                 let response = SearchService::query_stream(&target, request).await?;
                 Ok(response.map(|stream| Guarded::new(stream, permit)))
@@ -379,9 +386,9 @@ macro_rules! search_service_over_collections {
 
             async fn routed_ingest_mapped(
                 &self,
-                mut request: Request<Streaming<RoutedIngestMappedRequest>>,
+                request: Request<Streaming<RoutedIngestMappedRequest>>,
             ) -> Result<Response<RoutedIngestMappedResponse>, Status> {
-                let (_permit, principal) = self.admit(&mut request)?;
+                let (_permit, principal) = self.admit(&request)?;
                 let mut inbound = MeteredIngest::new(request.into_inner(), principal);
                 let mut bind = CoordinatorServiceImpl::routed_bind(&mut inbound).await?;
                 let (name, target) = self.members.resolve(&bind.collection)?;
@@ -397,7 +404,7 @@ macro_rules! search_service_over_collections {
                 &self,
                 mut request: Request<ClusterHealthRequest>,
             ) -> Result<Response<ClusterHealthResponse>, Status> {
-                let (_permit, _) = self.admit(&mut request)?;
+                let (_permit, _) = self.admit(&request)?;
                 let requested = request.get_ref().collection.clone();
                 // An unnamed health request on a named set lists every
                 // collection separately; counts are never summed across them.

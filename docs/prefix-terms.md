@@ -1,6 +1,6 @@
 # Prefix terms and string ranges
 
-Landed 2026-09-02 (roadmap item 6). One structural fact underlies both
+Implemented on branch 2026-09-02 (roadmap item 6). One structural fact underlies both
 features: every dictionary in a `.bm25` file is in **byte order**. The term
 directory always was (its lookup is a binary search); facet, map-key, and
 map-value dictionaries are now written in that order at flush too. Byte

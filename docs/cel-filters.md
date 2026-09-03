@@ -207,7 +207,7 @@ also carries facet counts.
   and has since landed (`docs/vector-filters.md`).
 - **Filter-only browse** — the BM25 routes still require query terms;
   a match-all + filter route is public-API work.
-- **String ranges** (`court < "b"`) — landed 2026-09-02 with the
+- **String ranges** (`court < "b"`) — implemented on branch 2026-09-02 with the
   sorted dictionary layout (`docs/prefix-terms.md`).
 - **Filter caching** — compiled trees are per-request; caching
   resolved predicates by (filter, stats_epoch) is a measurement away

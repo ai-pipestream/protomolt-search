@@ -256,6 +256,20 @@ impl Principal {
         Ok(())
     }
 
+    /// The rule for an unset `k`: it means the coordinator's default,
+    /// `default_k`, and that resolved value is what the cap judges. The
+    /// request keeps its unset `k`; nothing rewrites it to the cap.
+    pub fn admit_default_k(&self, default_k: u32) -> Result<(), Status> {
+        if self.max_k != 0 && default_k > self.max_k {
+            return Err(Status::resource_exhausted(format!(
+                "principal {:?}: k is unset, which means the coordinator default k={default_k}, \
+                 above its max_k={}; send an explicit k",
+                self.name, self.max_k
+            )));
+        }
+        Ok(())
+    }
+
     /// Take one in-flight slot, or refuse by name when the principal is
     /// at its concurrency limit. The permit releases on drop.
     pub fn admit_request(self: &Arc<Self>) -> Result<Permit, Status> {
@@ -519,17 +533,19 @@ where
 
 /// Byte equality whose running time depends on the lengths only.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
+    // The accumulator is a usize so a length difference survives whole:
+    // narrowing it to a byte would let lengths 256 apart compare as one.
+    let mut diff: usize = a.len() ^ b.len();
     let n = a.len().min(b.len());
     for i in 0..n {
-        diff |= a[i] ^ b[i];
+        diff |= usize::from(a[i] ^ b[i]);
     }
     // Walk the rest of the longer input so length differences cost
     // the same as content differences.
     for &x in a.iter().skip(n).chain(b.iter().skip(n)) {
         std::hint::black_box(x);
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 // ---------------------------------------------------------------------
@@ -666,6 +682,13 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
+        // Lengths 256 apart, in both directions, with equal prefixes.
+        let short = [7u8; 16];
+        let long = [7u8; 272];
+        assert!(!constant_time_eq(&short, &long));
+        assert!(!constant_time_eq(&long, &short));
+        assert!(!constant_time_eq(&[], &[0u8; 256]));
+        assert!(constant_time_eq(&long, &long[..]));
     }
 
     #[test]
