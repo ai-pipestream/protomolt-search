@@ -418,6 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     tx.send(AddDocumentsRequest {
                         collection: String::new(),
+                        cased_field: String::new(),
                         sentence_fields: Vec::new(),
                         materialize: None,
                         map_numerics: Vec::new(),
@@ -781,6 +782,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                         chunk_fields(&case_names2, chunk.cluster_id, &body_columns2, &chunk.text);
                     tx.blocking_send(AddDocumentsRequest {
                         collection: String::new(),
+                        cased_field: String::new(),
                         sentence_fields: Vec::new(),
                         materialize: None,
                         map_numerics: Vec::new(),

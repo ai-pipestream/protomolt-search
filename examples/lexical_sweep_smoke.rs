@@ -30,6 +30,7 @@ async fn add_documents(addr: &str, texts: &[&str]) {
     for text in texts {
         tx.send(AddDocumentsRequest {
             collection: String::new(),
+            cased_field: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             map_numerics: Vec::new(),

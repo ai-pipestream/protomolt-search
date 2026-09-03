@@ -536,12 +536,22 @@ fn tempdir(tag: &str) -> PathBuf {
 /// The reshard replay analyzer over the native provider, the same shape
 /// `examples/reshard.rs` builds.
 #[allow(clippy::type_complexity)]
-fn native_replay_analyzer(
-) -> impl FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> {
+fn native_replay_analyzer() -> impl FnMut(
+    &[(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )],
+) -> Result<Vec<AnalyzedDoc>, String> {
     move |docs| {
         docs.iter()
-            .map(|(text, spec)| {
-                analyzer::analyze_document_native(text, *spec).map_err(|e| e.to_string())
+            .map(|(text, spec, layers)| {
+                if layers.dual_cased {
+                    analyzer::analyze_document_native_dual(text, *spec)
+                } else {
+                    analyzer::analyze_document_native(text, *spec)
+                }
+                .map_err(|e| e.to_string())
             })
             .collect()
     }

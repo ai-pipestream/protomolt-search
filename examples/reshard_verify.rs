@@ -66,11 +66,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = analysis_addr.clone();
     let handle = tokio::runtime::Handle::current();
-    let mut analyze =
-        move |docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
-            tokio::task::block_in_place(|| handle.block_on(analyzer::analyze_batch(&addr, docs)))
-                .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
-        };
+    let mut analyze = move |docs: &[(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )]|
+          -> Result<Vec<AnalyzedDoc>, String> {
+        tokio::task::block_in_place(|| handle.block_on(analyzer::analyze_batch(&addr, docs)))
+            .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
+    };
 
     let gen = reshard::resolve_gen(Path::new(&log))?;
     eprintln!("splitting {} {n} ways...", gen.display());

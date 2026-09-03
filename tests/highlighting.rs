@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use common::mock::{start_mock_analysis_metered, start_mock_analysis_without_sentences};
 use common::start_empty_node;
 use pipestream_search::analyzer::{
-    self, analyze_document_native, body_spec, NATIVE_ANALYSIS_BACKEND,
+    self, analyze_document_native, analyze_document_native_dual, body_spec, NATIVE_ANALYSIS_BACKEND,
 };
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::node::{bm25_sidecar_path, Bm25Shard, NodeConfig, NodeServiceImpl};
@@ -854,11 +854,23 @@ fn tempdir(tag: &str) -> PathBuf {
 }
 
 #[allow(clippy::type_complexity)]
-fn native_replay_analyzer(
-) -> impl FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> {
+fn native_replay_analyzer() -> impl FnMut(
+    &[(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )],
+) -> Result<Vec<AnalyzedDoc>, String> {
     move |docs| {
         docs.iter()
-            .map(|(text, spec)| analyze_document_native(text, *spec).map_err(|e| e.to_string()))
+            .map(|(text, spec, layers)| {
+                if layers.dual_cased {
+                    analyze_document_native_dual(text, *spec)
+                } else {
+                    analyze_document_native(text, *spec)
+                }
+                .map_err(|e| e.to_string())
+            })
             .collect()
     }
 }

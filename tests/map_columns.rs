@@ -63,6 +63,7 @@ async fn add_documents_mapped(
     for (text, strs, nums) in docs {
         tx.send(AddDocumentsRequest {
             collection: String::new(),
+            cased_field: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             text: text.to_string(),
@@ -588,6 +589,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // column, empty string value, non-finite numeric value.
     let bad_facet = |field: &str, key: &str, value: &str| AddDocumentsRequest {
         collection: String::new(),
+        cased_field: String::new(),
         sentence_fields: Vec::new(),
         materialize: None,
         text: "some text".to_string(),

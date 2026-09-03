@@ -31,6 +31,7 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
                 collection: String::new(),
+                cased_field: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),

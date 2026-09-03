@@ -79,6 +79,7 @@ async fn add_documents_geo(
     for (text, points) in docs {
         tx.send(AddDocumentsRequest {
             collection: String::new(),
+            cased_field: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             text: text.to_string(),

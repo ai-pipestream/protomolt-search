@@ -1984,6 +1984,7 @@ mod tests {
             0,
             "a".to_string(),
             AnalyzedDoc {
+                cased: None,
                 fields: vec![
                     AnalyzedField {
                         sentences: None,
@@ -2020,6 +2021,7 @@ mod tests {
             2,
             "c".to_string(),
             AnalyzedDoc {
+                cased: None,
                 fields: vec![
                     AnalyzedField {
                         sentences: None,
@@ -2144,6 +2146,7 @@ mod tests {
                 });
             }
             AnalyzedDoc {
+                cased: None,
                 fields,
                 quality: None,
                 geography: None,
@@ -2250,6 +2253,7 @@ mod tests {
             0,
             "New York City".into(),
             AnalyzedDoc {
+                cased: None,
                 fields: vec![
                     AnalyzedField {
                         sentences: None,

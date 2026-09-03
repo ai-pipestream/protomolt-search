@@ -130,6 +130,7 @@ fn random_two_field_corpus(
             id,
             format!("doc {id}"),
             AnalyzedDoc {
+                cased: None,
                 fields,
                 quality: None,
                 geography: None,
@@ -397,6 +398,7 @@ fn fused_ties_at_floor_and_kth_slot() {
             i,
             format!("doc {i}"),
             AnalyzedDoc {
+                cased: None,
                 fields: vec![
                     AnalyzedField {
                         sentences: None,
@@ -509,6 +511,7 @@ fn fused_ties_at_floor_and_kth_slot() {
             i,
             format!("doc {i}"),
             AnalyzedDoc {
+                cased: None,
                 fields,
                 quality: None,
                 geography: None,
@@ -606,6 +609,7 @@ fn fused_blocks_actually_skip() {
             i,
             format!("doc {i}"),
             AnalyzedDoc {
+                cased: None,
                 fields,
                 quality: None,
                 geography: None,
@@ -861,6 +865,7 @@ fn fused_pruned_distributed_equals_monolithic() {
             });
         }
         AnalyzedDoc {
+            cased: None,
             fields,
             quality: None,
             geography: None,
@@ -1023,6 +1028,7 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
             i,
             format!("doc {i}"),
             AnalyzedDoc {
+                cased: None,
                 fields: vec![
                     AnalyzedField {
                         sentences: None,

@@ -585,7 +585,14 @@ coordinates anywhere in its source data, using two features that are both
 already built and tested. This is the single best ratio of new capability
 to new code in the document.
 
-### 18. Dual-cased term identity in one analysis pass
+### 18. Dual-cased term identity in one analysis pass — IMPLEMENTED ON BRANCH
+
+**Implemented on branch 2026-09-02 (`docs/dual-cased.md`,
+`tests/dual_cased.rs`).** `AddDocumentsRequest.cased_field` names the
+field that receives the body's cased identity from the same analysis
+pass; the sidecar's `dual_cased` and a native twin accumulator both
+serve it, replay included.
+
 
 `AnalysisResult` already carries `cased_term_vectors` alongside
 `term_vectors`, and `TermVectorOptions` already has `dual_cased`. The

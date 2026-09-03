@@ -4,5 +4,5 @@
 
 pub use pipestream_search::harness::mock_analysis::{
     start_mock_analysis, start_mock_analysis_delayed, start_mock_analysis_metered,
-    start_mock_analysis_without_sentences, toy_stem,
+    start_mock_analysis_without_dual_identity, start_mock_analysis_without_sentences, toy_stem,
 };

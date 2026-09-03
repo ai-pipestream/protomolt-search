@@ -252,6 +252,9 @@ pub const CHAR_FILTER_WHITESPACE: i32 = 2;
 /// Full Unicode case fold. Sidecar wire value
 /// `TermVectorOptions.NormalizerStep.NORMALIZER_STEP_FULL_CASE_FOLD`.
 pub const CHAR_FILTER_FULL_CASE_FOLD: i32 = 6;
+/// Simple (per-character) case folding; the sidecar's other case step.
+/// A cased twin drops it along with the full fold.
+pub const CHAR_FILTER_CASE_FOLD: i32 = 16;
 /// Unicode NFKC compatibility composition (full-width to ASCII,
 /// superscripts to digits, Roman-numeral codepoints to letters). Sidecar
 /// wire value `NORMALIZER_STEP_NFKC`. Not in [`body_spec`]: measured at
@@ -375,6 +378,17 @@ pub fn analyze_document_native(
     Ok(native_analysis(text, spec)?.doc)
 }
 
+/// Both identities from one native pass (`docs/dual-cased.md`): the
+/// folded body at field 0 and the cased twin in `cased`.
+pub fn analyze_document_native_dual(
+    text: &str,
+    spec: Option<&AnalysisSpec>,
+) -> Result<AnalyzedDoc, Status> {
+    validate_dual_cased_spec(spec)?;
+    let spec = native_spec(spec)?;
+    Ok(native_dual_with_spec(text, &spec)?.doc)
+}
+
 #[derive(Debug)]
 struct NativeAnalysis {
     doc: AnalyzedDoc,
@@ -392,6 +406,45 @@ fn native_analysis_with_spec(
 ) -> Result<NativeAnalysis, Status> {
     let analyzed = protomolt_analyzer::analyze(text, spec)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let tokens = analyzed.tokens.clone();
+    Ok(NativeAnalysis {
+        doc: AnalyzedDoc {
+            fields: vec![native_field(analyzed)],
+            cased: None,
+            quality: None,
+            geography: None,
+            entities: Vec::new(),
+        },
+        tokens,
+    })
+}
+
+/// Both identities from one native pass (`docs/dual-cased.md`).
+fn native_dual_with_spec(
+    text: &str,
+    spec: &protomolt_analyzer::AnalysisSpec,
+) -> Result<NativeAnalysis, Status> {
+    let dual = protomolt_analyzer::analyze_dual(text, spec)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let tokens = dual.folded.tokens.clone();
+    Ok(NativeAnalysis {
+        doc: AnalyzedDoc {
+            fields: vec![native_field(dual.folded)],
+            cased: Some(native_field(dual.cased)),
+            quality: None,
+            geography: None,
+            entities: Vec::new(),
+        },
+        tokens,
+    })
+}
+
+/// One native identity stream as an analyzed field. The native
+/// tokenizer numbers its own tokens, so positions come out of the same
+/// pass as the terms (no second walk), and its newline sentence detector
+/// runs in that pass too, so every native analysis carries a sentence
+/// table (docs/highlighting.md).
+fn native_field(analyzed: protomolt_analyzer::AnalyzedDocument) -> crate::postings::AnalyzedField {
     let mut terms = crate::postings::DocTerms::with_capacity(analyzed.term_vectors.len());
     let mut positions = crate::postings::DocPositions::with_capacity(analyzed.term_vectors.len());
     for vector in analyzed.term_vectors {
@@ -406,22 +459,18 @@ fn native_analysis_with_spec(
         ));
         positions.push(vector.positions);
     }
-    // The native tokenizer numbers its own tokens, so positions come
-    // out of the same pass as the terms — there is no second walk. Its
-    // newline sentence detector runs in that pass too, so every native
-    // analysis carries a sentence table (docs/highlighting.md).
-    let mut doc = AnalyzedDoc::body_positioned(terms, positions, analyzed.length);
-    doc.fields[0].sentences = Some(
-        analyzed
-            .sentences
-            .iter()
-            .map(|span| (span.start, span.end))
-            .collect(),
-    );
-    Ok(NativeAnalysis {
-        doc,
-        tokens: analyzed.tokens,
-    })
+    crate::postings::AnalyzedField {
+        terms,
+        length: analyzed.length,
+        positions: Some(positions),
+        sentences: Some(
+            analyzed
+                .sentences
+                .iter()
+                .map(|span| (span.start, span.end))
+                .collect(),
+        ),
+    }
 }
 
 fn native_spec(spec: Option<&AnalysisSpec>) -> Result<protomolt_analyzer::AnalysisSpec, Status> {
@@ -586,6 +635,11 @@ pub struct SessionLayers {
     /// Model-free by default on the sidecar (its newline detector) and
     /// one traversal of text it already holds.
     pub sentences: bool,
+    /// Both term identities from one pass (`docs/dual-cased.md`): the
+    /// sidecar's `dual_cased`, or the native analyzer's twin accumulator.
+    /// Opening a sidecar session preflights
+    /// `GetCapabilities.dual_term_identity_available`.
+    pub dual_cased: bool,
 }
 
 /// Maps `spec` straight onto the sidecar's `AnalysisOptions`: term vectors
@@ -613,12 +667,10 @@ fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> Analy
             // number, same values, different vocabulary.
             steps: char_filters,
             source,
-            // One call returning both a folded and an unfolded term
-            // stream. Our A/B arms are separate columns with their own
-            // specs and fingerprints, so each is requested on its own;
-            // this stays off until a caller wants both identities from
-            // a single analysis pass.
-            dual_cased: false,
+            // One call returning both the folded and the cased term
+            // stream (`docs/dual-cased.md`): on when the ingest names a
+            // cased field, so the A/B pair costs one pass.
+            dual_cased: layers.dual_cased,
         }),
         // The quality layers ride the SAME analysis pass as the terms
         // (docs/quality-columns.md). Both are model-free structural
@@ -647,6 +699,74 @@ fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> Analy
 /// this counter is what keeps them bounded.
 static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The cased twin of an analysis spec (`docs/dual-cased.md`): the same
+/// tokenizer, stemmer, mode, and source, and the same step chain minus
+/// case folding — what the sidecar's `cased_term_vectors` and the native
+/// analyzer's cased accumulator compute. Its fingerprint is the cased
+/// field's fingerprint.
+pub fn cased_twin_spec(spec: &AnalysisSpec) -> AnalysisSpec {
+    AnalysisSpec {
+        char_filters: spec
+            .char_filters
+            .iter()
+            .copied()
+            .filter(|step| *step != CHAR_FILTER_FULL_CASE_FOLD && *step != CHAR_FILTER_CASE_FOLD)
+            .collect(),
+        ..spec.clone()
+    }
+}
+
+/// The body spec a cased field can be derived from: explicit, and with
+/// a step-chain source (`SOURCE_STEMS` ignores the chain, so it has no
+/// folded form to contrast with).
+pub fn validate_dual_cased_spec(spec: Option<&AnalysisSpec>) -> Result<(), Status> {
+    let Some(spec) = spec else {
+        return Err(Status::invalid_argument(
+            "cased_field needs an explicit body AnalysisSpec: the cased field's fingerprint is \
+             the twin of the body's, and analyzer 'server' describes none",
+        ));
+    };
+    if spec.term_vector_source == SOURCE_STEMS {
+        return Err(Status::invalid_argument(
+            "cased_field needs a step-chain term vector source on the body (SOURCE_TOKENS or \
+             SOURCE_NORMALIZED_STEMS); SOURCE_STEMS ignores the step chain, so it has no folded \
+             form to contrast with",
+        ));
+    }
+    Ok(())
+}
+
+/// Term vectors to per-document terms: `(terms, length)`, dropping
+/// zero-frequency and zero-length identities.
+fn terms_of(vectors: Vec<crate::pb::analysis::TermVector>) -> (crate::postings::DocTerms, u32) {
+    let mut terms = crate::postings::DocTerms::new();
+    let mut length = 0u32;
+    for tv in vectors {
+        if tv.frequency <= 0 {
+            continue;
+        }
+        if tv.term.is_empty() {
+            let n = EMPTY_TERMS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 20 || n.is_multiple_of(1_000_000) {
+                eprintln!(
+                    "analysis: dropped zero-length term (occurrence {n} this process): a \
+                     token of stripped characters; unqueryable, and refused at index open \
+                     if it were kept"
+                );
+            }
+            continue;
+        }
+        let offsets = tv
+            .occurrences
+            .iter()
+            .map(|s| (s.start.max(0) as u32, s.end.max(0) as u32))
+            .collect();
+        length += tv.frequency as u32;
+        terms.push((tv.term, tv.frequency as u32, offsets));
+    }
+    (terms, length)
+}
+
 /// Folds a response's term vectors into a single-field (body)
 /// [`AnalyzedDoc`] (term, tf, original-text offsets, and document
 /// length).
@@ -663,7 +783,10 @@ static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// have produced; the dropped token contributes nothing to the
 /// document length either, exactly as if the analyzer had never
 /// emitted it.
-fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> Result<AnalyzedDoc, Status> {
+fn analyzed_from(
+    mut response: AnalyzeResponse,
+    layers: SessionLayers,
+) -> Result<AnalyzedDoc, Status> {
     match crate::pb::analysis::OffsetUnit::try_from(response.offset_unit) {
         Ok(crate::pb::analysis::OffsetUnit::Unspecified)
         | Ok(crate::pb::analysis::OffsetUnit::Utf16CodeUnits) => {}
@@ -697,31 +820,7 @@ fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> Result<Ana
     } else {
         Vec::new()
     };
-    let mut terms = crate::postings::DocTerms::new();
-    let mut length = 0u32;
-    for tv in response.term_vectors {
-        if tv.frequency <= 0 {
-            continue;
-        }
-        if tv.term.is_empty() {
-            let n = EMPTY_TERMS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n <= 20 || n.is_multiple_of(1_000_000) {
-                eprintln!(
-                    "analysis: dropped zero-length term (occurrence {n} this process): a \
-                     token of stripped characters; unqueryable, and refused at index open \
-                     if it were kept"
-                );
-            }
-            continue;
-        }
-        let offsets = tv
-            .occurrences
-            .iter()
-            .map(|s| (s.start.max(0) as u32, s.end.max(0) as u32))
-            .collect();
-        length += tv.frequency as u32;
-        terms.push((tv.term, tv.frequency as u32, offsets));
-    }
+    let (terms, length) = terms_of(std::mem::take(&mut response.term_vectors));
     let positions = token_positions(&response.tokens, &terms)?;
     // The sentence layer is the answer only when it was asked for: a
     // response without it for a session that requested it is a table
@@ -736,7 +835,28 @@ fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> Result<Ana
     });
     let mut doc = AnalyzedDoc::body(terms, length);
     doc.fields[0].positions = positions;
-    doc.fields[0].sentences = sentences;
+    doc.fields[0].sentences = sentences.clone();
+    if layers.dual_cased {
+        // The cased identity of the same pass: the same tokens, so the
+        // same token layer derives its ordinals and the same sentences
+        // bound it.
+        let (cased_terms, cased_length) =
+            terms_of(std::mem::take(&mut response.cased_term_vectors));
+        if cased_terms.is_empty() && !doc.fields[0].terms.is_empty() {
+            return Err(Status::failed_precondition(
+                "dual_cased was requested but the analysis sidecar returned no cased term \
+                 identities; the running jar ignores the flag (an open port is not the jar); \
+                 rebuild grpc-opennlp-analysis from main",
+            ));
+        }
+        let cased_positions = token_positions(&response.tokens, &cased_terms)?;
+        doc.cased = Some(crate::postings::AnalyzedField {
+            terms: cased_terms,
+            length: cased_length,
+            positions: cased_positions,
+            sentences,
+        });
+    }
     doc.quality = quality;
     doc.geography = geography;
     doc.entities = entities;
@@ -1003,15 +1123,28 @@ impl AnalyzeStream {
             return Self::open_native(spec, vocab, layers);
         }
         let mut client = client(addr)?;
-        if layers.geography || layers.entities {
+        if layers.dual_cased {
+            validate_dual_cased_spec(spec)?;
+        }
+        if layers.geography || layers.entities || layers.dual_cased {
             let capabilities = client
                 .get_capabilities(crate::pb::analysis::GetCapabilitiesRequest {})
                 .await?
                 .into_inner();
-            if !capabilities.ner_available {
+            if (layers.geography || layers.entities) && !capabilities.ner_available {
                 return Err(Status::failed_precondition(
                     "entity or geography columns were requested but this sidecar has no NER model configured (GetCapabilities.ner_available = false); configure an NER model or disable those columns",
                 ));
+            }
+            // An open port is not the jar: the running sidecar must say
+            // it serves both identities before ingest depends on it.
+            if layers.dual_cased && !capabilities.dual_term_identity_available {
+                return Err(Status::failed_precondition(format!(
+                    "a cased field was requested but the sidecar at {addr} does not serve the \
+                     dual term identity (GetCapabilities.dual_term_identity_available = false); \
+                     rebuild grpc-opennlp-analysis from main (./gradlew installDist) or drop \
+                     cased_field"
+                )));
             }
         }
         let (requests, feed) = tokio::sync::mpsc::channel(SUBMIT_BUFFER);
@@ -1046,6 +1179,7 @@ impl AnalyzeStream {
         // every other optional layer needs the sidecar.
         let sidecar_only = SessionLayers {
             sentences: false,
+            dual_cased: false,
             ..layers
         };
         if sidecar_only != SessionLayers::default() {
@@ -1064,6 +1198,10 @@ impl AnalyzeStream {
                 requested.join(", ")
             )));
         }
+        if layers.dual_cased {
+            validate_dual_cased_spec(spec)?;
+        }
+        let dual_cased = layers.dual_cased;
         let spec = std::sync::Arc::new(native_spec(spec)?);
         let (requests, mut feed) = tokio::sync::mpsc::channel::<NativeRequest>(SUBMIT_BUFFER);
         let (emit, responses) = tokio::sync::mpsc::channel::<NativeResponse>(SUBMIT_BUFFER);
@@ -1072,7 +1210,11 @@ impl AnalyzeStream {
                 let sequence = request.sequence;
                 let spec = spec.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    native_analysis_with_spec(&request.text, &spec)
+                    if dual_cased {
+                        native_dual_with_spec(&request.text, &spec)
+                    } else {
+                        native_analysis_with_spec(&request.text, &spec)
+                    }
                 })
                 .await
                 .unwrap_or_else(|error| {
@@ -1228,7 +1370,7 @@ impl AnalyzeStream {
 /// than one stream per spec see [`analyze_batch_streams`].
 pub async fn analyze_batch(
     addr: &str,
-    docs: &[(&str, Option<&AnalysisSpec>)],
+    docs: &[(&str, Option<&AnalysisSpec>, SessionLayers)],
 ) -> Result<Vec<AnalyzedDoc>, Status> {
     analyze_batch_streams(addr, docs, 1).await
 }
@@ -1255,7 +1397,7 @@ pub async fn analyze_batch(
 /// immediately close.
 pub async fn analyze_batch_streams(
     addr: &str,
-    docs: &[(&str, Option<&AnalysisSpec>)],
+    docs: &[(&str, Option<&AnalysisSpec>, SessionLayers)],
     streams: usize,
 ) -> Result<Vec<AnalyzedDoc>, Status> {
     let mut out: Vec<Option<AnalyzedDoc>> = Vec::new();
@@ -1263,14 +1405,16 @@ pub async fn analyze_batch_streams(
     // Group indices by spec, preserving first-seen order; the global doc
     // index is the sequence, so results land in their input slots no
     // matter which group or which stream answered.
-    let mut groups: Vec<(Option<&AnalysisSpec>, Vec<usize>)> = Vec::new();
-    for (i, (_, spec)) in docs.iter().enumerate() {
-        match groups.iter_mut().find(|(s, _)| *s == *spec) {
+    // One session per (spec, layers) pair: the layers a replayed record
+    // needs (sentence spans, the cased identity) come from that one call.
+    let mut groups: Vec<((Option<&AnalysisSpec>, SessionLayers), Vec<usize>)> = Vec::new();
+    for (i, (_, spec, layers)) in docs.iter().enumerate() {
+        match groups.iter_mut().find(|(key, _)| *key == (*spec, *layers)) {
             Some((_, indices)) => indices.push(i),
-            None => groups.push((*spec, vec![i])),
+            None => groups.push(((*spec, *layers), vec![i])),
         }
     }
-    for (spec, indices) in groups {
+    for ((spec, layers), indices) in groups {
         let want = streams.max(1).min(indices.len());
         if want == 0 {
             continue;
@@ -1291,7 +1435,7 @@ pub async fn analyze_batch_streams(
 
         let mut sessions = Vec::with_capacity(chunks.len());
         for _ in 0..chunks.len() {
-            sessions.push(open_stream(addr, spec).await?);
+            sessions.push(open_stream(addr, spec, layers).await?);
         }
         // Drive every stream from this one task: the work being
         // overlapped is the sidecar's, and these futures only wait on
@@ -1324,8 +1468,12 @@ pub async fn analyze_batch_streams(
 /// a sidecar predating AnalyzeStream GOAWAYs after ~70 of them. The
 /// "fallback" did not degrade gracefully, it failed obscurely thousands
 /// of documents later.
-async fn open_stream(addr: &str, spec: Option<&AnalysisSpec>) -> Result<AnalyzeStream, Status> {
-    match AnalyzeStream::open(addr, spec).await {
+async fn open_stream(
+    addr: &str,
+    spec: Option<&AnalysisSpec>,
+    layers: SessionLayers,
+) -> Result<AnalyzeStream, Status> {
+    match AnalyzeStream::open_with_vocab(addr, spec, None, layers).await {
         Ok(session) => Ok(session),
         Err(status) if status.code() == tonic::Code::Unimplemented => {
             Err(Status::failed_precondition(format!(
@@ -1808,6 +1956,7 @@ mod tests {
             Some(&body_spec()),
             None,
             SessionLayers {
+                dual_cased: false,
                 sentences: false,
                 quality: true,
                 geography: false,

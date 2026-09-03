@@ -47,7 +47,14 @@ const TEXTS: [&str; 7] = [
 #[tokio::test]
 async fn batch_restores_input_order_despite_reordered_responses() {
     let (addr, server) = start_mock_analysis().await;
-    let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS.iter().map(|t| (*t, None)).collect();
+    let docs: Vec<(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )> = TEXTS
+        .iter()
+        .map(|t| (*t, None, Default::default()))
+        .collect();
     let batch = analyze_batch(&addr, &docs).await.unwrap();
     assert_eq!(batch.len(), TEXTS.len());
     for (i, text) in TEXTS.iter().enumerate() {
@@ -163,7 +170,14 @@ async fn start_no_stream_mock() -> (
 #[tokio::test]
 async fn batch_refuses_a_sidecar_without_analyze_stream() {
     let (addr, server) = start_no_stream_mock().await;
-    let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS.iter().map(|t| (*t, None)).collect();
+    let docs: Vec<(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )> = TEXTS
+        .iter()
+        .map(|t| (*t, None, Default::default()))
+        .collect();
     let status = analyze_batch(&addr, &docs)
         .await
         .expect_err("a sidecar without AnalyzeStream must be refused, not silently downgraded");
@@ -189,6 +203,7 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
     for text in TEXTS {
         tx.send(AddDocumentsRequest {
             collection: String::new(),
+            cased_field: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             map_numerics: Vec::new(),
@@ -240,7 +255,14 @@ async fn stream_count_does_not_change_a_single_result() {
     let (addr, server) = start_mock_analysis().await;
     // More documents than streams, and (below) more streams than
     // documents: both sides of the clamp.
-    let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS.iter().map(|t| (*t, None)).collect();
+    let docs: Vec<(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )> = TEXTS
+        .iter()
+        .map(|t| (*t, None, Default::default()))
+        .collect();
     let baseline = analyze_batch_streams(&addr, &docs, 1).await.unwrap();
     for streams in [2, 3, 4, 7, 16] {
         let split = analyze_batch_streams(&addr, &docs, streams).await.unwrap();
@@ -269,10 +291,20 @@ async fn multiple_streams_keep_each_spec_with_its_own_documents() {
         char_filters: Vec::new(),
     };
     // Interleaved specs, so a naive split would cross a group boundary.
-    let docs: Vec<(&str, Option<&AnalysisSpec>)> = TEXTS
+    let docs: Vec<(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )> = TEXTS
         .iter()
         .enumerate()
-        .map(|(i, t)| (*t, if i % 2 == 0 { Some(&stemmed) } else { None }))
+        .map(|(i, t)| {
+            (
+                *t,
+                if i % 2 == 0 { Some(&stemmed) } else { None },
+                Default::default(),
+            )
+        })
         .collect();
     let baseline = analyze_batch_streams(&addr, &docs, 1).await.unwrap();
     for streams in [2, 5] {

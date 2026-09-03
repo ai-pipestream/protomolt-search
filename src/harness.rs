@@ -384,6 +384,12 @@ pub mod mock_analysis {
         /// that ignores the request — the state a sentence field's
         /// ingest refuses by name (docs/highlighting.md).
         pub sentence_layer: bool,
+        /// Whether this mock serves both term identities from one pass
+        /// (`dual_cased`) and says so in `GetCapabilities`. Defaults to
+        /// true; [`start_mock_analysis_without_dual_identity`] models an
+        /// older jar, which ingest with a cased field refuses by name
+        /// (docs/dual-cased.md).
+        pub dual_identity: bool,
         /// Analysis calls this mock served, unary and streaming alike,
         /// one per document: the meter that proves a query path added
         /// no analysis (docs/highlighting.md).
@@ -396,6 +402,7 @@ pub mod mock_analysis {
             MockAnalysis {
                 ner: true,
                 sentence_layer: true,
+                dual_identity: true,
                 calls: Arc::new(AtomicU64::new(0)),
                 unary_delay: None,
             }
@@ -440,6 +447,7 @@ pub mod mock_analysis {
         options: &AnalysisOptions,
         ner: bool,
         sentence_layer: bool,
+        dual_identity: bool,
         calls: &AtomicU64,
     ) -> Result<AnalyzeResponse, Status> {
         calls.fetch_add(1, Ordering::SeqCst);
@@ -471,28 +479,44 @@ pub mod mock_analysis {
         };
 
         let mut term_vectors: Vec<TermVector> = Vec::new();
+        let mut cased_term_vectors: Vec<TermVector> = Vec::new();
         if let Some(tv) = &options.term_vectors {
             if tv.enabled {
                 const SOURCE_STEMS: i32 = 2;
                 const MODE_SCORING_ONLY: i32 = 2;
+                const FULL_CASE_FOLD: i32 = 6;
+                const CASE_FOLD: i32 = 16;
                 if tv.source == SOURCE_STEMS && !stemming_on {
                     return Err(Status::invalid_argument("SOURCE_STEMS requires a stemmer"));
                 }
-                for (i, token) in tokens.iter().enumerate() {
-                    let identity = if tv.source == SOURCE_STEMS {
-                        stems[i].clone()
-                    } else {
-                        token.text.to_lowercase()
-                    };
-                    let span = token.span.unwrap();
-                    match term_vectors.iter_mut().find(|t| t.term == identity) {
+                if tv.dual_cased && tv.source == SOURCE_STEMS {
+                    return Err(Status::invalid_argument(
+                        "dual_cased requires a step-chain term vector source; SOURCE_STEMS has no \
+                         folded form to contrast with",
+                    ));
+                }
+                // The mock honours the case-folding steps the way the
+                // sidecar does: a chain that names steps but no fold
+                // keeps the token's case, which is what a cased twin spec
+                // asks for. An empty chain is the server default, which
+                // folds, as every spec-less request here has assumed.
+                let folds = tv.steps.is_empty()
+                    || tv
+                        .steps
+                        .iter()
+                        .any(|step| *step == FULL_CASE_FOLD || *step == CASE_FOLD);
+                let push =
+                    |vectors: &mut Vec<TermVector>, identity: String, span: Span| match vectors
+                        .iter_mut()
+                        .find(|t| t.term == identity)
+                    {
                         Some(entry) => {
                             entry.frequency += 1;
                             if tv.mode != MODE_SCORING_ONLY {
                                 entry.occurrences.push(span);
                             }
                         }
-                        None => term_vectors.push(TermVector {
+                        None => vectors.push(TermVector {
                             term: identity,
                             frequency: 1,
                             occurrences: if tv.mode == MODE_SCORING_ONLY {
@@ -501,6 +525,23 @@ pub mod mock_analysis {
                                 vec![span]
                             },
                         }),
+                    };
+                for (i, token) in tokens.iter().enumerate() {
+                    let identity = if tv.source == SOURCE_STEMS {
+                        stems[i].clone()
+                    } else if folds {
+                        token.text.to_lowercase()
+                    } else {
+                        token.text.clone()
+                    };
+                    let span = token.span.unwrap();
+                    push(&mut term_vectors, identity, span);
+                    // The cased identity of the same token, from the
+                    // same pass: the chain minus case folding. A mock
+                    // without the capability ignores the flag, as an
+                    // older jar would.
+                    if tv.dual_cased && dual_identity {
+                        push(&mut cased_term_vectors, token.text.clone(), span);
                     }
                 }
             }
@@ -603,6 +644,7 @@ pub mod mock_analysis {
             stems,
             entities: Vec::new(),
             term_vectors,
+            cased_term_vectors,
             embeddings: Vec::new(),
             warnings: Vec::new(),
             lemmas: Vec::new(),
@@ -636,6 +678,7 @@ pub mod mock_analysis {
                 &options,
                 self.ner,
                 self.sentence_layer,
+                self.dual_identity,
                 &self.calls,
             )?))
         }
@@ -655,6 +698,7 @@ pub mod mock_analysis {
             let mut inbound = request.into_inner();
             let ner = self.ner;
             let sentence_layer = self.sentence_layer;
+            let dual_identity = self.dual_identity;
             let calls = self.calls.clone();
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AnalyzeStreamResponse, Status>>(16);
             tokio::spawn(async move {
@@ -687,17 +731,22 @@ pub mod mock_analysis {
                                     .await;
                                 return;
                             };
-                            let result =
-                                match analyze_text(&doc.text, options, ner, sentence_layer, &calls)
-                                {
-                                    Ok(ok) => analyze_stream_response::Result::Ok(ok),
-                                    Err(status) => {
-                                        analyze_stream_response::Result::Error(AnalyzeStreamError {
-                                            code: status.code() as i32,
-                                            message: status.message().to_string(),
-                                        })
-                                    }
-                                };
+                            let result = match analyze_text(
+                                &doc.text,
+                                options,
+                                ner,
+                                sentence_layer,
+                                dual_identity,
+                                &calls,
+                            ) {
+                                Ok(ok) => analyze_stream_response::Result::Ok(ok),
+                                Err(status) => {
+                                    analyze_stream_response::Result::Error(AnalyzeStreamError {
+                                        code: status.code() as i32,
+                                        message: status.message().to_string(),
+                                    })
+                                }
+                            };
                             let response = AnalyzeStreamResponse {
                                 sequence: doc.sequence,
                                 result: Some(result),
@@ -736,6 +785,7 @@ pub mod mock_analysis {
         ) -> Result<Response<GetCapabilitiesResponse>, Status> {
             Ok(Response::new(GetCapabilitiesResponse {
                 ner_available: self.ner,
+                dual_term_identity_available: self.dual_identity,
                 ..Default::default()
             }))
         }
@@ -804,6 +854,24 @@ pub mod mock_analysis {
             ..Default::default()
         })
         .await
+    }
+
+    /// A mock modelling a jar that predates the dual term identity: it
+    /// reports the capability false and ignores `dual_cased`. Returns
+    /// the call meter too, so a test can pin that nothing was analyzed.
+    pub async fn start_mock_analysis_without_dual_identity() -> (
+        String,
+        JoinHandle<Result<(), TransportError>>,
+        Arc<AtomicU64>,
+    ) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (address, handle) = start_mock(MockAnalysis {
+            dual_identity: false,
+            calls: calls.clone(),
+            ..Default::default()
+        })
+        .await;
+        (address, handle, calls)
     }
 
     async fn start_mock(mock: MockAnalysis) -> (String, JoinHandle<Result<(), TransportError>>) {

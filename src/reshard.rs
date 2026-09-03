@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::analyzer::SessionLayers;
 use crate::pb::wal::wal_record;
 use crate::pb::{AddDocumentsRequest, AnalysisSpec};
 use crate::postings::{AnalyzedDoc, SpillBuilder};
@@ -45,8 +46,8 @@ use crate::wal::{self, RecordReader, WalManifest};
 /// ingest, hence the spec round-trip. Multi-field documents
 /// (docs/multi-field.md) flatten into the batch as one entry per field
 /// (body first, extras in record order); the caller reassembles.
-pub type Analyzer<'a> =
-    dyn FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> + 'a;
+pub type Analyzer<'a> = dyn FnMut(&[(&str, Option<&AnalysisSpec>, SessionLayers)]) -> Result<Vec<AnalyzedDoc>, String>
+    + 'a;
 
 /// Batch size handed to the analyzer (the analyzer's concurrency window).
 const ANALYZE_BATCH: usize = 32;
@@ -712,11 +713,30 @@ fn build_child(
                 end += 1;
             }
             let analyzed = {
-                let mut batch: Vec<(&str, Option<&AnalysisSpec>)> = Vec::with_capacity(entries);
+                let mut batch: Vec<(&str, Option<&AnalysisSpec>, SessionLayers)> =
+                    Vec::with_capacity(entries);
                 for (_, d) in &mapped[i..end] {
-                    batch.push((d.text.as_str(), d.analysis.as_ref()));
+                    // The layers each text needs on replay: sentence
+                    // spans for a sentence field, and the cased identity
+                    // for the body when the record names a cased field.
+                    batch.push((
+                        d.text.as_str(),
+                        d.analysis.as_ref(),
+                        SessionLayers {
+                            sentences: !d.sentence_fields.is_empty(),
+                            dual_cased: !d.cased_field.is_empty(),
+                            ..SessionLayers::default()
+                        },
+                    ));
                     for f in &d.fields {
-                        batch.push((f.text.as_str(), f.analysis.as_ref()));
+                        batch.push((
+                            f.text.as_str(),
+                            f.analysis.as_ref(),
+                            SessionLayers {
+                                sentences: d.sentence_fields.iter().any(|n| n == &f.field),
+                                ..SessionLayers::default()
+                            },
+                        ));
                     }
                 }
                 analyze(&batch)
@@ -730,9 +750,28 @@ fn build_child(
             }
             let mut results = analyzed.into_iter();
             for (local, doc) in &mut mapped[i..end] {
-                let body = results.next().expect("counted above").into_body();
+                let mut body = results.next().expect("counted above");
+                let cased = body.cased.take();
                 let mut fields = vec![crate::postings::AnalyzedField::default(); table.len()];
-                fields[0] = body;
+                fields[0] = body.into_body();
+                // The cased identity came out of the body's one pass; it
+                // lands at the field the record named (docs/dual-cased.md).
+                if !doc.cased_field.is_empty() {
+                    let Some(ci) = table.iter().position(|n| n == &doc.cased_field) else {
+                        return Err(format!(
+                            "record at child slot {local} names cased field {:?} outside the \
+                             table {table:?}",
+                            doc.cased_field
+                        ));
+                    };
+                    fields[ci] = cased.ok_or_else(|| {
+                        format!(
+                            "record at child slot {local}: the replay analysis carried no cased \
+                             identity for {:?}",
+                            doc.cased_field
+                        )
+                    })?;
+                }
                 for f in &doc.fields {
                     let analyzed_field = results.next().expect("counted above").into_body();
                     let Some(fi) = table.iter().position(|n| n == &f.field) else {
@@ -821,6 +860,26 @@ fn build_child(
                         crate::analyzer::analysis_fingerprint(doc.analysis.as_ref()),
                     )
                     .map_err(|error| format!("body analysis fingerprint: {error}"))?;
+                // The cased field carries the twin of the body's spec, as
+                // at first ingest (docs/dual-cased.md).
+                if let (false, Some(spec)) = (doc.cased_field.is_empty(), doc.analysis.as_ref()) {
+                    let ci = table
+                        .iter()
+                        .position(|name| name == &doc.cased_field)
+                        .expect("cased field was resolved above");
+                    let twin = crate::analyzer::cased_twin_spec(spec);
+                    builder
+                        .set_analysis_fingerprint(
+                            ci,
+                            crate::analyzer::analysis_fingerprint(Some(&twin)),
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "cased field {:?} analysis fingerprint: {error}",
+                                doc.cased_field
+                            )
+                        })?;
+                }
                 for field in &doc.fields {
                     let fi = table
                         .iter()
@@ -880,6 +939,7 @@ fn build_child(
                         // (docs/quality-columns.md,
                         // docs/geography-columns.md).
                         crate::postings::AnalyzedDoc {
+                            cased: None,
                             fields,
                             quality: None,
                             geography: None,

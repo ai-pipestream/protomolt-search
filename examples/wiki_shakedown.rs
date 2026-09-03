@@ -77,6 +77,7 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
             }
             tx.send(AddDocumentsRequest {
                 collection: String::new(),
+                cased_field: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),

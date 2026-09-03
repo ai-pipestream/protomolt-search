@@ -56,6 +56,7 @@ const OFFSETS: [u64; 2] = [0, 3];
 fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
     AddDocumentsRequest {
         collection: String::new(),
+        cased_field: String::new(),
         sentence_fields: Vec::new(),
         materialize: None,
         map_numerics: Vec::new(),

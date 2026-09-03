@@ -119,6 +119,7 @@ async fn start_cluster(
                 for text in texts {
                     tx.send(pipestream_search::pb::AddDocumentsRequest {
                         collection: String::new(),
+                        cased_field: String::new(),
                         sentence_fields: Vec::new(),
                         materialize: None,
                         map_numerics: Vec::new(),

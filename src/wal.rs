@@ -1080,6 +1080,7 @@ mod tests {
         wal_record::Op::AddDocuments(LoggedAddDocuments {
             first_id: id,
             documents: vec![AddDocumentsRequest {
+                cased_field: String::new(),
                 collection: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,

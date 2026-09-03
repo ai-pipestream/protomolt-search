@@ -47,6 +47,9 @@ generation-bound policy in
 [docs/dense-execution-policy.md](docs/dense-execution-policy.md): exhaustive
 providers resolve to `EXACT`, a configured ANN provider only at a measured
 point, and the response reports which.
+A cased A/B column costs no second analysis:
+[docs/dual-cased.md](docs/dual-cased.md) — `AddDocumentsRequest.cased_field`
+takes the body's cased identity from the same pass, sidecar or native.
 Block-max pruning, designed for the lexical leg and measured dead on the
 vector leg: [README-block-max.md](README-block-max.md) (overview) and
 [docs/block-max.md](docs/block-max.md) (design doc).

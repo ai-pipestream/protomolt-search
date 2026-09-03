@@ -1607,6 +1607,16 @@ message AddDocumentsRequest {
   // refuses, and an empty name is written with the node's before the
   // document is logged, so a replay carries it.
   string collection = 21;
+  // The declared BM25 field that receives the body's CASED term identity
+  // from the same analysis pass (docs/dual-cased.md): the same tokens under
+  // the body's chain minus case folding, so occurrence spans and token
+  // ordinals coincide with the body's, and no second analysis runs. The
+  // field must be in the shard's field table, must not be "body", and must
+  // not also appear in `fields`; the body's analysis must be an explicit
+  // spec with a step-chain source (SOURCE_STEMS has no folded form). The
+  // sidecar must advertise GetCapabilities.dual_term_identity_available, or
+  // ingest refuses by name. The field's fingerprint is the twin spec's.
+  string cased_field = 22;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share

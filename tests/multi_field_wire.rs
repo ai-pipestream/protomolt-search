@@ -54,6 +54,7 @@ const OFFSETS: [u64; 2] = [0, 3];
 fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
     AddDocumentsRequest {
         collection: String::new(),
+        cased_field: String::new(),
         sentence_fields: Vec::new(),
         materialize: None,
         map_numerics: Vec::new(),
@@ -373,6 +374,7 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
 
     let bad = |field: &str, text: &str| AddDocumentsRequest {
         collection: String::new(),
+        cased_field: String::new(),
         sentence_fields: Vec::new(),
         materialize: None,
         map_numerics: Vec::new(),
@@ -505,6 +507,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
     ] {
         tx.send(AddDocumentsRequest {
             collection: String::new(),
+            cased_field: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             map_numerics: Vec::new(),

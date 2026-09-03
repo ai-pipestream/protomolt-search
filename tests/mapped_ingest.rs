@@ -669,7 +669,11 @@ async fn live_reshard_catches_the_tail_and_cuts_over_without_stopping_queries() 
             .unwrap();
     let handle = tokio::runtime::Handle::current();
     let analyze_addr = analysis.clone();
-    let mut analyze = move |docs: &[(&str, Option<&pipestream_search::pb::AnalysisSpec>)]| {
+    let mut analyze = move |docs: &[(
+        &str,
+        Option<&pipestream_search::pb::AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )]| {
         tokio::task::block_in_place(|| {
             handle
                 .block_on(pipestream_search::analyzer::analyze_batch_streams(
@@ -1326,16 +1330,27 @@ async fn reshard_replay_carries_the_binding() {
 
     let handle = tokio::runtime::Handle::current();
     let analysis_addr = analysis.clone();
-    let mut analyze = move |docs: &[(&str, Option<&pipestream_search::pb::AnalysisSpec>)]| {
+    let mut analyze = move |docs: &[(
+        &str,
+        Option<&pipestream_search::pb::AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )]| {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut out = Vec::with_capacity(docs.len());
-                for (text, spec) in docs {
-                    out.push(
+                for (text, spec, layers) in docs {
+                    let analyzed = if *layers != Default::default() {
+                        pipestream_search::analyzer::analyze_batch(
+                            &analysis_addr,
+                            &[(*text, *spec, *layers)],
+                        )
+                        .await
+                        .map(|mut batch| batch.remove(0))
+                    } else {
                         pipestream_search::analyzer::analyze_document(&analysis_addr, text, *spec)
                             .await
-                            .map_err(|e| e.to_string())?,
-                    );
+                    };
+                    out.push(analyzed.map_err(|e| e.to_string())?);
                 }
                 Ok(out)
             })

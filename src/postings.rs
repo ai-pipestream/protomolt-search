@@ -761,6 +761,12 @@ impl AnalyzedField {
 pub struct AnalyzedDoc {
     /// Per-field analyzed data, indexed by field id.
     pub fields: Vec<AnalyzedField>,
+    /// The body's cased term identity from the SAME analysis pass
+    /// (`docs/dual-cased.md`), when the ingest asked for one: the same
+    /// tokens under the same chain minus case folding, spans and
+    /// ordinals coinciding with the body's. The node places it at the
+    /// field the request named; it is never a second analysis.
+    pub cased: Option<AnalyzedField>,
     /// Per-document quality scalars from the sidecar's noise and
     /// artifact layers, when the ingest asked for them
     /// (`docs/quality-columns.md`). `None` means they were not
@@ -823,6 +829,7 @@ impl AnalyzedDoc {
                 positions: None,
                 sentences: None,
             }],
+            cased: None,
             quality: None,
             geography: None,
             entities: Vec::new(),
@@ -838,6 +845,7 @@ impl AnalyzedDoc {
                 positions: Some(positions),
                 sentences: None,
             }],
+            cased: None,
             quality: None,
             geography: None,
             entities: Vec::new(),
@@ -9574,6 +9582,7 @@ mod tests {
                 positions: None,
             });
             AnalyzedDoc {
+                cased: None,
                 fields,
                 quality: None,
                 geography: None,
@@ -10712,6 +10721,7 @@ mod tests {
                 id,
                 format!("case {i} body"),
                 AnalyzedDoc {
+                    cased: None,
                     fields,
                     quality: None,
                     geography: None,

@@ -149,6 +149,7 @@ async fn ingest(
         for i in 0..docs {
             tx.send(AddDocumentsRequest {
                 collection: String::new(),
+                cased_field: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),
@@ -202,18 +203,28 @@ async fn ingest(
 #[allow(clippy::type_complexity)]
 fn replay_analyzer(
     analysis_addr: &str,
-) -> impl FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String> + '_ {
+) -> impl FnMut(
+    &[(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )],
+) -> Result<Vec<AnalyzedDoc>, String>
+       + '_ {
     let handle = tokio::runtime::Handle::current();
     move |docs| {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut out = Vec::with_capacity(docs.len());
-                for (text, spec) in docs {
-                    out.push(
-                        analyzer::analyze_document(analysis_addr, text, *spec)
+                for (text, spec, layers) in docs {
+                    let analyzed = if *layers != Default::default() {
+                        analyzer::analyze_batch(analysis_addr, &[(*text, *spec, *layers)])
                             .await
-                            .map_err(|e| e.to_string())?,
-                    );
+                            .map(|mut batch| batch.remove(0))
+                    } else {
+                        analyzer::analyze_document(analysis_addr, text, *spec).await
+                    };
+                    out.push(analyzed.map_err(|e| e.to_string())?);
                 }
                 Ok(out)
             })
@@ -223,10 +234,18 @@ fn replay_analyzer(
 
 /// Analyze one document through a batch analyzer (test convenience).
 fn analyze_one(
-    analyze: &mut impl FnMut(&[(&str, Option<&AnalysisSpec>)]) -> Result<Vec<AnalyzedDoc>, String>,
+    analyze: &mut impl FnMut(
+        &[(
+            &str,
+            Option<&AnalysisSpec>,
+            pipestream_search::analyzer::SessionLayers,
+        )],
+    ) -> Result<Vec<AnalyzedDoc>, String>,
     text: &str,
 ) -> AnalyzedDoc {
-    analyze(&[(text, None)]).unwrap().remove(0)
+    analyze(&[(text, None, Default::default())])
+        .unwrap()
+        .remove(0)
 }
 
 /// Top-k of one query as `(global_id, score_bits)`, coordinator order
@@ -696,10 +715,14 @@ fn reshard_refuses_a_log_with_preexisting_state() {
     let gen = writer.dir().to_path_buf();
     drop(writer);
 
-    let mut analyze =
-        |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
-            unreachable!("reshard must refuse before analyzing anything")
-        };
+    let mut analyze = |_docs: &[(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )]|
+     -> Result<Vec<AnalyzedDoc>, String> {
+        unreachable!("reshard must refuse before analyzing anything")
+    };
     let err = reshard::split(
         &gen,
         2,
@@ -760,10 +783,14 @@ fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
     writer.flush().unwrap();
     let generation = writer.dir().to_path_buf();
     drop(writer);
-    let mut analyze =
-        |_docs: &[(&str, Option<&AnalysisSpec>)]| -> Result<Vec<AnalyzedDoc>, String> {
-            unreachable!("invalid WAL must fail before analysis")
-        };
+    let mut analyze = |_docs: &[(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )]|
+     -> Result<Vec<AnalyzedDoc>, String> {
+        unreachable!("invalid WAL must fail before analysis")
+    };
     let error = reshard::split_logs_segmented(
         &[generation],
         1,
@@ -1106,6 +1133,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
         for (i, name) in names_feed.iter().enumerate() {
             tx.send(AddDocumentsRequest {
                 collection: String::new(),
+                cased_field: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),

@@ -5842,13 +5842,35 @@ impl MappedSource<'_> {
 /// the streaming contract permits it) from stalling the whole ingest on
 /// one field.
 fn join_fields(
-    body: crate::postings::AnalyzedDoc,
+    mut body: crate::postings::AnalyzedDoc,
     extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
+    cased: Option<usize>,
 ) -> Result<crate::postings::AnalyzedDoc, Status> {
-    if extras.is_empty() {
+    // The body's cased identity (docs/dual-cased.md) came out of the
+    // same pass; it lands at the field the request named.
+    let cased_identity = body.cased.take();
+    match (cased, &cased_identity) {
+        (Some(_), None) => {
+            return Err(Status::internal(
+                "the document names a cased field but its analysis carried no cased identity",
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(Status::internal(
+                "the analysis carried a cased identity no field asked for",
+            ))
+        }
+        _ => {}
+    }
+    if extras.is_empty() && cased.is_none() {
         return Ok(body);
     }
-    let n = extras.iter().map(|&(fi, _)| fi + 1).max().unwrap_or(1);
+    let n = extras
+        .iter()
+        .map(|&(fi, _)| fi + 1)
+        .chain(cased.map(|ci| ci + 1))
+        .max()
+        .unwrap_or(1);
     let mut fields = vec![crate::postings::AnalyzedField::default(); n];
     let quality = body.quality;
     let geography = body.geography.clone();
@@ -5862,12 +5884,60 @@ fn join_fields(
             ))
         })?;
     }
+    if let (Some(ci), Some(identity)) = (cased, cased_identity) {
+        fields[ci] = identity;
+    }
     Ok(crate::postings::AnalyzedDoc {
         fields,
+        cased: None,
         quality,
         geography,
         entities,
     })
+}
+
+/// The field index `cased_field` names, validated (`docs/dual-cased.md`):
+/// a declared BM25 field other than the body, not derived from the phrase
+/// glossary or a bigram source, with an explicit step-chain body spec to
+/// twin. `None` when the request names none.
+fn cased_field_index(
+    config: &NodeConfig,
+    phrase_index: Option<&crate::phrases::PhraseIndex>,
+    doc: &AddDocumentsRequest,
+) -> Result<Option<usize>, Status> {
+    if doc.cased_field.is_empty() {
+        return Ok(None);
+    }
+    let name = doc.cased_field.as_str();
+    if name == "body" {
+        return Err(Status::invalid_argument(
+            "cased_field must name a field other than \"body\": the body is the folded identity",
+        ));
+    }
+    if phrase_index.is_some_and(|phrases| name == phrases.phrase_field()) {
+        return Err(Status::invalid_argument(format!(
+            "cased_field {name:?} is the configured phrase glossary field; it is derived, not \
+             cased"
+        )));
+    }
+    if let Some(source) = config
+        .bigram_fields
+        .iter()
+        .find(|source| crate::proximity::bigram_field_name(source) == name)
+    {
+        return Err(Status::invalid_argument(format!(
+            "cased_field {name:?} is the bigram column derived from {source:?}; it is derived, \
+             not cased"
+        )));
+    }
+    let Some(fi) = config.bm25_fields.iter().position(|n| n == name) else {
+        return Err(Status::invalid_argument(format!(
+            "unknown cased_field {name:?}; this shard indexes {:?}",
+            config.bm25_fields
+        )));
+    };
+    crate::analyzer::validate_dual_cased_spec(doc.analysis.as_ref())?;
+    Ok(Some(fi))
 }
 
 /// Whether an ingest asked for any quality column at all. An empty
@@ -6013,6 +6083,7 @@ fn session_layers(
         // the document, because the document's own record is filled
         // from that configuration only after analysis is requested.
         sentences: !sentence_fields.is_empty(),
+        dual_cased: !doc.cased_field.is_empty(),
     }
 }
 
@@ -6127,6 +6198,9 @@ impl NodeServiceImpl {
         streams: &mut FieldStreams,
         route: &mut std::collections::HashMap<u64, (u64, usize)>,
     ) -> Result<Vec<(usize, Option<crate::postings::AnalyzedField>)>, Status> {
+        // A cased field is validated here, before the body is submitted,
+        // so a misnamed one is refused without analyzing anything.
+        cased_field_index(&self.config, self.phrase_index.as_deref(), doc)?;
         if doc.fields.is_empty() {
             return Ok(Vec::new());
         }
@@ -6165,6 +6239,13 @@ impl NodeServiceImpl {
             if seen.contains(&field.field.as_str()) {
                 return Err(Status::invalid_argument(format!(
                     "field {:?} repeats in one document",
+                    field.field
+                )));
+            }
+            if !doc.cased_field.is_empty() && field.field == doc.cased_field {
+                return Err(Status::invalid_argument(format!(
+                    "field {:?} is the body's cased identity (cased_field), produced from the \
+                     body's analysis; do not supply it as a DocumentField",
                     field.field
                 )));
             }
@@ -6887,6 +6968,21 @@ impl NodeServiceImpl {
             shard
                 .set_analysis_fingerprint(0, body)
                 .map_err(Status::failed_precondition)?;
+            // The cased field is fingerprinted as the twin of the body's
+            // spec: what the same pass computed for it.
+            if let Some(ci) = cased_field_index(&self.config, self.phrase_index.as_deref(), &doc)? {
+                let spec = doc
+                    .analysis
+                    .as_ref()
+                    .expect("cased_field_index requires an explicit body spec");
+                let twin = crate::analyzer::cased_twin_spec(spec);
+                shard
+                    .set_analysis_fingerprint(
+                        ci,
+                        crate::analyzer::analysis_fingerprint(Some(&twin)),
+                    )
+                    .map_err(Status::failed_precondition)?;
+            }
             for field in &doc.fields {
                 let Some(fi) = self
                     .config
@@ -7516,6 +7612,7 @@ impl NodeServiceImpl {
         let mut spec = first.analysis.clone();
         let mut quality = first.quality.clone();
         let mut geography = first.geography.clone();
+        let mut cased_field = first.cased_field.clone();
         let mut submit = Some(session.submitter());
         // The body session covers the BODY only; extra fields ride their
         // own per-spec sessions, and a document applies once its body and
@@ -7593,7 +7690,10 @@ impl NodeServiceImpl {
                     // The quality layers are requested in the session's
                     // options message, so a change to them reopens the
                     // session for the same reason a spec change does.
-                    if doc.analysis != spec || doc.quality != quality || doc.geography != geography
+                    if doc.analysis != spec
+                        || doc.quality != quality
+                        || doc.geography != geography
+                        || doc.cased_field != cased_field
                     {
                         // A mid-stream BODY spec change (rare): collect
                         // what the current session still owes so nothing
@@ -7634,6 +7734,7 @@ impl NodeServiceImpl {
                         spec = doc.analysis.clone();
                         quality = doc.quality.clone();
                         geography = doc.geography.clone();
+                        cased_field = doc.cased_field.clone();
                         submit = Some(session.submitter());
                     }
                     submit
@@ -7689,7 +7790,8 @@ impl NodeServiceImpl {
             }
             let analyzed = results.remove(next_apply).expect("readiness just checked");
             let held = pending.remove(next_apply).expect("readiness just checked");
-            let analyzed = join_fields(analyzed, held.extras)?;
+            let cased = cased_field_index(&self.config, self.phrase_index.as_deref(), &held.doc)?;
+            let analyzed = join_fields(analyzed, held.extras, cased)?;
             self.apply_analyzed_document(
                 held.doc,
                 analyzed,
