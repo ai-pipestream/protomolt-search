@@ -1388,6 +1388,48 @@ pub struct RequestFilters {
     pub tree: Option<crate::pb::FilterExpr>,
 }
 
+/// The provider-mismatch line of a cluster health report: empty when
+/// every reachable, configured shard scores under one backend kind and
+/// scoring fingerprint, else every distinct pair with the shards that
+/// serve it.
+fn provider_mismatch_of(targets: &[ShardHealth]) -> String {
+    let mut seen: Vec<((String, String), Vec<String>)> = Vec::new();
+    for target in targets {
+        let Some(health) = &target.health else {
+            continue;
+        };
+        if health.vector_backend.is_empty() {
+            continue;
+        }
+        let key = (
+            health.vector_backend.clone(),
+            health.scoring_fingerprint.clone(),
+        );
+        let who = format!("shard {} ({})", target.shard, target.addr);
+        match seen.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, shards)) => shards.push(who),
+            None => seen.push((key, vec![who])),
+        }
+    }
+    if seen.len() <= 1 {
+        return String::new();
+    }
+    seen.iter()
+        .map(|((kind, fingerprint), shards)| format!("{kind}/{fingerprint}: {}", shards.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// One provider identity the shard fleet agrees on
+/// (`CoordinatorServiceImpl::fleet_vector_identity`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FleetVectorIdentity {
+    pub provider: String,
+    pub scoring_fingerprint: String,
+    pub dimensions: u32,
+    pub rows: u64,
+}
+
 /// The request side of a dense execution policy key
 /// (`docs/dense-execution-policy.md`): the requested `k` as sent (0 is
 /// refused by the policy, not defaulted), the candidate depth the
@@ -1609,6 +1651,19 @@ impl CoordinatorServiceImpl {
     /// True only for coordinators that may create network transports.
     pub fn allows_network(&self) -> bool {
         self.allow_network
+    }
+
+    /// Whether dense search runs on a clustered TurboVec backend rather
+    /// than the shard fleet.
+    fn has_clustered_vectors(&self) -> bool {
+        #[cfg(feature = "net")]
+        {
+            self.clustered_vectors.is_some()
+        }
+        #[cfg(not(feature = "net"))]
+        {
+            false
+        }
     }
 
     pub fn max_k(&self) -> u32 {
@@ -1967,6 +2022,84 @@ impl CoordinatorServiceImpl {
     ) -> Self {
         self.dense_execution_policy = Some(Arc::new(policy));
         self
+    }
+
+    /// One provider identity across the shard fleet, or a refusal that
+    /// names the mismatch (`docs/mmap-vectors.md`): every reachable shard
+    /// must advertise the same backend kind, scoring fingerprint, and
+    /// dimension before the coordinator scores anything across them.
+    /// With `require_configured`, a shard without a vector backend is a
+    /// refusal too; without it (ingest, health), unconfigured shards are
+    /// skipped and an all-unconfigured fleet is an empty identity.
+    pub(crate) async fn fleet_vector_identity(
+        &self,
+        require_configured: bool,
+    ) -> Result<FleetVectorIdentity, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, addr) in self.node_addrs.iter().enumerate() {
+            let mut client = self.node_client(addr)?;
+            let addr = addr.clone();
+            tasks.push(tokio::spawn(async move {
+                client
+                    .get_vector_backend(crate::pb::GetVectorBackendRequest {})
+                    .await
+                    .map(|response| (shard, addr, response.into_inner()))
+            }));
+        }
+        let mut identity: Option<FleetVectorIdentity> = None;
+        let mut first: Option<(usize, String)> = None;
+        for task in tasks {
+            let (shard, addr, backend) = task.await.map_err(|error| {
+                Status::internal(format!("provider preflight failed: {error}"))
+            })??;
+            let Some(descriptor) = backend.descriptor else {
+                if require_configured {
+                    return Err(Status::failed_precondition(format!(
+                        "provider preflight: shard {shard} ({addr}) has no vector backend \
+                         configured"
+                    )));
+                }
+                continue;
+            };
+            let seen = FleetVectorIdentity {
+                provider: descriptor.backend_kind.clone(),
+                scoring_fingerprint: descriptor.scoring_fingerprint.clone(),
+                dimensions: descriptor.dim,
+                rows: backend.num_vectors,
+            };
+            match &mut identity {
+                None => {
+                    identity = Some(seen);
+                    first = Some((shard, addr));
+                }
+                Some(held) => {
+                    let (first_shard, first_addr) =
+                        first.as_ref().expect("identity and first are set together");
+                    if held.provider != seen.provider
+                        || held.scoring_fingerprint != seen.scoring_fingerprint
+                        || held.dimensions != seen.dimensions
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "provider preflight: shard {first_shard} ({first_addr}) scores \
+                             under {}/{} dim {}, but shard {shard} ({addr}) under {}/{} dim {}; \
+                             a fleet scores in one space, so nothing is searched until every \
+                             shard serves the same provider state",
+                            held.provider,
+                            held.scoring_fingerprint,
+                            held.dimensions,
+                            seen.provider,
+                            seen.scoring_fingerprint,
+                            seen.dimensions
+                        )));
+                    }
+                    held.rows = held
+                        .rows
+                        .checked_add(seen.rows)
+                        .ok_or_else(|| Status::internal("provider preflight row count overflow"))?;
+                }
+            }
+        }
+        Ok(identity.unwrap_or_default())
     }
 
     /// The clustered backend's live identity, when one is configured.
@@ -9064,6 +9197,9 @@ impl CoordinatorServiceImpl {
             ));
         }
         self.require_topology_generation(bind.required_topology_generation)?;
+        // Ingest lands rows on shards that must score alike: a fleet that
+        // already scores in two spaces is refused before a row moves.
+        self.fleet_vector_identity(false).await?;
         let mapped_bind = bind
             .bind
             .ok_or_else(|| Status::invalid_argument("routed mapped bind is missing bind"))?;
@@ -9181,6 +9317,12 @@ impl SearchService for CoordinatorServiceImpl {
         // CEL text compiles ONCE, here, into the predicate IR the
         // shards execute; no shard ever sees CEL text.
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+        // The fleet scores in one space or not at all: mixed provider
+        // kinds or fingerprints are refused before any shard is asked
+        // (docs/mmap-vectors.md).
+        if !self.has_clustered_vectors() {
+            self.fleet_vector_identity(true).await?;
+        }
 
         #[cfg(feature = "net")]
         if self.clustered_vectors.is_some() {
@@ -10196,6 +10338,7 @@ impl SearchService for CoordinatorServiceImpl {
                 }
             }
         }
+        let provider_mismatch = provider_mismatch_of(&targets);
         #[cfg(feature = "net")]
         let clustered_vector = if let Some(backend) = &self.clustered_vectors {
             Some(match backend.health().await {
@@ -10227,6 +10370,7 @@ impl SearchService for CoordinatorServiceImpl {
             collections: Vec::new(),
             targets,
             clustered_vector,
+            provider_mismatch,
         }))
     }
 

@@ -110,6 +110,33 @@ impl SegmentedProvider {
         Ok((parts, next))
     }
 
+    /// Wrap a catalog snapshot around an image that already holds rows:
+    /// the index a shard created before its first document (a
+    /// calibration, or vectors ingested first). Those rows are the tail
+    /// of a catalog that has none yet; a catalog with sealed rows cannot
+    /// adopt such an image, because its rows would overlap the sealed
+    /// ones, and refuses by name.
+    pub fn adopt(set: Arc<OpenedSegmentSet>, tail: VectorIndex) -> Result<Self, VectorError> {
+        if tail.is_empty() {
+            return Self::open(set, tail);
+        }
+        let (parts, next) = Self::parts_of(&set, &tail)?;
+        if next != 0 {
+            return Err(VectorError::new(format!(
+                "the segment catalog already covers {next} rows; a vector index with {} rows \
+                 created outside the segmented layout cannot become its tail",
+                tail.len()
+            )));
+        }
+        Ok(SegmentedProvider {
+            set,
+            parts,
+            frozen: None,
+            tail,
+            tail_base: 0,
+        })
+    }
+
     pub fn tail(&self) -> &VectorIndex {
         &self.tail
     }

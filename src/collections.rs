@@ -428,6 +428,7 @@ macro_rules! search_service_over_collections {
                         targets: Vec::new(),
                         clustered_vector: None,
                         collections,
+                        provider_mismatch: String::new(),
                     }));
                 }
                 let (name, target) = self.members.resolve(&requested)?;

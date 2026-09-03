@@ -55,6 +55,13 @@ by name (a segment's artifacts cover the same rows); mapped ingest keeps
 them aligned. A documents-only shard seals documents-only segments (no
 vector artifact); the catalog and its collectors accept them.
 
+A sealed segment's vector image is served from its file through a memory
+map by default (`docs/mmap-vectors.md`; `--vector-mmap=false` loads it into
+memory instead); the tail image is owned, because it takes writes. A vector
+index the shard created before its first document — a calibration, or
+vectors ingested first — becomes the segmented provider's tail when the
+catalog appears, so its rows seal with the documents.
+
 The node's whole-shard live bitmap and exact-vector sidecar remain the
 serving copies; each sealed segment carries its own slice of both for
 compaction, split, and merge. Deletes after sealing go to the node bitmap

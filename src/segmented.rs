@@ -208,7 +208,16 @@ impl SegmentedShard {
     /// column tables every sealed segment has; a mismatch refuses by
     /// name, because a union over different tables has no meaning.
     pub fn open(root: impl Into<PathBuf>, tail: Bm25Store) -> Result<Self, String> {
-        let catalog = SegmentCatalog::open(root)?;
+        Self::open_with(root, tail, crate::segments::VectorLoad::default())
+    }
+
+    /// [`Self::open`] with the way sealed vector images are served.
+    pub fn open_with(
+        root: impl Into<PathBuf>,
+        tail: Bm25Store,
+        load: crate::segments::VectorLoad,
+    ) -> Result<Self, String> {
+        let catalog = SegmentCatalog::open_with(root, load)?;
         Self::from_catalog(catalog, tail)
     }
 
@@ -417,14 +426,22 @@ impl SegmentedShard {
     /// frozen store is returned shared so the seal can write it with no
     /// lock on the shard. Refuses while a frozen part is still waiting
     /// on its publication.
-    pub fn freeze_tail(&mut self, fresh: Bm25Store) -> Result<Arc<Bm25Store>, String> {
+    /// `rows` is the positional span the segment covers: the tail's
+    /// documents, or more when the vector side has rows the document
+    /// side does not (a vectors-only shard), never fewer.
+    pub fn freeze_tail(&mut self, fresh: Bm25Store, rows: u32) -> Result<Arc<Bm25Store>, String> {
         if self.frozen.is_some() {
             return Err("a seal is already in flight on this shard".to_string());
         }
         if fresh.next_doc_id() != 0 {
             return Err("a fresh tail must start empty".to_string());
         }
-        let rows = self.tail.next_doc_id();
+        if rows < self.tail.next_doc_id() {
+            return Err(format!(
+                "a seal of {rows} rows cannot cover the tail's {} documents",
+                self.tail.next_doc_id()
+            ));
+        }
         let store = Arc::new(std::mem::replace(&mut self.tail, fresh));
         self.frozen = Some(Frozen {
             base: self.tail_base,

@@ -257,6 +257,10 @@ pub trait VectorProvider: Send + Sync {
     fn as_segmented(&self) -> Option<&crate::segmented_vectors::SegmentedProvider> {
         None
     }
+    /// Whether the provider serves from a mapped file; owned by default.
+    fn is_mapped(&self) -> bool {
+        false
+    }
     fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {
         None
     }
@@ -348,6 +352,25 @@ impl VectorIndex {
                 "cannot load unavailable vector backend {other:?}"
             ))),
         }
+    }
+
+    /// Serve one backend image from its file through a memory map
+    /// (`docs/mmap-vectors.md`): the image stays on its pages and the
+    /// search cache is assembled chunk by chunk as scans touch them.
+    /// Scores are bit for bit those of [`Self::load`]; the index is
+    /// read-only, which is what a sealed segment is.
+    pub fn load_mapped(backend_kind: &str, path: &Path) -> Result<Self, VectorError> {
+        match backend_kind {
+            EMBEDDED_TURBOVEC => embedded_turbovec::load_mapped(path),
+            other => Err(VectorError::new(format!(
+                "cannot load unavailable vector backend {other:?}"
+            ))),
+        }
+    }
+
+    /// Whether this index serves from a mapped file ([`Self::load_mapped`]).
+    pub fn is_mapped(&self) -> bool {
+        self.engine.is_mapped()
     }
 
     pub fn descriptor(&self) -> VectorBackendDescriptor {
@@ -566,6 +589,12 @@ mod embedded_turbovec {
             .map_err(|e| VectorError::new(format!("load {}: {e}", path.display())))
     }
 
+    pub(super) fn load_mapped(path: &Path) -> Result<VectorIndex, VectorError> {
+        TurboQuantIndex::load_mapped(path)
+            .map(wrap)
+            .map_err(|e| VectorError::new(format!("map {}: {e}", path.display())))
+    }
+
     fn wrap(index: TurboQuantIndex) -> VectorIndex {
         VectorIndex {
             engine: Box::new(EmbeddedTurboVec { index }),
@@ -613,6 +642,10 @@ mod embedded_turbovec {
     }
 
     impl VectorProvider for EmbeddedTurboVec {
+        fn is_mapped(&self) -> bool {
+            self.index.is_mapped()
+        }
+
         fn descriptor(&self) -> VectorBackendDescriptor {
             let config = self
                 .backend_config()

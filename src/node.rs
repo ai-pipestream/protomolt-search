@@ -246,6 +246,10 @@ pub struct NodeConfig {
     /// An existing shard keeps the layout its files have; nothing
     /// converts on open.
     pub layout: Layout,
+    /// Serve sealed segments' vector images from their files through
+    /// memory maps (`docs/mmap-vectors.md`); off loads them into memory.
+    /// The tail and single-image shards are owned either way.
+    pub vector_mmap: bool,
     /// On a segmented shard, seal the tail into a segment once it holds
     /// this many documents, so a bulk ingest stays bounded in heap
     /// without waiting for a flush. 0 seals only on flush.
@@ -286,6 +290,17 @@ pub struct NodeConfig {
     pub rerank_parallel: usize,
 }
 
+impl NodeConfig {
+    /// How sealed vector images are served under this configuration.
+    pub fn vector_load(&self) -> crate::segments::VectorLoad {
+        if self.vector_mmap {
+            crate::segments::VectorLoad::Mapped
+        } else {
+            crate::segments::VectorLoad::Heap
+        }
+    }
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -312,6 +327,7 @@ impl Default for NodeConfig {
             collection: String::new(),
             udp_hmac_key: None,
             layout: Layout::Segments,
+            vector_mmap: true,
             seal_tail_docs: 500_000,
             bigram_fields: Vec::new(),
             wal: false,
@@ -3481,7 +3497,7 @@ impl NodeServiceImpl {
                 // persisted shard under the default. Never a conversion —
                 // a single-image file above took the other branch.
                 let tail = heap_store(&config)?;
-                let shard = SegmentedShard::open(&root, tail)
+                let shard = SegmentedShard::open_with(&root, tail, config.vector_load())
                     .map_err(|error| format!("segment catalog {}: {error}", root.display()))?;
                 let set = shard.snapshot().clone();
                 if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
@@ -3717,7 +3733,7 @@ impl NodeServiceImpl {
             Some(p) if self.config.layout == Layout::Segments && generation.is_none() => {
                 let root = segments_root(p);
                 let tail = heap_store(&self.config).map_err(Status::failed_precondition)?;
-                SegmentedShard::open(&root, tail)
+                SegmentedShard::open_with(&root, tail, self.config.vector_load())
                     .map(Bm25Shard::Segmented)
                     .map_err(|e| {
                         Status::internal(format!("segment catalog {}: {e}", root.display()))
@@ -3937,6 +3953,16 @@ impl NodeServiceImpl {
     fn fresh_index(&self, bm25: Option<&Bm25Shard>, dim: usize) -> Result<VectorIndex, Status> {
         let created = VectorIndex::create(&self.config.vector_backend, dim, self.config.bit_width)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        Self::adopt_layout(bm25, created)
+    }
+
+    /// A new, empty vector index in the shard's layout: the tail image of
+    /// a segmented provider over the catalog's sealed images when the
+    /// documents are segmented, else the index as created. Every path
+    /// that creates the shard's first index goes through here, so a
+    /// calibrated-then-ingested segmented shard seals its vectors like
+    /// an ingested-then-calibrated one.
+    fn adopt_layout(bm25: Option<&Bm25Shard>, created: VectorIndex) -> Result<VectorIndex, Status> {
         match bm25 {
             Some(Bm25Shard::Segmented(g)) => {
                 let provider = SegmentedProvider::open(g.snapshot().clone(), created)
@@ -4020,8 +4046,11 @@ impl NodeServiceImpl {
                 }
                 let fresh = heap_store(&self.config).map_err(Status::failed_precondition)?;
                 shard.tail_mut().set_binding(mapped_binding.clone());
-                let store = shard.freeze_tail(fresh).map_err(Status::internal)?;
-                (base, docs.max(vectors), store)
+                let rows = docs.max(vectors);
+                let store = shard
+                    .freeze_tail(fresh, rows as u32)
+                    .map_err(Status::internal)?;
+                (base, rows, store)
             }
         };
         let image = match provider {
@@ -4493,6 +4522,46 @@ impl NodeServiceImpl {
         let loaded = VectorIndex::load(&self.config.vector_backend, &tv_tmp).map_err(|e| {
             Status::invalid_argument(format!("snapshot is not a valid vector backend image: {e}"))
         })?;
+        // A snapshot installs only from the same provider state: kind and
+        // scoring fingerprint (calibration included), or the fleet would
+        // score one shard in another space (docs/mmap-vectors.md).
+        {
+            let incoming = loaded.descriptor();
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let serving_kind = guard
+                .index
+                .as_ref()
+                .map(|index| index.descriptor().backend_kind)
+                .or_else(|| {
+                    guard
+                        .wal
+                        .as_ref()
+                        .map(|wal| wal.manifest().vector_backend.clone())
+                        .filter(|kind| !kind.is_empty())
+                });
+            if let Some(kind) = serving_kind {
+                if kind != incoming.backend_kind {
+                    return Err(Status::failed_precondition(format!(
+                        "snapshot image is a {:?} image but this shard serves {kind:?}; a \
+                         snapshot installs only from the same provider",
+                        incoming.backend_kind
+                    )));
+                }
+            }
+            if let Some(serving) = guard.index.as_ref().map(|index| index.descriptor()) {
+                if serving.scoring_fingerprint != incoming.scoring_fingerprint {
+                    return Err(Status::failed_precondition(format!(
+                        "snapshot image scores under {}/{} but this shard serves {}/{}; a \
+                         snapshot installs only from the same provider state (calibration \
+                         included), or the fleet would score in two spaces",
+                        incoming.backend_kind,
+                        incoming.scoring_fingerprint,
+                        serving.backend_kind,
+                        serving.scoring_fingerprint
+                    )));
+                }
+            }
+        }
         if with_exact_vectors {
             let exact = ExactVectorStore::open(&exact_tmp).map_err(|e| {
                 Status::invalid_argument(format!(
@@ -4683,7 +4752,9 @@ impl NodeServiceImpl {
                 ))
             }
             None => {
-                guard.index = Some(build()?);
+                let built = build()?;
+                let adopted = Self::adopt_layout(guard.bm25.as_ref(), built)?;
+                guard.index = Some(adopted);
                 Ok(false)
             }
         };
@@ -6864,6 +6935,26 @@ impl NodeServiceImpl {
         if guard.bm25.is_none() {
             let builder = self.new_builder(guard.generation.as_ref())?;
             guard.bm25 = Some(builder);
+            // A vector index created before the first document (a
+            // calibration, or vectors ingested first) becomes the
+            // segmented provider's tail now that the catalog exists, so
+            // its rows seal with the documents (docs/immutable-segments.md).
+            let snapshot = match guard.bm25.as_ref() {
+                Some(Bm25Shard::Segmented(g)) => Some(g.snapshot().clone()),
+                _ => None,
+            };
+            if let Some(set) = snapshot {
+                if guard
+                    .index
+                    .as_ref()
+                    .is_some_and(|index| index.as_segmented().is_none())
+                {
+                    let plain = guard.index.take().expect("checked above");
+                    let provider = SegmentedProvider::adopt(set, plain)
+                        .map_err(|e| Status::failed_precondition(format!("{e}")))?;
+                    guard.index = Some(VectorIndex::from_provider(provider));
+                }
+            }
         }
         let doc_id = vector_tip.max(
             guard

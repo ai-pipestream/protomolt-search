@@ -19,7 +19,7 @@ use tonic::transport::Error as TransportError;
 
 pub use harness::{
     embedded_backend_request, fit_calibration, start_coordinator, start_empty_node, start_node,
-    unit_vectors,
+    start_opened_node, unit_vectors,
 };
 
 pub const DIM: usize = 128;

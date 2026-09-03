@@ -88,6 +88,9 @@ fn node_args(port: u16, index: &Path, slot_offset: u64) -> Vec<String> {
         format!("--node-listen=127.0.0.1:{port}"),
         format!("--index={}", index.display()),
         format!("--slot-offset={slot_offset}"),
+        // These tests read the single `.tv` image the shard writes; the
+        // default segment layout seals into a catalog instead.
+        "--layout=single-image".into(),
         "--chunk-blocks=8".into(),
     ]
 }

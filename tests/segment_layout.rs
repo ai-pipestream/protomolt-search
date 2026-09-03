@@ -464,7 +464,9 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
         }
         // Freeze the tail as the node's seal does, and read through the
         // frozen part before its segment exists: the same rows answer.
-        let frozen = union.freeze_tail(tail()).unwrap();
+        let frozen = union
+            .freeze_tail(tail(), union.tail().next_doc_id())
+            .unwrap();
         let (base, rows, _) = union.frozen().unwrap();
         assert_eq!(u64::from(base) + u64::from(rows), u64::from(next));
         assert_eq!(union.df("court"), whole.df("court"), "frozen part served");
@@ -590,4 +592,198 @@ async fn in_memory_shards_stay_in_heap_whatever_the_layout_says() {
     let c = coordinator(&addr);
     assert_eq!(bm25(&c, probes()[0].clone()).await.hits.len(), 3);
     handle.abort();
+}
+
+/// A sealed segment's vector image serves mapped (the default) with the
+/// hits and scores of the same shard served from memory, bit for bit,
+/// through Search (docs/mmap-vectors.md).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_segments_serve_mapped_and_equal_the_heap_load_bit_for_bit() {
+    use pipestream_search::pb::{AddVectorsRequest, SearchRequest, SetCalibrationRequest};
+    use pipestream_search::segments::VectorLoad;
+
+    const DIM: usize = 64;
+    let dir = tempdir("mapped");
+    let path = dir.join("mapped.tv");
+    let docs: Vec<(&str, &str)> = BATCHES.iter().flat_map(|b| b.iter().copied()).collect();
+    let corpus = pipestream_search::harness::unit_vectors(docs.len(), DIM, 0x3A9E_0001);
+    let (shift, scale) = pipestream_search::harness::fit_calibration(DIM, 4, &corpus);
+    let build = |mmap: bool| NodeConfig {
+        vector_mmap: mmap,
+        ..config(Some(path.clone()), Layout::Segments)
+    };
+    let (addr, handle) = start_empty_node(build(true)).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client
+        .set_calibration(SetCalibrationRequest {
+            dim: DIM as u32,
+            bit_width: 4,
+            shift: shift.clone(),
+            scale: scale.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(ingest(&addr, &docs).await, docs.len() as u64);
+    client
+        .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            vectors: corpus.clone(),
+            dim: DIM as u32,
+        }]))
+        .await
+        .unwrap();
+    assert!(flush(&addr).await);
+    handle.abort();
+
+    let root = segments_root(&path);
+    let mapped_set = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
+    assert_eq!(mapped_set.len(), 1);
+    assert!(mapped_set.vector(0).unwrap().is_mapped());
+    let heap_set = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
+    assert!(!heap_set.vector(0).unwrap().is_mapped());
+
+    // The same shard reopened two ways answers Search identically.
+    let (mapped_addr, mapped_node) = common::start_opened_node(build(true)).await;
+    let (heap_addr, heap_node) = common::start_opened_node(build(false)).await;
+    for q in 0..docs.len() {
+        let request = SearchRequest {
+            k: 5,
+            vector: corpus[q * DIM..(q + 1) * DIM].to_vec(),
+            ..Default::default()
+        };
+        let mut answers = Vec::new();
+        for addr in [&mapped_addr, &heap_addr] {
+            let c = coordinator(addr);
+            let hits = SearchService::search(&c, Request::new(request.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .hits;
+            answers.push(
+                hits.iter()
+                    .map(|h| (h.vector_id, h.score.to_bits()))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(answers[0], answers[1], "query {q}");
+        assert_eq!(answers[0].len(), 5);
+    }
+    mapped_node.abort();
+    heap_node.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+fn rss_bytes() -> usize {
+    let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+    let resident_pages: usize = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+    resident_pages * 4096
+}
+
+/// Opening a catalog whose sealed image is large costs the headers when
+/// mapped and the image when loaded; both answer the same top-k.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mapped_sealed_image_opens_without_the_heap_load() {
+    use pipestream_search::exact_vectors::ExactVectorStore;
+    use pipestream_search::live_docs::LiveDocs;
+    use pipestream_search::postings::AnalyzedDoc;
+    use pipestream_search::segments::{SegmentCatalog, SegmentSource, VectorLoad};
+    use pipestream_search::vector::{VectorSearchOptions, EMBEDDED_TURBOVEC};
+
+    const DIM: usize = 256;
+    const ROWS: usize = 80_000;
+    let dir = tempdir("rss");
+    let root = dir.join("catalog");
+    let stage = dir.join("stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    let corpus = pipestream_search::harness::unit_vectors(ROWS, DIM, 0x3A9E_0002);
+    let (shift, scale) = pipestream_search::harness::fit_calibration(DIM, 4, &corpus[..2048 * DIM]);
+    let vector_path = stage.join("vector.index");
+    {
+        let mut index = pipestream_search::harness::seeded_index(DIM, 4, &shift, &scale);
+        index.add(&corpus, DIM).unwrap();
+        index.prepare().unwrap();
+        index.write(&vector_path).unwrap();
+    }
+    let image_bytes = std::fs::metadata(&vector_path).unwrap().len() as usize;
+    assert!(
+        image_bytes > 8 * 1024 * 1024,
+        "image is {image_bytes} bytes"
+    );
+    let exact_path = stage.join("vectors.f32");
+    ExactVectorStore::from_values(DIM, corpus.clone())
+        .unwrap()
+        .write(&exact_path)
+        .unwrap();
+    let bm25_path = stage.join("documents.bm25");
+    {
+        let mut store = Bm25Store::with_fields(&["body"]);
+        for i in 0..ROWS as u32 {
+            store.add_document(
+                i,
+                format!("row {i}"),
+                AnalyzedDoc::body(vec![("row".to_string(), 1, vec![(0, 3)])], 1),
+            );
+        }
+        store.save(&bm25_path).unwrap();
+    }
+    let live_path = stage.join("live-docs.bin");
+    LiveDocs::default().write(&live_path, ROWS as u64).unwrap();
+    let catalog = SegmentCatalog::open(&root).unwrap();
+    catalog
+        .append(SegmentSource {
+            segment_id: "seg-0",
+            generation: 1,
+            base_label: 0,
+            backend_kind: EMBEDDED_TURBOVEC,
+            vector_path: Some(&vector_path),
+            exact_vector_path: Some(&exact_path),
+            bm25_path: &bm25_path,
+            live_docs_path: &live_path,
+        })
+        .unwrap();
+    drop(catalog);
+
+    // Both opens verify every artifact and open the BM25 and exact
+    // stores; the image is the difference between them.
+    let before = rss_bytes();
+    let mapped = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
+    let mapped_growth = rss_bytes().saturating_sub(before);
+    assert!(mapped.vector(0).unwrap().is_mapped());
+    let before = rss_bytes();
+    let heap = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
+    let heap_growth = rss_bytes().saturating_sub(before);
+    assert!(
+        mapped_growth < image_bytes / 2,
+        "mapped open grew RSS by {mapped_growth} bytes for a {image_bytes}-byte image"
+    );
+    assert!(
+        heap_growth > mapped_growth + image_bytes / 2,
+        "a heap load grew RSS by {heap_growth} bytes against {mapped_growth} mapped for a \
+         {image_bytes}-byte image"
+    );
+    let query = &corpus[7 * DIM..8 * DIM];
+    let a = mapped
+        .vector(0)
+        .unwrap()
+        .try_search(query, 10, VectorSearchOptions::new())
+        .unwrap();
+    let b = heap
+        .vector(0)
+        .unwrap()
+        .try_search(query, 10, VectorSearchOptions::new())
+        .unwrap();
+    assert_eq!(a.slots_for_query(0), b.slots_for_query(0));
+    assert_eq!(
+        a.scores_for_query(0)
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>(),
+        b.scores_for_query(0)
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(a.slots_for_query(0)[0], 7);
+    let _ = std::fs::remove_dir_all(&dir);
 }

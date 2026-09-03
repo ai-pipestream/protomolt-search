@@ -54,6 +54,10 @@ point, and the response reports which.
 A cased A/B column costs no second analysis:
 [docs/dual-cased.md](docs/dual-cased.md) — `AddDocumentsRequest.cased_field`
 takes the body's cased identity from the same pass, sidecar or native.
+Sealed segments serve their vector images from disk through memory maps,
+bit for bit the heap scores, and the coordinator refuses a fleet that scores
+in two provider states before any shard is asked:
+[docs/mmap-vectors.md](docs/mmap-vectors.md).
 Block-max pruning, designed for the lexical leg and measured dead on the
 vector leg: [README-block-max.md](README-block-max.md) (overview) and
 [docs/block-max.md](docs/block-max.md) (design doc).

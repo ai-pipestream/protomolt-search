@@ -221,6 +221,26 @@ pub async fn start_empty_node(
 }
 
 /// Start an empty node with the product-owned phrase vocabulary attached.
+/// Reopen a persisted shard through [`NodeServiceImpl::open`] — the
+/// recovery path the serving binary and the embedded runtime take — and
+/// serve it. `start_empty_node` constructs a fresh shard instead.
+pub async fn start_opened_node(
+    config: NodeConfig,
+) -> (String, JoinHandle<Result<(), TransportError>>) {
+    let node = NodeServiceImpl::open(config, None, false).expect("reopen the shard");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    node.spawn_floor_listener(addr);
+    let handle = tokio::spawn(
+        Server::builder()
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW)
+            .add_service(NodeServiceImpl::into_server(node, MAX_MESSAGE_BYTES))
+            .serve_with_incoming(nodelay_incoming(listener)),
+    );
+    (format!("http://{addr}"), handle)
+}
+
 pub async fn start_empty_phrase_node(
     config: NodeConfig,
     phrases: std::sync::Arc<crate::phrases::PhraseIndex>,

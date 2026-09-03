@@ -310,6 +310,14 @@ async fn rejects_mismatched_calibration() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    // The image scores under another provider state (a different
+    // calibration is a different scoring fingerprint); the refusal
+    // names both (docs/mmap-vectors.md).
+    assert!(
+        err.message().contains("scores under") && err.message().contains("same provider state"),
+        "{}",
+        err.message()
+    );
 
     // Nothing installed: shard still empty, no generation, no staging dir.
     let cal = client

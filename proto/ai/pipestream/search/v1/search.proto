@@ -773,6 +773,11 @@ message ClusterHealthResponse {
   // one entry per collection, each with its own targets and counts,
   // and the top-level `targets` empty (docs/collections.md).
   repeated CollectionHealth collections = 3;
+  // Non-empty when the reachable shards do not score in one space: it
+  // names each provider kind and scoring fingerprint seen and the shards
+  // that serve it. A fleet in this state refuses Search/Query and routed
+  // ingest by name until it is repaired (docs/mmap-vectors.md).
+  string provider_mismatch = 4;
 }
 
 // One collection's health, as ClusterHealth would report it alone.

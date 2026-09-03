@@ -180,6 +180,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 collection: shard.collection.clone(),
                 udp_hmac_key: cfg.udp_hmac_key.clone(),
                 layout: cfg.layout,
+                vector_mmap: cfg.vector_mmap,
                 seal_tail_docs: cfg.seal_tail_docs,
                 vector_backend: shard.vector_backend.clone(),
                 slot_offset: shard.slot_offset,

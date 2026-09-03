@@ -158,8 +158,21 @@ impl crate::scorefn::NumericRead for NoColumns {
     }
 }
 
+/// How a sealed segment's vector image is served: mapped from its file
+/// (the default; `docs/mmap-vectors.md`), or loaded into memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VectorLoad {
+    #[default]
+    Mapped,
+    Heap,
+}
+
 impl OpenedSegmentSet {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::open_with(root, VectorLoad::default())
+    }
+
+    pub fn open_with(root: impl Into<PathBuf>, load: VectorLoad) -> Result<Self, String> {
         let root = root.into();
         let path = root.join(SET_FILE);
         let manifest = if path.exists() {
@@ -170,10 +183,14 @@ impl OpenedSegmentSet {
         } else {
             SegmentSetManifest::default()
         };
-        Self::open_manifest(root, manifest)
+        Self::open_manifest(root, manifest, load)
     }
 
-    fn open_manifest(root: PathBuf, manifest: SegmentSetManifest) -> Result<Self, String> {
+    fn open_manifest(
+        root: PathBuf,
+        manifest: SegmentSetManifest,
+        load: VectorLoad,
+    ) -> Result<Self, String> {
         validate_manifest(&manifest)?;
         let mut segments = Vec::with_capacity(manifest.segments.len());
         let mut scoring_fingerprint: Option<&str> = None;
@@ -193,10 +210,11 @@ impl OpenedSegmentSet {
             verify_artifact(&directory, &metadata.bm25)?;
             verify_artifact(&directory, &metadata.live_docs)?;
             let vector = if has_vectors {
-                let mut vector = VectorIndex::load(
-                    &metadata.backend_kind,
-                    &directory.join(&metadata.vector.file),
-                )
+                let image = directory.join(&metadata.vector.file);
+                let mut vector = match load {
+                    VectorLoad::Mapped => VectorIndex::load_mapped(&metadata.backend_kind, &image),
+                    VectorLoad::Heap => VectorIndex::load(&metadata.backend_kind, &image),
+                }
                 .map_err(|error| {
                     format!("open vector segment {:?}: {error}", metadata.segment_id)
                 })?;
@@ -535,18 +553,25 @@ pub struct SegmentCatalog {
     root: PathBuf,
     current: Arc<RwLock<Arc<OpenedSegmentSet>>>,
     update: Arc<Mutex<()>>,
+    /// How every snapshot this catalog publishes serves vector images.
+    load: VectorLoad,
 }
 
 impl SegmentCatalog {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::open_with(root, VectorLoad::default())
+    }
+
+    pub fn open_with(root: impl Into<PathBuf>, load: VectorLoad) -> Result<Self, String> {
         let root = root.into();
         std::fs::create_dir_all(root.join("segments"))
             .map_err(|error| format!("mkdir segment root {}: {error}", root.display()))?;
-        let current = OpenedSegmentSet::open(root.clone())?;
+        let current = OpenedSegmentSet::open_with(root.clone(), load)?;
         Ok(Self {
             root,
             current: Arc::new(RwLock::new(Arc::new(current))),
             update: Arc::new(Mutex::new(())),
+            load,
         })
     }
 
@@ -790,6 +815,7 @@ impl SegmentCatalog {
         let opened = Arc::new(OpenedSegmentSet::open_manifest(
             self.root.clone(),
             manifest.clone(),
+            self.load,
         )?);
         write_json_atomic(&self.root.join(SET_FILE), &manifest)?;
         *self

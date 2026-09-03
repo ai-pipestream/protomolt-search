@@ -83,8 +83,11 @@ async fn start_wal_node(
     PathBuf,
     JoinHandle<Result<(), TransportError>>,
 ) {
+    // These fixtures ingest documents and vectors at different counts,
+    // which the segment layout refuses to seal by name; they exercise
+    // the WAL, so the single-image layout serves them.
     start_wal_node_with_layout(
-        pipestream_search::node::Layout::default(),
+        pipestream_search::node::Layout::SingleImage,
         dir,
         name,
         slot_offset,

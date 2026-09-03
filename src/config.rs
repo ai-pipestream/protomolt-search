@@ -378,6 +378,9 @@ pub struct Config {
     /// Documents a segmented shard's tail may hold before it seals a
     /// segment on its own (`--seal-tail-docs`); 0 seals on flush only.
     pub seal_tail_docs: u32,
+    /// Serve sealed segments' vector images through memory maps
+    /// (`--vector-mmap=true|false`, docs/mmap-vectors.md); on by default.
+    pub vector_mmap: bool,
     /// Documents per vocabulary window before automatic rollover (only
     /// relevant to shards with `vocab` enabled).
     pub vocab_window_docs: u64,
@@ -437,6 +440,7 @@ struct FileConfig {
     udp_hmac_key: Option<String>,
     layout: Option<String>,
     seal_tail_docs: Option<u32>,
+    vector_mmap: Option<bool>,
     role: Option<String>,
     node_listen: Option<String>,
     coord_listen: Option<String>,
@@ -1910,6 +1914,17 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     )
     .map(|path| crate::security::UdpKey::load(&path))
     .transpose()?;
+    let vector_mmap =
+        match opt(args, "vector-mmap", "PIPESTREAM_SEARCH_VECTOR_MMAP", None).as_deref() {
+            None => file.vector_mmap.unwrap_or(true),
+            Some("true") => true,
+            Some("false") => false,
+            Some(other) => {
+                return Err(format!(
+                    "--vector-mmap={other:?} is not a boolean; use true (the default) or false"
+                ))
+            }
+        };
     let layout = match opt(
         args,
         "layout",
@@ -2037,6 +2052,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         udp_hmac_key,
         layout,
         seal_tail_docs,
+        vector_mmap,
         vocab_window_docs,
         vocab_top_k,
     })

@@ -139,3 +139,128 @@ async fn first_batch_completes_generic_wal_provider_metadata() {
     handle.abort();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Two shards calibrated two ways score in two spaces: Search refuses
+/// before a shard is asked, ClusterHealth names the split, and routed
+/// ingest takes no rows (docs/mmap-vectors.md). The same shards
+/// calibrated one way serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fleet_calibrated_two_ways_is_refused_before_a_shard_is_asked() {
+    use pipestream_search::pb::search_service_server::SearchService;
+    use pipestream_search::pb::{
+        ClusterHealthRequest, RoutedMappedBind, SearchRequest, SetCalibrationRequest,
+    };
+    use tonic::Request;
+
+    let (addr_a, handle_a) = start_empty_node(Default::default()).await;
+    let (addr_b, handle_b) = start_empty_node(Default::default()).await;
+    let (addr_c, handle_c) = start_empty_node(Default::default()).await;
+    let corpus = unit_vectors(96, DIM, 0xBACC_E010);
+    let (shift_a, scale_a) = fit_calibration(DIM, 4, &unit_vectors(512, DIM, 0xBACC_E011));
+    let (shift_c, scale_c) = fit_calibration(DIM, 4, &unit_vectors(512, DIM, 0xBACC_E012));
+    assert_ne!(
+        shift_a, shift_c,
+        "the samples must fit different calibrations"
+    );
+    // A and B are calibrated alike; C under the other pair.
+    for (addr, shift, scale, from) in [
+        (&addr_a, &shift_a, &scale_a, 0usize),
+        (&addr_b, &shift_a, &scale_a, 32usize),
+        (&addr_c, &shift_c, &scale_c, 64usize),
+    ] {
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        client
+            .set_calibration(SetCalibrationRequest {
+                dim: DIM as u32,
+                bit_width: 4,
+                shift: shift.clone(),
+                scale: scale.clone(),
+            })
+            .await
+            .unwrap();
+        client
+            .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                vectors: corpus[from * DIM..(from + 32) * DIM].to_vec(),
+                dim: DIM as u32,
+            }]))
+            .await
+            .unwrap();
+    }
+    let query = SearchRequest {
+        k: 3,
+        vector: corpus[..DIM].to_vec(),
+        ..Default::default()
+    };
+    let health_request = || {
+        Request::new(ClusterHealthRequest {
+            ..Default::default()
+        })
+    };
+
+    // Alike: served, and the health line is empty.
+    let alike = CoordinatorServiceImpl::new(vec![addr_a.clone(), addr_b.clone()])
+        .with_topology_generation(1);
+    let hits = SearchService::search(&alike, Request::new(query.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(hits.len(), 3);
+    let health = SearchService::cluster_health(&alike, health_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        health.provider_mismatch.is_empty(),
+        "{}",
+        health.provider_mismatch
+    );
+
+    // Two ways: refused before a shard is asked, named in health, and no
+    // rows taken.
+    let mixed = CoordinatorServiceImpl::new(vec![addr_a.clone(), addr_c.clone()])
+        .with_topology_generation(1);
+    let error = SearchService::search(&mixed, Request::new(query))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("provider preflight")
+            && error.message().contains("scores")
+            && error.message().contains("shard 0")
+            && error.message().contains("shard 1"),
+        "{}",
+        error.message()
+    );
+    let health = SearchService::cluster_health(&mixed, health_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        health.provider_mismatch.contains("shard 0")
+            && health.provider_mismatch.contains("shard 1")
+            && health.provider_mismatch.contains(EMBEDDED_TURBOVEC),
+        "{}",
+        health.provider_mismatch
+    );
+    let ingest = mixed
+        .routed_ingest_mapped_bound(
+            RoutedMappedBind {
+                collection: String::new(),
+                required_topology_generation: 1,
+                bind: None,
+            },
+            tokio_stream::empty(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(ingest.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        ingest.message().contains("provider preflight"),
+        "{}",
+        ingest.message()
+    );
+    handle_a.abort();
+    handle_b.abort();
+    handle_c.abort();
+}
