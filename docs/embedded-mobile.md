@@ -219,9 +219,9 @@ link and archive steps with the real NDK and Xcode toolchains.
 
 The 2026-09-01 mobile enablement audit refreshed all versions allowed by the
 workspace's compatibility constraints and upgraded direct unpinned consumers
-to TOML 1.1, Tower 0.5, and bzip2 0.6. The `turbovec-grpc` revision now names
-its current `main` merge while retaining the exact same source tree and
-TurboVec `turbovec-pipestream-s17` scoring dependency.
+to TOML 1.1, Tower 0.5, and bzip2 0.6. Item 10 advanced the embedded
+`turbovec-grpc` revision to `0b21a16` and both Rust services to TurboVec
+`turbovec-pipestream-s20`, so the product resolves one scoring-engine revision.
 
 The standalone `sidecars/route-cost` crate is now explicitly excluded from the
 root workspace, matching its manifest's ownership comment. Its independent

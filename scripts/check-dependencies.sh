@@ -83,14 +83,14 @@ check_freshness "route-cost sidecar" "$repo_dir/sidecars/route-cost/Cargo.toml"
 check_live_ref \
   "production TurboVec fork" \
   "https://github.com/ai-pipestream/turbovec.git" \
-  "refs/heads/turbovec-pipestream-s17" \
+  "refs/heads/turbovec-pipestream-s20" \
   "$repo_dir/Cargo.lock"
 latest_chain_ref=$(git ls-remote --heads \
   "https://github.com/ai-pipestream/turbovec.git" \
   'refs/heads/turbovec-pipestream-s*' |
   awk '$2 ~ /^refs\/heads\/turbovec-pipestream-s[0-9]+$/ { print $2 }' |
   sort -V | tail -1)
-if [[ $latest_chain_ref != "refs/heads/turbovec-pipestream-s17" ]]; then
+if [[ $latest_chain_ref != "refs/heads/turbovec-pipestream-s20" ]]; then
   echo "production Cargo.toml is not on the newest immutable TurboVec patch chain: $latest_chain_ref" >&2
   exit 1
 fi

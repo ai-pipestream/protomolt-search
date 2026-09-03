@@ -11,9 +11,9 @@ TurboQuant scoring and collaborative live-floor streaming.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s17` | Patch fork carrying the seedable top-k floor and live-floor streaming collector. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s17` |
-| [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s17` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s20` | Patch fork carrying the seedable top-k floor, live-floor streaming collector, and mapped-image reader. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s20` |
+| [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s20` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 The in-repository [`protomolt-analyzer`](crates/protomolt-analyzer) crate is
@@ -1178,20 +1178,20 @@ the heap builder (bulk-load discipline: build in memory, flush back).
 This is what makes a corpus larger than machine memory work: the
 postings (~130 GB at full CourtListener scale) and doc text (~40 GB)
 live in page cache shared across all consumers, not per-process heap.
-The provider vector index remains heap-resident today. Its product-owned
-original-FP32 rerank sidecar is mmap-backed after flush or load and faults only
-the candidate rows used by reranking. A v7 `load()` transforms
-the stored sequential blocks into the native blocked search layout and retains
-that heap representation; mmap support remains a fork-level decision (see the
-TODO list).
+The product-owned original-FP32 rerank sidecar is mmap-backed after flush or
+load and faults only the candidate rows used by reranking. Sealed TurboVec v7
+segment images are mmap-backed by default and populate a bounded blocked-layout
+cache as searches touch them; writable tails and explicit single-image shards
+remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
-- **mmap vector index.** Postings and doc text are disk-resident (page
-  cache); the turbovec index is heap-resident (see above). A
-  packed-bytes abstraction — owned Vec or mmap behind one accessor,
-  with a paged blocked cache — is a fork-level decision, reported not
-  built.
-- **Provider verification.** Ingest drivers fit and broadcast opaque provider
-  state; health and `GetVectorBackend` expose the scoring fingerprint so a
-  mismatched fleet can be rejected before traffic.
+- **Landed 2026-09-03: mmap vector index.** Sealed segment images use the
+  `turbovec-pipestream-s20` mapped reader, linear large-k chunk merge, and
+  bounded blocked-layout cache;
+  mapped and heap searches are bitwise identical.
+- **Landed 2026-09-03: provider verification.** Search and routed ingest
+  preflight the fleet's provider kind, dimension, and scoring fingerprint;
+  health reports mismatches and snapshot install rejects a foreign provider.
+  Details and test evidence: [Mapped vector images and provider
+  verification](docs/mmap-vectors.md).

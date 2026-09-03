@@ -11,8 +11,8 @@ exclude = ["sidecars/route-cost"]
 resolver = "2"
 
 [dependencies]
-turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s17" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "1dab45f33a408506aef17610680f1ffc5d9a03b8", optional = true }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s20" }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "0b21a161d008936d21feb474e801e456415e6622", optional = true }
 # tonic's core (Status, Request, codegen, the prost codec) is all the
 # embedded runtime needs; the HTTP/2 transport rides the `net` feature.
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
@@ -89,9 +89,3 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 # binary compiles filters, it never interprets them, and this crate's
 # dependency tree (regex included) stays out of it.
 cel-interpreter = "0.10"
-
-# The mmap patch lives on the fork chain branch turbovec-pipestream-s18
-# (docs/mmap-vectors.md). Until that branch is published the pin below
-# resolves to the local checkout; the pin moves to the branch when it is.
-[patch."https://github.com/ai-pipestream/turbovec.git"]
-turbovec = { path = "../turbovec/turbovec" }

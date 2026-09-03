@@ -8,30 +8,37 @@ shards do not agree on one provider state, before any shard is asked.
 ## The engine patch
 
 The mmap serving is the third patch on the TurboVec fork chain
-(`turbovec-pipestream-s18`, `turbovec/src/mapped.rs`), on top of the seeded
+(`turbovec-pipestream-s20`, `turbovec/src/mapped.rs`), on top of the seeded
 search floor and the streaming collector. It changes nothing about the `.tv`
 encoding: a v7 image stays the sync container upstream writes.
-`TurboQuantIndex::load_mapped(path)` maps the file, parses the superblock
+The unsafe `TurboQuantIndex::load_mapped(path)` maps the file, parses the superblock
 and the two commit headers (the same parse `load` runs, factored so both
 share it), and leaves the block units on their pages. A search assembles the
 chunks it scans on demand: each chunk gathers its blocks' code bytes and
 scales from their units (the partial last block from the commit header),
 applies the redo ops the loaded header carries — exactly as the loader does
 — and runs the same stored-to-native layout transform, so the kernel reads
-the same bytes it reads from a loaded index. The assembled chunks live in a
-bounded least-recently-used cache (64 MiB by default), so resident memory
-stays at the budget plus whatever the page cache keeps, never the image.
+the same bytes it reads from a loaded index. Each chunk's ordered candidates
+are merged into the ordered global result window in linear time with one
+reused scratch buffer; the mapped path does not re-sort up to k candidates
+after each chunk, because k=10,000 or more is a normal retrieval shape. The
+assembled chunks live in a bounded least-recently-used cache (64 MiB by
+default), so resident memory stays at the budget plus whatever the page cache
+keeps, never the image.
 Top-k over a mapped image is the streaming scan's chunk loop with a global
 heap per query, the batch's current k-th best seeded as the floor of the
 next chunk (a true lower bound, so pruning is exact and ties at the floor
-survive), and the kernel's own ordering rule. A mapped index is read-only:
+survive), and the kernel's own ordering rule. The constructor requires the
+backing storage to remain unchanged and untruncated for the mapping's lifetime;
+the product discharges that requirement only at its sealed-segment boundary.
+A mapped index is read-only:
 `add`, `swap_remove`, `calibrate`, and `sync` refuse by name; `write` and
 `to_bytes` materialize the layout in memory first, on request. A v5 or v6
 file is refused with the conversion advice `load` gives: converting a file
 forward is a file operation, not a corpus rebuild.
 
 The fork's `tests/mapped_image.rs` pins mapped against loaded results bit
-for bit (top-k, batched queries, masks, seeded floors, streaming), a synced
+for bit (top-k, oversized k, batched queries, masks, seeded floors, streaming), a synced
 file with pending removal ops and a partial tail block, the read-only
 refusals, `write` reproducing the loaded bytes, resident memory at open (a
 20 MiB image maps for under an eighth of its size where a load costs the

@@ -590,7 +590,10 @@ mod embedded_turbovec {
     }
 
     pub(super) fn load_mapped(path: &Path) -> Result<VectorIndex, VectorError> {
-        TurboQuantIndex::load_mapped(path)
+        // SAFETY: this path is reached only for immutable vector artifacts in
+        // a sealed segment generation. Writers publish a different generation
+        // and never modify or truncate this image while the segment is open.
+        unsafe { TurboQuantIndex::load_mapped(path) }
             .map(wrap)
             .map_err(|e| VectorError::new(format!("map {}: {e}", path.display())))
     }
