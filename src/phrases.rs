@@ -205,6 +205,7 @@ pub fn entity_key(namespace: &str, identity: &str) -> String {
 /// Convert a durable posting list into the positional analyzed field shape.
 pub fn analyzed_field(postings: &[PhrasePosting]) -> crate::postings::AnalyzedField {
     crate::postings::AnalyzedField {
+        sentences: None,
         terms: postings
             .iter()
             .map(|posting| {

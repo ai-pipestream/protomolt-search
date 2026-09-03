@@ -122,6 +122,7 @@ pub fn derive_bigrams(source: &AnalyzedField) -> Result<AnalyzedField, String> {
     }
     let length = terms.iter().map(|(_, tf, _)| *tf).sum();
     Ok(AnalyzedField {
+        sentences: None,
         terms,
         length,
         positions: None,
@@ -266,6 +267,7 @@ mod tests {
 
     fn positioned(terms: &[PositionedTerm<'_>]) -> AnalyzedField {
         AnalyzedField {
+            sentences: None,
             terms: terms
                 .iter()
                 .map(|(t, ords, spans)| (t.to_string(), ords.len() as u32, spans.to_vec()))

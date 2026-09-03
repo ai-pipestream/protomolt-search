@@ -1571,6 +1571,11 @@ message AddDocumentsRequest {
   // agreement rules as `position_fields`; resharding rebuilds the derived
   // field table from this record.
   repeated BigramField bigram_fields = 19;
+  // Fields whose sentence spans this document's node stores
+  // (docs/highlighting.md). Filled by the node from --sentence-fields
+  // before the document is logged, so a replay stores the same spans; a
+  // replay on a node with a different setting refuses by name.
+  repeated string sentence_fields = 20;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share
@@ -1713,6 +1718,9 @@ message FieldStats {
   // phrase on a field only when EVERY shard answers true; a mixed fleet
   // refuses rather than matching the phrase on half the corpus.
   bool positions = 4;
+  // Whether this shard stores sentence spans for the field
+  // (docs/highlighting.md).
+  bool sentences = 5;
 }
 
 // This shard's share of the global BM25 corpus stats.
@@ -1861,6 +1869,8 @@ message Bm25QueryRequest {
   // Positional phrase constraint over `terms` on the flat body route;
   // same contract as Bm25FieldLeg.phrase.
   PhraseLeg phrase = 20;
+  // Snippets to cut for each returned hit (docs/highlighting.md).
+  HighlightSpec highlight = 21;
 }
 
 // Internal exact phrase scoring request. `phrase_leg` indexes `query.fields`.
@@ -2341,6 +2351,67 @@ message OffsetSpan {
   uint32 end = 2;
 }
 
+// How a snippet's bounds were chosen (docs/highlighting.md).
+enum HighlightMode {
+  // Sentence mode.
+  HIGHLIGHT_MODE_UNSPECIFIED = 0;
+  // Each snippet is one stored sentence span (ingested with
+  // --sentence-fields); a sentence wider than max_chars is trimmed
+  // around its first highlight and marked SNIPPET_CUT_TRUNCATED_SENTENCE.
+  // A field without stored sentence spans refuses this mode by name.
+  HIGHLIGHT_MODE_SENTENCE = 1;
+  // Each snippet is a window of at most max_chars around a cluster of
+  // highlights, cut at whitespace; no sentence spans are consulted.
+  HIGHLIGHT_MODE_WINDOW = 2;
+}
+
+// Server-side snippets for each hit (docs/highlighting.md). The shard
+// cuts them from the stored text and the occurrence spans it already
+// collected; no analyzer runs on the query path.
+message HighlightSpec {
+  // Fields to cut snippets from; empty means the body. Only fields with
+  // stored text qualify (the body), and any other name refuses.
+  repeated string fields = 1;
+  // Snippets per hit per field; 0 means 3, at most 64.
+  uint32 max_snippets = 2;
+  // Snippet width in UTF-16 code units; 0 means 300, at least 16, at
+  // most 4096.
+  uint32 max_chars = 3;
+  HighlightMode mode = 4;
+}
+
+enum SnippetCut {
+  SNIPPET_CUT_UNSPECIFIED = 0;
+  // Both edges are a stored sentence's edges.
+  SNIPPET_CUT_SENTENCE = 1;
+  // A stored sentence wider than max_chars, trimmed at whitespace
+  // around its first highlight.
+  SNIPPET_CUT_TRUNCATED_SENTENCE = 2;
+  // A window around a highlight cluster, cut at whitespace.
+  SNIPPET_CUT_WINDOW = 3;
+}
+
+// One snippet of one hit. Offsets are UTF-16 code units of the ORIGINAL
+// stored text, the unit every persisted span uses; `text` is the UTF-8
+// slice at [start, end). Highlights are merged (no two overlap or
+// touch), ascending, and lie inside [start, end); subtract `start` for
+// snippet-relative positions.
+message Snippet {
+  string field = 1;
+  string text = 2;
+  uint32 start = 3;
+  uint32 end = 4;
+  repeated OffsetSpan highlights = 5;
+  SnippetCut cut = 6;
+  // For a SENTENCE or TRUNCATED_SENTENCE cut: the sentence's ordinal in
+  // the document's stored sentence table — the analysis sidecar's own
+  // sentence layer over the original text, the same layer its
+  // SOURCE_SENTENCES embeddings are computed from, in order. Sentence k
+  // here is embedding k there, so a dense hit's sentence provenance and
+  // a lexical hit's highlight name the same text. Absent for a WINDOW cut.
+  optional uint32 sentence_index = 7;
+}
+
 // Occurrences of one query term in one hit document.
 message TermOccurrences {
   // The query term as scored (stem identity when SOURCE_STEMS).
@@ -2371,6 +2442,9 @@ message Bm25Hit {
   // division by zero) — the engine's Kleene rule, absence in, absence
   // out, never a fabricated default.
   repeated ProjectedValue projected = 4;
+  // Server-side snippets when the request carried a HighlightSpec
+  // (docs/highlighting.md), in text order per field.
+  repeated Snippet snippets = 5;
 }
 
 // A shard's BM25 top-k.
@@ -2668,6 +2742,9 @@ message Bm25SearchRequest {
   // query's terms (docs/prefix-terms.md). Flat route only; on the
   // fused route each QueryField carries its own.
   repeated TermPrefix prefixes = 16;
+  // Server-side snippets per hit (docs/highlighting.md). Absent means
+  // no snippets; hits keep their occurrence spans either way.
+  HighlightSpec highlight = 17;
 }
 
 // A prefix over a field's term dictionary (docs/prefix-terms.md): every
@@ -3764,6 +3841,11 @@ message QueryRequest {
   // current generation. A nonzero mismatch fails before analysis or fan-out,
   // so a retry can never silently cross a live reshard cutover.
   uint64 required_topology_generation = 11;
+  // Server-side snippets on each hit (docs/highlighting.md). Served for
+  // the single lexical selection; every other shape refuses by name,
+  // because only the lexical leg carries the occurrence spans snippets
+  // are cut around.
+  HighlightSpec highlight = 12;
 }
 
 // A column sort order for browse.
@@ -4313,6 +4395,8 @@ message QueryHit {
   // dimensions in request order (every dimension is reported, skipped
   // ones included). Empty when the request carried no scorer.
   repeated DimensionScore dimensions = 8;
+  // Snippets when the request carried a HighlightSpec.
+  repeated Snippet snippets = 9;
 }
 
 // One named raw relevance signal.

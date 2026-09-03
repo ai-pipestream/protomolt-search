@@ -337,7 +337,22 @@ bitmap union, or declare the estimator and its error in the response. The
 project's stance argues for the first with the cost made visible, which is
 the same argument that settled count-then-rank.
 
-### 9. Server-side highlighting
+### 9. Server-side highlighting — LANDED
+
+**Landed 2026-09-02 (`docs/highlighting.md`, `tests/highlighting.rs`).**
+Sentence spans are stored at ingest as a kind-8 column
+(`--sentence-fields=body`, 4 B per slot plus 8 B per sentence, the
+sidecar's own sentence layer in original-text UTF-16 units — the same
+layer its sentence embeddings are parallel to, so `sentence_index` on a
+snippet names the embedding). `HighlightSpec` on `Bm25Search` and on
+the lexical `Query` leaf returns per-hit `Snippet`s: sentence-bounded,
+overlapping occurrence spans merged, ranked by distinct terms, in text
+order, cut at whitespace when a sentence outruns `max_chars`, with a
+named window mode for fields without spans. No analyzer runs on the
+query path (metered), whole documents are never the mechanism, and
+every other `Query` shape refuses by name.
+
+The original rationale, kept:
 
 `Bm25Hit` already returns every occurrence span in original-text
 coordinates, and the texts are in the index. What is missing is snippet

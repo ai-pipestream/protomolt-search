@@ -102,6 +102,7 @@ fn random_two_field_corpus(
             }
         }
         let mut fields = vec![AnalyzedField {
+            sentences: None,
             terms: body,
             length: body_len,
             positions: None,
@@ -119,6 +120,7 @@ fn random_two_field_corpus(
                 name.push((term.clone(), tf, vec![(0, 4)]));
             }
             fields.push(AnalyzedField {
+                sentences: None,
                 terms: name,
                 length: name_len,
                 positions: None,
@@ -397,11 +399,13 @@ fn fused_ties_at_floor_and_kth_slot() {
             AnalyzedDoc {
                 fields: vec![
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
                         length: 3,
                         positions: None,
                     },
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
                         length: 1,
                         positions: None,
@@ -488,12 +492,14 @@ fn fused_ties_at_floor_and_kth_slot() {
     let mut store = Bm25Store::with_fields(&["body", "name"]);
     for i in 0..300u32 {
         let mut fields = vec![AnalyzedField {
+            sentences: None,
             terms: vec![("court".to_string(), 1, vec![(0, 4)])],
             length: 3,
             positions: None,
         }];
         if i % 25 == 0 {
             fields.push(AnalyzedField {
+                sentences: None,
                 terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
                 length: 1,
                 positions: None,
@@ -581,6 +587,7 @@ fn fused_blocks_actually_skip() {
         // share one tf) so block maxes genuinely differ.
         let fields = vec![
             AnalyzedField {
+                sentences: None,
                 terms: vec![
                     ("court".to_string(), 1 + (i / 128) % 5, vec![(0, 4)]),
                     (format!("rare{}", i % 97), 1, vec![(0, 4)]),
@@ -589,6 +596,7 @@ fn fused_blocks_actually_skip() {
                 positions: None,
             },
             AnalyzedField {
+                sentences: None,
                 terms: vec![("smith".to_string(), 1 + (i / 128) % 3, vec![(0, 5)])],
                 length: 10 + i % 5,
                 positions: None,
@@ -836,12 +844,14 @@ fn fused_pruned_distributed_equals_monolithic() {
         ];
         let body_len: u32 = body.iter().map(|t| t.1).sum();
         let mut fields = vec![AnalyzedField {
+            sentences: None,
             terms: body,
             length: body_len,
             positions: None,
         }];
         if g % 3 != 1 {
             fields.push(AnalyzedField {
+                sentences: None,
                 terms: vec![
                     ("smith".to_string(), 1, vec![(0, 5)]),
                     (format!("n{}", g % 2), 1, vec![]),
@@ -1015,11 +1025,13 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
             AnalyzedDoc {
                 fields: vec![
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![("court".to_string(), tf, vec![(0, 5)])],
                         length: 4,
                         positions: None,
                     },
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
                         length: 1,
                         positions: None,

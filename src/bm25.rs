@@ -1980,6 +1980,7 @@ mod tests {
             AnalyzedDoc {
                 fields: vec![
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![
                             ("rust".into(), 2, vec![(0, 4)]),
                             ("search".into(), 1, vec![]),
@@ -1988,6 +1989,7 @@ mod tests {
                         positions: None,
                     },
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![("smith".into(), 1, vec![(0, 5)])],
                         length: 1,
                         positions: None,
@@ -2014,11 +2016,13 @@ mod tests {
             AnalyzedDoc {
                 fields: vec![
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![("search".into(), 1, vec![])],
                         length: 1,
                         positions: None,
                     },
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![
                             ("rust".into(), 1, vec![(0, 4)]),
                             ("smith".into(), 1, vec![]),
@@ -2117,12 +2121,14 @@ mod tests {
             ];
             let body_len: u32 = body.iter().map(|t| t.1).sum();
             let mut fields = vec![AnalyzedField {
+                sentences: None,
                 terms: body,
                 length: body_len,
                 positions: None,
             }];
             if g % 3 != 1 {
                 fields.push(AnalyzedField {
+                    sentences: None,
                     terms: vec![
                         ("smith".to_string(), 1, vec![(0, 5)]),
                         (format!("n{}", g % 2), 1, vec![]),
@@ -2240,6 +2246,7 @@ mod tests {
             AnalyzedDoc {
                 fields: vec![
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![
                             ("new".into(), 1, vec![(0, 3)]),
                             ("york".into(), 1, vec![(4, 8)]),
@@ -2249,6 +2256,7 @@ mod tests {
                         positions: None,
                     },
                     AnalyzedField {
+                        sentences: None,
                         terms: vec![
                             ("$phrase:nyc".into(), 1, vec![(0, 13)]),
                             ("$phrase:new-york".into(), 1, vec![(0, 8)]),

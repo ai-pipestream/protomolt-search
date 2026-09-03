@@ -203,6 +203,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 vocab_top_k: cfg.vocab_top_k,
                 position_fields: cfg.position_fields.clone(),
                 bigram_fields: cfg.bigram_fields.clone(),
+                sentence_fields: cfg.sentence_fields.clone(),
             };
             let node = if shard.demo.is_some() {
                 NodeServiceImpl::new(load_shard_index(shard, None)?, node_config)

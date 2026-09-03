@@ -132,6 +132,13 @@ pub struct TermVector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzedDocument {
     pub term_vectors: Vec<TermVector>,
+    /// Sentence spans in `offset_unit`, in document order, produced by
+    /// the newline sentence detector (the same model-free rule the
+    /// sidecar's default detector applies): each maximal run of text
+    /// between line breaks, trimmed of whitespace at both ends; blank
+    /// lines yield none. Every token lies inside exactly one sentence,
+    /// because a whitespace token never contains a line break.
+    pub sentences: Vec<Span>,
     /// Token surface forms in input order, used only by ingest vocabulary
     /// accounting. Query callers may ignore this field.
     pub tokens: Vec<String>,
@@ -439,6 +446,7 @@ pub fn analyze_with_offset_unit(
     let length = vectors.iter().map(|vector| vector.frequency).sum();
     Ok(AnalyzedDocument {
         term_vectors: vectors,
+        sentences: split_sentences(text, offset_unit),
         tokens: tokens
             .into_iter()
             .map(|token| token.surface.to_string())
@@ -539,6 +547,41 @@ pub fn unicode_case_fold(text: &str) -> String {
 /// holds, and stemming a fragment would change the fragment.
 pub fn normalize_term(token: &str, steps: &[NormalizerStep]) -> String {
     normalize(token, steps)
+}
+
+/// Newline sentence detection: one span per line that holds any
+/// non-whitespace character, trimmed at both ends, in `offset_unit`.
+/// `\r`, `\n`, and `\r\n` all end a line.
+fn split_sentences(text: &str, offset_unit: OffsetUnit) -> Vec<Span> {
+    let mut sentences = Vec::new();
+    // (utf16, byte) of the first non-whitespace character on this line.
+    let mut start: Option<(u32, usize)> = None;
+    // Just past the last non-whitespace character seen on this line.
+    let mut last_end = (0u32, 0usize);
+    let mut utf16 = 0u32;
+    for (byte, ch) in text.char_indices() {
+        if ch == '\n' || ch == '\r' {
+            if let Some((start_utf16, start_byte)) = start.take() {
+                sentences.push(Span {
+                    start: offset_unit.position(start_utf16, start_byte),
+                    end: offset_unit.position(last_end.0, last_end.1),
+                });
+            }
+        } else if !is_unicode_whitespace(ch) {
+            if start.is_none() {
+                start = Some((utf16, byte));
+            }
+            last_end = (utf16 + ch.len_utf16() as u32, byte + ch.len_utf8());
+        }
+        utf16 += ch.len_utf16() as u32;
+    }
+    if let Some((start_utf16, start_byte)) = start {
+        sentences.push(Span {
+            start: offset_unit.position(start_utf16, start_byte),
+            end: offset_unit.position(last_end.0, last_end.1),
+        });
+    }
+    sentences
 }
 
 fn tokenize_whitespace(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
@@ -1106,5 +1149,65 @@ mod tests {
         entries[0].term.push('!');
         assert_ne!(forward, Glossary::new(entries, true).unwrap().fingerprint());
         assert_ne!(phrase_posting_term("a:b"), phrase_posting_term("a") + ":b");
+    }
+}
+
+#[cfg(test)]
+mod sentence_tests {
+    use super::*;
+
+    fn spans(text: &str, unit: OffsetUnit) -> Vec<(u32, u32)> {
+        split_sentences(text, unit)
+            .into_iter()
+            .map(|s| (s.start, s.end))
+            .collect()
+    }
+
+    #[test]
+    fn lines_become_sentences_trimmed_and_blank_lines_yield_none() {
+        let text = "  first line  \n\n\t \nsecond\r\nthird";
+        assert_eq!(
+            spans(text, OffsetUnit::Utf16CodeUnits),
+            vec![(2, 12), (19, 25), (27, 32)]
+        );
+        assert_eq!(spans("", OffsetUnit::Utf16CodeUnits), vec![]);
+        assert_eq!(spans(" \n \n", OffsetUnit::Utf16CodeUnits), vec![]);
+        assert_eq!(spans("one", OffsetUnit::Utf16CodeUnits), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn sentence_offsets_follow_the_requested_unit() {
+        // The emoji is one code point, two UTF-16 units, four UTF-8 bytes.
+        let text = "a 😀 b\ncafé";
+        assert_eq!(
+            spans(text, OffsetUnit::Utf16CodeUnits),
+            vec![(0, 6), (7, 11)]
+        );
+        assert_eq!(spans(text, OffsetUnit::Utf8Bytes), vec![(0, 8), (9, 14)]);
+    }
+
+    #[test]
+    fn every_token_lies_inside_one_sentence() {
+        let text = "the court held\n  that the claim  \nfails";
+        let spec = AnalysisSpec {
+            tokenizer: Tokenizer::Whitespace,
+            stemmer: Stemmer::Porter,
+            term_vector_mode: TermVectorMode::Full,
+            term_vector_source: TermVectorSource::NormalizedStems,
+            normalizers: vec![NormalizerStep::FullCaseFold],
+        };
+        let doc = analyze(text, &spec).unwrap();
+        assert_eq!(doc.sentences.len(), 3);
+        for vector in &doc.term_vectors {
+            for span in &vector.occurrences {
+                assert!(
+                    doc.sentences
+                        .iter()
+                        .any(|s| s.start <= span.start && span.end <= s.end),
+                    "{:?} at {span:?} lies in no sentence",
+                    vector.term
+                );
+            }
+        }
     }
 }

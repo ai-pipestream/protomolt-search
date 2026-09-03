@@ -668,6 +668,24 @@ fn build_child(
             t.into_iter().collect()
         };
         let position_names: Vec<&str> = position_table.iter().map(String::as_str).collect();
+        // The child's sentence fields (docs/highlighting.md), by the same
+        // rule.
+        let sentence_table: Vec<String> = {
+            let mut t = BTreeSet::new();
+            for (local, doc) in &mapped {
+                for name in &doc.sentence_fields {
+                    if !table.contains(name) {
+                        return Err(format!(
+                            "record at child slot {local} keeps sentence spans on {name:?} \
+                             outside the table {table:?}"
+                        ));
+                    }
+                    t.insert(name.clone());
+                }
+            }
+            t.into_iter().collect()
+        };
+        let sentence_names: Vec<&str> = sentence_table.iter().map(String::as_str).collect();
         let mut builder = SpillBuilder::create_with_fields(&spill_dir, &names)
             .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
             .with_facet_fields(&facet_names)
@@ -676,7 +694,8 @@ fn build_child(
             .with_map_numeric_fields(&map_numeric_names)
             .with_integer_fields(&integer_names)
             .with_geo_fields(&geo_names)
-            .with_position_fields(&position_names);
+            .with_position_fields(&position_names)
+            .with_sentence_fields(&sentence_names);
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -750,6 +769,21 @@ fn build_child(
                         return Err(format!(
                             "record at child slot {local}: field {name:?} keeps token positions \
                              but the replay analysis carried none"
+                        ));
+                    }
+                }
+                for name in &doc.sentence_fields {
+                    let fi = table.iter().position(|n| n == name).expect("checked above");
+                    if fields[fi].sentences.is_none() {
+                        return Err(format!(
+                            "record at child slot {local}: field {name:?} keeps sentence spans \
+                             but the replay analysis carried none"
+                        ));
+                    }
+                    if let Err(error) = fields[fi].check_sentences() {
+                        return Err(format!(
+                            "record at child slot {local}: field {name:?}: malformed sentence \
+                             spans: {error}"
                         ));
                     }
                 }

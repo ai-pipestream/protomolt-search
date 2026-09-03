@@ -2461,6 +2461,7 @@ impl CoordinatorServiceImpl {
             &[],
             &[],
             &mut Vec::new(),
+            None,
         )
         .await
         .map(|r| (r.0, r.1, r.2))
@@ -2488,6 +2489,7 @@ impl CoordinatorServiceImpl {
         projections: &[crate::pb::CompiledProjection],
         prefixes: &[crate::pb::TermPrefix],
         expansions: &mut Vec<crate::pb::PrefixExpansion>,
+        highlight: Option<&crate::pb::HighlightSpec>,
     ) -> Result<AggregatedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -2548,6 +2550,7 @@ impl CoordinatorServiceImpl {
                     stats_fields,
                     cardinality_fields,
                     projections,
+                    highlight,
                 )
                 .await
             {
@@ -2583,6 +2586,7 @@ impl CoordinatorServiceImpl {
         stats_fields: &[String],
         cardinality_fields: &[String],
         projections: &[crate::pb::CompiledProjection],
+        highlight: Option<&crate::pb::HighlightSpec>,
     ) -> Result<AggregatedHits, Status> {
         if self.node_addrs.is_empty() {
             return Err(Status::failed_precondition("no shard nodes configured"));
@@ -2606,6 +2610,7 @@ impl CoordinatorServiceImpl {
         });
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
+                highlight: highlight.cloned(),
                 projections: projections.to_vec(),
                 terms: terms.to_vec(),
                 k,
@@ -2957,6 +2962,7 @@ impl CoordinatorServiceImpl {
             geo_filters,
             filter,
             &mut Vec::new(),
+            None,
         )
         .await
         .map(|(hits, _)| hits)
@@ -2986,6 +2992,7 @@ impl CoordinatorServiceImpl {
         geo_filters: &[crate::pb::GeoFilter],
         filter: Option<&crate::pb::FilterExpr>,
         expansions: &mut Vec<crate::pb::PrefixExpansion>,
+        highlight: Option<&crate::pb::HighlightSpec>,
     ) -> Result<(FacetedHits, Vec<crate::pb::PhraseRouting>), Status> {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
@@ -3236,6 +3243,7 @@ impl CoordinatorServiceImpl {
                     range_facet_fields,
                     geo_filters,
                     filter,
+                    highlight,
                     trace,
                     t0,
                     t_analyzed,
@@ -3419,6 +3427,7 @@ impl CoordinatorServiceImpl {
                     &base.range_facet_fields,
                     &base.geo_filters,
                     filter,
+                    None,
                     trace,
                     t0,
                     t_analyzed,
@@ -3700,6 +3709,7 @@ impl CoordinatorServiceImpl {
         range_facet_fields: &[crate::pb::RangeFacetField],
         geo_filters: &[crate::pb::GeoFilter],
         filter: Option<&crate::pb::FilterExpr>,
+        highlight: Option<&crate::pb::HighlightSpec>,
         trace: bool,
         t0: std::time::Instant,
         t_analyzed: std::time::Duration,
@@ -3770,6 +3780,7 @@ impl CoordinatorServiceImpl {
         });
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let request = Bm25QueryRequest {
+                highlight: highlight.cloned(),
                 projections: Vec::new(),
                 terms: Vec::new(),
                 k,
@@ -4876,6 +4887,7 @@ impl CoordinatorServiceImpl {
             let mut leg_tasks = Vec::with_capacity(n_nodes);
             for (shard, node) in self.node_addrs.iter().enumerate() {
                 let request = Bm25QueryRequest {
+                    highlight: None,
                     projections: Vec::new(),
                     terms: terms.to_vec(),
                     k: legs.leg_k,
@@ -8817,6 +8829,12 @@ impl SearchService for CoordinatorServiceImpl {
         }
         let req = request.into_inner();
         let k = self.resolve_k(req.k)?;
+        // A malformed HighlightSpec refuses here, before any shard is
+        // asked, so an empty fleet answers the same as a full one
+        // (docs/highlighting.md).
+        if let Some(spec) = req.highlight.as_ref() {
+            crate::highlight::Plan::from_spec(spec)?;
+        }
         if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
             return Err(Status::invalid_argument(
                 "min_score must be finite (NaN and -inf are not valid floors)",
@@ -8875,6 +8893,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.geo_filters,
                         filter.as_ref(),
                         &mut prefix_expansions,
+                        req.highlight.as_ref(),
                     )
                     .await?;
                 phrase_routing = routing;
@@ -8896,6 +8915,7 @@ impl SearchService for CoordinatorServiceImpl {
                     &projections,
                     &req.prefixes,
                     &mut prefix_expansions,
+                    req.highlight.as_ref(),
                 )
                 .await?
             } else {
@@ -8956,6 +8976,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.geo_filters,
                         filter.as_ref(),
                         &mut prefix_expansions,
+                        req.highlight.as_ref(),
                     )
                     .await?;
                 phrase_routing = routing;

@@ -294,6 +294,14 @@ pub struct Config {
     /// The column is the BM25 field named `<source>.bigrams`, which must
     /// be declared in `bm25_fields`; clients never supply it.
     pub bigram_fields: Vec<String>,
+    /// Fields whose sentence spans are stored per document for
+    /// server-side snippets (`--sentence-fields=body`,
+    /// docs/highlighting.md). Snippets are cut from stored text, and
+    /// only the body's text is stored, so the only legal entry is the
+    /// body. Shards loaded from existing files keep the declaration they
+    /// were written with; ingest refuses a sentence field the file never
+    /// declared.
+    pub sentence_fields: Vec<String>,
     /// The map<string, f64> column table for NEW shard builders
     /// (`--map-numeric-fields=attrs`). Same rules.
     pub map_numeric_fields: Vec<String>,
@@ -391,6 +399,7 @@ struct FileConfig {
     phrase_ner: Option<bool>,
     position_fields: Option<Vec<String>>,
     bigram_fields: Option<Vec<String>>,
+    sentence_fields: Option<Vec<String>>,
     map_numeric_fields: Option<Vec<String>>,
     integer_fields: Option<Vec<String>>,
     geo_fields: Option<Vec<String>>,
@@ -1474,6 +1483,28 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "PIPESTREAM_SEARCH_BIGRAM_FIELDS",
         file.bigram_fields.as_ref(),
     );
+    let sentence_fields = list(
+        "sentence-fields",
+        "PIPESTREAM_SEARCH_SENTENCE_FIELDS",
+        file.sentence_fields.as_ref(),
+    );
+    for (i, name) in sentence_fields.iter().enumerate() {
+        if sentence_fields[..i].contains(name) {
+            return Err(format!(
+                "sentence field {name:?} repeats in --sentence-fields"
+            ));
+        }
+        if !bm25_fields.contains(name) {
+            return Err(format!(
+                "sentence field {name:?} must be declared in --bm25-fields"
+            ));
+        }
+        if name != "body" {
+            return Err(format!(
+                "sentence field {name:?}: snippets are cut from stored text, and only the body's text is stored; --sentence-fields accepts body only"
+            ));
+        }
+    }
     for (i, name) in position_fields.iter().enumerate() {
         if position_fields[..i].contains(name) {
             return Err(format!(
@@ -1569,6 +1600,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         phrase_ner,
         position_fields,
         bigram_fields,
+        sentence_fields,
         map_numeric_fields,
         integer_fields,
         geo_fields,

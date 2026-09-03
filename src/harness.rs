@@ -378,6 +378,16 @@ pub mod mock_analysis {
         /// Defaults to true; [`start_mock_analysis_without_ner`] models
         /// the bare sidecar.
         pub ner: bool,
+        /// Whether this mock serves the sentence layer when asked
+        /// (`sentence_detection`). Defaults to true;
+        /// [`start_mock_analysis_without_sentences`] models a sidecar
+        /// that ignores the request — the state a sentence field's
+        /// ingest refuses by name (docs/highlighting.md).
+        pub sentence_layer: bool,
+        /// Analysis calls this mock served, unary and streaming alike,
+        /// one per document: the meter that proves a query path added
+        /// no analysis (docs/highlighting.md).
+        pub calls: Arc<AtomicU64>,
         unary_delay: Option<(Duration, AnalysisDelayProbe)>,
     }
 
@@ -385,6 +395,8 @@ pub mod mock_analysis {
         fn default() -> Self {
             MockAnalysis {
                 ner: true,
+                sentence_layer: true,
+                calls: Arc::new(AtomicU64::new(0)),
                 unary_delay: None,
             }
         }
@@ -400,13 +412,37 @@ pub mod mock_analysis {
         ("springfield", "Springfield", "US", 39.7817, -89.6501, 0.4),
     ];
 
+    /// The sidecar's model-free sentence detector: one span per line
+    /// holding a non-whitespace character, trimmed, in the same
+    /// coordinates as the tokens.
+    fn newline_sentences(text: &str) -> Vec<Span> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        for line in text.split_inclusive(['\n', '\r']) {
+            let body = line.trim_end_matches(['\n', '\r']);
+            let lead = body.len() - body.trim_start().len();
+            let trimmed = body.trim();
+            if !trimmed.is_empty() {
+                out.push(Span {
+                    start: (cursor + lead) as i32,
+                    end: (cursor + lead + trimmed.len()) as i32,
+                });
+            }
+            cursor += line.len();
+        }
+        out
+    }
+
     /// The analysis itself, shared verbatim by the unary and streaming
     /// paths — the same guarantee the real sidecar tests prove.
     fn analyze_text(
         text: &str,
         options: &AnalysisOptions,
         ner: bool,
+        sentence_layer: bool,
+        calls: &AtomicU64,
     ) -> Result<AnalyzeResponse, Status> {
+        calls.fetch_add(1, Ordering::SeqCst);
         if text.is_empty() {
             return Err(Status::invalid_argument("empty text"));
         }
@@ -558,7 +594,11 @@ pub mod mock_analysis {
         };
 
         Ok(AnalyzeResponse {
-            sentences: Vec::new(),
+            sentences: if options.sentence_detection && sentence_layer {
+                newline_sentences(text)
+            } else {
+                Vec::new()
+            },
             tokens,
             stems,
             entities: Vec::new(),
@@ -591,7 +631,13 @@ pub mod mock_analysis {
             }
             let req = request.into_inner();
             let options = req.options.unwrap_or_default();
-            Ok(Response::new(analyze_text(&req.text, &options, self.ner)?))
+            Ok(Response::new(analyze_text(
+                &req.text,
+                &options,
+                self.ner,
+                self.sentence_layer,
+                &self.calls,
+            )?))
         }
 
         type AnalyzeStreamStream =
@@ -608,6 +654,8 @@ pub mod mock_analysis {
         ) -> Result<Response<Self::AnalyzeStreamStream>, Status> {
             let mut inbound = request.into_inner();
             let ner = self.ner;
+            let sentence_layer = self.sentence_layer;
+            let calls = self.calls.clone();
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AnalyzeStreamResponse, Status>>(16);
             tokio::spawn(async move {
                 let mut options: Option<AnalysisOptions> = None;
@@ -639,15 +687,17 @@ pub mod mock_analysis {
                                     .await;
                                 return;
                             };
-                            let result = match analyze_text(&doc.text, options, ner) {
-                                Ok(ok) => analyze_stream_response::Result::Ok(ok),
-                                Err(status) => {
-                                    analyze_stream_response::Result::Error(AnalyzeStreamError {
-                                        code: status.code() as i32,
-                                        message: status.message().to_string(),
-                                    })
-                                }
-                            };
+                            let result =
+                                match analyze_text(&doc.text, options, ner, sentence_layer, &calls)
+                                {
+                                    Ok(ok) => analyze_stream_response::Result::Ok(ok),
+                                    Err(status) => {
+                                        analyze_stream_response::Result::Error(AnalyzeStreamError {
+                                            code: status.code() as i32,
+                                            message: status.message().to_string(),
+                                        })
+                                    }
+                                };
                             let response = AnalyzeStreamResponse {
                                 sequence: doc.sequence,
                                 result: Some(result),
@@ -723,6 +773,34 @@ pub mod mock_analysis {
     ) -> (String, JoinHandle<Result<(), TransportError>>) {
         start_mock(MockAnalysis {
             ner: false,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// A normal mock plus its call meter: every analysis it serves,
+    /// unary or streaming, one per document.
+    pub async fn start_mock_analysis_metered() -> (
+        String,
+        JoinHandle<Result<(), TransportError>>,
+        Arc<AtomicU64>,
+    ) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (address, handle) = start_mock(MockAnalysis {
+            calls: calls.clone(),
+            ..Default::default()
+        })
+        .await;
+        (address, handle, calls)
+    }
+
+    /// A mock that never returns the sentence layer, even when asked:
+    /// the response a sentence field's ingest refuses rather than
+    /// storing an empty table for a document with terms.
+    pub async fn start_mock_analysis_without_sentences(
+    ) -> (String, JoinHandle<Result<(), TransportError>>) {
+        start_mock(MockAnalysis {
+            sentence_layer: false,
             ..Default::default()
         })
         .await

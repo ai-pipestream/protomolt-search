@@ -416,6 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  shard {shard}: {i}/{n} documents analyzed");
                     }
                     tx.send(AddDocumentsRequest {
+                        sentence_fields: Vec::new(),
                         materialize: None,
                         map_numerics: Vec::new(),
                         map_facets: Vec::new(),
@@ -776,6 +777,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                     let fields =
                         chunk_fields(&case_names2, chunk.cluster_id, &body_columns2, &chunk.text);
                     tx.blocking_send(AddDocumentsRequest {
+                        sentence_fields: Vec::new(),
                         materialize: None,
                         map_numerics: Vec::new(),
                         map_facets: Vec::new(),

@@ -63,6 +63,7 @@ async fn add_documents_integer(
     let (tx, rx) = mpsc::channel(8);
     for (text, integers) in docs {
         tx.send(AddDocumentsRequest {
+            sentence_fields: Vec::new(),
             materialize: None,
             text: text.to_string(),
             analysis: None,
@@ -472,6 +473,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            highlight: None,
             projections: Vec::new(),
             filter: String::new(),
             text: "rust".to_string(),
@@ -856,6 +858,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             .map(|_| ())
     };
     let stamped = |text: &str, seconds: i64, nanos: i32| AddDocumentsRequest {
+        sentence_fields: Vec::new(),
         materialize: None,
         text: text.to_string(),
         analysis: None,

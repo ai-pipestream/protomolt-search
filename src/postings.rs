@@ -132,6 +132,23 @@ fn positions_section_size(n_terms: u64, total: u64) -> u64 {
     4 + 4 * (n_terms + 1) + 4 * total
 }
 
+/// Kind 8: a field's sentence table (`docs/highlighting.md`), the
+/// spans server-side snippets are cut at. Entry: the field's name under
+/// [`SENTENCES_ENTRY_PREFIX`], then `u64 off | u64 total`. Section:
+/// `u32 n_slots | (n_slots + 1) x u32 base | total x (u32 start, u32 end)`
+/// — `base[d]..base[d + 1]` are document `d`'s sentences in text order,
+/// UTF-16 units of the stored text, sorted and non-overlapping. Costs
+/// 4 B per slot plus 8 B per sentence, read only for returned hits.
+const COLUMN_KIND_SENTENCES: u8 = 8;
+/// Column-table name prefix of a kind-8 entry: `sentences:<field>`.
+const SENTENCES_ENTRY_PREFIX: &str = "sentences:";
+
+/// Byte size of a kind-8 section for `n_slots` documents holding
+/// `total` sentences.
+fn sentences_section_size(n_slots: u64, total: u64) -> u64 {
+    4 + 4 * (n_slots + 1) + 8 * total
+}
+
 /// v8 layout: a v6 or v7 payload, byte-identical, wearing integrity.
 /// The leading magic becomes `TVBM2508`; after the last payload byte
 /// sits an integrity section (u32 n_entries, then per entry u16
@@ -402,7 +419,7 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:vals"), u64_at(base + 32)));
                     cursor = base + 40;
                 }
-                COLUMN_KIND_POSITIONS => {
+                COLUMN_KIND_POSITIONS | COLUMN_KIND_SENTENCES => {
                     starts.push((format!("column:{name}:vals"), u64_at(base)));
                     cursor = base + 16;
                 }
@@ -595,6 +612,19 @@ pub trait Bm25Index {
         let _ = (term, doc_id);
         None
     }
+    /// Whether this field stores sentence spans per document
+    /// (`docs/highlighting.md`). Sentence-mode snippets over a field
+    /// answering false refuse by name.
+    fn has_sentences(&self) -> bool {
+        false
+    }
+    /// The sentence spans of `doc_id` in UTF-16 units of the stored
+    /// text, sorted; `None` when the field stores none, an empty table
+    /// for a slot without a document.
+    fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
+        let _ = doc_id;
+        None
+    }
     /// Every term of this field starting with `prefix`, in byte order,
     /// when there are at most `cap` of them; `Err(count)` with the exact
     /// count otherwise (`docs/prefix-terms.md`). The heap store walks its
@@ -663,9 +693,32 @@ pub struct AnalyzedField {
     /// than indexing it without positions, because half a column with
     /// positions is a phrase index that lies about the other half.
     pub positions: Option<DocPositions>,
+    /// Sentence spans of the field's text in UTF-16 units, sorted and
+    /// non-overlapping, or `None` when the analysis carried no sentence
+    /// layer. A sentence field refuses a `None` document by name
+    /// (`docs/highlighting.md`); every occurrence must lie inside one
+    /// sentence, which [`Self::check_sentences`] enforces at ingest so
+    /// the query path can trust the table.
+    pub sentences: Option<Vec<(u32, u32)>>,
 }
 
 impl AnalyzedField {
+    /// Check that `sentences`, when present, is a sorted, non-overlapping
+    /// table of non-empty spans covering every occurrence of every term.
+    pub fn check_sentences(&self) -> Result<(), String> {
+        let Some(sentences) = &self.sentences else {
+            return Ok(());
+        };
+        crate::highlight::check_sentence_table(sentences)?;
+        let occurrences = self
+            .terms
+            .iter()
+            .flat_map(|(_, _, offsets)| offsets.iter().copied());
+        crate::highlight::check_coverage(sentences, occurrences).map_err(|(start, end)| {
+            format!("occurrence [{start}, {end}) lies outside every sentence span")
+        })
+    }
+
     /// Check that `positions`, when present, is shaped exactly like the
     /// term table: one list per term, one ordinal per occurrence, each
     /// list strictly ascending (occurrences are in text order, and two
@@ -767,6 +820,7 @@ impl AnalyzedDoc {
                 terms,
                 length,
                 positions: None,
+                sentences: None,
             }],
             quality: None,
             geography: None,
@@ -781,6 +835,7 @@ impl AnalyzedDoc {
                 terms,
                 length,
                 positions: Some(positions),
+                sentences: None,
             }],
             quality: None,
             geography: None,
@@ -821,6 +876,13 @@ struct FieldStore {
     /// from the file's kind-7 entry); a positional field refuses a
     /// document without positions instead of storing a hole.
     positions: bool,
+    /// Whether this field keeps sentence spans per document
+    /// (`docs/highlighting.md`), declared at construction or read from
+    /// the file's kind-8 entry.
+    sentences: bool,
+    /// Per-document sentence spans, indexed by local doc id, populated
+    /// only when `sentences` is set (sparse slots hold an empty table).
+    doc_sentences: Vec<Vec<(u32, u32)>>,
 }
 
 impl FieldStore {
@@ -832,6 +894,8 @@ impl FieldStore {
             doc_lengths: Vec::new(),
             total_length: 0,
             positions: false,
+            sentences: false,
+            doc_sentences: Vec::new(),
         }
     }
 }
@@ -1676,6 +1740,54 @@ impl Bm25Store {
             .collect()
     }
 
+    /// Declare the fields that keep sentence spans per document
+    /// (`docs/highlighting.md`). Must precede any document, and every
+    /// name must be in the field table; a sentence store persists as v7
+    /// (the kind-8 entry lives in the column table). Panics on either
+    /// violation, like the other declaration builders.
+    pub fn with_sentences(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "sentence fields must be declared before documents are added"
+        );
+        for name in names {
+            let fi = self
+                .field_index(name)
+                .unwrap_or_else(|| panic!("sentence field {name:?} is not in the field table"));
+            self.fields[fi].sentences = true;
+        }
+        self
+    }
+
+    /// Whether field `f` keeps sentence spans. Panics when out of range.
+    pub fn field_has_sentences(&self, f: usize) -> bool {
+        self.fields[f].sentences
+    }
+
+    /// Names of the fields that keep sentence spans, field-id order.
+    pub fn sentence_fields(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|f| f.sentences)
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+
+    /// Field `f`'s sentence spans for `doc_id`: `None` when the field
+    /// keeps none, an empty table for a slot without a document.
+    pub fn field_doc_sentences(&self, f: usize, doc_id: u32) -> Option<&[(u32, u32)]> {
+        let field = &self.fields[f];
+        if !field.sentences {
+            return None;
+        }
+        Some(
+            field
+                .doc_sentences
+                .get(doc_id as usize)
+                .map_or(&[][..], Vec::as_slice),
+        )
+    }
+
     /// Declare the facet field table, in facet-id order (builder style:
     /// `Bm25Store::with_fields(&["body"]).with_facets(&["court"])`).
     /// Must be called before any document is added. A store with facet
@@ -2128,6 +2240,9 @@ impl Bm25Store {
         );
         for field in &mut self.fields {
             field.doc_lengths.resize(slot + 1, 0);
+            if field.sentences {
+                field.doc_sentences.resize_with(slot + 1, Vec::new);
+            }
         }
         self.texts.resize_with(slot + 1, || None);
         self.lineages.resize_with(slot + 1, || None);
@@ -2137,6 +2252,17 @@ impl Bm25Store {
             let field = &mut self.fields[fi];
             field.doc_lengths[slot] = analyzed.length;
             field.total_length += u64::from(analyzed.length);
+            // A sentence field takes the document's table verbatim under
+            // the same opt-in rule as positions; the node checked its
+            // shape and refused a sentence-less document upstream.
+            if field.sentences {
+                field.doc_sentences[slot] = analyzed.sentences.unwrap_or_else(|| {
+                    panic!(
+                        "field {:?} keeps sentence spans but the document carried none",
+                        field.name
+                    )
+                });
+            }
             // A positional field takes the document's ordinals verbatim;
             // every other field drops them, which is the whole opt-in:
             // the payload exists only where it was asked for. The shape
@@ -2550,7 +2676,7 @@ impl Bm25Store {
             || !self.integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
-            || self.fields.iter().any(|f| f.positions);
+            || self.fields.iter().any(|f| f.positions || f.sentences);
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -2589,6 +2715,12 @@ impl Bm25Store {
                     .iter()
                     .filter(|f| f.positions)
                     .map(|f| 2 + (POSITIONS_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
+                    .sum::<u64>()
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.sentences)
+                    .map(|f| 2 + (SENTENCES_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
         };
@@ -2704,6 +2836,17 @@ impl Bm25Store {
             positions_offs.push((fi, cursor, total));
             cursor += positions_section_size(field_terms[fi].len() as u64, total);
         }
+        // Kind-8 sentence sections follow the positions sections, one per
+        // sentence field in table order (docs/highlighting.md).
+        let mut sentences_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, field) in self.fields.iter().enumerate() {
+            if !field.sentences {
+                continue;
+            }
+            let total: u64 = field.doc_sentences.iter().map(|s| s.len() as u64).sum();
+            sentences_offs.push((fi, cursor, total));
+            cursor += sentences_section_size(n_slots, total);
+        }
 
         w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
         write_u32(w, self.fields.len() as u32)?;
@@ -2730,6 +2873,7 @@ impl Bm25Store {
                     + self.integers.len()
                     + self.geos.len()
                     + positions_offs.len()
+                    + sentences_offs.len()
                     + usize::from(self.binding.is_some())) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
@@ -2801,6 +2945,14 @@ impl Bm25Store {
                 write_u64(w, off)?;
                 write_u64(w, total)?;
             }
+            for &(fi, off, total) in &sentences_offs {
+                let name = format!("{SENTENCES_ENTRY_PREFIX}{}", self.fields[fi].name);
+                write_u16(w, name.len() as u16)?;
+                w.write_all(name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_SENTENCES])?;
+                write_u64(w, off)?;
+                write_u64(w, total)?;
+            }
             write_binding_entry(w, self.binding.as_ref())?;
         }
         self.write_shared_sections(w, 0)?;
@@ -2868,6 +3020,25 @@ impl Bm25Store {
                 for p in &field.postings[*term] {
                     for &ordinal in &p.positions {
                         write_u32(w, ordinal)?;
+                    }
+                }
+            }
+        }
+        for &(fi, _, total) in &sentences_offs {
+            let field = &self.fields[fi];
+            write_u32(w, n_slots as u32)?;
+            let mut base = 0u64;
+            for slot in 0..n_slots as usize {
+                write_u32(w, u32::try_from(base).expect("sentences exceed u32"))?;
+                base += field.doc_sentences.get(slot).map_or(0, |s| s.len() as u64);
+            }
+            write_u32(w, u32::try_from(base).expect("sentences exceed u32"))?;
+            debug_assert_eq!(base, total);
+            for slot in 0..n_slots as usize {
+                if let Some(spans) = field.doc_sentences.get(slot) {
+                    for &(start, end) in spans {
+                        write_u32(w, start)?;
+                        write_u32(w, end)?;
                     }
                 }
             }
@@ -3005,6 +3176,8 @@ impl Bm25Store {
                 doc_lengths,
                 total_length,
                 positions: false,
+                sentences: false,
+                doc_sentences: Vec::new(),
             }],
             texts,
             lineages,
@@ -3457,6 +3630,21 @@ impl Bm25Index for StoreFieldView<'_> {
             .ok()
             .map(|i| postings[i].positions.clone())
     }
+    fn has_sentences(&self) -> bool {
+        self.field.sentences
+    }
+    fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
+        if !self.field.sentences {
+            return None;
+        }
+        Some(
+            self.field
+                .doc_sentences
+                .get(doc_id as usize)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         let matches: Vec<&String> = self
             .field
@@ -3509,6 +3697,12 @@ impl Bm25Index for Bm25Store {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         self.field(0).posting_positions(term, doc_id)
+    }
+    fn has_sentences(&self) -> bool {
+        self.field(0).has_sentences()
+    }
+    fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
+        self.field(0).doc_sentences(doc_id)
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)
@@ -3818,6 +4012,7 @@ impl Bm25Store {
         let mut geo_metas: Vec<(String, u64)> = Vec::new();
         // (field name, section_off) per kind-7 entry.
         let mut positions_metas: Vec<(String, u64)> = Vec::new();
+        let mut sentences_metas: Vec<(String, u64)> = Vec::new();
         let mut binding_meta: Option<StoredBinding> = None;
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
@@ -3880,6 +4075,16 @@ impl Bm25Store {
                             })?
                             .to_string();
                         positions_metas.push((field, u64_at(base)?));
+                        cursor = base + 16;
+                    }
+                    COLUMN_KIND_SENTENCES => {
+                        let field = name
+                            .strip_prefix(SENTENCES_ENTRY_PREFIX)
+                            .ok_or_else(|| {
+                                invalid("kind-8 entry name lacks the sentences: prefix")
+                            })?
+                            .to_string();
+                        sentences_metas.push((field, u64_at(base)?));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_BINDING => {
@@ -3957,6 +4162,27 @@ impl Bm25Store {
                 .find(|(field, _)| *field == name)
                 .map(|(_, off)| *off);
             let postings = Self::read_v5_shaped_postings(all, d_off, p_off, positions_off)?;
+            // A kind-8 section (validated above) comes back into heap as
+            // one table per slot.
+            let sentences_off = sentences_metas
+                .iter()
+                .find(|(field, _)| *field == name)
+                .map(|(_, off)| *off);
+            let mut doc_sentences: Vec<Vec<(u32, u32)>> = Vec::new();
+            if let Some(off) = sentences_off {
+                let slots = u64::from(u32_at(off)?);
+                let data = off + 4 + 4 * (slots + 1);
+                doc_sentences.reserve(slots as usize);
+                for slot in 0..slots {
+                    let from = u64::from(u32_at(off + 4 + 4 * slot)?);
+                    let to = u64::from(u32_at(off + 4 + 4 * (slot + 1))?);
+                    doc_sentences.push(
+                        (from..to)
+                            .map(|k| Ok((u32_at(data + 8 * k)?, u32_at(data + 8 * k + 4)?)))
+                            .collect::<io::Result<Vec<_>>>()?,
+                    );
+                }
+            }
             fields.push(FieldStore {
                 name,
                 analysis_fingerprint: fingerprint,
@@ -3964,6 +4190,8 @@ impl Bm25Store {
                 doc_lengths,
                 total_length,
                 positions: positions_off.is_some(),
+                sentences: sentences_off.is_some(),
+                doc_sentences,
             });
         }
         // Facet columns (v7 only): dict then per-slot ordinals.
@@ -4144,6 +4372,23 @@ struct FieldSpill {
     /// occurrence after the offset pairs, and `finish` writes the
     /// field's kind-7 section.
     positions: bool,
+    /// Whether this field keeps sentence spans (the spill-side mirror of
+    /// `FieldStore::sentences`): spans stream to a stage file as
+    /// documents arrive, and `finish` writes the field's kind-8 section.
+    sentences: bool,
+    /// The stage, opened on the first document (`docs/highlighting.md`).
+    sentence_stage: Option<SentencesStage>,
+}
+
+/// The ingest-time stage of one sentence field's kind-8 section: spans
+/// stream to a file in slot order as documents arrive, and the per-slot
+/// bases accumulate in heap (4 B per slot, the doc-length table's own
+/// budget).
+struct SentencesStage {
+    writer: io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    bases: Vec<u32>,
+    total: u64,
 }
 
 impl FieldSpill {
@@ -4156,6 +4401,8 @@ impl FieldSpill {
             doc_lengths: Vec::new(),
             total_length: 0,
             positions: false,
+            sentences: false,
+            sentence_stage: None,
         }
     }
 }
@@ -4313,6 +4560,31 @@ impl SpillBuilder {
             self.fields[fi].positions = true;
         }
         self
+    }
+
+    /// Declare the fields that keep sentence spans per document
+    /// (`docs/highlighting.md`), the spill-side twin of
+    /// [`Bm25Store::with_sentences`]: same rules, same panics.
+    pub fn with_sentence_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "sentence fields must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no sentence spans");
+        for name in names {
+            let fi = self
+                .fields
+                .iter()
+                .position(|f| f.name == *name)
+                .unwrap_or_else(|| panic!("sentence field {name:?} is not in the field table"));
+            self.fields[fi].sentences = true;
+        }
+        self
+    }
+
+    /// Whether field `f` keeps sentence spans. Panics when out of range.
+    pub fn field_has_sentences(&self, f: usize) -> bool {
+        self.fields[f].sentences
     }
 
     /// Whether field `f` keeps token positions. Panics when out of range.
@@ -4579,12 +4851,30 @@ impl SpillBuilder {
         );
         // Gap slots (ids consumed by the vector side) are written to the
         // spill NOW so the final texts section is a straight copy.
+        // A sentence field's stage opens on the first document so the
+        // builder chain stays infallible (docs/highlighting.md).
+        for (fi, field) in self.fields.iter_mut().enumerate() {
+            if field.sentences && field.sentence_stage.is_none() {
+                let path = self.dir.join(format!("sentences-f{fi:03}.stage"));
+                field.sentence_stage = Some(SentencesStage {
+                    writer: io::BufWriter::new(std::fs::File::create(&path)?),
+                    path,
+                    bases: Vec::new(),
+                    total: 0,
+                });
+            }
+        }
         while self.fields[0].doc_lengths.len() < slot {
             write_u32(&mut self.texts, u32::MAX)?;
             self.texts_bytes += 4;
             self.text_lens.push(u32::MAX);
             for field in &mut self.fields {
                 field.doc_lengths.push(0);
+                if let Some(stage) = field.sentence_stage.as_mut() {
+                    stage
+                        .bases
+                        .push(u32::try_from(stage.total).expect("sentences exceed u32"));
+                }
             }
             self.lineages.push(None);
         }
@@ -4593,11 +4883,34 @@ impl SpillBuilder {
         self.texts_bytes += 4 + text.len() as u64;
         self.text_lens.push(text.len() as u32);
         self.lineages.push(lineage);
+        // Every sentence field's base for this slot is its running total
+        // BEFORE the slot's spans, whether or not the document carries
+        // the field.
+        for field in &mut self.fields {
+            if let Some(stage) = field.sentence_stage.as_mut() {
+                stage
+                    .bases
+                    .push(u32::try_from(stage.total).expect("sentences exceed u32"));
+            }
+        }
         let mut lengths = vec![0u32; self.fields.len()];
         for (fi, analyzed) in doc.fields.into_iter().enumerate() {
             lengths[fi] = analyzed.length;
             let field = &mut self.fields[fi];
             field.total_length += u64::from(analyzed.length);
+            if let Some(stage) = field.sentence_stage.as_mut() {
+                let spans = analyzed.sentences.as_deref().unwrap_or_else(|| {
+                    panic!(
+                        "field {:?} keeps sentence spans but the document carried none",
+                        field.name
+                    )
+                });
+                for &(start, end) in spans {
+                    write_u32(&mut stage.writer, start)?;
+                    write_u32(&mut stage.writer, end)?;
+                }
+                stage.total += spans.len() as u64;
+            }
             // Same opt-in rule as the heap store: a positional field
             // takes the document's ordinals, every other field drops
             // them. The node validated the shape and refused a
@@ -4876,7 +5189,7 @@ impl SpillBuilder {
             || !self.integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
-            || self.fields.iter().any(|f| f.positions);
+            || self.fields.iter().any(|f| f.positions || f.sentences);
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -4915,6 +5228,12 @@ impl SpillBuilder {
                     .iter()
                     .filter(|f| f.positions)
                     .map(|f| 2 + (POSITIONS_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
+                    .sum::<u64>()
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.sentences)
+                    .map(|f| 2 + (SENTENCES_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
         };
@@ -5016,6 +5335,19 @@ impl SpillBuilder {
             positions_offs.push((fi, cursor, stage.total));
             cursor += positions_section_size(directories[fi].len() as u64, stage.total);
         }
+        // Kind-8 sentence sections after the positions sections, from
+        // the stages the ingest filled — same geometry as the heap
+        // writer (docs/highlighting.md).
+        let n_slots_u64 = self.fields[0].doc_lengths.len() as u64;
+        let mut sentences_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, field) in self.fields.iter().enumerate() {
+            if !field.sentences {
+                continue;
+            }
+            let total = field.sentence_stage.as_ref().map_or(0, |s| s.total);
+            sentences_offs.push((fi, cursor, total));
+            cursor += sentences_section_size(n_slots_u64, total);
+        }
 
         let tmp = path.with_extension("bm25tmp");
         {
@@ -5045,6 +5377,7 @@ impl SpillBuilder {
                         + self.integers.len()
                         + self.geos.len()
                         + positions_offs.len()
+                        + sentences_offs.len()
                         + usize::from(self.binding.is_some())) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
@@ -5113,6 +5446,14 @@ impl SpillBuilder {
                     write_u16(&mut w, name.len() as u16)?;
                     w.write_all(name.as_bytes())?;
                     w.write_all(&[COLUMN_KIND_POSITIONS])?;
+                    write_u64(&mut w, off)?;
+                    write_u64(&mut w, total)?;
+                }
+                for &(fi, off, total) in &sentences_offs {
+                    let name = format!("{SENTENCES_ENTRY_PREFIX}{}", self.fields[fi].name);
+                    write_u16(&mut w, name.len() as u16)?;
+                    w.write_all(name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_SENTENCES])?;
                     write_u64(&mut w, off)?;
                     write_u64(&mut w, total)?;
                 }
@@ -5224,6 +5565,27 @@ impl SpillBuilder {
                 let mut ordinals = std::fs::File::open(&stage.path)?;
                 io::copy(&mut ordinals, &mut w)?;
             }
+            for &(fi, _, total) in &sentences_offs {
+                write_u32(&mut w, n_slots_u64 as u32)?;
+                match self.fields[fi].sentence_stage.as_mut() {
+                    Some(stage) => {
+                        debug_assert_eq!(stage.bases.len() as u64, n_slots_u64);
+                        for &base in &stage.bases {
+                            write_u32(&mut w, base)?;
+                        }
+                        write_u32(&mut w, u32::try_from(total).expect("sentences exceed u32"))?;
+                        stage.writer.flush()?;
+                        let mut spans = std::fs::File::open(&stage.path)?;
+                        io::copy(&mut spans, &mut w)?;
+                    }
+                    None => {
+                        // Declared, no document arrived: an empty table.
+                        for _ in 0..=n_slots_u64 {
+                            write_u32(&mut w, 0)?;
+                        }
+                    }
+                }
+            }
             w.flush()?;
         }
         finalize_v8(&tmp)?;
@@ -5240,6 +5602,12 @@ impl SpillBuilder {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the v4 oracle format cannot carry token positions",
+            ));
+        }
+        if self.fields[0].sentences {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the v4 oracle format cannot carry sentence spans",
             ));
         }
         self.spill_run()?;
@@ -6070,6 +6438,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let mut geos: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
     // (field name, section_off, total occurrences) per kind-7 entry.
     let mut positions: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+    let mut sentences: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     if v7 {
         let n_columns = u64::from(u32_at(cursor)?);
         if n_columns == 0 {
@@ -6164,6 +6533,33 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     positions.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
                     cursor = base + 16;
                 }
+                COLUMN_KIND_SENTENCES => {
+                    // Same rule as kind 7: the entry names a field of
+                    // THIS file's table, once.
+                    let name = column_names.last().expect("pushed above");
+                    let field = name
+                        .strip_prefix(SENTENCES_ENTRY_PREFIX.as_bytes())
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "column {i}: kind {COLUMN_KIND_SENTENCES} must be named \
+                                 {SENTENCES_ENTRY_PREFIX}<field>"
+                            ))
+                        })?;
+                    if !names.iter().any(|n| n == field) {
+                        return Err(invalid(format!(
+                            "column {i}: sentences for field {:?}, which the field table lacks",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    if sentences.iter().any(|(f, _, _)| f == field) {
+                        return Err(invalid(format!(
+                            "column {i}: field {:?} has two sentences entries",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    sentences.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    cursor = base + 16;
+                }
                 COLUMN_KIND_BINDING => {
                     // The reserved binding record: pinned name, inline
                     // payload, no sections. Duplicates fall to the
@@ -6221,6 +6617,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         .or_else(|| integers.first().map(|c| c.2))
         .or_else(|| geos.first().map(|c| c.4))
         .or_else(|| positions.first().map(|p| p.1))
+        .or_else(|| sentences.first().map(|s| s.1))
         .unwrap_or(file_len);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
@@ -6690,10 +7087,55 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             )));
         }
         let group_end = off + positions_section_size(n_terms, *total);
-        let expected_end = positions.get(i + 1).map_or(file_len, |p| p.1);
+        let expected_end = positions
+            .get(i + 1)
+            .map(|p| p.1)
+            .or_else(|| sentences.first().map(|s| s.1))
+            .unwrap_or(file_len);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "positions {i}: section does not end at the next section's start"
+            )));
+        }
+        expected_start = group_end;
+    }
+    // Sentence groups (docs/highlighting.md) after the positions groups,
+    // tiling to EOF: slot count equals the file's, base table monotone
+    // from 0 to the declared total, size exactly the geometry's. The
+    // spans are payload (CRC-covered), left on disk at open.
+    let n_slots = u64::from(u32_at(12)?);
+    for (i, (field_name, off, total)) in sentences.iter().enumerate() {
+        if *off != expected_start {
+            return Err(invalid(format!(
+                "sentences {i}: section does not start at the previous section's end"
+            )));
+        }
+        if u64::from(u32_at(*off)?) != n_slots {
+            return Err(invalid(format!(
+                "sentences {i}: slot count disagrees with the file's for field {:?}",
+                String::from_utf8_lossy(field_name)
+            )));
+        }
+        let mut prev = 0u64;
+        for d in 0..=n_slots {
+            let base = u64::from(u32_at(off + 4 + 4 * d)?);
+            if base < prev {
+                return Err(invalid(format!(
+                    "sentences {i}: base table not monotone at slot {d}"
+                )));
+            }
+            prev = base;
+        }
+        if prev != *total {
+            return Err(invalid(format!(
+                "sentences {i}: base table ends at {prev} but the entry declares {total}"
+            )));
+        }
+        let group_end = off + sentences_section_size(n_slots, *total);
+        let expected_end = sentences.get(i + 1).map_or(file_len, |s| s.1);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "sentences {i}: section does not end at the next section's start"
             )));
         }
         expected_start = group_end;
@@ -6731,6 +7173,10 @@ struct FieldSlice {
     /// carries one (`docs/phrase-proximity.md`); `None` is a field
     /// without token positions, which refuses phrase and slop by name.
     positions_off: Option<u64>,
+    /// Start of this field's kind-8 sentence section, when the file
+    /// carries one (`docs/highlighting.md`); `None` refuses sentence-mode
+    /// snippets by name.
+    sentences_off: Option<u64>,
 }
 
 /// Per-facet read state of one open v7 file: the decoded value
@@ -7406,6 +7852,7 @@ impl Bm25Reader {
                 n_terms,
                 run_base: 0,
                 positions_off: None,
+                sentences_off: None,
             }],
             facets: Vec::new(),
             numerics: Vec::new(),
@@ -7477,6 +7924,7 @@ impl Bm25Reader {
                 n_terms,
                 run_base: postings_off,
                 positions_off: None,
+                sentences_off: None,
             });
             cursor = base + 40;
         }
@@ -7624,6 +8072,17 @@ impl Bm25Reader {
                             .position(|f| f.name == field)
                             .expect("validation tied the kind-7 entry to a field");
                         fields[fi].positions_off = Some(u64_at(base));
+                        cursor = base + 16;
+                    }
+                    COLUMN_KIND_SENTENCES => {
+                        let field = name
+                            .strip_prefix(SENTENCES_ENTRY_PREFIX)
+                            .expect("validation checked the kind-8 name");
+                        let fi = fields
+                            .iter()
+                            .position(|f| f.name == field)
+                            .expect("validation tied the kind-8 entry to a field");
+                        fields[fi].sentences_off = Some(u64_at(base));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_BINDING => {
@@ -7774,6 +8233,31 @@ impl Bm25Reader {
     /// Whether field `f` carries a kind-7 positions section.
     pub fn field_has_positions(&self, f: usize) -> bool {
         self.fields[f].positions_off.is_some()
+    }
+
+    /// Whether field `f` carries a kind-8 sentence section.
+    pub fn field_has_sentences(&self, f: usize) -> bool {
+        self.fields[f].sentences_off.is_some()
+    }
+
+    /// Field `f`'s sentence spans for `doc_id`, read from the map:
+    /// `None` when the field has no section, an empty table for a slot
+    /// past the section's count or without a document.
+    pub fn field_doc_sentences(&self, f: usize, doc_id: u32) -> Option<Vec<(u32, u32)>> {
+        let section = self.fields[f].sentences_off? as usize;
+        let n_slots = self.u32_at(section) as usize;
+        let slot = doc_id as usize;
+        if slot >= n_slots {
+            return Some(Vec::new());
+        }
+        let from = self.u32_at(section + 4 + 4 * slot) as usize;
+        let to = self.u32_at(section + 4 + 4 * (slot + 1)) as usize;
+        let data = section + 4 + 4 * (n_slots + 1);
+        Some(
+            (from..to)
+                .map(|k| (self.u32_at(data + 8 * k), self.u32_at(data + 8 * k + 4)))
+                .collect(),
+        )
     }
 
     fn u32_at(&self, off: usize) -> u32 {
@@ -8393,6 +8877,18 @@ impl Bm25Index for FieldView<'_> {
     fn has_positions(&self) -> bool {
         self.field.positions_off.is_some()
     }
+    fn has_sentences(&self) -> bool {
+        self.field.sentences_off.is_some()
+    }
+    fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
+        let fi = self
+            .reader
+            .fields
+            .iter()
+            .position(|f| std::ptr::eq(f, self.field))
+            .expect("a field view borrows one of its reader's fields");
+        self.reader.field_doc_sentences(fi, doc_id)
+    }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         let r = self.reader;
         if !r.v5_runs {
@@ -8491,6 +8987,12 @@ impl Bm25Index for Bm25Reader {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         self.field(0).posting_positions(term, doc_id)
+    }
+    fn has_sentences(&self) -> bool {
+        self.field(0).has_sentences()
+    }
+    fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
+        self.field(0).doc_sentences(doc_id)
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)
@@ -8827,11 +9329,13 @@ mod tests {
             let positions: DocPositions = body.iter().map(|(_, ords)| ords.to_vec()).collect();
             let length = terms.iter().map(|(_, tf, _)| *tf).sum();
             let mut fields = vec![AnalyzedField {
+                sentences: None,
                 terms,
                 length,
                 positions: Some(positions),
             }];
             fields.push(AnalyzedField {
+                sentences: None,
                 terms: name
                     .iter()
                     .map(|(t, tf)| (t.to_string(), *tf, Vec::new()))
@@ -9949,6 +10453,7 @@ mod tests {
             }
             let body_len: u32 = body.iter().map(|t| t.1).sum();
             let mut fields = vec![AnalyzedField {
+                sentences: None,
                 terms: body,
                 length: body_len,
                 positions: None,
@@ -9957,6 +10462,7 @@ mod tests {
                 // "smith" and "court" appear in BOTH fields, with
                 // different postings; "n*" terms only here.
                 fields.push(AnalyzedField {
+                    sentences: None,
                     terms: vec![
                         ("smith".to_string(), 1, vec![(0, 5)]),
                         ("court".to_string(), 1, Vec::new()),

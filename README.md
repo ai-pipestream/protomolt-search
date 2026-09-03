@@ -372,6 +372,14 @@ ordering (`court < "b"`) and `startsWith` compile to one ordinal range;
 a file with an older first-seen dictionary serves equality and refuses
 ordering by name. See [`docs/prefix-terms.md`](docs/prefix-terms.md).
 
+Server-side highlighting (`HighlightSpec` on `Bm25Search` and on the
+lexical `Query` leaf) returns sentence-bounded snippets per hit with the
+occurrence spans merged, cut by the shard from the stored text and the
+sentence spans it kept at ingest (`--sentence-fields=body`); no analyzer
+runs on the query path, offsets are UTF-16 units of the original text,
+and a field without spans refuses sentence mode by name (window mode
+cuts at whitespace instead). See [`docs/highlighting.md`](docs/highlighting.md).
+
 Select native analysis with `--analysis-addr=native` or
 `analysis_addr = "native"`. A single-shard `both` process propagates that
 setting to its shard. Multi-shard node configurations set `analysis_addr` on

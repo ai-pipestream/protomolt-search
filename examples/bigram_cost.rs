@@ -3,11 +3,12 @@
 //! Reads NDJSON records with a `text` field (the CourtListener chunk files
 //! under `/work/court-corpus` have that shape), analyzes each natively
 //! under `body_spec`, and writes three shards through the bounded-memory
-//! spill builder: body only, body with token positions, and body with its
-//! bigram column. It then reports every section's bytes and the bytes per
-//! document each payload adds, read back from the files' integrity
-//! tables — the same accounting the cost gate in
-//! `tests/phrase_proximity.rs` pins on a synthetic corpus.
+//! spill builder: body only, body with token positions, body with its
+//! bigram column, and body with sentence spans (`docs/highlighting.md`).
+//! It then reports every section's bytes and the bytes per document each
+//! payload adds, read back from the files' integrity tables — the same
+//! accounting the cost gates in `tests/phrase_proximity.rs` and
+//! `tests/highlighting.rs` pin on synthetic corpora.
 //!
 //! ```bash
 //! cargo run --release --example bigram_cost -- \
@@ -83,16 +84,17 @@ fn main() {
         ("plain", &["body"][..]),
         ("positions", &["body"][..]),
         ("bigrams", &["body", "body.bigrams"][..]),
+        ("sentences", &["body"][..]),
     ];
     let mut builders: Vec<SpillBuilder> = names
         .iter()
         .map(|(tag, fields)| {
             let b = SpillBuilder::create_with_fields(&out.join(format!("build-{tag}")), fields)
                 .expect("spill dir");
-            if *tag == "positions" {
-                b.with_position_fields(&["body"])
-            } else {
-                b
+            match *tag {
+                "positions" => b.with_position_fields(&["body"]),
+                "sentences" => b.with_sentence_fields(&["body"]),
+                _ => b,
             }
         })
         .collect();
@@ -103,6 +105,7 @@ fn main() {
     let mut occurrences = 0u64;
     let mut distinct_terms_per_doc = 0u64;
     let mut bigram_postings = 0u64;
+    let mut sentences = 0u64;
     let mut text_bytes = 0u64;
     let started = std::time::Instant::now();
     for line in std::io::BufReader::new(file).lines() {
@@ -129,6 +132,7 @@ fn main() {
         distinct_terms_per_doc += body.terms.len() as u64;
         let column = derive_bigrams(&body).expect("native analysis carries positions");
         bigram_postings += column.terms.len() as u64;
+        sentences += body.sentences.as_ref().map_or(0, |s| s.len() as u64);
         text_bytes += text.len() as u64;
 
         builders[0]
@@ -142,6 +146,11 @@ fn main() {
         builders[1]
             .add_document_with_lineage(docs, text.clone(), doc, None)
             .expect("positional add");
+        let mut with_sentences = AnalyzedDoc::body(body.terms.clone(), body.length);
+        with_sentences.fields[0].sentences = body.sentences.clone();
+        builders[3]
+            .add_document_with_lineage(docs, text.clone(), with_sentences, None)
+            .expect("sentence add");
         let mut both = AnalyzedDoc::body(body.terms, body.length);
         both.fields.push(column);
         builders[2]
@@ -160,11 +169,12 @@ fn main() {
     let d = f64::from(docs.max(1));
     println!(
         "documents {docs}  text {:.1} B/doc  distinct terms {:.1}/doc  occurrences {:.1}/doc  \
-         bigram postings {:.1}/doc  analyzed+built in {:.1}s",
+         bigram postings {:.1}/doc  sentences {:.2}/doc  analyzed+built in {:.1}s",
         text_bytes as f64 / d,
         distinct_terms_per_doc as f64 / d,
         occurrences as f64 / d,
         bigram_postings as f64 / d,
+        sentences as f64 / d,
         analyzed_in.as_secs_f64()
     );
     let mut totals = Vec::new();
@@ -192,7 +202,8 @@ fn main() {
     println!(
         "\nbody index (lengths+postings+directory) {:.1} B/doc\n\
          positions add {:.1} B/doc (+{:.1}% of the body index, {:.1}% of the file)\n\
-         bigram column adds {:.1} B/doc (+{:.1}% of the body index, {:.1}% of the file)",
+         bigram column adds {:.1} B/doc (+{:.1}% of the body index, {:.1}% of the file)\n\
+         sentence spans add {:.1} B/doc (+{:.1}% of the body index, {:.1}% of the file)",
         body_postings as f64 / d,
         (totals[1] - totals[0]) as f64 / d,
         100.0 * (totals[1] - totals[0]) as f64 / body_postings as f64,
@@ -200,6 +211,9 @@ fn main() {
         (totals[2] - totals[0]) as f64 / d,
         100.0 * (totals[2] - totals[0]) as f64 / body_postings as f64,
         100.0 * (totals[2] - totals[0]) as f64 / totals[0] as f64,
+        (totals[3] - totals[0]) as f64 / d,
+        100.0 * (totals[3] - totals[0]) as f64 / body_postings as f64,
+        100.0 * (totals[3] - totals[0]) as f64 / totals[0] as f64,
     );
     println!("\nfiles left under {}", out.display());
 }

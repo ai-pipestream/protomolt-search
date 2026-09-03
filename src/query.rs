@@ -585,6 +585,7 @@ async fn execute_recursive_boolean(
     let mut hits: Vec<QueryHit> = evaluated
         .into_iter()
         .map(|(doc_id, hit)| QueryHit {
+            snippets: Vec::new(),
             projected: Vec::new(),
             doc_id,
             score: hit.score,
@@ -821,6 +822,23 @@ pub async fn execute(
         .selection
         .as_ref()
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
+    // Snippets are cut around the lexical leg's occurrence spans, which
+    // only the single lexical selection carries to the client; every
+    // other shape — the boolean planner included — refuses rather than
+    // returning hits without them (docs/highlighting.md).
+    let single_lexical = matches!(
+        selection.node.as_ref(),
+        Some(selection_query::Node::Search(SearchQuery {
+            query: Some(search_query::Query::Lexical(_)),
+            ..
+        }))
+    );
+    if req.highlight.is_some() && !single_lexical {
+        return Err(refuse(
+            "highlight is served for the single lexical selection only: no other shape \
+             carries the occurrence spans snippets are cut around",
+        ));
+    }
     if let Some(selection_query::Node::Boolean(boolean)) = selection.node.as_ref() {
         let boolean = boolean.clone();
         return execute_recursive_boolean(coordinator, req, &boolean).await;
@@ -1061,6 +1079,7 @@ pub async fn execute(
                 .iter()
                 .enumerate()
                 .map(|(i, &doc_id)| QueryHit {
+                    snippets: Vec::new(),
                     projected: Vec::new(),
                     doc_id,
                     // No relevance score exists on this route; the id
@@ -1114,6 +1133,7 @@ pub async fn execute(
                     geo_filters: plan.geo_filters.clone(),
                     filter,
                     projections: req.projections.clone(),
+                    highlight: req.highlight.clone(),
                     ..Default::default()
                 }))
                 .await?
@@ -1125,6 +1145,7 @@ pub async fn execute(
                 .hits
                 .iter()
                 .map(|h| QueryHit {
+                    snippets: h.snippets.clone(),
                     projected: h.projected.clone(),
                     doc_id: h.doc_id,
                     score: h.score,
@@ -1170,6 +1191,7 @@ pub async fn execute(
                 .hits
                 .iter()
                 .map(|h| QueryHit {
+                    snippets: Vec::new(),
                     projected: Vec::new(),
                     doc_id: h.vector_id,
                     score: h.score,
@@ -1301,6 +1323,7 @@ pub async fn execute(
                             }
                         }
                         QueryHit {
+                            snippets: Vec::new(),
                             projected: Vec::new(),
                             doc_id: h.doc_id,
                             // Cascade's final order is the rerank leg's:
@@ -1350,6 +1373,7 @@ pub async fn execute(
                             }
                         }
                         QueryHit {
+                            snippets: Vec::new(),
                             projected: Vec::new(),
                             doc_id: h.doc_id,
                             score: h.fused_score,

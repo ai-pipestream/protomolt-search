@@ -213,6 +213,10 @@ pub struct NodeConfig {
     /// active file never declared rather than storing a half-positional
     /// column.
     pub position_fields: Vec<String>,
+    /// Fields whose sentence spans are stored per document for
+    /// server-side snippets (`docs/highlighting.md`). Only the body has
+    /// stored text to cut from, so the list is `["body"]` or empty.
+    pub sentence_fields: Vec<String>,
     /// Source fields whose adjacent-token pairs are derived into a
     /// bigram column named `<source>.bigrams`, which must itself be in
     /// `bm25_fields`. Derived at ingest from the source's positions, so
@@ -271,6 +275,7 @@ impl Default for NodeConfig {
             integer_fields: Vec::new(),
             geo_fields: Vec::new(),
             position_fields: Vec::new(),
+            sentence_fields: Vec::new(),
             bigram_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
@@ -393,6 +398,17 @@ impl Bm25Shard {
             Bm25Shard::Building(s) => s.field_has_positions(f),
             Bm25Shard::Spilling(s) => s.field_has_positions(f),
             Bm25Shard::Resident(r) => r.field_has_positions(f),
+        }
+    }
+
+    /// Whether field `f` keeps sentence spans (`docs/highlighting.md`)
+    /// in this shard's active storage — the declaration on a builder,
+    /// the kind-8 entry on a file.
+    fn field_has_sentences(&self, f: usize) -> bool {
+        match self {
+            Bm25Shard::Building(s) => s.field_has_sentences(f),
+            Bm25Shard::Spilling(s) => s.field_has_sentences(f),
+            Bm25Shard::Resident(r) => r.field_has_sentences(f),
         }
     }
 
@@ -3392,6 +3408,19 @@ impl NodeServiceImpl {
                 )));
             }
         }
+        let sentences: Vec<&str> = self
+            .config
+            .sentence_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for name in &sentences {
+            if !names.contains(name) {
+                return Err(Status::failed_precondition(format!(
+                    "sentence field {name:?} is not in this shard's BM25 field table {names:?}"
+                )));
+            }
+        }
         match self.config.index_path.as_ref() {
             Some(p) => {
                 let dir = bm25_build_dir(&storage_paths(p, generation).2);
@@ -3404,7 +3433,8 @@ impl NodeServiceImpl {
                                 .with_map_numeric_fields(&map_numerics)
                                 .with_integer_fields(&integers)
                                 .with_geo_fields(&geos)
-                                .with_position_fields(&positions),
+                                .with_position_fields(&positions)
+                                .with_sentence_fields(&sentences),
                         )
                     })
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
@@ -3417,7 +3447,8 @@ impl NodeServiceImpl {
                     .with_map_numerics(&map_numerics)
                     .with_integers(&integers)
                     .with_geos(&geos)
-                    .with_positions(&positions),
+                    .with_positions(&positions)
+                    .with_sentences(&sentences),
             )),
         }
     }
@@ -4585,28 +4616,54 @@ impl NodeServiceImpl {
                     }
                     docs
                 };
+                let highlight = highlight_plan(store, req.highlight.as_ref())?;
+                let body = store.field_name(0);
+                let text_index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
                 docs.into_iter()
-                    .map(|doc| Bm25Hit {
-                        projected: Vec::new(),
-                        doc_id: self.config.slot_offset + u64::from(doc.doc_id),
-                        score: doc.score as f32,
-                        terms: doc
-                            .term_offsets
-                            .into_iter()
-                            .map(|(fi, ti, offsets)| {
-                                let leg = &req.fields[leg_of_view[fi]];
-                                TermOccurrences {
-                                    term: leg.terms[ti].clone(),
-                                    field: leg.field.clone(),
-                                    offsets: offsets
-                                        .into_iter()
-                                        .map(|(start, end)| OffsetSpan { start, end })
-                                        .collect(),
-                                }
-                            })
-                            .collect(),
+                    .map(|doc| -> Result<Bm25Hit, Status> {
+                        let snippets = match highlight.as_ref() {
+                            Some(plan) => {
+                                // Body occurrences only (the stored text
+                                // is the body's); a term is distinct per
+                                // leg, so the key carries the leg.
+                                let occurrences: Vec<(usize, (u32, u32))> = doc
+                                    .term_offsets
+                                    .iter()
+                                    .filter(|(fi, _, _)| req.fields[leg_of_view[*fi]].field == body)
+                                    .flat_map(|(fi, ti, offsets)| {
+                                        let key = (leg_of_view[*fi] << 20) | *ti;
+                                        offsets.iter().map(move |&span| (key, span))
+                                    })
+                                    .collect();
+                                cut_snippets(plan, text_index, body, doc.doc_id, &occurrences)?
+                            }
+                            None => Vec::new(),
+                        };
+                        Ok(Bm25Hit {
+                            snippets,
+                            projected: Vec::new(),
+                            doc_id: self.config.slot_offset + u64::from(doc.doc_id),
+                            score: doc.score as f32,
+                            terms: doc
+                                .term_offsets
+                                .into_iter()
+                                .map(|(fi, ti, offsets)| {
+                                    let leg = &req.fields[leg_of_view[fi]];
+                                    TermOccurrences {
+                                        term: leg.terms[ti].clone(),
+                                        field: leg.field.clone(),
+                                        offsets: offsets
+                                            .into_iter()
+                                            .map(|(start, end)| OffsetSpan { start, end })
+                                            .collect(),
+                                    }
+                                })
+                                .collect(),
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, Status>>()?
             }
             _ => {
                 facets = req
@@ -5309,17 +5366,103 @@ pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> Stri
     crate::sha256::to_hex(&hasher.finalize())
 }
 
+/// Validate a request's `HighlightSpec` against this shard's storage
+/// (`docs/highlighting.md`): every named field must be the one with
+/// stored text (the body), and sentence mode needs the body's kind-8
+/// table. Both refuse by name before any hit is scored, so a shard with
+/// no matching document refuses exactly like one with a thousand.
+fn highlight_plan(
+    store: &Bm25Shard,
+    spec: Option<&crate::pb::HighlightSpec>,
+) -> Result<Option<crate::highlight::Plan>, Status> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let plan = crate::highlight::Plan::from_spec(spec)?;
+    let body = store.field_name(0);
+    for field in &plan.fields {
+        if field != body {
+            return Err(Status::invalid_argument(format!(
+                "highlight field {field:?}: snippets are cut from stored text, and only the \
+                 body's text ({body:?}) is stored on this shard"
+            )));
+        }
+    }
+    if plan.mode == crate::highlight::Mode::Sentence && !store.field_has_sentences(0) {
+        return Err(Status::failed_precondition(format!(
+            "field {body:?} on this shard stores no sentence spans, so sentence-mode snippets \
+             cannot be cut; ingest with --sentence-fields={body}, or ask for \
+             HIGHLIGHT_MODE_WINDOW, which cuts at whitespace without them"
+        )));
+    }
+    Ok(Some(plan))
+}
+
+/// Cut one hit's snippets from the shard's stored text and sentence
+/// table, around the occurrence spans the scorer already collected
+/// (`(distinct term key, span)` pairs). No analyzer runs here.
+fn cut_snippets(
+    plan: &crate::highlight::Plan,
+    index: &dyn Bm25Index,
+    field: &str,
+    local: u32,
+    occurrences: &[(usize, (u32, u32))],
+) -> Result<Vec<crate::pb::Snippet>, Status> {
+    if occurrences.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = index.text(local).ok_or_else(|| {
+        Status::internal(format!(
+            "highlight: hit {local} has no stored text to cut snippets from"
+        ))
+    })?;
+    let sentences = match plan.mode {
+        crate::highlight::Mode::Sentence => index.doc_sentences(local),
+        crate::highlight::Mode::Window => None,
+    };
+    let cut = crate::highlight::snippets(
+        &text,
+        sentences.as_deref(),
+        occurrences,
+        plan.mode,
+        plan.max_snippets,
+        plan.max_chars,
+    )?;
+    Ok(cut
+        .into_iter()
+        .map(|s| crate::pb::Snippet {
+            field: field.to_string(),
+            text: s.text,
+            start: s.start,
+            end: s.end,
+            highlights: s
+                .highlights
+                .into_iter()
+                .map(|(start, end)| OffsetSpan { start, end })
+                .collect(),
+            cut: crate::highlight::Plan::wire_cut(s.cut),
+            sentence_index: s.sentence_index.map(|i| i as u32),
+        })
+        .collect())
+}
+
 /// The optional sidecar layers a document's specs ask its analysis
 /// session for — the session-identity companion to the reopen
 /// condition (a change to either spec reopens the session).
 fn session_layers(
     doc: &AddDocumentsRequest,
     phrase_index: Option<&crate::phrases::PhraseIndex>,
+    sentence_fields: &[String],
 ) -> crate::analyzer::SessionLayers {
     crate::analyzer::SessionLayers {
         quality: quality_wanted(doc.quality.as_ref()),
         geography: geography_wanted(doc.geography.as_ref()),
         entities: phrase_index.is_some_and(crate::phrases::PhraseIndex::include_ner),
+        // A node that stores sentence spans asks every session for the
+        // layer (docs/highlighting.md): the node's configuration, not
+        // the document, because the document's own record is filled
+        // from that configuration only after analysis is requested.
+        sentences: !sentence_fields.is_empty(),
     }
 }
 
@@ -5785,11 +5928,29 @@ impl NodeServiceImpl {
                 field: bigram_field_name(source),
             })
             .collect();
-        let fresh = doc.position_fields.is_empty() && doc.bigram_fields.is_empty();
+        let fresh = doc.position_fields.is_empty()
+            && doc.bigram_fields.is_empty()
+            && doc.sentence_fields.is_empty();
         if fresh {
             doc.position_fields = self.config.position_fields.clone();
             doc.bigram_fields = configured_bigrams.clone();
+            doc.sentence_fields = self.config.sentence_fields.clone();
         } else {
+            let mut held: Vec<&str> = doc.sentence_fields.iter().map(String::as_str).collect();
+            let mut want: Vec<&str> = self
+                .config
+                .sentence_fields
+                .iter()
+                .map(String::as_str)
+                .collect();
+            held.sort_unstable();
+            want.sort_unstable();
+            if held != want {
+                return Err(Status::failed_precondition(format!(
+                    "document records sentence spans on {held:?} but this node keeps them on \
+                     {want:?}; rebuild or replay with the matching --sentence-fields"
+                )));
+            }
             let mut held: Vec<&str> = doc.position_fields.iter().map(String::as_str).collect();
             let mut want: Vec<&str> = self
                 .config
@@ -5823,7 +5984,10 @@ impl NodeServiceImpl {
                 )));
             }
         }
-        if doc.position_fields.is_empty() && doc.bigram_fields.is_empty() {
+        if doc.position_fields.is_empty()
+            && doc.bigram_fields.is_empty()
+            && doc.sentence_fields.is_empty()
+        {
             return Ok((doc, analyzed));
         }
         let table = &self.config.bm25_fields;
@@ -5885,6 +6049,29 @@ impl NodeServiceImpl {
         for name in &doc.position_fields {
             let fi = field_index(name)?;
             require_positions(&analyzed, fi, "positional field")?;
+        }
+        // A sentence field needs the sentence layer on every document,
+        // shaped so the query path can trust it: sorted, non-overlapping,
+        // and covering every occurrence (docs/highlighting.md). A
+        // document with terms but no sentence covering them is a broken
+        // analysis contract, refused here, not a snippet-less hit later.
+        for name in &doc.sentence_fields {
+            let fi = field_index(name)?;
+            let Some(field) = analyzed.fields.get(fi) else {
+                continue;
+            };
+            if field.sentences.is_none() {
+                return Err(Status::failed_precondition(format!(
+                    "sentence field {name:?}: the analysis carried no sentence layer, so the \
+                     document cannot be indexed with sentence spans; the analysis backend must \
+                     return its sentence layer (the sidecar's sentence_detection)"
+                )));
+            }
+            field.check_sentences().map_err(|error| {
+                Status::failed_precondition(format!(
+                    "sentence field {name:?}: malformed sentence spans: {error}"
+                ))
+            })?;
         }
         for bigram in &doc.bigram_fields {
             let source = field_index(&bigram.source)?;
@@ -6093,6 +6280,17 @@ impl NodeServiceImpl {
                     return Err(Status::failed_precondition(format!(
                         "shard field {name:?} predates token positions (its storage declares \
                          none); rebuild or reshard the generation before positional ingest"
+                    )));
+                }
+            }
+            for name in &doc.sentence_fields {
+                let Some(fi) = self.config.bm25_fields.iter().position(|n| n == name) else {
+                    continue; // refused upstream
+                };
+                if fi < shard.field_count() && !shard.field_has_sentences(fi) {
+                    return Err(Status::failed_precondition(format!(
+                        "shard field {name:?} predates sentence spans (its storage declares \
+                         none); rebuild or reshard the generation before sentence ingest"
                     )));
                 }
             }
@@ -6830,7 +7028,11 @@ impl NodeServiceImpl {
                             addr,
                             doc.analysis.as_ref(),
                             self.vocab.clone(),
-                            session_layers(&doc, self.phrase_index.as_deref()),
+                            session_layers(
+                                &doc,
+                                self.phrase_index.as_deref(),
+                                &self.config.sentence_fields,
+                            ),
                         )
                         .await?;
                         spec = doc.analysis.clone();
@@ -8652,7 +8854,11 @@ impl NodeService for NodeServiceImpl {
                 &addr,
                 first.req.analysis.as_ref(),
                 self.vocab.clone(),
-                session_layers(&first.req, self.phrase_index.as_deref()),
+                session_layers(
+                    &first.req,
+                    self.phrase_index.as_deref(),
+                    &self.config.sentence_fields,
+                ),
             )
             .await
             {
@@ -8856,7 +9062,11 @@ impl NodeService for NodeServiceImpl {
                 &addr,
                 first.req.analysis.as_ref(),
                 self.vocab.clone(),
-                session_layers(&first.req, self.phrase_index.as_deref()),
+                session_layers(
+                    &first.req,
+                    self.phrase_index.as_deref(),
+                    &self.config.sentence_fields,
+                ),
             )
             .await
             {
@@ -8934,6 +9144,7 @@ impl NodeService for NodeServiceImpl {
                                 store.next_doc_id(),
                             );
                             crate::pb::FieldStats {
+                                sentences: store.field_has_sentences(fi),
                                 total_doc_length,
                                 doc_frequencies,
                                 known: true,
@@ -8941,6 +9152,7 @@ impl NodeService for NodeServiceImpl {
                             }
                         }
                         None => crate::pb::FieldStats {
+                            sentences: false,
                             total_doc_length: 0,
                             doc_frequencies: vec![0; ft.terms.len()],
                             known: false,
@@ -8966,6 +9178,7 @@ impl NodeService for NodeServiceImpl {
                 req.fields
                     .iter()
                     .map(|ft| crate::pb::FieldStats {
+                        sentences: false,
                         total_doc_length: 0,
                         doc_frequencies: vec![0; ft.terms.len()],
                         known: false,
@@ -10064,33 +10277,51 @@ impl NodeServiceImpl {
                     }
                     docs
                 };
+                let highlight = highlight_plan(store, req.highlight.as_ref())?;
+                let body = store.field_name(0);
                 docs.into_iter()
-                    .map(|doc| Bm25Hit {
-                        projected: resolved_projections
-                            .iter()
-                            .map(|rv| {
-                                projected_value(
-                                    crate::values::eval(rv, doc.doc_id, &numeric_read),
-                                    store,
-                                )
-                            })
-                            .collect(),
-                        doc_id: self.config.slot_offset + u64::from(doc.doc_id),
-                        score: doc.score as f32,
-                        terms: doc
-                            .term_offsets
-                            .into_iter()
-                            .map(|(ti, offsets)| TermOccurrences {
-                                term: req.terms[ti].clone(),
-                                offsets: offsets
-                                    .into_iter()
-                                    .map(|(start, end)| OffsetSpan { start, end })
-                                    .collect(),
-                                field: String::new(),
-                            })
-                            .collect(),
+                    .map(|doc| -> Result<Bm25Hit, Status> {
+                        let snippets = match highlight.as_ref() {
+                            Some(plan) => {
+                                let occurrences: Vec<(usize, (u32, u32))> = doc
+                                    .term_offsets
+                                    .iter()
+                                    .flat_map(|(ti, offsets)| {
+                                        offsets.iter().map(move |&span| (*ti, span))
+                                    })
+                                    .collect();
+                                cut_snippets(plan, index, body, doc.doc_id, &occurrences)?
+                            }
+                            None => Vec::new(),
+                        };
+                        Ok(Bm25Hit {
+                            snippets,
+                            projected: resolved_projections
+                                .iter()
+                                .map(|rv| {
+                                    projected_value(
+                                        crate::values::eval(rv, doc.doc_id, &numeric_read),
+                                        store,
+                                    )
+                                })
+                                .collect(),
+                            doc_id: self.config.slot_offset + u64::from(doc.doc_id),
+                            score: doc.score as f32,
+                            terms: doc
+                                .term_offsets
+                                .into_iter()
+                                .map(|(ti, offsets)| TermOccurrences {
+                                    term: req.terms[ti].clone(),
+                                    offsets: offsets
+                                        .into_iter()
+                                        .map(|(start, end)| OffsetSpan { start, end })
+                                        .collect(),
+                                    field: String::new(),
+                                })
+                                .collect(),
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, Status>>()?
             }
             _ => Vec::new(),
         };
@@ -10168,6 +10399,7 @@ impl NodeServiceImpl {
                 let hits = bm25::score_candidates(index, &req.terms, &stats, params, &local)
                     .into_iter()
                     .map(|doc| Bm25Hit {
+                        snippets: Vec::new(),
                         projected: Vec::new(),
                         doc_id: offset + u64::from(doc.doc_id),
                         score: chain.eval(doc.score, doc.doc_id, &numeric_read) as f32,

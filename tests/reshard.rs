@@ -119,6 +119,7 @@ async fn ingest(
     tokio::spawn(async move {
         for i in 0..docs {
             tx.send(AddDocumentsRequest {
+                sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),
                 map_facets: Vec::new(),
@@ -1058,6 +1059,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     tokio::spawn(async move {
         for (i, name) in names_feed.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),
                 map_facets: Vec::new(),

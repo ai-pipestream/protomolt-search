@@ -1073,6 +1073,7 @@ mod tests {
         wal_record::Op::AddDocuments(LoggedAddDocuments {
             first_id: id,
             documents: vec![AddDocumentsRequest {
+                sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),
                 map_facets: Vec::new(),

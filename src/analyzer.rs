@@ -407,9 +407,19 @@ fn native_analysis_with_spec(
         positions.push(vector.positions);
     }
     // The native tokenizer numbers its own tokens, so positions come
-    // out of the same pass as the terms — there is no second walk.
+    // out of the same pass as the terms — there is no second walk. Its
+    // newline sentence detector runs in that pass too, so every native
+    // analysis carries a sentence table (docs/highlighting.md).
+    let mut doc = AnalyzedDoc::body_positioned(terms, positions, analyzed.length);
+    doc.fields[0].sentences = Some(
+        analyzed
+            .sentences
+            .iter()
+            .map(|span| (span.start, span.end))
+            .collect(),
+    );
     Ok(NativeAnalysis {
-        doc: AnalyzedDoc::body_positioned(terms, positions, analyzed.length),
+        doc,
         tokens: analyzed.tokens,
     })
 }
@@ -571,6 +581,11 @@ pub struct SessionLayers {
     /// Named entity mentions for materialization into a product-owned map
     /// column. Requires a configured sidecar NER model.
     pub entities: bool,
+    /// The sentence layer (`docs/highlighting.md`): spans in original-text
+    /// coordinates, stored per document for sentence-bounded snippets.
+    /// Model-free by default on the sidecar (its newline detector) and
+    /// one traversal of text it already holds.
+    pub sentences: bool,
 }
 
 /// Maps `spec` straight onto the sidecar's `AnalysisOptions`: term vectors
@@ -616,6 +631,9 @@ fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> Analy
         // well. Availability was preflighted at session open.
         ner: layers.entities || layers.geography,
         geo: layers.geography,
+        // Sentence spans for snippets (docs/highlighting.md) ride the
+        // same pass; the term identity is unchanged by the layer.
+        sentence_detection: layers.sentences,
         // Search persistence remains one unambiguous legacy coordinate system.
         // Offset output selection is separate from term identity and is exposed
         // by the portable analyzer API rather than AnalysisSpec.
@@ -705,8 +723,20 @@ fn analyzed_from(response: AnalyzeResponse, layers: SessionLayers) -> Result<Ana
         terms.push((tv.term, tv.frequency as u32, offsets));
     }
     let positions = token_positions(&response.tokens, &terms)?;
+    // The sentence layer is the answer only when it was asked for: a
+    // response without it for a session that requested it is a table
+    // of zero sentences, which the sentence field's coverage check
+    // refuses for any document with a term (docs/highlighting.md).
+    let sentences = layers.sentences.then(|| {
+        response
+            .sentences
+            .iter()
+            .map(|s| (s.start.max(0) as u32, s.end.max(0) as u32))
+            .collect::<Vec<(u32, u32)>>()
+    });
     let mut doc = AnalyzedDoc::body(terms, length);
     doc.fields[0].positions = positions;
+    doc.fields[0].sentences = sentences;
     doc.quality = quality;
     doc.geography = geography;
     doc.entities = entities;
@@ -1011,7 +1041,14 @@ impl AnalyzeStream {
         vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
         layers: SessionLayers,
     ) -> Result<Self, Status> {
-        if layers != SessionLayers::default() {
+        // The native analyzer serves the sentence layer itself (its
+        // newline detector runs in the same pass, docs/highlighting.md);
+        // every other optional layer needs the sidecar.
+        let sidecar_only = SessionLayers {
+            sentences: false,
+            ..layers
+        };
+        if sidecar_only != SessionLayers::default() {
             let mut requested = Vec::new();
             if layers.quality {
                 requested.push("quality");
@@ -1771,6 +1808,7 @@ mod tests {
             Some(&body_spec()),
             None,
             SessionLayers {
+                sentences: false,
                 quality: true,
                 geography: false,
                 entities: false,

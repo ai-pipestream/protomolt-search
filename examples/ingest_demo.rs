@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel(8);
     for text in DOCS {
         tx.send(AddDocumentsRequest {
+            sentence_fields: Vec::new(),
             materialize: None,
             map_numerics: Vec::new(),
             map_facets: Vec::new(),
@@ -114,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for query in ["dogs barking", "running", "fox", "kitchen"] {
         let response = search_client
             .bm25_search(Bm25SearchRequest {
+                highlight: None,
                 projections: Vec::new(),
                 filter: String::new(),
                 map_facet_fields: Vec::new(),

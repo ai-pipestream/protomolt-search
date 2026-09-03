@@ -39,6 +39,7 @@ pub mod filter;
 pub mod fusion;
 pub mod geo;
 pub mod harness;
+pub mod highlight;
 pub mod interleave;
 pub mod live_docs;
 pub mod ltr;
