@@ -334,9 +334,14 @@ impl EmbeddedSearch {
     }
 
     pub async fn cluster_health(&self) -> Result<ClusterHealthResponse, Status> {
-        SearchService::cluster_health(&self.coordinator, Request::new(ClusterHealthRequest {}))
-            .await
-            .map(tonic::Response::into_inner)
+        SearchService::cluster_health(
+            &self.coordinator,
+            Request::new(ClusterHealthRequest {
+                collection: String::new(),
+            }),
+        )
+        .await
+        .map(tonic::Response::into_inner)
     }
 
     pub async fn broadcast_vector_backend(

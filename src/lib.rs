@@ -29,6 +29,7 @@ pub mod bm25;
 pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;
+pub mod collections;
 pub mod config;
 pub mod control_plane;
 pub mod coordinator;

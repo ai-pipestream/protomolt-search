@@ -206,6 +206,12 @@ pub struct WalManifest {
     /// Per-coordinate calibration scale (length `dim`).
     #[serde(default)]
     pub calibration_scale: Vec<f32>,
+    /// The collection this generation belongs to (`docs/collections.md`);
+    /// empty in a manifest written before collections, which the first
+    /// open under a named node writes. A node of another collection
+    /// refuses the log by name.
+    #[serde(default)]
+    pub collection: String,
     /// The shard's global id base for this generation.
     pub slot_offset: u64,
     /// Generation number (matches the directory name; 0 for the initial
@@ -1019,6 +1025,7 @@ mod tests {
 
     fn manifest(bucket_count: u32) -> WalManifest {
         WalManifest {
+            collection: String::new(),
             dim: 8,
             vector_backend: String::new(),
             vector_config_format: String::new(),
@@ -1073,6 +1080,7 @@ mod tests {
         wal_record::Op::AddDocuments(LoggedAddDocuments {
             first_id: id,
             documents: vec![AddDocumentsRequest {
+                collection: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),

@@ -86,6 +86,7 @@ async fn populate_embedded(runtime: &EmbeddedSearch, corpus: &[f32]) {
     let (shift, scale) = fit_calibration(DIM, 4, corpus);
     let applied = runtime
         .broadcast_calibration(BroadcastCalibrationRequest {
+            collection: String::new(),
             dim: DIM as u32,
             bit_width: 4,
             shift,
@@ -239,6 +240,7 @@ async fn local_cluster_matches_network_service_and_streams_completion() {
 
     let mut stream = embedded
         .query_stream(QueryStreamRequest {
+            collection: String::new(),
             query: Some(request),
             timeout_ms: 0,
         })
@@ -377,6 +379,7 @@ async fn descriptor_plan_and_mapped_ingest_use_the_embedded_schema() {
     let descriptor_set = record_descriptor();
     let planned = runtime
         .plan_index(PlanIndexRequest {
+            collection: String::new(),
             descriptor_set: descriptor_set.clone(),
             message_type: "private.v1.Record".into(),
         })
@@ -406,6 +409,7 @@ async fn descriptor_plan_and_mapped_ingest_use_the_embedded_schema() {
             vec![
                 IngestMappedRequest {
                     payload: Some(ingest_mapped_request::Payload::Bind(MappedBind {
+                        collection: String::new(),
                         descriptor_set,
                         message_type: "private.v1.Record".into(),
                         expected_fingerprint: plan.fingerprint.clone(),

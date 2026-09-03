@@ -71,6 +71,7 @@ async fn start_shard(
     let feeder = tokio::spawn(async move {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                collection: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),

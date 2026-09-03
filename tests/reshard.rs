@@ -119,6 +119,7 @@ async fn ingest(
     tokio::spawn(async move {
         for i in 0..docs {
             tx.send(AddDocumentsRequest {
+                collection: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),
@@ -415,6 +416,7 @@ async fn merge_reproduces_monolithic() {
     let craft_gen = |name: &str, bucket_count: u32, perturb: bool| {
         let wal_root = dir.join(name);
         let manifest = pipestream_search::wal::WalManifest {
+            collection: String::new(),
             dim: DIM as u32,
             vector_backend: String::new(),
             vector_config_format: String::new(),
@@ -645,6 +647,7 @@ async fn split_finer_than_buckets_repartitions() {
 fn reshard_refuses_a_log_with_preexisting_state() {
     let dir = tempdir("preexisting");
     let manifest = pipestream_search::wal::WalManifest {
+        collection: String::new(),
         dim: DIM as u32,
         vector_backend: String::new(),
         vector_config_format: String::new(),
@@ -692,6 +695,7 @@ fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
     let config =
         VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, DIM, BIT_WIDTH, &calibration).unwrap();
     let mut manifest = pipestream_search::wal::WalManifest {
+        collection: String::new(),
         dim: DIM as u32,
         vector_backend: String::new(),
         vector_config_format: String::new(),
@@ -1059,6 +1063,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     tokio::spawn(async move {
         for (i, name) in names_feed.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                collection: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),

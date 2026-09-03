@@ -155,6 +155,7 @@ impl Arm {
                 ..Default::default()
             }),
             None => search_variant::Query::Bm25(Bm25SearchRequest {
+                collection: String::new(),
                 highlight: None,
                 projections: Vec::new(),
                 filter: String::new(),
@@ -537,6 +538,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let resp = client
                 .variant_search(VariantSearchRequest {
+                    collection: String::new(),
                     request_id: String::new(),
                     variants,
                     k,
@@ -664,6 +666,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let resp = client
         .variant_search(VariantSearchRequest {
+            collection: String::new(),
             request_id: String::new(),
             variants,
             k,

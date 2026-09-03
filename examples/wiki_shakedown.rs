@@ -76,6 +76,7 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
                 eprintln!("  shard {shard}: {i}/{n} documents analyzed");
             }
             tx.send(AddDocumentsRequest {
+                collection: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),
@@ -210,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = harness::embedded_backend_request(dim, 4, &shift, &scale);
     let results = coordinator
         .fanout_vector_backend(&BroadcastVectorBackendRequest {
+            collection: String::new(),
             dim: backend.dim,
             config: backend.config,
         })

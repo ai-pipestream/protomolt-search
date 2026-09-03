@@ -60,6 +60,7 @@ async fn add_documents_faceted(
     let (tx, rx) = mpsc::channel(8);
     for (text, facets) in docs {
         tx.send(AddDocumentsRequest {
+            collection: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             map_numerics: Vec::new(),
@@ -347,6 +348,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),
@@ -377,6 +379,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),

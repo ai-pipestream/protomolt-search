@@ -311,6 +311,7 @@ async fn seed_calibration(addr: &str) {
 fn bind() -> MappedBind {
     let plan = derive_plan(&case_set(), "law.v1.Case").expect("the Case plan derives");
     MappedBind {
+        collection: String::new(),
         descriptor_set: case_set(),
         message_type: "law.v1.Case".into(),
         expected_fingerprint: plan.fingerprint,
@@ -504,6 +505,7 @@ async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
         RoutedIngestMappedRequest {
             payload: Some(routed_ingest_mapped_request::Payload::Bind(
                 RoutedMappedBind {
+                    collection: String::new(),
                     required_topology_generation: 10,
                     bind: Some(bind()),
                 },
@@ -551,6 +553,7 @@ async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
         .routed_ingest_mapped(tokio_stream::iter([RoutedIngestMappedRequest {
             payload: Some(routed_ingest_mapped_request::Payload::Bind(
                 RoutedMappedBind {
+                    collection: String::new(),
                     required_topology_generation: 9,
                     bind: Some(bind()),
                 },
@@ -563,6 +566,7 @@ async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
     let frozen = SearchService::freeze_topology_writes(
         &coordinator,
         Request::new(FreezeTopologyWritesRequest {
+            collection: String::new(),
             required_topology_generation: 10,
         }),
     )
@@ -575,6 +579,7 @@ async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
             .routed_ingest_mapped(tokio_stream::iter([RoutedIngestMappedRequest {
                 payload: Some(routed_ingest_mapped_request::Payload::Bind(
                     RoutedMappedBind {
+                        collection: String::new(),
                         required_topology_generation: 10,
                         bind: Some(bind()),
                     },
@@ -587,6 +592,7 @@ async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
     SearchService::publish_topology(
         &coordinator,
         Request::new(PublishTopologyRequest {
+            collection: String::new(),
             cutover_token: frozen.cutover_token,
             generation: 11,
             shards: vec![
@@ -787,6 +793,7 @@ async fn live_reshard_catches_the_tail_and_cuts_over_without_stopping_queries() 
         .routed_ingest_mapped(tokio_stream::iter([RoutedIngestMappedRequest {
             payload: Some(routed_ingest_mapped_request::Payload::Bind(
                 RoutedMappedBind {
+                    collection: String::new(),
                     required_topology_generation: 2,
                     bind: Some(bind()),
                 },
@@ -1511,6 +1518,7 @@ fn chunk_of(parent: usize, ordinal: usize, row: usize) -> ChunkDoc {
 fn opinion_bind() -> MappedBind {
     let plan = derive_plan(&opinion_set(), "law2.v1.Opinion").expect("the Opinion plan derives");
     MappedBind {
+        collection: String::new(),
         descriptor_set: opinion_set(),
         message_type: "law2.v1.Opinion".into(),
         expected_fingerprint: plan.fingerprint,

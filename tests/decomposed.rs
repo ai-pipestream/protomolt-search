@@ -94,6 +94,7 @@ async fn start_fixture() -> Fixture {
         let feeder = tokio::spawn(async move {
             for text in shard_texts {
                 tx.send(AddDocumentsRequest {
+                    collection: String::new(),
                     sentence_fields: Vec::new(),
                     materialize: None,
                     map_numerics: Vec::new(),

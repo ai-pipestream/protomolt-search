@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use pipestream_search::clustered_turbovec::ClusteredTurboVecBackend;
+use pipestream_search::collections::{ClusterControlSet, CollectionSet};
 use pipestream_search::config::{
     load_shard_map, normalize_addr, parse, ClusteredTurboVecConfig, Config, DemoConfig, Role,
     ShardConfig, ShardMap,
@@ -175,6 +176,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cfg.role, Role::Node | Role::Both) {
         for shard in &cfg.shards {
             let node_config = NodeConfig {
+                collection: shard.collection.clone(),
                 vector_backend: shard.vector_backend.clone(),
                 slot_offset: shard.slot_offset,
                 chunk_blocks: cfg.chunk_blocks,
@@ -254,238 +256,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cfg.role, Role::Coordinator | Role::Both) {
         let listener = TcpListener::bind(cfg.coord_listen).await?;
         let addr: SocketAddr = listener.local_addr()?;
-        let to_duration = |ms: u64| (ms > 0).then(|| std::time::Duration::from_millis(ms));
-        let mut coordinator = CoordinatorServiceImpl::new(cfg.node_addrs.clone())
-            .with_bm25(
-                cfg.analysis_addr.clone(),
-                pipestream_search::bm25::Bm25Params {
-                    k1: f64::from(cfg.bm25_k1),
-                    b: f64::from(cfg.bm25_b),
-                },
-            )
-            .with_phrase_index(phrase_index.clone())
-            .with_limits(pipestream_search::coordinator::FanoutLimits {
-                shard_deadline: to_duration(cfg.shard_deadline_ms),
-                hedge_delay: to_duration(cfg.hedge_delay_ms),
-            })
-            .with_replicas(cfg.replica_addrs.clone())
-            .with_stream_search(cfg.stream_search)
-            .with_bm25_stream(cfg.bm25_stream)
-            .with_max_k(cfg.max_k)
-            .with_max_rerank_bytes(cfg.max_rerank_bytes)
-            .with_topology_generation(cfg.shard_map.as_ref().map_or(0, |map| map.generation));
-        if let Some(path) = &cfg.dense_quality_profile {
-            let profile = pipestream_search::quality::DenseQualityProfile::load(path)?;
-            eprintln!(
-                "dense quality profile: {} ({} measured queries)",
-                path.display(),
-                profile.measured_queries()
-            );
-            coordinator = coordinator.with_dense_quality_profile(profile);
-        }
-        if let Some(clustered) = &cfg.clustered_turbovec {
-            let backend = match clustered {
-                ClusteredTurboVecConfig::InProcess {
-                    nodes,
-                    state,
-                    allow_ephemeral,
-                } => {
-                    let table = turbovec_grpc::NodeTable::parse(&nodes.join("\n"))?;
-                    let limits = turbovec_grpc::CoordinatorLimits {
-                        max_k: cfg.max_k as usize,
-                        ..Default::default()
-                    };
-                    let service = match state {
-                        Some(path) => {
-                            turbovec_grpc::CoordinatorService::with_state_file_and_limits(
-                                table, path, limits,
-                            )?
-                        }
-                        None if *allow_ephemeral => {
-                            turbovec_grpc::CoordinatorService::with_limits(table, limits)
-                        }
-                        None => unreachable!(
-                            "configuration requires durable state or explicit ephemeral mode"
-                        ),
-                    };
-                    ClusteredTurboVecBackend::in_process(service)
-                }
-                ClusteredTurboVecConfig::External { endpoint } => {
-                    ClusteredTurboVecBackend::external(endpoint, cfg.max_message_bytes)?
-                }
-            };
-            eprintln!(
-                "vector backend: clustered TurboVec ({} coordinator)",
-                backend.transport_name()
-            );
-            coordinator = coordinator.with_clustered_turbovec(backend);
-        }
-        if let Some(map) = &cfg.shard_map {
-            let ranges = topology_routes(map)?
-                .into_iter()
-                .map(|route| route.hash_range)
-                .collect();
-            coordinator = coordinator.with_hot_topology(ranges)?;
-            eprintln!(
-                "shard map generation {} ({} shards)",
-                map.generation,
-                cfg.node_addrs.len()
-            );
-        }
-        if cfg.shard_map_reload_ms > 0 {
-            let path = cfg
-                .shard_map_path
-                .clone()
-                .expect("configuration validated a shard-map path");
-            let reload = coordinator.clone();
-            let reload_ms = cfg.shard_map_reload_ms;
-            let mut shutdown = shutdown_rx.clone();
-            handles.push(tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_millis(reload_ms));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                break;
-                            }
-                        }
-                        _ = interval.tick() => {
-                            let candidate = match load_shard_map(&path) {
-                                Ok(map) => map,
-                                Err(error) => {
-                                    eprintln!("shard-map reload refused: {error}");
-                                    continue;
-                                }
-                            };
-                            if candidate.generation <= reload.current_topology_generation() {
-                                continue;
-                            }
-                            let generation = candidate.generation;
-                            match topology_routes(&candidate)
-                                .and_then(|routes| reload.reload_topology(generation, routes))
-                            {
-                                Ok(()) => eprintln!(
-                                    "shard-map generation {generation} published atomically ({} shards)",
-                                    candidate.shards.len()
-                                ),
-                                Err(error) => eprintln!("shard-map reload refused: {error}"),
-                            }
-                        }
-                    }
-                }
-                Ok::<(), tonic::transport::Error>(())
-            }));
-        }
-        if cfg.replica_sync_ms > 0 {
-            let path = cfg
-                .replica_state_path
-                .clone()
-                .expect("configuration validated a replica-state path");
-            let mut state = pipestream_search::replication::ReplicaState::load(&path)?;
-            let topology = coordinator.clone();
-            let sync_ms = cfg.replica_sync_ms;
-            let mut shutdown = shutdown_rx.clone();
-            handles.push(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_millis(sync_ms));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                break;
-                            }
-                        }
-                        _ = interval.tick() => {
-                            for route in topology.current_topology_routes() {
-                                let Some(replica) = route.replica else {
-                                    continue;
-                                };
-                                let prior = state.cursor_mut(&route.addr, &replica).clone();
-                                match pipestream_search::replication::sync_once(&prior).await {
-                                    Ok(updated) => {
-                                        *state.cursor_mut(&route.addr, &replica) = updated;
-                                        if let Err(error) = state.write(&path) {
-                                            eprintln!("replica cursor persistence failed: {error}");
-                                        }
-                                    }
-                                    Err(error) => eprintln!(
-                                        "replica catch-up {} -> {} refused: {error}",
-                                        route.addr, replica
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok::<(), tonic::transport::Error>(())
-            }));
-        }
-        let control_service = if let Some(path) = &cfg.control_state_path {
-            let plane = DurableControlPlane::open(
-                path,
-                ControlPolicy {
-                    lease_ms: cfg.control_lease_ms,
-                    replication_factor: cfg.control_replication_factor,
-                    split_rows: cfg.control_split_rows,
-                    merge_rows: cfg.control_merge_rows,
-                    compact_segments: cfg.control_compact_segments,
-                    compact_tombstone_ppm: cfg.control_compact_tombstone_ppm,
-                    history_limit: 32,
-                },
-            )?;
-            plane.bootstrap_topology(
-                coordinator.current_topology_generation(),
-                &coordinator.current_topology_routes(),
-            )?;
-            let control = ClusterControlService::new(plane).with_coordinator(coordinator.clone());
-            control.publish_current_topology()?;
-            if cfg.control_reconcile_ms > 0 {
-                let reconcile = control.clone();
-                let interval_ms = cfg.control_reconcile_ms;
-                let mut shutdown = shutdown_rx.clone();
-                handles.push(tokio::spawn(async move {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_millis(interval_ms));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        tokio::select! {
-                            changed = shutdown.changed() => {
-                                if changed.is_err() || *shutdown.borrow() {
-                                    break;
-                                }
-                            }
-                            _ = interval.tick() => {
-                                if let Err(error) = ClusterControl::reconcile_cluster(
-                                    &reconcile,
-                                    tonic::Request::new(ReconcileClusterRequest { dry_run: false }),
-                                ).await {
-                                    eprintln!("cluster reconciliation refused: {error}");
-                                }
-                            }
-                        }
-                    }
-                    Ok::<(), tonic::transport::Error>(())
-                }));
-            }
-            eprintln!("cluster control state: {}", path.display());
-            Some(control)
-        } else {
-            None
-        };
-        eprintln!(
-            "SearchService listening on {addr} ({} shard nodes)",
-            cfg.node_addrs.len()
-        );
+        let (search_set, control_set) =
+            build_collections(&cfg, &phrase_index, &shutdown_rx, &mut handles, addr).await?;
         let max = cfg.max_message_bytes;
         let mut shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(
             Server::builder()
                 .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                 .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
-                .add_optional_service(control_service.map(|service| service.into_server(max)))
-                .add_service(CoordinatorServiceImpl::into_server(coordinator, max))
+                .add_optional_service(control_set.map(|set| set.into_server(max)))
+                .add_service(search_set.into_server(max))
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;
                 }),
@@ -501,6 +281,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .max_encoding_message_size(cfg.max_message_bytes);
         let response = client
             .search(SearchRequest {
+                collection: String::new(),
                 request_id: String::new(),
                 k: 10,
                 vector: query,
@@ -608,6 +389,371 @@ async fn configure_backend(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
     }
     Ok(())
+}
+
+/// One dataset's coordinator settings (`docs/collections.md`): the
+/// unnamed dataset of a pre-collection configuration, or one named
+/// collection.
+struct CorpusSpec<'a> {
+    name: &'a str,
+    node_addrs: &'a [String],
+    replica_addrs: &'a [Option<String>],
+    shard_map: Option<&'a ShardMap>,
+    shard_map_path: Option<&'a Path>,
+    analysis_addr: Option<&'a String>,
+    bm25_k1: f32,
+    bm25_b: f32,
+    dense_quality_profile: Option<&'a Path>,
+    replica_state_path: Option<&'a Path>,
+    control_state_path: Option<&'a Path>,
+    clustered_turbovec: Option<&'a ClusteredTurboVecConfig>,
+}
+
+type TaskHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
+
+/// Build one dataset's coordinator, its background tasks (shard-map
+/// reload, replica sync, control reconciliation), and its control plane
+/// when configured. A collection set contains one of these per collection.
+async fn build_corpus(
+    cfg: &Config,
+    dataset: CorpusSpec<'_>,
+    phrase_index: &Option<std::sync::Arc<pipestream_search::phrases::PhraseIndex>>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+    handles: &mut Vec<TaskHandle>,
+) -> Result<(CoordinatorServiceImpl, Option<ClusterControlService>), Box<dyn std::error::Error>> {
+    let to_duration = |ms: u64| (ms > 0).then(|| std::time::Duration::from_millis(ms));
+    let mut coordinator = CoordinatorServiceImpl::new(dataset.node_addrs.to_vec())
+        .with_bm25(
+            dataset.analysis_addr.cloned(),
+            pipestream_search::bm25::Bm25Params {
+                k1: f64::from(dataset.bm25_k1),
+                b: f64::from(dataset.bm25_b),
+            },
+        )
+        .with_phrase_index(phrase_index.clone())
+        .with_limits(pipestream_search::coordinator::FanoutLimits {
+            shard_deadline: to_duration(cfg.shard_deadline_ms),
+            hedge_delay: to_duration(cfg.hedge_delay_ms),
+        })
+        .with_replicas(dataset.replica_addrs.to_vec())
+        .with_stream_search(cfg.stream_search)
+        .with_bm25_stream(cfg.bm25_stream)
+        .with_max_k(cfg.max_k)
+        .with_max_rerank_bytes(cfg.max_rerank_bytes)
+        .with_topology_generation(dataset.shard_map.map_or(0, |map| map.generation))
+        .with_collection(dataset.name);
+    if let Some(path) = dataset.dense_quality_profile {
+        let profile = pipestream_search::quality::DenseQualityProfile::load(path)?;
+        eprintln!(
+            "dense quality profile: {} ({} measured queries)",
+            path.display(),
+            profile.measured_queries()
+        );
+        coordinator = coordinator.with_dense_quality_profile(profile);
+    }
+    if let Some(clustered) = dataset.clustered_turbovec {
+        let backend = match clustered {
+            ClusteredTurboVecConfig::InProcess {
+                nodes,
+                state,
+                allow_ephemeral,
+            } => {
+                let table = turbovec_grpc::NodeTable::parse(&nodes.join("\n"))?;
+                let limits = turbovec_grpc::CoordinatorLimits {
+                    max_k: cfg.max_k as usize,
+                    ..Default::default()
+                };
+                let service = match state {
+                    Some(path) => turbovec_grpc::CoordinatorService::with_state_file_and_limits(
+                        table, path, limits,
+                    )?,
+                    None if *allow_ephemeral => {
+                        turbovec_grpc::CoordinatorService::with_limits(table, limits)
+                    }
+                    None => unreachable!(
+                        "configuration requires durable state or explicit ephemeral mode"
+                    ),
+                };
+                ClusteredTurboVecBackend::in_process(service)
+            }
+            ClusteredTurboVecConfig::External { endpoint } => {
+                ClusteredTurboVecBackend::external(endpoint, cfg.max_message_bytes)?
+            }
+        };
+        eprintln!(
+            "vector backend: clustered TurboVec ({} coordinator)",
+            backend.transport_name()
+        );
+        coordinator = coordinator.with_clustered_turbovec(backend);
+    }
+    if let Some(map) = dataset.shard_map {
+        let ranges = topology_routes(map)?
+            .into_iter()
+            .map(|route| route.hash_range)
+            .collect();
+        coordinator = coordinator.with_hot_topology(ranges)?;
+        eprintln!(
+            "shard map generation {} ({} shards)",
+            map.generation,
+            dataset.node_addrs.len()
+        );
+    }
+    if cfg.shard_map_reload_ms > 0 {
+        let path = dataset
+            .shard_map_path
+            .map(Path::to_path_buf)
+            .expect("configuration validated a shard-map path");
+        let reload = coordinator.clone();
+        let reload_ms = cfg.shard_map_reload_ms;
+        let mut shutdown = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_millis(reload_ms));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        _ = interval.tick() => {
+                            let candidate = match load_shard_map(&path) {
+                                Ok(map) => map,
+                                Err(error) => {
+                                    eprintln!("shard-map reload refused: {error}");
+                                    continue;
+                                }
+                            };
+                            if candidate.generation <= reload.current_topology_generation() {
+                                continue;
+                            }
+                            let generation = candidate.generation;
+                            match topology_routes(&candidate)
+                                .and_then(|routes| reload.reload_topology(generation, routes))
+                            {
+                                Ok(()) => eprintln!(
+                                    "shard-map generation {generation} published atomically ({} shards)",
+                                    candidate.shards.len()
+                                ),
+                                Err(error) => eprintln!("shard-map reload refused: {error}"),
+                            }
+                        }
+                    }
+                }
+                Ok::<(), tonic::transport::Error>(())
+            }));
+    }
+    if cfg.replica_sync_ms > 0 {
+        let path = dataset
+            .replica_state_path
+            .map(Path::to_path_buf)
+            .expect("configuration validated a replica-state path");
+        let mut state = pipestream_search::replication::ReplicaState::load(&path)?;
+        let topology = coordinator.clone();
+        let sync_ms = cfg.replica_sync_ms;
+        let mut shutdown = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(sync_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        for route in topology.current_topology_routes() {
+                            let Some(replica) = route.replica else {
+                                continue;
+                            };
+                            let prior = state.cursor_mut(&route.addr, &replica).clone();
+                            match pipestream_search::replication::sync_once(&prior).await {
+                                Ok(updated) => {
+                                    *state.cursor_mut(&route.addr, &replica) = updated;
+                                    if let Err(error) = state.write(&path) {
+                                        eprintln!("replica cursor persistence failed: {error}");
+                                    }
+                                }
+                                Err(error) => eprintln!(
+                                    "replica catch-up {} -> {} refused: {error}",
+                                    route.addr, replica
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            Ok::<(), tonic::transport::Error>(())
+        }));
+    }
+    let control_service = if let Some(path) = dataset.control_state_path {
+        let plane = DurableControlPlane::open(
+            path,
+            ControlPolicy {
+                lease_ms: cfg.control_lease_ms,
+                replication_factor: cfg.control_replication_factor,
+                split_rows: cfg.control_split_rows,
+                merge_rows: cfg.control_merge_rows,
+                compact_segments: cfg.control_compact_segments,
+                compact_tombstone_ppm: cfg.control_compact_tombstone_ppm,
+                history_limit: 32,
+            },
+        )?
+        .with_collection(dataset.name)?;
+        plane.bootstrap_topology(
+            coordinator.current_topology_generation(),
+            &coordinator.current_topology_routes(),
+        )?;
+        let control = ClusterControlService::new(plane).with_coordinator(coordinator.clone());
+        control.publish_current_topology()?;
+        if cfg.control_reconcile_ms > 0 {
+            let reconcile = control.clone();
+            let interval_ms = cfg.control_reconcile_ms;
+            let mut shutdown = shutdown_rx.clone();
+            handles.push(tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = interval.tick() => {
+                                if let Err(error) = ClusterControl::reconcile_cluster(
+                                    &reconcile,
+                                    tonic::Request::new(ReconcileClusterRequest { collection: String::new(), dry_run: false }),
+                                ).await {
+                                    eprintln!("cluster reconciliation refused: {error}");
+                                }
+                            }
+                        }
+                    }
+                    Ok::<(), tonic::transport::Error>(())
+                }));
+        }
+        eprintln!("cluster control state: {}", path.display());
+        Some(control)
+    } else {
+        None
+    };
+    Ok((coordinator, control_service))
+}
+
+/// The collection set this coordinator serves: the one unnamed dataset of
+/// a pre-collection configuration, or every named collection, each with
+/// its own coordinator and control plane (`docs/collections.md`).
+/// Membership is verified against the nodes that answer; a node that
+/// serves another collection refuses startup, an unreachable one is
+/// reported and re-checked by cluster health.
+async fn build_collections(
+    cfg: &Config,
+    phrase_index: &Option<std::sync::Arc<pipestream_search::phrases::PhraseIndex>>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+    handles: &mut Vec<TaskHandle>,
+    addr: SocketAddr,
+) -> Result<(CollectionSet, Option<ClusterControlSet>), Box<dyn std::error::Error>> {
+    let (search_set, control_set) = if cfg.collections.is_empty() {
+        let (coordinator, control) = build_corpus(
+            cfg,
+            CorpusSpec {
+                name: "",
+                node_addrs: &cfg.node_addrs,
+                replica_addrs: &cfg.replica_addrs,
+                shard_map: cfg.shard_map.as_ref(),
+                shard_map_path: cfg.shard_map_path.as_deref(),
+                analysis_addr: cfg.analysis_addr.as_ref(),
+                bm25_k1: cfg.bm25_k1,
+                bm25_b: cfg.bm25_b,
+                dense_quality_profile: cfg.dense_quality_profile.as_deref(),
+                replica_state_path: cfg.replica_state_path.as_deref(),
+                control_state_path: cfg.control_state_path.as_deref(),
+                clustered_turbovec: cfg.clustered_turbovec.as_ref(),
+            },
+            phrase_index,
+            shutdown_rx,
+            handles,
+        )
+        .await?;
+        eprintln!(
+            "SearchService listening on {addr} ({} shard nodes)",
+            cfg.node_addrs.len()
+        );
+        (
+            CollectionSet::single(coordinator),
+            control.map(ClusterControlSet::single),
+        )
+    } else {
+        let mut members = Vec::with_capacity(cfg.collections.len());
+        let mut controls = Vec::new();
+        for c in &cfg.collections {
+            let (coordinator, control) = build_corpus(
+                cfg,
+                CorpusSpec {
+                    name: &c.name,
+                    node_addrs: &c.node_addrs,
+                    replica_addrs: &c.replica_addrs,
+                    shard_map: c.shard_map.as_ref(),
+                    shard_map_path: c.shard_map_path.as_deref(),
+                    analysis_addr: c.analysis_addr.as_ref(),
+                    bm25_k1: c.bm25_k1,
+                    bm25_b: c.bm25_b,
+                    dense_quality_profile: c.dense_quality_profile.as_deref(),
+                    replica_state_path: c.replica_state_path.as_deref(),
+                    control_state_path: c.control_state_path.as_deref(),
+                    clustered_turbovec: None,
+                },
+                phrase_index,
+                shutdown_rx,
+                handles,
+            )
+            .await?;
+            eprintln!(
+                "collection {:?}: {} shard nodes{}",
+                c.name,
+                c.node_addrs.len(),
+                if control.is_some() {
+                    ", durable control"
+                } else {
+                    ""
+                }
+            );
+            members.push((c.name.clone(), coordinator));
+            if let Some(control) = control {
+                controls.push((c.name.clone(), control));
+            }
+        }
+        let set = CollectionSet::named(members, cfg.default_collection.clone())?;
+        let control = if controls.is_empty() {
+            None
+        } else {
+            Some(ClusterControlSet::named(
+                controls,
+                cfg.default_collection.clone(),
+            )?)
+        };
+        eprintln!(
+            "SearchService listening on {addr} (collections {:?}, default {:?})",
+            set.names(),
+            cfg.default_collection
+        );
+        (set, control)
+    };
+    match search_set.verify_membership().await {
+        Ok(()) => {}
+        Err(status) if status.code() == tonic::Code::Unavailable => {
+            eprintln!(
+                "collection membership not verified at start ({}); cluster health re-checks it",
+                status.message()
+            );
+        }
+        Err(status) => return Err(format!("collection membership: {}", status.message()).into()),
+    }
+    Ok((search_set, control_set))
 }
 
 #[tokio::main]

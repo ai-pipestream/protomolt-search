@@ -108,7 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
         loop {
             let probe = client
-                .cluster_health(ClusterHealthRequest {})
+                .cluster_health(ClusterHealthRequest {
+                    collection: String::new(),
+                })
                 .await?
                 .into_inner();
             let up = probe
@@ -147,7 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
     let health = client
-        .cluster_health(ClusterHealthRequest {})
+        .cluster_health(ClusterHealthRequest {
+            collection: String::new(),
+        })
         .await?
         .into_inner();
     let primaries: Vec<_> = health.targets.iter().filter(|t| !t.is_replica).collect();
@@ -335,6 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- the lexical legs ----------------------------------------------
     let body_only = client
         .bm25_search(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),
@@ -370,6 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let case_only = client
         .bm25_search(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),
@@ -413,6 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fused = client
         .bm25_search(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),
@@ -590,6 +597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ab_arm = |label: &str, fields: Vec<QueryField>| SearchVariant {
         label: label.to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),
@@ -629,6 +637,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let variants = client
         .variant_search(VariantSearchRequest {
+            collection: String::new(),
             request_id: String::new(),
             variants: vec![
                 ab_arm("body-only", vec![body_field()]),
@@ -692,6 +701,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bogus.field = "case_nmae".to_string();
             match client
                 .variant_search(VariantSearchRequest {
+                    collection: String::new(),
                     request_id: String::new(),
                     variants: vec![
                         ab_arm("body-only", vec![body_field()]),

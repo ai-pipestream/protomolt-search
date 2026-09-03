@@ -405,6 +405,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
             Some(wal_record::Op::Bind(binding)) => {
                 let response = replica
                     .apply_wal_binding(ApplyWalBindingRequest {
+                        collection: String::new(),
                         plan_fingerprint: binding.plan_fingerprint,
                         body_path: binding.body_path,
                         materialize_sha: binding.materialize_sha,
@@ -779,6 +780,7 @@ pub async fn atomic_live_cutover(
         .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
     let frozen = control
         .freeze_topology_writes(crate::pb::FreezeTopologyWritesRequest {
+            collection: String::new(),
             required_topology_generation: state.old_topology_generation,
         })
         .await
@@ -807,6 +809,7 @@ pub async fn atomic_live_cutover(
         durable_map_published = true;
         let published = control
             .publish_topology(crate::pb::PublishTopologyRequest {
+                collection: String::new(),
                 cutover_token: token,
                 generation: map.generation,
                 shards: map
@@ -832,6 +835,7 @@ pub async fn atomic_live_cutover(
     if result.is_err() && !durable_map_published {
         let _ = control
             .abort_topology_cutover(crate::pb::AbortTopologyCutoverRequest {
+                collection: String::new(),
                 cutover_token: token,
             })
             .await;

@@ -890,6 +890,7 @@ async fn plan_index_answers_over_the_wire() {
     let set = product_set();
     let response = client
         .plan_index(pipestream_search::pb::PlanIndexRequest {
+            collection: String::new(),
             descriptor_set: set.clone(),
             message_type: "shop.v1.Product".to_string(),
         })
@@ -901,6 +902,7 @@ async fn plan_index_answers_over_the_wire() {
 
     let refusal = client
         .plan_index(pipestream_search::pb::PlanIndexRequest {
+            collection: String::new(),
             descriptor_set: set,
             message_type: "shop.v1.Nope".to_string(),
         })

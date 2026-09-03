@@ -686,6 +686,9 @@ message ApplyWalBindingRequest {
   string plan_fingerprint = 1;
   string body_path = 2;
   string materialize_sha = 3;
+  // The collection the binding belongs to; a node of another
+  // collection refuses (docs/collections.md).
+  string collection = 4;
 }
 
 message ApplyWalBindingResponse {
@@ -731,9 +734,17 @@ message HealthResponse {
   // Next positional document id relative to slot_offset. Unlike bm25_docs,
   // this includes allocated rows with no postings and is the replication tip.
   uint64 document_slots = 20;
+  // The collection this node serves (docs/collections.md); empty for
+  // a node configured without one.
+  string collection = 21;
 }
 
-message ClusterHealthRequest {}
+message ClusterHealthRequest {
+  // The collection to report (docs/collections.md). Empty on a
+  // coordinator with named collections lists every collection's health
+  // separately in `collections`, mixing no counts.
+  string collection = 1;
+}
 
 // Health of one fan-out target (a shard's primary or replica).
 message ShardHealth {
@@ -758,6 +769,16 @@ message ClusterHealthResponse {
   // Present when vector queries use a clustered provider instead of the
   // vector indexes on the product shard nodes.
   ClusteredVectorHealth clustered_vector = 2;
+  // On a coordinator with named collections and an unnamed request:
+  // one entry per collection, each with its own targets and counts,
+  // and the top-level `targets` empty (docs/collections.md).
+  repeated CollectionHealth collections = 3;
+}
+
+// One collection's health, as ClusterHealth would report it alone.
+message CollectionHealth {
+  string name = 1;
+  ClusterHealthResponse health = 2;
 }
 
 message ClusteredVectorHealth {
@@ -1232,6 +1253,11 @@ message SearchRequest {
   // unsupported construct, or a column no shard knows is refused by
   // name; a filter is never reinterpreted into something that runs.
   string filter = 6;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 7;
 }
 
 // Client-facing search response.
@@ -1576,6 +1602,11 @@ message AddDocumentsRequest {
   // before the document is logged, so a replay stores the same spans; a
   // replay on a node with a different setting refuses by name.
   repeated string sentence_fields = 20;
+  // The collection this document belongs to (docs/collections.md). A
+  // node serves only one collection: a name other than the node's
+  // refuses, and an empty name is written with the node's before the
+  // document is logged, so a replay carries it.
+  string collection = 21;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share
@@ -2745,6 +2776,11 @@ message Bm25SearchRequest {
   // Server-side snippets per hit (docs/highlighting.md). Absent means
   // no snippets; hits keep their occurrence spans either way.
   HighlightSpec highlight = 17;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 18;
 }
 
 // A prefix over a field's term dictionary (docs/prefix-terms.md): every
@@ -2852,6 +2888,11 @@ message BigramField {
 message PhraseSearchRequest {
   Bm25SearchRequest base = 1;
   PhraseSearchOptions options = 2;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 3;
 }
 
 message PhraseSearchOptions {
@@ -3248,6 +3289,11 @@ message HybridSearchRequest {
   // a lie about the result set; the vector leg now applies the same
   // allowlist, so a fused hit is a document that passed every filter
   // on whichever leg found it.
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 11;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -3404,6 +3450,11 @@ message BroadcastCalibrationRequest {
   repeated float shift = 3;
   // Per-coordinate calibration scale (length `dim`).
   repeated float scale = 4;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 5;
 }
 
 // One node's outcome of a calibration broadcast.
@@ -3429,6 +3480,11 @@ message BroadcastCalibrationResponse {
 message BroadcastVectorBackendRequest {
   uint32 dim = 1;
   VectorBackendConfig config = 2;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 3;
 }
 
 message VectorBackendApplyResult {
@@ -3630,6 +3686,11 @@ message VariantSearchRequest {
   // same query reproducible while still varying across queries. Set it
   // explicitly only to replay a specific past interleaving.
   uint64 interleave_seed = 6;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 7;
 }
 
 // One variant's ranking.
@@ -3846,6 +3907,11 @@ message QueryRequest {
   // because only the lexical leg carries the occurrence spans snippets
   // are cut around.
   HighlightSpec highlight = 12;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 13;
 }
 
 // A column sort order for browse.
@@ -4279,6 +4345,11 @@ message QueryStreamRequest {
   // Whole-query deadline from stream acceptance through terminal completion.
   // 0 means no additional deadline beyond transport and shard limits.
   uint64 timeout_ms = 2;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 3;
 }
 
 enum QueryStreamPhase {
@@ -4455,6 +4526,11 @@ message PlanIndexRequest {
   // Fully qualified message type to plan over, e.g. "shop.v1.Product".
   // No leading dot.
   string message_type = 2;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 3;
 }
 
 // PlanIndexResponse returns the plan a future bind would bind.
@@ -4675,6 +4751,9 @@ message MappedBind {
   // document with the derived values and the spec cleared, so replay
   // never re-evaluates — the same contract as ordinary ingest.
   MaterializeSpec materialize = 6;
+  // The collection this bind writes into; a node of another
+  // collection refuses (docs/collections.md).
+  string collection = 7;
 }
 
 message IngestMappedResponse {
@@ -4704,6 +4783,11 @@ message RoutedMappedBind {
   // Required optimistic topology stamp. Writes never interpret zero as
   // "current": the caller must first observe the live generation.
   uint64 required_topology_generation = 2;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 3;
 }
 
 // One source document and the stable product identity used only for routing.
@@ -4737,6 +4821,11 @@ message RoutedIngestMappedResponse {
 
 message FreezeTopologyWritesRequest {
   uint64 required_topology_generation = 1;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 2;
 }
 
 message FreezeTopologyWritesResponse {
@@ -4755,6 +4844,11 @@ message PublishTopologyRequest {
   uint64 cutover_token = 1;
   uint64 generation = 2;
   repeated PublishedTopologyShard shards = 3;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 4;
 }
 
 message PublishTopologyResponse {
@@ -4763,6 +4857,11 @@ message PublishTopologyResponse {
 
 message AbortTopologyCutoverRequest {
   uint64 cutover_token = 1;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 2;
 }
 
 message AbortTopologyCutoverResponse {
@@ -4806,6 +4905,8 @@ message RegisterNodeRequest {
   NodeCapacity capacity = 3;
   // Requested lease duration. Zero selects the authority policy.
   uint64 lease_ms = 4;
+  // The collection the node serves (docs/collections.md).
+  string collection = 5;
 }
 
 message RenewNodeLeaseRequest {
@@ -4813,6 +4914,8 @@ message RenewNodeLeaseRequest {
   uint64 lease_token = 2;
   NodeCapacity capacity = 3;
   uint64 lease_ms = 4;
+  // The collection the lease belongs to (docs/collections.md).
+  string collection = 5;
 }
 
 message NodeLease {
@@ -4825,6 +4928,8 @@ message NodeLease {
 message DrainNodeRequest {
   string node_id = 1;
   uint64 lease_token = 2;
+  // The collection the node serves (docs/collections.md).
+  string collection = 3;
 }
 
 message ShardReplicaState {
@@ -4843,12 +4948,16 @@ message ShardReplicaState {
   string analysis_fingerprint = 13;
   uint32 immutable_segments = 14;
   uint64 tombstones = 15;
+  // The collection the shard belongs to (docs/collections.md).
+  string collection = 16;
 }
 
 message ReportShardRequest {
   string node_id = 1;
   uint64 lease_token = 2;
   ShardReplicaState replica = 3;
+  // The collection the shard belongs to (docs/collections.md).
+  string collection = 4;
 }
 
 message CompletePlacementActionRequest {
@@ -4859,19 +4968,28 @@ message CompletePlacementActionRequest {
   // return one replica, SPLIT returns every child, MERGE returns one merged
   // primary, and DROP returns none.
   repeated ShardReplicaState outputs = 4;
+  // The collection the action belongs to (docs/collections.md).
+  string collection = 5;
 }
 
 message ReconcileClusterRequest {
   // A dry run computes and returns actions without persisting them.
   bool dry_run = 1;
+  // The collection to reconcile (docs/collections.md).
+  string collection = 2;
 }
 
-message GetClusterPlanRequest {}
+message GetClusterPlanRequest {
+  // The collection whose plan to return (docs/collections.md).
+  string collection = 1;
+}
 
 message RollbackClusterRequest {
   // Historical topology generation to restore as a NEW generation. Zero
   // selects the immediately previous published topology.
   uint64 topology_generation = 1;
+  // The collection to roll back (docs/collections.md).
+  string collection = 2;
 }
 
 message ClusterNode {
@@ -4881,6 +4999,8 @@ message ClusterNode {
   reserved 4; // Lease credentials are returned only to their registering node.
   uint64 expires_unix_ms = 5;
   NodeCapacity capacity = 6;
+  // The collection the node serves (docs/collections.md).
+  string collection = 7;
 }
 
 message PlacementAction {
@@ -4897,6 +5017,8 @@ message PlacementAction {
   string reason = 11;
   // Exact peer generation captured when a merge was planned; zero otherwise.
   uint64 peer_source_generation = 12;
+  // The collection the action stays inside (docs/collections.md).
+  string collection = 13;
 }
 
 message ClusterPlan {
@@ -4906,6 +5028,8 @@ message ClusterPlan {
   repeated ShardReplicaState replicas = 4;
   repeated PlacementAction actions = 5;
   repeated uint64 topology_history = 6;
+  // The collection this plan governs (docs/collections.md).
+  string collection = 7;
 }
 
 // ---------------------------------------------------------------------------
@@ -5112,6 +5236,11 @@ message AggregateRequest {
   // count-below rounds (at most 64), never a sketch, never an
   // interpolation. Fleet-wide only: percentiles ignore group_by.
   repeated PercentileSpec percentiles = 7;
+  // The collection this request addresses (docs/collections.md). Empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 8;
 }
 
 // One requested percentile set over one expression.

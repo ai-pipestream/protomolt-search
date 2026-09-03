@@ -388,6 +388,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let routed_embedded = SearchService::search(
         &embedded_product,
         Request::new(SearchRequest {
+            collection: String::new(),
             request_id: "clustered-route".to_string(),
             k: K as u32,
             vector: public_query.clone(),
@@ -402,6 +403,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let routed = SearchService::search(
         &product,
         Request::new(SearchRequest {
+            collection: String::new(),
             request_id: "clustered-route".to_string(),
             k: K as u32,
             vector: public_query.clone(),
@@ -426,6 +428,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let routed_external = SearchService::search(
         &product_external,
         Request::new(SearchRequest {
+            collection: String::new(),
             request_id: "clustered-route-external".to_string(),
             k: K as u32,
             vector: public_query.clone(),
@@ -597,12 +600,17 @@ candidates = {ROWS}
     assert_eq!(unknown.code(), tonic::Code::InvalidArgument);
     assert!(unknown.message().contains("kourt"));
 
-    let health = SearchService::cluster_health(&product, Request::new(ClusterHealthRequest {}))
-        .await
-        .unwrap()
-        .into_inner()
-        .clustered_vector
-        .expect("cluster health reports the selected vector backend");
+    let health = SearchService::cluster_health(
+        &product,
+        Request::new(ClusterHealthRequest {
+            collection: String::new(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .clustered_vector
+    .expect("cluster health reports the selected vector backend");
     assert_eq!(health.transport, "in-process");
     assert!(health.reachable && health.servable);
     assert_eq!(health.rows, ROWS as u64);

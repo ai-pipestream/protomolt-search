@@ -82,6 +82,9 @@ pub struct ShardConfig {
     /// snapshotting to `<index path>.vocab/` (see `docs/VOCABULARY-INDEX.md`).
     /// Defaults OFF — zero overhead when off. Requires an index path.
     pub vocab: bool,
+    /// The collection this shard serves (`docs/collections.md`); empty
+    /// for a shard outside any named collection.
+    pub collection: String,
 }
 
 /// One shard entry of a coordinator shard map (`--shard-map`): which node
@@ -341,6 +344,14 @@ pub struct Config {
     pub control_merge_rows: u64,
     pub control_compact_segments: u32,
     pub control_compact_tombstone_ppm: u32,
+    /// Named collections this coordinator serves (`docs/collections.md`);
+    /// empty means the one unnamed dataset described by `node_addrs` and
+    /// the top-level knobs. When present, `node_addrs` is empty and every
+    /// per-dataset setting lives on the collection.
+    pub collections: Vec<CollectionConfig>,
+    /// The collection an unnamed request gets to, when configured; with
+    /// named collections and no default, unnamed requests refuse.
+    pub default_collection: Option<String>,
     /// Documents per vocabulary window before automatic rollover (only
     /// relevant to shards with `vocab` enabled).
     pub vocab_window_docs: u64,
@@ -349,9 +360,43 @@ pub struct Config {
 }
 
 /// Raw TOML file shape; every field optional (file < env < CLI).
+/// One collection's dataset settings (`docs/collections.md`): everything
+/// a coordinator needs that differs per dataset. Knobs not listed here
+/// (limits, streaming, message sizes, the phrase index) are shared.
+#[derive(Debug, Clone)]
+pub struct CollectionConfig {
+    pub name: String,
+    pub node_addrs: Vec<String>,
+    pub replica_addrs: Vec<Option<String>>,
+    pub shard_map: Option<ShardMap>,
+    pub shard_map_path: Option<PathBuf>,
+    pub analysis_addr: Option<String>,
+    pub bm25_k1: f32,
+    pub bm25_b: f32,
+    pub dense_quality_profile: Option<PathBuf>,
+    pub replica_state_path: Option<PathBuf>,
+    pub control_state_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileCollection {
+    name: String,
+    nodes: Option<Vec<String>>,
+    shard_map: Option<String>,
+    analysis_addr: Option<String>,
+    bm25_k1: Option<f32>,
+    bm25_b: Option<f32>,
+    dense_quality_profile: Option<String>,
+    replica_state: Option<String>,
+    control_state: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct FileConfig {
+    collections: Vec<FileCollection>,
+    default_collection: Option<String>,
     role: Option<String>,
     node_listen: Option<String>,
     coord_listen: Option<String>,
@@ -438,6 +483,7 @@ struct FileClusteredTurboVec {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct FileShard {
+    collection: Option<String>,
     listen: Option<String>,
     vector_backend: Option<String>,
     index: Option<String>,
@@ -802,6 +848,16 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         return Err("vocab top-K must be positive".to_string());
     }
 
+    let cli_collection = opt(args, "collection", "PIPESTREAM_SEARCH_COLLECTION", None);
+    if let Some(name) = &cli_collection {
+        crate::collections::validate_name(name).map_err(|e| format!("--collection: {e}"))?;
+    }
+    for (i, shard) in file.shards.iter().enumerate() {
+        if let Some(name) = &shard.collection {
+            crate::collections::validate_name(name)
+                .map_err(|e| format!("shards[{i}].collection: {e}"))?;
+        }
+    }
     let mut shards: Vec<ShardConfig> = if cli_index.is_some() || cli_demo.is_some() {
         if cli_index.is_some() && cli_demo.is_some() {
             return Err("--index and --demo-vectors are mutually exclusive".to_string());
@@ -830,6 +886,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             demo,
             slot_offset: cli_offset,
             analysis_addr: None,
+            collection: cli_collection.clone().unwrap_or_default(),
         }]
     } else {
         file.shards
@@ -868,6 +925,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     demo,
                     slot_offset: shard.slot_offset.unwrap_or(0),
                     analysis_addr: shard.analysis_addr.clone().map(normalize_analysis_backend),
+                    collection: shard.collection.clone().unwrap_or_default(),
                 })
             })
             .collect::<Result<_, String>>()?
@@ -1162,9 +1220,13 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                 .to_string(),
         );
     }
-    if matches!(role, Role::Coordinator | Role::Both) && node_addrs.is_empty() {
+    if matches!(role, Role::Coordinator | Role::Both)
+        && node_addrs.is_empty()
+        && file.collections.is_empty()
+    {
         return Err(
-            "coordinator role requires --nodes or --shard-map (or `nodes` in the config file)"
+            "coordinator role requires --nodes or --shard-map (or `nodes` or `collections` in \
+             the config file)"
                 .to_string(),
         );
     }
@@ -1556,6 +1618,150 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
     }
 
+    // Named collections (docs/collections.md): each carries its own
+    // dataset settings; the top-level dataset knobs must then be absent,
+    // because there is no unnamed dataset to apply them to.
+    let mut collections: Vec<CollectionConfig> = Vec::with_capacity(file.collections.len());
+    if !file.collections.is_empty() {
+        if !node_addrs.is_empty() {
+            return Err(
+                "`collections` replaces --nodes / --shard-map: put each collection's nodes or \
+                 shard_map on the collection"
+                    .to_string(),
+            );
+        }
+        if control_state_path.is_some() {
+            return Err(
+                "`collections` replaces --control-state: put each collection's control_state on \
+                 the collection"
+                    .to_string(),
+            );
+        }
+        if replica_state_path.is_some() {
+            return Err(
+                "`collections` replaces --replica-state: put each collection's replica_state on \
+                 the collection"
+                    .to_string(),
+            );
+        }
+        if clustered_turbovec.is_some() {
+            return Err(
+                "clustered TurboVec serves one dataset and is not yet configurable per \
+                 collection; drop `collections` or the clustered backend"
+                    .to_string(),
+            );
+        }
+        let mut owners: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (i, c) in file.collections.iter().enumerate() {
+            let at = format!("collections[{i}]");
+            crate::collections::validate_name(&c.name).map_err(|e| format!("{at}: {e}"))?;
+            if collections.iter().any(|known| known.name == c.name) {
+                return Err(format!("{at}: collection {:?} is declared twice", c.name));
+            }
+            let shard_map_path = c.shard_map.as_ref().map(PathBuf::from);
+            if shard_map_path.is_some() && c.nodes.is_some() {
+                return Err(format!("{at}: shard_map replaces nodes; give only one"));
+            }
+            let shard_map = shard_map_path.as_deref().map(load_shard_map).transpose()?;
+            let node_addrs = match &shard_map {
+                Some(map) => normalize_addrs(map.shards.iter().map(|s| s.addr.clone()).collect()),
+                None => normalize_addrs(c.nodes.clone().unwrap_or_default()),
+            };
+            if node_addrs.is_empty() {
+                return Err(format!("{at}: a collection needs nodes or a shard_map"));
+            }
+            for addr in &node_addrs {
+                if let Some(other) = owners.insert(addr.clone(), c.name.clone()) {
+                    return Err(format!(
+                        "{at}: node {addr} is already listed under collection {other:?}; a shard \
+                         belongs to only one collection"
+                    ));
+                }
+            }
+            let replica_addrs: Vec<Option<String>> = match &shard_map {
+                Some(map) => map
+                    .shards
+                    .iter()
+                    .map(|s| {
+                        s.replica
+                            .clone()
+                            .map(|r| normalize_addrs(vec![r]).remove(0))
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            let control_state_path = c.control_state.as_ref().map(PathBuf::from);
+            if control_state_path.is_some() && shard_map.is_none() {
+                return Err(format!(
+                    "{at}: control_state requires a generation-written shard_map"
+                ));
+            }
+            let replica_state_path = c.replica_state.as_ref().map(PathBuf::from);
+            if replica_sync_ms > 0
+                && replica_addrs.iter().any(Option::is_some)
+                && replica_state_path.is_none()
+            {
+                return Err(format!(
+                    "{at}: automatic replica sync needs replica_state on the collection"
+                ));
+            }
+            if shard_map_reload_ms > 0 && shard_map_path.is_none() {
+                return Err(format!(
+                    "{at}: --shard-map-reload-ms needs a shard_map on every collection"
+                ));
+            }
+            collections.push(CollectionConfig {
+                name: c.name.clone(),
+                node_addrs,
+                replica_addrs,
+                shard_map,
+                shard_map_path,
+                analysis_addr: c
+                    .analysis_addr
+                    .clone()
+                    .map(normalize_analysis_backend)
+                    .or_else(|| analysis_addr.clone()),
+                bm25_k1: c.bm25_k1.unwrap_or(bm25_k1),
+                bm25_b: c.bm25_b.unwrap_or(bm25_b),
+                dense_quality_profile: c
+                    .dense_quality_profile
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or_else(|| dense_quality_profile.clone()),
+                replica_state_path,
+                control_state_path,
+            });
+        }
+    }
+    let default_collection = file.default_collection.clone();
+    if let Some(name) = &default_collection {
+        if !collections.iter().any(|c| &c.name == name) {
+            return Err(format!(
+                "default_collection {name:?} is not a declared collection ({:?})",
+                collections
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+    if !collections.is_empty() && matches!(role, Role::Node | Role::Both) {
+        for (i, shard) in shards.iter().enumerate() {
+            if !collections.iter().any(|c| c.name == shard.collection) {
+                return Err(format!(
+                    "shards[{i}] serves collection {:?}, which this process's `collections` \
+                     does not declare ({:?})",
+                    shard.collection,
+                    collections
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+    }
+
     Ok(Config {
         role,
         coord_listen,
@@ -1617,6 +1823,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         control_merge_rows,
         control_compact_segments,
         control_compact_tombstone_ppm,
+        collections,
+        default_collection,
         vocab_window_docs,
         vocab_top_k,
     })

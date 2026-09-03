@@ -97,6 +97,7 @@ async fn phrase_search_boosts_registered_matches_and_exposes_entity_map() {
     let phrase = SearchService::phrase_search(
         &coordinator,
         Request::new(PhraseSearchRequest {
+            collection: String::new(),
             base: Some(base),
             options: Some(PhraseSearchOptions {
                 weight_per_token: 1.0,
@@ -128,6 +129,7 @@ async fn phrase_search_boosts_registered_matches_and_exposes_entity_map() {
     let filtered = SearchService::phrase_search(
         &coordinator,
         Request::new(PhraseSearchRequest {
+            collection: String::new(),
             base: Some(Bm25SearchRequest {
                 text: "food".into(),
                 k: 10,
@@ -186,6 +188,7 @@ async fn phrase_search_boosts_registered_matches_and_exposes_entity_map() {
     let error = SearchService::phrase_search(
         &mixed,
         Request::new(PhraseSearchRequest {
+            collection: String::new(),
             base: Some(Bm25SearchRequest {
                 text: "New York City food".into(),
                 k: 10,

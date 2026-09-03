@@ -62,6 +62,7 @@ async fn add_documents_mapped(
     let (tx, rx) = mpsc::channel(8);
     for (text, strs, nums) in docs {
         tx.send(AddDocumentsRequest {
+            collection: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             text: text.to_string(),
@@ -342,6 +343,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),
@@ -585,6 +587,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // Ingest refusals: empty key, repeated (column, key), unknown
     // column, empty string value, non-finite numeric value.
     let bad_facet = |field: &str, key: &str, value: &str| AddDocumentsRequest {
+        collection: String::new(),
         sentence_fields: Vec::new(),
         materialize: None,
         text: "some text".to_string(),

@@ -270,6 +270,11 @@ pub struct CoordinatorServiceImpl {
     /// Node addresses in `http://host:port` form, in stable shard order
     /// (index in this list is the shard index used for tie-breaking).
     node_addrs: Vec<String>,
+    /// The collection this coordinator serves (`docs/collections.md`):
+    /// empty for the unnamed single dataset. A request naming another
+    /// collection is refused by `admit`; a node reporting another is
+    /// refused by `verify_collection_membership` and flagged in health.
+    collection: String,
     /// Optional replica address per shard (same data, exact same
     /// results), the target for hedged retries.
     replica_addrs: Vec<Option<String>>,
@@ -1520,6 +1525,7 @@ impl CoordinatorServiceImpl {
         let stats_cache = Arc::new(crate::stats_cache::StatsCache::new(node_addrs.len()));
         Self {
             node_addrs,
+            collection: String::new(),
             replica_addrs: Vec::new(),
             analysis_addr: None,
             bm25_params: Bm25Params::default(),
@@ -1922,6 +1928,73 @@ impl CoordinatorServiceImpl {
     pub fn with_topology_generation(mut self, generation: u64) -> Self {
         self.topology_generation = generation;
         self
+    }
+
+    /// Name the collection this coordinator serves (`docs/collections.md`).
+    pub fn with_collection(mut self, name: &str) -> Self {
+        self.collection = name.to_string();
+        self
+    }
+
+    /// The collection this coordinator serves; empty for the unnamed
+    /// single dataset.
+    pub fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    /// The shard addresses this coordinator fans out to, in shard order.
+    pub fn node_addresses(&self) -> &[String] {
+        &self.node_addrs
+    }
+
+    /// Admit a request only for this coordinator's collection: an empty
+    /// name gets to the unnamed dataset, or a named collection through a
+    /// [`crate::collections::CollectionSet`] that written the name; any
+    /// other name refuses rather than answering from the wrong dataset.
+    fn admit(&self, requested: &str) -> Result<(), Status> {
+        if requested.is_empty() || requested == self.collection {
+            return Ok(());
+        }
+        Err(if self.collection.is_empty() {
+            Status::invalid_argument(format!(
+                "unknown collection {requested:?}: this coordinator serves one unnamed dataset"
+            ))
+        } else {
+            Status::invalid_argument(format!(
+                "this coordinator serves collection {:?}, not {requested:?}",
+                self.collection
+            ))
+        })
+    }
+
+    /// Ask every shard which collection it serves and refuse when any
+    /// answer differs from this coordinator's: a shard belongs to precisely
+    /// one collection, and a fleet that disagrees never serves.
+    pub async fn verify_collection_membership(&self) -> Result<(), Status> {
+        let mut addrs: Vec<String> = self.node_addrs.clone();
+        addrs.extend(self.replica_addrs.iter().flatten().cloned());
+        for addr in addrs {
+            let mut client = self.node_client(&addr)?;
+            let health = client
+                .health(HealthRequest {})
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!(
+                        "collection {:?}: node {addr} did not answer a health probe: {}",
+                        self.collection,
+                        e.message()
+                    ))
+                })?
+                .into_inner();
+            if health.collection != self.collection {
+                return Err(Status::failed_precondition(format!(
+                    "node {addr} serves collection {:?}, but this coordinator is {:?}; a shard \
+                     belongs to only one collection",
+                    health.collection, self.collection
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Prove the dense traversal contract against every live shard before the
@@ -8713,6 +8786,128 @@ impl Ord for StreamHeapEntry {
     }
 }
 
+impl CoordinatorServiceImpl {
+    /// The first message of a routed mapped ingest stream, which must be
+    /// the bind: it names the collection the whole stream writes into
+    /// (`docs/collections.md`).
+    pub async fn routed_bind(
+        inbound: &mut Streaming<RoutedIngestMappedRequest>,
+    ) -> Result<crate::pb::RoutedMappedBind, Status> {
+        match inbound.message().await? {
+            Some(RoutedIngestMappedRequest {
+                payload: Some(crate::pb::routed_ingest_mapped_request::Payload::Bind(bind)),
+            }) => Ok(bind),
+            _ => Err(Status::invalid_argument(
+                "first RoutedIngestMappedRequest must be a RoutedMappedBind",
+            )),
+        }
+    }
+
+    /// Routed mapped ingest after its bind was read (and, on a collection
+    /// set, resolved): the write gate, the topology snapshot, and the
+    /// per-shard fan-out.
+    pub async fn routed_ingest_mapped_bound(
+        &self,
+        bind: crate::pb::RoutedMappedBind,
+        mut inbound: Streaming<RoutedIngestMappedRequest>,
+    ) -> Result<RoutedIngestMappedResponse, Status> {
+        // Gate before snapshotting: a write that arrived during a cutover
+        // must resume into the new map, never retain the old snapshot while
+        // waiting behind the final-tail barrier.
+        let _write_guard = if self.live_topology.is_some() {
+            Some(self.write_gate.clone().read_owned().await)
+        } else {
+            None
+        };
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(snapshot.routed_ingest_mapped_bound(bind, inbound)).await;
+        }
+        if bind.required_topology_generation == 0 {
+            return Err(Status::invalid_argument(
+                "routed writes require required_topology_generation; zero is not accepted",
+            ));
+        }
+        self.require_topology_generation(bind.required_topology_generation)?;
+        let mapped_bind = bind
+            .bind
+            .ok_or_else(|| Status::invalid_argument("routed mapped bind is missing bind"))?;
+        let mut batches: Vec<Vec<crate::pb::IngestMappedRequest>> =
+            vec![Vec::new(); self.node_addrs.len()];
+        while let Some(message) = inbound.message().await? {
+            let document = match message.payload {
+                Some(crate::pb::routed_ingest_mapped_request::Payload::Document(document)) => {
+                    document
+                }
+                Some(crate::pb::routed_ingest_mapped_request::Payload::Bind(_)) => {
+                    return Err(Status::invalid_argument(
+                        "routed mapped bind repeats mid-stream",
+                    ))
+                }
+                None => {
+                    return Err(Status::invalid_argument(
+                        "empty RoutedIngestMappedRequest payload",
+                    ))
+                }
+            };
+            let (_, shard) = self
+                .route_stable_key(&document.stable_key)
+                .map_err(Status::invalid_argument)?;
+            if batches[shard].is_empty() {
+                batches[shard].push(crate::pb::IngestMappedRequest {
+                    payload: Some(crate::pb::ingest_mapped_request::Payload::Bind(
+                        mapped_bind.clone(),
+                    )),
+                });
+            }
+            batches[shard].push(crate::pb::IngestMappedRequest {
+                payload: Some(crate::pb::ingest_mapped_request::Payload::RoutedDocument(
+                    document,
+                )),
+            });
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (shard, batch) in batches.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            let addr = self.node_addrs[shard].clone();
+            let mut client = self.node_client(&addr)?;
+            tasks.spawn(async move {
+                let response = client
+                    .ingest_mapped(tokio_stream::iter(batch))
+                    .await?
+                    .into_inner();
+                Ok::<_, Status>((shard, addr, response))
+            });
+        }
+        let mut shards = Vec::new();
+        let mut added = 0u64;
+        let mut parents = 0u64;
+        while let Some(result) = tasks.join_next().await {
+            let (shard, addr, response) = result.map_err(|error| {
+                Status::internal(format!("routed ingest task failed: {error}"))
+            })??;
+            added = added.saturating_add(response.added);
+            parents = parents.saturating_add(response.parents);
+            shards.push(RoutedShardIngest {
+                shard: shard as u32,
+                addr,
+                added: response.added,
+                parents: response.parents,
+                first_id: response.first_id,
+            });
+        }
+        shards.sort_by_key(|result| result.shard);
+        Ok(RoutedIngestMappedResponse {
+            added,
+            parents,
+            served_topology_generation: self.topology_generation,
+            shards,
+        })
+    }
+}
+
 #[tonic::async_trait]
 impl SearchService for CoordinatorServiceImpl {
     type QueryStreamStream = ReceiverStream<Result<crate::pb::QueryStreamResponse, Status>>;
@@ -8721,6 +8916,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::search(&snapshot, request)).await;
         }
@@ -8824,6 +9020,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::bm25_search(&snapshot, request)).await;
         }
@@ -9008,6 +9205,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::PhraseSearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::phrase_search(&snapshot, request)).await;
         }
@@ -9068,6 +9266,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::hybrid_search(&snapshot, request)).await;
         }
@@ -9231,6 +9430,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::QueryRequest>,
     ) -> Result<Response<crate::pb::QueryResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::query(&snapshot, request)).await;
         }
@@ -9245,6 +9445,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::QueryStreamRequest>,
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::query_stream(&snapshot, request)).await;
         }
@@ -9514,6 +9715,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::PlanIndexRequest>,
     ) -> Result<Response<crate::pb::PlanIndexResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::plan_index(&snapshot, request)).await;
         }
@@ -9531,117 +9733,19 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<Streaming<RoutedIngestMappedRequest>>,
     ) -> Result<Response<RoutedIngestMappedResponse>, Status> {
-        // Gate before snapshotting: a write that arrived during a cutover
-        // must resume onto the new map, never retain the old snapshot while
-        // waiting behind the final-tail barrier.
-        let _write_guard = if self.live_topology.is_some() {
-            Some(self.write_gate.clone().read_owned().await)
-        } else {
-            None
-        };
-        if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::routed_ingest_mapped(&snapshot, request)).await;
-        }
         let mut inbound = request.into_inner();
-        let bind = match inbound.message().await? {
-            Some(RoutedIngestMappedRequest {
-                payload: Some(crate::pb::routed_ingest_mapped_request::Payload::Bind(bind)),
-            }) => bind,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "first RoutedIngestMappedRequest must be a RoutedMappedBind",
-                ))
-            }
-        };
-        if bind.required_topology_generation == 0 {
-            return Err(Status::invalid_argument(
-                "routed writes require required_topology_generation; zero is not accepted",
-            ));
-        }
-        self.require_topology_generation(bind.required_topology_generation)?;
-        let mapped_bind = bind
-            .bind
-            .ok_or_else(|| Status::invalid_argument("routed mapped bind is missing bind"))?;
-        let mut batches: Vec<Vec<crate::pb::IngestMappedRequest>> =
-            vec![Vec::new(); self.node_addrs.len()];
-        while let Some(message) = inbound.message().await? {
-            let document = match message.payload {
-                Some(crate::pb::routed_ingest_mapped_request::Payload::Document(document)) => {
-                    document
-                }
-                Some(crate::pb::routed_ingest_mapped_request::Payload::Bind(_)) => {
-                    return Err(Status::invalid_argument(
-                        "routed mapped bind repeats mid-stream",
-                    ))
-                }
-                None => {
-                    return Err(Status::invalid_argument(
-                        "empty RoutedIngestMappedRequest payload",
-                    ))
-                }
-            };
-            let (_, shard) = self
-                .route_stable_key(&document.stable_key)
-                .map_err(Status::invalid_argument)?;
-            if batches[shard].is_empty() {
-                batches[shard].push(crate::pb::IngestMappedRequest {
-                    payload: Some(crate::pb::ingest_mapped_request::Payload::Bind(
-                        mapped_bind.clone(),
-                    )),
-                });
-            }
-            batches[shard].push(crate::pb::IngestMappedRequest {
-                payload: Some(crate::pb::ingest_mapped_request::Payload::RoutedDocument(
-                    document,
-                )),
-            });
-        }
-
-        let mut tasks = tokio::task::JoinSet::new();
-        for (shard, batch) in batches.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let addr = self.node_addrs[shard].clone();
-            let mut client = self.node_client(&addr)?;
-            tasks.spawn(async move {
-                let response = client
-                    .ingest_mapped(tokio_stream::iter(batch))
-                    .await?
-                    .into_inner();
-                Ok::<_, Status>((shard, addr, response))
-            });
-        }
-        let mut shards = Vec::new();
-        let mut added = 0u64;
-        let mut parents = 0u64;
-        while let Some(result) = tasks.join_next().await {
-            let (shard, addr, response) = result.map_err(|error| {
-                Status::internal(format!("routed ingest task failed: {error}"))
-            })??;
-            added = added.saturating_add(response.added);
-            parents = parents.saturating_add(response.parents);
-            shards.push(RoutedShardIngest {
-                shard: shard as u32,
-                addr,
-                added: response.added,
-                parents: response.parents,
-                first_id: response.first_id,
-            });
-        }
-        shards.sort_by_key(|result| result.shard);
-        Ok(Response::new(RoutedIngestMappedResponse {
-            added,
-            parents,
-            served_topology_generation: self.topology_generation,
-            shards,
-        }))
+        let bind = Self::routed_bind(&mut inbound).await?;
+        self.admit(&bind.collection)?;
+        self.routed_ingest_mapped_bound(bind, inbound)
+            .await
+            .map(Response::new)
     }
 
     async fn freeze_topology_writes(
         &self,
         request: Request<FreezeTopologyWritesRequest>,
     ) -> Result<Response<FreezeTopologyWritesResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if self.live_topology.is_none() {
             return Err(Status::failed_precondition(
                 "topology cutover requires a generation-stamped hot shard map",
@@ -9691,6 +9795,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<PublishTopologyRequest>,
     ) -> Result<Response<PublishTopologyResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         let req = request.into_inner();
         let routes = req
             .shards
@@ -9727,6 +9832,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<AbortTopologyCutoverRequest>,
     ) -> Result<Response<AbortTopologyCutoverResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         let token = request.into_inner().cutover_token;
         let mut held = self
             .cutover_guard
@@ -9755,6 +9861,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::AggregateRequest>,
     ) -> Result<Response<crate::pb::AggregateResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::aggregate(&snapshot, request)).await;
         }
@@ -9770,10 +9877,13 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         _request: Request<ClusterHealthRequest>,
     ) -> Result<Response<ClusterHealthResponse>, Status> {
+        self.admit(&_request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::cluster_health(
                 &snapshot,
-                Request::new(ClusterHealthRequest {}),
+                Request::new(ClusterHealthRequest {
+                    collection: String::new(),
+                }),
             ))
             .await;
         }
@@ -9834,6 +9944,18 @@ impl SearchService for CoordinatorServiceImpl {
                 Err(e) => return Err(Status::internal(format!("health probe task failed: {e}"))),
             }
         }
+        // A reachable node that serves another collection is a
+        // misconfiguration, named here rather than counted here.
+        for target in &mut targets {
+            if let Some(health) = &target.health {
+                if health.collection != self.collection {
+                    target.error = format!(
+                        "node serves collection {:?}, but this coordinator is {:?}",
+                        health.collection, self.collection
+                    );
+                }
+            }
+        }
         let clustered_vector = if let Some(backend) = &self.clustered_vectors {
             Some(match backend.health().await {
                 Ok(health) => ClusteredVectorHealth {
@@ -9859,6 +9981,7 @@ impl SearchService for CoordinatorServiceImpl {
             None
         };
         Ok(Response::new(ClusterHealthResponse {
+            collections: Vec::new(),
             targets,
             clustered_vector,
         }))
@@ -9868,6 +9991,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<BroadcastVectorBackendRequest>,
     ) -> Result<Response<BroadcastVectorBackendResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::broadcast_vector_backend(&snapshot, request)).await;
         }
@@ -9885,6 +10009,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<BroadcastCalibrationRequest>,
     ) -> Result<Response<BroadcastCalibrationResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::broadcast_calibration(&snapshot, request)).await;
         }
@@ -9902,6 +10027,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<VariantSearchRequest>,
     ) -> Result<Response<VariantSearchResponse>, Status> {
+        self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::variant_search(&snapshot, request)).await;
         }
@@ -10133,6 +10259,7 @@ mod stream_cancel_tests {
         let frozen = SearchService::freeze_topology_writes(
             &coordinator,
             Request::new(FreezeTopologyWritesRequest {
+                collection: String::new(),
                 required_topology_generation: 4,
             }),
         )
@@ -10148,6 +10275,7 @@ mod stream_cancel_tests {
         SearchService::publish_topology(
             &coordinator,
             Request::new(PublishTopologyRequest {
+                collection: String::new(),
                 cutover_token: frozen.cutover_token,
                 generation: 5,
                 shards: vec![
@@ -10176,6 +10304,7 @@ mod stream_cancel_tests {
         let frozen = SearchService::freeze_topology_writes(
             &coordinator,
             Request::new(FreezeTopologyWritesRequest {
+                collection: String::new(),
                 required_topology_generation: 5,
             }),
         )
@@ -10185,6 +10314,7 @@ mod stream_cancel_tests {
         let aborted = SearchService::abort_topology_cutover(
             &coordinator,
             Request::new(AbortTopologyCutoverRequest {
+                collection: String::new(),
                 cutover_token: frozen.cutover_token,
             }),
         )

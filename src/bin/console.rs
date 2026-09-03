@@ -228,7 +228,9 @@ fn node_client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
 async fn health(ctx: &Ctx) -> Result<Value, String> {
     let mut client = search_client(&ctx.coordinator)?;
     let response = client
-        .cluster_health(ClusterHealthRequest {})
+        .cluster_health(ClusterHealthRequest {
+            collection: String::new(),
+        })
         .await
         .map_err(|e| e.to_string())?
         .into_inner();
@@ -430,6 +432,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
     let embed_ms = t_embed.elapsed().as_secs_f32() * 1e3;
 
     let request = HybridSearchRequest {
+        collection: String::new(),
         request_id: String::new(),
         text: req.text.clone(),
         vector,

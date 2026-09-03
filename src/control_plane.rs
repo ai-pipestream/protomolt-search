@@ -168,6 +168,11 @@ struct ActionSpec<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredState {
     format: u32,
+    /// The collection this plane governs (docs/collections.md); empty in
+    /// state written before collections, written on the first open under
+    /// a named collection.
+    #[serde(default)]
+    collection: String,
     revision: u64,
     next_token: u64,
     next_action: u64,
@@ -184,6 +189,7 @@ impl Default for StoredState {
     fn default() -> Self {
         Self {
             format: 1,
+            collection: String::new(),
             revision: 1,
             next_token: 1,
             next_action: 1,
@@ -279,6 +285,38 @@ impl DurableControlPlane {
             path: None,
             policy,
         }
+    }
+
+    /// Bind this plane to a collection (`docs/collections.md`). State
+    /// written before collections is adopted and written; state that
+    /// names another collection is refused, because its shards are that
+    /// dataset's.
+    pub fn with_collection(self, name: &str) -> Result<Self, String> {
+        {
+            let mut state = self.state.lock().expect("control state lock poisoned");
+            if state.collection.is_empty() {
+                state.collection = name.to_string();
+            } else if state.collection != name {
+                return Err(format!(
+                    "control state {} governs collection {:?}, not {name:?}",
+                    self.path
+                        .as_ref()
+                        .map_or_else(|| "(in memory)".to_string(), |p| p.display().to_string()),
+                    state.collection
+                ));
+            }
+            self.persist_locked(&state)?;
+        }
+        Ok(self)
+    }
+
+    /// The collection this plane governs; empty for an unnamed dataset.
+    pub fn collection(&self) -> String {
+        self.state
+            .lock()
+            .expect("control state lock poisoned")
+            .collection
+            .clone()
     }
 
     /// Seed a pristine control store from the topology already loaded by the
@@ -1462,12 +1500,14 @@ impl DurableControlPlane {
 
     fn plan_of(state: &StoredState) -> ClusterPlan {
         ClusterPlan {
+            collection: state.collection.clone(),
             control_revision: state.revision,
             topology_generation: state.topology.generation,
             nodes: state
                 .nodes
                 .values()
                 .map(|node| ClusterNode {
+                    collection: state.collection.clone(),
                     node_id: node.node_id.clone(),
                     addr: node.addr.clone(),
                     state: match node.state {
@@ -1483,6 +1523,7 @@ impl DurableControlPlane {
                 .replicas
                 .values()
                 .map(|replica| ShardReplicaState {
+                    collection: state.collection.clone(),
                     shard_id: replica.shard_id.clone(),
                     node_id: replica.node_id.clone(),
                     addr: replica.addr.clone(),
@@ -1507,6 +1548,7 @@ impl DurableControlPlane {
                 .actions
                 .iter()
                 .map(|action| PlacementAction {
+                    collection: state.collection.clone(),
                     action_id: action.action_id,
                     kind: action.kind,
                     shard_id: action.shard_id.clone(),
@@ -1547,6 +1589,29 @@ impl ClusterControlService {
     pub fn with_coordinator(mut self, coordinator: CoordinatorServiceImpl) -> Self {
         self.coordinator = Some(coordinator);
         self
+    }
+
+    /// The collection this plane governs (`docs/collections.md`).
+    pub fn collection(&self) -> String {
+        self.plane.collection()
+    }
+
+    /// Admit a request only for this plane's collection (the same rule
+    /// as `CoordinatorServiceImpl::admit`).
+    fn admit(&self, requested: &str) -> Result<(), Status> {
+        let own = self.plane.collection();
+        if requested.is_empty() || requested == own {
+            return Ok(());
+        }
+        Err(if own.is_empty() {
+            Status::invalid_argument(format!(
+                "unknown collection {requested:?}: this control plane governs one unnamed dataset"
+            ))
+        } else {
+            Status::invalid_argument(format!(
+                "this control plane governs collection {own:?}, not {requested:?}"
+            ))
+        })
     }
 
     pub fn into_server(self, max_message_bytes: usize) -> ClusterControlServer<Self> {
@@ -1590,6 +1655,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<NodeLease>, Status> {
+        self.admit(&request.get_ref().collection)?;
         self.plane
             .register(request.into_inner(), now_ms())
             .map(Response::new)
@@ -1599,6 +1665,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<RenewNodeLeaseRequest>,
     ) -> Result<Response<NodeLease>, Status> {
+        self.admit(&request.get_ref().collection)?;
         self.plane
             .renew(request.into_inner(), now_ms())
             .map(Response::new)
@@ -1608,6 +1675,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.admit(&request.get_ref().collection)?;
         self.plane.drain(request.into_inner(), now_ms())?;
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
         self.publish_if_needed()?;
@@ -1618,7 +1686,12 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<ReportShardRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
-        self.plane.report(request.into_inner(), now_ms())?;
+        self.admit(&request.get_ref().collection)?;
+        let req = request.into_inner();
+        if let Some(replica) = &req.replica {
+            self.admit(&replica.collection)?;
+        }
+        self.plane.report(req, now_ms())?;
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
         self.publish_if_needed()?;
         Ok(Response::new(plan))
@@ -1628,6 +1701,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<CompletePlacementActionRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.admit(&request.get_ref().collection)?;
         self.plane.complete_action(request.into_inner(), now_ms())?;
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
         self.publish_if_needed()?;
@@ -1638,6 +1712,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<ReconcileClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.admit(&request.get_ref().collection)?;
         let request = request.into_inner();
         let (plan, _changed) = self.plane.reconcile(request.dry_run, now_ms())?;
         if !request.dry_run {
@@ -1650,6 +1725,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         _request: Request<GetClusterPlanRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.admit(&_request.get_ref().collection)?;
         self.plane.plan().map(Response::new)
     }
 
@@ -1657,6 +1733,7 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<RollbackClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        self.admit(&request.get_ref().collection)?;
         let (plan, _changed) = self
             .plane
             .rollback(request.into_inner().topology_generation)?;
@@ -1679,6 +1756,7 @@ mod tests {
         plane
             .register(
                 RegisterNodeRequest {
+                    collection: String::new(),
                     node_id: id.into(),
                     addr: addr.into(),
                     capacity: Some(NodeCapacity {
@@ -1720,6 +1798,7 @@ mod tests {
         plane
             .report(
                 ReportShardRequest {
+                    collection: String::new(),
                     node_id: lease.node_id.clone(),
                     lease_token: lease.lease_token,
                     replica: Some(ShardReplicaState {
@@ -1841,6 +1920,7 @@ mod tests {
         plane
             .drain(
                 DrainNodeRequest {
+                    collection: String::new(),
                     node_id: primary.node_id.clone(),
                     lease_token: primary.lease_token,
                 },
@@ -1870,6 +1950,7 @@ mod tests {
         plane
             .complete_action(
                 CompletePlacementActionRequest {
+                    collection: String::new(),
                     node_id: target.node_id.clone(),
                     lease_token: target.lease_token,
                     action_id: copy.action_id,
@@ -1888,6 +1969,7 @@ mod tests {
         plane
             .complete_action(
                 CompletePlacementActionRequest {
+                    collection: String::new(),
                     node_id: primary.node_id.clone(),
                     lease_token: primary.lease_token,
                     action_id: drop_action.action_id,
@@ -2050,6 +2132,7 @@ mod tests {
             .clone();
         let midpoint = u64::MAX / 2;
         let invalid = CompletePlacementActionRequest {
+            collection: String::new(),
             node_id: node.node_id.clone(),
             lease_token: node.lease_token,
             action_id: action.action_id,
@@ -2068,6 +2151,7 @@ mod tests {
             .any(|held| held.action_id == action.action_id));
 
         let completion = CompletePlacementActionRequest {
+            collection: String::new(),
             node_id: node.node_id.clone(),
             lease_token: node.lease_token,
             action_id: action.action_id,
@@ -2132,6 +2216,7 @@ mod tests {
         plane
             .complete_action(
                 CompletePlacementActionRequest {
+                    collection: String::new(),
                     node_id: node.node_id.clone(),
                     lease_token: node.lease_token,
                     action_id: action.action_id,

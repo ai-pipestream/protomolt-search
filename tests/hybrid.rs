@@ -56,6 +56,7 @@ async fn add_documents(addr: &str, texts: &[String]) {
     let feeder = tokio::spawn(async move {
         for text in texts {
             tx.send(AddDocumentsRequest {
+                collection: String::new(),
                 sentence_fields: Vec::new(),
                 materialize: None,
                 map_numerics: Vec::new(),
@@ -1143,6 +1144,7 @@ async fn broadcast_calibration_reaches_all_shards() {
     let coordinator =
         CoordinatorServiceImpl::new(vec![addr_a.clone(), addr_b.clone(), addr_c.clone()]);
     let request = pipestream_search::pb::BroadcastCalibrationRequest {
+        collection: String::new(),
         dim: DIM as u32,
         bit_width: 4,
         shift: shift.clone(),

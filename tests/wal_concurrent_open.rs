@@ -44,6 +44,7 @@ fn fresh_dir(tag: &str) -> PathBuf {
 
 fn manifest() -> WalManifest {
     WalManifest {
+        collection: String::new(),
         dim: 8,
         vector_backend: String::new(),
         vector_config_format: String::new(),

@@ -388,7 +388,21 @@ still sit in df and in the length normalizer until the next compaction,
 so the response says so, and compaction is the rebuild habit this project
 already has, now scoped to a shard.
 
-### 11. Collections, or at least a namespace
+### 11. Collections, or at least a namespace — LANDED
+
+**Landed 2026-09-02 (`docs/collections.md`, `tests/collections.rs`).**
+The real version, not the cheap one: a collection is one
+`CoordinatorServiceImpl` — its own shard set, topology, statistics
+cache, calibration, analysis backend, BM25 parameters, control plane —
+under a name, and `CollectionSet` routes every public request to the
+one it names. Nothing is shared between collections, so nothing can
+leak: same term, different df, different scores. A node serves precisely
+one collection (config, health, ingest write and refusal, WAL manifest,
+reshard compatibility, control-plane records all carry it). Unknown
+names refuse; an unnamed request on a named set refuses unless a
+default is configured; an empty collection is empty.
+
+The original rationale, kept:
 
 One cluster serves one corpus. There is no index name, no collection, no
 tenant. Everything — shard layout, the column table, the analysis

@@ -29,6 +29,7 @@ async fn add_documents(addr: &str, texts: &[&str]) {
     let (tx, rx) = mpsc::channel(8);
     for text in texts {
         tx.send(AddDocumentsRequest {
+            collection: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             map_numerics: Vec::new(),

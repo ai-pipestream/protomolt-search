@@ -118,6 +118,7 @@ async fn start_cluster(
             let feed = tokio::spawn(async move {
                 for text in texts {
                     tx.send(pipestream_search::pb::AddDocumentsRequest {
+                        collection: String::new(),
                         sentence_fields: Vec::new(),
                         materialize: None,
                         map_numerics: Vec::new(),

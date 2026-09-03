@@ -78,6 +78,7 @@ async fn add_documents_geo(
     let (tx, rx) = mpsc::channel(64);
     for (text, points) in docs {
         tx.send(AddDocumentsRequest {
+            collection: String::new(),
             sentence_fields: Vec::new(),
             materialize: None,
             text: text.to_string(),
@@ -855,6 +856,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            collection: String::new(),
             highlight: None,
             projections: Vec::new(),
             filter: String::new(),

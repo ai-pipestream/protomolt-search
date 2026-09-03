@@ -71,7 +71,9 @@ async fn cluster_health_reports_reachable_and_unreachable_targets() {
     let coordinator = CoordinatorServiceImpl::new(vec![cluster.node_addrs[0].clone(), dead])
         .with_replicas(vec![None, Some(cluster.node_addrs[1].clone())]);
     let report = coordinator
-        .cluster_health(Request::new(ClusterHealthRequest {}))
+        .cluster_health(Request::new(ClusterHealthRequest {
+            collection: String::new(),
+        }))
         .await
         .unwrap()
         .into_inner();

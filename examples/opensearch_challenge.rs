@@ -469,7 +469,9 @@ async fn health_protomolt() -> Result<(), Error> {
     let mut coordinator =
         SearchServiceClient::connect(normalize_addr(&required("coordinator")?)).await?;
     let cluster = coordinator
-        .cluster_health(ClusterHealthRequest {})
+        .cluster_health(ClusterHealthRequest {
+            collection: String::new(),
+        })
         .await?
         .into_inner();
     if cluster.targets.len() != 1 {
@@ -748,6 +750,7 @@ async fn one_protomolt(
         let request = protomolt_query(&workload, format!("challenge-{}-{iteration}", workload.id));
         let mut stream = client
             .query_stream(QueryStreamRequest {
+                collection: String::new(),
                 query: Some(request),
                 timeout_ms: 30_000,
             })

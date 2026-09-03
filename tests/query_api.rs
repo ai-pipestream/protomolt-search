@@ -210,7 +210,11 @@ async fn streamed_query(
     timeout_ms: u64,
 ) -> Vec<QueryStreamResponse> {
     let mut inbound = coordinator
-        .query_stream(Request::new(QueryStreamRequest { query, timeout_ms }))
+        .query_stream(Request::new(QueryStreamRequest {
+            collection: String::new(),
+            query,
+            timeout_ms,
+        }))
         .await
         .expect("QueryStream opens")
         .into_inner();
@@ -1783,6 +1787,7 @@ async fn public_query_stream_deadline_and_client_drop_cancel_analysis() {
 
     let mut stream = coordinator
         .query_stream(Request::new(QueryStreamRequest {
+            collection: String::new(),
             query: Some(request()),
             timeout_ms: 0,
         }))

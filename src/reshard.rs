@@ -450,7 +450,11 @@ fn read_gens_binding(gens: &[PathBuf]) -> Result<Option<crate::postings::StoredB
 /// Provider scoring identity for the merge check (slot offset and generation
 /// legitimately differ between inputs; the shape and provider state must not).
 fn same_backend_config(a: &WalManifest, b: &WalManifest) -> bool {
-    a.dim == b.dim && a.backend_config().ok() == b.backend_config().ok()
+    // One dataset, one provider state: generations of two collections
+    // never merge, whatever their vectors look like (docs/collections.md).
+    a.collection == b.collection
+        && a.dim == b.dim
+        && a.backend_config().ok() == b.backend_config().ok()
 }
 
 /// Build one child image from its share of the replay: the vector index

@@ -87,6 +87,7 @@ async fn coordinator_broadcasts_provider_config_and_reports_partial_failure() {
     let coordinator = CoordinatorServiceImpl::new(vec![addr_a, addr_b, addr_c]);
     let results = coordinator
         .fanout_vector_backend(&BroadcastVectorBackendRequest {
+            collection: String::new(),
             dim: request.dim,
             config: request.config,
         })

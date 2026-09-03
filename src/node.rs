@@ -217,6 +217,11 @@ pub struct NodeConfig {
     /// server-side snippets (`docs/highlighting.md`). Only the body has
     /// stored text to cut from, so the list is `["body"]` or empty.
     pub sentence_fields: Vec<String>,
+    /// The collection this node serves (`docs/collections.md`); empty for
+    /// a node outside any named collection. Reported in health, written
+    /// on every logged document, checked on every bind, and matched
+    /// against the WAL manifest at open.
+    pub collection: String,
     /// Source fields whose adjacent-token pairs are derived into a
     /// bigram column named `<source>.bigrams`, which must itself be in
     /// `bm25_fields`. Derived at ingest from the source's positions, so
@@ -276,6 +281,7 @@ impl Default for NodeConfig {
             geo_fields: Vec::new(),
             position_fields: Vec::new(),
             sentence_fields: Vec::new(),
+            collection: String::new(),
             bigram_fields: Vec::new(),
             wal: false,
             wal_buckets: 64,
@@ -2715,6 +2721,7 @@ fn wal_manifest(
         bit_width,
         calibration_shift: shift,
         calibration_scale: scale,
+        collection: config.collection.clone(),
         slot_offset: config.slot_offset,
         generation,
         bucket_bits: config.wal_buckets.trailing_zeros(),
@@ -2787,6 +2794,21 @@ fn open_wal(index: Option<&VectorIndex>, config: &NodeConfig) -> Option<WalWrite
     let fresh = wal_manifest(index, config, 0, (vector_tip, doc_tip));
     let mut writer = wal::open_or_create(&dir, cutoff, fresh)
         .unwrap_or_else(|e| panic!("open WAL at {}: {e}", dir.display()));
+    // The log belongs to one collection (docs/collections.md). A manifest
+    // from before collections is adopted by the node that opens it, and
+    // written; one that names another collection is refused, because a
+    // replay of it here would put that dataset's documents into this one.
+    let held = writer.manifest().collection.clone();
+    if held.is_empty() && !config.collection.is_empty() {
+        writer.update_manifest(|m| m.collection = config.collection.clone());
+    } else if held != config.collection {
+        panic!(
+            "WAL at {} belongs to collection {held:?}, but this node serves {:?}; a shard \
+             belongs to only one collection",
+            dir.display(),
+            config.collection
+        );
+    }
     if writer.manifest().bucket_count != config.wal_buckets {
         eprintln!(
             "wal: --wal-buckets={} ignored; the existing log at {} has bucket_count={}",
@@ -5913,12 +5935,35 @@ impl NodeServiceImpl {
     /// scoring-only field has no occurrences to place, so a phrase over
     /// it could never match and would silently return nothing. Bigram
     /// columns derive from the source's positions by the same rule.
+    /// Admit a write only for this node's collection (`docs/collections.md`):
+    /// an empty name means "this node's", any other name refuses.
+    fn admit_collection(&self, requested: &str) -> Result<(), Status> {
+        if requested.is_empty() || requested == self.config.collection {
+            return Ok(());
+        }
+        Err(if self.config.collection.is_empty() {
+            Status::invalid_argument(format!(
+                "collection {requested:?} named, but this node serves no named collection"
+            ))
+        } else {
+            Status::invalid_argument(format!(
+                "this node serves collection {:?}, not {requested:?}",
+                self.config.collection
+            ))
+        })
+    }
+
     fn materialize_proximity(
         &self,
         mut doc: AddDocumentsRequest,
         mut analyzed: crate::postings::AnalyzedDoc,
     ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
         use crate::proximity::{bigram_field_name, derive_bigrams};
+        // A shard belongs to only one collection (docs/collections.md):
+        // a document naming another refuses, and an unnamed one is written
+        // with this node's before it is logged, so a replay carries it.
+        self.admit_collection(&doc.collection)?;
+        doc.collection = self.config.collection.clone();
         let configured_bigrams: Vec<crate::pb::BigramField> = self
             .config
             .bigram_fields
@@ -8244,6 +8289,7 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::ApplyWalBindingRequest>,
     ) -> Result<Response<crate::pb::ApplyWalBindingResponse>, Status> {
         let req = request.into_inner();
+        self.admit_collection(&req.collection)?;
         if req.plan_fingerprint.is_empty() || req.body_path.is_empty() {
             return Err(Status::invalid_argument(
                 "WAL binding requires plan_fingerprint and body_path",
@@ -8348,6 +8394,7 @@ impl NodeService for NodeServiceImpl {
                 )
             });
         Ok(Response::new(HealthResponse {
+            collection: self.config.collection.clone(),
             num_vectors,
             dim,
             bits_per_dimension: bit_width,
@@ -9044,6 +9091,7 @@ impl NodeService for NodeServiceImpl {
                 ))
             }
         };
+        self.admit_collection(&bind.collection)?;
         let extractor = self.bind_mapped(&bind)?;
         let fingerprint = extractor.plan().fingerprint.clone();
         let mut added = 0u64;

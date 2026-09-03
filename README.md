@@ -380,6 +380,15 @@ runs on the query path, offsets are UTF-16 units of the original text,
 and a field without spans refuses sentence mode by name (window mode
 cuts at whitespace instead). See [`docs/highlighting.md`](docs/highlighting.md).
 
+Collections (`[[collections]]` in the config file, `collection` on every
+public request) let one cluster serve many datasets with no shared state
+between them: each collection has its own shard set, topology,
+statistics, calibration, analysis backend, and control plane, and a node
+serves only one (`--collection`, checked at ingest, in the WAL
+manifest, and in health). Unknown names refuse, and an unnamed request
+gets to a named collection only through a configured default. See
+[`docs/collections.md`](docs/collections.md).
+
 Select native analysis with `--analysis-addr=native` or
 `analysis_addr = "native"`. A single-shard `both` process propagates that
 setting to its shard. Multi-shard node configurations set `analysis_addr` on
