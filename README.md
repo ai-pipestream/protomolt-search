@@ -29,7 +29,11 @@ runs the same public `SearchService` contract over private local shards through
 an in-process coordinator. It binds and dials no sockets, forces the native
 analyzer, and supports create/open, protobuf-mapped ingest, vector ingest,
 delete/replace, `Query`, `QueryStream`, health, and flush on Android, iOS, and
-desktop. See [Embedded and mobile Protomolt Search](docs/embedded-mobile.md).
+desktop. Its coordinator reaches shards through an in-process link
+(`src/link.rs`), the same handlers the network serves, so the crate links
+no HTTP/2, hyper, or Tokio networking — a `cargo tree` gate in its tests
+keeps it that way. See
+[Embedded and mobile Protomolt Search](docs/embedded-mobile.md).
 
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
 uses TurboVec's current `.tv` persistence format. Provider images are opaque to

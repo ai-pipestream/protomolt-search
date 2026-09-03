@@ -40,9 +40,11 @@ pub mod exact_vectors;
 pub mod filter;
 pub mod fusion;
 pub mod geo;
+#[cfg(feature = "net")]
 pub mod harness;
 pub mod highlight;
 pub mod interleave;
+pub mod link;
 pub mod live_docs;
 pub mod ltr;
 pub mod mapping;
@@ -56,6 +58,7 @@ pub mod proximity;
 pub mod quality;
 pub mod query;
 pub mod rankdiff;
+#[cfg(feature = "net")]
 pub mod replication;
 pub mod reshard;
 pub mod scorefn;
@@ -64,6 +67,7 @@ pub mod segmented;
 pub mod segmented_vectors;
 pub mod segments;
 pub mod sha256;
+#[cfg(feature = "net")]
 pub mod snapshot;
 pub mod stats_cache;
 mod stream_signal;

@@ -5,6 +5,10 @@
 //! loss, duplication, reordering, and malformed packets cannot turn an
 //! incomplete scan into a completed one.
 
+// The decode side serves the UDP listener, which the `net` feature builds;
+// the frame format itself stays in every build.
+#![cfg_attr(not(feature = "net"), allow(dead_code))]
+
 /// `TVS1`, the frozen identifier for the first streaming-signal frame.
 const MAGIC: [u8; 4] = *b"TVS1";
 const RAISE_FLOOR: u8 = 1;

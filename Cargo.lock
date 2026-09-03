@@ -1136,6 +1136,7 @@ dependencies = [
  "bzip2",
  "cel-interpreter",
  "csv",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

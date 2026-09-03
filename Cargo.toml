@@ -12,8 +12,10 @@ resolver = "2"
 
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s17" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "1dab45f33a408506aef17610680f1ffc5d9a03b8" }
-tonic = "0.12"
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "1dab45f33a408506aef17610680f1ffc5d9a03b8", optional = true }
+# tonic's core (Status, Request, codegen, the prost codec) is all the
+# embedded runtime needs; the HTTP/2 transport rides the `net` feature.
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
 prost = "0.13"
 # google.protobuf.Timestamp on the ingest wire compiles to this crate's
 # type; tonic-build emits the reference, the runtime needs the crate.
@@ -24,20 +26,51 @@ prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal", "fs", "io-util"] }
-tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 memmap2 = "0.9"
 protomolt-analyzer = { path = "crates/protomolt-analyzer" }
-tower = { version = "0.5", features = ["util"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+# The in-process node link (src/link.rs) frames request streams into the
+# handler's body itself: the body trait and the byte buffers, no socket.
+http-body = "1"
+bytes = "1"
+tower = { version = "0.5", features = ["util"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 
 [features]
+# The network stack (docs/embedded-mobile.md): tonic's HTTP/2 transport,
+# Tokio's sockets and signals, the clustered TurboVec gRPC client, and
+# everything that listens or dials — the serving binary, the harness,
+# replication, snapshots, the sidecar client, the UDP floor lane. Off,
+# the library is the same handlers reached in-process through
+# `link::NodeLink`; that is what the embedded runtime links, and
+# `cargo tree -p protomolt-search-embedded` shows no h2, hyper, or
+# Tokio `net` because of it.
+net = [
+    "tonic/transport",
+    "tokio/net",
+    "tokio/signal",
+    "tokio-stream/net",
+    "dep:tower",
+    "dep:hyper-util",
+    "dep:turbovec-grpc",
+]
 # TLS/mTLS on the gRPC listeners and the cluster-internal channels
 # (docs/security.md): rustls through tonic. On by default for the serving
-# binary; the embedded runtime turns it off, because it speaks over an
-# in-process duplex and must not carry a TLS stack onto a phone.
-default = ["tls"]
-tls = ["tonic/tls"]
+# binary; the embedded runtime turns it off, because it reaches its nodes
+# in-process and must not carry a TLS stack onto a phone.
+default = ["net", "tls"]
+tls = ["net", "tonic/tls"]
+
+[[bin]]
+name = "pipestream-search"
+path = "src/main.rs"
+required-features = ["net"]
+
+[[bin]]
+name = "console"
+path = "src/bin/console.rs"
+required-features = ["net"]
 
 [build-dependencies]
 tonic-build = "0.12"

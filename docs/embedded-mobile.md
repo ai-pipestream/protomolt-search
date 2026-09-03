@@ -12,17 +12,23 @@ EmbeddedSearch / SearchService
        v
 local coordinator
        |
-       +---- in-memory HTTP/2 ---- local shard 0
-       +---- in-memory HTTP/2 ---- local shard 1
-       `---- in-memory HTTP/2 ---- local shard N
+       +---- in-process link ---- local shard 0
+       +---- in-process link ---- local shard 1
+       `---- in-process link ---- local shard N
 ```
 
 This is a local cluster, not a federated query. The server never receives the
 phone's index, documents, queries, vectors, analyzer output, or rankings.
 Each shard is the ordinary `NodeServiceImpl`; the coordinator is the ordinary
-`CoordinatorServiceImpl`. Tonic carries the existing protobuf messages over
-Tokio duplex streams so the embedded runtime does not maintain a second
-ranking or schema implementation.
+`CoordinatorServiceImpl`. The coordinator reaches a shard through
+`link::NodeLink` (`src/link.rs`): across the network it is the generated gRPC
+client over a channel; in the embedded runtime it is `NodeLink::Local`, a
+direct call into the same `NodeService` handler. A client-streaming call
+frames the caller's messages into the handler's `Streaming` body in memory
+(the gRPC five-byte prefix and the protobuf bytes, never a socket), and a
+server stream comes back as the handler's own receiver. So the embedded
+runtime maintains no second ranking or schema implementation, and it links
+no HTTP/2 to get there.
 
 ## Contract
 
@@ -55,18 +61,30 @@ completion all remain coordinator behavior.
 No-egress is enforced by construction rather than by a convention:
 
 1. `EmbeddedSearchConfig` accepts shard configurations, not node addresses.
-2. Every coordinator channel is preloaded with an in-memory duplex connector.
-3. An embedded coordinator rejects a missing channel instead of falling back
+2. Every coordinator link is an in-process `NodeLink::Local` to a shard it
+   opened itself.
+3. An embedded coordinator rejects a missing link instead of falling back
    to TCP, and both DNS resolution and the UDP floor-hint lane are disabled.
 4. Every shard and the coordinator are forced to the in-process `native`
    analyzer. A sidecar URL is rejected before any service task starts.
 5. Embeddings enter as caller-supplied vectors or fields in mapped protobuf
    documents. Embedded startup never configures a remote embedding provider.
 
-The dependency graph still contains tonic, HTTP/2, and Tokio networking code
-because the embedded and network products intentionally share generated
-services and handlers. The embedded runtime constructs only duplex streams;
-it needs no reachable host, listener, DNS, UDP, or remote service.
+The network stack is a feature of the search crate, `net` (on by default;
+`tls` implies it): tonic's HTTP/2 transport, Tokio's sockets and signals,
+the clustered TurboVec gRPC client, the serving binary, the test harness,
+replication, snapshots, the sidecar client, and the UDP floor lane. The
+embedded crate depends on the search crate with `default-features = false`
+and on tonic's core only (`Status`, `Request`, the codec), so the mobile link
+carries no `h2`, `hyper`, `hyper-util`, `axum`, `tower`, `rustls`, `socket2`,
+or `mio`, and Tokio without `net` or `signal`. Resolved on its own,
+`cargo tree -p protomolt-search-embedded -e normal` lists `tokio` (`bytes,
+fs, io-util, macros, rt, rt-multi-thread, sync, time`) and `tonic`
+(`codegen, prost`) and nothing that listens or dials.
+`crates/protomolt-search-embedded/tests/dependency_gate.rs` runs that
+`cargo tree` and fails the build the moment one of them comes back. The
+same handlers serve both builds: `tests/embedded.rs` pins the embedded
+results bitwise against the network service.
 
 ## Create and open
 

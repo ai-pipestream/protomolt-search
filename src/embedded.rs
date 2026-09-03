@@ -9,35 +9,25 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyper_util::rt::TokioIo;
-use tokio::io::{duplex, DuplexStream};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
-use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Status};
-use tower::service_fn;
 
 use crate::analyzer::NATIVE_ANALYSIS_BACKEND;
 use crate::bm25::Bm25Params;
 use crate::coordinator::{
     CoordinatorServiceImpl, FanoutLimits, DEFAULT_MAX_K, DEFAULT_MAX_RERANK_BYTES,
 };
+use crate::link::NodeLink;
 use crate::node::{
     bm25_sidecar_path, exact_vector_sidecar_path, generation_dir, live_docs_sidecar_path,
     NodeConfig, NodeServiceImpl,
 };
-use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_server::SearchService;
 use crate::pb::*;
 use crate::quality::DenseQualityProfile;
-
-const DUPLEX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// One private shard in an embedded runtime.
 #[derive(Clone, Debug)]
@@ -168,9 +158,9 @@ impl From<Status> for EmbeddedError {
 /// owns a network listener.
 pub struct EmbeddedSearch {
     coordinator: CoordinatorServiceImpl,
-    channels: Vec<Channel>,
-    nodes: Vec<NodeServiceImpl>,
-    tasks: Vec<JoinHandle<Result<(), tonic::transport::Error>>>,
+    /// The shards, reached in-process through [`NodeLink::Local`]: the
+    /// same handlers the network serves, with no HTTP/2 between.
+    nodes: Vec<Arc<NodeServiceImpl>>,
 }
 
 impl EmbeddedSearch {
@@ -192,9 +182,7 @@ impl EmbeddedSearch {
     pub async fn open(mut config: EmbeddedSearchConfig) -> Result<Self, EmbeddedError> {
         validate_config(&mut config)?;
 
-        let mut channels = Vec::with_capacity(config.shards.len());
         let mut nodes = Vec::with_capacity(config.shards.len());
-        let mut tasks = Vec::with_capacity(config.shards.len());
         for (shard, shard_config) in config.shards.iter().enumerate() {
             let node = NodeServiceImpl::open(
                 shard_config.node.clone(),
@@ -202,13 +190,10 @@ impl EmbeddedSearch {
                 shard_config.allow_missing_bm25,
             )
             .map_err(|message| EmbeddedError::OpenShard { shard, message })?;
-            let (channel, task) = spawn_node(node.clone());
-            channels.push(channel);
-            nodes.push(node);
-            tasks.push(task);
+            nodes.push(Arc::new(node));
         }
 
-        let mut coordinator = CoordinatorServiceImpl::with_in_process_channels(channels.clone())
+        let mut coordinator = CoordinatorServiceImpl::with_local_nodes(nodes.clone())
             .with_bm25(
                 Some(NATIVE_ANALYSIS_BACKEND.to_string()),
                 config.bm25_params,
@@ -224,16 +209,11 @@ impl EmbeddedSearch {
             coordinator = coordinator.with_dense_quality_profile(profile);
         }
 
-        Ok(Self {
-            coordinator,
-            channels,
-            nodes,
-            tasks,
-        })
+        Ok(Self { coordinator, nodes })
     }
 
     pub fn shard_count(&self) -> usize {
-        self.channels.len()
+        self.nodes.len()
     }
 
     /// The exact public service implementation used by the network server.
@@ -252,16 +232,16 @@ impl EmbeddedSearch {
     /// A generated client for the complete shard/admin contract over an
     /// in-memory HTTP/2 stream. This is useful for less common operations such
     /// as snapshot install and encoded-row movement.
-    pub fn shard_client(&self, shard: usize) -> Result<NodeServiceClient<Channel>, EmbeddedError> {
-        let channel = self.channels.get(shard).ok_or_else(|| {
+    /// The in-process link to one shard: every node RPC, dispatched
+    /// straight into the handler.
+    pub fn shard_client(&self, shard: usize) -> Result<NodeLink, EmbeddedError> {
+        let node = self.nodes.get(shard).ok_or_else(|| {
             EmbeddedError::InvalidConfig(format!(
                 "shard {shard} is out of range for {} embedded shards",
-                self.channels.len()
+                self.nodes.len()
             ))
         })?;
-        Ok(NodeServiceClient::new(channel.clone())
-            .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
+        Ok(NodeLink::local(Arc::clone(node)))
     }
 
     pub async fn query(&self, request: QueryRequest) -> Result<QueryResponse, Status> {
@@ -476,9 +456,6 @@ impl Drop for EmbeddedSearch {
         for node in &self.nodes {
             node.snapshot_vocab_on_shutdown();
         }
-        for task in &self.tasks {
-            task.abort();
-        }
     }
 }
 
@@ -539,32 +516,4 @@ fn first_existing_artifact(index_path: &Path) -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|path| path.exists())
-}
-
-fn spawn_node(node: NodeServiceImpl) -> (Channel, JoinHandle<Result<(), tonic::transport::Error>>) {
-    let (incoming_tx, incoming_rx) = mpsc::channel::<DuplexStream>(8);
-    let incoming = ReceiverStream::new(incoming_rx).map(Ok::<_, io::Error>);
-    let task = tokio::spawn(
-        Server::builder()
-            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
-            .initial_connection_window_size(crate::H2_CONN_WINDOW)
-            .add_service(node.into_server(crate::MAX_MESSAGE_BYTES))
-            .serve_with_incoming(incoming),
-    );
-
-    let connector = service_fn(move |_| {
-        let incoming_tx = incoming_tx.clone();
-        async move {
-            let (client, server) = duplex(DUPLEX_BUFFER_BYTES);
-            incoming_tx.send(server).await.map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "embedded node service stopped")
-            })?;
-            Ok::<_, io::Error>(TokioIo::new(client))
-        }
-    });
-    let channel = Endpoint::from_static("http://embedded.protomolt.invalid")
-        .initial_stream_window_size(crate::H2_STREAM_WINDOW)
-        .initial_connection_window_size(crate::H2_CONN_WINDOW)
-        .connect_with_connector_lazy(connector);
-    (channel, task)
 }

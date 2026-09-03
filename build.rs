@@ -7,9 +7,13 @@
 //! `tonic::include_proto!`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The generated clients' `connect()` helpers name tonic's transport;
+    // they exist only when the `net` feature builds it.
+    let net = std::env::var_os("CARGO_FEATURE_NET").is_some();
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        .build_transport(net)
         .compile_protos(
             &[
                 "proto/ai/pipestream/search/v1/search.proto",

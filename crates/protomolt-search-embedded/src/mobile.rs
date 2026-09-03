@@ -846,6 +846,7 @@ mod tests {
             requests: vec![
                 IngestMappedRequest {
                     payload: Some(ingest_mapped_request::Payload::Bind(MappedBind {
+                        collection: String::new(),
                         descriptor_set,
                         message_type: "private.v1.Record".into(),
                         expected_fingerprint: plan.fingerprint,
@@ -871,6 +872,7 @@ mod tests {
         assert_eq!(queried.hits.len(), 1);
 
         let stream_request = QueryStreamRequest {
+            collection: String::new(),
             query: Some(query),
             timeout_ms: 0,
         };

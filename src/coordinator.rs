@@ -8,17 +8,20 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
+#[cfg(feature = "net")]
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::bm25::{Bm25Params, CorpusStats};
+#[cfg(feature = "net")]
 use crate::clustered_turbovec::{
     ClusteredCandidateEvent, ClusteredLabelFilter, ClusteredTurboVecBackend,
 };
 use crate::fusion::{self, Leg};
 use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
-use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
+#[cfg(feature = "net")]
+use crate::pb::HybridLegHit;
 use crate::pb::{
     bm25_query_stream_request, bm25_query_stream_response, Bm25QueryResponse,
     Bm25QueryStreamRequest, Bm25QueryStreamResponse,
@@ -31,14 +34,13 @@ use crate::pb::{
     CascadeHit, ClusterHealthRequest, ClusterHealthResponse, ClusteredVectorHealth,
     ConfigureVectorBackendRequest, ExactVectorRescoreRequest, FloorUpdate,
     FreezeTopologyWritesRequest, FreezeTopologyWritesResponse, FusionMode, HealthRequest,
-    HybridDebug, HybridHit, HybridLegHit, HybridSearchRequest, HybridSearchResponse,
-    HybridShardDebug, HybridShardRequest, ParentGroup, PublishTopologyRequest,
-    PublishTopologyResponse, RoutedIngestMappedRequest, RoutedIngestMappedResponse,
-    RoutedShardIngest, ScoredHit, SearchRequest, SearchResponse, SearchShardDone,
-    SearchShardRequest, SearchShardResponse, SetCalibrationRequest, ShardHealth, ShardLegsRequest,
-    ShardScanStats, StartShardSearch, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
-    StreamSearchResponse, StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult,
-    VectorRescoreRequest,
+    HybridDebug, HybridHit, HybridSearchRequest, HybridSearchResponse, HybridShardDebug,
+    HybridShardRequest, ParentGroup, PublishTopologyRequest, PublishTopologyResponse,
+    RoutedIngestMappedRequest, RoutedIngestMappedResponse, RoutedShardIngest, ScoredHit,
+    SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse,
+    SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats, StartShardSearch,
+    StartStreamSearch, StopStreamSearch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult, VectorRescoreRequest,
 };
 use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
@@ -231,6 +233,7 @@ pub fn stable_routing_hash(key: &[u8]) -> u64 {
     hash
 }
 
+#[cfg(feature = "net")]
 #[derive(Clone, Copy, Debug)]
 struct ProductLabelRange {
     start: u64,
@@ -238,12 +241,14 @@ struct ProductLabelRange {
     shard: u32,
 }
 
+#[cfg(feature = "net")]
 impl ProductLabelRange {
     fn contains(self, label: u64) -> bool {
         label >= self.start && label < self.end
     }
 }
 
+#[cfg(feature = "net")]
 struct ClusteredVectorResult {
     hits: Vec<(u64, f32)>,
 }
@@ -309,7 +314,7 @@ pub struct CoordinatorServiceImpl {
     /// Hard request-wide logical FP32 row-byte bound for reranking.
     max_rerank_bytes: u64,
     /// One reusable channel per address, created on first use.
-    channels: Arc<Mutex<HashMap<String, Channel>>>,
+    links: Arc<Mutex<HashMap<String, crate::link::NodeLink>>>,
     /// Whether a channel cache miss may create a network connection. The
     /// embedded runtime preloads every shard channel and keeps this false,
     /// making a missing channel a hard error instead of a possible egress.
@@ -326,6 +331,7 @@ pub struct CoordinatorServiceImpl {
     stats_cache: Arc<crate::stats_cache::StatsCache>,
     /// Optional distributed vector collection. The product coordinator calls
     /// it once as one provider; it never learns or re-fans its shard topology.
+    #[cfg(feature = "net")]
     clustered_vectors: Option<ClusteredTurboVecBackend>,
     /// Optional measured candidate-depth contract for FP32 reranking.
     dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
@@ -399,7 +405,7 @@ struct Bm25StreamShardResult {
 async fn stream_bm25_shard(
     shard: u32,
     k: usize,
-    mut client: NodeServiceClient<Channel>,
+    mut client: crate::link::NodeLink,
     request: Bm25QueryRequest,
     floor_tx: Arc<watch::Sender<f32>>,
     mut floor_rx: watch::Receiver<f32>,
@@ -1559,11 +1565,12 @@ impl CoordinatorServiceImpl {
             bm25_stream: false,
             max_k: DEFAULT_MAX_K,
             max_rerank_bytes: DEFAULT_MAX_RERANK_BYTES,
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            links: Arc::new(Mutex::new(HashMap::new())),
             allow_network: true,
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
+            #[cfg(feature = "net")]
             clustered_vectors: None,
             dense_quality_profile: None,
             dense_execution_policy: None,
@@ -1582,17 +1589,19 @@ impl CoordinatorServiceImpl {
     /// in-process channels. Cache misses never fall back to TCP and the UDP
     /// signal lane is disabled. The labels are diagnostic identities only;
     /// no address parsing or name resolution occurs.
-    pub fn with_in_process_channels(channels: Vec<Channel>) -> Self {
-        let node_addrs: Vec<String> = (0..channels.len())
+    /// A coordinator over nodes living in this process, reached through
+    /// [`crate::link::NodeLink::Local`]: no network fallback, no UDP lane.
+    pub fn with_local_nodes(nodes: Vec<Arc<crate::node::NodeServiceImpl>>) -> Self {
+        let node_addrs: Vec<String> = (0..nodes.len())
             .map(|shard| format!("in-process://shard-{shard}"))
             .collect();
-        let channel_map = node_addrs
+        let links = node_addrs
             .iter()
             .cloned()
-            .zip(channels)
+            .zip(nodes.into_iter().map(crate::link::NodeLink::local))
             .collect::<HashMap<_, _>>();
         let mut coordinator = Self::new(node_addrs);
-        coordinator.channels = Arc::new(Mutex::new(channel_map));
+        coordinator.links = Arc::new(Mutex::new(links));
         coordinator.allow_network = false;
         coordinator
     }
@@ -1938,6 +1947,7 @@ impl CoordinatorServiceImpl {
 
     /// Route vector work through one distributed TurboVec collection. The
     /// backend itself owns its only global heap and shard completion.
+    #[cfg(feature = "net")]
     pub fn with_clustered_turbovec(mut self, backend: ClusteredTurboVecBackend) -> Self {
         self.clustered_vectors = Some(backend);
         self
@@ -1957,6 +1967,24 @@ impl CoordinatorServiceImpl {
     ) -> Self {
         self.dense_execution_policy = Some(Arc::new(policy));
         self
+    }
+
+    /// The clustered backend's live identity, when one is configured.
+    #[cfg(feature = "net")]
+    async fn clustered_quality_identity(
+        &self,
+    ) -> Result<Option<crate::clustered_turbovec::ClusteredQualityIdentity>, Status> {
+        match &self.clustered_vectors {
+            Some(clustered) => clustered.quality_identity().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(not(feature = "net"))]
+    async fn clustered_quality_identity(
+        &self,
+    ) -> Result<Option<crate::clustered_turbovec::ClusteredQualityIdentity>, Status> {
+        Ok(None)
     }
 
     pub fn with_topology_generation(mut self, generation: u64) -> Self {
@@ -2056,8 +2084,7 @@ impl CoordinatorServiceImpl {
         key: DenseRequestKey<'_>,
     ) -> Result<crate::pb::DenseExecutionOutcome, Status> {
         let (provider, scoring_fingerprint, quality, exhaustive, dimensions, rows, generation) =
-            if let Some(clustered) = &self.clustered_vectors {
-                let identity = clustered.quality_identity().await?;
+            if let Some(identity) = self.clustered_quality_identity().await? {
                 (
                     "clustered-turbovec".to_string(),
                     identity.scoring_fingerprint,
@@ -2396,10 +2423,9 @@ impl CoordinatorServiceImpl {
             )));
         }
 
-        let (provider, scoring_fingerprint, rows, generation, dimensions) = if let Some(clustered) =
-            &self.clustered_vectors
+        let (provider, scoring_fingerprint, rows, generation, dimensions) = if let Some(identity) =
+            self.clustered_quality_identity().await?
         {
-            let identity = clustered.quality_identity().await?;
             let mut tasks = Vec::with_capacity(self.node_addrs.len());
             for addr in &self.node_addrs {
                 let mut client = self.node_client(addr)?;
@@ -2558,16 +2584,10 @@ impl CoordinatorServiceImpl {
     /// `connect_lazy` defers the TCP/HTTP2 handshake to the first RPC and
     /// transparently reconnects after failures, so one entry serves the
     /// address for the process lifetime.
-    fn channel_to(&self, addr: &str) -> Result<Channel, Status> {
-        let mut cache = self.channels.lock().expect("channel cache mutex poisoned");
-        if let Some(ch) = cache.get(addr) {
-            return Ok(ch.clone());
-        }
-        if !self.allow_network {
-            return Err(Status::failed_precondition(format!(
-                "in-process coordinator has no channel for {addr}; network fallback is disabled"
-            )));
-        }
+    /// Dial a node across the network (the `net` feature): a lazy channel
+    /// with the engine's window sizes and the process's client TLS.
+    #[cfg(feature = "net")]
+    fn connect(&self, addr: &str) -> Result<Channel, Status> {
         let endpoint = Endpoint::from_shared(addr.to_string())
             .map_err(|e| Status::unavailable(format!("invalid node address {addr}: {e}")))?
             .tcp_nodelay(true)
@@ -2583,17 +2603,34 @@ impl CoordinatorServiceImpl {
                 .or(crate::security::process_client_tls()),
         )
         .map_err(Status::failed_precondition)?;
-        let ch = endpoint.connect_lazy();
-        cache.insert(addr.to_string(), ch.clone());
-        Ok(ch)
+        Ok(endpoint.connect_lazy())
     }
 
-    /// A client over the pooled channel for `addr` with the message size
-    /// limits applied. Cheap: clones the channel, no new connection.
-    fn node_client(&self, addr: &str) -> Result<NodeServiceClient<Channel>, Status> {
-        Ok(NodeServiceClient::new(self.channel_to(addr)?)
-            .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
+    /// The link to a node: the cached one (a local node, or a channel
+    /// dialed before), else a new channel when the network is allowed.
+    fn node_client(&self, addr: &str) -> Result<crate::link::NodeLink, Status> {
+        #[cfg_attr(not(feature = "net"), allow(unused_mut))]
+        let mut cache = self.links.lock().expect("node link cache mutex poisoned");
+        if let Some(link) = cache.get(addr) {
+            return Ok(link.clone());
+        }
+        if !self.allow_network {
+            return Err(Status::failed_precondition(format!(
+                "in-process coordinator has no link for {addr}; network fallback is disabled"
+            )));
+        }
+        #[cfg(feature = "net")]
+        {
+            let link = crate::link::NodeLink::remote(self.connect(addr)?);
+            cache.insert(addr.to_string(), link.clone());
+            Ok(link)
+        }
+        #[cfg(not(feature = "net"))]
+        {
+            Err(Status::failed_precondition(format!(
+                "this build has no network transport (feature `net` is off); no link for {addr}"
+            )))
+        }
     }
 
     /// Distributed BM25 with the two-phase global-stats flow (see the
@@ -4375,6 +4412,7 @@ impl CoordinatorServiceImpl {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "net")]
     async fn clustered_hybrid_global_rank(
         &self,
         request_id: &str,
@@ -4543,6 +4581,9 @@ impl CoordinatorServiceImpl {
     /// comparable scores per leg this is exactly the monolithic result
     /// for k <= leg_k (see the proto's FusionMode comments).
     #[allow(clippy::too_many_arguments)]
+    // Without the network stack the clustered arm is compiled out and
+    // its inputs go unread; the exact arm is the whole function then.
+    #[cfg_attr(not(feature = "net"), allow(unused_variables, unused_mut))]
     async fn fanout_hybrid_global_rank(
         &self,
         request_id: &str,
@@ -4555,6 +4596,7 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        #[cfg(feature = "net")]
         if self.clustered_vectors.is_some() {
             return self
                 .clustered_hybrid_global_rank(
@@ -4730,6 +4772,7 @@ impl CoordinatorServiceImpl {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "net")]
     async fn clustered_hybrid_two_level(
         &self,
         request_id: &str,
@@ -4900,6 +4943,7 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        #[cfg(feature = "net")]
         if self.clustered_vectors.is_some() {
             return self
                 .clustered_hybrid_two_level(
@@ -5056,6 +5100,9 @@ impl CoordinatorServiceImpl {
     ///   calibration), b from the leg, from `Bm25Rescore`, or exactly
     ///   0 when the unfilled leg proves no further doc matches.
     #[allow(clippy::too_many_arguments)]
+    // Without the network stack the clustered arm is compiled out and
+    // its inputs go unread; the exact arm is the whole function then.
+    #[cfg_attr(not(feature = "net"), allow(unused_variables, unused_mut))]
     async fn fanout_hybrid_decomposed(
         &self,
         request_id: &str,
@@ -5226,6 +5273,7 @@ impl CoordinatorServiceImpl {
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut clustered_counts = vec![0u32; n_nodes];
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
+        #[cfg(feature = "net")]
         if let Some(backend) = &self.clustered_vectors {
             let ranges = self.product_label_ranges().await?;
             let allowed = self.clustered_allowed_labels(filters).await?;
@@ -5468,6 +5516,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         by_shard: HashMap<u32, Vec<u64>>,
     ) -> Result<HashMap<u64, f32>, Status> {
+        #[cfg(feature = "net")]
         if let Some(clustered) = &self.clustered_vectors {
             let mut ids: Vec<u64> = by_shard.into_values().flatten().collect();
             ids.sort_unstable();
@@ -6393,31 +6442,42 @@ impl CoordinatorServiceImpl {
         // Phase 1 carries the filters, so the candidate gate is the
         // filtered corpus; phase 2 reranks that pool and never widens
         // it, so no unfiltered document can reappear.
-        let phase1 = if self.clustered_vectors.is_some() {
-            let candidates = self
-                .clustered_vector_candidates(request_id, vector, k, None, true, filters)
-                .await?;
-            let ranges = self.product_label_ranges().await?;
-            let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = (0..self.node_addrs.len())
-                .map(|shard| (shard as u32, Vec::new()))
-                .collect();
-            for (doc_id, score) in candidates.hits {
-                let owner = Self::product_owner(&ranges, doc_id)?;
-                shard_hits[owner as usize].1.push((doc_id, score));
-            }
-            FanoutResult {
-                shard_stats: vec![None; self.node_addrs.len()],
-                shard_wall_ms: (0..self.node_addrs.len())
-                    .map(|shard| (shard as u32, 0.0))
-                    .collect(),
-                shard_hits,
-                hits: Vec::new(),
-                hedges_fired: 0,
-                hedge_wins: 0,
-            }
+        #[cfg(feature = "net")]
+        let clustered_phase1: Option<FanoutResult> = if self.clustered_vectors.is_some() {
+            Some({
+                let candidates = self
+                    .clustered_vector_candidates(request_id, vector, k, None, true, filters)
+                    .await?;
+                let ranges = self.product_label_ranges().await?;
+                let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = (0..self.node_addrs.len())
+                    .map(|shard| (shard as u32, Vec::new()))
+                    .collect();
+                for (doc_id, score) in candidates.hits {
+                    let owner = Self::product_owner(&ranges, doc_id)?;
+                    shard_hits[owner as usize].1.push((doc_id, score));
+                }
+                FanoutResult {
+                    shard_stats: vec![None; self.node_addrs.len()],
+                    shard_wall_ms: (0..self.node_addrs.len())
+                        .map(|shard| (shard as u32, 0.0))
+                        .collect(),
+                    shard_hits,
+                    hits: Vec::new(),
+                    hedges_fired: 0,
+                    hedge_wins: 0,
+                }
+            })
         } else {
-            self.fanout_search(request_id, vector, k, true, filters)
-                .await?
+            None
+        };
+        #[cfg(not(feature = "net"))]
+        let clustered_phase1: Option<FanoutResult> = None;
+        let phase1 = match clustered_phase1 {
+            Some(phase1) => phase1,
+            None => {
+                self.fanout_search(request_id, vector, k, true, filters)
+                    .await?
+            }
         };
         let phase1_ms = t_legs.elapsed().as_secs_f32() * 1e3;
         let mut all: Vec<(u64, u32, f64)> = Vec::new(); // (doc_id, shard, score)
@@ -6667,6 +6727,7 @@ impl CoordinatorServiceImpl {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+        #[cfg(feature = "net")]
         if let Some(clustered) = &self.clustered_vectors {
             let k = u32::try_from(ids.len()).map_err(|_| {
                 Status::resource_exhausted("dense boost candidate set does not fit u32")
@@ -7312,6 +7373,7 @@ impl CoordinatorServiceImpl {
     /// filter remains `None` and therefore costs no shard pass. An explicitly
     /// present empty bitmap set is an intentional match-none set and stays
     /// distinguishable at the provider boundary.
+    #[cfg(feature = "net")]
     async fn clustered_allowed_labels(
         &self,
         filters: &RequestFilters,
@@ -7387,6 +7449,7 @@ impl CoordinatorServiceImpl {
         Ok(Some(ClusteredLabelFilter::Bitmaps(bitmaps)))
     }
 
+    #[cfg(feature = "net")]
     /// Product ownership ranges, independent of vector shard cuts. Hybrid
     /// provenance, BM25 rescoring, and lineage lookup all route by this map;
     /// the clustered provider remains unaware of product shard meaning.
@@ -7431,6 +7494,7 @@ impl CoordinatorServiceImpl {
         Ok(ranges)
     }
 
+    #[cfg(feature = "net")]
     fn product_owner(ranges: &[ProductLabelRange], label: u64) -> Result<u32, Status> {
         ranges
             .iter()
@@ -7444,6 +7508,7 @@ impl CoordinatorServiceImpl {
             })
     }
 
+    #[cfg(feature = "net")]
     /// Resolve lineage in compact batches on the owning product shards. A
     /// document without stored lineage parents itself under the same tagged
     /// domain as the embedded path; raw document text never crosses this seam.
@@ -7508,6 +7573,7 @@ impl CoordinatorServiceImpl {
     /// Collect one exact provider top-k. The product owns the only heap and
     /// drives its inclusive live floor. Tie-complete mode retains the entire
     /// final boundary group for cascade.
+    #[cfg(feature = "net")]
     async fn clustered_vector_candidates(
         &self,
         request_id: &str,
@@ -7613,6 +7679,7 @@ impl CoordinatorServiceImpl {
         })
     }
 
+    #[cfg(feature = "net")]
     async fn clustered_parent_collapse(
         &self,
         request_id: &str,
@@ -7766,6 +7833,7 @@ impl CoordinatorServiceImpl {
     /// Exact product-shard-local vector legs over one provider stream. The
     /// safe collection floor is the minimum filled local k-th score because a
     /// lower candidate cannot enter any product shard's local list.
+    #[cfg(feature = "net")]
     async fn clustered_local_vector_legs(
         &self,
         request_id: &str,
@@ -8660,7 +8728,7 @@ fn floor_message(floor: f32) -> SearchShardRequest {
 /// both ways, return the terminal Done.
 async fn run_shard_stream(
     shard: u32,
-    mut client: NodeServiceClient<Channel>,
+    mut client: crate::link::NodeLink,
     ctx: ShardQueryCtx,
 ) -> Result<SearchShardDone, Status> {
     let (req_tx, req_rx) = mpsc::channel::<SearchShardRequest>(8);
@@ -8749,8 +8817,8 @@ async fn run_shard_stream(
 /// bounded by `shard_deadline`.
 async fn run_shard_with_hedge(
     shard: u32,
-    primary: NodeServiceClient<Channel>,
-    replica: Option<NodeServiceClient<Channel>>,
+    primary: crate::link::NodeLink,
+    replica: Option<crate::link::NodeLink>,
     ctx: ShardQueryCtx,
     limits: FanoutLimits,
 ) -> Result<SearchShardDone, Status> {
@@ -9114,6 +9182,7 @@ impl SearchService for CoordinatorServiceImpl {
         // shards execute; no shard ever sees CEL text.
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
 
+        #[cfg(feature = "net")]
         if self.clustered_vectors.is_some() {
             if req.collapse_parents {
                 let collapsed = self
@@ -10127,6 +10196,7 @@ impl SearchService for CoordinatorServiceImpl {
                 }
             }
         }
+        #[cfg(feature = "net")]
         let clustered_vector = if let Some(backend) = &self.clustered_vectors {
             Some(match backend.health().await {
                 Ok(health) => ClusteredVectorHealth {
@@ -10151,6 +10221,8 @@ impl SearchService for CoordinatorServiceImpl {
         } else {
             None
         };
+        #[cfg(not(feature = "net"))]
+        let clustered_vector: Option<ClusteredVectorHealth> = None;
         Ok(Response::new(ClusterHealthResponse {
             collections: Vec::new(),
             targets,
@@ -10514,11 +10586,11 @@ mod stream_cancel_tests {
 
     #[test]
     fn in_process_mode_has_no_network_fallback_or_udp_lane() {
-        let coordinator = CoordinatorServiceImpl::with_in_process_channels(Vec::new());
+        let coordinator = CoordinatorServiceImpl::with_local_nodes(Vec::new());
         assert!(!coordinator.allows_network());
         let error = coordinator
-            .channel_to("http://must-not-resolve.invalid:50051")
-            .expect_err("a missing in-process channel must not dial");
+            .node_client("http://must-not-resolve.invalid:50051")
+            .expect_err("a missing in-process link must not dial");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(coordinator.floor_socket().is_none());
         assert!(coordinator

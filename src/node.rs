@@ -3134,6 +3134,7 @@ fn raise_floor_cell(cell: &std::sync::atomic::AtomicU32, floor: f32) {
     );
 }
 
+#[cfg_attr(not(feature = "net"), allow(dead_code))]
 struct StreamSignals {
     floor: std::sync::atomic::AtomicU32,
     cancelled: std::sync::atomic::AtomicBool,
@@ -3142,6 +3143,7 @@ struct StreamSignals {
     last_seq: std::sync::atomic::AtomicU32,
 }
 
+#[cfg_attr(not(feature = "net"), allow(dead_code))]
 impl StreamSignals {
     fn new(initial_floor: f32) -> Self {
         Self {
@@ -3171,6 +3173,7 @@ impl StreamSignals {
     }
 }
 
+#[cfg(feature = "net")]
 /// Fold one typed UDP signal into its stream state. Anything malformed or
 /// addressed to an unknown token is dropped. A UDP cancel is advisory only:
 /// it makes the node return `completed = false`, and the authoritative gRPC
@@ -3586,6 +3589,7 @@ impl NodeServiceImpl {
     /// into the matching stream state (see [`apply_stream_datagram`]). A
     /// failed bind only loses the fast lane: both signals still travel on
     /// every stream's authoritative gRPC leg.
+    #[cfg(feature = "net")]
     pub fn spawn_floor_listener(&self, addr: std::net::SocketAddr) {
         let signals = Arc::clone(&self.stream_signals);
         let key = self.config.udp_hmac_key.clone();

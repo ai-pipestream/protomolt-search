@@ -13,7 +13,10 @@ pipestream-search = { path = "../..", default-features = false }
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tokio-stream = "0.1"
-tonic = "0.12"
+# tonic core only: Status and Code on the bridge. The transport (HTTP/2,
+# hyper, Tokio net) is the search crate's `net` feature, off here; the
+# gate in tests/dependency_gate.rs keeps it off.
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.22.4"

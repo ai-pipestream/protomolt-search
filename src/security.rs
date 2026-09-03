@@ -168,6 +168,7 @@ pub fn process_client_tls() -> Option<&'static ClientTls> {
 
 /// Apply the process-wide client TLS material to an endpoint, when
 /// installed; a plaintext endpoint otherwise.
+#[cfg(feature = "net")]
 pub fn secure_endpoint(
     endpoint: tonic::transport::Endpoint,
 ) -> Result<tonic::transport::Endpoint, String> {
@@ -175,6 +176,7 @@ pub fn secure_endpoint(
 }
 
 /// Apply the given client TLS material to an endpoint.
+#[cfg(feature = "net")]
 pub fn apply_client_tls(
     endpoint: tonic::transport::Endpoint,
     tls: Option<&ClientTls>,

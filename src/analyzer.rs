@@ -7,13 +7,18 @@
 //! direct users of either analyzer can select UTF-8 instead. Embeddings and optional
 //! model-backed/structural layers remain sidecar capabilities.
 
+#[cfg(feature = "net")]
 use std::collections::HashMap;
+#[cfg(feature = "net")]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "net")]
 use tokio_stream::wrappers::ReceiverStream;
+#[cfg(feature = "net")]
 use tonic::transport::Channel;
 use tonic::{Status, Streaming};
 
+#[cfg(feature = "net")]
 use crate::pb::analysis::analysis_service_client::AnalysisServiceClient;
 use crate::pb::analysis::{
     analyze_stream_request, analyze_stream_response, AnalysisOptions, AnalyzeRequest,
@@ -310,6 +315,7 @@ pub fn normalize_prefix(prefix: &str, spec: Option<&AnalysisSpec>) -> Result<Str
     Ok(normalized)
 }
 
+#[cfg(feature = "net")]
 pub fn shared_channel(addr: &str) -> Result<Channel, Status> {
     static CHANNELS: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
     let map = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -358,12 +364,21 @@ pub async fn analyze_document(
         text: text.to_string(),
         options: Some(analysis_options(spec, SessionLayers::default())),
     };
-    let mut client = client(addr)?;
-    // Raw Status passthrough: transport failures keep tonic's Unavailable
-    // (the channel connects lazily, so "sidecar down" surfaces HERE, not
-    // at client construction), server errors keep their own codes.
-    let response = client.analyze(request).await?.into_inner();
-    analyzed_from(response, SessionLayers::default())
+    #[cfg(feature = "net")]
+    {
+        let mut client = client(addr)?;
+        // Raw Status passthrough: transport failures keep tonic's
+        // Unavailable (the channel connects lazily, so "sidecar down"
+        // surfaces HERE, not at client construction), server errors keep
+        // their own codes.
+        let response = client.analyze(request).await?.into_inner();
+        analyzed_from(response, SessionLayers::default())
+    }
+    #[cfg(not(feature = "net"))]
+    {
+        let _ = request;
+        Err(sidecar_needs_net(addr))
+    }
 }
 
 /// Analyze one document with the in-process Rust provider.
@@ -556,6 +571,17 @@ fn native_spec(spec: Option<&AnalysisSpec>) -> Result<protomolt_analyzer::Analys
     Ok(native)
 }
 
+/// The refusal a sidecar address gets from a build without the network
+/// stack: the embedded runtime analyzes natively and dials nothing.
+#[cfg(not(feature = "net"))]
+fn sidecar_needs_net(addr: &str) -> Status {
+    Status::failed_precondition(format!(
+        "analysis sidecar {addr:?} is unreachable from this build: the `net` feature is off, so \
+         nothing dials; use --analysis-addr=native"
+    ))
+}
+
+#[cfg(feature = "net")]
 fn client(addr: &str) -> Result<AnalysisServiceClient<Channel>, Status> {
     Ok(AnalysisServiceClient::new(shared_channel(addr)?)
         .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
@@ -587,33 +613,41 @@ pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
             ..Default::default()
         }),
     };
-    let response = client(addr)?.analyze(request).await?.into_inner();
-    if response.embeddings.is_empty() {
-        return Err(Status::failed_precondition(format!(
-            "sidecar returned no embeddings ({})",
-            if response.warnings.is_empty() {
-                "no warning given".to_string()
-            } else {
-                response.warnings.join("; ")
+    #[cfg(not(feature = "net"))]
+    {
+        let _ = request;
+        Err(sidecar_needs_net(addr))
+    }
+    #[cfg(feature = "net")]
+    {
+        let response = client(addr)?.analyze(request).await?.into_inner();
+        if response.embeddings.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "sidecar returned no embeddings ({})",
+                if response.warnings.is_empty() {
+                    "no warning given".to_string()
+                } else {
+                    response.warnings.join("; ")
+                }
+            )));
+        }
+        let dim = response.embeddings[0].vector.len();
+        let mut pooled = vec![0.0f64; dim];
+        for chunk in &response.embeddings {
+            if chunk.vector.len() != dim {
+                return Err(Status::internal("sidecar embeddings disagree on dim"));
             }
-        )));
-    }
-    let dim = response.embeddings[0].vector.len();
-    let mut pooled = vec![0.0f64; dim];
-    for chunk in &response.embeddings {
-        if chunk.vector.len() != dim {
-            return Err(Status::internal("sidecar embeddings disagree on dim"));
+            for (acc, &v) in pooled.iter_mut().zip(&chunk.vector) {
+                *acc += f64::from(v);
+            }
         }
-        for (acc, &v) in pooled.iter_mut().zip(&chunk.vector) {
-            *acc += f64::from(v);
+        let n = response.embeddings.len() as f64;
+        let norm = pooled.iter().map(|v| (v / n).powi(2)).sum::<f64>().sqrt();
+        if norm == 0.0 {
+            return Err(Status::failed_precondition("embedding pooled to zero"));
         }
+        Ok(pooled.iter().map(|v| ((v / n) / norm) as f32).collect())
     }
-    let n = response.embeddings.len() as f64;
-    let norm = pooled.iter().map(|v| (v / n).powi(2)).sum::<f64>().sqrt();
-    if norm == 0.0 {
-        return Err(Status::failed_precondition("embedding pooled to zero"));
-    }
-    Ok(pooled.iter().map(|v| ((v / n) / norm) as f32).collect())
 }
 
 /// Which optional sidecar layers an analysis SESSION requests beyond
@@ -1014,6 +1048,7 @@ pub struct AnalyzeSubmit {
     requests: AnalyzeRequests,
 }
 
+#[cfg_attr(not(feature = "net"), allow(dead_code))]
 #[derive(Clone)]
 enum AnalyzeRequests {
     Sidecar(tokio::sync::mpsc::Sender<AnalyzeStreamRequest>),
@@ -1078,6 +1113,7 @@ pub struct AnalyzeStream {
     layers: SessionLayers,
 }
 
+#[cfg_attr(not(feature = "net"), allow(dead_code))]
 enum AnalyzeResponses {
     Sidecar(Box<Streaming<AnalyzeStreamResponse>>),
     Native(tokio::sync::mpsc::Receiver<NativeResponse>),
@@ -1122,51 +1158,59 @@ impl AnalyzeStream {
         if AnalysisBackend::parse(addr)? == AnalysisBackend::Native {
             return Self::open_native(spec, vocab, layers);
         }
-        let mut client = client(addr)?;
-        if layers.dual_cased {
-            validate_dual_cased_spec(spec)?;
+        #[cfg(not(feature = "net"))]
+        {
+            let _ = (spec, vocab, layers);
+            Err(sidecar_needs_net(addr))
         }
-        if layers.geography || layers.entities || layers.dual_cased {
-            let capabilities = client
-                .get_capabilities(crate::pb::analysis::GetCapabilitiesRequest {})
+        #[cfg(feature = "net")]
+        {
+            let mut client = client(addr)?;
+            if layers.dual_cased {
+                validate_dual_cased_spec(spec)?;
+            }
+            if layers.geography || layers.entities || layers.dual_cased {
+                let capabilities = client
+                    .get_capabilities(crate::pb::analysis::GetCapabilitiesRequest {})
+                    .await?
+                    .into_inner();
+                if (layers.geography || layers.entities) && !capabilities.ner_available {
+                    return Err(Status::failed_precondition(
+                        "entity or geography columns were requested but this sidecar has no NER model configured (GetCapabilities.ner_available = false); configure an NER model or disable those columns",
+                    ));
+                }
+                // An open port is not the jar: the running sidecar must say
+                // it serves both identities before ingest depends on it.
+                if layers.dual_cased && !capabilities.dual_term_identity_available {
+                    return Err(Status::failed_precondition(format!(
+                        "a cased field was requested but the sidecar at {addr} does not serve the \
+                         dual term identity (GetCapabilities.dual_term_identity_available = false); \
+                         rebuild grpc-opennlp-analysis from main (./gradlew installDist) or drop \
+                         cased_field"
+                    )));
+                }
+            }
+            let (requests, feed) = tokio::sync::mpsc::channel(SUBMIT_BUFFER);
+            requests
+                .try_send(AnalyzeStreamRequest {
+                    msg: Some(analyze_stream_request::Msg::Options(analysis_options(
+                        spec, layers,
+                    ))),
+                })
+                .expect("fresh channel has capacity");
+            let responses = client
+                .analyze_stream(ReceiverStream::new(feed))
                 .await?
                 .into_inner();
-            if (layers.geography || layers.entities) && !capabilities.ner_available {
-                return Err(Status::failed_precondition(
-                    "entity or geography columns were requested but this sidecar has no NER model configured (GetCapabilities.ner_available = false); configure an NER model or disable those columns",
-                ));
-            }
-            // An open port is not the jar: the running sidecar must say
-            // it serves both identities before ingest depends on it.
-            if layers.dual_cased && !capabilities.dual_term_identity_available {
-                return Err(Status::failed_precondition(format!(
-                    "a cased field was requested but the sidecar at {addr} does not serve the \
-                     dual term identity (GetCapabilities.dual_term_identity_available = false); \
-                     rebuild grpc-opennlp-analysis from main (./gradlew installDist) or drop \
-                     cased_field"
-                )));
-            }
-        }
-        let (requests, feed) = tokio::sync::mpsc::channel(SUBMIT_BUFFER);
-        requests
-            .try_send(AnalyzeStreamRequest {
-                msg: Some(analyze_stream_request::Msg::Options(analysis_options(
-                    spec, layers,
-                ))),
+            Ok(Self {
+                submit: Some(AnalyzeSubmit {
+                    requests: AnalyzeRequests::Sidecar(requests),
+                }),
+                responses: AnalyzeResponses::Sidecar(Box::new(responses)),
+                vocab,
+                layers,
             })
-            .expect("fresh channel has capacity");
-        let responses = client
-            .analyze_stream(ReceiverStream::new(feed))
-            .await?
-            .into_inner();
-        Ok(Self {
-            submit: Some(AnalyzeSubmit {
-                requests: AnalyzeRequests::Sidecar(requests),
-            }),
-            responses: AnalyzeResponses::Sidecar(Box::new(responses)),
-            vocab,
-            layers,
-        })
+        }
     }
 
     fn open_native(
@@ -1395,6 +1439,9 @@ pub async fn analyze_batch(
 /// `streams` is clamped to at least 1 and to the number of documents in
 /// a group; more streams than documents would open connections that
 /// immediately close.
+/// One batch session's key (spec and layers) and the input indices it serves.
+type SessionGroup<'a> = ((Option<&'a AnalysisSpec>, SessionLayers), Vec<usize>);
+
 pub async fn analyze_batch_streams(
     addr: &str,
     docs: &[(&str, Option<&AnalysisSpec>, SessionLayers)],
@@ -1407,7 +1454,7 @@ pub async fn analyze_batch_streams(
     // matter which group or which stream answered.
     // One session per (spec, layers) pair: the layers a replayed record
     // needs (sentence spans, the cased identity) come from that one call.
-    let mut groups: Vec<((Option<&AnalysisSpec>, SessionLayers), Vec<usize>)> = Vec::new();
+    let mut groups: Vec<SessionGroup<'_>> = Vec::new();
     for (i, (_, spec, layers)) in docs.iter().enumerate() {
         match groups.iter_mut().find(|(key, _)| *key == (*spec, *layers)) {
             Some((_, indices)) => indices.push(i),

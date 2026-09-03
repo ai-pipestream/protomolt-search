@@ -288,6 +288,7 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
 /// is a scraper and the only resource is the page. Bind the listener
 /// to a trusted interface; there is no auth here (there is none
 /// anywhere in the engine yet — the ops doc is explicit about it).
+#[cfg(feature = "net")]
 pub async fn serve(listener: tokio::net::TcpListener, gauges: Vec<GaugeProvider>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let gauges = std::sync::Arc::new(gauges);
