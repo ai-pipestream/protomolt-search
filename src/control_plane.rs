@@ -1714,11 +1714,11 @@ impl ClusterControl for ClusterControlService {
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<NodeLease>, Status> {
         crate::metrics::timed(Route::RegisterNode, request, |request| async move {
-        self.membership(&request)?;
-        self.admit(&request.get_ref().collection)?;
-        self.plane
-            .register(request.into_inner(), now_ms())
-            .map(Response::new)
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            self.plane
+                .register(request.into_inner(), now_ms())
+                .map(Response::new)
         })
         .await
     }
@@ -1728,11 +1728,11 @@ impl ClusterControl for ClusterControlService {
         request: Request<RenewNodeLeaseRequest>,
     ) -> Result<Response<NodeLease>, Status> {
         crate::metrics::timed(Route::RenewNodeLease, request, |request| async move {
-        self.membership(&request)?;
-        self.admit(&request.get_ref().collection)?;
-        self.plane
-            .renew(request.into_inner(), now_ms())
-            .map(Response::new)
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            self.plane
+                .renew(request.into_inner(), now_ms())
+                .map(Response::new)
         })
         .await
     }
@@ -1742,12 +1742,12 @@ impl ClusterControl for ClusterControlService {
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
         crate::metrics::timed(Route::DrainNode, request, |request| async move {
-        self.membership(&request)?;
-        self.admit(&request.get_ref().collection)?;
-        self.plane.drain(request.into_inner(), now_ms())?;
-        let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
-        self.publish_if_needed()?;
-        Ok(Response::new(plan))
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            self.plane.drain(request.into_inner(), now_ms())?;
+            let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
+            self.publish_if_needed()?;
+            Ok(Response::new(plan))
         })
         .await
     }
@@ -1757,16 +1757,16 @@ impl ClusterControl for ClusterControlService {
         request: Request<ReportShardRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
         crate::metrics::timed(Route::ReportShard, request, |request| async move {
-        self.membership(&request)?;
-        self.admit(&request.get_ref().collection)?;
-        let req = request.into_inner();
-        if let Some(replica) = &req.replica {
-            self.admit(&replica.collection)?;
-        }
-        self.plane.report(req, now_ms())?;
-        let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
-        self.publish_if_needed()?;
-        Ok(Response::new(plan))
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            let req = request.into_inner();
+            if let Some(replica) = &req.replica {
+                self.admit(&replica.collection)?;
+            }
+            self.plane.report(req, now_ms())?;
+            let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
+            self.publish_if_needed()?;
+            Ok(Response::new(plan))
         })
         .await
     }
@@ -1779,12 +1779,12 @@ impl ClusterControl for ClusterControlService {
             Route::CompletePlacementAction,
             request,
             |request| async move {
-        self.membership(&request)?;
-        self.admit(&request.get_ref().collection)?;
-        self.plane.complete_action(request.into_inner(), now_ms())?;
-        let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
-        self.publish_if_needed()?;
-        Ok(Response::new(plan))
+                self.membership(&request)?;
+                self.admit(&request.get_ref().collection)?;
+                self.plane.complete_action(request.into_inner(), now_ms())?;
+                let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
+                self.publish_if_needed()?;
+                Ok(Response::new(plan))
             },
         )
         .await
@@ -1795,14 +1795,14 @@ impl ClusterControl for ClusterControlService {
         request: Request<ReconcileClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
         crate::metrics::timed(Route::ReconcileCluster, request, |request| async move {
-        self.membership(&request)?;
-        self.admit(&request.get_ref().collection)?;
-        let request = request.into_inner();
-        let (plan, _changed) = self.plane.reconcile(request.dry_run, now_ms())?;
-        if !request.dry_run {
-            self.publish_if_needed()?;
-        }
-        Ok(Response::new(plan))
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            let request = request.into_inner();
+            let (plan, _changed) = self.plane.reconcile(request.dry_run, now_ms())?;
+            if !request.dry_run {
+                self.publish_if_needed()?;
+            }
+            Ok(Response::new(plan))
         })
         .await
     }
@@ -1812,9 +1812,9 @@ impl ClusterControl for ClusterControlService {
         _request: Request<GetClusterPlanRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
         crate::metrics::timed(Route::GetClusterPlan, _request, |_request| async move {
-        self.membership(&_request)?;
-        self.admit(&_request.get_ref().collection)?;
-        self.plane.plan().map(Response::new)
+            self.membership(&_request)?;
+            self.admit(&_request.get_ref().collection)?;
+            self.plane.plan().map(Response::new)
         })
         .await
     }
@@ -1824,13 +1824,13 @@ impl ClusterControl for ClusterControlService {
         request: Request<RollbackClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
         crate::metrics::timed(Route::RollbackCluster, request, |request| async move {
-        self.membership(&request)?;
-        self.admit(&request.get_ref().collection)?;
-        let (plan, _changed) = self
-            .plane
-            .rollback(request.into_inner().topology_generation)?;
-        self.publish_if_needed()?;
-        Ok(Response::new(plan))
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            let (plan, _changed) = self
+                .plane
+                .rollback(request.into_inner().topology_generation)?;
+            self.publish_if_needed()?;
+            Ok(Response::new(plan))
         })
         .await
     }

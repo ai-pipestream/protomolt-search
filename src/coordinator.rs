@@ -8621,8 +8621,8 @@ impl CoordinatorServiceImpl {
                 req.k = k;
                 let resp =
                     SearchService::bm25_search(self, crate::metrics::nested(Request::new(req)))
-                    .await?
-                    .into_inner();
+                        .await?
+                        .into_inner();
                 Ok(resp
                     .hits
                     .into_iter()
@@ -8640,8 +8640,8 @@ impl CoordinatorServiceImpl {
                 req.debug = false;
                 let resp =
                     SearchService::hybrid_search(self, crate::metrics::nested(Request::new(req)))
-                    .await?
-                    .into_inner();
+                        .await?
+                        .into_inner();
                 // CASCADE reports in `cascade_hits` and leaves `hits`
                 // empty; the other modes do the reverse. Both are a
                 // ranking, which is all a diff needs.
@@ -9343,115 +9343,115 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         crate::metrics::timed(Route::Search, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
                 return Box::pin(SearchService::search(
                     &snapshot,
                     crate::metrics::nested(request),
                 ))
                 .await;
-        }
-        let req = request.into_inner();
-        let k = self.resolve_k(req.k)?;
-        if req.vector.is_empty() {
-            return Err(Status::invalid_argument("empty query vector"));
-        }
-        if req.vector.iter().any(|x| !x.is_finite()) {
-            return Err(Status::invalid_argument(
-                "query vector has non-finite coordinates",
-            ));
-        }
-        let request_id = if req.request_id.is_empty() {
-            format!(
-                "req-{}-{}",
-                std::process::id(),
-                REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-            )
-        } else {
-            req.request_id.clone()
-        };
-        // CEL text compiles ONCE, here, into the predicate IR the
-        // shards execute; no shard ever sees CEL text.
-        let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
-        // The fleet scores in one space or not at all: mixed provider
-        // kinds or fingerprints are refused before any shard is asked
-        // (docs/mmap-vectors.md).
-        if !self.has_clustered_vectors() {
-            self.fleet_vector_identity(true).await?;
-        }
+            }
+            let req = request.into_inner();
+            let k = self.resolve_k(req.k)?;
+            if req.vector.is_empty() {
+                return Err(Status::invalid_argument("empty query vector"));
+            }
+            if req.vector.iter().any(|x| !x.is_finite()) {
+                return Err(Status::invalid_argument(
+                    "query vector has non-finite coordinates",
+                ));
+            }
+            let request_id = if req.request_id.is_empty() {
+                format!(
+                    "req-{}-{}",
+                    std::process::id(),
+                    REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+                )
+            } else {
+                req.request_id.clone()
+            };
+            // CEL text compiles ONCE, here, into the predicate IR the
+            // shards execute; no shard ever sees CEL text.
+            let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            // The fleet scores in one space or not at all: mixed provider
+            // kinds or fingerprints are refused before any shard is asked
+            // (docs/mmap-vectors.md).
+            if !self.has_clustered_vectors() {
+                self.fleet_vector_identity(true).await?;
+            }
 
-        #[cfg(feature = "net")]
-        if self.clustered_vectors.is_some() {
-            if req.collapse_parents {
-                let collapsed = self
-                    .clustered_parent_collapse(&request_id, &req.vector, k, &filters)
+            #[cfg(feature = "net")]
+            if self.clustered_vectors.is_some() {
+                if req.collapse_parents {
+                    let collapsed = self
+                        .clustered_parent_collapse(&request_id, &req.vector, k, &filters)
+                        .await?;
+                    return Ok(Response::new(SearchResponse {
+                        request_id,
+                        hits: collapsed.hits,
+                        groups: collapsed.groups,
+                        chunk_floor: collapsed.chunk_floor,
+                    }));
+                }
+                let result = self
+                    .clustered_vector_candidates(&request_id, &req.vector, k, None, false, &filters)
+                    .await?;
+                let hits = result
+                    .hits
+                    .into_iter()
+                    .map(|(vector_id, score)| ScoredHit {
+                        vector_id,
+                        score,
+                        parent_id: 0,
+                    })
+                    .collect();
+                return Ok(Response::new(SearchResponse {
+                    request_id,
+                    hits,
+                    groups: Vec::new(),
+                    chunk_floor: 0.0,
+                }));
+            }
+
+            let result = if req.collapse_parents {
+                // Document mode on a streaming coordinator: parents
+                // aggregate here from tagged chunk emissions, and the
+                // response carries the per-parent chunk groups. The bidi
+                // path collapses shard-side and returns representatives
+                // only.
+                if self.stream_search {
+                    let doc = self
+                        .fanout_stream_search_collapse(&request_id, &req.vector, k, &filters)
+                        .await?;
+                    return Ok(Response::new(SearchResponse {
+                        request_id,
+                        hits: doc.hits,
+                        groups: doc.groups,
+                        chunk_floor: doc.chunk_floor,
+                    }));
+                }
+                self.fanout_search_collapse(&request_id, &req.vector, k, &filters)
+                    .await?
+            } else if self.stream_search {
+                let streamed = self
+                    .fanout_stream_search(&request_id, &req.vector, k, None, &filters)
                     .await?;
                 return Ok(Response::new(SearchResponse {
                     request_id,
-                    hits: collapsed.hits,
-                    groups: collapsed.groups,
-                    chunk_floor: collapsed.chunk_floor,
+                    hits: streamed.hits,
+                    groups: Vec::new(),
+                    chunk_floor: 0.0,
                 }));
-            }
-            let result = self
-                .clustered_vector_candidates(&request_id, &req.vector, k, None, false, &filters)
-                .await?;
-            let hits = result
-                .hits
-                .into_iter()
-                .map(|(vector_id, score)| ScoredHit {
-                    vector_id,
-                    score,
-                    parent_id: 0,
-                })
-                .collect();
-            return Ok(Response::new(SearchResponse {
+            } else {
+                self.fanout_search(&request_id, &req.vector, k, false, &filters)
+                    .await?
+            };
+            Ok(Response::new(SearchResponse {
                 request_id,
-                hits,
+                hits: result.hits,
                 groups: Vec::new(),
                 chunk_floor: 0.0,
-            }));
-        }
-
-        let result = if req.collapse_parents {
-            // Document mode on a streaming coordinator: parents
-            // aggregate here from tagged chunk emissions, and the
-            // response carries the per-parent chunk groups. The bidi
-            // path collapses shard-side and returns representatives
-            // only.
-            if self.stream_search {
-                let doc = self
-                    .fanout_stream_search_collapse(&request_id, &req.vector, k, &filters)
-                    .await?;
-                return Ok(Response::new(SearchResponse {
-                    request_id,
-                    hits: doc.hits,
-                    groups: doc.groups,
-                    chunk_floor: doc.chunk_floor,
-                }));
-            }
-            self.fanout_search_collapse(&request_id, &req.vector, k, &filters)
-                .await?
-        } else if self.stream_search {
-            let streamed = self
-                .fanout_stream_search(&request_id, &req.vector, k, None, &filters)
-                .await?;
-            return Ok(Response::new(SearchResponse {
-                request_id,
-                hits: streamed.hits,
-                groups: Vec::new(),
-                chunk_floor: 0.0,
-            }));
-        } else {
-            self.fanout_search(&request_id, &req.vector, k, false, &filters)
-                .await?
-        };
-        Ok(Response::new(SearchResponse {
-            request_id,
-            hits: result.hits,
-            groups: Vec::new(),
-            chunk_floor: 0.0,
-        }))
+            }))
         })
         .await
     }
@@ -9461,185 +9461,189 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
         crate::metrics::timed(Route::Bm25Search, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
-                return Box::pin(SearchService::bm25_search(&snapshot, crate::metrics::nested(request))).await;
-        }
-        let req = request.into_inner();
-        let k = self.resolve_k(req.k)?;
-        // A malformed HighlightSpec refuses here, before any shard is
-        // asked, so an empty fleet answers the same as a full one
-        // (docs/highlighting.md).
-        if let Some(spec) = req.highlight.as_ref() {
-            crate::highlight::Plan::from_spec(spec)?;
-        }
-        if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
-            return Err(Status::invalid_argument(
-                "min_score must be finite (NaN and -inf are not valid floors)",
-            ));
-        }
-        // CEL text compiles ONCE, here, into the predicate IR the
-        // shards execute (docs/cel-filters.md): every shard sees the
-        // same tree, and none ever sees CEL text.
-        let filter = crate::cel::compile_filter(&req.filter)?;
-        // Projection text compiles ONCE, here, into the ValueExpr IR
-        // the shards resolve and evaluate (docs/cel-values.md).
-        let projections = compile_projections(&req.projections)?;
-        let mut phrase_routing = Vec::new();
-        let mut prefix_expansions = Vec::new();
-        let (hits, facets, range_facets, stats, cardinality) =
-            if req.fields.is_empty() && req.phrase.is_some() {
-                // A phrase on the flat route is the body field's phrase on
-                // the fused route (docs/phrase-proximity.md); the fused
-                // route's uncertified combinations refuse by name here too.
-                if !req.score_stages.is_empty() {
-                    return Err(Status::invalid_argument(
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
+                return Box::pin(SearchService::bm25_search(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
+            }
+            let req = request.into_inner();
+            let k = self.resolve_k(req.k)?;
+            // A malformed HighlightSpec refuses here, before any shard is
+            // asked, so an empty fleet answers the same as a full one
+            // (docs/highlighting.md).
+            if let Some(spec) = req.highlight.as_ref() {
+                crate::highlight::Plan::from_spec(spec)?;
+            }
+            if req.min_score.is_nan() || req.min_score == f32::NEG_INFINITY {
+                return Err(Status::invalid_argument(
+                    "min_score must be finite (NaN and -inf are not valid floors)",
+                ));
+            }
+            // CEL text compiles ONCE, here, into the predicate IR the
+            // shards execute (docs/cel-filters.md): every shard sees the
+            // same tree, and none ever sees CEL text.
+            let filter = crate::cel::compile_filter(&req.filter)?;
+            // Projection text compiles ONCE, here, into the ValueExpr IR
+            // the shards resolve and evaluate (docs/cel-values.md).
+            let projections = compile_projections(&req.projections)?;
+            let mut phrase_routing = Vec::new();
+            let mut prefix_expansions = Vec::new();
+            let (hits, facets, range_facets, stats, cardinality) =
+                if req.fields.is_empty() && req.phrase.is_some() {
+                    // A phrase on the flat route is the body field's phrase on
+                    // the fused route (docs/phrase-proximity.md); the fused
+                    // route's uncertified combinations refuse by name here too.
+                    if !req.score_stages.is_empty() {
+                        return Err(Status::invalid_argument(
                     "score stages are not yet certified with a phrase constraint; drop `phrase` \
                      or drop `score_stages`",
                 ));
-                }
-                if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
-                    return Err(Status::invalid_argument(
+                    }
+                    if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
+                        return Err(Status::invalid_argument(
                         "stats/cardinality are not yet certified with a phrase constraint; drop \
                      `phrase` or drop the aggregations",
                     ));
-                }
-                if !req.projections.is_empty() {
-                    return Err(Status::invalid_argument(
+                    }
+                    if !req.projections.is_empty() {
+                        return Err(Status::invalid_argument(
                     "projections are not yet certified with a phrase constraint; drop `phrase` \
                      or drop the projections",
                 ));
-                }
-                let body = vec![crate::pb::QueryField {
-                    field: "body".to_string(),
-                    analysis: req.analysis.clone(),
-                    weight: 1.0,
-                    k1: 0.0,
-                    b: 0.0,
-                    phrase: req.phrase,
-                    prefixes: req.prefixes.clone(),
-                }];
-                let ((hits, facets, ranges), routing) = self
-                    .fanout_bm25_fused_routed(
+                    }
+                    let body = vec![crate::pb::QueryField {
+                        field: "body".to_string(),
+                        analysis: req.analysis.clone(),
+                        weight: 1.0,
+                        k1: 0.0,
+                        b: 0.0,
+                        phrase: req.phrase,
+                        prefixes: req.prefixes.clone(),
+                    }];
+                    let ((hits, facets, ranges), routing) = self
+                        .fanout_bm25_fused_routed(
+                            &req.text,
+                            k,
+                            &body,
+                            req.min_score,
+                            &req.facet_fields,
+                            &req.map_facet_fields,
+                            &req.range_facet_fields,
+                            &req.geo_filters,
+                            filter.as_ref(),
+                            &mut prefix_expansions,
+                            req.highlight.as_ref(),
+                        )
+                        .await?;
+                    phrase_routing = routing;
+                    (hits, facets, ranges, Vec::new(), Vec::new())
+                } else if req.fields.is_empty() {
+                    self.fanout_bm25_aggregated(
                         &req.text,
                         k,
-                        &body,
+                        req.analysis.as_ref(),
                         req.min_score,
                         &req.facet_fields,
                         &req.map_facet_fields,
                         &req.range_facet_fields,
+                        &req.score_stages,
                         &req.geo_filters,
                         filter.as_ref(),
+                        &req.stats_fields,
+                        &req.cardinality_fields,
+                        &projections,
+                        &req.prefixes,
                         &mut prefix_expansions,
                         req.highlight.as_ref(),
                     )
-                    .await?;
-                phrase_routing = routing;
-                (hits, facets, ranges, Vec::new(), Vec::new())
-            } else if req.fields.is_empty() {
-                self.fanout_bm25_aggregated(
-                    &req.text,
-                    k,
-                    req.analysis.as_ref(),
-                    req.min_score,
-                    &req.facet_fields,
-                    &req.map_facet_fields,
-                    &req.range_facet_fields,
-                    &req.score_stages,
-                    &req.geo_filters,
-                    filter.as_ref(),
-                    &req.stats_fields,
-                    &req.cardinality_fields,
-                    &projections,
-                    &req.prefixes,
-                    &mut prefix_expansions,
-                    req.highlight.as_ref(),
-                )
-                .await?
-            } else {
-                if !req.score_stages.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "score stages are not yet supported on the fused multi-field route; \
+                    .await?
+                } else {
+                    if !req.score_stages.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "score stages are not yet supported on the fused multi-field route; \
                      drop `fields` to use the flat route, or drop `score_stages`",
-                    ));
-                }
-                if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "stats/cardinality are not yet supported on the fused multi-field \
+                        ));
+                    }
+                    if !req.stats_fields.is_empty() || !req.cardinality_fields.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "stats/cardinality are not yet supported on the fused multi-field \
                      route; drop `fields` to use the flat route, or drop the aggregations",
-                    ));
-                }
-                if !req.projections.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "projections are not yet supported on the fused multi-field route; \
+                        ));
+                    }
+                    if !req.projections.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "projections are not yet supported on the fused multi-field route; \
                      drop `fields` to use the flat route, or drop the projections",
-                    ));
-                }
-                // `analysis` is documented as ignored once `fields` is set,
-                // because term identity is per field. Ignoring it QUIETLY is
-                // the trap: the caller believes it asked for the ingest
-                // analysis, every field falls back to the sidecar default,
-                // and the query runs against terms that do not exist in the
-                // index. That returns a confident ranking over whichever
-                // tokens happened to survive, so it does not look like a
-                // failure -- it looks like bad relevance.
-                if req.analysis.is_some() {
-                    return Err(Status::invalid_argument(
+                        ));
+                    }
+                    // `analysis` is documented as ignored once `fields` is set,
+                    // because term identity is per field. Ignoring it QUIETLY is
+                    // the trap: the caller believes it asked for the ingest
+                    // analysis, every field falls back to the sidecar default,
+                    // and the query runs against terms that do not exist in the
+                    // index. That returns a confident ranking over whichever
+                    // tokens happened to survive, so it does not look like a
+                    // failure -- it looks like bad relevance.
+                    if req.analysis.is_some() {
+                        return Err(Status::invalid_argument(
                     "Bm25SearchRequest.analysis is ignored when `fields` is set (term identity \
                      is per field). Move the spec onto each QueryField.analysis, or drop \
                      `fields` to use the single-field route.",
                 ));
-                }
-                if req.phrase.is_some() {
-                    return Err(Status::invalid_argument(
+                    }
+                    if req.phrase.is_some() {
+                        return Err(Status::invalid_argument(
                     "Bm25SearchRequest.phrase is the flat route's constraint; with `fields` set, \
                      put the PhraseMatch on the QueryField it constrains",
                 ));
-                }
-                if !req.prefixes.is_empty() {
-                    return Err(Status::invalid_argument(
+                    }
+                    if !req.prefixes.is_empty() {
+                        return Err(Status::invalid_argument(
                         "Bm25SearchRequest.prefixes expand in the body; with `fields` set, put \
                          the prefixes on the QueryField whose dictionary they expand in",
                     ));
-                }
-                let ((hits, facets, ranges), routing) = self
-                    .fanout_bm25_fused_routed(
-                        &req.text,
-                        k,
-                        &req.fields,
-                        req.min_score,
-                        &req.facet_fields,
-                        &req.map_facet_fields,
-                        &req.range_facet_fields,
-                        &req.geo_filters,
-                        filter.as_ref(),
-                        &mut prefix_expansions,
-                        req.highlight.as_ref(),
-                    )
-                    .await?;
-                phrase_routing = routing;
-                (hits, facets, ranges, Vec::new(), Vec::new())
+                    }
+                    let ((hits, facets, ranges), routing) = self
+                        .fanout_bm25_fused_routed(
+                            &req.text,
+                            k,
+                            &req.fields,
+                            req.min_score,
+                            &req.facet_fields,
+                            &req.map_facet_fields,
+                            &req.range_facet_fields,
+                            &req.geo_filters,
+                            filter.as_ref(),
+                            &mut prefix_expansions,
+                            req.highlight.as_ref(),
+                        )
+                        .await?;
+                    phrase_routing = routing;
+                    (hits, facets, ranges, Vec::new(), Vec::new())
+                };
+            // The merged k-th best: one f32 ULP below the last hit's score
+            // when k hits were returned (see `bm25::floor_seed` — a later
+            // seed can never exceed the true k-th best), 0 otherwise.
+            let kth_best = if hits.len() == k as usize {
+                hits.last()
+                    .map(|h| crate::bm25::floor_seed(h.score))
+                    .unwrap_or(0.0)
+            } else {
+                0.0
             };
-        // The merged k-th best: one f32 ULP below the last hit's score
-        // when k hits were returned (see `bm25::floor_seed` — a later
-        // seed can never exceed the true k-th best), 0 otherwise.
-        let kth_best = if hits.len() == k as usize {
-            hits.last()
-                .map(|h| crate::bm25::floor_seed(h.score))
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        Ok(Response::new(Bm25SearchResponse {
-            hits,
-            kth_best,
-            facets,
-            range_facets,
-            stats,
-            cardinality,
-            phrase_routing,
-            prefix_expansions,
-        }))
+            Ok(Response::new(Bm25SearchResponse {
+                hits,
+                kth_best,
+                facets,
+                range_facets,
+                stats,
+                cardinality,
+                phrase_routing,
+                prefix_expansions,
+            }))
         })
         .await
     }
@@ -9713,166 +9717,166 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
         crate::metrics::timed(Route::HybridSearch, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
                 return Box::pin(SearchService::hybrid_search(
                     &snapshot,
                     crate::metrics::nested(request),
                 ))
                 .await;
-        }
-        let req = request.into_inner();
-        let k = self.resolve_k(req.k)?;
-        if req.text.is_empty() {
-            return Err(Status::invalid_argument(
-                "hybrid search requires query text",
-            ));
-        }
-        if req.vector.is_empty() {
-            return Err(Status::invalid_argument(
-                "hybrid search requires a query vector",
-            ));
-        }
-        if req.vector.iter().any(|x| !x.is_finite()) {
-            return Err(Status::invalid_argument(
-                "query vector has non-finite coordinates",
-            ));
-        }
-        let request_id = if req.request_id.is_empty() {
-            format!(
-                "req-{}-{}",
-                std::process::id(),
-                REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-            )
-        } else {
-            req.request_id.clone()
-        };
-        // One compilation, both legs. The hybrid route used to refuse
-        // filters outright because the vector leg had no filter
-        // machinery and filtering only the lexical half would have
-        // misdescribed the result set (docs/vector-filters.md).
-        let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
-        // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
-        // leg's depth; explicit values below k are clamped to k.
-        let options = req.legs.unwrap_or_default();
-        let rrf_k = if options.rrf_k == 0.0 {
-            fusion::DEFAULT_RRF_K
-        } else {
-            f64::from(options.rrf_k)
-        };
-        // Weights: absent = 1.0; an explicit 0 disables the leg (the
-        // proto documents which modes support that).
-        let vector_weight = options.vector_weight.unwrap_or(1.0);
-        let bm25_weight = options.bm25_weight.unwrap_or(1.0);
-        if vector_weight == 0.0 && bm25_weight == 0.0 {
-            return Err(Status::invalid_argument(
-                "both legs disabled: at least one of vector_weight/bm25_weight must be nonzero",
-            ));
-        }
-        if options.fusion_mode() == FusionMode::TwoLevel
-            && (vector_weight == 0.0 || bm25_weight == 0.0)
-        {
-            return Err(Status::invalid_argument(
-                "TWO_LEVEL cannot disable a leg (its node wire format cannot distinguish \
-                 0 from unset); use GLOBAL_RANK or SCORE_BLEND",
-            ));
-        }
-        // The decomposed floor algebra divides by vector_weight and
-        // scales bounds by bm25_weight; both must be strictly positive
-        // (a single-leg query belongs to GLOBAL_RANK or SCORE_BLEND).
-        if options.fusion_mode() == FusionMode::Decomposed
-            && !(vector_weight > 0.0
-                && vector_weight.is_finite()
-                && bm25_weight > 0.0
-                && bm25_weight.is_finite())
-        {
-            return Err(Status::invalid_argument(
-                "DECOMPOSED requires finite leg weights > 0 for both legs",
-            ));
-        }
-        if options.min_vector_score.is_nan() {
-            return Err(Status::invalid_argument("min_vector_score must not be NaN"));
-        }
-        // A floor on the vector leg's score cannot be met by a query that
-        // does not run the vector leg. Fusion would drop every hit and
-        // return an empty result set, which reads as "nothing matched"
-        // rather than "you asked for two contradictory things".
-        if options.min_vector_score > 0.0 && vector_weight == 0.0 {
-            return Err(Status::invalid_argument(
-                "min_vector_score is set but the vector leg is disabled (vector_weight 0); \
-                 no hit can carry a qualifying vector score",
-            ));
-        }
-        let legs = HybridLegs {
-            leg_k: if options.leg_k == 0 {
-                k.max(rrf_k as u32)
+            }
+            let req = request.into_inner();
+            let k = self.resolve_k(req.k)?;
+            if req.text.is_empty() {
+                return Err(Status::invalid_argument(
+                    "hybrid search requires query text",
+                ));
+            }
+            if req.vector.is_empty() {
+                return Err(Status::invalid_argument(
+                    "hybrid search requires a query vector",
+                ));
+            }
+            if req.vector.iter().any(|x| !x.is_finite()) {
+                return Err(Status::invalid_argument(
+                    "query vector has non-finite coordinates",
+                ));
+            }
+            let request_id = if req.request_id.is_empty() {
+                format!(
+                    "req-{}-{}",
+                    std::process::id(),
+                    REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+                )
             } else {
-                options.leg_k.max(k)
-            },
-            vector_weight,
-            bm25_weight,
-            rrf_k,
-            fusion_mode: options.fusion_mode(),
-            normalization: match options.normalization() {
-                crate::pb::ScoreNormalization::ZScore => fusion::Normalization::ZScore,
-                crate::pb::ScoreNormalization::None => fusion::Normalization::None,
-                _ => fusion::Normalization::MinMax,
-            },
-            combination: match options.combination() {
-                crate::pb::ScoreCombination::Geometric => fusion::Combination::Geometric,
-                crate::pb::ScoreCombination::Harmonic => fusion::Combination::Harmonic,
-                _ => fusion::Combination::Arithmetic,
-            },
-            min_vector_score: options.min_vector_score,
-        };
-        let (mut hits, mut cascade_hits, mut debug) = match legs.fusion_mode {
-            FusionMode::Cascade | FusionMode::Unspecified => {
-                let (cascade_hits, debug) = self
-                    .fanout_cascade(
-                        &request_id,
-                        &req.text,
-                        &req.vector,
-                        k,
-                        req.analysis.as_ref(),
-                        legs.min_vector_score,
-                        req.debug,
-                        &filters,
-                    )
-                    .await?;
-                (Vec::new(), cascade_hits, debug)
+                req.request_id.clone()
+            };
+            // One compilation, both legs. The hybrid route used to refuse
+            // filters outright because the vector leg had no filter
+            // machinery and filtering only the lexical half would have
+            // misdescribed the result set (docs/vector-filters.md).
+            let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
+            // leg's depth; explicit values below k are clamped to k.
+            let options = req.legs.unwrap_or_default();
+            let rrf_k = if options.rrf_k == 0.0 {
+                fusion::DEFAULT_RRF_K
+            } else {
+                f64::from(options.rrf_k)
+            };
+            // Weights: absent = 1.0; an explicit 0 disables the leg (the
+            // proto documents which modes support that).
+            let vector_weight = options.vector_weight.unwrap_or(1.0);
+            let bm25_weight = options.bm25_weight.unwrap_or(1.0);
+            if vector_weight == 0.0 && bm25_weight == 0.0 {
+                return Err(Status::invalid_argument(
+                    "both legs disabled: at least one of vector_weight/bm25_weight must be nonzero",
+                ));
             }
-            _ => {
-                let (hits, debug) = self
-                    .fanout_hybrid(
-                        &request_id,
-                        &req.text,
-                        &req.vector,
-                        k,
-                        req.analysis.as_ref(),
-                        legs,
-                        req.debug,
-                        &filters,
-                    )
-                    .await?;
-                (hits, Vec::new(), debug)
+            if options.fusion_mode() == FusionMode::TwoLevel
+                && (vector_weight == 0.0 || bm25_weight == 0.0)
+            {
+                return Err(Status::invalid_argument(
+                    "TWO_LEVEL cannot disable a leg (its node wire format cannot distinguish \
+                 0 from unset); use GLOBAL_RANK or SCORE_BLEND",
+                ));
             }
-        };
-        if let Some(boost) = &req.boost {
-            self.apply_boost(
-                boost,
-                req.analysis.as_ref(),
-                &mut hits,
-                &mut cascade_hits,
-                &mut debug,
-            )
-            .await?;
-        }
-        Ok(Response::new(HybridSearchResponse {
-            request_id,
-            hits,
-            cascade_hits,
-            debug,
-        }))
+            // The decomposed floor algebra divides by vector_weight and
+            // scales bounds by bm25_weight; both must be strictly positive
+            // (a single-leg query belongs to GLOBAL_RANK or SCORE_BLEND).
+            if options.fusion_mode() == FusionMode::Decomposed
+                && !(vector_weight > 0.0
+                    && vector_weight.is_finite()
+                    && bm25_weight > 0.0
+                    && bm25_weight.is_finite())
+            {
+                return Err(Status::invalid_argument(
+                    "DECOMPOSED requires finite leg weights > 0 for both legs",
+                ));
+            }
+            if options.min_vector_score.is_nan() {
+                return Err(Status::invalid_argument("min_vector_score must not be NaN"));
+            }
+            // A floor on the vector leg's score cannot be met by a query that
+            // does not run the vector leg. Fusion would drop every hit and
+            // return an empty result set, which reads as "nothing matched"
+            // rather than "you asked for two contradictory things".
+            if options.min_vector_score > 0.0 && vector_weight == 0.0 {
+                return Err(Status::invalid_argument(
+                    "min_vector_score is set but the vector leg is disabled (vector_weight 0); \
+                 no hit can carry a qualifying vector score",
+                ));
+            }
+            let legs = HybridLegs {
+                leg_k: if options.leg_k == 0 {
+                    k.max(rrf_k as u32)
+                } else {
+                    options.leg_k.max(k)
+                },
+                vector_weight,
+                bm25_weight,
+                rrf_k,
+                fusion_mode: options.fusion_mode(),
+                normalization: match options.normalization() {
+                    crate::pb::ScoreNormalization::ZScore => fusion::Normalization::ZScore,
+                    crate::pb::ScoreNormalization::None => fusion::Normalization::None,
+                    _ => fusion::Normalization::MinMax,
+                },
+                combination: match options.combination() {
+                    crate::pb::ScoreCombination::Geometric => fusion::Combination::Geometric,
+                    crate::pb::ScoreCombination::Harmonic => fusion::Combination::Harmonic,
+                    _ => fusion::Combination::Arithmetic,
+                },
+                min_vector_score: options.min_vector_score,
+            };
+            let (mut hits, mut cascade_hits, mut debug) = match legs.fusion_mode {
+                FusionMode::Cascade | FusionMode::Unspecified => {
+                    let (cascade_hits, debug) = self
+                        .fanout_cascade(
+                            &request_id,
+                            &req.text,
+                            &req.vector,
+                            k,
+                            req.analysis.as_ref(),
+                            legs.min_vector_score,
+                            req.debug,
+                            &filters,
+                        )
+                        .await?;
+                    (Vec::new(), cascade_hits, debug)
+                }
+                _ => {
+                    let (hits, debug) = self
+                        .fanout_hybrid(
+                            &request_id,
+                            &req.text,
+                            &req.vector,
+                            k,
+                            req.analysis.as_ref(),
+                            legs,
+                            req.debug,
+                            &filters,
+                        )
+                        .await?;
+                    (hits, Vec::new(), debug)
+                }
+            };
+            if let Some(boost) = &req.boost {
+                self.apply_boost(
+                    boost,
+                    req.analysis.as_ref(),
+                    &mut hits,
+                    &mut cascade_hits,
+                    &mut debug,
+                )
+                .await?;
+            }
+            Ok(Response::new(HybridSearchResponse {
+                request_id,
+                hits,
+                cascade_hits,
+                debug,
+            }))
         })
         .await
     }
@@ -9884,19 +9888,19 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<crate::pb::QueryRequest>,
     ) -> Result<Response<crate::pb::QueryResponse>, Status> {
         crate::metrics::timed(Route::Query, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
                 return Box::pin(SearchService::query(
                     &snapshot,
                     crate::metrics::nested(request),
                 ))
                 .await;
-        }
-        let request = request.into_inner();
-        self.require_topology_generation(request.required_topology_generation)?;
-        let mut response = crate::query::execute(self, request).await?;
-        response.served_topology_generation = self.topology_generation;
-        Ok(Response::new(response))
+            }
+            let request = request.into_inner();
+            self.require_topology_generation(request.required_topology_generation)?;
+            let mut response = crate::query::execute(self, request).await?;
+            response.served_topology_generation = self.topology_generation;
+            Ok(Response::new(response))
         })
         .await
     }
@@ -10184,22 +10188,22 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<crate::pb::PlanIndexRequest>,
     ) -> Result<Response<crate::pb::PlanIndexResponse>, Status> {
         crate::metrics::timed(Route::PlanIndex, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
                 return Box::pin(SearchService::plan_index(
                     &snapshot,
                     crate::metrics::nested(request),
                 ))
                 .await;
-        }
-        // Derivation is local and deterministic (docs/descriptor-mappings.md):
-        // nothing fans out, nothing binds, and the same request returns the
-        // same fingerprint on every coordinator.
-        let req = request.into_inner();
-        let plan = crate::mapping::derive_plan(&req.descriptor_set, &req.message_type)?;
-        Ok(Response::new(crate::pb::PlanIndexResponse {
-            plan: Some(plan),
-        }))
+            }
+            // Derivation is local and deterministic (docs/descriptor-mappings.md):
+            // nothing fans out, nothing binds, and the same request returns the
+            // same fingerprint on every coordinator.
+            let req = request.into_inner();
+            let plan = crate::mapping::derive_plan(&req.descriptor_set, &req.message_type)?;
+            Ok(Response::new(crate::pb::PlanIndexResponse {
+                plan: Some(plan),
+            }))
         })
         .await
     }
@@ -10209,12 +10213,12 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<Streaming<RoutedIngestMappedRequest>>,
     ) -> Result<Response<RoutedIngestMappedResponse>, Status> {
         crate::metrics::timed(Route::RoutedIngestMapped, request, |request| async move {
-        let mut inbound = request.into_inner();
-        let bind = Self::routed_bind(&mut inbound).await?;
-        self.admit(&bind.collection)?;
-        self.routed_ingest_mapped_bound(bind, inbound)
-            .await
-            .map(Response::new)
+            let mut inbound = request.into_inner();
+            let bind = Self::routed_bind(&mut inbound).await?;
+            self.admit(&bind.collection)?;
+            self.routed_ingest_mapped_bound(bind, inbound)
+                .await
+                .map(Response::new)
         })
         .await
     }
@@ -10224,50 +10228,50 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<FreezeTopologyWritesRequest>,
     ) -> Result<Response<FreezeTopologyWritesResponse>, Status> {
         crate::metrics::timed(Route::FreezeTopologyWrites, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if self.live_topology.is_none() {
-            return Err(Status::failed_precondition(
-                "topology cutover requires a generation-stamped hot shard map",
-            ));
-        }
-        let requested = request.into_inner().required_topology_generation;
-        if requested == 0 {
-            return Err(Status::invalid_argument(
-                "freeze requires a nonzero topology generation",
-            ));
-        }
-        if requested != self.current_topology_generation() {
-            return Err(Status::failed_precondition(format!(
-                "freeze requires topology generation {requested}, live {}",
-                self.current_topology_generation()
-            )));
-        }
-        if self
-            .cutover_pending
-            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
-            .is_err()
-        {
-            return Err(Status::already_exists(
-                "another topology cutover is already pending",
-            ));
-        }
-        let guard = self.write_gate.clone().write_owned().await;
-        if requested != self.current_topology_generation() {
-            self.cutover_pending.store(false, AtomicOrdering::Release);
-            drop(guard);
-            return Err(Status::failed_precondition(
-                "topology changed while the write barrier was being acquired",
-            ));
-        }
-        let token = floor_token();
-        *self
-            .cutover_guard
-            .lock()
-            .expect("cutover guard mutex poisoned") = Some((token, guard));
-        Ok(Response::new(FreezeTopologyWritesResponse {
-            topology_generation: requested,
-            cutover_token: token,
-        }))
+            self.admit(&request.get_ref().collection)?;
+            if self.live_topology.is_none() {
+                return Err(Status::failed_precondition(
+                    "topology cutover requires a generation-stamped hot shard map",
+                ));
+            }
+            let requested = request.into_inner().required_topology_generation;
+            if requested == 0 {
+                return Err(Status::invalid_argument(
+                    "freeze requires a nonzero topology generation",
+                ));
+            }
+            if requested != self.current_topology_generation() {
+                return Err(Status::failed_precondition(format!(
+                    "freeze requires topology generation {requested}, live {}",
+                    self.current_topology_generation()
+                )));
+            }
+            if self
+                .cutover_pending
+                .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                .is_err()
+            {
+                return Err(Status::already_exists(
+                    "another topology cutover is already pending",
+                ));
+            }
+            let guard = self.write_gate.clone().write_owned().await;
+            if requested != self.current_topology_generation() {
+                self.cutover_pending.store(false, AtomicOrdering::Release);
+                drop(guard);
+                return Err(Status::failed_precondition(
+                    "topology changed while the write barrier was being acquired",
+                ));
+            }
+            let token = floor_token();
+            *self
+                .cutover_guard
+                .lock()
+                .expect("cutover guard mutex poisoned") = Some((token, guard));
+            Ok(Response::new(FreezeTopologyWritesResponse {
+                topology_generation: requested,
+                cutover_token: token,
+            }))
         })
         .await
     }
@@ -10277,37 +10281,37 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<PublishTopologyRequest>,
     ) -> Result<Response<PublishTopologyResponse>, Status> {
         crate::metrics::timed(Route::PublishTopology, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        let req = request.into_inner();
-        let routes = req
-            .shards
-            .into_iter()
-            .map(|shard| TopologyRoute {
-                addr: crate::config::normalize_addr(shard.addr),
-                replica: (!shard.replica.is_empty())
-                    .then(|| crate::config::normalize_addr(shard.replica)),
-                hash_range: Some((shard.hash_lo, shard.hash_hi)),
-            })
-            .collect();
-        let mut held = self
-            .cutover_guard
-            .lock()
-            .expect("cutover guard mutex poisoned");
-        let Some((token, _)) = held.as_ref() else {
-            return Err(Status::failed_precondition(
-                "no topology cutover write freeze is active",
-            ));
-        };
-        if *token != req.cutover_token {
-            return Err(Status::permission_denied("cutover token does not match"));
-        }
-        self.publish_topology_inner(req.generation, routes)
-            .map_err(Status::invalid_argument)?;
-        held.take();
-        self.cutover_pending.store(false, AtomicOrdering::Release);
-        Ok(Response::new(PublishTopologyResponse {
-            topology_generation: req.generation,
-        }))
+            self.admit(&request.get_ref().collection)?;
+            let req = request.into_inner();
+            let routes = req
+                .shards
+                .into_iter()
+                .map(|shard| TopologyRoute {
+                    addr: crate::config::normalize_addr(shard.addr),
+                    replica: (!shard.replica.is_empty())
+                        .then(|| crate::config::normalize_addr(shard.replica)),
+                    hash_range: Some((shard.hash_lo, shard.hash_hi)),
+                })
+                .collect();
+            let mut held = self
+                .cutover_guard
+                .lock()
+                .expect("cutover guard mutex poisoned");
+            let Some((token, _)) = held.as_ref() else {
+                return Err(Status::failed_precondition(
+                    "no topology cutover write freeze is active",
+                ));
+            };
+            if *token != req.cutover_token {
+                return Err(Status::permission_denied("cutover token does not match"));
+            }
+            self.publish_topology_inner(req.generation, routes)
+                .map_err(Status::invalid_argument)?;
+            held.take();
+            self.cutover_pending.store(false, AtomicOrdering::Release);
+            Ok(Response::new(PublishTopologyResponse {
+                topology_generation: req.generation,
+            }))
         })
         .await
     }
@@ -10317,25 +10321,25 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<AbortTopologyCutoverRequest>,
     ) -> Result<Response<AbortTopologyCutoverResponse>, Status> {
         crate::metrics::timed(Route::AbortTopologyCutover, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        let token = request.into_inner().cutover_token;
-        let mut held = self
-            .cutover_guard
-            .lock()
-            .expect("cutover guard mutex poisoned");
-        let Some((expected, _)) = held.as_ref() else {
-            return Err(Status::failed_precondition(
-                "no topology cutover write freeze is active",
-            ));
-        };
-        if *expected != token {
-            return Err(Status::permission_denied("cutover token does not match"));
-        }
-        held.take();
-        self.cutover_pending.store(false, AtomicOrdering::Release);
-        Ok(Response::new(AbortTopologyCutoverResponse {
-            topology_generation: self.current_topology_generation(),
-        }))
+            self.admit(&request.get_ref().collection)?;
+            let token = request.into_inner().cutover_token;
+            let mut held = self
+                .cutover_guard
+                .lock()
+                .expect("cutover guard mutex poisoned");
+            let Some((expected, _)) = held.as_ref() else {
+                return Err(Status::failed_precondition(
+                    "no topology cutover write freeze is active",
+                ));
+            };
+            if *expected != token {
+                return Err(Status::permission_denied("cutover token does not match"));
+            }
+            held.take();
+            self.cutover_pending.store(false, AtomicOrdering::Release);
+            Ok(Response::new(AbortTopologyCutoverResponse {
+                topology_generation: self.current_topology_generation(),
+            }))
         })
         .await
     }
@@ -10349,20 +10353,20 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<crate::pb::AggregateRequest>,
     ) -> Result<Response<crate::pb::AggregateResponse>, Status> {
         crate::metrics::timed(Route::Aggregate, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
                 return Box::pin(SearchService::aggregate(
                     &snapshot,
                     crate::metrics::nested(request),
                 ))
                 .await;
-        }
-        let req = request.into_inner();
-        let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
-        let compiled = compile_aggregations(&req)?;
-        self.fanout_aggregate(&filters, &compiled, None)
-            .await
-            .map(Response::new)
+            }
+            let req = request.into_inner();
+            let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            let compiled = compile_aggregations(&req)?;
+            self.fanout_aggregate(&filters, &compiled, None)
+                .await
+                .map(Response::new)
         })
         .await
     }
@@ -10382,107 +10386,107 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<crate::pb::SuggestRequest>,
     ) -> Result<Response<crate::pb::SuggestResponse>, Status> {
         crate::metrics::timed(Route::Suggest, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::suggest(&snapshot, request)).await;
-        }
-        let req = request.into_inner();
-        let limit = match req.limit as usize {
-            0 => DEFAULT_SUGGEST_LIMIT,
-            n if n > MAX_SUGGEST_LIMIT => {
-                return Err(Status::invalid_argument(format!(
-                    "limit {n} exceeds the maximum {MAX_SUGGEST_LIMIT}"
-                )))
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
+                return Box::pin(SearchService::suggest(&snapshot, request)).await;
             }
-            n => n,
-        };
-        let max_scan = match req.max_scan {
-            0 => DEFAULT_SUGGEST_SCAN,
-            n if n > MAX_SUGGEST_SCAN as u64 => {
-                return Err(Status::invalid_argument(format!(
-                    "max_scan {n} exceeds the maximum {MAX_SUGGEST_SCAN}"
-                )))
-            }
-            n => n as usize,
-        };
-        if req.field.is_empty() {
-            return Err(Status::invalid_argument(
-                "suggest needs a field: name the indexed BM25 field whose dictionary to \
-                 complete (\"body\" for the body)",
-            ));
-        }
-        let field = req.field.as_str();
-        let normalized = crate::analyzer::normalize_prefix(&req.prefix, req.analysis.as_ref())?;
-        let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for (i, node) in self.node_addrs.iter().enumerate() {
-            let mut client = self.node_client(node)?;
-            let request = crate::pb::SuggestTermsRequest {
-                field: field.to_string(),
-                prefix: normalized.clone(),
-                max_scan: max_scan as u64,
+            let req = request.into_inner();
+            let limit = match req.limit as usize {
+                0 => DEFAULT_SUGGEST_LIMIT,
+                n if n > MAX_SUGGEST_LIMIT => {
+                    return Err(Status::invalid_argument(format!(
+                        "limit {n} exceeds the maximum {MAX_SUGGEST_LIMIT}"
+                    )))
+                }
+                n => n,
             };
-            tasks.push((
-                i,
-                tokio::spawn(
-                    async move { client.suggest_terms(request).await.map(|r| r.into_inner()) },
-                ),
-            ));
-        }
-        // Term -> (summed df, shards holding it), in byte order.
-        let mut union: std::collections::BTreeMap<String, (u64, u32)> =
-            std::collections::BTreeMap::new();
-        let mut known = false;
-        let mut tombstoned = false;
-        for (shard, task) in tasks {
-            let resp = task
-                .await
-                .map_err(|e| Status::internal(format!("suggest task failed: {e}")))??;
-            tombstoned |= resp.tombstoned_rows > 0;
-            if !resp.known {
-                continue;
+            let max_scan = match req.max_scan {
+                0 => DEFAULT_SUGGEST_SCAN,
+                n if n > MAX_SUGGEST_SCAN as u64 => {
+                    return Err(Status::invalid_argument(format!(
+                        "max_scan {n} exceeds the maximum {MAX_SUGGEST_SCAN}"
+                    )))
+                }
+                n => n as usize,
+            };
+            if req.field.is_empty() {
+                return Err(Status::invalid_argument(
+                    "suggest needs a field: name the indexed BM25 field whose dictionary to \
+                 complete (\"body\" for the body)",
+                ));
             }
-            known = true;
-            if resp.count as usize > max_scan {
-                return Err(Status::invalid_argument(format!(
-                    "prefix {normalized:?} on field {field:?} matches {} dictionary terms on \
+            let field = req.field.as_str();
+            let normalized = crate::analyzer::normalize_prefix(&req.prefix, req.analysis.as_ref())?;
+            let mut tasks = Vec::with_capacity(self.node_addrs.len());
+            for (i, node) in self.node_addrs.iter().enumerate() {
+                let mut client = self.node_client(node)?;
+                let request = crate::pb::SuggestTermsRequest {
+                    field: field.to_string(),
+                    prefix: normalized.clone(),
+                    max_scan: max_scan as u64,
+                };
+                tasks.push((
+                    i,
+                    tokio::spawn(async move {
+                        client.suggest_terms(request).await.map(|r| r.into_inner())
+                    }),
+                ));
+            }
+            // Term -> (summed df, shards holding it), in byte order.
+            let mut union: std::collections::BTreeMap<String, (u64, u32)> =
+                std::collections::BTreeMap::new();
+            let mut known = false;
+            let mut tombstoned = false;
+            for (shard, task) in tasks {
+                let resp = task
+                    .await
+                    .map_err(|e| Status::internal(format!("suggest task failed: {e}")))??;
+                tombstoned |= resp.tombstoned_rows > 0;
+                if !resp.known {
+                    continue;
+                }
+                known = true;
+                if resp.count as usize > max_scan {
+                    return Err(Status::invalid_argument(format!(
+                        "prefix {normalized:?} on field {field:?} matches {} dictionary terms on \
                      shard {shard}; the scan bound is {max_scan} (raise max_scan up to \
                      {MAX_SUGGEST_SCAN}, or lengthen the prefix)",
-                    resp.count
+                        resp.count
+                    )));
+                }
+                for entry in resp.entries {
+                    let slot = union.entry(entry.term).or_insert((0, 0));
+                    slot.0 += entry.df;
+                    slot.1 += 1;
+                }
+            }
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary to \
+                 complete in"
                 )));
             }
-            for entry in resp.entries {
-                let slot = union.entry(entry.term).or_insert((0, 0));
-                slot.0 += entry.df;
-                slot.1 += 1;
-            }
-        }
-        if !known {
-            return Err(Status::invalid_argument(format!(
-                "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary to \
-                 complete in"
-            )));
-        }
-        if union.len() > max_scan {
-            return Err(Status::invalid_argument(format!(
-                "prefix {normalized:?} on field {field:?} matches {} dictionary terms across \
+            if union.len() > max_scan {
+                return Err(Status::invalid_argument(format!(
+                    "prefix {normalized:?} on field {field:?} matches {} dictionary terms across \
                  the fleet; the scan bound is {max_scan} (raise max_scan up to \
                  {MAX_SUGGEST_SCAN}, or lengthen the prefix)",
-                union.len()
-            )));
-        }
-        let dictionary_terms_with_prefix = union.len() as u64;
-        let mut ranked: Vec<(String, (u64, u32))> = union.into_iter().collect();
-        // df descending; the map's byte order breaks ties (stable sort).
-        ranked.sort_by_key(|(_, (df, _))| std::cmp::Reverse(*df));
-        ranked.truncate(limit);
-        Ok(Response::new(crate::pb::SuggestResponse {
-            suggestions: ranked
-                .into_iter()
-                .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
-                .collect(),
-            dictionary_terms_with_prefix,
-            df_includes_tombstoned_rows: tombstoned,
-        }))
+                    union.len()
+                )));
+            }
+            let dictionary_terms_with_prefix = union.len() as u64;
+            let mut ranked: Vec<(String, (u64, u32))> = union.into_iter().collect();
+            // df descending; the map's byte order breaks ties (stable sort).
+            ranked.sort_by_key(|(_, (df, _))| std::cmp::Reverse(*df));
+            ranked.truncate(limit);
+            Ok(Response::new(crate::pb::SuggestResponse {
+                suggestions: ranked
+                    .into_iter()
+                    .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
+                    .collect(),
+                dictionary_terms_with_prefix,
+                df_includes_tombstoned_rows: tombstoned,
+            }))
         })
         .await
     }
@@ -10492,143 +10496,143 @@ impl SearchService for CoordinatorServiceImpl {
         _request: Request<ClusterHealthRequest>,
     ) -> Result<Response<ClusterHealthResponse>, Status> {
         crate::metrics::timed(Route::ClusterHealth, _request, |_request| async move {
-        self.admit(&_request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::cluster_health(
-                &snapshot,
+            self.admit(&_request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
+                return Box::pin(SearchService::cluster_health(
+                    &snapshot,
                     crate::metrics::nested(Request::new(ClusterHealthRequest {
-                    collection: String::new(),
+                        collection: String::new(),
                     })),
-            ))
-            .await;
-        }
-        // Probe every primary, then every configured replica. Unreachable
-        // is a reported outcome, never an error; a 2s probe timeout keeps
-        // one filtered port from stalling the whole report.
-        let mut probes: Vec<(u32, String, bool)> = Vec::new();
-        for (shard, addr) in self.node_addrs.iter().enumerate() {
-            probes.push((shard as u32, addr.clone(), false));
-        }
-        for (shard, replica) in self.replica_addrs.iter().enumerate() {
-            if let Some(addr) = replica {
-                probes.push((shard as u32, addr.clone(), true));
+                ))
+                .await;
             }
-        }
-        let mut tasks = Vec::with_capacity(probes.len());
-        for (shard, addr, is_replica) in probes {
-            let client = self.node_client(&addr);
-            tasks.push(tokio::spawn(async move {
-                let outcome = match client {
-                    Ok(mut client) => {
-                        match tokio::time::timeout(
-                            Duration::from_secs(2),
-                            client.health(HealthRequest {}),
-                        )
-                        .await
-                        {
-                            Ok(reply) => reply.map(|r| r.into_inner()),
-                            Err(_) => Err(Status::deadline_exceeded("health probe timed out")),
-                        }
-                    }
-                    Err(e) => Err(e),
-                };
-                match outcome {
-                    Ok(health) => ShardHealth {
-                        shard,
-                        addr,
-                        is_replica,
-                        reachable: true,
-                        error: String::new(),
-                        health: Some(health),
-                    },
-                    Err(e) => ShardHealth {
-                        shard,
-                        addr,
-                        is_replica,
-                        reachable: false,
-                        error: e.message().to_string(),
-                        health: None,
-                    },
+            // Probe every primary, then every configured replica. Unreachable
+            // is a reported outcome, never an error; a 2s probe timeout keeps
+            // one filtered port from stalling the whole report.
+            let mut probes: Vec<(u32, String, bool)> = Vec::new();
+            for (shard, addr) in self.node_addrs.iter().enumerate() {
+                probes.push((shard as u32, addr.clone(), false));
+            }
+            for (shard, replica) in self.replica_addrs.iter().enumerate() {
+                if let Some(addr) = replica {
+                    probes.push((shard as u32, addr.clone(), true));
                 }
-            }));
-        }
-        let mut targets = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            match task.await {
-                Ok(target) => targets.push(target),
+            }
+            let mut tasks = Vec::with_capacity(probes.len());
+            for (shard, addr, is_replica) in probes {
+                let client = self.node_client(&addr);
+                tasks.push(tokio::spawn(async move {
+                    let outcome = match client {
+                        Ok(mut client) => {
+                            match tokio::time::timeout(
+                                Duration::from_secs(2),
+                                client.health(HealthRequest {}),
+                            )
+                            .await
+                            {
+                                Ok(reply) => reply.map(|r| r.into_inner()),
+                                Err(_) => Err(Status::deadline_exceeded("health probe timed out")),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match outcome {
+                        Ok(health) => ShardHealth {
+                            shard,
+                            addr,
+                            is_replica,
+                            reachable: true,
+                            error: String::new(),
+                            health: Some(health),
+                        },
+                        Err(e) => ShardHealth {
+                            shard,
+                            addr,
+                            is_replica,
+                            reachable: false,
+                            error: e.message().to_string(),
+                            health: None,
+                        },
+                    }
+                }));
+            }
+            let mut targets = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                match task.await {
+                    Ok(target) => targets.push(target),
                     Err(e) => {
                         return Err(Status::internal(format!("health probe task failed: {e}")))
                     }
-            }
-        }
-        // A reachable node that serves another collection is a
-        // misconfiguration, named here rather than counted here.
-        for target in &mut targets {
-            if let Some(health) = &target.health {
-                if health.collection != self.collection {
-                    target.error = format!(
-                        "node serves collection {:?}, but this coordinator is {:?}",
-                        health.collection, self.collection
-                    );
                 }
             }
-        }
-        let provider_mismatch = provider_mismatch_of(&targets);
-        #[cfg(feature = "net")]
-        let clustered_vector = if let Some(backend) = &self.clustered_vectors {
-            Some(match backend.health().await {
-                Ok(health) => {
-                    // The score-space identity a quality profile binds to;
-                    // a servable cluster that cannot state it reports that
-                    // as its error rather than an empty fingerprint.
-                    let (scoring_fingerprint, dimensions, error) = if health.servable {
-                        match backend.quality_identity().await {
-                            Ok(identity) => (
-                                identity.scoring_fingerprint,
-                                identity.dimensions,
-                                health.error,
-                            ),
-                            Err(status) => (String::new(), 0, status.message().to_string()),
-                        }
-                    } else {
-                        (String::new(), 0, health.error)
-                    };
-                    ClusteredVectorHealth {
-                        backend_kind: "clustered-turbovec".to_string(),
-                        transport: backend.transport_name().to_string(),
-                        reachable: true,
-                        servable: health.servable,
-                        error,
-                        rows: health.rows,
-                        topology_generation: health.topology_generation,
-                        scoring_fingerprint,
-                        dimensions,
+            // A reachable node that serves another collection is a
+            // misconfiguration, named here rather than counted here.
+            for target in &mut targets {
+                if let Some(health) = &target.health {
+                    if health.collection != self.collection {
+                        target.error = format!(
+                            "node serves collection {:?}, but this coordinator is {:?}",
+                            health.collection, self.collection
+                        );
                     }
                 }
-                Err(status) => ClusteredVectorHealth {
-                    backend_kind: "clustered-turbovec".to_string(),
-                    transport: backend.transport_name().to_string(),
-                    reachable: false,
-                    servable: false,
-                    error: status.to_string(),
-                    rows: 0,
-                    topology_generation: 0,
-                    scoring_fingerprint: String::new(),
-                    dimensions: 0,
-                },
-            })
-        } else {
-            None
-        };
-        #[cfg(not(feature = "net"))]
-        let clustered_vector: Option<ClusteredVectorHealth> = None;
-        Ok(Response::new(ClusterHealthResponse {
-            collections: Vec::new(),
-            targets,
-            clustered_vector,
-            provider_mismatch,
-            topology_generation: self.topology_generation,
-        }))
+            }
+            let provider_mismatch = provider_mismatch_of(&targets);
+            #[cfg(feature = "net")]
+            let clustered_vector = if let Some(backend) = &self.clustered_vectors {
+                Some(match backend.health().await {
+                    Ok(health) => {
+                        // The score-space identity a quality profile binds to;
+                        // a servable cluster that cannot state it reports that
+                        // as its error rather than an empty fingerprint.
+                        let (scoring_fingerprint, dimensions, error) = if health.servable {
+                            match backend.quality_identity().await {
+                                Ok(identity) => (
+                                    identity.scoring_fingerprint,
+                                    identity.dimensions,
+                                    health.error,
+                                ),
+                                Err(status) => (String::new(), 0, status.message().to_string()),
+                            }
+                        } else {
+                            (String::new(), 0, health.error)
+                        };
+                        ClusteredVectorHealth {
+                            backend_kind: "clustered-turbovec".to_string(),
+                            transport: backend.transport_name().to_string(),
+                            reachable: true,
+                            servable: health.servable,
+                            error,
+                            rows: health.rows,
+                            topology_generation: health.topology_generation,
+                            scoring_fingerprint,
+                            dimensions,
+                        }
+                    }
+                    Err(status) => ClusteredVectorHealth {
+                        backend_kind: "clustered-turbovec".to_string(),
+                        transport: backend.transport_name().to_string(),
+                        reachable: false,
+                        servable: false,
+                        error: status.to_string(),
+                        rows: 0,
+                        topology_generation: 0,
+                        scoring_fingerprint: String::new(),
+                        dimensions: 0,
+                    },
+                })
+            } else {
+                None
+            };
+            #[cfg(not(feature = "net"))]
+            let clustered_vector: Option<ClusteredVectorHealth> = None;
+            Ok(Response::new(ClusterHealthResponse {
+                collections: Vec::new(),
+                targets,
+                clustered_vector,
+                provider_mismatch,
+                topology_generation: self.topology_generation,
+            }))
         })
         .await
     }
@@ -10641,22 +10645,22 @@ impl SearchService for CoordinatorServiceImpl {
             Route::BroadcastVectorBackend,
             request,
             |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+                self.admit(&request.get_ref().collection)?;
+                if let Some(snapshot) = self.request_snapshot() {
                     return Box::pin(SearchService::broadcast_vector_backend(
                         &snapshot,
                         crate::metrics::nested(request),
                     ))
                     .await;
-        }
-        let req = request.into_inner();
-        if req.dim == 0 || req.config.is_none() {
-            return Err(Status::invalid_argument(
-                "positive dim and vector backend config are required",
-            ));
-        }
-        let results = self.fanout_vector_backend(&req).await;
-        Ok(Response::new(BroadcastVectorBackendResponse { results }))
+                }
+                let req = request.into_inner();
+                if req.dim == 0 || req.config.is_none() {
+                    return Err(Status::invalid_argument(
+                        "positive dim and vector backend config are required",
+                    ));
+                }
+                let results = self.fanout_vector_backend(&req).await;
+                Ok(Response::new(BroadcastVectorBackendResponse { results }))
             },
         )
         .await
@@ -10667,22 +10671,22 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<BroadcastCalibrationRequest>,
     ) -> Result<Response<BroadcastCalibrationResponse>, Status> {
         crate::metrics::timed(Route::BroadcastCalibration, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
                 return Box::pin(SearchService::broadcast_calibration(
                     &snapshot,
                     crate::metrics::nested(request),
                 ))
                 .await;
-        }
-        let req = request.into_inner();
-        if req.shift.len() != req.dim as usize || req.scale.len() != req.dim as usize {
-            return Err(Status::invalid_argument(
-                "shift and scale must have length dim",
-            ));
-        }
-        let results = self.fanout_calibration(&req).await;
-        Ok(Response::new(BroadcastCalibrationResponse { results }))
+            }
+            let req = request.into_inner();
+            if req.shift.len() != req.dim as usize || req.scale.len() != req.dim as usize {
+                return Err(Status::invalid_argument(
+                    "shift and scale must have length dim",
+                ));
+            }
+            let results = self.fanout_calibration(&req).await;
+            Ok(Response::new(BroadcastCalibrationResponse { results }))
         })
         .await
     }
@@ -10692,140 +10696,140 @@ impl SearchService for CoordinatorServiceImpl {
         request: Request<VariantSearchRequest>,
     ) -> Result<Response<VariantSearchResponse>, Status> {
         crate::metrics::timed(Route::VariantSearch, request, |request| async move {
-        self.admit(&request.get_ref().collection)?;
-        if let Some(snapshot) = self.request_snapshot() {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
                 return Box::pin(SearchService::variant_search(
                     &snapshot,
                     crate::metrics::nested(request),
                 ))
                 .await;
-        }
-        let req = request.into_inner();
-        if req.variants.len() < 2 {
-            return Err(Status::invalid_argument(format!(
-                "variant search compares configurations: at least 2 variants required, got {}",
-                req.variants.len()
-            )));
-        }
-        // 0 = unset selects max_k, like every other client-facing k.
-        let k = self.resolve_k(req.k)?;
-        // Labels carry the whole result: a blank or duplicated one makes
-        // the diffs unreadable, so reject rather than disambiguate.
-        let mut seen: Vec<&str> = Vec::with_capacity(req.variants.len());
-        for (i, v) in req.variants.iter().enumerate() {
-            if v.label.is_empty() {
+            }
+            let req = request.into_inner();
+            if req.variants.len() < 2 {
                 return Err(Status::invalid_argument(format!(
-                    "variant {i} has an empty label; every arm must be named"
+                    "variant search compares configurations: at least 2 variants required, got {}",
+                    req.variants.len()
                 )));
             }
-            if seen.contains(&v.label.as_str()) {
-                return Err(Status::invalid_argument(format!(
-                    "duplicate variant label {:?}: labels identify arms in the diffs",
-                    v.label
-                )));
+            // 0 = unset selects max_k, like every other client-facing k.
+            let k = self.resolve_k(req.k)?;
+            // Labels carry the whole result: a blank or duplicated one makes
+            // the diffs unreadable, so reject rather than disambiguate.
+            let mut seen: Vec<&str> = Vec::with_capacity(req.variants.len());
+            for (i, v) in req.variants.iter().enumerate() {
+                if v.label.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "variant {i} has an empty label; every arm must be named"
+                    )));
+                }
+                if seen.contains(&v.label.as_str()) {
+                    return Err(Status::invalid_argument(format!(
+                        "duplicate variant label {:?}: labels identify arms in the diffs",
+                        v.label
+                    )));
+                }
+                seen.push(&v.label);
+                if v.query.is_none() {
+                    return Err(Status::invalid_argument(format!(
+                        "variant {:?} has no query set (expected bm25 or hybrid)",
+                        v.label
+                    )));
+                }
             }
-            seen.push(&v.label);
-            if v.query.is_none() {
-                return Err(Status::invalid_argument(format!(
-                    "variant {:?} has no query set (expected bm25 or hybrid)",
-                    v.label
-                )));
-            }
-        }
-        // RBO's persistence is a probability; 1.0 would never terminate
-        // its weighting and is as much an error as 2.0.
-        let rbo_p = if req.rbo_p == 0.0 {
-            0.9
-        } else {
-            f64::from(req.rbo_p)
-        };
-        if !(rbo_p.is_finite() && rbo_p > 0.0 && rbo_p < 1.0) {
-            return Err(Status::invalid_argument(format!(
-                "rbo_p must be in (0, 1); got {}",
-                req.rbo_p
-            )));
-        }
-        if req.interleave && req.variants.len() != 2 {
-            return Err(Status::invalid_argument(format!(
-                "interleaving is a two-way method (team draft); got {} variants. \
-                 Compare more arms with diffs, or interleave them pairwise.",
-                req.variants.len()
-            )));
-        }
-        let request_id = if req.request_id.is_empty() {
-            format!(
-                "req-{}-{}",
-                std::process::id(),
-                REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-            )
-        } else {
-            req.request_id.clone()
-        };
-
-        // Sequential, not concurrent. Running the arms together would
-        // make each one's `elapsed_ms` a measure of how hard the other
-        // arms were hitting the same shards, and per-arm cost is part of
-        // what an A/B is asked to report.
-        let mut results = Vec::with_capacity(req.variants.len());
-        for variant in &req.variants {
-            let query = variant
-                .query
-                .as_ref()
-                .expect("query presence checked above");
-            let started = std::time::Instant::now();
-            let hits = self.run_variant(query, k).await.map_err(|e| {
-                // Name the arm: with several in flight, an unadorned
-                // status leaves the caller guessing which one failed.
-                Status::new(
-                    e.code(),
-                    format!("variant {:?}: {}", variant.label, e.message()),
-                )
-            })?;
-            results.push(VariantResult {
-                label: variant.label.clone(),
-                hits,
-                elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
-            });
-        }
-
-        let diffs: Vec<RankingDiff> = results[1..]
-            .iter()
-            .map(|v| diff_against(&results[0], v, k as usize, rbo_p))
-            .collect();
-
-        let interleaving = req.interleave.then(|| {
-            let a: Vec<u64> = results[0].hits.iter().map(|h| h.doc_id).collect();
-            let b: Vec<u64> = results[1].hits.iter().map(|h| h.doc_id).collect();
-            // A seed derived from the query text keeps a re-run of the
-            // same query byte-identical while still varying across
-            // queries, so determinism does not become a first-position
-            // bias for one arm.
-            let seed = if req.interleave_seed == 0 {
-                crate::interleave::seed_for(variant_text(&req.variants[0]))
+            // RBO's persistence is a probability; 1.0 would never terminate
+            // its weighting and is as much an error as 2.0.
+            let rbo_p = if req.rbo_p == 0.0 {
+                0.9
             } else {
-                req.interleave_seed
+                f64::from(req.rbo_p)
             };
-            let merged = crate::interleave::team_draft(&a, &b, k as usize, seed);
-            Interleaving {
-                doc_ids: merged.ids,
-                teams: merged
-                    .team
-                    .into_iter()
-                    .map(|t| match t {
-                        crate::interleave::Team::A => InterleaveTeam::A as i32,
-                        crate::interleave::Team::B => InterleaveTeam::B as i32,
-                    })
-                    .collect(),
-                seed,
+            if !(rbo_p.is_finite() && rbo_p > 0.0 && rbo_p < 1.0) {
+                return Err(Status::invalid_argument(format!(
+                    "rbo_p must be in (0, 1); got {}",
+                    req.rbo_p
+                )));
             }
-        });
+            if req.interleave && req.variants.len() != 2 {
+                return Err(Status::invalid_argument(format!(
+                    "interleaving is a two-way method (team draft); got {} variants. \
+                 Compare more arms with diffs, or interleave them pairwise.",
+                    req.variants.len()
+                )));
+            }
+            let request_id = if req.request_id.is_empty() {
+                format!(
+                    "req-{}-{}",
+                    std::process::id(),
+                    REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+                )
+            } else {
+                req.request_id.clone()
+            };
 
-        Ok(Response::new(VariantSearchResponse {
-            request_id,
-            results,
-            diffs,
-            interleaving,
-        }))
+            // Sequential, not concurrent. Running the arms together would
+            // make each one's `elapsed_ms` a measure of how hard the other
+            // arms were hitting the same shards, and per-arm cost is part of
+            // what an A/B is asked to report.
+            let mut results = Vec::with_capacity(req.variants.len());
+            for variant in &req.variants {
+                let query = variant
+                    .query
+                    .as_ref()
+                    .expect("query presence checked above");
+                let started = std::time::Instant::now();
+                let hits = self.run_variant(query, k).await.map_err(|e| {
+                    // Name the arm: with several in flight, an unadorned
+                    // status leaves the caller guessing which one failed.
+                    Status::new(
+                        e.code(),
+                        format!("variant {:?}: {}", variant.label, e.message()),
+                    )
+                })?;
+                results.push(VariantResult {
+                    label: variant.label.clone(),
+                    hits,
+                    elapsed_ms: started.elapsed().as_secs_f32() * 1000.0,
+                });
+            }
+
+            let diffs: Vec<RankingDiff> = results[1..]
+                .iter()
+                .map(|v| diff_against(&results[0], v, k as usize, rbo_p))
+                .collect();
+
+            let interleaving = req.interleave.then(|| {
+                let a: Vec<u64> = results[0].hits.iter().map(|h| h.doc_id).collect();
+                let b: Vec<u64> = results[1].hits.iter().map(|h| h.doc_id).collect();
+                // A seed derived from the query text keeps a re-run of the
+                // same query byte-identical while still varying across
+                // queries, so determinism does not become a first-position
+                // bias for one arm.
+                let seed = if req.interleave_seed == 0 {
+                    crate::interleave::seed_for(variant_text(&req.variants[0]))
+                } else {
+                    req.interleave_seed
+                };
+                let merged = crate::interleave::team_draft(&a, &b, k as usize, seed);
+                Interleaving {
+                    doc_ids: merged.ids,
+                    teams: merged
+                        .team
+                        .into_iter()
+                        .map(|t| match t {
+                            crate::interleave::Team::A => InterleaveTeam::A as i32,
+                            crate::interleave::Team::B => InterleaveTeam::B as i32,
+                        })
+                        .collect(),
+                    seed,
+                }
+            });
+
+            Ok(Response::new(VariantSearchResponse {
+                request_id,
+                results,
+                diffs,
+                interleaving,
+            }))
         })
         .await
     }

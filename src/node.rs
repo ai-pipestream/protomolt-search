@@ -8715,225 +8715,364 @@ impl NodeService for NodeServiceImpl {
     type Bm25QueryStreamStream =
         crate::metrics::Timed<ReceiverStream<Result<Bm25QueryStreamResponse, Status>>>;
     type ReadWalStream = crate::metrics::Timed<ReceiverStream<Result<ReadWalResponse, Status>>>;
-    type StreamSnapshotStream = crate::metrics::Timed<ReceiverStream<Result<SnapshotChunk, Status>>>;
+    type StreamSnapshotStream =
+        crate::metrics::Timed<ReceiverStream<Result<SnapshotChunk, Status>>>;
 
     async fn search_shard(
         &self,
         request: Request<Streaming<SearchShardRequest>>,
     ) -> Result<Response<Self::SearchShardStream>, Status> {
         crate::metrics::timed_stream(Route::SearchShard, request, |request| async move {
-        let mut inbound = request.into_inner();
-        let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
-        let state = self.state.clone();
-        let config = self.config.clone();
-        let scan_queue = config.coalesce.then(|| self.scan_queue());
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
+            let state = self.state.clone();
+            let config = self.config.clone();
+            let scan_queue = config.coalesce.then(|| self.scan_queue());
 
-        tokio::spawn(async move {
-            // Protocol: the first message must be Start.
-            let start = match inbound.message().await {
-                Ok(Some(SearchShardRequest {
-                    payload: Some(search_shard_request::Payload::Start(start)),
-                })) => start,
-                Ok(_) => {
-                    let _ = tx
-                        .send(Err(Status::invalid_argument(
-                            "first SearchShardRequest must be StartShardSearch",
-                        )))
-                        .await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-            // Filter validation is shape-only and shard-independent, so
-            // it happens once here rather than inside the scan: a
-            // malformed tree must refuse before any work, exactly as on
-            // the lexical routes.
-            let geo_regions = match validate_geo_filters(&start.geo_filters) {
-                Ok(regions) => regions,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-            if let Some(f) = start.filter.as_ref() {
-                if let Err(e) = crate::filter::validate_filter(f) {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            }
-
-            // Floor updates arrive on the same stream; a pump task folds
-            // them into a watch cell the blocking scan polls between chunks.
-            // Updates are monotone maxes, so only raises are stored.
-            let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
             tokio::spawn(async move {
-                loop {
-                    match inbound.message().await {
-                        Ok(Some(SearchShardRequest {
-                            payload: Some(search_shard_request::Payload::FloorUpdate(u)),
-                        })) => {
-                            floor_tx.send_if_modified(|cur| {
-                                if !u.floor.is_nan() && u.floor > *cur {
-                                    *cur = u.floor;
-                                    true
-                                } else {
-                                    false
-                                }
-                            });
-                        }
-                        // Duplicate Start or empty payload: ignore.
-                        Ok(Some(_)) => {}
-                        // Client closed (end of updates or cancellation) or
-                        // the stream broke: stop pumping; the scan finishes
-                        // on its own either way.
-                        Ok(None) | Err(_) => break,
+                // Protocol: the first message must be Start.
+                let start = match inbound.message().await {
+                    Ok(Some(SearchShardRequest {
+                        payload: Some(search_shard_request::Payload::Start(start)),
+                    })) => start,
+                    Ok(_) => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "first SearchShardRequest must be StartShardSearch",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                // Filter validation is shape-only and shard-independent, so
+                // it happens once here rather than inside the scan: a
+                // malformed tree must refuse before any work, exactly as on
+                // the lexical routes.
+                let geo_regions = match validate_geo_filters(&start.geo_filters) {
+                    Ok(regions) => regions,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Some(f) = start.filter.as_ref() {
+                    if let Err(e) = crate::filter::validate_filter(f) {
+                        let _ = tx.send(Err(e)).await;
+                        return;
                     }
                 }
-            });
 
-            let share = config.share_floors;
-            let floor_delta = config.floor_delta;
-            let chunk_blocks = config.chunk_blocks;
-            let slot_offset = config.slot_offset;
-            let scan_tx = tx.clone();
-            // Publish only raises that clear the delta gate, and never
-            // block the scan on a full channel: intermediate floors are
-            // disposable (they are monotone, so the next chunk's publish
-            // supersedes any dropped one). The terminal Done is sent
-            // with `.await` below and cannot be dropped.
-            let warmup = config.floor_warmup_chunks;
-            let min_interval = (config.floor_min_interval_ms > 0)
-                .then(|| std::time::Duration::from_millis(config.floor_min_interval_ms));
-            let mut last_published = f32::NEG_INFINITY;
-            let mut offers = 0u32;
-            let mut last_at: Option<std::time::Instant> = None;
-            // Returns whether the floor actually went on the wire, so
-            // the scan can report offers and publishes apart. Reporting
-            // only offers is how the warmup and debounce knobs came to
-            // look like no-ops.
-            let publish_floor = move |floor: f32| -> bool {
-                if !share {
-                    return false;
-                }
-                // Skip the opening chunks: their floors are the weakest
-                // and cost a broadcast to every shard apiece.
-                offers += 1;
-                if offers <= warmup {
-                    return false;
-                }
-                if floor <= last_published + floor_delta {
-                    return false;
-                }
-                // Debounce. Suppressing a floor loses nothing: they are
-                // monotone, so the next one published is at least as
-                // high as the one dropped.
-                if let (Some(interval), Some(at)) = (min_interval, last_at) {
-                    if at.elapsed() < interval {
+                // Floor updates arrive on the same stream; a pump task folds
+                // them into a watch cell the blocking scan polls between chunks.
+                // Updates are monotone maxes, so only raises are stored.
+                let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
+                tokio::spawn(async move {
+                    loop {
+                        match inbound.message().await {
+                            Ok(Some(SearchShardRequest {
+                                payload: Some(search_shard_request::Payload::FloorUpdate(u)),
+                            })) => {
+                                floor_tx.send_if_modified(|cur| {
+                                    if !u.floor.is_nan() && u.floor > *cur {
+                                        *cur = u.floor;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            }
+                            // Duplicate Start or empty payload: ignore.
+                            Ok(Some(_)) => {}
+                            // Client closed (end of updates or cancellation) or
+                            // the stream broke: stop pumping; the scan finishes
+                            // on its own either way.
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                });
+
+                let share = config.share_floors;
+                let floor_delta = config.floor_delta;
+                let chunk_blocks = config.chunk_blocks;
+                let slot_offset = config.slot_offset;
+                let scan_tx = tx.clone();
+                // Publish only raises that clear the delta gate, and never
+                // block the scan on a full channel: intermediate floors are
+                // disposable (they are monotone, so the next chunk's publish
+                // supersedes any dropped one). The terminal Done is sent
+                // with `.await` below and cannot be dropped.
+                let warmup = config.floor_warmup_chunks;
+                let min_interval = (config.floor_min_interval_ms > 0)
+                    .then(|| std::time::Duration::from_millis(config.floor_min_interval_ms));
+                let mut last_published = f32::NEG_INFINITY;
+                let mut offers = 0u32;
+                let mut last_at: Option<std::time::Instant> = None;
+                // Returns whether the floor actually went on the wire, so
+                // the scan can report offers and publishes apart. Reporting
+                // only offers is how the warmup and debounce knobs came to
+                // look like no-ops.
+                let publish_floor = move |floor: f32| -> bool {
+                    if !share {
                         return false;
                     }
-                }
-                last_published = floor;
-                last_at = Some(std::time::Instant::now());
-                let _ = scan_tx.try_send(Ok(SearchShardResponse {
-                    payload: Some(search_shard_response::Payload::FloorUpdate(FloorUpdate {
-                        floor,
-                    })),
-                }));
-                true
-            };
-            let external_floor = move || {
-                if share {
-                    let f = *floor_rx.borrow();
-                    (f != f32::NEG_INFINITY).then_some(f)
-                } else {
-                    None
-                }
-            };
+                    // Skip the opening chunks: their floors are the weakest
+                    // and cost a broadcast to every shard apiece.
+                    offers += 1;
+                    if offers <= warmup {
+                        return false;
+                    }
+                    if floor <= last_published + floor_delta {
+                        return false;
+                    }
+                    // Debounce. Suppressing a floor loses nothing: they are
+                    // monotone, so the next one published is at least as
+                    // high as the one dropped.
+                    if let (Some(interval), Some(at)) = (min_interval, last_at) {
+                        if at.elapsed() < interval {
+                            return false;
+                        }
+                    }
+                    last_published = floor;
+                    last_at = Some(std::time::Instant::now());
+                    let _ = scan_tx.try_send(Ok(SearchShardResponse {
+                        payload: Some(search_shard_response::Payload::FloorUpdate(FloorUpdate {
+                            floor,
+                        })),
+                    }));
+                    true
+                };
+                let external_floor = move || {
+                    if share {
+                        let f = *floor_rx.borrow();
+                        (f != f32::NEG_INFINITY).then_some(f)
+                    } else {
+                        None
+                    }
+                };
 
-            // Collapse-by-parent scans run their own solo path: the
-            // collection semantics (one entry per parent, parent floors,
-            // saturation escalation) do not batch with plain scans.
-            if start.collapse_parents {
-                if start.tie_complete {
-                    let _ = tx
-                        .send(Err(Status::invalid_argument(
-                            "collapse_parents and tie_complete are mutually exclusive",
-                        )))
-                        .await;
-                    return;
-                }
-                let mut external_floor = external_floor;
-                let mut publish_floor = publish_floor;
-                let geo_regions = geo_regions.clone();
-                let scan = tokio::task::spawn_blocking(move || {
-                    let n = {
+                // Collapse-by-parent scans run their own solo path: the
+                // collection semantics (one entry per parent, parent floors,
+                // saturation escalation) do not batch with plain scans.
+                if start.collapse_parents {
+                    if start.tie_complete {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "collapse_parents and tie_complete are mutually exclusive",
+                            )))
+                            .await;
+                        return;
+                    }
+                    let mut external_floor = external_floor;
+                    let mut publish_floor = publish_floor;
+                    let geo_regions = geo_regions.clone();
+                    let scan = tokio::task::spawn_blocking(move || {
+                        let n = {
+                            let guard = state.read().expect("shard state lock poisoned");
+                            let index = guard.index.as_ref().ok_or_else(|| {
+                                Status::failed_precondition(
+                                    "shard has no index yet (set calibration or add vectors)",
+                                )
+                            })?;
+                            Self::validate_start(index, &start)?;
+                            index.len()
+                        };
+                        // parent_map takes its own locks (read to build, write
+                        // to cache), so the validation guard is dropped first.
+                        let parents = Self::parent_map(&state, slot_offset, n);
                         let guard = state.read().expect("shard state lock poisoned");
                         let index = guard.index.as_ref().ok_or_else(|| {
-                            Status::failed_precondition(
-                                "shard has no index yet (set calibration or add vectors)",
-                            )
+                            Status::failed_precondition("shard index disappeared mid-setup")
                         })?;
-                        Self::validate_start(index, &start)?;
-                        index.len()
-                    };
-                    // parent_map takes its own locks (read to build, write
-                    // to cache), so the validation guard is dropped first.
-                    let parents = Self::parent_map(&state, slot_offset, n);
-                    let guard = state.read().expect("shard state lock poisoned");
-                    let index = guard.index.as_ref().ok_or_else(|| {
-                        Status::failed_precondition("shard index disappeared mid-setup")
-                    })?;
-                    if index.len() != parents.len() {
+                        if index.len() != parents.len() {
                             return Err(Status::aborted(
                                 "shard grew between setup and scan; retry",
                             ));
+                        }
+                        // Filters remove chunks, and a parent's score is the
+                        // max over its SURVIVING chunks, so collapse under a
+                        // filter is the collapse of the filtered corpus —
+                        // still every floor a valid lower bound, still no new
+                        // pruning math.
+                        let (_, allow) = resolve_shard_filters(
+                            guard.bm25.as_ref(),
+                            guard.live_docs.words(),
+                            index.len(),
+                            &start.geo_filters,
+                            &geo_regions,
+                            start.filter.as_ref(),
+                        )?;
+                        let known = filter_known_flags(
+                            guard.bm25.as_ref(),
+                            &start.geo_filters,
+                            start.filter.as_ref(),
+                        );
+                        let (hits, stats) = chunked_topk_collapsed(
+                            index,
+                            &start.vector,
+                            start.k as usize,
+                            chunk_blocks,
+                            &parents,
+                            &mut external_floor,
+                            &mut publish_floor,
+                            allow.as_deref(),
+                        );
+                        Ok((hits, stats, known))
+                    });
+                    let outcome = match scan.await {
+                        Ok(result) => result,
+                        Err(e) => Err(Status::internal(format!("collapse scan task failed: {e}"))),
+                    };
+                    match outcome {
+                        Ok((hits, stats, (geo_columns_known, filter_columns_known))) => {
+                            let done = SearchShardDone {
+                                hits: hits
+                                    .into_iter()
+                                    .map(|h| ScoredHit {
+                                        vector_id: slot_offset + u64::from(h.slot),
+                                        score: h.score,
+                                        parent_id: h.parent,
+                                    })
+                                    .collect(),
+                                stats: Some(ShardScanStats {
+                                    chunk_calls: stats.chunk_calls,
+                                    candidates_collected: stats.candidates_collected,
+                                    floors_published: stats.floors_published,
+                                    floor_updates_applied: stats.floor_updates_applied,
+                                    floors_offered: stats.floors_offered,
+                                }),
+                                geo_columns_known,
+                                filter_columns_known,
+                            };
+                            let _ = tx
+                                .send(Ok(SearchShardResponse {
+                                    payload: Some(search_shard_response::Payload::Done(done)),
+                                }))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                        }
                     }
-                    // Filters remove chunks, and a parent's score is the
-                    // max over its SURVIVING chunks, so collapse under a
-                    // filter is the collapse of the filtered corpus —
-                    // still every floor a valid lower bound, still no new
-                    // pruning math.
-                    let (_, allow) = resolve_shard_filters(
-                        guard.bm25.as_ref(),
-                        guard.live_docs.words(),
-                        index.len(),
-                        &start.geo_filters,
-                        &geo_regions,
-                        start.filter.as_ref(),
-                    )?;
-                    let known = filter_known_flags(
-                        guard.bm25.as_ref(),
-                        &start.geo_filters,
-                        start.filter.as_ref(),
-                    );
-                    let (hits, stats) = chunked_topk_collapsed(
-                        index,
-                        &start.vector,
-                        start.k as usize,
-                        chunk_blocks,
-                        &parents,
-                        &mut external_floor,
-                        &mut publish_floor,
-                        allow.as_deref(),
-                    );
-                    Ok((hits, stats, known))
-                });
-                let outcome = match scan.await {
-                    Ok(result) => result,
-                    Err(e) => Err(Status::internal(format!("collapse scan task failed: {e}"))),
+                    return;
+                }
+
+                let outcome: Result<ScanOutcome, Status> = match scan_queue {
+                    Some(jobs) => {
+                        // Coalesced path: validate against the current index
+                        // cheaply, then queue for a batched kernel pass. The
+                        // batch runner holds the read lock for the scan, the
+                        // same consistency the solo path gets.
+                        let validated = {
+                            let guard = state.read().expect("shard state lock poisoned");
+                            match guard.index.as_ref() {
+                                Some(index) => Self::validate_start(index, &start),
+                                None => Err(Status::failed_precondition(
+                                    "shard has no index yet (set calibration or add vectors)",
+                                )),
+                            }
+                        };
+                        match validated {
+                            Ok(()) => {
+                                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                                let job = ScanJob {
+                                    vector: start.vector.clone(),
+                                    k: start.k as usize,
+                                    tie_complete: start.tie_complete,
+                                    geo_filters: start.geo_filters.clone(),
+                                    geo_regions: geo_regions.clone(),
+                                    filter: start.filter.clone(),
+                                    external: Box::new(external_floor),
+                                    publish: Box::new(publish_floor),
+                                    done: done_tx,
+                                };
+                                if jobs.send(job).await.is_err() {
+                                    Err(Status::internal("scan scheduler unavailable"))
+                                } else {
+                                    match done_rx.await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(Status::internal(
+                                            "scan batch dropped before finishing",
+                                        )),
+                                    }
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => {
+                        // Solo path (the coalescing A/B baseline): one
+                        // blocking scan per RPC, exactly the historical
+                        // behavior.
+                        let mut external_floor = external_floor;
+                        let mut publish_floor = publish_floor;
+                        let scan = tokio::task::spawn_blocking(move || {
+                            // The read guard is held for the whole chunked
+                            // scan: adds (write lock) never interleave with a
+                            // scan, so a search sees one consistent index
+                            // snapshot.
+                            let guard = state.read().expect("shard state lock poisoned");
+                            let index = guard.index.as_ref().ok_or_else(|| {
+                                Status::failed_precondition(
+                                    "shard has no index yet (set calibration or add vectors)",
+                                )
+                            })?;
+                            Self::validate_start(index, &start)?;
+                            let (_, allow) = resolve_shard_filters(
+                                guard.bm25.as_ref(),
+                                guard.live_docs.words(),
+                                index.len(),
+                                &start.geo_filters,
+                                &geo_regions,
+                                start.filter.as_ref(),
+                            )?;
+                            let (geo_columns_known, filter_columns_known) = filter_known_flags(
+                                guard.bm25.as_ref(),
+                                &start.geo_filters,
+                                start.filter.as_ref(),
+                            );
+                            let (hits, stats) = chunked_topk(
+                                index,
+                                &start.vector,
+                                start.k as usize,
+                                chunk_blocks,
+                                &mut external_floor,
+                                &mut publish_floor,
+                                start.tie_complete,
+                                allow.as_deref(),
+                            );
+                            crate::metrics::record_scan(&stats);
+                            Ok(ScanOutcome {
+                                hits,
+                                stats,
+                                geo_columns_known,
+                                filter_columns_known,
+                            })
+                        });
+                        match scan.await {
+                            Ok(result) => result,
+                            Err(e) => Err(Status::internal(format!("scan task failed: {e}"))),
+                        }
+                    }
                 };
+
                 match outcome {
-                    Ok((hits, stats, (geo_columns_known, filter_columns_known))) => {
+                    Ok(ScanOutcome {
+                        hits,
+                        stats,
+                        geo_columns_known,
+                        filter_columns_known,
+                    }) => {
                         let done = SearchShardDone {
                             hits: hits
                                 .into_iter()
                                 .map(|h| ScoredHit {
                                     vector_id: slot_offset + u64::from(h.slot),
                                     score: h.score,
-                                    parent_id: h.parent,
+                                    parent_id: 0,
                                 })
                                 .collect(),
                             stats: Some(ShardScanStats {
@@ -8956,147 +9095,9 @@ impl NodeService for NodeServiceImpl {
                         let _ = tx.send(Err(e)).await;
                     }
                 }
-                return;
-            }
+            });
 
-            let outcome: Result<ScanOutcome, Status> = match scan_queue {
-                Some(jobs) => {
-                    // Coalesced path: validate against the current index
-                    // cheaply, then queue for a batched kernel pass. The
-                    // batch runner holds the read lock for the scan, the
-                    // same consistency the solo path gets.
-                    let validated = {
-                        let guard = state.read().expect("shard state lock poisoned");
-                        match guard.index.as_ref() {
-                            Some(index) => Self::validate_start(index, &start),
-                            None => Err(Status::failed_precondition(
-                                "shard has no index yet (set calibration or add vectors)",
-                            )),
-                        }
-                    };
-                    match validated {
-                        Ok(()) => {
-                            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                            let job = ScanJob {
-                                vector: start.vector.clone(),
-                                k: start.k as usize,
-                                tie_complete: start.tie_complete,
-                                geo_filters: start.geo_filters.clone(),
-                                geo_regions: geo_regions.clone(),
-                                filter: start.filter.clone(),
-                                external: Box::new(external_floor),
-                                publish: Box::new(publish_floor),
-                                done: done_tx,
-                            };
-                            if jobs.send(job).await.is_err() {
-                                Err(Status::internal("scan scheduler unavailable"))
-                            } else {
-                                match done_rx.await {
-                                    Ok(result) => result,
-                                        Err(_) => Err(Status::internal(
-                                            "scan batch dropped before finishing",
-                                        )),
-                                }
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                None => {
-                    // Solo path (the coalescing A/B baseline): one
-                    // blocking scan per RPC, exactly the historical
-                    // behavior.
-                    let mut external_floor = external_floor;
-                    let mut publish_floor = publish_floor;
-                    let scan = tokio::task::spawn_blocking(move || {
-                        // The read guard is held for the whole chunked
-                        // scan: adds (write lock) never interleave with a
-                        // scan, so a search sees one consistent index
-                        // snapshot.
-                        let guard = state.read().expect("shard state lock poisoned");
-                        let index = guard.index.as_ref().ok_or_else(|| {
-                            Status::failed_precondition(
-                                "shard has no index yet (set calibration or add vectors)",
-                            )
-                        })?;
-                        Self::validate_start(index, &start)?;
-                        let (_, allow) = resolve_shard_filters(
-                            guard.bm25.as_ref(),
-                            guard.live_docs.words(),
-                            index.len(),
-                            &start.geo_filters,
-                            &geo_regions,
-                            start.filter.as_ref(),
-                        )?;
-                        let (geo_columns_known, filter_columns_known) = filter_known_flags(
-                            guard.bm25.as_ref(),
-                            &start.geo_filters,
-                            start.filter.as_ref(),
-                        );
-                        let (hits, stats) = chunked_topk(
-                            index,
-                            &start.vector,
-                            start.k as usize,
-                            chunk_blocks,
-                            &mut external_floor,
-                            &mut publish_floor,
-                            start.tie_complete,
-                            allow.as_deref(),
-                        );
-                        crate::metrics::record_scan(&stats);
-                        Ok(ScanOutcome {
-                            hits,
-                            stats,
-                            geo_columns_known,
-                            filter_columns_known,
-                        })
-                    });
-                    match scan.await {
-                        Ok(result) => result,
-                        Err(e) => Err(Status::internal(format!("scan task failed: {e}"))),
-                    }
-                }
-            };
-
-            match outcome {
-                Ok(ScanOutcome {
-                    hits,
-                    stats,
-                    geo_columns_known,
-                    filter_columns_known,
-                }) => {
-                    let done = SearchShardDone {
-                        hits: hits
-                            .into_iter()
-                            .map(|h| ScoredHit {
-                                vector_id: slot_offset + u64::from(h.slot),
-                                score: h.score,
-                                parent_id: 0,
-                            })
-                            .collect(),
-                        stats: Some(ShardScanStats {
-                            chunk_calls: stats.chunk_calls,
-                            candidates_collected: stats.candidates_collected,
-                            floors_published: stats.floors_published,
-                            floor_updates_applied: stats.floor_updates_applied,
-                            floors_offered: stats.floors_offered,
-                        }),
-                        geo_columns_known,
-                        filter_columns_known,
-                    };
-                    let _ = tx
-                        .send(Ok(SearchShardResponse {
-                            payload: Some(search_shard_response::Payload::Done(done)),
-                        }))
-                        .await;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+            Ok(Response::new(ReceiverStream::new(rx)))
         })
         .await
     }
@@ -9110,72 +9111,18 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::BrowseShardRequest>,
     ) -> Result<Response<crate::pb::BrowseShardResponse>, Status> {
         crate::metrics::timed(Route::BrowseShard, request, |request| async move {
-        let req = request.into_inner();
-        if req.k == 0 {
-            return Err(Status::invalid_argument("browse requires k > 0"));
-        }
-        let geo_regions = validate_geo_filters(&req.geo_filters)?;
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let (geo_columns_known, filter_columns_known) =
-            filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
-        let slot_offset = self.config.slot_offset;
-        let Some(store) = guard.bm25.as_ref() else {
-            // A document-less shard admits nothing; its all-false known
-            // flags feed the coordinator's typo rule like everywhere.
-            return Ok(Response::new(crate::pb::BrowseShardResponse {
-                doc_ids: Vec::new(),
-                geo_columns_known,
-                filter_columns_known,
-                sort_key_bits: Vec::new(),
-                sort_keys: Vec::new(),
-                sort_column_known: false,
-            }));
-        };
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before browsing",
-            ));
-        }
-        let n = u64::from(store.next_doc_id());
-        // The exclusive floor in local id space. The first page carries
-        // no floor at all (proto3 cannot distinguish after = 0 from
-        // unset, so the request says which it is).
-        let start = if req.first_page || req.after < slot_offset {
-            0
-        } else {
-            (req.after - slot_offset + 1).min(n)
-        };
-        let doc_filter = crate::filter::DocFilter {
-            deleted: guard.live_docs.words(),
-            geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-            pred: req
-                .filter
-                .as_ref()
-                .map(|f| store.resolve_filter(f))
-                .transpose()?,
-            phrase: Vec::new(),
-        };
-        let cols = ShardNumericRead(store);
-        if let Some(sort) = &req.sort {
-            // Column-ordered browse: walk the FULL admitted set with a
-            // k-bounded heap. Exhaustive by construction, so the
-            // exactness certificate is trivial; per-shard exact top-k
-            // by key means the coordinator's merged union contains the
-            // global top-k (local rank <= global rank).
-                let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> =
-                    if let Some(ni) = store.numeric_index(&sort.column) {
-                        Box::new(move |doc| {
-                            store.numeric_value(ni, doc).map(|v| (f64_order_bits(v), v))
-                        })
-            } else if let Some(ii) = store.integer_index(&sort.column) {
-                Box::new(move |doc| {
-                    store
-                        .integer_value(ii, doc)
-                        .map(|v| (i64_order_bits(v), v as f64))
-                })
-            } else {
-                // Unknown here; the coordinator's typo rule refuses
-                // only when NO shard knows it.
+            let req = request.into_inner();
+            if req.k == 0 {
+                return Err(Status::invalid_argument("browse requires k > 0"));
+            }
+            let geo_regions = validate_geo_filters(&req.geo_filters)?;
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let (geo_columns_known, filter_columns_known) =
+                filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+            let slot_offset = self.config.slot_offset;
+            let Some(store) = guard.bm25.as_ref() else {
+                // A document-less shard admits nothing; its all-false known
+                // flags feed the coordinator's typo rule like everywhere.
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
                     doc_ids: Vec::new(),
                     geo_columns_known,
@@ -9185,68 +9132,122 @@ impl NodeService for NodeServiceImpl {
                     sort_column_known: false,
                 }));
             };
-            let boundary = (!req.first_page).then_some((req.after_key_bits, req.after));
-            // Max-heap keeping the k SMALLEST (adjusted-bits, id) pairs.
-            let mut heap: std::collections::BinaryHeap<(u64, u64, u64)> =
-                std::collections::BinaryHeap::with_capacity(req.k as usize + 1);
-            for local in 0..n {
-                let doc = local as u32;
-                if !doc_filter.passes(doc, &cols) {
-                    continue;
-                }
-                // A document without a value has no honest position in
-                // a column order: excluded, same stance as the filters.
-                let Some((bits, value)) = key_of(doc) else {
-                    continue;
-                };
-                let adjusted = if sort.descending { !bits } else { bits };
-                let id = slot_offset + local;
-                if let Some(b) = boundary {
-                    if (adjusted, id) <= b {
+            if store.as_index().is_none() {
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush before browsing",
+                ));
+            }
+            let n = u64::from(store.next_doc_id());
+            // The exclusive floor in local id space. The first page carries
+            // no floor at all (proto3 cannot distinguish after = 0 from
+            // unset, so the request says which it is).
+            let start = if req.first_page || req.after < slot_offset {
+                0
+            } else {
+                (req.after - slot_offset + 1).min(n)
+            };
+            let doc_filter = crate::filter::DocFilter {
+                deleted: guard.live_docs.words(),
+                geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+                pred: req
+                    .filter
+                    .as_ref()
+                    .map(|f| store.resolve_filter(f))
+                    .transpose()?,
+                phrase: Vec::new(),
+            };
+            let cols = ShardNumericRead(store);
+            if let Some(sort) = &req.sort {
+                // Column-ordered browse: walk the FULL admitted set with a
+                // k-bounded heap. Exhaustive by construction, so the
+                // exactness certificate is trivial; per-shard exact top-k
+                // by key means the coordinator's merged union contains the
+                // global top-k (local rank <= global rank).
+                let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> =
+                    if let Some(ni) = store.numeric_index(&sort.column) {
+                        Box::new(move |doc| {
+                            store.numeric_value(ni, doc).map(|v| (f64_order_bits(v), v))
+                        })
+                    } else if let Some(ii) = store.integer_index(&sort.column) {
+                        Box::new(move |doc| {
+                            store
+                                .integer_value(ii, doc)
+                                .map(|v| (i64_order_bits(v), v as f64))
+                        })
+                    } else {
+                        // Unknown here; the coordinator's typo rule refuses
+                        // only when NO shard knows it.
+                        return Ok(Response::new(crate::pb::BrowseShardResponse {
+                            doc_ids: Vec::new(),
+                            geo_columns_known,
+                            filter_columns_known,
+                            sort_key_bits: Vec::new(),
+                            sort_keys: Vec::new(),
+                            sort_column_known: false,
+                        }));
+                    };
+                let boundary = (!req.first_page).then_some((req.after_key_bits, req.after));
+                // Max-heap keeping the k SMALLEST (adjusted-bits, id) pairs.
+                let mut heap: std::collections::BinaryHeap<(u64, u64, u64)> =
+                    std::collections::BinaryHeap::with_capacity(req.k as usize + 1);
+                for local in 0..n {
+                    let doc = local as u32;
+                    if !doc_filter.passes(doc, &cols) {
                         continue;
                     }
+                    // A document without a value has no honest position in
+                    // a column order: excluded, same stance as the filters.
+                    let Some((bits, value)) = key_of(doc) else {
+                        continue;
+                    };
+                    let adjusted = if sort.descending { !bits } else { bits };
+                    let id = slot_offset + local;
+                    if let Some(b) = boundary {
+                        if (adjusted, id) <= b {
+                            continue;
+                        }
+                    }
+                    heap.push((adjusted, id, value.to_bits()));
+                    if heap.len() > req.k as usize {
+                        heap.pop();
+                    }
                 }
-                heap.push((adjusted, id, value.to_bits()));
-                if heap.len() > req.k as usize {
-                    heap.pop();
+                let mut rows = heap.into_vec();
+                rows.sort_unstable();
+                let mut doc_ids = Vec::with_capacity(rows.len());
+                let mut sort_key_bits = Vec::with_capacity(rows.len());
+                let mut sort_keys = Vec::with_capacity(rows.len());
+                for (adjusted, id, value_bits) in rows {
+                    doc_ids.push(id);
+                    sort_key_bits.push(adjusted);
+                    sort_keys.push(f64::from_bits(value_bits));
+                }
+                return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    doc_ids,
+                    geo_columns_known,
+                    filter_columns_known,
+                    sort_key_bits,
+                    sort_keys,
+                    sort_column_known: true,
+                }));
+            }
+            let mut doc_ids = Vec::new();
+            for local in start..n {
+                if doc_filter.passes(local as u32, &cols) {
+                    doc_ids.push(slot_offset + local);
+                    if doc_ids.len() == req.k as usize {
+                        break;
+                    }
                 }
             }
-            let mut rows = heap.into_vec();
-            rows.sort_unstable();
-            let mut doc_ids = Vec::with_capacity(rows.len());
-            let mut sort_key_bits = Vec::with_capacity(rows.len());
-            let mut sort_keys = Vec::with_capacity(rows.len());
-            for (adjusted, id, value_bits) in rows {
-                doc_ids.push(id);
-                sort_key_bits.push(adjusted);
-                sort_keys.push(f64::from_bits(value_bits));
-            }
-            return Ok(Response::new(crate::pb::BrowseShardResponse {
+            Ok(Response::new(crate::pb::BrowseShardResponse {
                 doc_ids,
                 geo_columns_known,
                 filter_columns_known,
-                sort_key_bits,
-                sort_keys,
-                sort_column_known: true,
-            }));
-        }
-        let mut doc_ids = Vec::new();
-        for local in start..n {
-            if doc_filter.passes(local as u32, &cols) {
-                doc_ids.push(slot_offset + local);
-                if doc_ids.len() == req.k as usize {
-                    break;
-                }
-            }
-        }
-        Ok(Response::new(crate::pb::BrowseShardResponse {
-            doc_ids,
-            geo_columns_known,
-            filter_columns_known,
-            sort_key_bits: Vec::new(),
-            sort_keys: Vec::new(),
-            sort_column_known: req.sort.is_none(),
-        }))
+                sort_key_bits: Vec::new(),
+                sort_keys: Vec::new(),
+                sort_column_known: req.sort.is_none(),
+            }))
         })
         .await
     }
@@ -9256,37 +9257,37 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::FilterBitmapRequest>,
     ) -> Result<Response<crate::pb::FilterBitmapResponse>, Status> {
         crate::metrics::timed(Route::ResolveFilterBitmap, request, |request| async move {
-        let req = request.into_inner();
-        let geo_regions = validate_geo_filters(&req.geo_filters)?;
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let (geo_columns_known, filter_columns_known) =
-            filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
-        let label_count = guard
-            .bm25
-            .as_ref()
-            .map_or(0, |store| store.next_doc_id() as usize);
-        let (_, allow) = resolve_shard_filters(
-            guard.bm25.as_ref(),
-            guard.live_docs.words(),
-            label_count,
-            &req.geo_filters,
-            &geo_regions,
-            req.filter.as_ref(),
-        )?;
-        let allow = allow.unwrap_or_else(|| vec![true; label_count]);
-        let mut bits = vec![0u8; label_count.div_ceil(8)];
-        for (position, admitted) in allow.into_iter().enumerate() {
-            if admitted {
-                bits[position / 8] |= 1 << (position % 8);
+            let req = request.into_inner();
+            let geo_regions = validate_geo_filters(&req.geo_filters)?;
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let (geo_columns_known, filter_columns_known) =
+                filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+            let label_count = guard
+                .bm25
+                .as_ref()
+                .map_or(0, |store| store.next_doc_id() as usize);
+            let (_, allow) = resolve_shard_filters(
+                guard.bm25.as_ref(),
+                guard.live_docs.words(),
+                label_count,
+                &req.geo_filters,
+                &geo_regions,
+                req.filter.as_ref(),
+            )?;
+            let allow = allow.unwrap_or_else(|| vec![true; label_count]);
+            let mut bits = vec![0u8; label_count.div_ceil(8)];
+            for (position, admitted) in allow.into_iter().enumerate() {
+                if admitted {
+                    bits[position / 8] |= 1 << (position % 8);
+                }
             }
-        }
-        Ok(Response::new(crate::pb::FilterBitmapResponse {
-            base_label: self.config.slot_offset,
-            label_count: label_count as u64,
-            bits,
-            geo_columns_known,
-            filter_columns_known,
-        }))
+            Ok(Response::new(crate::pb::FilterBitmapResponse {
+                base_label: self.config.slot_offset,
+                label_count: label_count as u64,
+                bits,
+                geo_columns_known,
+                filter_columns_known,
+            }))
         })
         .await
     }
@@ -9358,301 +9359,301 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::AggregateShardRequest>,
     ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
         crate::metrics::timed(Route::AggregateShard, request, |request| async move {
-        let req = request.into_inner();
+            let req = request.into_inner();
             if req.aggregations.is_empty()
                 && req.histograms.is_empty()
                 && req.percentiles.is_empty()
             {
-            return Err(Status::invalid_argument(
-                "aggregate requires at least one aggregation, histogram, or percentile",
-            ));
-        }
-        let grouping = !req.group_by.is_empty();
-        let group_cap = req.max_groups as usize;
-        let geo_regions = validate_geo_filters(&req.geo_filters)?;
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let (geo_columns_known, filter_columns_known) =
-            filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
-        // Expression column leaves: aggregations first, then
-        // histograms, request order then depth-first — the projection
-        // typo contract.
-        let mut leaves = Vec::new();
-        for expr in req
-            .aggregations
-            .iter()
-            .filter_map(|a| a.expr.as_ref())
-            .chain(req.histograms.iter().filter_map(|h| h.expr.as_ref()))
-            .chain(req.percentiles.iter().filter_map(|p| p.expr.as_ref()))
-        {
-            crate::values::column_leaves(expr, &mut leaves);
-        }
-        let Some(store) = guard.bm25.as_ref() else {
-            // A document-less shard holds no values and no columns; its
-            // all-absent partials and all-false flags feed the merge
-            // and the typo rule like everywhere.
-            return Ok(Response::new(crate::pb::AggregateShardResponse {
-                partials: req
-                    .aggregations
-                    .iter()
-                    .map(|_| AggAcc::Absent.partial())
-                    .collect(),
-                matched: 0,
-                geo_columns_known,
-                filter_columns_known,
-                expr_leaves_known: vec![false; leaves.len()],
-                groups: Vec::new(),
-                ungrouped: 0,
-                group_column_known: false,
-                histograms: req
-                    .histograms
-                    .iter()
-                    .map(|_| crate::pb::ShardHistogram::default())
-                    .collect(),
-                percentile_partials: req
-                    .percentiles
-                    .iter()
-                    .map(|_| crate::pb::PercentilePartial {
-                        vtype: crate::pb::AggregateValueType::Absent as i32,
-                        ..Default::default()
-                    })
-                    .collect(),
-            }));
-        };
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before aggregating",
-            ));
-        }
-        let expr_leaves_known: Vec<bool> = leaves
-            .iter()
-            .map(|l| crate::values::leaf_known(l, store))
-            .collect();
-        let group_facet = grouping.then(|| store.facet_index(&req.group_by)).flatten();
-        let group_column_known = group_facet.is_some();
-        // Resolve every expression and admit its op against the
-        // resolved type BEFORE touching any document: a type conflict
-        // refuses the request, it never mis-aggregates.
-        let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType)> =
-            Vec::with_capacity(req.aggregations.len());
-        let mut totals: Vec<AggAcc> = Vec::with_capacity(req.aggregations.len());
-        for agg in &req.aggregations {
-            let op = agg_op_of(agg.op)?;
-            let expr = agg.expr.as_ref().ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "aggregation {:?} without an expression",
-                    agg.name
-                ))
-            })?;
-            let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
-                Status::invalid_argument(format!("aggregation {:?}: {}", agg.name, e.message()))
-            })?;
-            check_agg_type(&agg.name, op, vt)?;
-            totals.push(acc_of(vt));
-            exprs.push((rv, vt));
-        }
-        let mut hists: Vec<(
-            Option<crate::values::ResolvedValue>,
-            f64,
-            usize,
-            String,
-            HistAcc,
-        )> = Vec::with_capacity(req.histograms.len());
-        for h in &req.histograms {
-            if !(h.interval > 0.0 && h.interval.is_finite()) {
-                return Err(Status::internal(format!(
-                    "histogram {:?} arrived with an unvalidated interval",
-                    h.name
-                )));
+                return Err(Status::invalid_argument(
+                    "aggregate requires at least one aggregation, histogram, or percentile",
+                ));
             }
-            let expr = h.expr.as_ref().ok_or_else(|| {
+            let grouping = !req.group_by.is_empty();
+            let group_cap = req.max_groups as usize;
+            let geo_regions = validate_geo_filters(&req.geo_filters)?;
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let (geo_columns_known, filter_columns_known) =
+                filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+            // Expression column leaves: aggregations first, then
+            // histograms, request order then depth-first — the projection
+            // typo contract.
+            let mut leaves = Vec::new();
+            for expr in req
+                .aggregations
+                .iter()
+                .filter_map(|a| a.expr.as_ref())
+                .chain(req.histograms.iter().filter_map(|h| h.expr.as_ref()))
+                .chain(req.percentiles.iter().filter_map(|p| p.expr.as_ref()))
+            {
+                crate::values::column_leaves(expr, &mut leaves);
+            }
+            let Some(store) = guard.bm25.as_ref() else {
+                // A document-less shard holds no values and no columns; its
+                // all-absent partials and all-false flags feed the merge
+                // and the typo rule like everywhere.
+                return Ok(Response::new(crate::pb::AggregateShardResponse {
+                    partials: req
+                        .aggregations
+                        .iter()
+                        .map(|_| AggAcc::Absent.partial())
+                        .collect(),
+                    matched: 0,
+                    geo_columns_known,
+                    filter_columns_known,
+                    expr_leaves_known: vec![false; leaves.len()],
+                    groups: Vec::new(),
+                    ungrouped: 0,
+                    group_column_known: false,
+                    histograms: req
+                        .histograms
+                        .iter()
+                        .map(|_| crate::pb::ShardHistogram::default())
+                        .collect(),
+                    percentile_partials: req
+                        .percentiles
+                        .iter()
+                        .map(|_| crate::pb::PercentilePartial {
+                            vtype: crate::pb::AggregateValueType::Absent as i32,
+                            ..Default::default()
+                        })
+                        .collect(),
+                }));
+            };
+            if store.as_index().is_none() {
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush before aggregating",
+                ));
+            }
+            let expr_leaves_known: Vec<bool> = leaves
+                .iter()
+                .map(|l| crate::values::leaf_known(l, store))
+                .collect();
+            let group_facet = grouping.then(|| store.facet_index(&req.group_by)).flatten();
+            let group_column_known = group_facet.is_some();
+            // Resolve every expression and admit its op against the
+            // resolved type BEFORE touching any document: a type conflict
+            // refuses the request, it never mis-aggregates.
+            let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType)> =
+                Vec::with_capacity(req.aggregations.len());
+            let mut totals: Vec<AggAcc> = Vec::with_capacity(req.aggregations.len());
+            for agg in &req.aggregations {
+                let op = agg_op_of(agg.op)?;
+                let expr = agg.expr.as_ref().ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "aggregation {:?} without an expression",
+                        agg.name
+                    ))
+                })?;
+                let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
+                    Status::invalid_argument(format!("aggregation {:?}: {}", agg.name, e.message()))
+                })?;
+                check_agg_type(&agg.name, op, vt)?;
+                totals.push(acc_of(vt));
+                exprs.push((rv, vt));
+            }
+            let mut hists: Vec<(
+                Option<crate::values::ResolvedValue>,
+                f64,
+                usize,
+                String,
+                HistAcc,
+            )> = Vec::with_capacity(req.histograms.len());
+            for h in &req.histograms {
+                if !(h.interval > 0.0 && h.interval.is_finite()) {
+                    return Err(Status::internal(format!(
+                        "histogram {:?} arrived with an unvalidated interval",
+                        h.name
+                    )));
+                }
+                let expr = h.expr.as_ref().ok_or_else(|| {
                     Status::invalid_argument(format!(
                         "histogram {:?} without an expression",
                         h.name
                     ))
-            })?;
-            let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
-                Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
-            })?;
-            let rv = match vt {
-                crate::values::ValueType::Double => Some(rv),
-                crate::values::ValueType::Unknown => None,
-                crate::values::ValueType::Int => {
-                    return Err(Status::invalid_argument(format!(
-                        "histogram {:?} takes a double expression; convert explicitly \
+                })?;
+                let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
+                    Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
+                })?;
+                let rv = match vt {
+                    crate::values::ValueType::Double => Some(rv),
+                    crate::values::ValueType::Unknown => None,
+                    crate::values::ValueType::Int => {
+                        return Err(Status::invalid_argument(format!(
+                            "histogram {:?} takes a double expression; convert explicitly \
                          with double()",
-                        h.name
-                    )));
-                }
-                other => {
-                    return Err(Status::invalid_argument(format!(
-                        "histogram {:?} takes a double expression, not a {}",
-                        h.name,
-                        match other {
-                            crate::values::ValueType::Str => "string",
-                            _ => "boolean",
-                        }
-                    )));
-                }
-            };
-            hists.push((
-                rv,
-                h.interval,
-                h.max_buckets as usize,
-                h.name.clone(),
-                HistAcc::default(),
-            ));
-        }
-        let mut pcts: Vec<(Option<(crate::values::ResolvedValue, bool)>, PctAcc)> =
-            Vec::with_capacity(req.percentiles.len());
-        for spec in &req.percentiles {
+                            h.name
+                        )));
+                    }
+                    other => {
+                        return Err(Status::invalid_argument(format!(
+                            "histogram {:?} takes a double expression, not a {}",
+                            h.name,
+                            match other {
+                                crate::values::ValueType::Str => "string",
+                                _ => "boolean",
+                            }
+                        )));
+                    }
+                };
+                hists.push((
+                    rv,
+                    h.interval,
+                    h.max_buckets as usize,
+                    h.name.clone(),
+                    HistAcc::default(),
+                ));
+            }
+            let mut pcts: Vec<(Option<(crate::values::ResolvedValue, bool)>, PctAcc)> =
+                Vec::with_capacity(req.percentiles.len());
+            for spec in &req.percentiles {
                 let resolved =
                     resolve_rankable(store, spec.expr.as_ref(), &spec.name, "percentile")?;
-            pcts.push((resolved, PctAcc::default()));
-        }
-        let doc_filter = crate::filter::DocFilter {
-            deleted: guard.live_docs.words(),
-            geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-            pred: req
-                .filter
-                .as_ref()
-                .map(|f| store.resolve_filter(f))
-                .transpose()?,
-            phrase: Vec::new(),
-        };
-        let cols = ShardNumericRead(store);
-        let n = u64::from(store.next_doc_id());
-        let id_allowlist = req.restrict_doc_ids.then(|| {
-            req.doc_ids
-                .iter()
-                .filter_map(|id| id.checked_sub(self.config.slot_offset))
-                .filter_map(|local| u32::try_from(local).ok())
-                .collect::<std::collections::HashSet<_>>()
-        });
-        let mut matched = 0u64;
-        let mut ungrouped = 0u64;
-        // Group accumulators by facet ordinal; each holds (matched,
-        // one accumulator per aggregation).
-        let mut groups: std::collections::HashMap<u32, (u64, Vec<AggAcc>)> =
-            std::collections::HashMap::new();
-        // One pass in doc order: the fold orders themselves are part
-        // of the determinism contract (Neumaier and Welford both fold
-        // exactly this sequence on every run).
-        for local in 0..n {
-            let doc = local as u32;
-            if id_allowlist
-                .as_ref()
-                .is_some_and(|allowlist| !allowlist.contains(&doc))
-            {
-                continue;
+                pcts.push((resolved, PctAcc::default()));
             }
-            if !doc_filter.passes(doc, &cols) {
-                continue;
-            }
-            matched += 1;
-            let group = if grouping {
-                match group_facet.and_then(|fi| store.facet_ord(fi, doc)) {
-                    Some(ord) => {
-                        let n_groups = groups.len();
-                        let entry = groups.entry(ord).or_insert_with(|| {
-                            (0, exprs.iter().map(|(_, vt)| acc_of(*vt)).collect())
-                        });
-                        if entry.0 == 0 && n_groups == group_cap {
-                            return Err(Status::failed_precondition(format!(
-                                "group_by {:?} exceeds {group_cap} distinct values on \
-                                 one shard; tighten the filter or raise max_groups",
-                                req.group_by
-                            )));
-                        }
-                        entry.0 += 1;
-                        Some(entry)
-                    }
-                    None => {
-                        ungrouped += 1;
-                        None
-                    }
-                }
-            } else {
-                None
+            let doc_filter = crate::filter::DocFilter {
+                deleted: guard.live_docs.words(),
+                geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+                pred: req
+                    .filter
+                    .as_ref()
+                    .map(|f| store.resolve_filter(f))
+                    .transpose()?,
+                phrase: Vec::new(),
             };
-            let mut group_accs = group.map(|g| &mut g.1);
-            for (i, (rv, _)) in exprs.iter().enumerate() {
-                // Absent-typed totals imply an absent-typed group
-                // accumulator: the type is the expression's, not the
-                // group's.
-                if matches!(totals[i], AggAcc::Absent) {
+            let cols = ShardNumericRead(store);
+            let n = u64::from(store.next_doc_id());
+            let id_allowlist = req.restrict_doc_ids.then(|| {
+                req.doc_ids
+                    .iter()
+                    .filter_map(|id| id.checked_sub(self.config.slot_offset))
+                    .filter_map(|local| u32::try_from(local).ok())
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            let mut matched = 0u64;
+            let mut ungrouped = 0u64;
+            // Group accumulators by facet ordinal; each holds (matched,
+            // one accumulator per aggregation).
+            let mut groups: std::collections::HashMap<u32, (u64, Vec<AggAcc>)> =
+                std::collections::HashMap::new();
+            // One pass in doc order: the fold orders themselves are part
+            // of the determinism contract (Neumaier and Welford both fold
+            // exactly this sequence on every run).
+            for local in 0..n {
+                let doc = local as u32;
+                if id_allowlist
+                    .as_ref()
+                    .is_some_and(|allowlist| !allowlist.contains(&doc))
+                {
                     continue;
                 }
-                if let Some(v) = crate::values::eval(rv, doc, &cols) {
-                    totals[i].push(v);
-                    if let Some(accs) = group_accs.as_deref_mut() {
-                        accs[i].push(v);
+                if !doc_filter.passes(doc, &cols) {
+                    continue;
+                }
+                matched += 1;
+                let group = if grouping {
+                    match group_facet.and_then(|fi| store.facet_ord(fi, doc)) {
+                        Some(ord) => {
+                            let n_groups = groups.len();
+                            let entry = groups.entry(ord).or_insert_with(|| {
+                                (0, exprs.iter().map(|(_, vt)| acc_of(*vt)).collect())
+                            });
+                            if entry.0 == 0 && n_groups == group_cap {
+                                return Err(Status::failed_precondition(format!(
+                                    "group_by {:?} exceeds {group_cap} distinct values on \
+                                 one shard; tighten the filter or raise max_groups",
+                                    req.group_by
+                                )));
+                            }
+                            entry.0 += 1;
+                            Some(entry)
+                        }
+                        None => {
+                            ungrouped += 1;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut group_accs = group.map(|g| &mut g.1);
+                for (i, (rv, _)) in exprs.iter().enumerate() {
+                    // Absent-typed totals imply an absent-typed group
+                    // accumulator: the type is the expression's, not the
+                    // group's.
+                    if matches!(totals[i], AggAcc::Absent) {
+                        continue;
+                    }
+                    if let Some(v) = crate::values::eval(rv, doc, &cols) {
+                        totals[i].push(v);
+                        if let Some(accs) = group_accs.as_deref_mut() {
+                            accs[i].push(v);
+                        }
                     }
                 }
-            }
-            for (rv, interval, cap, name, acc) in hists.iter_mut() {
-                let Some(rv) = rv else { continue };
+                for (rv, interval, cap, name, acc) in hists.iter_mut() {
+                    let Some(rv) = rv else { continue };
                     if let Some(crate::values::Val::Double(x)) = crate::values::eval(rv, doc, &cols)
                     {
-                    acc.push(x, *interval, *cap, name)?;
-                }
-            }
-            for (resolved, acc) in pcts.iter_mut() {
-                let Some((rv, int_typed)) = resolved else {
-                    continue;
-                };
-                if let Some(v) = crate::values::eval(rv, doc, &cols) {
-                    acc.push(rankable_bits(v, *int_typed));
-                }
-            }
-        }
-        let mut group_rows: Vec<(u32, u64, Vec<AggAcc>)> = groups
-            .into_iter()
-            .map(|(ord, (m, accs))| (ord, m, accs))
-            .collect();
-        group_rows.sort_unstable_by_key(|r| r.0);
-        let groups = group_facet
-            .map(|fi| {
-                group_rows
-                    .iter()
-                    .map(|(ord, m, accs)| crate::pb::AggregateShardGroup {
-                        value: store.facet_value(fi, *ord).to_string(),
-                        matched: *m,
-                        partials: accs.iter().map(AggAcc::partial).collect(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Response::new(crate::pb::AggregateShardResponse {
-            partials: totals.iter().map(AggAcc::partial).collect(),
-            matched,
-            geo_columns_known,
-            filter_columns_known,
-            expr_leaves_known,
-            groups,
-            ungrouped,
-            group_column_known,
-            histograms: hists
-                .iter()
-                .map(|(_, _, _, _, acc)| acc.response())
-                .collect(),
-            percentile_partials: pcts
-                .iter()
-                .map(|(resolved, acc)| {
-                    use crate::pb::AggregateValueType as T;
-                    crate::pb::PercentilePartial {
-                        vtype: match resolved {
-                            None => T::Absent as i32,
-                            Some((_, true)) => T::Int as i32,
-                            Some((_, false)) => T::Double as i32,
-                        },
-                        present: acc.present,
-                        unrankable: acc.unrankable,
-                        min_bits: acc.min_bits,
-                        max_bits: acc.max_bits,
+                        acc.push(x, *interval, *cap, name)?;
                     }
+                }
+                for (resolved, acc) in pcts.iter_mut() {
+                    let Some((rv, int_typed)) = resolved else {
+                        continue;
+                    };
+                    if let Some(v) = crate::values::eval(rv, doc, &cols) {
+                        acc.push(rankable_bits(v, *int_typed));
+                    }
+                }
+            }
+            let mut group_rows: Vec<(u32, u64, Vec<AggAcc>)> = groups
+                .into_iter()
+                .map(|(ord, (m, accs))| (ord, m, accs))
+                .collect();
+            group_rows.sort_unstable_by_key(|r| r.0);
+            let groups = group_facet
+                .map(|fi| {
+                    group_rows
+                        .iter()
+                        .map(|(ord, m, accs)| crate::pb::AggregateShardGroup {
+                            value: store.facet_value(fi, *ord).to_string(),
+                            matched: *m,
+                            partials: accs.iter().map(AggAcc::partial).collect(),
+                        })
+                        .collect()
                 })
-                .collect(),
-        }))
+                .unwrap_or_default();
+            Ok(Response::new(crate::pb::AggregateShardResponse {
+                partials: totals.iter().map(AggAcc::partial).collect(),
+                matched,
+                geo_columns_known,
+                filter_columns_known,
+                expr_leaves_known,
+                groups,
+                ungrouped,
+                group_column_known,
+                histograms: hists
+                    .iter()
+                    .map(|(_, _, _, _, acc)| acc.response())
+                    .collect(),
+                percentile_partials: pcts
+                    .iter()
+                    .map(|(resolved, acc)| {
+                        use crate::pb::AggregateValueType as T;
+                        crate::pb::PercentilePartial {
+                            vtype: match resolved {
+                                None => T::Absent as i32,
+                                Some((_, true)) => T::Int as i32,
+                                Some((_, false)) => T::Double as i32,
+                            },
+                            present: acc.present,
+                            unrankable: acc.unrankable,
+                            min_bits: acc.min_bits,
+                            max_bits: acc.max_bits,
+                        }
+                    })
+                    .collect(),
+            }))
         })
         .await
     }
@@ -9662,85 +9663,85 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::QuantileCountsRequest>,
     ) -> Result<Response<crate::pb::QuantileCountsResponse>, Status> {
         crate::metrics::timed(Route::QuantileCounts, request, |request| async move {
-        let req = request.into_inner();
-        let geo_regions = validate_geo_filters(&req.geo_filters)?;
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let Some(store) = guard.bm25.as_ref() else {
-            return Ok(Response::new(crate::pb::QuantileCountsResponse {
-                counts: vec![0; req.targets.len()],
-            }));
-        };
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before aggregating",
-            ));
-        }
-        let mut exprs = Vec::with_capacity(req.exprs.len());
-        for spec in &req.exprs {
-            exprs.push(resolve_rankable(
-                store,
-                spec.expr.as_ref(),
-                &spec.name,
-                "percentile",
-            )?);
-        }
-        for t in &req.targets {
-            if t.expr_index as usize >= exprs.len() {
-                return Err(Status::internal(
-                    "quantile target refers past the expression list",
+            let req = request.into_inner();
+            let geo_regions = validate_geo_filters(&req.geo_filters)?;
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let Some(store) = guard.bm25.as_ref() else {
+                return Ok(Response::new(crate::pb::QuantileCountsResponse {
+                    counts: vec![0; req.targets.len()],
+                }));
+            };
+            if store.as_index().is_none() {
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush before aggregating",
                 ));
             }
-        }
-        let doc_filter = crate::filter::DocFilter {
-            deleted: guard.live_docs.words(),
-            geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-            pred: req
-                .filter
-                .as_ref()
-                .map(|f| store.resolve_filter(f))
-                .transpose()?,
-            phrase: Vec::new(),
-        };
-        let cols = ShardNumericRead(store);
-        let n = u64::from(store.next_doc_id());
-        let id_allowlist = req.restrict_doc_ids.then(|| {
-            req.doc_ids
-                .iter()
-                .filter_map(|id| id.checked_sub(self.config.slot_offset))
-                .filter_map(|local| u32::try_from(local).ok())
-                .collect::<std::collections::HashSet<_>>()
-        });
-        let mut counts = vec![0u64; req.targets.len()];
-        let mut bits_of = vec![None; exprs.len()];
-        // One admitted-set pass per round: each expression evaluates
-        // once per document, every target reads the cached bits.
-        for local in 0..n {
-            let doc = local as u32;
-            if id_allowlist
-                .as_ref()
-                .is_some_and(|allowlist| !allowlist.contains(&doc))
-            {
-                continue;
+            let mut exprs = Vec::with_capacity(req.exprs.len());
+            for spec in &req.exprs {
+                exprs.push(resolve_rankable(
+                    store,
+                    spec.expr.as_ref(),
+                    &spec.name,
+                    "percentile",
+                )?);
             }
-            if !doc_filter.passes(doc, &cols) {
-                continue;
+            for t in &req.targets {
+                if t.expr_index as usize >= exprs.len() {
+                    return Err(Status::internal(
+                        "quantile target refers past the expression list",
+                    ));
+                }
             }
-            for (slot, resolved) in bits_of.iter_mut().zip(&exprs) {
-                *slot = match resolved {
-                    Some((rv, int_typed)) => crate::values::eval(rv, doc, &cols)
-                        .and_then(|v| rankable_bits(v, *int_typed)),
-                    None => None,
-                };
-            }
-            for (count, t) in counts.iter_mut().zip(&req.targets) {
-                if let Some(bits) = bits_of[t.expr_index as usize] {
-                    if bits <= t.threshold_bits {
-                        *count += 1;
+            let doc_filter = crate::filter::DocFilter {
+                deleted: guard.live_docs.words(),
+                geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+                pred: req
+                    .filter
+                    .as_ref()
+                    .map(|f| store.resolve_filter(f))
+                    .transpose()?,
+                phrase: Vec::new(),
+            };
+            let cols = ShardNumericRead(store);
+            let n = u64::from(store.next_doc_id());
+            let id_allowlist = req.restrict_doc_ids.then(|| {
+                req.doc_ids
+                    .iter()
+                    .filter_map(|id| id.checked_sub(self.config.slot_offset))
+                    .filter_map(|local| u32::try_from(local).ok())
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            let mut counts = vec![0u64; req.targets.len()];
+            let mut bits_of = vec![None; exprs.len()];
+            // One admitted-set pass per round: each expression evaluates
+            // once per document, every target reads the cached bits.
+            for local in 0..n {
+                let doc = local as u32;
+                if id_allowlist
+                    .as_ref()
+                    .is_some_and(|allowlist| !allowlist.contains(&doc))
+                {
+                    continue;
+                }
+                if !doc_filter.passes(doc, &cols) {
+                    continue;
+                }
+                for (slot, resolved) in bits_of.iter_mut().zip(&exprs) {
+                    *slot = match resolved {
+                        Some((rv, int_typed)) => crate::values::eval(rv, doc, &cols)
+                            .and_then(|v| rankable_bits(v, *int_typed)),
+                        None => None,
+                    };
+                }
+                for (count, t) in counts.iter_mut().zip(&req.targets) {
+                    if let Some(bits) = bits_of[t.expr_index as usize] {
+                        if bits <= t.threshold_bits {
+                            *count += 1;
+                        }
                     }
                 }
             }
-        }
-        Ok(Response::new(crate::pb::QuantileCountsResponse { counts }))
+            Ok(Response::new(crate::pb::QuantileCountsResponse { counts }))
         })
         .await
     }
@@ -9750,120 +9751,120 @@ impl NodeService for NodeServiceImpl {
         request: Request<ReadWalRequest>,
     ) -> Result<Response<Self::ReadWalStream>, Status> {
         crate::metrics::timed_stream(Route::ReadWal, request, |request| async move {
-        let req = request.into_inner();
-        let (generation, high_watermark, records, prefix_health) = loop {
-            let needs_flush = self
-                .state
-                .read()
-                .expect("shard state lock poisoned")
-                .wal
-                .as_ref()
-                .is_some_and(WalWriter::is_dirty);
-            if needs_flush {
-                let service = self.clone();
-                tokio::task::spawn_blocking(move || service.flush_index())
-                    .await
-                    .map_err(|error| {
-                        Status::internal(format!("WAL flush task failed: {error}"))
-                    })??;
-            }
-            let snapshot = {
-                let guard = self.state.read().expect("shard state lock poisoned");
-                let wal = guard.wal.as_ref().ok_or_else(|| {
-                    Status::failed_precondition(
-                        "this shard has no WAL; live catch-up is unavailable",
-                    )
-                })?;
-                if req.generation != wal.generation() {
-                    return Err(Status::failed_precondition(format!(
-                        "WAL generation mismatch: requested {}, live {}",
-                        req.generation,
-                        wal.generation()
-                    )));
+            let req = request.into_inner();
+            let (generation, high_watermark, records, prefix_health) = loop {
+                let needs_flush = self
+                    .state
+                    .read()
+                    .expect("shard state lock poisoned")
+                    .wal
+                    .as_ref()
+                    .is_some_and(WalWriter::is_dirty);
+                if needs_flush {
+                    let service = self.clone();
+                    tokio::task::spawn_blocking(move || service.flush_index())
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!("WAL flush task failed: {error}"))
+                        })??;
                 }
-                if req.after_clock > wal.high_watermark() {
-                    return Err(Status::invalid_argument(format!(
-                        "after_clock {} is beyond WAL high watermark {}",
-                        req.after_clock,
-                        wal.high_watermark()
-                    )));
-                }
+                let snapshot = {
+                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let wal = guard.wal.as_ref().ok_or_else(|| {
+                        Status::failed_precondition(
+                            "this shard has no WAL; live catch-up is unavailable",
+                        )
+                    })?;
+                    if req.generation != wal.generation() {
+                        return Err(Status::failed_precondition(format!(
+                            "WAL generation mismatch: requested {}, live {}",
+                            req.generation,
+                            wal.generation()
+                        )));
+                    }
+                    if req.after_clock > wal.high_watermark() {
+                        return Err(Status::invalid_argument(format!(
+                            "after_clock {} is beyond WAL high watermark {}",
+                            req.after_clock,
+                            wal.high_watermark()
+                        )));
+                    }
                     let records =
                         wal::read_clocked_records(wal.dir(), req.after_clock).map_err(|error| {
                             Status::failed_precondition(format!("read WAL: {error}"))
                         })?;
-                let num_vectors = guard.index.as_ref().map_or(0, |index| index.len() as u64);
-                let document_slots = guard
-                    .bm25
-                    .as_ref()
-                    .map_or(0, |shard| u64::from(shard.next_doc_id()));
-                let physical_docs = physical_rows(&guard);
-                let deleted_docs = guard.live_docs.deleted_count().min(physical_docs);
-                let scoring_fingerprint = guard
-                    .index
-                    .as_ref()
-                    .map_or_else(String::new, |index| index.descriptor().scoring_fingerprint);
-                (
-                    wal.generation(),
-                    wal.high_watermark(),
-                    records,
+                    let num_vectors = guard.index.as_ref().map_or(0, |index| index.len() as u64);
+                    let document_slots = guard
+                        .bm25
+                        .as_ref()
+                        .map_or(0, |shard| u64::from(shard.next_doc_id()));
+                    let physical_docs = physical_rows(&guard);
+                    let deleted_docs = guard.live_docs.deleted_count().min(physical_docs);
+                    let scoring_fingerprint = guard
+                        .index
+                        .as_ref()
+                        .map_or_else(String::new, |index| index.descriptor().scoring_fingerprint);
                     (
-                        num_vectors,
-                        document_slots,
-                        physical_docs - deleted_docs,
-                        deleted_docs,
-                        scoring_fingerprint,
-                    ),
-                )
+                        wal.generation(),
+                        wal.high_watermark(),
+                        records,
+                        (
+                            num_vectors,
+                            document_slots,
+                            physical_docs - deleted_docs,
+                            deleted_docs,
+                            scoring_fingerprint,
+                        ),
+                    )
+                };
+                // A writer can append after the dirty check and before the read
+                // lock. Its buffered bytes then trail the in-memory watermark.
+                // Never advertise that watermark: retry, which sees dirty=true
+                // and makes the whole index/WAL prefix durable first.
+                if snapshot.1 == req.after_clock
+                    || snapshot
+                        .2
+                        .last()
+                        .is_some_and(|record| record.clock == snapshot.1)
+                {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
             };
-            // A writer can append after the dirty check and before the read
-            // lock. Its buffered bytes then trail the in-memory watermark.
-            // Never advertise that watermark: retry, which sees dirty=true
-            // and makes the whole index/WAL prefix durable first.
-            if snapshot.1 == req.after_clock
-                || snapshot
-                    .2
-                    .last()
-                    .is_some_and(|record| record.clock == snapshot.1)
-            {
-                break snapshot;
-            }
-            tokio::task::yield_now().await;
-        };
-        let (tx, rx) = mpsc::channel(64);
-        let slot_offset = self.config.slot_offset;
-        tokio::spawn(async move {
-            for record in records {
-                if tx
+            let (tx, rx) = mpsc::channel(64);
+            let slot_offset = self.config.slot_offset;
+            tokio::spawn(async move {
+                for record in records {
+                    if tx
+                        .send(Ok(ReadWalResponse {
+                            generation,
+                            high_watermark,
+                            record: prost::Message::encode_to_vec(&record),
+                            completed: false,
+                            ..Default::default()
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = tx
                     .send(Ok(ReadWalResponse {
                         generation,
                         high_watermark,
-                        record: prost::Message::encode_to_vec(&record),
-                        completed: false,
-                        ..Default::default()
+                        record: Vec::new(),
+                        completed: true,
+                        num_vectors: prefix_health.0,
+                        document_slots: prefix_health.1,
+                        live_docs: prefix_health.2,
+                        deleted_docs: prefix_health.3,
+                        scoring_fingerprint: prefix_health.4,
+                        slot_offset,
                     }))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = tx
-                .send(Ok(ReadWalResponse {
-                    generation,
-                    high_watermark,
-                    record: Vec::new(),
-                    completed: true,
-                    num_vectors: prefix_health.0,
-                    document_slots: prefix_health.1,
-                    live_docs: prefix_health.2,
-                    deleted_docs: prefix_health.3,
-                    scoring_fingerprint: prefix_health.4,
-                    slot_offset,
-                }))
-                .await;
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+                    .await;
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
         })
         .await
     }
@@ -9896,12 +9897,12 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::CompactShardRequest>,
     ) -> Result<Response<crate::pb::CompactShardResponse>, Status> {
         crate::metrics::timed(Route::CompactShard, request, |request| async move {
-        let req = request.into_inner();
-        let service = self.clone();
-        tokio::task::spawn_blocking(move || service.compact_shard(&req))
-            .await
-            .map_err(|e| Status::internal(format!("compaction task failed: {e}")))?
-            .map(Response::new)
+            let req = request.into_inner();
+            let service = self.clone();
+            tokio::task::spawn_blocking(move || service.compact_shard(&req))
+                .await
+                .map_err(|e| Status::internal(format!("compaction task failed: {e}")))?
+                .map(Response::new)
         })
         .await
     }
@@ -9995,279 +9996,279 @@ impl NodeService for NodeServiceImpl {
         request: Request<Streaming<StreamSearchRequest>>,
     ) -> Result<Response<Self::StreamSearchStream>, Status> {
         crate::metrics::timed_stream(Route::StreamSearch, request, |request| async move {
-        let mut inbound = request.into_inner();
-        let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
-        let state = self.state.clone();
-        let slot_offset = self.config.slot_offset;
-        let stream_signals = Arc::clone(&self.stream_signals);
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
+            let state = self.state.clone();
+            let slot_offset = self.config.slot_offset;
+            let stream_signals = Arc::clone(&self.stream_signals);
 
-        tokio::spawn(async move {
-            // Protocol: the first message must be Start.
-            let start = match inbound.message().await {
-                Ok(Some(StreamSearchRequest {
-                    payload: Some(stream_search_request::Payload::Start(start)),
-                })) => start,
-                Ok(_) => {
+            tokio::spawn(async move {
+                // Protocol: the first message must be Start.
+                let start = match inbound.message().await {
+                    Ok(Some(StreamSearchRequest {
+                        payload: Some(stream_search_request::Payload::Start(start)),
+                    })) => start,
+                    Ok(_) => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "first StreamSearchRequest must be StartStreamSearch",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                if start.initial_floor.is_some_and(f32::is_nan) {
                     let _ = tx
                         .send(Err(Status::invalid_argument(
-                            "first StreamSearchRequest must be StartStreamSearch",
+                            "initial_floor must not be NaN",
                         )))
                         .await;
                     return;
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
+                // Shape-only filter validation before any scan work, the
+                // same order the lexical routes use.
+                let geo_regions = match validate_geo_filters(&start.geo_filters) {
+                    Ok(regions) => regions,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                if let Some(f) = start.filter.as_ref() {
+                    if let Err(e) = crate::filter::validate_filter(f) {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
                 }
-            };
-            if start.initial_floor.is_some_and(f32::is_nan) {
-                let _ = tx
-                    .send(Err(Status::invalid_argument(
-                        "initial_floor must not be NaN",
-                    )))
-                    .await;
-                return;
-            }
-            // Shape-only filter validation before any scan work, the
-            // same order the lexical routes use.
-            let geo_regions = match validate_geo_filters(&start.geo_filters) {
-                Ok(regions) => regions,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-            if let Some(f) = start.filter.as_ref() {
-                if let Err(e) = crate::filter::validate_filter(f) {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            }
 
-            // Floor raises and cancellation fold into one stream state that
-            // the blocking scan polls before every chunk. The gRPC request
-            // stream is authoritative; UDP is only a fast lossy duplicate.
-            let signals = Arc::new(StreamSignals::new(
-                start.initial_floor.unwrap_or(f32::NEG_INFINITY),
-            ));
-            let udp_token = (start.floor_token != 0).then_some(start.floor_token);
-            if let Some(token) = udp_token {
-                stream_signals
-                    .lock()
-                    .expect("stream signal registry poisoned")
-                    .insert(token, Arc::clone(&signals));
-            }
-            let pump_signals = Arc::clone(&signals);
-            tokio::spawn(async move {
-                loop {
-                    match inbound.message().await {
-                        Ok(Some(StreamSearchRequest {
-                            payload: Some(stream_search_request::Payload::FloorUpdate(u)),
-                        })) => raise_floor_cell(&pump_signals.floor, u.floor),
-                        Ok(Some(StreamSearchRequest {
-                            payload: Some(stream_search_request::Payload::Stop(_)),
-                        })) => {
-                            pump_signals
-                                .cancelled
-                                .store(true, std::sync::atomic::Ordering::Release);
-                            break;
+                // Floor raises and cancellation fold into one stream state that
+                // the blocking scan polls before every chunk. The gRPC request
+                // stream is authoritative; UDP is only a fast lossy duplicate.
+                let signals = Arc::new(StreamSignals::new(
+                    start.initial_floor.unwrap_or(f32::NEG_INFINITY),
+                ));
+                let udp_token = (start.floor_token != 0).then_some(start.floor_token);
+                if let Some(token) = udp_token {
+                    stream_signals
+                        .lock()
+                        .expect("stream signal registry poisoned")
+                        .insert(token, Arc::clone(&signals));
+                }
+                let pump_signals = Arc::clone(&signals);
+                tokio::spawn(async move {
+                    loop {
+                        match inbound.message().await {
+                            Ok(Some(StreamSearchRequest {
+                                payload: Some(stream_search_request::Payload::FloorUpdate(u)),
+                            })) => raise_floor_cell(&pump_signals.floor, u.floor),
+                            Ok(Some(StreamSearchRequest {
+                                payload: Some(stream_search_request::Payload::Stop(_)),
+                            })) => {
+                                pump_signals
+                                    .cancelled
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                                break;
+                            }
+                            // Duplicate Start or empty payload: ignore.
+                            Ok(Some(_)) => {}
+                            // Client closed or the stream broke: no more
+                            // raises can arrive; the scan finishes (or hits
+                            // the dead response channel) on its own.
+                            Ok(None) | Err(_) => break,
                         }
-                        // Duplicate Start or empty payload: ignore.
-                        Ok(Some(_)) => {}
-                        // Client closed or the stream broke: no more
-                        // raises can arrive; the scan finishes (or hits
-                        // the dead response channel) on its own.
-                        Ok(None) | Err(_) => break,
+                    }
+                });
+
+                let scan_tx = tx.clone();
+                let scan_signals = Arc::clone(&signals);
+                let scan =
+                    tokio::task::spawn_blocking(move || -> Result<StreamSearchSummary, Status> {
+                        // Document mode: resolve each emitted slot's parent.
+                        // parent_map takes its own locks (read to build,
+                        // write to cache), so it runs before the scan's read
+                        // guard is taken, exactly as in the bidi collapse
+                        // path.
+                        let parents = if start.collapse_parents {
+                            let n = {
+                                let guard = state.read().expect("shard state lock poisoned");
+                                guard.index.as_ref().map_or(0, |index| index.len())
+                            };
+                            Some(Self::parent_map(&state, slot_offset, n))
+                        } else {
+                            None
+                        };
+                        let guard = state.read().expect("shard state lock poisoned");
+                        let index = guard.index.as_ref().ok_or_else(|| {
+                            Status::failed_precondition(
+                                "shard has no index yet (set calibration or add vectors)",
+                            )
+                        })?;
+                        let dim = index
+                            .dim_opt()
+                            .ok_or_else(|| Status::failed_precondition("index has no vectors"))?;
+                        if start.vector.len() != dim {
+                            return Err(Status::invalid_argument(format!(
+                                "query vector has dim {}, index expects {dim}",
+                                start.vector.len()
+                            )));
+                        }
+                        if let Some((_, coord, value)) =
+                            first_invalid_coordinate(&start.vector, dim)
+                        {
+                            return Err(Status::invalid_argument(format!(
+                                "query coordinate {coord} is invalid: {value}"
+                            )));
+                        }
+                        if let Some(p) = parents.as_ref() {
+                            if p.len() != index.len() {
+                                return Err(Status::aborted(
+                                    "shard grew between setup and scan; retry",
+                                ));
+                            }
+                        }
+                        let scoring_fingerprint = index.descriptor().scoring_fingerprint;
+                        if scoring_fingerprint.is_empty() {
+                            return Err(Status::failed_precondition(
+                                "vector backend has no scoring fingerprint",
+                            ));
+                        }
+
+                        // The request's filters as a slot allowlist, resolved
+                        // under this scan's read guard so columns and index
+                        // are one snapshot. The streaming engine emits every
+                        // live slot at or above the floor; with an allowlist
+                        // "live" means "survived the filters", so the
+                        // completion certificate covers the filtered corpus
+                        // and means exactly what it meant before.
+                        let (_, allow) = resolve_shard_filters(
+                            guard.bm25.as_ref(),
+                            guard.live_docs.words(),
+                            index.len(),
+                            &start.geo_filters,
+                            &geo_regions,
+                            start.filter.as_ref(),
+                        )?;
+                        let (geo_columns_known, filter_columns_known) = filter_known_flags(
+                            guard.bm25.as_ref(),
+                            &start.geo_filters,
+                            start.filter.as_ref(),
+                        );
+
+                        let mut options = VectorSearchOptions::new();
+                        if let Some(a) = allow.as_deref() {
+                            options = options.with_mask(a);
+                        }
+                        let mut floor_now = f32::NEG_INFINITY;
+                        if let Some(f) = start.initial_floor {
+                            options = options.with_initial_threshold(f);
+                            floor_now = f;
+                        }
+                        let mut raises = 0u64;
+                        let stride = if parents.is_some() { 20 } else { 12 };
+                        let summary = index
+                            .try_search_streaming_controlled(
+                                &start.vector,
+                                options,
+                                |batch| {
+                                    // Pack the batch as fixed-stride LE records
+                                    // (u64 global id, f32 score, and in document
+                                    // mode the slot's u64 parent), fused into the
+                                    // slot-to-global-id rebase — one pass, no
+                                    // per-hit messages. Real emissions only
+                                    // carry live slots; a negative would be an
+                                    // engine contract break, dropped rather
+                                    // than wrapped into a bogus global id.
+                                    let mut hits: Vec<u8> =
+                                        Vec::with_capacity(stride * batch.slots.len());
+                                    for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
+                                        if slot < 0 {
+                                            continue;
+                                        }
+                                        hits.extend_from_slice(
+                                            &(slot_offset + slot as u64).to_le_bytes(),
+                                        );
+                                        hits.extend_from_slice(&score.to_le_bytes());
+                                        if let Some(p) = parents.as_deref() {
+                                            hits.extend_from_slice(&p[slot as usize].to_le_bytes());
+                                        }
+                                    }
+                                    let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
+                                        payload: Some(stream_search_response::Payload::Batch(
+                                            StreamSearchBatch { hits },
+                                        )),
+                                    }));
+                                    if sent.is_err() {
+                                        VectorStreamControl::Stop
+                                    } else {
+                                        VectorStreamControl::Continue
+                                    }
+                                },
+                                || {
+                                    if scan_signals
+                                        .cancelled
+                                        .load(std::sync::atomic::Ordering::Acquire)
+                                    {
+                                        return VectorStreamControl::Stop;
+                                    }
+                                    let f = f32::from_bits(
+                                        scan_signals
+                                            .floor
+                                            .load(std::sync::atomic::Ordering::Acquire),
+                                    );
+                                    if f > floor_now {
+                                        floor_now = f;
+                                        raises += 1;
+                                        VectorStreamControl::RaiseFloor(f)
+                                    } else {
+                                        VectorStreamControl::Continue
+                                    }
+                                },
+                            )
+                            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                        Ok(StreamSearchSummary {
+                            completed: summary.completed
+                                && !scan_signals
+                                    .cancelled
+                                    .load(std::sync::atomic::Ordering::Acquire),
+                            emitted: summary.emitted as u64,
+                            blocks_scanned: summary.units_scanned as u64,
+                            floor_raises_applied: raises,
+                            geo_columns_known,
+                            filter_columns_known,
+                            scoring_fingerprint,
+                        })
+                    });
+                let outcome = scan.await;
+                if let Some(token) = udp_token {
+                    stream_signals
+                        .lock()
+                        .expect("stream signal registry poisoned")
+                        .remove(&token);
+                }
+                match outcome {
+                    Ok(Ok(summary)) => {
+                        let _ = tx
+                            .send(Ok(StreamSearchResponse {
+                                payload: Some(stream_search_response::Payload::Summary(summary)),
+                            }))
+                            .await;
+                    }
+                    Ok(Err(status)) => {
+                        let _ = tx.send(Err(status)).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("stream scan panicked: {e}"))))
+                            .await;
                     }
                 }
             });
 
-            let scan_tx = tx.clone();
-            let scan_signals = Arc::clone(&signals);
-            let scan =
-                tokio::task::spawn_blocking(move || -> Result<StreamSearchSummary, Status> {
-                    // Document mode: resolve each emitted slot's parent.
-                    // parent_map takes its own locks (read to build,
-                    // write to cache), so it runs before the scan's read
-                    // guard is taken, exactly as in the bidi collapse
-                    // path.
-                    let parents = if start.collapse_parents {
-                        let n = {
-                            let guard = state.read().expect("shard state lock poisoned");
-                            guard.index.as_ref().map_or(0, |index| index.len())
-                        };
-                        Some(Self::parent_map(&state, slot_offset, n))
-                    } else {
-                        None
-                    };
-                    let guard = state.read().expect("shard state lock poisoned");
-                    let index = guard.index.as_ref().ok_or_else(|| {
-                        Status::failed_precondition(
-                            "shard has no index yet (set calibration or add vectors)",
-                        )
-                    })?;
-                    let dim = index
-                        .dim_opt()
-                        .ok_or_else(|| Status::failed_precondition("index has no vectors"))?;
-                    if start.vector.len() != dim {
-                        return Err(Status::invalid_argument(format!(
-                            "query vector has dim {}, index expects {dim}",
-                            start.vector.len()
-                        )));
-                    }
-                        if let Some((_, coord, value)) =
-                            first_invalid_coordinate(&start.vector, dim)
-                        {
-                        return Err(Status::invalid_argument(format!(
-                            "query coordinate {coord} is invalid: {value}"
-                        )));
-                    }
-                    if let Some(p) = parents.as_ref() {
-                        if p.len() != index.len() {
-                            return Err(Status::aborted(
-                                "shard grew between setup and scan; retry",
-                            ));
-                        }
-                    }
-                    let scoring_fingerprint = index.descriptor().scoring_fingerprint;
-                    if scoring_fingerprint.is_empty() {
-                        return Err(Status::failed_precondition(
-                            "vector backend has no scoring fingerprint",
-                        ));
-                    }
-
-                    // The request's filters as a slot allowlist, resolved
-                    // under this scan's read guard so columns and index
-                    // are one snapshot. The streaming engine emits every
-                    // live slot at or above the floor; with an allowlist
-                    // "live" means "survived the filters", so the
-                    // completion certificate covers the filtered corpus
-                    // and means exactly what it meant before.
-                    let (_, allow) = resolve_shard_filters(
-                        guard.bm25.as_ref(),
-                        guard.live_docs.words(),
-                        index.len(),
-                        &start.geo_filters,
-                        &geo_regions,
-                        start.filter.as_ref(),
-                    )?;
-                    let (geo_columns_known, filter_columns_known) = filter_known_flags(
-                        guard.bm25.as_ref(),
-                        &start.geo_filters,
-                        start.filter.as_ref(),
-                    );
-
-                    let mut options = VectorSearchOptions::new();
-                    if let Some(a) = allow.as_deref() {
-                        options = options.with_mask(a);
-                    }
-                    let mut floor_now = f32::NEG_INFINITY;
-                    if let Some(f) = start.initial_floor {
-                        options = options.with_initial_threshold(f);
-                        floor_now = f;
-                    }
-                    let mut raises = 0u64;
-                    let stride = if parents.is_some() { 20 } else { 12 };
-                    let summary = index
-                        .try_search_streaming_controlled(
-                            &start.vector,
-                            options,
-                            |batch| {
-                                // Pack the batch as fixed-stride LE records
-                                // (u64 global id, f32 score, and in document
-                                // mode the slot's u64 parent), fused into the
-                                // slot-to-global-id rebase — one pass, no
-                                // per-hit messages. Real emissions only
-                                // carry live slots; a negative would be an
-                                // engine contract break, dropped rather
-                                // than wrapped into a bogus global id.
-                                let mut hits: Vec<u8> =
-                                    Vec::with_capacity(stride * batch.slots.len());
-                                for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
-                                    if slot < 0 {
-                                        continue;
-                                    }
-                                    hits.extend_from_slice(
-                                        &(slot_offset + slot as u64).to_le_bytes(),
-                                    );
-                                    hits.extend_from_slice(&score.to_le_bytes());
-                                    if let Some(p) = parents.as_deref() {
-                                        hits.extend_from_slice(&p[slot as usize].to_le_bytes());
-                                    }
-                                }
-                                let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
-                                    payload: Some(stream_search_response::Payload::Batch(
-                                        StreamSearchBatch { hits },
-                                    )),
-                                }));
-                                if sent.is_err() {
-                                    VectorStreamControl::Stop
-                                } else {
-                                    VectorStreamControl::Continue
-                                }
-                            },
-                            || {
-                                if scan_signals
-                                    .cancelled
-                                    .load(std::sync::atomic::Ordering::Acquire)
-                                {
-                                    return VectorStreamControl::Stop;
-                                }
-                                let f = f32::from_bits(
-                                    scan_signals
-                                        .floor
-                                        .load(std::sync::atomic::Ordering::Acquire),
-                                );
-                                if f > floor_now {
-                                    floor_now = f;
-                                    raises += 1;
-                                    VectorStreamControl::RaiseFloor(f)
-                                } else {
-                                    VectorStreamControl::Continue
-                                }
-                            },
-                        )
-                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                    Ok(StreamSearchSummary {
-                        completed: summary.completed
-                            && !scan_signals
-                                .cancelled
-                                .load(std::sync::atomic::Ordering::Acquire),
-                        emitted: summary.emitted as u64,
-                        blocks_scanned: summary.units_scanned as u64,
-                        floor_raises_applied: raises,
-                        geo_columns_known,
-                        filter_columns_known,
-                        scoring_fingerprint,
-                    })
-                });
-            let outcome = scan.await;
-            if let Some(token) = udp_token {
-                stream_signals
-                    .lock()
-                    .expect("stream signal registry poisoned")
-                    .remove(&token);
-            }
-            match outcome {
-                Ok(Ok(summary)) => {
-                    let _ = tx
-                        .send(Ok(StreamSearchResponse {
-                            payload: Some(stream_search_response::Payload::Summary(summary)),
-                        }))
-                        .await;
-                }
-                Ok(Err(status)) => {
-                    let _ = tx.send(Err(status)).await;
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("stream scan panicked: {e}"))))
-                        .await;
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+            Ok(Response::new(ReceiverStream::new(rx)))
         })
         .await
     }
@@ -10344,45 +10345,45 @@ impl NodeService for NodeServiceImpl {
         request: Request<Streaming<AddVectorsRequest>>,
     ) -> Result<Response<AddVectorsResponse>, Status> {
         crate::metrics::timed(Route::AddVectors, request, |request| async move {
-        let _ingest = self.claim_ingest()?;
-        let stable_routing_key = replication_stable_key(&request)?;
-        let mut inbound = request.into_inner();
-        let mut added = 0u64;
-        let mut first_id = 0u64;
-        let mut batches = 0usize;
-        while let Some(batch) = inbound.message().await? {
-            batches += 1;
-            if stable_routing_key.is_some() && batches > 1 {
-                return Err(Status::invalid_argument(
+            let _ingest = self.claim_ingest()?;
+            let stable_routing_key = replication_stable_key(&request)?;
+            let mut inbound = request.into_inner();
+            let mut added = 0u64;
+            let mut first_id = 0u64;
+            let mut batches = 0usize;
+            while let Some(batch) = inbound.message().await? {
+                batches += 1;
+                if stable_routing_key.is_some() && batches > 1 {
+                    return Err(Status::invalid_argument(
                     "a replication stable-key metadata value may carry exactly one vector batch",
                 ));
+                }
+                let service = self.clone();
+                let key = stable_routing_key.clone();
+                let (batch_added, batch_first_id) =
+                    tokio::task::spawn_blocking(move || service.apply_batch(batch, key))
+                        .await
+                        .map_err(|e| Status::internal(format!("add task failed: {e}")))??;
+                if added == 0 && batch_added > 0 {
+                    first_id = batch_first_id;
+                }
+                added += batch_added;
+                self.seal_if_due().await?;
             }
-            let service = self.clone();
-            let key = stable_routing_key.clone();
-            let (batch_added, batch_first_id) =
-                tokio::task::spawn_blocking(move || service.apply_batch(batch, key))
-                    .await
-                    .map_err(|e| Status::internal(format!("add task failed: {e}")))??;
-            if added == 0 && batch_added > 0 {
-                first_id = batch_first_id;
-            }
-            added += batch_added;
-            self.seal_if_due().await?;
-        }
-        let (total, wal_generation) = {
-            let guard = self.state.read().expect("shard state lock poisoned");
-            (
-                guard.index.as_ref().map_or(0, |i| i.len() as u64),
-                guard.wal.as_ref().map_or(0, WalWriter::generation),
-            )
-        };
-        crate::metrics::add_ingested(0, added);
-        Ok(Response::new(AddVectorsResponse {
-            added,
-            total,
-            first_id,
-            wal_generation,
-        }))
+            let (total, wal_generation) = {
+                let guard = self.state.read().expect("shard state lock poisoned");
+                (
+                    guard.index.as_ref().map_or(0, |i| i.len() as u64),
+                    guard.wal.as_ref().map_or(0, WalWriter::generation),
+                )
+            };
+            crate::metrics::add_ingested(0, added);
+            Ok(Response::new(AddVectorsResponse {
+                added,
+                total,
+                first_id,
+                wal_generation,
+            }))
         })
         .await
     }
@@ -10450,12 +10451,12 @@ impl NodeService for NodeServiceImpl {
         request: Request<ExportSnapshotRequest>,
     ) -> Result<Response<ExportSnapshotResponse>, Status> {
         crate::metrics::timed(Route::ExportSnapshot, request, |request| async move {
-        let directory = PathBuf::from(request.into_inner().directory);
-        let service = self.clone();
-        tokio::task::spawn_blocking(move || service.export_snapshot_blocking(&directory))
-            .await
-            .map_err(|e| Status::internal(format!("export task failed: {e}")))?
-            .map(Response::new)
+            let directory = PathBuf::from(request.into_inner().directory);
+            let service = self.clone();
+            tokio::task::spawn_blocking(move || service.export_snapshot_blocking(&directory))
+                .await
+                .map_err(|e| Status::internal(format!("export task failed: {e}")))?
+                .map(Response::new)
         })
         .await
     }
@@ -10465,47 +10466,48 @@ impl NodeService for NodeServiceImpl {
         request: Request<StreamSnapshotRequest>,
     ) -> Result<Response<Self::StreamSnapshotStream>, Status> {
         crate::metrics::timed_stream(Route::StreamSnapshot, request, |_request| async move {
-        let path = self.config.index_path.clone().ok_or_else(|| {
-            Status::failed_precondition(
-                "shard has no persistence path (index_path); a snapshot export needs one",
-            )
-        })?;
-        let staging = export_staging_dir(&path);
-        let service = self.clone();
-        let dir = staging.clone();
-        let exported = tokio::task::spawn_blocking(move || service.export_snapshot_blocking(&dir))
-            .await
-            .map_err(|e| Status::internal(format!("export task failed: {e}")))?;
-        let exported = match exported {
-            Ok(exported) => exported,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&staging).await;
-                return Err(e);
-            }
-        };
-        let manifest = exported
-            .manifest
-            .ok_or_else(|| Status::internal("export produced no manifest"))?;
-        let artifacts: Vec<PathBuf> = manifest
-            .artifacts
-            .iter()
-            .map(|artifact| staging.join(&artifact.file))
-            .collect();
-        let (tx, rx) = mpsc::channel::<Result<SnapshotChunk, Status>>(2);
-        tokio::spawn(async move {
-            let first = SnapshotChunk {
-                payload: Some(snapshot_chunk::Payload::Repository(manifest)),
+            let path = self.config.index_path.clone().ok_or_else(|| {
+                Status::failed_precondition(
+                    "shard has no persistence path (index_path); a snapshot export needs one",
+                )
+            })?;
+            let staging = export_staging_dir(&path);
+            let service = self.clone();
+            let dir = staging.clone();
+            let exported =
+                tokio::task::spawn_blocking(move || service.export_snapshot_blocking(&dir))
+                    .await
+                    .map_err(|e| Status::internal(format!("export task failed: {e}")))?;
+            let exported = match exported {
+                Ok(exported) => exported,
+                Err(e) => {
+                    let _ = tokio::fs::remove_dir_all(&staging).await;
+                    return Err(e);
+                }
             };
-            if tx.send(Ok(first)).await.is_ok() {
-                for artifact in artifacts {
-                    if !stream_file(&tx, &artifact).await {
-                        break;
+            let manifest = exported
+                .manifest
+                .ok_or_else(|| Status::internal("export produced no manifest"))?;
+            let artifacts: Vec<PathBuf> = manifest
+                .artifacts
+                .iter()
+                .map(|artifact| staging.join(&artifact.file))
+                .collect();
+            let (tx, rx) = mpsc::channel::<Result<SnapshotChunk, Status>>(2);
+            tokio::spawn(async move {
+                let first = SnapshotChunk {
+                    payload: Some(snapshot_chunk::Payload::Repository(manifest)),
+                };
+                if tx.send(Ok(first)).await.is_ok() {
+                    for artifact in artifacts {
+                        if !stream_file(&tx, &artifact).await {
+                            break;
+                        }
                     }
                 }
-            }
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
         })
         .await
     }
@@ -10515,21 +10517,21 @@ impl NodeService for NodeServiceImpl {
         request: Request<InstallSnapshotFromRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         crate::metrics::timed(Route::InstallSnapshotFrom, request, |request| async move {
-        use crate::pb::install_snapshot_from_request::Source;
-        let path = self.config.index_path.clone().ok_or_else(|| {
-            Status::failed_precondition(
-                "shard has no persistence path (index_path); a snapshot install IS persistence",
-            )
-        })?;
-        let req = request.into_inner();
-        let source = req.source.ok_or_else(|| {
-            Status::invalid_argument(
-                "InstallSnapshotFrom needs a source: directory, url, or peer_addr",
-            )
-        })?;
-        let tmp_dir = generation_tmp_dir(&path);
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        let staged = match source {
+            use crate::pb::install_snapshot_from_request::Source;
+            let path = self.config.index_path.clone().ok_or_else(|| {
+                Status::failed_precondition(
+                    "shard has no persistence path (index_path); a snapshot install IS persistence",
+                )
+            })?;
+            let req = request.into_inner();
+            let source = req.source.ok_or_else(|| {
+                Status::invalid_argument(
+                    "InstallSnapshotFrom needs a source: directory, url, or peer_addr",
+                )
+            })?;
+            let tmp_dir = generation_tmp_dir(&path);
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            let staged = match source {
             Source::Directory(directory) => {
                 let staging = tmp_dir.clone();
                 tokio::task::spawn_blocking(move || {
@@ -10549,28 +10551,28 @@ impl NodeService for NodeServiceImpl {
                 "this build has no network stack (feature `net` is off); install from a directory",
             )),
         };
-        let (manifest, sha) = match staged {
-            Ok(staged) => staged,
-            Err(e) => {
+            let (manifest, sha) = match staged {
+                Ok(staged) => staged,
+                Err(e) => {
+                    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+                    return Err(e);
+                }
+            };
+            if let Err(e) = repo::check_expected_sha(&req.expected_manifest_sha256, &sha) {
                 let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-                return Err(e);
+                return Err(Status::invalid_argument(e));
             }
-        };
-        if let Err(e) = repo::check_expected_sha(&req.expected_manifest_sha256, &sha) {
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            return Err(Status::invalid_argument(e));
-        }
-        let service = self.clone();
-        let cleanup = tmp_dir.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            service.install_staged_repository(&tmp_dir, &manifest)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
-        if result.is_err() {
-            let _ = tokio::fs::remove_dir_all(&cleanup).await;
-        }
-        result.map(Response::new)
+            let service = self.clone();
+            let cleanup = tmp_dir.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                service.install_staged_repository(&tmp_dir, &manifest)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
+            if result.is_err() {
+                let _ = tokio::fs::remove_dir_all(&cleanup).await;
+            }
+            result.map(Response::new)
         })
         .await
     }
@@ -10580,82 +10582,82 @@ impl NodeService for NodeServiceImpl {
         request: Request<Streaming<AddDocumentsRequest>>,
     ) -> Result<Response<AddDocumentsResponse>, Status> {
         crate::metrics::timed(Route::AddDocuments, request, |request| async move {
-        let _ingest = self.claim_ingest()?;
-        let addr = self.config.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
-        })?;
-        let stable_routing_key = replication_stable_key(&request)?;
-        let mut inbound = request.into_inner();
-        let mut source = IngestSource::Plain {
-            stream: &mut inbound,
-            stable_routing_key,
-            consumed: false,
-        };
-        let mut added = 0u64;
-        let mut first_id = 0u64;
-        // Analysis dominates bulk ingest. One analysis stream covers the
-        // whole call, using either native bounded channels or sidecar flow
-        // control. Documents are applied strictly in arrival order, so ids
-        // and WAL order stay deterministic.
-        //
-        // A sidecar without AnalyzeStream is REFUSED rather than served on
-        // the old per-document unary path. That fallback existed and cost
-        // real debugging time: a stale sidecar silently took it, then its
-        // gRPC server GOAWAYed the connection after ~70 streams, and the
-        // bulk driver died seconds into a multi-hour job with an opaque
-        // "h2 protocol error" while this node logged nothing and stayed
-        // healthy. Degrading quietly turned a one-line version mismatch
-        // into an h2 forensics exercise; failing here names it instead.
-        if let Some(first) = source.next().await? {
-            match crate::analyzer::AnalyzeStream::open_with_vocab(
-                &addr,
-                first.req.analysis.as_ref(),
-                self.vocab.clone(),
-                session_layers(
-                    &first.req,
-                    self.phrase_index.as_deref(),
-                    &self.config.sentence_fields,
-                ),
-            )
-            .await
-            {
-                Ok(session) => {
-                    self.ingest_streamed(
-                        session,
-                        first,
-                        &mut source,
-                        &addr,
-                        &mut added,
-                        &mut first_id,
-                    )
-                    .await?;
-                }
-                Err(status) if status.code() == tonic::Code::Unimplemented => {
-                    return Err(Status::failed_precondition(format!(
-                        "analysis sidecar at {addr} does not implement AnalyzeStream; \
+            let _ingest = self.claim_ingest()?;
+            let addr = self.config.analysis_addr.clone().ok_or_else(|| {
+                Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
+            })?;
+            let stable_routing_key = replication_stable_key(&request)?;
+            let mut inbound = request.into_inner();
+            let mut source = IngestSource::Plain {
+                stream: &mut inbound,
+                stable_routing_key,
+                consumed: false,
+            };
+            let mut added = 0u64;
+            let mut first_id = 0u64;
+            // Analysis dominates bulk ingest. One analysis stream covers the
+            // whole call, using either native bounded channels or sidecar flow
+            // control. Documents are applied strictly in arrival order, so ids
+            // and WAL order stay deterministic.
+            //
+            // A sidecar without AnalyzeStream is REFUSED rather than served on
+            // the old per-document unary path. That fallback existed and cost
+            // real debugging time: a stale sidecar silently took it, then its
+            // gRPC server GOAWAYed the connection after ~70 streams, and the
+            // bulk driver died seconds into a multi-hour job with an opaque
+            // "h2 protocol error" while this node logged nothing and stayed
+            // healthy. Degrading quietly turned a one-line version mismatch
+            // into an h2 forensics exercise; failing here names it instead.
+            if let Some(first) = source.next().await? {
+                match crate::analyzer::AnalyzeStream::open_with_vocab(
+                    &addr,
+                    first.req.analysis.as_ref(),
+                    self.vocab.clone(),
+                    session_layers(
+                        &first.req,
+                        self.phrase_index.as_deref(),
+                        &self.config.sentence_fields,
+                    ),
+                )
+                .await
+                {
+                    Ok(session) => {
+                        self.ingest_streamed(
+                            session,
+                            first,
+                            &mut source,
+                            &addr,
+                            &mut added,
+                            &mut first_id,
+                        )
+                        .await?;
+                    }
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        return Err(Status::failed_precondition(format!(
+                            "analysis sidecar at {addr} does not implement AnalyzeStream; \
                          it predates the RPC and must be rebuilt (./gradlew installDist \
                          in grpc-opennlp-analysis). Refusing to ingest on the removed \
                          unary path."
-                    )));
+                        )));
+                    }
+                    Err(status) => return Err(status),
                 }
-                Err(status) => return Err(status),
             }
-        }
-        let (total, wal_generation) = {
-            let guard = self.state.read().expect("shard state lock poisoned");
-            (
-                guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
-                guard.wal.as_ref().map_or(0, WalWriter::generation),
-            )
-        };
-        crate::metrics::add_ingested(added, 0);
-        self.seal_if_due().await?;
-        Ok(Response::new(AddDocumentsResponse {
-            added,
-            total,
-            first_id,
-            wal_generation,
-        }))
+            let (total, wal_generation) = {
+                let guard = self.state.read().expect("shard state lock poisoned");
+                (
+                    guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
+                    guard.wal.as_ref().map_or(0, WalWriter::generation),
+                )
+            };
+            crate::metrics::add_ingested(added, 0);
+            self.seal_if_due().await?;
+            Ok(Response::new(AddDocumentsResponse {
+                added,
+                total,
+                first_id,
+                wal_generation,
+            }))
         })
         .await
     }
@@ -10665,10 +10667,10 @@ impl NodeService for NodeServiceImpl {
         request: Request<DeleteDocumentsRequest>,
     ) -> Result<Response<DeleteDocumentsResponse>, Status> {
         crate::metrics::timed(Route::DeleteDocuments, request, |request| async move {
-        let req = request.into_inner();
-        let mut guard = self.state.write().expect("shard state lock poisoned");
-        self.delete_documents_locked(&mut guard, &req.doc_ids, req.expected_wal_generation)
-            .map(Response::new)
+            let req = request.into_inner();
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            self.delete_documents_locked(&mut guard, &req.doc_ids, req.expected_wal_generation)
+                .map(Response::new)
         })
         .await
     }
@@ -10678,9 +10680,13 @@ impl NodeService for NodeServiceImpl {
         request: Request<CommitReplacementsRequest>,
     ) -> Result<Response<CommitReplacementsResponse>, Status> {
         crate::metrics::timed(Route::CommitReplacements, request, |request| async move {
-        let req = request.into_inner();
-        let mut guard = self.state.write().expect("shard state lock poisoned");
-        self.commit_replacements_locked(&mut guard, &req.replacements, req.expected_wal_generation)
+            let req = request.into_inner();
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            self.commit_replacements_locked(
+                &mut guard,
+                &req.replacements,
+                req.expected_wal_generation,
+            )
             .map(Response::new)
         })
         .await
@@ -10691,94 +10697,94 @@ impl NodeService for NodeServiceImpl {
         request: Request<Streaming<IngestMappedRequest>>,
     ) -> Result<Response<IngestMappedResponse>, Status> {
         crate::metrics::timed(Route::IngestMapped, request, |request| async move {
-        let _ingest = self.claim_ingest()?;
-        let addr = self.config.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
-        })?;
-        let mut inbound = request.into_inner();
-        // Protocol: the first message must be the bind, and the bind
-        // must stand — fingerprint agreement, declared columns, a body
-        // — before a single document streams.
-        let bind = match inbound.message().await? {
-            Some(IngestMappedRequest {
-                payload: Some(crate::pb::ingest_mapped_request::Payload::Bind(bind)),
-            }) => bind,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "first IngestMappedRequest must be a MappedBind",
-                ))
-            }
-        };
-        self.admit_collection(&bind.collection)?;
-        let extractor = self.bind_mapped(&bind)?;
-        let fingerprint = extractor.plan().fingerprint.clone();
-        let mut added = 0u64;
-        let mut first_id = 0u64;
-        let mut source = IngestSource::Mapped(Box::new(MappedSource {
-            stream: &mut inbound,
-            extractor,
-            analysis: bind.analysis.clone(),
-            materialize: bind.materialize.clone(),
-            position: 0,
-            parents: 0,
-            rows: std::collections::VecDeque::new(),
-        }));
-        if let Some(first) = source.next().await? {
-            match crate::analyzer::AnalyzeStream::open_with_vocab(
-                &addr,
-                first.req.analysis.as_ref(),
-                self.vocab.clone(),
-                session_layers(
-                    &first.req,
-                    self.phrase_index.as_deref(),
-                    &self.config.sentence_fields,
-                ),
-            )
-            .await
-            {
-                Ok(session) => {
-                    self.ingest_streamed(
-                        session,
-                        first,
-                        &mut source,
-                        &addr,
-                        &mut added,
-                        &mut first_id,
-                    )
-                    .await?;
+            let _ingest = self.claim_ingest()?;
+            let addr = self.config.analysis_addr.clone().ok_or_else(|| {
+                Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
+            })?;
+            let mut inbound = request.into_inner();
+            // Protocol: the first message must be the bind, and the bind
+            // must stand — fingerprint agreement, declared columns, a body
+            // — before a single document streams.
+            let bind = match inbound.message().await? {
+                Some(IngestMappedRequest {
+                    payload: Some(crate::pb::ingest_mapped_request::Payload::Bind(bind)),
+                }) => bind,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "first IngestMappedRequest must be a MappedBind",
+                    ))
                 }
-                Err(status) if status.code() == tonic::Code::Unimplemented => {
-                    return Err(Status::failed_precondition(format!(
-                        "analysis sidecar at {addr} does not implement AnalyzeStream; \
+            };
+            self.admit_collection(&bind.collection)?;
+            let extractor = self.bind_mapped(&bind)?;
+            let fingerprint = extractor.plan().fingerprint.clone();
+            let mut added = 0u64;
+            let mut first_id = 0u64;
+            let mut source = IngestSource::Mapped(Box::new(MappedSource {
+                stream: &mut inbound,
+                extractor,
+                analysis: bind.analysis.clone(),
+                materialize: bind.materialize.clone(),
+                position: 0,
+                parents: 0,
+                rows: std::collections::VecDeque::new(),
+            }));
+            if let Some(first) = source.next().await? {
+                match crate::analyzer::AnalyzeStream::open_with_vocab(
+                    &addr,
+                    first.req.analysis.as_ref(),
+                    self.vocab.clone(),
+                    session_layers(
+                        &first.req,
+                        self.phrase_index.as_deref(),
+                        &self.config.sentence_fields,
+                    ),
+                )
+                .await
+                {
+                    Ok(session) => {
+                        self.ingest_streamed(
+                            session,
+                            first,
+                            &mut source,
+                            &addr,
+                            &mut added,
+                            &mut first_id,
+                        )
+                        .await?;
+                    }
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        return Err(Status::failed_precondition(format!(
+                            "analysis sidecar at {addr} does not implement AnalyzeStream; \
                          it predates the RPC and must be rebuilt (./gradlew installDist \
                          in grpc-opennlp-analysis). Refusing to ingest on the removed \
                          unary path."
-                    )));
+                        )));
+                    }
+                    Err(status) => return Err(status),
                 }
-                Err(status) => return Err(status),
             }
-        }
-        let (total, wal_generation) = {
-            let guard = self.state.read().expect("shard state lock poisoned");
-            (
-                guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
-                guard.wal.as_ref().map_or(0, WalWriter::generation),
-            )
-        };
-        // Each mapped row carries exactly one vector.
-        crate::metrics::add_ingested(added, added);
-        let parents = match &source {
-            IngestSource::Mapped(mapped) => mapped.parents,
-            IngestSource::Plain { .. } => unreachable!("this handler built a mapped source"),
-        };
-        Ok(Response::new(IngestMappedResponse {
-            added,
-            total,
-            first_id,
-            fingerprint,
-            parents,
-            wal_generation,
-        }))
+            let (total, wal_generation) = {
+                let guard = self.state.read().expect("shard state lock poisoned");
+                (
+                    guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
+                    guard.wal.as_ref().map_or(0, WalWriter::generation),
+                )
+            };
+            // Each mapped row carries exactly one vector.
+            crate::metrics::add_ingested(added, added);
+            let parents = match &source {
+                IngestSource::Mapped(mapped) => mapped.parents,
+                IngestSource::Plain { .. } => unreachable!("this handler built a mapped source"),
+            };
+            Ok(Response::new(IngestMappedResponse {
+                added,
+                total,
+                first_id,
+                fingerprint,
+                parents,
+                wal_generation,
+            }))
         })
         .await
     }
@@ -10788,83 +10794,83 @@ impl NodeService for NodeServiceImpl {
         request: Request<TermStatsRequest>,
     ) -> Result<Response<TermStatsResponse>, Status> {
         crate::metrics::timed(Route::TermStats, request, |request| async move {
-        let req = request.into_inner();
-        let guard = self.state.read().expect("shard state lock poisoned");
+            let req = request.into_inner();
+            let guard = self.state.read().expect("shard state lock poisoned");
             let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard
                 .bm25
                 .as_ref()
-        {
-            Some(store) => {
-                let index = store.as_index().ok_or_else(|| {
-                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                })?;
-                // Per-field shares: a shard without a named field
-                // answers zeros — that IS its share of the globals.
-                let field_stats = req
-                    .fields
-                    .iter()
-                    .map(|ft| match store.field_index(&ft.field) {
-                        Some(fi) => {
-                            let view = store
-                                .field_view(fi)
-                                .expect("as_index above proves the shard is searchable");
-                            let (total_doc_length, doc_frequencies) = live_field_stats(
-                                view.as_ref(),
-                                &ft.terms,
-                                &guard.live_docs,
-                                store.next_doc_id(),
-                            );
-                            crate::pb::FieldStats {
-                                sentences: store.field_has_sentences(fi),
-                                total_doc_length,
-                                doc_frequencies,
-                                known: true,
-                                positions: store.field_has_positions(fi),
+            {
+                Some(store) => {
+                    let index = store.as_index().ok_or_else(|| {
+                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                    })?;
+                    // Per-field shares: a shard without a named field
+                    // answers zeros — that IS its share of the globals.
+                    let field_stats = req
+                        .fields
+                        .iter()
+                        .map(|ft| match store.field_index(&ft.field) {
+                            Some(fi) => {
+                                let view = store
+                                    .field_view(fi)
+                                    .expect("as_index above proves the shard is searchable");
+                                let (total_doc_length, doc_frequencies) = live_field_stats(
+                                    view.as_ref(),
+                                    &ft.terms,
+                                    &guard.live_docs,
+                                    store.next_doc_id(),
+                                );
+                                crate::pb::FieldStats {
+                                    sentences: store.field_has_sentences(fi),
+                                    total_doc_length,
+                                    doc_frequencies,
+                                    known: true,
+                                    positions: store.field_has_positions(fi),
+                                }
                             }
-                        }
-                        None => crate::pb::FieldStats {
+                            None => crate::pb::FieldStats {
+                                sentences: false,
+                                total_doc_length: 0,
+                                doc_frequencies: vec![0; ft.terms.len()],
+                                known: false,
+                                positions: false,
+                            },
+                        })
+                        .collect();
+                    let (total_doc_length, doc_frequencies) =
+                        live_field_stats(index, &req.terms, &guard.live_docs, store.next_doc_id());
+                    (
+                        live_document_count(store, &guard.live_docs),
+                        total_doc_length,
+                        doc_frequencies,
+                        field_stats,
+                    )
+                }
+                None => (
+                    0,
+                    0,
+                    req.terms.iter().map(|_| 0).collect(),
+                    // No postings at all: this shard knows no field, which is
+                    // a different statement from "the field does not exist".
+                    req.fields
+                        .iter()
+                        .map(|ft| crate::pb::FieldStats {
                             sentences: false,
                             total_doc_length: 0,
                             doc_frequencies: vec![0; ft.terms.len()],
                             known: false,
                             positions: false,
-                        },
-                    })
-                    .collect();
-                let (total_doc_length, doc_frequencies) =
-                    live_field_stats(index, &req.terms, &guard.live_docs, store.next_doc_id());
-                (
-                    live_document_count(store, &guard.live_docs),
-                    total_doc_length,
-                    doc_frequencies,
-                    field_stats,
-                )
-            }
-            None => (
-                0,
-                0,
-                req.terms.iter().map(|_| 0).collect(),
-                // No postings at all: this shard knows no field, which is
-                // a different statement from "the field does not exist".
-                req.fields
-                    .iter()
-                    .map(|ft| crate::pb::FieldStats {
-                        sentences: false,
-                        total_doc_length: 0,
-                        doc_frequencies: vec![0; ft.terms.len()],
-                        known: false,
-                        positions: false,
-                    })
-                    .collect(),
-            ),
-        };
-        Ok(Response::new(TermStatsResponse {
-            doc_count,
-            total_doc_length,
-            doc_frequencies,
-            field_stats,
-            stats_epoch: guard.stats_epoch,
-        }))
+                        })
+                        .collect(),
+                ),
+            };
+            Ok(Response::new(TermStatsResponse {
+                doc_count,
+                total_doc_length,
+                doc_frequencies,
+                field_stats,
+                stats_epoch: guard.stats_epoch,
+            }))
         })
         .await
     }
@@ -10874,45 +10880,45 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::ExpandTermPrefixRequest>,
     ) -> Result<Response<crate::pb::ExpandTermPrefixResponse>, Status> {
         crate::metrics::timed(Route::ExpandTermPrefix, request, |request| async move {
-        let req = request.into_inner();
-        if req.prefix.is_empty() {
-            return Err(Status::invalid_argument("a term prefix must be non-empty"));
-        }
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let Some(store) = guard.bm25.as_ref() else {
-            return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
-                terms: Vec::new(),
-                count: 0,
-                known: false,
-            }));
-        };
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush first",
-            ));
-        }
-        let Some(fi) = store.field_index(&req.field) else {
-            return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
-                terms: Vec::new(),
-                count: 0,
-                known: false,
-            }));
-        };
-        let view = store
-            .field_view(fi)
-            .expect("as_index above proves the shard is searchable");
-        let (terms, count) = match view.expand_prefix(&req.prefix, req.cap as usize) {
-            Ok(terms) => {
-                let count = terms.len() as u64;
-                (terms, count)
+            let req = request.into_inner();
+            if req.prefix.is_empty() {
+                return Err(Status::invalid_argument("a term prefix must be non-empty"));
             }
-            Err(count) => (Vec::new(), count as u64),
-        };
-        Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
-            terms,
-            count,
-            known: true,
-        }))
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let Some(store) = guard.bm25.as_ref() else {
+                return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
+                    terms: Vec::new(),
+                    count: 0,
+                    known: false,
+                }));
+            };
+            if store.as_index().is_none() {
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush first",
+                ));
+            }
+            let Some(fi) = store.field_index(&req.field) else {
+                return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
+                    terms: Vec::new(),
+                    count: 0,
+                    known: false,
+                }));
+            };
+            let view = store
+                .field_view(fi)
+                .expect("as_index above proves the shard is searchable");
+            let (terms, count) = match view.expand_prefix(&req.prefix, req.cap as usize) {
+                Ok(terms) => {
+                    let count = terms.len() as u64;
+                    (terms, count)
+                }
+                Err(count) => (Vec::new(), count as u64),
+            };
+            Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
+                terms,
+                count,
+                known: true,
+            }))
         })
         .await
     }
@@ -10929,60 +10935,60 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::SuggestTermsRequest>,
     ) -> Result<Response<crate::pb::SuggestTermsResponse>, Status> {
         crate::metrics::timed(Route::SuggestTerms, request, |request| async move {
-        let req = request.into_inner();
-        if req.prefix.is_empty() {
-            return Err(Status::invalid_argument("a term prefix must be non-empty"));
-        }
-        if req.max_scan == 0 {
-            return Err(Status::invalid_argument(
-                "max_scan must be positive: it bounds the dictionary scan",
-            ));
-        }
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let tombstoned_rows = guard.live_docs.deleted_count();
-        let unknown = || crate::pb::SuggestTermsResponse {
-            entries: Vec::new(),
-            count: 0,
-            known: false,
-            tombstoned_rows,
-        };
-        let Some(store) = guard.bm25.as_ref() else {
-            return Ok(Response::new(unknown()));
-        };
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush first",
-            ));
-        }
-        let Some(fi) = store.field_index(&req.field) else {
-            return Ok(Response::new(unknown()));
-        };
-        let view = store
-            .field_view(fi)
-            .expect("as_index above proves the shard is searchable");
-        let max_scan = usize::try_from(req.max_scan).map_err(|_| {
-            Status::invalid_argument(format!("max_scan {} is out of range", req.max_scan))
-        })?;
-        let (entries, count) = match view.suggest_prefix(&req.prefix, max_scan) {
-            Ok(entries) => {
-                let count = entries.len() as u64;
-                let entries = entries
-                    .into_iter()
-                    .map(|(term, df)| crate::pb::SuggestTermEntry {
-                        term,
-                        df: u64::from(df),
-                    })
-                    .collect();
-                (entries, count)
+            let req = request.into_inner();
+            if req.prefix.is_empty() {
+                return Err(Status::invalid_argument("a term prefix must be non-empty"));
             }
-            Err(count) => (Vec::new(), count as u64),
-        };
-        Ok(Response::new(crate::pb::SuggestTermsResponse {
-            entries,
-            count,
-            known: true,
-            tombstoned_rows,
-        }))
+            if req.max_scan == 0 {
+                return Err(Status::invalid_argument(
+                    "max_scan must be positive: it bounds the dictionary scan",
+                ));
+            }
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let tombstoned_rows = guard.live_docs.deleted_count();
+            let unknown = || crate::pb::SuggestTermsResponse {
+                entries: Vec::new(),
+                count: 0,
+                known: false,
+                tombstoned_rows,
+            };
+            let Some(store) = guard.bm25.as_ref() else {
+                return Ok(Response::new(unknown()));
+            };
+            if store.as_index().is_none() {
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush first",
+                ));
+            }
+            let Some(fi) = store.field_index(&req.field) else {
+                return Ok(Response::new(unknown()));
+            };
+            let view = store
+                .field_view(fi)
+                .expect("as_index above proves the shard is searchable");
+            let max_scan = usize::try_from(req.max_scan).map_err(|_| {
+                Status::invalid_argument(format!("max_scan {} is out of range", req.max_scan))
+            })?;
+            let (entries, count) = match view.suggest_prefix(&req.prefix, max_scan) {
+                Ok(entries) => {
+                    let count = entries.len() as u64;
+                    let entries = entries
+                        .into_iter()
+                        .map(|(term, df)| crate::pb::SuggestTermEntry {
+                            term,
+                            df: u64::from(df),
+                        })
+                        .collect();
+                    (entries, count)
+                }
+                Err(count) => (Vec::new(), count as u64),
+            };
+            Ok(Response::new(crate::pb::SuggestTermsResponse {
+                entries,
+                count,
+                known: true,
+                tombstoned_rows,
+            }))
         })
         .await
     }
@@ -10992,12 +10998,12 @@ impl NodeService for NodeServiceImpl {
         request: Request<Bm25QueryRequest>,
     ) -> Result<Response<Bm25QueryResponse>, Status> {
         crate::metrics::timed(Route::Bm25Query, request, |request| async move {
-        let service = self.clone();
-        let req = request.into_inner();
-        tokio::task::spawn_blocking(move || service.run_bm25_query(req))
-            .await
-            .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))?
-            .map(Response::new)
+            let service = self.clone();
+            let req = request.into_inner();
+            tokio::task::spawn_blocking(move || service.run_bm25_query(req))
+                .await
+                .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))?
+                .map(Response::new)
         })
         .await
     }
@@ -11007,14 +11013,14 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::Bm25PhraseQueryRequest>,
     ) -> Result<Response<Bm25QueryResponse>, Status> {
         crate::metrics::timed(Route::Bm25PhraseQuery, request, |request| async move {
-        let service = self.clone();
-        let req = request.into_inner();
-        tokio::task::spawn_blocking(move || service.run_bm25_phrase_query(req))
-            .await
+            let service = self.clone();
+            let req = request.into_inner();
+            tokio::task::spawn_blocking(move || service.run_bm25_phrase_query(req))
+                .await
                 .map_err(|error| {
                     Status::internal(format!("bm25 phrase query task failed: {error}"))
                 })?
-            .map(Response::new)
+                .map(Response::new)
         })
         .await
     }
@@ -11024,194 +11030,194 @@ impl NodeService for NodeServiceImpl {
         request: Request<Streaming<Bm25QueryStreamRequest>>,
     ) -> Result<Response<Self::Bm25QueryStreamStream>, Status> {
         crate::metrics::timed_stream(Route::Bm25QueryStream, request, |request| async move {
-        let mut inbound = request.into_inner();
-        let (tx, rx) = mpsc::channel::<Result<Bm25QueryStreamResponse, Status>>(64);
-        let service = self.clone();
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel::<Result<Bm25QueryStreamResponse, Status>>(64);
+            let service = self.clone();
 
-        tokio::spawn(async move {
-            // Protocol: the first message must be Start.
-            let req = match inbound.message().await {
-                Ok(Some(Bm25QueryStreamRequest {
-                    payload: Some(bm25_query_stream_request::Payload::Start(req)),
-                })) => req,
-                Ok(_) => {
-                    let _ = tx
-                        .send(Err(Status::invalid_argument(
-                            "first Bm25QueryStreamRequest must be a Bm25QueryRequest start",
-                        )))
-                        .await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            // Floor updates arrive on the same stream; a pump task folds
-            // them into a watch cell the blocking scan polls each loop
-            // iteration. Updates are monotone maxes, so only raises are
-            // stored — exactly the SearchShard pump.
-            let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let pump_cancelled = Arc::clone(&cancelled);
             tokio::spawn(async move {
-                loop {
-                    match inbound.message().await {
-                        Ok(Some(Bm25QueryStreamRequest {
-                            payload: Some(bm25_query_stream_request::Payload::FloorUpdate(u)),
-                        })) => {
-                            floor_tx.send_if_modified(|cur| {
-                                if !u.floor.is_nan() && u.floor > *cur {
-                                    *cur = u.floor;
-                                    true
-                                } else {
-                                    false
-                                }
-                            });
-                        }
-                        Ok(Some(Bm25QueryStreamRequest {
-                            payload: Some(bm25_query_stream_request::Payload::Stop(_)),
-                        })) => {
-                            pump_cancelled.store(true, AtomicOrdering::Release);
-                            break;
-                        }
-                        // Duplicate Start or empty payload: ignore.
-                        Ok(Some(_)) => {}
-                        // Client closed or the stream broke: stop pumping;
-                        // the scan finishes on its own either way.
-                        Ok(None) | Err(_) => break,
+                // Protocol: the first message must be Start.
+                let req = match inbound.message().await {
+                    Ok(Some(Bm25QueryStreamRequest {
+                        payload: Some(bm25_query_stream_request::Payload::Start(req)),
+                    })) => req,
+                    Ok(_) => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "first Bm25QueryStreamRequest must be a Bm25QueryRequest start",
+                            )))
+                            .await;
+                        return;
                     }
-                }
-            });
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
 
-            // The scorer-side hook: publish strict raises of the running
-            // k-th best (gated by the node's floor knobs, never blocking
-            // the scan — dropped raises are superseded by the next one),
-            // and hand back the highest coordinator floor seen.
-            let share = service.config.share_floors;
-            let floor_delta = service.config.floor_delta;
+                // Floor updates arrive on the same stream; a pump task folds
+                // them into a watch cell the blocking scan polls each loop
+                // iteration. Updates are monotone maxes, so only raises are
+                // stored — exactly the SearchShard pump.
+                let (floor_tx, floor_rx) = watch::channel(f32::NEG_INFINITY);
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let pump_cancelled = Arc::clone(&cancelled);
+                tokio::spawn(async move {
+                    loop {
+                        match inbound.message().await {
+                            Ok(Some(Bm25QueryStreamRequest {
+                                payload: Some(bm25_query_stream_request::Payload::FloorUpdate(u)),
+                            })) => {
+                                floor_tx.send_if_modified(|cur| {
+                                    if !u.floor.is_nan() && u.floor > *cur {
+                                        *cur = u.floor;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            }
+                            Ok(Some(Bm25QueryStreamRequest {
+                                payload: Some(bm25_query_stream_request::Payload::Stop(_)),
+                            })) => {
+                                pump_cancelled.store(true, AtomicOrdering::Release);
+                                break;
+                            }
+                            // Duplicate Start or empty payload: ignore.
+                            Ok(Some(_)) => {}
+                            // Client closed or the stream broke: stop pumping;
+                            // the scan finishes on its own either way.
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                });
+
+                // The scorer-side hook: publish strict raises of the running
+                // k-th best (gated by the node's floor knobs, never blocking
+                // the scan — dropped raises are superseded by the next one),
+                // and hand back the highest coordinator floor seen.
+                let share = service.config.share_floors;
+                let floor_delta = service.config.floor_delta;
                 let min_interval = (service.config.floor_min_interval_ms > 0).then(|| {
                     std::time::Duration::from_millis(service.config.floor_min_interval_ms)
                 });
-            let scan_tx = tx.clone();
-            let hook_cancelled = Arc::clone(&cancelled);
-            let mut last_published = f32::NEG_INFINITY;
-            let mut last_at: Option<std::time::Instant> = None;
-            let mut hook = move |seed: Option<f32>| -> Option<f32> {
-                if hook_cancelled.load(AtomicOrdering::Acquire) || scan_tx.is_closed() {
-                    hook_cancelled.store(true, AtomicOrdering::Release);
-                    return Some(f32::INFINITY);
-                }
-                if !share {
-                    return None;
-                }
-                if let Some(seed) = seed {
-                    let debounced = matches!(
-                        (min_interval, last_at),
-                        (Some(interval), Some(at)) if at.elapsed() < interval
-                    );
-                    if seed > last_published + floor_delta && !debounced {
-                        last_published = seed;
-                        last_at = Some(std::time::Instant::now());
-                        let _ = scan_tx.try_send(Ok(Bm25QueryStreamResponse {
-                            payload: Some(bm25_query_stream_response::Payload::FloorUpdate(
-                                FloorUpdate { floor: seed },
-                            )),
-                        }));
+                let scan_tx = tx.clone();
+                let hook_cancelled = Arc::clone(&cancelled);
+                let mut last_published = f32::NEG_INFINITY;
+                let mut last_at: Option<std::time::Instant> = None;
+                let mut hook = move |seed: Option<f32>| -> Option<f32> {
+                    if hook_cancelled.load(AtomicOrdering::Acquire) || scan_tx.is_closed() {
+                        hook_cancelled.store(true, AtomicOrdering::Release);
+                        return Some(f32::INFINITY);
                     }
-                }
-                let f = *floor_rx.borrow();
-                (f != f32::NEG_INFINITY).then_some(f)
-            };
-
-            let scoring_fingerprint = bm25_scoring_fingerprint(&req);
-            let candidate_tx = tx.clone();
-            let scan_cancelled = Arc::clone(&cancelled);
-            let outcome = tokio::task::spawn_blocking(move || {
-                // Stay below tonic's default 4 MiB even if a caller lowers
-                // the process-wide cap. 64 KiB amortizes framing without
-                // delaying the first useful candidates.
-                const BATCH_BYTES: usize = (64 * 1024 / 12) * 12;
-                let mut pending = Vec::with_capacity(BATCH_BYTES);
-                let mut emitted = 0u64;
-                let response = {
-                    let mut emit = |doc_id: u32, score: f32| {
-                        pending.extend_from_slice(
-                            &(service.config.slot_offset + u64::from(doc_id)).to_le_bytes(),
+                    if !share {
+                        return None;
+                    }
+                    if let Some(seed) = seed {
+                        let debounced = matches!(
+                            (min_interval, last_at),
+                            (Some(interval), Some(at)) if at.elapsed() < interval
                         );
-                        pending.extend_from_slice(&score.to_le_bytes());
-                        if pending.len() >= BATCH_BYTES {
-                            let records = (pending.len() / 12) as u64;
+                        if seed > last_published + floor_delta && !debounced {
+                            last_published = seed;
+                            last_at = Some(std::time::Instant::now());
+                            let _ = scan_tx.try_send(Ok(Bm25QueryStreamResponse {
+                                payload: Some(bm25_query_stream_response::Payload::FloorUpdate(
+                                    FloorUpdate { floor: seed },
+                                )),
+                            }));
+                        }
+                    }
+                    let f = *floor_rx.borrow();
+                    (f != f32::NEG_INFINITY).then_some(f)
+                };
+
+                let scoring_fingerprint = bm25_scoring_fingerprint(&req);
+                let candidate_tx = tx.clone();
+                let scan_cancelled = Arc::clone(&cancelled);
+                let outcome = tokio::task::spawn_blocking(move || {
+                    // Stay below tonic's default 4 MiB even if a caller lowers
+                    // the process-wide cap. 64 KiB amortizes framing without
+                    // delaying the first useful candidates.
+                    const BATCH_BYTES: usize = (64 * 1024 / 12) * 12;
+                    let mut pending = Vec::with_capacity(BATCH_BYTES);
+                    let mut emitted = 0u64;
+                    let response = {
+                        let mut emit = |doc_id: u32, score: f32| {
+                            pending.extend_from_slice(
+                                &(service.config.slot_offset + u64::from(doc_id)).to_le_bytes(),
+                            );
+                            pending.extend_from_slice(&score.to_le_bytes());
+                            if pending.len() >= BATCH_BYTES {
+                                let records = (pending.len() / 12) as u64;
                                 let batch = std::mem::replace(
                                     &mut pending,
                                     Vec::with_capacity(BATCH_BYTES),
                                 );
-                            if candidate_tx
-                                .blocking_send(Ok(Bm25QueryStreamResponse {
-                                    payload: Some(
-                                        bm25_query_stream_response::Payload::CandidateBatch(
-                                            Bm25CandidateBatch { candidates: batch },
+                                if candidate_tx
+                                    .blocking_send(Ok(Bm25QueryStreamResponse {
+                                        payload: Some(
+                                            bm25_query_stream_response::Payload::CandidateBatch(
+                                                Bm25CandidateBatch { candidates: batch },
+                                            ),
                                         ),
-                                    ),
-                                }))
-                                .is_ok()
-                            {
-                                emitted += records;
-                            } else {
-                                scan_cancelled.store(true, AtomicOrdering::Release);
+                                    }))
+                                    .is_ok()
+                                {
+                                    emitted += records;
+                                } else {
+                                    scan_cancelled.store(true, AtomicOrdering::Release);
+                                }
                             }
-                        }
+                        };
+                        service.run_bm25_query_live(req, Some(&mut hook), Some(&mut emit))
                     };
-                    service.run_bm25_query_live(req, Some(&mut hook), Some(&mut emit))
-                };
-                if response.is_ok() && !pending.is_empty() {
-                    let records = (pending.len() / 12) as u64;
-                    if candidate_tx
-                        .blocking_send(Ok(Bm25QueryStreamResponse {
-                            payload: Some(bm25_query_stream_response::Payload::CandidateBatch(
-                                Bm25CandidateBatch {
-                                    candidates: pending,
+                    if response.is_ok() && !pending.is_empty() {
+                        let records = (pending.len() / 12) as u64;
+                        if candidate_tx
+                            .blocking_send(Ok(Bm25QueryStreamResponse {
+                                payload: Some(bm25_query_stream_response::Payload::CandidateBatch(
+                                    Bm25CandidateBatch {
+                                        candidates: pending,
+                                    },
+                                )),
+                            }))
+                            .is_ok()
+                        {
+                            emitted += records;
+                        } else {
+                            scan_cancelled.store(true, AtomicOrdering::Release);
+                        }
+                    }
+                    let completed = !scan_cancelled.load(AtomicOrdering::Acquire);
+                    (response, completed, emitted)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    (
+                        Err(Status::internal(format!("bm25 stream task failed: {e}"))),
+                        false,
+                        0,
+                    )
+                });
+                let _ = match outcome {
+                    (Ok(response), completed, candidates_emitted) => {
+                        tx.send(Ok(Bm25QueryStreamResponse {
+                            payload: Some(bm25_query_stream_response::Payload::Completion(
+                                Bm25StreamCompletion {
+                                    completed,
+                                    response: completed.then_some(response),
+                                    scoring_fingerprint,
+                                    candidates_emitted,
                                 },
                             )),
                         }))
-                        .is_ok()
-                    {
-                        emitted += records;
-                    } else {
-                        scan_cancelled.store(true, AtomicOrdering::Release);
+                        .await
                     }
-                }
-                let completed = !scan_cancelled.load(AtomicOrdering::Acquire);
-                (response, completed, emitted)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                (
-                    Err(Status::internal(format!("bm25 stream task failed: {e}"))),
-                    false,
-                    0,
-                )
+                    (Err(e), _, _) => tx.send(Err(e)).await,
+                };
             });
-            let _ = match outcome {
-                (Ok(response), completed, candidates_emitted) => {
-                    tx.send(Ok(Bm25QueryStreamResponse {
-                        payload: Some(bm25_query_stream_response::Payload::Completion(
-                            Bm25StreamCompletion {
-                                completed,
-                                response: completed.then_some(response),
-                                scoring_fingerprint,
-                                candidates_emitted,
-                            },
-                        )),
-                    }))
-                    .await
-                }
-                (Err(e), _, _) => tx.send(Err(e)).await,
-            };
-        });
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+            Ok(Response::new(ReceiverStream::new(rx)))
         })
         .await
     }
@@ -11221,12 +11227,12 @@ impl NodeService for NodeServiceImpl {
         request: Request<Bm25RescoreRequest>,
     ) -> Result<Response<Bm25RescoreResponse>, Status> {
         crate::metrics::timed(Route::Bm25Rescore, request, |request| async move {
-        let service = self.clone();
-        let req = request.into_inner();
-        tokio::task::spawn_blocking(move || service.run_bm25_rescore(req))
-            .await
-            .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))?
-            .map(Response::new)
+            let service = self.clone();
+            let req = request.into_inner();
+            tokio::task::spawn_blocking(move || service.run_bm25_rescore(req))
+                .await
+                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))?
+                .map(Response::new)
         })
         .await
     }
@@ -11236,104 +11242,104 @@ impl NodeService for NodeServiceImpl {
         request: Request<crate::pb::FetchValuesRequest>,
     ) -> Result<Response<crate::pb::FetchValuesResponse>, Status> {
         crate::metrics::timed(Route::FetchValues, request, |request| async move {
-        let req = request.into_inner();
-        let offset = self.config.slot_offset;
-        let state = self.state.clone();
-        let resp = tokio::task::spawn_blocking(
-            move || -> Result<crate::pb::FetchValuesResponse, Status> {
-                // Stage parameters validate everywhere they arrive; a
-                // malformed stage is a request error, not a shard gap.
-                let specs = parse_score_stages(&req.stages)?;
-                let guard = state.read().expect("shard state lock poisoned");
-                let projection_leaves = {
-                    let mut leaves = Vec::new();
-                    for p in &req.projections {
-                        if let Some(expr) = p.expr.as_ref() {
-                            crate::values::column_leaves(expr, &mut leaves);
+            let req = request.into_inner();
+            let offset = self.config.slot_offset;
+            let state = self.state.clone();
+            let resp = tokio::task::spawn_blocking(
+                move || -> Result<crate::pb::FetchValuesResponse, Status> {
+                    // Stage parameters validate everywhere they arrive; a
+                    // malformed stage is a request error, not a shard gap.
+                    let specs = parse_score_stages(&req.stages)?;
+                    let guard = state.read().expect("shard state lock poisoned");
+                    let projection_leaves = {
+                        let mut leaves = Vec::new();
+                        for p in &req.projections {
+                            if let Some(expr) = p.expr.as_ref() {
+                                crate::values::column_leaves(expr, &mut leaves);
+                            }
                         }
-                    }
-                    leaves
-                };
-                // No column tables at all: this shard holds none of the
-                // candidates' values and resolves no column.
-                let Some(store) = guard.bm25.as_ref() else {
-                    return Ok(crate::pb::FetchValuesResponse {
-                        rows: Vec::new(),
-                        stage_columns_known: vec![false; req.stages.len()],
-                        projection_leaves_known: vec![false; projection_leaves.len()],
-                    });
-                };
-                let projection_leaves_known: Vec<bool> = projection_leaves
-                    .iter()
-                    .map(|leaf| crate::values::leaf_known(leaf, store))
-                    .collect();
-                // Projections resolve against this shard's tables once
-                // per request; type conflicts refuse here, by name —
-                // the same rule as the lexical route.
-                let resolved: Vec<crate::values::ResolvedValue> = req
-                    .projections
-                    .iter()
-                    .map(|p| {
-                        let expr = p.expr.as_ref().ok_or_else(|| {
-                            Status::invalid_argument("projection: empty compiled expression")
-                        })?;
-                        crate::values::resolve(expr, store).map(|(rv, _)| rv)
-                    })
-                    .collect::<Result<_, Status>>()?;
-                let chain = store.resolve_chain(&specs);
+                        leaves
+                    };
+                    // No column tables at all: this shard holds none of the
+                    // candidates' values and resolves no column.
+                    let Some(store) = guard.bm25.as_ref() else {
+                        return Ok(crate::pb::FetchValuesResponse {
+                            rows: Vec::new(),
+                            stage_columns_known: vec![false; req.stages.len()],
+                            projection_leaves_known: vec![false; projection_leaves.len()],
+                        });
+                    };
+                    let projection_leaves_known: Vec<bool> = projection_leaves
+                        .iter()
+                        .map(|leaf| crate::values::leaf_known(leaf, store))
+                        .collect();
+                    // Projections resolve against this shard's tables once
+                    // per request; type conflicts refuse here, by name —
+                    // the same rule as the lexical route.
+                    let resolved: Vec<crate::values::ResolvedValue> = req
+                        .projections
+                        .iter()
+                        .map(|p| {
+                            let expr = p.expr.as_ref().ok_or_else(|| {
+                                Status::invalid_argument("projection: empty compiled expression")
+                            })?;
+                            crate::values::resolve(expr, store).map(|(rv, _)| rv)
+                        })
+                        .collect::<Result<_, Status>>()?;
+                    let chain = store.resolve_chain(&specs);
                     let stage_columns_known =
                         chain.stages.iter().map(|s| s.column.is_some()).collect();
-                let numeric_read = ShardNumericRead(store);
-                let n = u64::from(store.next_doc_id());
-                let mut ids: Vec<u64> = req
-                    .candidate_ids
-                    .iter()
-                    .copied()
-                    .filter(|&id| {
-                        id >= offset
-                            && id - offset < n
-                            && !guard.live_docs.is_deleted((id - offset) as usize)
+                    let numeric_read = ShardNumericRead(store);
+                    let n = u64::from(store.next_doc_id());
+                    let mut ids: Vec<u64> = req
+                        .candidate_ids
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            id >= offset
+                                && id - offset < n
+                                && !guard.live_docs.is_deleted((id - offset) as usize)
+                        })
+                        .collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let rows = ids
+                        .into_iter()
+                        .map(|id| {
+                            let local = (id - offset) as u32;
+                            crate::pb::FetchedRow {
+                                doc_id: id,
+                                values: resolved
+                                    .iter()
+                                    .map(|rv| {
+                                        projected_value(
+                                            crate::values::eval(rv, local, &numeric_read),
+                                            store,
+                                        )
+                                    })
+                                    .collect(),
+                                stage_values: chain
+                                    .stages
+                                    .iter()
+                                    .map(|s| crate::pb::ProjectedValue {
+                                        value: s
+                                            .contribution(local, &numeric_read)
+                                            .map(crate::pb::projected_value::Value::DoubleValue),
+                                    })
+                                    .collect(),
+                            }
+                        })
+                        .collect();
+                    Ok(crate::pb::FetchValuesResponse {
+                        rows,
+                        stage_columns_known,
+                        projection_leaves_known,
                     })
-                    .collect();
-                ids.sort_unstable();
-                ids.dedup();
-                let rows = ids
-                    .into_iter()
-                    .map(|id| {
-                        let local = (id - offset) as u32;
-                        crate::pb::FetchedRow {
-                            doc_id: id,
-                            values: resolved
-                                .iter()
-                                .map(|rv| {
-                                    projected_value(
-                                        crate::values::eval(rv, local, &numeric_read),
-                                        store,
-                                    )
-                                })
-                                .collect(),
-                            stage_values: chain
-                                .stages
-                                .iter()
-                                .map(|s| crate::pb::ProjectedValue {
-                                    value: s
-                                        .contribution(local, &numeric_read)
-                                        .map(crate::pb::projected_value::Value::DoubleValue),
-                                })
-                                .collect(),
-                        }
-                    })
-                    .collect();
-                Ok(crate::pb::FetchValuesResponse {
-                    rows,
-                    stage_columns_known,
-                    projection_leaves_known,
-                })
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(format!("fetch values task failed: {e}")))??;
-        Ok(Response::new(resp))
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("fetch values task failed: {e}")))??;
+            Ok(Response::new(resp))
         })
         .await
     }
@@ -11343,67 +11349,67 @@ impl NodeService for NodeServiceImpl {
         request: Request<VectorRescoreRequest>,
     ) -> Result<Response<VectorRescoreResponse>, Status> {
         crate::metrics::timed(Route::VectorRescore, request, |request| async move {
-        let req = request.into_inner();
-        let offset = self.config.slot_offset;
-        let state = self.state.clone();
-        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
-            let guard = state.read().expect("shard state lock poisoned");
-            // A shard with no index holds none of the candidates.
-            let Some(index) = guard.index.as_ref() else {
-                return Ok(Vec::new());
-            };
-            let Some(dim) = index.dim_opt() else {
-                return Ok(Vec::new());
-            };
-            if req.vector.len() != dim {
-                return Err(Status::invalid_argument(format!(
-                    "query vector has dim {}, index expects {dim}",
-                    req.vector.len()
-                )));
-            }
-            if let Some((_, coord, value)) = first_invalid_coordinate(&req.vector, dim) {
-                return Err(Status::invalid_argument(format!(
-                    "query coordinate {coord} is invalid: {value}"
-                )));
-            }
-            // Route global ids into this shard's live slots; the mask
-            // names slots and is sized to the slot count (slots are
-            // dense on the mainline engine: no capacity/len split). The
-            // kernel short-circuits fully-masked SIMD blocks, so a tiny
-            // allowlist costs a mask walk, not a scan.
-            let n = index.len();
-            let mut mask = vec![false; index.len()];
-            let mut allowed = 0usize;
-            for &id in &req.candidate_ids {
-                if id >= offset && id - offset < n as u64 {
-                    let slot = (id - offset) as usize;
-                    if !guard.live_docs.is_deleted(slot) && !mask[slot] {
-                        mask[slot] = true;
-                        allowed += 1;
+            let req = request.into_inner();
+            let offset = self.config.slot_offset;
+            let state = self.state.clone();
+            let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
+                let guard = state.read().expect("shard state lock poisoned");
+                // A shard with no index holds none of the candidates.
+                let Some(index) = guard.index.as_ref() else {
+                    return Ok(Vec::new());
+                };
+                let Some(dim) = index.dim_opt() else {
+                    return Ok(Vec::new());
+                };
+                if req.vector.len() != dim {
+                    return Err(Status::invalid_argument(format!(
+                        "query vector has dim {}, index expects {dim}",
+                        req.vector.len()
+                    )));
+                }
+                if let Some((_, coord, value)) = first_invalid_coordinate(&req.vector, dim) {
+                    return Err(Status::invalid_argument(format!(
+                        "query coordinate {coord} is invalid: {value}"
+                    )));
+                }
+                // Route global ids into this shard's live slots; the mask
+                // names slots and is sized to the slot count (slots are
+                // dense on the mainline engine: no capacity/len split). The
+                // kernel short-circuits fully-masked SIMD blocks, so a tiny
+                // allowlist costs a mask walk, not a scan.
+                let n = index.len();
+                let mut mask = vec![false; index.len()];
+                let mut allowed = 0usize;
+                for &id in &req.candidate_ids {
+                    if id >= offset && id - offset < n as u64 {
+                        let slot = (id - offset) as usize;
+                        if !guard.live_docs.is_deleted(slot) && !mask[slot] {
+                            mask[slot] = true;
+                            allowed += 1;
+                        }
                     }
                 }
-            }
-            if allowed == 0 {
-                return Ok(Vec::new());
-            }
-            let results = index
-                .try_search_with_mask(&req.vector, allowed, Some(&mask))
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let hits = results
-                .indices_for_query(0)
-                .iter()
-                .zip(results.scores_for_query(0))
-                .filter(|&(&slot, _)| slot >= 0)
-                .map(|(&slot, &score)| RawLegHit {
-                    doc_id: offset + slot as u64,
-                    score,
-                })
-                .collect();
-            Ok(hits)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
-        Ok(Response::new(VectorRescoreResponse { hits }))
+                if allowed == 0 {
+                    return Ok(Vec::new());
+                }
+                let results = index
+                    .try_search_with_mask(&req.vector, allowed, Some(&mask))
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                let hits = results
+                    .indices_for_query(0)
+                    .iter()
+                    .zip(results.scores_for_query(0))
+                    .filter(|&(&slot, _)| slot >= 0)
+                    .map(|(&slot, &score)| RawLegHit {
+                        doc_id: offset + slot as u64,
+                        score,
+                    })
+                    .collect();
+                Ok(hits)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
+            Ok(Response::new(VectorRescoreResponse { hits }))
         })
         .await
     }
@@ -11516,37 +11522,37 @@ impl NodeService for NodeServiceImpl {
         request: Request<GetDocumentsRequest>,
     ) -> Result<Response<GetDocumentsResponse>, Status> {
         crate::metrics::timed(Route::GetDocuments, request, |request| async move {
-        let req = request.into_inner();
-        let offset = self.config.slot_offset;
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let mut documents = Vec::new();
-        if let Some(store) = guard.bm25.as_ref() {
-            let store = store.as_index().ok_or_else(|| {
-                Status::failed_precondition("bm25 bulk build in progress; Flush first")
-            })?;
-            for id in req.doc_ids {
-                if id < offset {
-                    continue;
-                }
-                let local = (id - offset) as u32;
-                if guard.live_docs.is_deleted(local as usize) {
-                    continue;
-                }
-                if let Some(text) = store.text(local) {
-                    documents.push(StoredDocument {
-                        doc_id: id,
-                        text,
-                        lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
-                            parent_id: l.parent_id,
-                            group_id: l.group_id,
-                            span_start: l.span_start,
-                            span_end: l.span_end,
-                        }),
-                    });
+            let req = request.into_inner();
+            let offset = self.config.slot_offset;
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let mut documents = Vec::new();
+            if let Some(store) = guard.bm25.as_ref() {
+                let store = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                for id in req.doc_ids {
+                    if id < offset {
+                        continue;
+                    }
+                    let local = (id - offset) as u32;
+                    if guard.live_docs.is_deleted(local as usize) {
+                        continue;
+                    }
+                    if let Some(text) = store.text(local) {
+                        documents.push(StoredDocument {
+                            doc_id: id,
+                            text,
+                            lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
+                                parent_id: l.parent_id,
+                                group_id: l.group_id,
+                                span_start: l.span_start,
+                                span_end: l.span_end,
+                            }),
+                        });
+                    }
                 }
             }
-        }
-        Ok(Response::new(GetDocumentsResponse { documents }))
+            Ok(Response::new(GetDocumentsResponse { documents }))
         })
         .await
     }
@@ -11556,39 +11562,39 @@ impl NodeService for NodeServiceImpl {
         request: Request<ResolveParentsRequest>,
     ) -> Result<Response<ResolveParentsResponse>, Status> {
         crate::metrics::timed(Route::ResolveParents, request, |request| async move {
-        const SELF_PARENT_TAG: u64 = 1 << 63;
-        let req = request.into_inner();
-        let offset = self.config.slot_offset;
-        let guard = self.state.read().expect("shard state lock poisoned");
-        let rows = guard
-            .index
-            .as_ref()
-            .map_or(0, |index| index.len() as u64)
-            .max(
-                guard
-                    .bm25
-                    .as_ref()
-                    .map_or(0, |store| u64::from(store.next_doc_id())),
-            );
-        let store = guard.bm25.as_ref().and_then(|store| store.as_index());
-        let mut parents = Vec::new();
-        for doc_id in req.doc_ids {
-            let Some(local) = doc_id.checked_sub(offset) else {
-                continue;
-            };
-            if local >= rows {
-                continue;
+            const SELF_PARENT_TAG: u64 = 1 << 63;
+            let req = request.into_inner();
+            let offset = self.config.slot_offset;
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let rows = guard
+                .index
+                .as_ref()
+                .map_or(0, |index| index.len() as u64)
+                .max(
+                    guard
+                        .bm25
+                        .as_ref()
+                        .map_or(0, |store| u64::from(store.next_doc_id())),
+                );
+            let store = guard.bm25.as_ref().and_then(|store| store.as_index());
+            let mut parents = Vec::new();
+            for doc_id in req.doc_ids {
+                let Some(local) = doc_id.checked_sub(offset) else {
+                    continue;
+                };
+                if local >= rows {
+                    continue;
+                }
+                if guard.live_docs.is_deleted(local as usize) {
+                    continue;
+                }
+                let parent_id = u32::try_from(local)
+                    .ok()
+                    .and_then(|local| store.and_then(|store| store.lineage(local)))
+                    .map_or(SELF_PARENT_TAG | doc_id, |lineage| lineage.parent_id);
+                parents.push(ResolvedParent { doc_id, parent_id });
             }
-            if guard.live_docs.is_deleted(local as usize) {
-                continue;
-            }
-            let parent_id = u32::try_from(local)
-                .ok()
-                .and_then(|local| store.and_then(|store| store.lineage(local)))
-                .map_or(SELF_PARENT_TAG | doc_id, |lineage| lineage.parent_id);
-            parents.push(ResolvedParent { doc_id, parent_id });
-        }
-        Ok(Response::new(ResolveParentsResponse { parents }))
+            Ok(Response::new(ResolveParentsResponse { parents }))
         })
         .await
     }
@@ -11598,11 +11604,11 @@ impl NodeService for NodeServiceImpl {
         request: Request<HybridShardRequest>,
     ) -> Result<Response<HybridShardResponse>, Status> {
         crate::metrics::timed(Route::HybridShard, request, |request| async move {
-        let service = self.clone();
-        tokio::task::spawn_blocking(move || service.run_hybrid(request.into_inner()))
-            .await
-            .map_err(|e| Status::internal(format!("hybrid task failed: {e}")))?
-            .map(Response::new)
+            let service = self.clone();
+            tokio::task::spawn_blocking(move || service.run_hybrid(request.into_inner()))
+                .await
+                .map_err(|e| Status::internal(format!("hybrid task failed: {e}")))?
+                .map(Response::new)
         })
         .await
     }
@@ -11612,57 +11618,57 @@ impl NodeService for NodeServiceImpl {
         request: Request<ShardLegsRequest>,
     ) -> Result<Response<ShardLegsResponse>, Status> {
         crate::metrics::timed(Route::ShardLegs, request, |request| async move {
-        let req = request.into_inner();
-        if req.terms.len() != req.global_doc_frequencies.len() {
-            return Err(Status::invalid_argument(
-                "terms and global_doc_frequencies must have the same length",
-            ));
-        }
-        let geo_regions = validate_geo_filters(&req.geo_filters)?;
-        if let Some(f) = req.filter.as_ref() {
-            crate::filter::validate_filter(f)?;
-        }
-        let service = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let legs = service.compute_legs(
-                &req.vector,
-                &req.terms,
-                req.global_doc_count,
-                req.global_total_doc_length,
-                &req.global_doc_frequencies,
-                params_from(req.k1, req.b)?,
-                req.k as usize,
-                req.expected_stats_epoch,
-                &LegFilters {
-                    geo: &req.geo_filters,
-                    regions: geo_regions,
-                    tree: req.filter.as_ref(),
-                },
-            )?;
-            Ok(ShardLegsResponse {
-                vector_hits: legs
-                    .vector
-                    .into_iter()
-                    .map(|(doc_id, score)| RawLegHit {
-                        doc_id,
-                        score: score as f32,
-                    })
-                    .collect(),
-                bm25_hits: legs
-                    .bm25
-                    .into_iter()
-                    .map(|(doc_id, score)| RawLegHit {
-                        doc_id,
-                        score: score as f32,
-                    })
-                    .collect(),
-                geo_columns_known: legs.geo_columns_known,
-                filter_columns_known: legs.filter_columns_known,
+            let req = request.into_inner();
+            if req.terms.len() != req.global_doc_frequencies.len() {
+                return Err(Status::invalid_argument(
+                    "terms and global_doc_frequencies must have the same length",
+                ));
+            }
+            let geo_regions = validate_geo_filters(&req.geo_filters)?;
+            if let Some(f) = req.filter.as_ref() {
+                crate::filter::validate_filter(f)?;
+            }
+            let service = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let legs = service.compute_legs(
+                    &req.vector,
+                    &req.terms,
+                    req.global_doc_count,
+                    req.global_total_doc_length,
+                    &req.global_doc_frequencies,
+                    params_from(req.k1, req.b)?,
+                    req.k as usize,
+                    req.expected_stats_epoch,
+                    &LegFilters {
+                        geo: &req.geo_filters,
+                        regions: geo_regions,
+                        tree: req.filter.as_ref(),
+                    },
+                )?;
+                Ok(ShardLegsResponse {
+                    vector_hits: legs
+                        .vector
+                        .into_iter()
+                        .map(|(doc_id, score)| RawLegHit {
+                            doc_id,
+                            score: score as f32,
+                        })
+                        .collect(),
+                    bm25_hits: legs
+                        .bm25
+                        .into_iter()
+                        .map(|(doc_id, score)| RawLegHit {
+                            doc_id,
+                            score: score as f32,
+                        })
+                        .collect(),
+                    geo_columns_known: legs.geo_columns_known,
+                    filter_columns_known: legs.filter_columns_known,
+                })
             })
-        })
-        .await
-        .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
-        .map(Response::new)
+            .await
+            .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
+            .map(Response::new)
         })
         .await
     }
