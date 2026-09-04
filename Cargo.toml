@@ -36,6 +36,21 @@ http-body = "1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+# The snapshot repository's HTTP(S) source (docs/snapshots.md): a node
+# GETs a repository from a NAS or object store itself. hyper's HTTP/1.1
+# client over hyper-util's connector is the client tonic already links;
+# http-body-util streams the response body to disk. `net` only.
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+# HTTPS for that source over the rustls stack tonic's `tls` feature
+# links (rustls 0.23 with `ring`, the provider already in the tree):
+# hyper-rustls is the connector, webpki-roots the public trust anchors,
+# rustls and rustls-pki-types add the cluster CA from `--tls-ca` to the
+# same trust store. Nothing here is a second TLS stack; `tls` only.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"], optional = true }
+webpki-roots = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [features]
 # The network stack (docs/embedded-mobile.md): tonic's HTTP/2 transport,
@@ -53,6 +68,10 @@ net = [
     "tokio-stream/net",
     "dep:tower",
     "dep:hyper-util",
+    "hyper-util/client-legacy",
+    "hyper-util/http1",
+    "dep:hyper",
+    "dep:http-body-util",
     "dep:turbovec-grpc",
 ]
 # TLS/mTLS on the gRPC listeners and the cluster-internal channels
@@ -60,7 +79,14 @@ net = [
 # binary; the embedded runtime turns it off, because it reaches its nodes
 # in-process and must not carry a TLS stack onto a phone.
 default = ["net", "tls"]
-tls = ["net", "tonic/tls"]
+tls = [
+    "net",
+    "tonic/tls",
+    "dep:hyper-rustls",
+    "dep:webpki-roots",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+]
 
 [[bin]]
 name = "pipestream-search"
@@ -83,6 +109,10 @@ bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+# The HTTPS repository test (tests/snapshot_https.rs) serves a directory
+# over TLS from the test certificates; tokio-rustls is the acceptor the
+# tree already links through tonic. TEST-ONLY.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 # The CEL differential oracle (tests/cel_filters.rs): the reference
 # interpreter the compiled ordinal path is held to agreement with,
 # wherever stock CEL is defined. TEST-ONLY by design — the serving

@@ -9,6 +9,7 @@
 //! sequences) rather than probabilistic.
 #![allow(dead_code, unused_imports)]
 
+pub mod files;
 pub mod mock;
 
 use pipestream_search::harness::{self, build_monolithic, build_shards};

@@ -149,6 +149,40 @@ service NodeService {
   // shard together, the same rule BroadcastCalibration documents.
   rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
 
+  // Publishes the shard's current generation as a snapshot repository
+  // (docs/snapshots.md): flushes, then copies every generation artifact
+  // (provider image, exact FP32 sidecar, BM25 image, live-row overlay; the
+  // segment catalog tree for the segment layout) into `directory` and
+  // writes `snapshot-manifest.json` beside them — provider descriptor,
+  // slot offset, collection, row counts, analysis fingerprints, the WAL
+  // cutoff the image contains, and every artifact's byte size and SHA-256.
+  // The copy runs under the shard's state READ lock: queries proceed,
+  // writes wait, and the hashes and the WAL cutoff describe the same
+  // bytes. A NAS path is the intended repository. A non-empty directory
+  // is refused by name (INVALID_ARGUMENT), as is a shard without a
+  // persistence path (FAILED_PRECONDITION).
+  rpc ExportSnapshot(ExportSnapshotRequest) returns (ExportSnapshotResponse);
+
+  // Streams the shard's current generation to a peer: the repository
+  // manifest first (`SnapshotChunk.repository`), then each artifact's
+  // bytes in manifest order. The node exports under its read lock exactly
+  // as ExportSnapshot does, into a private staging directory, and streams
+  // from that copy with the lock released.
+  rpc StreamSnapshot(StreamSnapshotRequest) returns (stream SnapshotChunk);
+
+  // Installs a snapshot the node fetches itself from a repository
+  // directory written by ExportSnapshot, an HTTP(S) URL serving that
+  // directory, or a peer node's StreamSnapshot. Every artifact is staged
+  // and verified against the manifest's byte size and SHA-256 before the
+  // SAME install as InstallSnapshot runs (provider identity checks
+  // included); a size or digest mismatch, a manifest whose SHA-256 differs
+  // from `expected_manifest_sha256`, a slot offset or collection other
+  // than this shard's, or a layout the shard cannot adopt is refused by
+  // name, and nothing is installed. The response carries the manifest so
+  // the caller learns the WAL cutoff the image contains (the exact clock
+  // replication catch-up resumes from).
+  rpc InstallSnapshotFrom(InstallSnapshotFromRequest) returns (InstallSnapshotResponse);
+
   // Ingests raw-text documents into the shard's BM25 postings index.
   // Client-streaming, one document per message. For each document the node
   // calls the configured analysis sidecar (Analyze, term vectors in
@@ -1237,6 +1271,11 @@ message SnapshotChunk {
     // Opaque image bytes: provider image first, then exact FP32 vectors,
     // BM25, and the live-row overlay. Senders should keep chunks around 1 MiB.
     bytes data = 2;
+    // The first frame of a `StreamSnapshot` stream: the repository
+    // manifest (docs/snapshots.md). `data` frames then carry each
+    // artifact's bytes in `artifacts` order. Never the first frame of an
+    // `InstallSnapshot` client stream, which refuses it.
+    SnapshotRepositoryManifest repository = 3;
   }
 }
 
@@ -1256,12 +1295,99 @@ message SnapshotManifest {
 
 // Result of an `InstallSnapshot` call.
 message InstallSnapshotResponse {
-  // The installed index file (inside the shard's generation directory).
+  // The installed index file (inside the shard's generation directory;
+  // the catalog root for a segment-layout install).
   string path = 1;
   // Vectors in the installed index.
   uint64 num_vectors = 2;
   // Documents in the installed BM25 sidecar (0 when none was sent).
   uint64 num_documents = 3;
+  // The repository manifest the image was installed from: set by
+  // InstallSnapshotFrom (its WAL cutoff is where catch-up resumes),
+  // absent on the InstallSnapshot client stream.
+  SnapshotRepositoryManifest manifest = 4;
+}
+
+// One artifact of a snapshot repository (docs/snapshots.md).
+message SnapshotArtifact {
+  // Path relative to the repository directory (`vector.index`,
+  // `vectors.f32`, `documents.bm25`, `live-docs.bin`, or
+  // `catalog/...` for the segment layout).
+  string file = 1;
+  uint64 bytes = 2;
+  // Lower-case hex SHA-256 of the file's bytes.
+  string sha256 = 3;
+}
+
+// The `snapshot-manifest.json` of a repository, as ExportSnapshot writes
+// it and StreamSnapshot's first frame carries it (docs/snapshots.md).
+message SnapshotRepositoryManifest {
+  uint32 format_version = 1;
+  // `single-image` or `segments`: the layout the artifacts form.
+  string layout = 2;
+  // The provider descriptor the image scores under.
+  string backend_kind = 3;
+  string scoring_fingerprint = 4;
+  uint32 dim = 5;
+  // The exporting shard's global id base and collection: an install
+  // refuses a shard whose own values differ.
+  uint64 slot_offset = 6;
+  string collection = 7;
+  // Row counts of the exported generation.
+  uint64 vector_rows = 8;
+  uint64 document_rows = 9;
+  uint64 live_rows = 10;
+  // Per-BM25-field analysis fingerprints, in field-table order.
+  repeated uint64 analysis_fingerprints = 11;
+  // The WAL cutoff the image contains: every record at or before
+  // `wal_high_watermark` of `wal_generation` is in the artifacts, so
+  // replication catch-up resumes from exactly this clock. Zero with
+  // `wal_clocked=false` when the shard has no catch-up-capable WAL.
+  uint64 wal_generation = 12;
+  uint64 wal_high_watermark = 13;
+  bool wal_clocked = 14;
+  repeated SnapshotArtifact artifacts = 15;
+}
+
+message ExportSnapshotRequest {
+  // The repository directory to write. Created when missing; refused
+  // when it holds anything.
+  string directory = 1;
+}
+
+message ExportSnapshotResponse {
+  SnapshotRepositoryManifest manifest = 1;
+  // The manifest file written, and the SHA-256 of its bytes (what
+  // `InstallSnapshotFromRequest.expected_manifest_sha256` pins).
+  string manifest_path = 2;
+  string manifest_sha256 = 3;
+  // Wall-clock milliseconds the copy held the shard's read lock: the
+  // time writes waited.
+  uint64 copy_millis = 4;
+  // Bytes copied.
+  uint64 bytes = 5;
+}
+
+message StreamSnapshotRequest {}
+
+message InstallSnapshotFromRequest {
+  oneof source {
+    // A repository directory written by ExportSnapshot, readable by the
+    // node (a NAS path).
+    string directory = 1;
+    // An HTTP(S) URL serving such a directory: the node GETs
+    // `<url>/snapshot-manifest.json` and each artifact, resuming an
+    // interrupted artifact with a `Range` request.
+    string url = 2;
+    // Another node's address: the node pulls its StreamSnapshot.
+    string peer_addr = 3;
+  }
+  // When non-empty, the lower-case hex SHA-256 the fetched manifest's
+  // bytes must have; a different digest refuses by name.
+  string expected_manifest_sha256 = 4;
+  // Sent as `Authorization: Bearer <token>` on every request of the
+  // `url` source; ignored by the other sources.
+  string bearer_token = 5;
 }
 
 // Client-facing search request.

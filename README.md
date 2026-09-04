@@ -864,6 +864,21 @@ store. An image without `vectors.f32` remains valid for provider-native
 queries but cannot serve FP32 rerank. Covered by `tests/snapshot.rs` (eight
 cases, including restart survival and crash recovery).
 
+A node can also fetch an image itself ([docs/snapshots.md](docs/snapshots.md)):
+`ExportSnapshot(directory)` copies the shard's generation to a repository
+directory (a NAS path) under the shard's read lock and writes
+`snapshot-manifest.json` — provider descriptor, slot offset, collection,
+row counts, analysis fingerprints, the WAL cutoff the image contains, and
+every artifact's size and SHA-256. `InstallSnapshotFrom` pulls such a
+repository from a `directory`, an HTTP(S) `url` (with `Range` resume and
+an optional bearer), or a `peer_addr` (the peer's `StreamSnapshot`),
+verifies every artifact against the manifest, and runs the same install;
+a tampered artifact, the wrong manifest digest, another shard's slot
+offset, or a layout the shard cannot adopt refuses by name. Both layouts
+export and install. The manifest's cutoff is where `replication::sync_once`
+resumes a replica. Covered by `tests/snapshot_repository.rs` and
+`tests/snapshot_https.rs`.
+
 Deletes and replacements use one generation-local tombstone overlay shared by
 every read path. Updates append the new row, then atomically retire the old
 row; one-child resharding compacts tombstones into a new dense generation. See
@@ -1206,6 +1221,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   `AUTO` with FP32 rerank resolves its depth through the default instead of
   running at `selection_k = k`, or refuses by name.
   Details: [Dense quality profile](docs/dense-quality-profile.md).
+- **Landed 2026-09-04: snapshot repository.** `ExportSnapshot` publishes
+  a shard's generation as a directory with a hashed manifest (WAL cutoff
+  included); `InstallSnapshotFrom` pulls it from a directory, an HTTP(S)
+  URL with `Range` resume, or a peer's `StreamSnapshot`, verifies every
+  artifact, and runs the same install; both layouts, one code path.
+  Details: [Snapshot repositories](docs/snapshots.md).
 - **Landed 2026-09-03: mmap vector index.** Sealed segment images use the
   `turbovec-pipestream-s20` mapped reader, linear large-k chunk merge, and
   bounded blocked-layout cache;

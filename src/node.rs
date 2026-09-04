@@ -46,24 +46,27 @@ use crate::pb::{
     Bm25QueryStreamResponse, Bm25RescoreRequest, Bm25RescoreResponse, Bm25StreamCompletion,
     CommitReplacementsRequest, CommitReplacementsResponse, ConfigureVectorBackendRequest,
     ConfigureVectorBackendResponse, DeleteDocumentsRequest, DeleteDocumentsResponse,
-    ExactVectorRescoreRequest, ExactVectorRescoreResponse, FloorUpdate, FlushRequest,
-    FlushResponse, GetCalibrationRequest, GetCalibrationResponse, GetDocumentsRequest,
-    GetDocumentsResponse, GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest,
-    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, IngestMappedRequest,
-    IngestMappedResponse, InstallSnapshotResponse, LexicalBitmapRequest, MembershipBitmapResponse,
-    OffsetSpan, RawLegHit, ReadWalRequest, ReadWalResponse, ResolveParentsRequest,
-    ResolveParentsResponse, ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest,
-    SearchShardResponse, SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest,
-    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
-    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermOccurrences, TermStatsRequest, TermStatsResponse,
-    VectorBackendConfig as WireVectorBackendConfig,
+    ExactVectorRescoreRequest, ExactVectorRescoreResponse, ExportSnapshotRequest,
+    ExportSnapshotResponse, FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest,
+    GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse, GetVectorBackendRequest,
+    GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
+    HybridShardResponse, IngestMappedRequest, IngestMappedResponse, InstallSnapshotFromRequest,
+    InstallSnapshotResponse, LexicalBitmapRequest, MembershipBitmapResponse, OffsetSpan, RawLegHit,
+    ReadWalRequest, ReadWalResponse, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent,
+    ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
+    SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk,
+    SnapshotManifest, StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
+    StreamSearchResponse, StreamSearchSummary, StreamSnapshotRequest, TermOccurrences,
+    TermStatsRequest, TermStatsResponse, VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorBitmapRequest,
     VectorQualityContract, VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
 use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
 use crate::segmented::SegmentedShard;
 use crate::segmented_vectors::SegmentedProvider;
+use crate::snapshot_repository::{
+    self as repo, RepositoryManifest, CATALOG_DIR, LAYOUT_SEGMENTS, LAYOUT_SINGLE_IMAGE,
+};
 use crate::vector::{
     embedded_turbovec_config, first_invalid_coordinate, legacy_calibration_config, QualityContract,
     ScoreDirection, VectorBackendConfig, VectorIndex, VectorSearchOptions, VectorStreamControl,
@@ -2748,6 +2751,59 @@ fn generation_old_dir(index_path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Where a segment-layout install parks the previous catalog during
+/// its swap (`<index path>.segments.snap-old`); see
+/// [`recover_segments_swap`].
+fn segments_old_dir(index_path: &Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".segments.snap-old");
+    PathBuf::from(p)
+}
+
+/// The private directory a `StreamSnapshot` exports into before
+/// streaming (`<index path>.snap-export-<n>/`): one per stream, removed
+/// when the stream ends.
+fn export_staging_dir(index_path: &Path) -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(format!(
+        ".snap-export-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    PathBuf::from(p)
+}
+
+/// Crash recovery for a segment-layout snapshot install, the catalog
+/// twin of [`recover_generation`]: the swap renames the live catalog to
+/// `.segments.snap-old` and the staged one into place. `snap-old`
+/// present with no live catalog means the crash fell between the two
+/// renames — the previous catalog is whole, rename it back; both present
+/// means the new catalog is live — delete the old one. Stray export
+/// staging directories are unreceived garbage and are removed.
+pub fn recover_segments_swap(index_path: &Path) {
+    let root = segments_root(index_path);
+    let old = segments_old_dir(index_path);
+    if old.exists() {
+        if root.join("segments.json").exists() {
+            let _ = std::fs::remove_dir_all(&old);
+        } else {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::rename(&old, &root);
+        }
+    }
+    if let (Some(parent), Some(name)) = (index_path.parent(), index_path.file_name()) {
+        let prefix = format!("{}.snap-export-", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+}
+
 /// Where the shard's files live: the active snapshot generation when one
 /// was installed, else the legacy `<index path>` (+`.bm25`) layout.
 /// Returns `(provider index, exact vectors, bm25)` paths.
@@ -3024,6 +3080,52 @@ fn open_wal(index: Option<&VectorIndex>, config: &NodeConfig) -> Option<WalWrite
 /// history) and the writer is dropped. Per the resharding policy, a
 /// shard without a WAL serves fine but can only be rebuilt, never
 /// resharded.
+/// Send `path` onto a snapshot stream in [`SNAPSHOT_STREAM_CHUNK`]
+/// pieces. False when the receiver hung up or the file could not be read
+/// (the receiver then sees a truncated artifact and refuses it by hash).
+async fn stream_file(tx: &mpsc::Sender<Result<SnapshotChunk, Status>>, path: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = tx
+                .send(Err(Status::internal(format!(
+                    "read {}: {e}",
+                    path.display()
+                ))))
+                .await;
+            return false;
+        }
+    };
+    let mut buf = vec![0u8; SNAPSHOT_STREAM_CHUNK];
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) => return true,
+            Ok(n) => {
+                let chunk = SnapshotChunk {
+                    payload: Some(snapshot_chunk::Payload::Data(buf[..n].to_vec())),
+                };
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return false;
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Err(Status::internal(format!(
+                        "read {}: {e}",
+                        path.display()
+                    ))))
+                    .await;
+                return false;
+            }
+        }
+    }
+}
+
+/// Snapshot stream chunk: 1 MiB keeps messages far under
+/// [`crate::MAX_MESSAGE_BYTES`] while amortizing per-message overhead.
+pub const SNAPSHOT_STREAM_CHUNK: usize = 1024 * 1024;
+
 fn wal_append_or_degrade(wal_slot: &mut Option<WalWriter>, op: wal_record::Op) {
     let Some(wal) = wal_slot.as_mut() else { return };
     if let Err(e) = wal.append(op) {
@@ -3437,10 +3539,10 @@ impl NodeServiceImpl {
         phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
         allow_missing_bm25: bool,
     ) -> Result<Self, String> {
-        let generation = config
-            .index_path
-            .as_ref()
-            .and_then(|path| recover_generation(path));
+        let generation = config.index_path.as_ref().and_then(|path| {
+            recover_segments_swap(path);
+            recover_generation(path)
+        });
 
         let mut index = match config.index_path.as_ref() {
             Some(index_path) => {
@@ -4682,39 +4784,616 @@ impl NodeServiceImpl {
         guard.parents = None;
         guard.generation = Some(snap.clone());
         guard.stats_epoch += 1;
-        // The snapshot supersedes the log: fsync and retire the current
-        // generation, open gen-(g+1) with the installed image's provider
-        // state (same bucket geometry), and mark where it came
-        // from. Records before this point describe the OLD shard
-        // contents.
-        if guard.wal.is_some() {
-            let source_generation = guard.wal.as_ref().map_or(0, WalWriter::generation);
-            // The installed image is state this fresh log does NOT
-            // contain: record it as preexisting so the reshard tool
-            // refuses a log-only replay that would drop the image.
-            let mut manifest = wal_manifest(
-                guard.index.as_ref(),
-                &self.config,
-                source_generation + 1,
-                (num_vectors, num_documents),
-            );
-            let previous = guard.wal.as_ref().expect("checked above").manifest();
-            manifest.bucket_bits = previous.bucket_bits;
-            manifest.bucket_count = previous.bucket_count;
-            let wal_err = |e: std::io::Error| Status::internal(format!("wal rotate: {e}"));
-            let wal = guard.wal.as_mut().expect("checked above");
-            wal.flush().map_err(wal_err)?;
-            *wal = WalWriter::create(&wal::wal_dir(&path), manifest).map_err(wal_err)?;
-            wal.append(wal_record::Op::Snapshot(SnapshotMarker {
-                source_generation,
-            }))
-            .map_err(wal_err)?;
-            wal.flush().map_err(wal_err)?;
-        }
+        Self::rotate_wal_after_install(
+            &mut guard,
+            &self.config,
+            &path,
+            (num_vectors, num_documents),
+        )?;
         Ok(InstallSnapshotResponse {
             path: generation_vector(&snap).display().to_string(),
             num_vectors,
             num_documents,
+            manifest: None,
+        })
+    }
+
+    /// The snapshot supersedes the log: fsync and retire the current
+    /// generation, open gen-(g+1) with the installed image's provider
+    /// state (same bucket geometry), and mark where it came from.
+    /// Records before this point describe the OLD shard contents.
+    fn rotate_wal_after_install(
+        guard: &mut ShardState,
+        config: &NodeConfig,
+        path: &Path,
+        counts: (u64, u64),
+    ) -> Result<(), Status> {
+        if guard.wal.is_none() {
+            return Ok(());
+        }
+        let source_generation = guard.wal.as_ref().map_or(0, WalWriter::generation);
+        // The installed image is state this fresh log does NOT
+        // contain: record it as preexisting so the reshard tool
+        // refuses a log-only replay that would drop the image.
+        let mut manifest =
+            wal_manifest(guard.index.as_ref(), config, source_generation + 1, counts);
+        let previous = guard.wal.as_ref().expect("checked above").manifest();
+        manifest.bucket_bits = previous.bucket_bits;
+        manifest.bucket_count = previous.bucket_count;
+        let wal_err = |e: std::io::Error| Status::internal(format!("wal rotate: {e}"));
+        let wal = guard.wal.as_mut().expect("checked above");
+        wal.flush().map_err(wal_err)?;
+        *wal = WalWriter::create(&wal::wal_dir(path), manifest).map_err(wal_err)?;
+        wal.append(wal_record::Op::Snapshot(SnapshotMarker {
+            source_generation,
+        }))
+        .map_err(wal_err)?;
+        wal.flush().map_err(wal_err)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Snapshot repository (docs/snapshots.md)
+    // -----------------------------------------------------------------
+
+    /// The layout the shard's files form: the segment catalog, or one
+    /// image plus sidecars (an installed generation is always the latter).
+    fn served_layout(guard: &ShardState) -> &'static str {
+        if guard.generation.is_none()
+            && (matches!(guard.bm25, Some(Bm25Shard::Segmented(_)))
+                || guard
+                    .index
+                    .as_ref()
+                    .is_some_and(|index| index.as_segmented().is_some()))
+        {
+            LAYOUT_SEGMENTS
+        } else {
+            LAYOUT_SINGLE_IMAGE
+        }
+    }
+
+    /// Per-field analysis fingerprints of the BM25 store, in field-table
+    /// order (empty without a store).
+    pub fn analysis_fingerprints(&self) -> Vec<u64> {
+        let guard = self.state.read().expect("shard state lock poisoned");
+        Self::analysis_fingerprints_of(&guard)
+    }
+
+    fn analysis_fingerprints_of(guard: &ShardState) -> Vec<u64> {
+        guard.bm25.as_ref().map_or_else(Vec::new, |bm25| {
+            (0..bm25.field_count())
+                .map(|f| bm25.analysis_fingerprint(f))
+                .collect()
+        })
+    }
+
+    /// Sealed immutable segments of the shard: the catalog's parts for
+    /// the segment layout, one for a disk-resident single image, zero
+    /// for a heap builder or an empty shard.
+    pub fn immutable_segments(&self) -> u32 {
+        let guard = self.state.read().expect("shard state lock poisoned");
+        match guard.bm25.as_ref() {
+            Some(Bm25Shard::Segmented(shard)) => shard.sealed_parts() as u32,
+            Some(Bm25Shard::Resident(_)) => 1,
+            _ => 0,
+        }
+    }
+
+    /// `ExportSnapshot` (`docs/snapshots.md`): flush, then copy the
+    /// current generation into `directory` under the shard's read lock
+    /// and write the manifest beside it. The read lock is what makes the
+    /// hashes, the row counts, and the WAL cutoff describe one state:
+    /// queries proceed, writes wait for the copy. A shard with a WAL is
+    /// copied only when the log holds nothing since the flush (a write
+    /// that slips in between flushes again, a bounded number of times);
+    /// a shard without one is copied under the write lock, because
+    /// nothing else can tell whether its files are current.
+    pub fn export_snapshot_blocking(
+        &self,
+        directory: &Path,
+    ) -> Result<ExportSnapshotResponse, Status> {
+        let index_path = self.config.index_path.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "shard has no persistence path (index_path); a snapshot export needs one",
+            )
+        })?;
+        if directory.as_os_str().is_empty() {
+            return Err(Status::invalid_argument("ExportSnapshot needs a directory"));
+        }
+        std::fs::create_dir_all(directory).map_err(|e| {
+            Status::internal(format!("create repository {}: {e}", directory.display()))
+        })?;
+        let entries = std::fs::read_dir(directory)
+            .map_err(|e| Status::internal(format!("read {}: {e}", directory.display())))?
+            .count();
+        if entries > 0 {
+            return Err(Status::invalid_argument(format!(
+                "repository directory {} is not empty ({entries} entries); a snapshot is \
+                 exported into an empty directory only",
+                directory.display()
+            )));
+        }
+        self.flush_index()?;
+        let started = std::time::Instant::now();
+        let mut attempts = 0u32;
+        let (manifest, bytes) = loop {
+            attempts += 1;
+            let guard = self.state.read().expect("shard state lock poisoned");
+            match guard.wal.as_ref() {
+                Some(wal) if wal.is_dirty() => {
+                    drop(guard);
+                    if attempts >= 8 {
+                        return Err(Status::aborted(format!(
+                            "shard kept writing through {attempts} flushes; a snapshot copies \
+                             a flushed generation, retry when ingest pauses"
+                        )));
+                    }
+                    self.flush_index()?;
+                    continue;
+                }
+                Some(_) => break self.export_locked(&guard, &index_path, directory)?,
+                None => {
+                    drop(guard);
+                    let guard = self.state.write().expect("shard state lock poisoned");
+                    break self.export_locked(&guard, &index_path, directory)?;
+                }
+            }
+        };
+        let copy_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let (manifest_path, manifest_sha256) = repo::write_manifest(directory, &manifest)
+            .map_err(|e| Status::internal(format!("write manifest: {e}")))?;
+        crate::postings::fsync_parent(&manifest_path)
+            .map_err(|e| Status::internal(format!("fsync {}: {e}", directory.display())))?;
+        Ok(ExportSnapshotResponse {
+            manifest: Some(manifest.to_pb()),
+            manifest_path: manifest_path.display().to_string(),
+            manifest_sha256,
+            copy_millis,
+            bytes,
+        })
+    }
+
+    /// The copy itself, under whichever lock the caller holds.
+    fn export_locked(
+        &self,
+        guard: &ShardState,
+        index_path: &Path,
+        directory: &Path,
+    ) -> Result<(RepositoryManifest, u64), Status> {
+        let layout = Self::served_layout(guard);
+        let mut sources: Vec<(String, PathBuf)> = Vec::new();
+        if layout == LAYOUT_SEGMENTS {
+            let root = segments_root(index_path);
+            for (name, path) in repo::walk_files(&root)
+                .map_err(|e| Status::internal(format!("walk {}: {e}", root.display())))?
+            {
+                sources.push((format!("{CATALOG_DIR}/{name}"), path));
+            }
+            for (name, path) in [
+                ("vector.index", index_path.to_path_buf()),
+                ("vectors.f32", exact_vector_sidecar_path(index_path)),
+                ("live-docs.bin", live_docs_sidecar_path(index_path)),
+            ] {
+                if path.is_file() {
+                    sources.push((name.to_string(), path));
+                }
+            }
+        } else {
+            let (vector, exact, bm25) = storage_paths(index_path, guard.generation.as_ref());
+            let live = live_docs_storage_path(index_path, guard.generation.as_ref());
+            for (name, path) in [
+                ("vector.index", vector),
+                ("vectors.f32", exact),
+                ("documents.bm25", bm25),
+                ("live-docs.bin", live),
+            ] {
+                if path.is_file() {
+                    sources.push((name.to_string(), path));
+                }
+            }
+        }
+        let mut artifacts = Vec::with_capacity(sources.len());
+        let mut bytes = 0u64;
+        for (name, source) in &sources {
+            let artifact = repo::copy_and_hash(source, &directory.join(name), name)
+                .map_err(|e| Status::internal(format!("copy {}: {e}", source.display())))?;
+            bytes += artifact.bytes;
+            artifacts.push(artifact);
+        }
+        let mut synced = std::collections::BTreeSet::new();
+        for artifact in &artifacts {
+            let path = directory.join(&artifact.file);
+            if let Some(parent) = path.parent() {
+                if synced.insert(parent.to_path_buf()) {
+                    crate::postings::fsync_parent(&path).map_err(|e| {
+                        Status::internal(format!("fsync {}: {e}", parent.display()))
+                    })?;
+                }
+            }
+        }
+        let (backend_kind, scoring_fingerprint, dim) = match guard.index.as_ref() {
+            Some(index) => {
+                let descriptor = index.descriptor();
+                (
+                    descriptor.backend_kind,
+                    descriptor.scoring_fingerprint,
+                    index.dim_opt().unwrap_or(0) as u32,
+                )
+            }
+            None => (self.config.vector_backend.clone(), String::new(), 0),
+        };
+        let physical = physical_rows(guard);
+        let deleted = guard.live_docs.deleted_count().min(physical);
+        let (wal_generation, wal_high_watermark, wal_clocked) =
+            guard.wal.as_ref().map_or((0, 0, false), |wal| {
+                (
+                    wal.generation(),
+                    wal.high_watermark(),
+                    !wal.has_legacy_clock_records(),
+                )
+            });
+        Ok((
+            RepositoryManifest {
+                format_version: repo::FORMAT_VERSION,
+                layout: layout.to_string(),
+                backend_kind,
+                scoring_fingerprint,
+                dim,
+                slot_offset: self.config.slot_offset,
+                collection: self.config.collection.clone(),
+                vector_rows: guard.index.as_ref().map_or(0, |i| i.len() as u64),
+                document_rows: guard
+                    .bm25
+                    .as_ref()
+                    .map_or(0, |b| u64::from(b.next_doc_id())),
+                live_rows: physical - deleted,
+                analysis_fingerprints: Self::analysis_fingerprints_of(guard),
+                wal_generation,
+                wal_high_watermark,
+                wal_clocked,
+                artifacts,
+            },
+            bytes,
+        ))
+    }
+
+    /// Stage a repository directory into the staging generation dir:
+    /// the manifest and every artifact it names, copied as they are.
+    /// Verification happens in [`Self::install_staged_repository`].
+    fn stage_from_directory(
+        source: &Path,
+        tmp_dir: &Path,
+    ) -> Result<(RepositoryManifest, String), Status> {
+        let (manifest, sha) = repo::read_manifest(source).map_err(|e| {
+            Status::invalid_argument(format!("repository {}: {e}", source.display()))
+        })?;
+        let io_err = |what: &Path, e: std::io::Error| {
+            Status::internal(format!("stage {}: {e}", what.display()))
+        };
+        std::fs::create_dir_all(tmp_dir).map_err(|e| io_err(tmp_dir, e))?;
+        std::fs::copy(
+            source.join(repo::MANIFEST_FILE),
+            tmp_dir.join(repo::MANIFEST_FILE),
+        )
+        .map_err(|e| io_err(&source.join(repo::MANIFEST_FILE), e))?;
+        for artifact in &manifest.artifacts {
+            let from = source.join(&artifact.file);
+            let to = tmp_dir.join(&artifact.file);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+            }
+            std::fs::copy(&from, &to).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "artifact {:?} is unreadable at {}: {e}",
+                    artifact.file,
+                    from.display()
+                ))
+            })?;
+        }
+        Ok((manifest, sha))
+    }
+
+    /// Verify a staged repository against its manifest and install it
+    /// through the layout's install path (the single-image path is the
+    /// same [`Self::apply_snapshot`] the client stream takes). Refuses,
+    /// by name and before touching the live shard: a size or digest
+    /// mismatch, another shard's slot offset or collection, a layout
+    /// this shard cannot adopt.
+    pub fn install_staged_repository(
+        &self,
+        tmp_dir: &Path,
+        manifest: &RepositoryManifest,
+    ) -> Result<InstallSnapshotResponse, Status> {
+        repo::verify_artifacts(tmp_dir, manifest).map_err(Status::invalid_argument)?;
+        if manifest.slot_offset != self.config.slot_offset {
+            return Err(Status::failed_precondition(format!(
+                "snapshot was exported from a shard at slot offset {}, this shard serves {}; \
+                 a repository image installs only on the shard it describes",
+                manifest.slot_offset, self.config.slot_offset
+            )));
+        }
+        if manifest.collection != self.config.collection {
+            return Err(Status::failed_precondition(format!(
+                "snapshot belongs to collection {:?}, this shard serves {:?}",
+                manifest.collection, self.config.collection
+            )));
+        }
+        if manifest.layout == LAYOUT_SEGMENTS {
+            return self.apply_segment_snapshot(tmp_dir, manifest);
+        }
+        if manifest.artifact("vector.index").is_none() {
+            return Err(Status::failed_precondition(
+                "snapshot has no provider image (vector.index); a single-image install needs one",
+            ));
+        }
+        {
+            let guard = self.state.read().expect("shard state lock poisoned");
+            if Self::served_layout(&guard) == LAYOUT_SEGMENTS && physical_rows(&guard) > 0 {
+                return Err(Status::failed_precondition(format!(
+                    "this shard serves a segment catalog with {} rows; a single-image snapshot \
+                     installs only on a single-image shard or an empty one (layouts do not mix)",
+                    physical_rows(&guard)
+                )));
+            }
+        }
+        let mut response = self.apply_snapshot(
+            tmp_dir,
+            manifest.artifact("vectors.f32").is_some(),
+            manifest.artifact("documents.bm25").is_some(),
+            manifest.artifact("live-docs.bin").is_some(),
+        )?;
+        response.manifest = Some(manifest.to_pb());
+        Ok(response)
+    }
+
+    /// Install a staged segment-catalog snapshot: validate the catalog
+    /// and the shard-level sidecars, then swap the catalog directory into
+    /// place with one rename (the previous catalog goes aside first, the
+    /// crash window is covered by [`recover_segments_swap`]) and reopen
+    /// the segmented shard over it. The shard-level exact-vector and
+    /// live-row sidecars move after the catalog; a crash between the two
+    /// leaves a catalog whose sidecars disagree with it, which the next
+    /// open refuses by name rather than serving.
+    fn apply_segment_snapshot(
+        &self,
+        tmp_dir: &Path,
+        manifest: &RepositoryManifest,
+    ) -> Result<InstallSnapshotResponse, Status> {
+        let path = self
+            .config
+            .index_path
+            .as_ref()
+            .expect("handler requires index_path")
+            .clone();
+        if self.config.layout != Layout::Segments {
+            return Err(Status::failed_precondition(
+                "this shard is configured --layout=single-image; a segment-catalog snapshot \
+                 installs only on a segment-layout shard",
+            ));
+        }
+        {
+            let guard = self.state.read().expect("shard state lock poisoned");
+            if guard.generation.is_some() {
+                return Err(Status::failed_precondition(
+                    "this shard serves an installed single-image generation; a segment-catalog \
+                     snapshot installs only on a segment-layout shard (layouts do not mix)",
+                ));
+            }
+        }
+        let catalog_tmp = tmp_dir.join(CATALOG_DIR);
+        if !catalog_tmp.join("segments.json").exists() {
+            return Err(Status::invalid_argument(
+                "segment-layout snapshot has no catalog/segments.json",
+            ));
+        }
+        let staged = crate::segments::OpenedSegmentSet::open_with(
+            &catalog_tmp,
+            self.config.vector_load(),
+        )
+        .map_err(|e| Status::invalid_argument(format!("snapshot catalog is invalid: {e}")))?;
+        let incoming = (0..staged.len())
+            .find_map(|i| staged.vector(i))
+            .map(|vector| vector.descriptor());
+        let vector_tmp = tmp_dir.join("vector.index");
+        let exact_tmp = tmp_dir.join("vectors.f32");
+        let live_tmp = tmp_dir.join("live-docs.bin");
+        let plain_image = if vector_tmp.exists() {
+            let mut loaded =
+                VectorIndex::load(&self.config.vector_backend, &vector_tmp).map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "snapshot is not a valid vector backend image: {e}"
+                    ))
+                })?;
+            loaded
+                .prepare()
+                .map_err(|e| Status::invalid_argument(format!("snapshot image: {e}")))?;
+            Some(loaded)
+        } else {
+            None
+        };
+        let incoming = incoming.or_else(|| plain_image.as_ref().map(|i| i.descriptor()));
+        {
+            let guard = self.state.read().expect("shard state lock poisoned");
+            let serving_kind = guard
+                .index
+                .as_ref()
+                .map(|index| index.descriptor().backend_kind)
+                .or_else(|| {
+                    guard
+                        .wal
+                        .as_ref()
+                        .map(|wal| wal.manifest().vector_backend.clone())
+                        .filter(|kind| !kind.is_empty())
+                });
+            if let (Some(kind), Some(incoming)) = (serving_kind, incoming.as_ref()) {
+                if kind != incoming.backend_kind {
+                    return Err(Status::failed_precondition(format!(
+                        "snapshot image is a {:?} image but this shard serves {kind:?}; a \
+                         snapshot installs only from the same provider",
+                        incoming.backend_kind
+                    )));
+                }
+            }
+            if let (Some(serving), Some(incoming)) = (
+                guard.index.as_ref().map(|index| index.descriptor()),
+                incoming.as_ref(),
+            ) {
+                if serving.scoring_fingerprint != incoming.scoring_fingerprint {
+                    return Err(Status::failed_precondition(format!(
+                        "snapshot image scores under {}/{} but this shard serves {}/{}; a \
+                         snapshot installs only from the same provider state (calibration \
+                         included), or the fleet would score in two spaces",
+                        incoming.backend_kind,
+                        incoming.scoring_fingerprint,
+                        serving.backend_kind,
+                        serving.scoring_fingerprint
+                    )));
+                }
+            }
+        }
+        if exact_tmp.exists() {
+            let exact = ExactVectorStore::open(&exact_tmp).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "snapshot sidecar is not a valid exact-vector store: {e}"
+                ))
+            })?;
+            exact.verify_payload().map_err(|e| {
+                Status::invalid_argument(format!(
+                    "snapshot exact-vector integrity check failed: {e}"
+                ))
+            })?;
+        }
+        let incoming_live = if live_tmp.exists() {
+            LiveDocs::open(&live_tmp).map_err(|e| {
+                Status::invalid_argument(format!("snapshot live-row overlay is invalid: {e}"))
+            })?
+        } else {
+            LiveDocs::default()
+        };
+        let staged_rows: u64 = staged
+            .manifest()
+            .segments
+            .iter()
+            .map(|segment| segment.rows)
+            .sum::<u64>()
+            .max(plain_image.as_ref().map_or(0, |i| i.len() as u64));
+        if incoming_live.persisted_rows() > staged_rows {
+            return Err(Status::invalid_argument(
+                "snapshot live-row overlay exceeds every aligned artifact's row count",
+            ));
+        }
+        drop(staged);
+        drop(plain_image);
+
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        if let (Some(index), Some(incoming)) = (guard.index.as_ref(), incoming.as_ref()) {
+            let current = index.descriptor();
+            if current.backend_kind != incoming.backend_kind
+                || current.scoring_fingerprint != incoming.scoring_fingerprint
+            {
+                return Err(Status::failed_precondition(
+                    "snapshot vector backend or scoring fingerprint differs from the \
+                     generation locked on this shard; mixed native scores are not mergeable",
+                ));
+            }
+        }
+        let root = segments_root(&path);
+        let old = segments_old_dir(&path);
+        crate::postings::fsync_parent(&catalog_tmp.join("segments.json"))
+            .map_err(|e| Status::internal(format!("fsync staging {}: {e}", tmp_dir.display())))?;
+        let _ = std::fs::remove_dir_all(&old);
+        if root.exists() {
+            std::fs::rename(&root, &old)
+                .map_err(|e| Status::internal(format!("retire {}: {e}", old.display())))?;
+        }
+        if let Err(e) = std::fs::rename(&catalog_tmp, &root) {
+            if old.exists() && !root.exists() {
+                let _ = std::fs::rename(&old, &root);
+            }
+            return Err(Status::internal(format!("install {}: {e}", root.display())));
+        }
+        for (tmp, dst) in [
+            (vector_tmp, path.clone()),
+            (exact_tmp, exact_vector_sidecar_path(&path)),
+            (live_tmp, live_docs_sidecar_path(&path)),
+        ] {
+            if tmp.exists() {
+                std::fs::rename(&tmp, &dst)
+                    .map_err(|e| Status::internal(format!("install {}: {e}", dst.display())))?;
+            } else if dst.exists() {
+                std::fs::remove_file(&dst)
+                    .map_err(|e| Status::internal(format!("retire {}: {e}", dst.display())))?;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&old);
+        let _ = std::fs::remove_dir_all(tmp_dir);
+        crate::postings::fsync_parent(&root)
+            .map_err(|e| Status::internal(format!("fsync {}: {e}", root.display())))?;
+
+        // Reopen over the installed files, the way `open` does at start.
+        let tail = heap_store(&self.config).map_err(Status::failed_precondition)?;
+        let shard = SegmentedShard::open_with(&root, tail, self.config.vector_load())
+            .map_err(|e| Status::internal(format!("open installed catalog: {e}")))?;
+        let set = shard.snapshot().clone();
+        let index = if path.exists() {
+            let mut loaded = VectorIndex::load(&self.config.vector_backend, &path)
+                .map_err(|e| Status::internal(format!("open installed {}: {e}", path.display())))?;
+            loaded
+                .prepare()
+                .map_err(|e| Status::internal(format!("prepare {}: {e}", path.display())))?;
+            Some(loaded)
+        } else if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
+            let backend = first
+                .backend_config()
+                .map_err(|e| Status::internal(format!("segment vector backend: {e}")))?;
+            let dim = first
+                .dim_opt()
+                .ok_or_else(|| Status::internal("segment vector image has no dimension"))?;
+            let tail_image = VectorIndex::from_backend_config(dim, &backend)
+                .map_err(|e| Status::internal(format!("segment tail image: {e}")))?;
+            let provider = SegmentedProvider::open(set, tail_image)
+                .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
+            Some(VectorIndex::from_provider(provider))
+        } else {
+            None
+        };
+        let exact_path = exact_vector_sidecar_path(&path);
+        let exact_vectors = if exact_path.exists() {
+            Some(ExactVectorStore::open(&exact_path).map_err(|e| {
+                Status::internal(format!("open installed {}: {e}", exact_path.display()))
+            })?)
+        } else {
+            None
+        };
+        let live_path = live_docs_sidecar_path(&path);
+        let live_docs = if live_path.exists() {
+            LiveDocs::open(&live_path).map_err(|e| {
+                Status::internal(format!("open installed {}: {e}", live_path.display()))
+            })?
+        } else {
+            LiveDocs::default()
+        };
+        let num_documents = shard.doc_count();
+        let num_vectors = index.as_ref().map_or(0, |i| i.len() as u64);
+        guard.mapped_binding = shard.binding().cloned();
+        guard.bm25 = Some(Bm25Shard::Segmented(shard));
+        guard.index = index;
+        guard.exact_vectors = exact_vectors;
+        guard.live_docs = live_docs;
+        guard.parents = None;
+        guard.generation = None;
+        guard.stats_epoch += 1;
+        Self::rotate_wal_after_install(
+            &mut guard,
+            &self.config,
+            &path,
+            (num_vectors, num_documents),
+        )?;
+        Ok(InstallSnapshotResponse {
+            path: root.display().to_string(),
+            num_vectors,
+            num_documents,
+            manifest: Some(manifest.to_pb()),
         })
     }
 
@@ -7906,6 +8585,7 @@ impl NodeService for NodeServiceImpl {
     type StreamSearchStream = ReceiverStream<Result<StreamSearchResponse, Status>>;
     type Bm25QueryStreamStream = ReceiverStream<Result<Bm25QueryStreamResponse, Status>>;
     type ReadWalStream = ReceiverStream<Result<ReadWalResponse, Status>>;
+    type StreamSnapshotStream = ReceiverStream<Result<SnapshotChunk, Status>>;
 
     async fn search_shard(
         &self,
@@ -9609,6 +10289,127 @@ impl NodeService for NodeServiceImpl {
         if result.is_err() {
             // Rejected AFTER receive (bad image, calibration mismatch):
             // leave no staging dir behind either.
+            let _ = tokio::fs::remove_dir_all(&cleanup).await;
+        }
+        result.map(Response::new)
+    }
+
+    async fn export_snapshot(
+        &self,
+        request: Request<ExportSnapshotRequest>,
+    ) -> Result<Response<ExportSnapshotResponse>, Status> {
+        let directory = PathBuf::from(request.into_inner().directory);
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.export_snapshot_blocking(&directory))
+            .await
+            .map_err(|e| Status::internal(format!("export task failed: {e}")))?
+            .map(Response::new)
+    }
+
+    async fn stream_snapshot(
+        &self,
+        _request: Request<StreamSnapshotRequest>,
+    ) -> Result<Response<Self::StreamSnapshotStream>, Status> {
+        let path = self.config.index_path.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "shard has no persistence path (index_path); a snapshot export needs one",
+            )
+        })?;
+        let staging = export_staging_dir(&path);
+        let service = self.clone();
+        let dir = staging.clone();
+        let exported = tokio::task::spawn_blocking(move || service.export_snapshot_blocking(&dir))
+            .await
+            .map_err(|e| Status::internal(format!("export task failed: {e}")))?;
+        let exported = match exported {
+            Ok(exported) => exported,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                return Err(e);
+            }
+        };
+        let manifest = exported
+            .manifest
+            .ok_or_else(|| Status::internal("export produced no manifest"))?;
+        let artifacts: Vec<PathBuf> = manifest
+            .artifacts
+            .iter()
+            .map(|artifact| staging.join(&artifact.file))
+            .collect();
+        let (tx, rx) = mpsc::channel::<Result<SnapshotChunk, Status>>(2);
+        tokio::spawn(async move {
+            let first = SnapshotChunk {
+                payload: Some(snapshot_chunk::Payload::Repository(manifest)),
+            };
+            if tx.send(Ok(first)).await.is_ok() {
+                for artifact in artifacts {
+                    if !stream_file(&tx, &artifact).await {
+                        break;
+                    }
+                }
+            }
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn install_snapshot_from(
+        &self,
+        request: Request<InstallSnapshotFromRequest>,
+    ) -> Result<Response<InstallSnapshotResponse>, Status> {
+        use crate::pb::install_snapshot_from_request::Source;
+        let path = self.config.index_path.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "shard has no persistence path (index_path); a snapshot install IS persistence",
+            )
+        })?;
+        let req = request.into_inner();
+        let source = req.source.ok_or_else(|| {
+            Status::invalid_argument(
+                "InstallSnapshotFrom needs a source: directory, url, or peer_addr",
+            )
+        })?;
+        let tmp_dir = generation_tmp_dir(&path);
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        let staged = match source {
+            Source::Directory(directory) => {
+                let staging = tmp_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    Self::stage_from_directory(Path::new(&directory), &staging)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("stage task failed: {e}")))?
+            }
+            #[cfg(feature = "net")]
+            Source::Url(url) => {
+                crate::snapshot::stage_from_url(&url, &req.bearer_token, &tmp_dir).await
+            }
+            #[cfg(feature = "net")]
+            Source::PeerAddr(peer) => crate::snapshot::stage_from_peer(&peer, &tmp_dir).await,
+            #[cfg(not(feature = "net"))]
+            Source::Url(_) | Source::PeerAddr(_) => Err(Status::failed_precondition(
+                "this build has no network stack (feature `net` is off); install from a directory",
+            )),
+        };
+        let (manifest, sha) = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = repo::check_expected_sha(&req.expected_manifest_sha256, &sha) {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            return Err(Status::invalid_argument(e));
+        }
+        let service = self.clone();
+        let cleanup = tmp_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            service.install_staged_repository(&tmp_dir, &manifest)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
+        if result.is_err() {
             let _ = tokio::fs::remove_dir_all(&cleanup).await;
         }
         result.map(Response::new)

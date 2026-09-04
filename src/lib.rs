@@ -69,6 +69,7 @@ pub mod segments;
 pub mod sha256;
 #[cfg(feature = "net")]
 pub mod snapshot;
+pub mod snapshot_repository;
 pub mod stats_cache;
 mod stream_signal;
 pub mod values;

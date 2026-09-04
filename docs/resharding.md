@@ -116,6 +116,14 @@ generation directories, recover interrupted swaps at startup. A node
 that installs a resharded image rotates its WAL to a fresh generation
 and logs on from there.
 
+Since 2026-09-04 a node can also fetch an image itself
+(`docs/snapshots.md`): `ExportSnapshot` publishes a shard's generation
+to a directory with a hashed manifest that records the WAL cutoff the
+image contains, and `InstallSnapshotFrom` pulls such a repository from a
+directory, an HTTP(S) URL, or a peer node's `StreamSnapshot`, verifies
+every artifact, and runs the same install. The cutoff in the manifest is
+the clock replica catch-up (`replication::sync_once`) resumes from.
+
 ### Hot shard map and write barrier
 
 The coordinator loads a versioned map (`--shard-map=file.toml`): a generation
