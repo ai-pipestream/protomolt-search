@@ -596,9 +596,12 @@ candidates = {ROWS}
         QueryStreamPhase::Final
     );
 
-    node.delete_documents(DeleteDocumentsRequest { doc_ids: vec![63] })
-        .await
-        .unwrap();
+    node.delete_documents(DeleteDocumentsRequest {
+        expected_wal_generation: None,
+        doc_ids: vec![63],
+    })
+    .await
+    .unwrap();
     let err = query(&coordinator, measured_request).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(

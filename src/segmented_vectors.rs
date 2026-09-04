@@ -275,6 +275,10 @@ impl VectorProvider for SegmentedProvider {
             .dimension()
             .ok_or_else(|| VectorError::new("segmented index has no dimension yet"))?;
         let nq = queries.len().checked_div(dim).unwrap_or(0);
+        // A tie-complete scan asks for `usize::MAX` rows; no query can
+        // return more than every row, and the embedded image clamps the
+        // same way, so the result shape is bounded by the shard.
+        let k = k.min(self.len());
         let mut per_query: Vec<Vec<(f32, i64)>> = vec![Vec::new(); nq];
         for (base, rows, image) in self.images() {
             let allow: Option<Vec<bool>> = match options.allow {

@@ -987,6 +987,7 @@ async fn the_measurement_refuses_shapes_it_cannot_certify() {
         .unwrap()
         .delete_documents(DeleteDocumentsRequest {
             doc_ids: vec![4095],
+            expected_wal_generation: None,
         })
         .await
         .unwrap();

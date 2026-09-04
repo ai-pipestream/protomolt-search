@@ -58,13 +58,19 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     node.flush(FlushRequest {}).await.unwrap();
 
     let deleted = node
-        .delete_documents(DeleteDocumentsRequest { doc_ids: vec![0] })
+        .delete_documents(DeleteDocumentsRequest {
+            expected_wal_generation: None,
+            doc_ids: vec![0],
+        })
         .await
         .unwrap()
         .into_inner();
     assert_eq!((deleted.deleted, deleted.already_deleted), (1, 0));
     let idempotent = node
-        .delete_documents(DeleteDocumentsRequest { doc_ids: vec![0] })
+        .delete_documents(DeleteDocumentsRequest {
+            expected_wal_generation: None,
+            doc_ids: vec![0],
+        })
         .await
         .unwrap()
         .into_inner();
@@ -177,6 +183,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     .unwrap();
     let incomplete = node
         .commit_replacements(CommitReplacementsRequest {
+            expected_wal_generation: None,
             replacements: vec![Replacement {
                 old_doc_id: 1,
                 new_doc_id: 4,
@@ -194,6 +201,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     .unwrap();
     let replacement = node
         .commit_replacements(CommitReplacementsRequest {
+            expected_wal_generation: None,
             replacements: vec![Replacement {
                 old_doc_id: 1,
                 new_doc_id: 4,
@@ -208,6 +216,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     );
     let replacement_retry = node
         .commit_replacements(CommitReplacementsRequest {
+            expected_wal_generation: None,
             replacements: vec![Replacement {
                 old_doc_id: 1,
                 new_doc_id: 4,

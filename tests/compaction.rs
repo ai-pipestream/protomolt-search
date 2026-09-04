@@ -1,0 +1,1284 @@
+//! Online compaction (`docs/mutations.md`): a shard keeps taking writes
+//! while `CompactShard` rebuilds it dense, tails the log into the
+//! rebuild, and cuts over under one brief write lock — on both layouts.
+//!
+//! Pinned here:
+//!
+//! - Writes are not frozen: a concurrent task appends, deletes, and
+//!   replaces through the public RPCs for the whole compaction; its
+//!   calls complete in a small fraction of the compaction's wall time,
+//!   and the tail applied its records (`tail_records_applied > 0`).
+//! - The write-lock hold is bounded (< 500 ms on this fixture) and
+//!   reported; the work directory is gone afterwards; the old generation
+//!   is gone; the rewritten WAL generation is full history.
+//! - A quiescent second compaction reclaims every tombstone: `Health`
+//!   shows `deleted_docs = 0` and live rows equal to the tracked set.
+//! - Every read path (lexical, dense, hybrid, facets, sorted browse,
+//!   fetch, parents) equals a shard freshly built from the same FINAL
+//!   document set, compared by stable text with scores bitwise; a reopen
+//!   from disk equals; the rewritten generation replays to the same
+//!   shard; a cursor minted before the cutover refuses by name.
+//! - Distributed equals monolithic with an untouched second shard.
+//! - The refusal table, the snapshot-during-compaction abort, the dry
+//!   run, and the rollback of an interrupted cutover.
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService;
+use pipestream_search::pb::{
+    search_query, selection_query, snapshot_chunk, AddDocumentsRequest, AddVectorsRequest,
+    Bm25SearchRequest, BrowseShardRequest, BrowseSort, CommitReplacementsRequest,
+    CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest, DenseQuery, DocLineage,
+    FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest, HybridSearchRequest,
+    IntegerValue, QueryRequest, Replacement, ResolveParentsRequest, SearchQuery, SearchRequest,
+    SelectionQuery, SetCalibrationRequest, SnapshotChunk, SnapshotManifest,
+};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Channel;
+use tonic::Request;
+
+use common::mock::start_mock_analysis;
+use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
+
+/// Rows ingested before the first compaction.
+const N: usize = 1_200;
+const GROUPS: [&str; 3] = ["red", "green", "blue"];
+const EXTRAS: [&str; 4] = ["one", "two", "three", "four"];
+const SEED: u64 = 0xC0A5_7A11;
+
+fn tempdir(tag: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("protomolt_compaction_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn config(index_path: Option<PathBuf>, layout: Layout, analysis: &str) -> NodeConfig {
+    NodeConfig {
+        index_path,
+        analysis_addr: Some(analysis.to_string()),
+        wal: true,
+        wal_buckets: 8,
+        layout,
+        facet_fields: vec!["grp".into()],
+        integer_fields: vec!["num".into()],
+        ..Default::default()
+    }
+}
+
+/// One product row: its stable key, text (unique per row, so hits map
+/// across renumbering by text), columns, and vector.
+#[derive(Clone, Debug, PartialEq)]
+struct Row {
+    key: String,
+    text: String,
+    num: i64,
+    grp: &'static str,
+    vector: Vec<f32>,
+}
+
+fn row(i: usize, revised: bool) -> Row {
+    let grp = GROUPS[i % GROUPS.len()];
+    let vector = unit_vectors(1, DIM, SEED.wrapping_add(i as u64 * 7919 + revised as u64));
+    Row {
+        key: format!("row/{i}{}", if revised { "/v2" } else { "" }),
+        text: if revised {
+            format!("row{i} common {grp} revised")
+        } else {
+            format!("row{i} common {grp} {}", EXTRAS[i % EXTRAS.len()])
+        },
+        num: i as i64 * 2 + revised as i64,
+        grp,
+        vector,
+    }
+}
+
+async fn client(addr: &str) -> NodeServiceClient<Channel> {
+    NodeServiceClient::connect(addr.to_string()).await.unwrap()
+}
+
+async fn calibrate(addr: &str, shift: &[f32], scale: &[f32]) {
+    client(addr)
+        .await
+        .set_calibration(SetCalibrationRequest {
+            dim: DIM as u32,
+            bit_width: BIT_WIDTH as u32,
+            shift: shift.to_vec(),
+            scale: scale.to_vec(),
+        })
+        .await
+        .unwrap();
+}
+
+/// Append one row with its stable key on both legs (the routed
+/// replication path: one document, then its vector, keyed), and return
+/// its global id with the WAL generation that id belongs to. The two
+/// calls can straddle a compaction cutover: the document is then
+/// answered with an old-generation id and the vector with the new one,
+/// and the row sits at the vector's id in the new generation (the tail
+/// applied the document at the shadow's tip, where the vector landed).
+async fn append(client: &mut NodeServiceClient<Channel>, row: &Row) -> (u64, u64) {
+    let doc = AddDocumentsRequest {
+        text: row.text.clone(),
+        lineage: Some(DocLineage {
+            parent_id: row.num as u64,
+            ..Default::default()
+        }),
+        facets: vec![FacetValue {
+            field: "grp".into(),
+            value: row.grp.to_string(),
+        }],
+        integers: vec![IntegerValue {
+            field: "num".into(),
+            value: row.num,
+        }],
+        ..Default::default()
+    };
+    let mut request = Request::new(tokio_stream::iter([doc]));
+    request.metadata_mut().insert_bin(
+        "x-protomolt-stable-key-bin",
+        tonic::metadata::MetadataValue::from_bytes(row.key.as_bytes()),
+    );
+    let documents = client.add_documents(request).await.unwrap().into_inner();
+    let mut request = Request::new(tokio_stream::iter([AddVectorsRequest {
+        vectors: row.vector.clone(),
+        dim: DIM as u32,
+    }]));
+    request.metadata_mut().insert_bin(
+        "x-protomolt-stable-key-bin",
+        tonic::metadata::MetadataValue::from_bytes(row.key.as_bytes()),
+    );
+    let vectors = client.add_vectors(request).await.unwrap().into_inner();
+    if documents.wal_generation == vectors.wal_generation {
+        assert_eq!(
+            documents.first_id, vectors.first_id,
+            "document and vector legs must land at one id"
+        );
+    }
+    (vectors.first_id, vectors.wal_generation)
+}
+
+/// The product's view of the shard: live rows by key, and the global
+/// id each live row currently has.
+#[derive(Default)]
+struct Tracked {
+    live: BTreeMap<String, Row>,
+    /// `(global id, WAL generation the id belongs to)`.
+    ids: BTreeMap<String, (u64, u64)>,
+}
+
+async fn seed_shard(addr: &str, shift: &[f32], scale: &[f32]) -> Tracked {
+    calibrate(addr, shift, scale).await;
+    let mut client = client(addr).await;
+    let mut tracked = Tracked::default();
+    for i in 0..N {
+        let row = row(i, false);
+        let id = append(&mut client, &row).await;
+        tracked.ids.insert(row.key.clone(), id);
+        tracked.live.insert(row.key.clone(), row);
+    }
+    // Deletes: every seventh row, claiming the generation the ids came
+    // from (0: a fresh shard's first generation is claimable too).
+    let doomed: Vec<u64> = (0..N)
+        .filter(|i| i % 7 == 0)
+        .map(|i| tracked.ids[&row(i, false).key].0)
+        .collect();
+    let deleted = client
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: doomed,
+            expected_wal_generation: Some(0),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.deleted as usize, N.div_ceil(7));
+    for i in (0..N).filter(|i| i % 7 == 0) {
+        let key = row(i, false).key;
+        tracked.live.remove(&key);
+        tracked.ids.remove(&key);
+    }
+    // Replacements: append the revision, then retire the original.
+    for i in [5usize, 11, 23, 100, 611] {
+        let old = row(i, false);
+        let new = row(i, true);
+        let new_id = append(&mut client, &new).await;
+        let committed = client
+            .commit_replacements(CommitReplacementsRequest {
+                replacements: vec![Replacement {
+                    old_doc_id: tracked.ids[&old.key].0,
+                    new_doc_id: new_id.0,
+                }],
+                expected_wal_generation: Some(0),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(committed.committed, 1);
+        tracked.live.remove(&old.key);
+        tracked.ids.remove(&old.key);
+        tracked.ids.insert(new.key.clone(), new_id);
+        tracked.live.insert(new.key.clone(), new);
+    }
+    client.flush(FlushRequest {}).await.unwrap();
+    tracked
+}
+
+/// What the concurrent writer did while compaction ran.
+#[derive(Default, Debug)]
+struct WriterStats {
+    calls: u64,
+    max_call: Duration,
+    /// Id-addressed mutations the writer withheld or the node refused
+    /// because the cutover renumbered the rows they named.
+    stale: u64,
+}
+
+fn is_stale_generation(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().contains("stale WAL generation")
+}
+
+/// Keep writing through the public RPCs until told to stop: appends,
+/// with every fifth append followed by a delete of an earlier one and
+/// every seventh by a replacement. Tracks the product's view.
+async fn writer(
+    addr: String,
+    tracked: Arc<Mutex<Tracked>>,
+    stop: Arc<AtomicBool>,
+    start_at: usize,
+) -> WriterStats {
+    let mut client = client(&addr).await;
+    let mut stats = WriterStats::default();
+    let mut i = start_at;
+    let mut mine: Vec<Row> = Vec::new();
+    let timed = |stats: &mut WriterStats, started: Instant| {
+        stats.calls += 1;
+        stats.max_call = stats.max_call.max(started.elapsed());
+    };
+    while !stop.load(Ordering::Acquire) {
+        let fresh = row(i, false);
+        let started = Instant::now();
+        let id = append(&mut client, &fresh).await;
+        timed(&mut stats, started);
+        {
+            let mut t = tracked.lock().unwrap();
+            t.ids.insert(fresh.key.clone(), id);
+            t.live.insert(fresh.key.clone(), fresh.clone());
+        }
+        mine.push(fresh);
+        if i.is_multiple_of(5) && mine.len() > 2 {
+            let victim = mine.remove(0);
+            let (id, generation) = tracked.lock().unwrap().ids[&victim.key];
+            let started = Instant::now();
+            let response = client
+                .delete_documents(DeleteDocumentsRequest {
+                    doc_ids: vec![id],
+                    expected_wal_generation: Some(generation),
+                })
+                .await;
+            timed(&mut stats, started);
+            match response {
+                Ok(response) => {
+                    assert_eq!(response.into_inner().deleted, 1);
+                    let mut t = tracked.lock().unwrap();
+                    t.live.remove(&victim.key);
+                    t.ids.remove(&victim.key);
+                }
+                Err(status) if is_stale_generation(&status) => stats.stale += 1,
+                Err(status) => panic!("delete during compaction: {status}"),
+            }
+        }
+        if i.is_multiple_of(7) && !mine.is_empty() {
+            let old = mine.remove(0);
+            let old_index: usize = old.key["row/".len()..].parse().unwrap();
+            let new = row(old_index, true);
+            let started = Instant::now();
+            let (new_id, new_generation) = append(&mut client, &new).await;
+            {
+                let mut t = tracked.lock().unwrap();
+                t.ids.insert(new.key.clone(), (new_id, new_generation));
+                t.live.insert(new.key.clone(), new.clone());
+            }
+            let (old_id, old_generation) = tracked.lock().unwrap().ids[&old.key];
+            if old_generation != new_generation {
+                // The old id predates the cutover: sending it would name
+                // some other row now. The revision stays as an ordinary
+                // live row beside the original.
+                stats.stale += 1;
+                timed(&mut stats, started);
+                i += 1;
+                continue;
+            }
+            let response = client
+                .commit_replacements(CommitReplacementsRequest {
+                    replacements: vec![Replacement {
+                        old_doc_id: old_id,
+                        new_doc_id: new_id,
+                    }],
+                    expected_wal_generation: Some(new_generation),
+                })
+                .await;
+            timed(&mut stats, started);
+            match response {
+                Ok(response) => {
+                    assert_eq!(response.into_inner().committed, 1);
+                    let mut t = tracked.lock().unwrap();
+                    t.live.remove(&old.key);
+                    t.ids.remove(&old.key);
+                }
+                Err(status) if is_stale_generation(&status) => stats.stale += 1,
+                Err(status) => panic!("replacement during compaction: {status}"),
+            }
+        }
+        i += 1;
+    }
+    stats
+}
+
+async fn compact(
+    addr: &str,
+    request: CompactShardRequest,
+) -> Result<CompactShardResponse, tonic::Status> {
+    let mut request = Request::new(request);
+    request.set_timeout(Duration::from_secs(600));
+    client(addr)
+        .await
+        .compact_shard(request)
+        .await
+        .map(|r| r.into_inner())
+}
+
+/// Everything a reader can observe on one shard, keyed by stable text
+/// so two shards with different positional ids compare directly. Scores
+/// are exact bits.
+#[derive(Debug, PartialEq)]
+struct Reads {
+    lexical: Vec<(String, Vec<(String, u32)>)>,
+    facets: Vec<(String, Vec<(String, u64)>)>,
+    dense: Vec<Vec<(String, u32)>>,
+    hybrid: Vec<Vec<(String, u32)>>,
+    browse_by_num: Vec<String>,
+    parents: Vec<(String, u64)>,
+}
+
+const LEXICAL_PROBES: [&str; 5] = ["revised", "four", "blue three", "row17 green", "red one"];
+
+async fn texts_of(
+    node: &mut NodeServiceClient<Channel>,
+    ids: &[u64],
+) -> BTreeMap<u64, (String, Option<DocLineage>)> {
+    if ids.is_empty() {
+        return BTreeMap::new();
+    }
+    node.get_documents(GetDocumentsRequest {
+        doc_ids: ids.to_vec(),
+    })
+    .await
+    .unwrap()
+    .into_inner()
+    .documents
+    .into_iter()
+    .map(|d| (d.doc_id, (d.text, d.lineage)))
+    .collect()
+}
+
+fn sorted(mut hits: Vec<(String, u32)>) -> Vec<(String, u32)> {
+    hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    hits
+}
+
+/// Observe `addrs` through one coordinator (and each node's own browse
+/// and parent routes). `browse_addr` is the node whose sorted browse and
+/// parents are read; the coordinator routes cover every shard.
+async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Reads {
+    let coordinator = CoordinatorServiceImpl::new(addrs.to_vec())
+        .with_bm25(Some(analysis.to_string()), Default::default());
+    let mut nodes = Vec::new();
+    for addr in addrs {
+        nodes.push(client(addr).await);
+    }
+    // Which node owns a global id: slot offsets are 0 and 1_000_000.
+    async fn resolve(
+        nodes: &mut [NodeServiceClient<Channel>],
+        ids: Vec<(u64, u32)>,
+    ) -> Vec<(String, u32)> {
+        let mut out = Vec::with_capacity(ids.len());
+        for (id, bits) in ids {
+            let owner = if id >= 1_000_000 { 1 } else { 0 }.min(nodes.len() - 1);
+            let mut texts = texts_of(&mut nodes[owner], &[id]).await;
+            let (text, _) = texts
+                .remove(&id)
+                .expect("hit resolves to a stored document");
+            out.push((text, bits));
+        }
+        sorted(out)
+    }
+    let mut lexical = Vec::new();
+    let mut facets = Vec::new();
+    for probe in LEXICAL_PROBES {
+        let response = SearchService::bm25_search(
+            &coordinator,
+            Request::new(Bm25SearchRequest {
+                text: probe.into(),
+                k: 5_000,
+                facet_fields: vec!["grp".into()],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let hits = response
+            .hits
+            .iter()
+            .map(|h| (h.doc_id, h.score.to_bits()))
+            .collect();
+        lexical.push((probe.to_string(), resolve(&mut nodes, hits).await));
+        let mut counts: Vec<(String, u64)> = response
+            .facets
+            .iter()
+            .flat_map(|f| f.counts.iter().map(|c| (c.value.clone(), c.count)))
+            .collect();
+        counts.sort();
+        facets.push((probe.to_string(), counts));
+    }
+    let mut dense = Vec::new();
+    let mut hybrid = Vec::new();
+    for query in queries {
+        let response = SearchService::search(
+            &coordinator,
+            Request::new(SearchRequest {
+                k: 20,
+                vector: query.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let hits = response
+            .hits
+            .iter()
+            .map(|h| (h.vector_id, h.score.to_bits()))
+            .collect();
+        dense.push(resolve(&mut nodes, hits).await);
+        let response = SearchService::hybrid_search(
+            &coordinator,
+            Request::new(HybridSearchRequest {
+                text: "common revised".into(),
+                vector: query.clone(),
+                k: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let hits = response
+            .hits
+            .iter()
+            .map(|h| (h.doc_id, h.fused_score.to_bits()))
+            .collect();
+        hybrid.push(resolve(&mut nodes, hits).await);
+    }
+    // Sorted browse and parents on the first node only (the routes are
+    // per shard).
+    let browse = nodes[0]
+        .browse_shard(BrowseShardRequest {
+            k: 100_000,
+            first_page: true,
+            sort: Some(BrowseSort {
+                column: "num".into(),
+                descending: false,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let texts = texts_of(&mut nodes[0], &browse.doc_ids).await;
+    let browse_by_num: Vec<String> = browse
+        .doc_ids
+        .iter()
+        .map(|id| texts[id].0.clone())
+        .collect();
+    let parents = nodes[0]
+        .resolve_parents(ResolveParentsRequest {
+            doc_ids: browse.doc_ids.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut parents: Vec<(String, u64)> = parents
+        .parents
+        .iter()
+        .map(|p| (texts[&p.doc_id].0.clone(), p.parent_id))
+        .collect();
+    parents.sort();
+    Reads {
+        lexical,
+        facets,
+        dense,
+        hybrid,
+        browse_by_num,
+        parents,
+    }
+}
+
+/// A fresh shard over exactly `rows`, for the reference reads.
+async fn reference_shard(
+    dir: &Path,
+    name: &str,
+    layout: Layout,
+    analysis: &str,
+    shift: &[f32],
+    scale: &[f32],
+    rows: &[Row],
+) -> (
+    String,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    let (addr, handle) = start_empty_node(config(Some(dir.join(name)), layout, analysis)).await;
+    calibrate(&addr, shift, scale).await;
+    let mut client = client(&addr).await;
+    for row in rows {
+        append(&mut client, row).await;
+    }
+    client.flush(FlushRequest {}).await.unwrap();
+    (addr, handle)
+}
+
+fn wal_gen(index_path: &Path, generation: u64) -> PathBuf {
+    pipestream_search::wal::gen_dir(&pipestream_search::wal::wal_dir(index_path), generation)
+}
+
+async fn run_online_compaction(layout: Layout) {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let tag = match layout {
+        Layout::Segments => "segments",
+        Layout::SingleImage => "single",
+    };
+    let dir = tempdir(tag);
+    let sample = unit_vectors(256, DIM, SEED);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
+    let index_path = dir.join("shard.vector");
+    let (addr, mut handle) =
+        start_empty_node(config(Some(index_path.clone()), layout, &analysis)).await;
+    let tracked = Arc::new(Mutex::new(seed_shard(&addr, &shift, &scale).await));
+    let queries: Vec<Vec<f32>> = (0..3)
+        .map(|q| unit_vectors(1, DIM, 0x5E61_0000 + q))
+        .collect();
+
+    // A cursor minted before the cutover; its boundary is the top hit
+    // for row 700's own vector, which the renumbering moves.
+    let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+        .with_bm25(Some(analysis.clone()), Default::default());
+    let cursor_probe = row(700, false).vector.clone();
+    let first_page = SearchService::query(
+        &coordinator,
+        Request::new(QueryRequest {
+            k: 1,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Search(SearchQuery {
+                    id: "dense".into(),
+                    query: Some(search_query::Query::Dense(DenseQuery {
+                        vector: cursor_probe.clone(),
+                        ..Default::default()
+                    })),
+                })),
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(!first_page.next_cursor.is_empty());
+
+    // Health before: tombstones present.
+    let before = client(&addr)
+        .await
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(before.deleted_docs > 0);
+    assert_eq!(before.wal_generation, 0);
+
+    // Compaction with a concurrent writer.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_task = tokio::spawn(writer(
+        addr.clone(),
+        Arc::clone(&tracked),
+        Arc::clone(&stop),
+        N + 100,
+    ));
+    let started = Instant::now();
+    let first = compact(&addr, CompactShardRequest::default())
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Release);
+    let stats = writer_task.await.unwrap();
+    eprintln!("compaction[{tag}] #1: {first:?} in {elapsed:?}; writer {stats:?}");
+
+    // Writes were not frozen: the writer completed calls during the
+    // compaction, none of which waited for anything like the whole run.
+    assert!(stats.calls > 0, "the concurrent writer completed no calls");
+    assert!(
+        stats.max_call < elapsed / 4,
+        "a write waited {:?} of a {:?} compaction",
+        stats.max_call,
+        elapsed
+    );
+    assert!(!first.dry_run);
+    assert_eq!(first.layout, tag.replace("single", "single-image"));
+    assert_eq!(first.wal_generation, 1);
+    assert!(first.rows_before >= (N + 5) as u64);
+    assert!(first.tombstones_reclaimed >= (N.div_ceil(7) + 5) as u64);
+    assert!(
+        first.tail_records_applied > 0,
+        "the tail applied nothing although writes ran"
+    );
+    assert!(first.locked_tail_records <= 256);
+    assert!(
+        first.write_lock_ms < 500,
+        "write lock held {} ms",
+        first.write_lock_ms
+    );
+    assert!(!pipestream_search::compaction::default_work_dir(&index_path).exists());
+    assert!(!pipestream_search::compaction::marker_path(&index_path).exists());
+    assert!(wal_gen(&index_path, 0).exists(), "history is kept");
+    assert!(wal_gen(&index_path, 1).exists());
+    match layout {
+        Layout::SingleImage => {
+            assert!(!dir.join("shard.vector.snap-old").exists());
+            assert!(!index_path.exists(), "the legacy image is retired");
+            assert!(pipestream_search::node::generation_dir(&index_path).exists());
+        }
+        Layout::Segments => {
+            let root = pipestream_search::node::segments_root(&index_path);
+            let manifest = pipestream_search::segments::SegmentCatalog::read_manifest(&root)
+                .unwrap()
+                .unwrap();
+            assert!(manifest.segments.iter().all(
+                |s| s.segment_id.starts_with("cmp-000001-") || s.segment_id.starts_with("seg-")
+            ));
+            for entry in std::fs::read_dir(root.join("segments")).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(
+                    manifest.segments.iter().any(|s| s.segment_id == name),
+                    "replaced segment {name} was not retired"
+                );
+            }
+        }
+    }
+
+    // Ids issued under the old generation refuse by name; the same ids
+    // without a claim would name whichever rows carry them now.
+    let stale_id = *tracked
+        .lock()
+        .unwrap()
+        .ids
+        .values()
+        .next()
+        .map(|(id, _)| id)
+        .unwrap();
+    let err = client(&addr)
+        .await
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![stale_id],
+            expected_wal_generation: Some(0),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("stale WAL generation"),
+        "{}",
+        err.message()
+    );
+
+    // The cursor from the old generation refuses by name.
+    let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+        .with_bm25(Some(analysis.clone()), Default::default());
+    let err = SearchService::query(
+        &coordinator,
+        Request::new(QueryRequest {
+            k: 1,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Search(SearchQuery {
+                    id: "dense".into(),
+                    query: Some(search_query::Query::Dense(DenseQuery {
+                        vector: cursor_probe,
+                        ..Default::default()
+                    })),
+                })),
+            }),
+            cursor: first_page.next_cursor,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("changed under the cursor"),
+        "{}",
+        err.message()
+    );
+
+    // A quiescent second compaction reclaims what the tail tombstoned
+    // and proves the rewritten generation is full history.
+    let second = compact(&addr, CompactShardRequest::default())
+        .await
+        .unwrap();
+    eprintln!("compaction[{tag}] #2: {second:?}");
+    assert_eq!(second.wal_generation, 2);
+    assert_eq!(second.tail_records_applied, 0);
+    // The writer may land a row between the first response and the
+    // stop flag; nothing else touched the shard.
+    assert!(second.rows_before >= first.rows_after);
+    let live_rows = tracked.lock().unwrap().live.len() as u64;
+    assert_eq!(second.rows_after, live_rows);
+    let health = client(&addr)
+        .await
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(health.deleted_docs, 0);
+    assert_eq!(health.live_docs, live_rows);
+    assert_eq!(health.document_slots, live_rows);
+    assert_eq!(health.num_vectors, live_rows);
+    assert_eq!(health.wal_generation, 2);
+    assert!(health.wal_clocked);
+
+    // Every read path equals a shard built fresh from the final set.
+    let final_rows: Vec<Row> = tracked.lock().unwrap().live.values().cloned().collect();
+    let (reference, reference_handle) = reference_shard(
+        &dir,
+        "reference.vector",
+        layout,
+        &analysis,
+        &shift,
+        &scale,
+        &final_rows,
+    )
+    .await;
+    let expected = observe(std::slice::from_ref(&reference), &analysis, &queries).await;
+    assert_eq!(expected.browse_by_num.len(), final_rows.len());
+    let got = observe(std::slice::from_ref(&addr), &analysis, &queries).await;
+    assert_eq!(got, expected, "compacted shard differs from the reference");
+
+    // Reopen from disk: the same.
+    handle.abort();
+    let _ = (&mut handle).await;
+    let (reopened, reopened_handle) =
+        start_opened_node(config(Some(index_path.clone()), layout, &analysis)).await;
+    let health = client(&reopened)
+        .await
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((health.live_docs, health.deleted_docs), (live_rows, 0));
+    assert_eq!(health.wal_generation, 2);
+    let got = observe(std::slice::from_ref(&reopened), &analysis, &queries).await;
+    assert_eq!(got, expected, "reopened shard differs from the reference");
+
+    // The rewritten generation replays to the same shard.
+    let handle_rt = tokio::runtime::Handle::current();
+    let replay_addr = analysis.clone();
+    let mut replay = move |docs: &[(
+        &str,
+        Option<&pipestream_search::pb::AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )]| {
+        tokio::task::block_in_place(|| {
+            handle_rt
+                .block_on(pipestream_search::analyzer::analyze_batch_streams(
+                    &replay_addr,
+                    docs,
+                    1,
+                ))
+                .map_err(|e| e.to_string())
+        })
+    };
+    let replayed = pipestream_search::reshard::split(
+        &wal_gen(&index_path, 2),
+        1,
+        &dir.join("replayed"),
+        0,
+        1_000_000,
+        false,
+        Some(&["body".to_string()]),
+        &mut replay,
+    )
+    .unwrap();
+    let child = &replayed.children[0];
+    assert_eq!(child.num_vectors, live_rows);
+    assert_eq!(child.num_documents, live_rows);
+    let (replayed_addr, replayed_handle) = start_opened_node(config(
+        Some(child.vector_path.clone()),
+        Layout::SingleImage,
+        &analysis,
+    ))
+    .await;
+    let got = observe(std::slice::from_ref(&replayed_addr), &analysis, &queries).await;
+    assert_eq!(
+        got, expected,
+        "the rewritten WAL generation replays differently"
+    );
+
+    // Distributed equals monolithic: the compacted shard beside an
+    // untouched one, against one shard holding both corpora.
+    let other_rows: Vec<Row> = (5_000..5_300).map(|i| row(i, false)).collect();
+    let (other, other_handle) = start_empty_node(NodeConfig {
+        slot_offset: 1_000_000,
+        ..config(Some(dir.join("other.vector")), layout, &analysis)
+    })
+    .await;
+    calibrate(&other, &shift, &scale).await;
+    {
+        let mut client = client(&other).await;
+        for row in &other_rows {
+            append(&mut client, row).await;
+        }
+        client.flush(FlushRequest {}).await.unwrap();
+    }
+    let mut union_rows = final_rows.clone();
+    union_rows.extend(other_rows.iter().cloned());
+    let (monolithic, monolithic_handle) = reference_shard(
+        &dir,
+        "monolithic.vector",
+        layout,
+        &analysis,
+        &shift,
+        &scale,
+        &union_rows,
+    )
+    .await;
+    let distributed = observe(&[reopened.clone(), other.clone()], &analysis, &queries).await;
+    let expected_union = observe(std::slice::from_ref(&monolithic), &analysis, &queries).await;
+    assert_eq!(distributed.lexical, expected_union.lexical);
+    assert_eq!(distributed.facets, expected_union.facets);
+    assert_eq!(distributed.dense, expected_union.dense);
+    assert_eq!(distributed.hybrid, expected_union.hybrid);
+
+    reference_handle.abort();
+    reopened_handle.abort();
+    replayed_handle.abort();
+    other_handle.abort();
+    monolithic_handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_image_shard_compacts_online() {
+    run_online_compaction(Layout::SingleImage).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn segmented_shard_compacts_online() {
+    run_online_compaction(Layout::Segments).await;
+}
+
+async fn expect_refusal(
+    result: Result<CompactShardResponse, tonic::Status>,
+    code: tonic::Code,
+    needle: &str,
+) {
+    let status = result.expect_err(&format!("expected a refusal mentioning {needle:?}"));
+    assert_eq!(status.code(), code, "{}", status.message());
+    assert!(
+        status.message().contains(needle),
+        "refusal {:?} does not mention {needle:?}",
+        status.message()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let dir = tempdir("refusals");
+    let sample = unit_vectors(64, DIM, SEED);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
+
+    // An in-memory shard has no log.
+    let (memory, memory_handle) = start_empty_node(NodeConfig {
+        wal: false,
+        ..config(None, Layout::SingleImage, &analysis)
+    })
+    .await;
+    expect_refusal(
+        compact(&memory, CompactShardRequest::default()).await,
+        tonic::Code::FailedPrecondition,
+        "needs a persisted shard",
+    )
+    .await;
+    memory_handle.abort();
+
+    // A persisted shard without a WAL.
+    let (unlogged, unlogged_handle) = start_empty_node(NodeConfig {
+        wal: false,
+        ..config(
+            Some(dir.join("unlogged.vector")),
+            Layout::SingleImage,
+            &analysis,
+        )
+    })
+    .await;
+    expect_refusal(
+        compact(&unlogged, CompactShardRequest::default()).await,
+        tonic::Code::FailedPrecondition,
+        "has no WAL",
+    )
+    .await;
+    unlogged_handle.abort();
+
+    // A bulk BM25 build in progress (single-image, documents before the
+    // first flush spill to disk).
+    let building_path = dir.join("building.vector");
+    let (building, building_handle) = start_empty_node(config(
+        Some(building_path.clone()),
+        Layout::SingleImage,
+        &analysis,
+    ))
+    .await;
+    calibrate(&building, &shift, &scale).await;
+    {
+        let mut client = client(&building).await;
+        append(&mut client, &row(1, false)).await;
+    }
+    expect_refusal(
+        compact(&building, CompactShardRequest::default()).await,
+        tonic::Code::FailedPrecondition,
+        "bulk BM25 build is in progress",
+    )
+    .await;
+    client(&building)
+        .await
+        .flush(FlushRequest {})
+        .await
+        .unwrap();
+
+    // A work directory that is not empty.
+    let busy = dir.join("busy-work");
+    std::fs::create_dir_all(&busy).unwrap();
+    std::fs::write(busy.join("leftover"), b"x").unwrap();
+    expect_refusal(
+        compact(
+            &building,
+            CompactShardRequest {
+                work_dir: busy.display().to_string(),
+                ..Default::default()
+            },
+        )
+        .await,
+        tonic::Code::FailedPrecondition,
+        "is not empty",
+    )
+    .await;
+
+    // A dry run reports and writes nothing.
+    {
+        let mut client = client(&building).await;
+        let (id, _) = append(&mut client, &row(2, false)).await;
+        client
+            .delete_documents(DeleteDocumentsRequest {
+                doc_ids: vec![id],
+                expected_wal_generation: None,
+            })
+            .await
+            .unwrap();
+        client.flush(FlushRequest {}).await.unwrap();
+    }
+    let dry = compact(
+        &building,
+        CompactShardRequest {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(dry.dry_run);
+    assert_eq!((dry.rows_before, dry.tombstones_reclaimed), (2, 1));
+    assert_eq!(dry.wal_generation, 1);
+    assert_eq!(dry.layout, "single-image");
+    assert!(!pipestream_search::compaction::default_work_dir(&building_path).exists());
+    assert!(!wal_gen(&building_path, 1).exists());
+    assert_eq!(
+        client(&building)
+            .await
+            .health(HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .wal_generation,
+        0
+    );
+    building_handle.abort();
+
+    // Legacy unclocked records: a frame with clock 0 appended to a
+    // flushed generation's bucket file is what a pre-clock log looks
+    // like on resume.
+    let legacy_path = dir.join("legacy.vector");
+    let (legacy, legacy_handle) = start_empty_node(config(
+        Some(legacy_path.clone()),
+        Layout::SingleImage,
+        &analysis,
+    ))
+    .await;
+    calibrate(&legacy, &shift, &scale).await;
+    {
+        let mut client = client(&legacy).await;
+        append(&mut client, &row(3, false)).await;
+        client.flush(FlushRequest {}).await.unwrap();
+    }
+    legacy_handle.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        use prost::Message;
+        use std::io::Write;
+        let gen = wal_gen(&legacy_path, 0);
+        let bucket = pipestream_search::wal::bucket_path(
+            &gen,
+            pipestream_search::reshard::bucket_of(0, 8) as u32,
+        );
+        let existing = pipestream_search::wal::scan_records(&bucket).unwrap();
+        let record = pipestream_search::pb::wal::WalRecord {
+            seq: existing.last_seq + 1,
+            clock: 0,
+            op: Some(pipestream_search::pb::wal::wal_record::Op::AddVectors(
+                pipestream_search::pb::wal::LoggedAddVectors {
+                    first_id: 0,
+                    batch: Some(AddVectorsRequest {
+                        vectors: vec![0.0; DIM],
+                        dim: DIM as u32,
+                    }),
+                    stable_routing_keys: Vec::new(),
+                },
+            )),
+        };
+        let payload = record.encode_to_vec();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&bucket)
+            .unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&pipestream_search::wal::crc32(&payload).to_le_bytes())
+            .unwrap();
+        file.write_all(&payload).unwrap();
+    }
+    let (legacy, legacy_handle) = start_opened_node(config(
+        Some(legacy_path.clone()),
+        Layout::SingleImage,
+        &analysis,
+    ))
+    .await;
+    assert!(
+        !client(&legacy)
+            .await
+            .health(HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .wal_clocked
+    );
+    expect_refusal(
+        compact(&legacy, CompactShardRequest::default()).await,
+        tonic::Code::FailedPrecondition,
+        "legacy unclocked records",
+    )
+    .await;
+    legacy_handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A shard large enough that its build outlasts a concurrent RPC.
+async fn slow_shard(
+    dir: &Path,
+    name: &str,
+    layout: Layout,
+    analysis: &str,
+) -> (
+    String,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    PathBuf,
+) {
+    let sample = unit_vectors(64, DIM, SEED);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
+    let index_path = dir.join(name);
+    let (addr, handle) = start_empty_node(config(Some(index_path.clone()), layout, analysis)).await;
+    calibrate(&addr, &shift, &scale).await;
+    let mut client = client(&addr).await;
+    for i in 0..4_000 {
+        append(&mut client, &row(i, false)).await;
+    }
+    client
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![1, 2, 3],
+            expected_wal_generation: None,
+        })
+        .await
+        .unwrap();
+    client.flush(FlushRequest {}).await.unwrap();
+    (addr, handle, index_path)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_compaction_and_a_snapshot_install_during_one_refuse_by_name() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let dir = tempdir("concurrent");
+    let (addr, handle, index_path) =
+        slow_shard(&dir, "shard.vector", Layout::SingleImage, &analysis).await;
+
+    // Two at once: the second refuses while the first runs.
+    let first = tokio::spawn({
+        let addr = addr.clone();
+        async move { compact(&addr, CompactShardRequest::default()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    expect_refusal(
+        compact(&addr, CompactShardRequest::default()).await,
+        tonic::Code::FailedPrecondition,
+        "already running",
+    )
+    .await;
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(first.tombstones_reclaimed, 3);
+    assert_eq!(first.wal_generation, 1);
+
+    // A snapshot installed under a running compaction rotates the WAL;
+    // the compaction aborts by name and the shard serves the snapshot.
+    let snap = pipestream_search::node::generation_dir(&index_path);
+    let image = std::fs::read(pipestream_search::node::generation_vector(&snap)).unwrap();
+    let exact = std::fs::read(pipestream_search::node::generation_exact_vectors(&snap)).unwrap();
+    let bm25 = std::fs::read(pipestream_search::node::generation_bm25(&snap)).unwrap();
+    let running = tokio::spawn({
+        let addr = addr.clone();
+        async move { compact(&addr, CompactShardRequest::default()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(SnapshotChunk {
+            payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
+                vector_bytes: image.len() as u64,
+                bm25_bytes: bm25.len() as u64,
+                exact_vector_bytes: exact.len() as u64,
+                live_docs_bytes: 0,
+            })),
+        })
+        .await
+        .unwrap();
+        for bytes in [image, exact, bm25] {
+            tx.send(SnapshotChunk {
+                payload: Some(snapshot_chunk::Payload::Data(bytes)),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        client(&addr)
+            .await
+            .install_snapshot(ReceiverStream::new(rx))
+            .await
+            .unwrap();
+    }
+    let aborted = running.await.unwrap();
+    expect_refusal(aborted, tonic::Code::Aborted, "snapshot was installed").await;
+    let health = client(&addr)
+        .await
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(health.wal_generation, 2);
+    assert_eq!(health.live_docs, 3_997);
+    assert!(!pipestream_search::compaction::marker_path(&index_path).exists());
+    // The snapshot's generation is partial history: compaction refuses
+    // it by name rather than dropping the image.
+    expect_refusal(
+        compact(&addr, CompactShardRequest::default()).await,
+        tonic::Code::FailedPrecondition,
+        "preexisting",
+    )
+    .await;
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_interrupted_cutover_rolls_back_at_open() {
+    // The on-disk state a crash leaves between a single-image cutover
+    // and its closing flush: marker present, old generation aside, new
+    // generation in place, rewritten WAL generation in place.
+    let dir = tempdir("rollback");
+    let index_path = dir.join("shard.vector");
+    let snap = pipestream_search::node::generation_dir(&index_path);
+    let old = dir.join("shard.vector.snap-old");
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(snap.join("vector.index"), b"new").unwrap();
+    std::fs::write(old.join("vector.index"), b"old").unwrap();
+    let wal_dir = pipestream_search::wal::wal_dir(&index_path);
+    std::fs::create_dir_all(wal_gen(&index_path, 0)).unwrap();
+    std::fs::create_dir_all(wal_gen(&index_path, 1)).unwrap();
+    std::fs::write(wal_gen(&index_path, 0).join("manifest.toml"), b"").unwrap();
+    let marker = pipestream_search::compaction::marker_path(&index_path);
+    std::fs::write(
+        &marker,
+        serde_json::json!({
+            "format": 1,
+            "layout": "single-image",
+            "old_wal_generation": 0,
+            "new_wal_generation": 1,
+            "work_dir": dir.join("work"),
+            "previous_snapshot": true,
+            "legacy_files": [],
+            "staged_segments": [],
+            "replaced_segments": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let recovered = pipestream_search::node::recover_generation(&index_path);
+    assert_eq!(recovered, Some(snap.clone()));
+    assert_eq!(std::fs::read(snap.join("vector.index")).unwrap(), b"old");
+    assert!(!old.exists());
+    assert!(
+        !wal_gen(&index_path, 1).exists(),
+        "the rewritten generation is gone"
+    );
+    assert!(wal_gen(&index_path, 0).exists());
+    assert!(!marker.exists());
+    assert!(wal_dir.exists());
+
+    // Without a marker the swap rules are the snapshot install's own:
+    // both present means the new generation is live.
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("vector.index"), b"older").unwrap();
+    assert_eq!(
+        pipestream_search::node::recover_generation(&index_path),
+        Some(snap.clone())
+    );
+    assert_eq!(std::fs::read(snap.join("vector.index")).unwrap(), b"old");
+    assert!(!old.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

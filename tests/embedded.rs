@@ -324,13 +324,20 @@ async fn local_mutations_and_persistence_survive_reopen() {
         .await
         .unwrap();
     runtime
-        .delete_documents(0, DeleteDocumentsRequest { doc_ids: vec![1] })
+        .delete_documents(
+            0,
+            DeleteDocumentsRequest {
+                expected_wal_generation: None,
+                doc_ids: vec![1],
+            },
+        )
         .await
         .unwrap();
     runtime
         .commit_replacements(
             0,
             CommitReplacementsRequest {
+                expected_wal_generation: None,
                 replacements: vec![Replacement {
                     old_doc_id: 2,
                     new_doc_id: 3,

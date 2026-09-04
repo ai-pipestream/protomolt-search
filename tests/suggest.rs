@@ -604,7 +604,10 @@ async fn the_tombstone_flag_reports_that_df_counts_deleted_rows() {
     // Document 0 holds "court" and "courtesi".
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let deleted = client
-        .delete_documents(DeleteDocumentsRequest { doc_ids: vec![0] })
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![0],
+            expected_wal_generation: None,
+        })
         .await
         .unwrap()
         .into_inner();

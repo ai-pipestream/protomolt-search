@@ -30,6 +30,7 @@ pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;
 pub mod collections;
+pub mod compaction;
 pub mod config;
 pub mod control_plane;
 pub mod coordinator;

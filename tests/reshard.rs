@@ -834,11 +834,15 @@ async fn one_child_reshard_compacts_generation_tombstones() {
     .await;
     ingest(&mut client, &corpus, rows, rows).await;
     client
-        .delete_documents(DeleteDocumentsRequest { doc_ids: vec![3] })
+        .delete_documents(DeleteDocumentsRequest {
+            expected_wal_generation: None,
+            doc_ids: vec![3],
+        })
         .await
         .unwrap();
     client
         .commit_replacements(CommitReplacementsRequest {
+            expected_wal_generation: None,
             replacements: vec![Replacement {
                 old_doc_id: 7,
                 new_doc_id: 31,

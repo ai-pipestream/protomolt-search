@@ -243,7 +243,10 @@ async fn a_fresh_shard_writes_a_catalog_and_every_query_equals_one_image() {
     for addr in [&seg, &one] {
         let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
         client
-            .delete_documents(DeleteDocumentsRequest { doc_ids: vec![1] })
+            .delete_documents(DeleteDocumentsRequest {
+                expected_wal_generation: None,
+                doc_ids: vec![1],
+            })
             .await
             .unwrap();
     }

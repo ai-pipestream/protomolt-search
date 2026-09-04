@@ -379,6 +379,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
             Some(wal_record::Op::DeleteDocument(delete)) => {
                 replica
                     .delete_documents(DeleteDocumentsRequest {
+                        expected_wal_generation: None,
                         doc_ids: vec![delete.doc_id],
                     })
                     .await
@@ -388,6 +389,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
             Some(wal_record::Op::Replacement(replacement)) => {
                 replica
                     .commit_replacements(CommitReplacementsRequest {
+                        expected_wal_generation: None,
                         replacements: vec![crate::pb::Replacement {
                             old_doc_id: replacement.old_doc_id,
                             new_doc_id: replacement.new_doc_id,

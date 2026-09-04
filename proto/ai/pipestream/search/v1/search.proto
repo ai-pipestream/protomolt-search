@@ -392,6 +392,16 @@ service NodeService {
   // same binding; a different binding is never accepted.
   rpc ApplyWalBinding(ApplyWalBindingRequest) returns (ApplyWalBindingResponse);
 
+  // Online compaction of this shard (docs/mutations.md): rebuild a dense
+  // all-live generation from the WAL up to a clock cutoff while writes
+  // continue, tail the log into it, and cut over under one brief write
+  // lock. Unary and long-running — the build reads the whole log and
+  // re-analyzes every live document — so clients set a deadline in
+  // minutes, not seconds. Refuses by name when the shard has no WAL, the
+  // log carries legacy unclocked records, a compaction or bulk BM25 build
+  // is already running, or the work directory is not empty.
+  rpc CompactShard(CompactShardRequest) returns (CompactShardResponse);
+
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
@@ -748,6 +758,62 @@ message ApplyWalBindingRequest {
 
 message ApplyWalBindingResponse {
   bool already_bound = 1;
+}
+
+message CompactShardRequest {
+  // Scratch directory for the build. Empty = `<index path>.compact`,
+  // beside the index. Must be empty (or absent) and on the same
+  // filesystem as the index: the finished generation is renamed into
+  // place, never copied. Removed on success; left for inspection on
+  // failure, and a retry then refuses it by name.
+  string work_dir = 1;
+  // The tail loop keeps applying the live log to the shadow with no
+  // lock held until fewer than this many records remain; the final
+  // write-locked apply is bounded by it. 0 = 256.
+  uint32 tail_bound = 2;
+  // Run the preflight only: every refusal, the cutoff, and the row and
+  // tombstone counts the compaction would work from, with no build and
+  // no files written.
+  bool dry_run = 3;
+}
+
+message CompactShardResponse {
+  // Physical rows (live plus tombstoned) at the cutoff clock.
+  uint64 rows_before = 1;
+  // Physical rows served after the cutover: the dense image plus the
+  // rows the tail appended. A dry run reports rows_before.
+  uint64 rows_after = 2;
+  // Tombstoned rows at the cutoff that the dense image dropped.
+  // Tombstones written after the cutoff are carried over as tombstones,
+  // not reclaimed; the next compaction takes them.
+  uint64 tombstones_reclaimed = 3;
+  // Live WAL records applied to the shadow after the cutoff, over every
+  // tail pass and the final write-locked apply.
+  uint64 tail_records_applied = 4;
+  // Records applied inside the write-locked cutover (at most tail_bound).
+  uint64 locked_tail_records = 5;
+  // Wall time the cutover held the shard's write lock, in milliseconds:
+  // the final tail apply, the marker, the renames, and the state swap.
+  uint64 write_lock_ms = 6;
+  // The rewritten full-history WAL generation the shard logs to after
+  // the cutover; the superseded generation stays on disk as history.
+  uint64 wal_generation = 7;
+  // The generation clock the dense image was built through.
+  uint64 cutoff_clock = 8;
+  // "single-image" or "segments".
+  string layout = 9;
+  bool dry_run = 10;
+  // Wall time of the closing Flush that makes the new generation's
+  // images durable and retires the old files, in milliseconds. It holds
+  // the write lock the way every Flush on the layout does (a
+  // single-image flush rewrites the image; a segmented flush seals the
+  // tail rows), which is why it is reported apart from write_lock_ms.
+  uint64 closing_flush_ms = 11;
+  // Unlocked tail passes before the cutover.
+  uint64 tail_passes = 12;
+  // Whether the compaction bumped the shard's stats epoch (always, after
+  // a non-dry run): coordinators refetch term statistics.
+  uint64 stats_epoch = 13;
 }
 
 // One shard's liveness and shape.
@@ -1240,6 +1306,11 @@ message AddVectorsResponse {
   // (`slot_offset + shard count before the stream`). Ids are contiguous
   // per shard in ingestion order.
   uint64 first_id = 3;
+  // The WAL generation the batch was logged in (0 on an unlogged
+  // shard). Positional ids are scoped to it: a compaction or snapshot
+  // install renumbers the rows, and id-addressed mutations may claim
+  // the generation they were issued under (docs/mutations.md).
+  uint64 wal_generation = 4;
 }
 
 // Empty: flush whatever the shard holds.
@@ -1852,16 +1923,28 @@ message AddDocumentsResponse {
   uint64 total = 2;
   // Global doc id assigned to the first document of this stream.
   uint64 first_id = 3;
+  // The WAL generation the documents were logged in; see
+  // AddVectorsResponse.wal_generation.
+  uint64 wal_generation = 4;
 }
 
 message DeleteDocumentsRequest {
   repeated uint64 doc_ids = 1;
+  // The WAL generation `doc_ids` were issued under (an ingest
+  // response's wal_generation); absent claims nothing. A compaction or
+  // snapshot install renumbers the shard's rows, so a claim that names
+  // another generation is refused with FAILED_PRECONDITION rather than
+  // applied to whatever rows now carry those ids (docs/mutations.md).
+  // Presence, not zero: generation 0 is a generation like any other.
+  optional uint64 expected_wal_generation = 2;
 }
 
 message DeleteDocumentsResponse {
   uint64 deleted = 1;
   uint64 already_deleted = 2;
   uint64 live_revision = 3;
+  // The WAL generation the tombstones were logged in.
+  uint64 wal_generation = 4;
 }
 
 message Replacement {
@@ -1871,12 +1954,17 @@ message Replacement {
 
 message CommitReplacementsRequest {
   repeated Replacement replacements = 1;
+  // The WAL generation the ids were issued under; absent claims
+  // nothing. See DeleteDocumentsRequest.expected_wal_generation.
+  optional uint64 expected_wal_generation = 2;
 }
 
 message CommitReplacementsResponse {
   uint64 committed = 1;
   uint64 already_committed = 2;
   uint64 live_revision = 3;
+  // The WAL generation the retirements were logged in.
+  uint64 wal_generation = 4;
 }
 
 // One field's query terms in a multi-field TermStats request.
@@ -5055,6 +5143,9 @@ message IngestMappedResponse {
   // document and adds nothing), so `added` counts rows and this counts
   // documents.
   uint64 parents = 5;
+  // The WAL generation the rows were logged in; see
+  // AddVectorsResponse.wal_generation.
+  uint64 wal_generation = 6;
 }
 
 // First message on a routed mapped-ingest stream.

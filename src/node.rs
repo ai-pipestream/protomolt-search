@@ -52,7 +52,7 @@ use crate::pb::{
     GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
     HybridShardResponse, IngestMappedRequest, IngestMappedResponse, InstallSnapshotFromRequest,
     InstallSnapshotResponse, LexicalBitmapRequest, MembershipBitmapResponse, OffsetSpan, RawLegHit,
-    ReadWalRequest, ReadWalResponse, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent,
+    ReadWalRequest, ReadWalResponse, Replacement, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent,
     ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse, SetCalibrationRequest,
     SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse, ShardScanStats, SnapshotChunk,
     SnapshotManifest, StartShardSearch, StoredDocument, StreamSearchBatch, StreamSearchRequest,
@@ -397,7 +397,7 @@ impl Bm25Shard {
         }
     }
 
-    fn next_doc_id(&self) -> u32 {
+    pub(crate) fn next_doc_id(&self) -> u32 {
         match self {
             Bm25Shard::Building(s) => s.next_doc_id(),
             Bm25Shard::Spilling(s) => s.next_doc_id(),
@@ -416,7 +416,7 @@ impl Bm25Shard {
     }
 
     /// Fields in the active table (`docs/multi-field.md`).
-    fn field_count(&self) -> usize {
+    pub(crate) fn field_count(&self) -> usize {
         match self {
             Bm25Shard::Building(s) => s.field_count(),
             Bm25Shard::Spilling(s) => s.field_count(),
@@ -426,7 +426,7 @@ impl Bm25Shard {
     }
 
     /// The name of field `f` in the active table.
-    fn field_name(&self, f: usize) -> &str {
+    pub(crate) fn field_name(&self, f: usize) -> &str {
         match self {
             Bm25Shard::Building(s) => s.field_name(f),
             Bm25Shard::Spilling(s) => s.field_name(f),
@@ -438,7 +438,7 @@ impl Bm25Shard {
     /// Field `f`'s analyzer fingerprint in the active table (0 =
     /// unknown, which never enforces).
     /// The mapped-plan binding persisted with this shard, if any.
-    fn binding(&self) -> Option<&crate::postings::StoredBinding> {
+    pub(crate) fn binding(&self) -> Option<&crate::postings::StoredBinding> {
         match self {
             Bm25Shard::Building(s) => s.binding(),
             Bm25Shard::Spilling(s) => s.binding(),
@@ -447,7 +447,7 @@ impl Bm25Shard {
         }
     }
 
-    fn analysis_fingerprint(&self, f: usize) -> u64 {
+    pub(crate) fn analysis_fingerprint(&self, f: usize) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
             Bm25Shard::Spilling(s) => s.analysis_fingerprint(f),
@@ -2400,7 +2400,7 @@ fn active_artifact_rows(guard: &ShardState) -> Vec<u64> {
     .collect()
 }
 
-fn physical_rows(guard: &ShardState) -> u64 {
+pub(crate) fn physical_rows(guard: &ShardState) -> u64 {
     active_artifact_rows(guard).into_iter().max().unwrap_or(0)
 }
 
@@ -2551,33 +2551,33 @@ pub(crate) fn parse_score_stages(
 /// the BM25 postings store. Either may be absent (vector-only shards,
 /// docs-only shards, from-scratch shards).
 #[derive(Default)]
-struct ShardState {
-    index: Option<VectorIndex>,
+pub(crate) struct ShardState {
+    pub(crate) index: Option<VectorIndex>,
     /// Original row-major FP32 vectors, aligned one-for-one with provider
     /// slots. Legacy generations may lack this sidecar; native provider
     /// search remains available, while FP32 rerank refuses by name.
-    exact_vectors: Option<ExactVectorStore>,
-    bm25: Option<Bm25Shard>,
+    pub(crate) exact_vectors: Option<ExactVectorStore>,
+    pub(crate) bm25: Option<Bm25Shard>,
     /// Generation tombstones shared by every lexical and vector read path.
-    live_docs: LiveDocs,
+    pub(crate) live_docs: LiveDocs,
     /// The active snapshot generation directory, when the shard's files
     /// came from (or were replaced by) an `InstallSnapshot` image.
     /// `Flush` and the AddDocuments reload path read/write THERE, never
     /// the legacy `<index path>` layout, so the two never split-brain.
-    generation: Option<PathBuf>,
+    pub(crate) generation: Option<PathBuf>,
     /// The write-ahead log (`<index path>.wal/`), behind the same lock as
     /// the index it precedes. `None` when the shard runs without one.
-    wal: Option<WalWriter>,
+    pub(crate) wal: Option<WalWriter>,
     /// Cached slot -> parent map for collapse scans (lineage parent_id
     /// per slot). Self-validating: rebuilt whenever its length disagrees
     /// with the index, cleared on snapshot install.
-    parents: Option<std::sync::Arc<Vec<u64>>>,
+    pub(crate) parents: Option<std::sync::Arc<Vec<u64>>>,
     /// The shard's mapped-plan binding (`docs/descriptor-mappings.md`
     /// section 4a): RAM authority for the identity every mapped stream
     /// must match. Loaded from the store's kind-6 entry on attach,
     /// recorded to the WAL (markers) on first bind, written back into
     /// the store at flush. `None` = never bound.
-    mapped_binding: Option<crate::postings::StoredBinding>,
+    pub(crate) mapped_binding: Option<crate::postings::StoredBinding>,
     /// Advances on every mutation of `bm25` (ingest, flush, snapshot
     /// install, startup attach). `TermStats` reports it and the scoring
     /// RPCs enforce a caller's claim against it, which is what lets a
@@ -2585,7 +2585,12 @@ struct ShardState {
     /// store the stats no longer describe. Starts at 1: 0 is the wire's
     /// "no claim". Over-bumping is safe (a cache refetches); a missed
     /// bump is the only unsound direction.
-    stats_epoch: u64,
+    pub(crate) stats_epoch: u64,
+    /// A compaction cutover whose closing flush has not run yet
+    /// (`docs/mutations.md`): the marker on disk says "roll back on
+    /// restart" until the next flush writes the new generation's images
+    /// and retires what the marker lists. `Flush` completes it.
+    pub(crate) pending_compaction: Option<crate::compaction::PendingCommit>,
 }
 
 /// Message prefix of a stats-epoch refusal. The coordinator's retry
@@ -2627,7 +2632,7 @@ pub fn segments_root(index_path: &std::path::Path) -> PathBuf {
 
 /// The heap store a node's configuration declares: the tail of a
 /// segmented shard, or the whole store of an in-memory one.
-fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
+pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
     let names: Vec<&str> = config.bm25_fields.iter().map(String::as_str).collect();
     for name in config.position_fields.iter().chain(&config.sentence_fields) {
         if !names.contains(&name.as_str()) {
@@ -2731,7 +2736,7 @@ pub fn generation_live_docs(dir: &Path) -> PathBuf {
     dir.join("live-docs.bin")
 }
 
-fn live_docs_storage_path(index_path: &Path, generation: Option<&PathBuf>) -> PathBuf {
+pub(crate) fn live_docs_storage_path(index_path: &Path, generation: Option<&PathBuf>) -> PathBuf {
     generation.map_or_else(
         || live_docs_sidecar_path(index_path),
         |dir| generation_live_docs(dir),
@@ -2740,12 +2745,12 @@ fn live_docs_storage_path(index_path: &Path, generation: Option<&PathBuf>) -> Pa
 
 /// Receive staging (`<index path>.snap-tmp/`) and swap-out
 /// (`<index path>.snap-old/`) directories for the generation swap.
-fn generation_tmp_dir(index_path: &Path) -> PathBuf {
+pub(crate) fn generation_tmp_dir(index_path: &Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".snap-tmp");
     PathBuf::from(p)
 }
-fn generation_old_dir(index_path: &Path) -> PathBuf {
+pub(crate) fn generation_old_dir(index_path: &Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".snap-old");
     PathBuf::from(p)
@@ -2807,7 +2812,10 @@ pub fn recover_segments_swap(index_path: &Path) {
 /// Where the shard's files live: the active snapshot generation when one
 /// was installed, else the legacy `<index path>` (+`.bm25`) layout.
 /// Returns `(provider index, exact vectors, bm25)` paths.
-fn storage_paths(index_path: &Path, generation: Option<&PathBuf>) -> (PathBuf, PathBuf, PathBuf) {
+pub(crate) fn storage_paths(
+    index_path: &Path,
+    generation: Option<&PathBuf>,
+) -> (PathBuf, PathBuf, PathBuf) {
     match generation {
         Some(dir) => (
             generation_vector(dir),
@@ -2835,6 +2843,11 @@ fn storage_paths(index_path: &Path, generation: Option<&PathBuf>) -> (PathBuf, P
 ///
 /// Returns the active generation directory when it holds an index.
 pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
+    // A compaction cutover that never reached its closing flush rolls
+    // back to the generation it replaced BEFORE the swap rules below
+    // run, or they would retire the very files the rollback restores
+    // (docs/mutations.md).
+    crate::compaction::recover_interrupted(index_path);
     let snap = generation_dir(index_path);
     let old = generation_old_dir(index_path);
     let tmp = generation_tmp_dir(index_path);
@@ -2920,7 +2933,7 @@ fn wire_backend_descriptor(index: &VectorIndex) -> WireVectorBackendDescriptor {
     }
 }
 
-fn wal_manifest(
+pub(crate) fn wal_manifest(
     index: Option<&VectorIndex>,
     config: &NodeConfig,
     generation: u64,
@@ -3070,16 +3083,6 @@ fn open_wal(index: Option<&VectorIndex>, config: &NodeConfig) -> Option<WalWrite
     Some(writer)
 }
 
-/// Log `op`, or degrade the shard to unlogged if the append fails.
-///
-/// The mutation was already applied when this runs (apply-then-log, see
-/// [`WalWriter::append`]), so failing the client's request would report a
-/// write that in fact happened. Instead the shard keeps serving and the
-/// log is retired loudly: the generation directory is renamed `.broken`
-/// (so the reshard tool and a restarting node cannot mistake it for
-/// history) and the writer is dropped. Per the resharding policy, a
-/// shard without a WAL serves fine but can only be rebuilt, never
-/// resharded.
 /// Send `path` onto a snapshot stream in [`SNAPSHOT_STREAM_CHUNK`]
 /// pieces. False when the receiver hung up or the file could not be read
 /// (the receiver then sees a truncated artifact and refuses it by hash).
@@ -3126,7 +3129,17 @@ async fn stream_file(tx: &mpsc::Sender<Result<SnapshotChunk, Status>>, path: &Pa
 /// [`crate::MAX_MESSAGE_BYTES`] while amortizing per-message overhead.
 pub const SNAPSHOT_STREAM_CHUNK: usize = 1024 * 1024;
 
-fn wal_append_or_degrade(wal_slot: &mut Option<WalWriter>, op: wal_record::Op) {
+/// Log `op`, or degrade the shard to unlogged if the append fails.
+///
+/// The mutation was already applied when this runs (apply-then-log, see
+/// [`WalWriter::append`]), so failing the client's request would report a
+/// write that in fact happened. Instead the shard keeps serving and the
+/// log is retired loudly: the generation directory is renamed `.broken`
+/// (so the reshard tool and a restarting node cannot mistake it for
+/// history) and the writer is dropped. Per the resharding policy, a
+/// shard without a WAL serves fine but can only be rebuilt, never
+/// resharded.
+pub(crate) fn wal_append_or_degrade(wal_slot: &mut Option<WalWriter>, op: wal_record::Op) {
     let Some(wal) = wal_slot.as_mut() else { return };
     if let Err(e) = wal.append(op) {
         let dir = wal.dir().to_path_buf();
@@ -3164,13 +3177,13 @@ struct SealPlan {
 #[derive(Clone)]
 pub struct NodeServiceImpl {
     /// Locked shard state; see [`ShardState`].
-    state: Arc<RwLock<ShardState>>,
+    pub(crate) state: Arc<RwLock<ShardState>>,
     /// Single-writer gate for ingest streams. Two concurrent AddDocuments
     /// (or AddVectors) streams would interleave positional ids into one
     /// shard — every doc logged, none attributable — so the second stream
     /// is refused outright rather than merged.
     ingest_busy: Arc<std::sync::atomic::AtomicBool>,
-    config: NodeConfig,
+    pub(crate) config: NodeConfig,
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
     scan_jobs: Arc<std::sync::OnceLock<mpsc::Sender<ScanJob>>>,
@@ -3189,10 +3202,13 @@ pub struct NodeServiceImpl {
     /// never per document — the ingest analog of the query rule.
     materialize_cache: Arc<std::sync::Mutex<Option<CompiledMaterialize>>>,
     /// Optional product-owned phrase vocabulary shared by ingest and query.
-    phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
+    pub(crate) phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
     /// Seals on this shard run one at a time; the frozen part of a seal
     /// in flight is the reason (`docs/immutable-segments.md`).
-    seal_lock: Arc<std::sync::Mutex<()>>,
+    pub(crate) seal_lock: Arc<std::sync::Mutex<()>>,
+    /// One compaction at a time per shard (`docs/mutations.md`): a
+    /// second `CompactShard` refuses by name while this is set.
+    pub(crate) compacting: Arc<std::sync::atomic::AtomicBool>,
     /// Woken after every flush: the node agent reports the shard to the
     /// control plane on it (`docs/cluster-control.md`).
     flush_notify: Option<Arc<tokio::sync::Notify>>,
@@ -3668,9 +3684,11 @@ impl NodeServiceImpl {
                 parents: None,
                 mapped_binding: None,
                 stats_epoch: 1,
+                pending_compaction: None,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             seal_lock: Arc::new(std::sync::Mutex::new(())),
+            compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
             rerank_slots: Arc::new(tokio::sync::Semaphore::new(rerank_parallel)),
@@ -4197,7 +4215,12 @@ impl NodeServiceImpl {
             .as_ref()
             .map(|i| i.descriptor().backend_kind)
             .unwrap_or_default();
-        let set = shard.snapshot();
+        // The segment's id is its generation, the published epoch plus
+        // one: monotone across seals AND across a compaction cutover,
+        // which renumbers the catalog and would otherwise let a fresh
+        // `seg-<count>` collide with a replaced directory the closing
+        // flush has not retired yet (docs/mutations.md).
+        let generation = shard.snapshot().epoch() + 1;
         Ok(Some(SealPlan {
             base,
             rows,
@@ -4206,9 +4229,9 @@ impl NodeServiceImpl {
             image,
             backend_kind,
             catalog: shard.catalog().clone(),
-            stage: shard.stage_dir(&format!("{:08}", shard.sealed_parts())),
-            segment_id: format!("seg-{:08}", shard.sealed_parts()),
-            generation: set.manifest().epoch + 1,
+            stage: shard.stage_dir(&format!("{generation:08}")),
+            segment_id: format!("seg-{generation:08}"),
+            generation,
         }))
     }
 
@@ -4438,6 +4461,14 @@ impl NodeServiceImpl {
             || guard.index.is_some()
             || guard.exact_vectors.is_some()
             || guard.bm25.is_some();
+        // A compaction cutover commits here (docs/mutations.md): its
+        // images are on disk now, so the marker that would roll it back
+        // on restart goes, and the generation it replaced with it.
+        if let Some(pending) = guard.pending_compaction.take() {
+            pending
+                .complete()
+                .map_err(|e| Status::internal(format!("complete compaction cutover: {e}")))?;
+        }
         // Durability point reached: the log was fsynced above, then the
         // indexes hit disk. The marker records that a flush happened;
         // its own fsync failing degrades the log rather than un-flushing
@@ -4632,8 +4663,6 @@ impl NodeServiceImpl {
             .as_ref()
             .expect("handler requires index_path")
             .clone();
-        let snap = generation_dir(&path);
-        let old = generation_old_dir(&path);
         let tv_tmp = generation_vector(tmp_dir);
         let exact_tmp = generation_exact_vectors(tmp_dir);
         let bm25_tmp = generation_bm25(tmp_dir);
@@ -4742,28 +4771,13 @@ impl NodeServiceImpl {
             }
         }
 
-        // The atomic swap: previous generation aside (if any), staging
-        // dir into place. Both files move inside ONE directory rename.
-        // The staging dir's own entries are fsynced first (the files'
-        // sync_all covered bytes and inodes, not the names pointing at
-        // them), and the parent is fsynced after so the swap itself
-        // survives a crash.
-        crate::postings::fsync_parent(&generation_vector(tmp_dir))
-            .map_err(|e| Status::internal(format!("fsync staging {}: {e}", tmp_dir.display())))?;
-        if snap.exists() {
-            std::fs::rename(&snap, &old)
-                .map_err(|e| Status::internal(format!("retire {}: {e}", old.display())))?;
+        if guard.pending_compaction.is_some() {
+            return Err(Status::failed_precondition(
+                "a compaction cutover is pending its closing flush on this shard; call Flush \
+                 before installing a snapshot",
+            ));
         }
-        if let Err(e) = std::fs::rename(tmp_dir, &snap) {
-            // Best-effort rollback so startup recovery sees a clean state.
-            if old.exists() && !snap.exists() {
-                let _ = std::fs::rename(&old, &snap);
-            }
-            return Err(Status::internal(format!("install {}: {e}", snap.display())));
-        }
-        let _ = std::fs::remove_dir_all(&old);
-        crate::postings::fsync_parent(&snap)
-            .map_err(|e| Status::internal(format!("fsync {}: {e}", snap.display())))?;
+        let snap = Self::adopt_generation(&path, tmp_dir, true)?;
 
         guard.bm25 = if with_bm25 {
             Some(Bm25Shard::open(&generation_bm25(&snap)).map_err(|e| {
@@ -5415,6 +5429,45 @@ impl NodeServiceImpl {
         })
     }
 
+    /// The atomic generation swap shared by snapshot install and
+    /// compaction cutover (`docs/mutations.md`): the previous generation
+    /// aside (if any), the staged directory into place, both inside ONE
+    /// directory rename each. The staged dir's own entries are fsynced
+    /// first (the files' sync_all covered bytes and inodes, not the names
+    /// pointing at them), and the parent is fsynced after so the swap
+    /// itself survives a crash; the window between the two renames is
+    /// covered by [`recover_generation`]. With `retire_old` the previous
+    /// generation is removed at once (a snapshot install); a compaction
+    /// keeps it until its closing flush and removes it then. Returns the
+    /// active generation directory.
+    pub(crate) fn adopt_generation(
+        index_path: &Path,
+        staged: &Path,
+        retire_old: bool,
+    ) -> Result<PathBuf, Status> {
+        let snap = generation_dir(index_path);
+        let old = generation_old_dir(index_path);
+        crate::postings::fsync_parent(&generation_vector(staged))
+            .map_err(|e| Status::internal(format!("fsync staging {}: {e}", staged.display())))?;
+        if snap.exists() {
+            std::fs::rename(&snap, &old)
+                .map_err(|e| Status::internal(format!("retire {}: {e}", old.display())))?;
+        }
+        if let Err(e) = std::fs::rename(staged, &snap) {
+            // Best-effort rollback so startup recovery sees a clean state.
+            if old.exists() && !snap.exists() {
+                let _ = std::fs::rename(&old, &snap);
+            }
+            return Err(Status::internal(format!("install {}: {e}", snap.display())));
+        }
+        if retire_old {
+            let _ = std::fs::remove_dir_all(&old);
+        }
+        crate::postings::fsync_parent(&snap)
+            .map_err(|e| Status::internal(format!("fsync {}: {e}", snap.display())))?;
+        Ok(snap)
+    }
+
     /// Apply one backend-owned configuration to an empty shard.
     fn apply_backend_config(&self, req: ConfigureVectorBackendRequest) -> Result<bool, Status> {
         let dim = req.dim as usize;
@@ -5497,10 +5550,24 @@ impl NodeServiceImpl {
         batch: AddVectorsRequest,
         stable_routing_key: Option<Vec<u8>>,
     ) -> Result<(u64, u64), Status> {
+        let mut guard = self.state.write().expect("shard state lock poisoned");
+        self.apply_batch_locked(&mut guard, batch, stable_routing_key)
+    }
+
+    /// [`Self::apply_batch`] against a state the caller holds: the live
+    /// shard under its write lock, or the shadow of a compaction that
+    /// tails the same records into its own generation
+    /// (`docs/mutations.md`). One apply function, so the shadow cannot
+    /// drift from what ingest does.
+    pub(crate) fn apply_batch_locked(
+        &self,
+        guard: &mut ShardState,
+        batch: AddVectorsRequest,
+        stable_routing_key: Option<Vec<u8>>,
+    ) -> Result<(u64, u64), Status> {
         if batch.vectors.is_empty() {
             return Ok((0, 0));
         }
-        let mut guard = self.state.write().expect("shard state lock poisoned");
         let known_dim = guard.index.as_ref().and_then(|i| i.dim_opt());
         let dim = if batch.dim != 0 {
             let d = batch.dim as usize;
@@ -6613,7 +6680,7 @@ impl MappedSource<'_> {
 /// a sidecar that holds a response (the test mock deliberately does, and
 /// the streaming contract permits it) from stalling the whole ingest on
 /// one field.
-fn join_fields(
+pub(crate) fn join_fields(
     mut body: crate::postings::AnalyzedDoc,
     extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
     cased: Option<usize>,
@@ -6672,7 +6739,7 @@ fn join_fields(
 /// a declared BM25 field other than the body, not derived from the phrase
 /// glossary or a bigram source, with an explicit step-chain body spec to
 /// twin. `None` when the request names none.
-fn cased_field_index(
+pub(crate) fn cased_field_index(
     config: &NodeConfig,
     phrase_index: Option<&crate::phrases::PhraseIndex>,
     doc: &AddDocumentsRequest,
@@ -6841,7 +6908,7 @@ fn cut_snippets(
 /// The optional sidecar layers a document's specs ask its analysis
 /// session for — the session-identity companion to the reopen
 /// condition (a change to either spec reopens the session).
-fn session_layers(
+pub(crate) fn session_layers(
     doc: &AddDocumentsRequest,
     phrase_index: Option<&crate::phrases::PhraseIndex>,
     sentence_fields: &[String],
@@ -7536,6 +7603,24 @@ impl NodeServiceImpl {
         Ok((doc, analyzed))
     }
 
+    /// The pre-lock half of [`Self::apply_analyzed_document`]: derive or
+    /// validate the document's proximity, phrase, quality, geography, and
+    /// materialized columns. On a document that already went through it
+    /// (a WAL record) every step validates instead of deriving, so the
+    /// compaction shadow replays records through the same function.
+    pub(crate) fn materialize_document(
+        &self,
+        doc: AddDocumentsRequest,
+        analyzed: crate::postings::AnalyzedDoc,
+    ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
+        let (doc, analyzed) = self.materialize_proximity(doc, analyzed)?;
+        let (doc, analyzed) = self.materialize_phrases(doc, analyzed)?;
+        let doc = materialize_quality(doc, &analyzed)?;
+        let doc = materialize_geography(doc, &analyzed)?;
+        let doc = self.materialize_columns(doc)?;
+        Ok((doc, analyzed))
+    }
+
     /// Apply one analyzed document: id assignment, store insert, WAL
     /// append. Must be called in arrival order — both transports
     /// guarantee it.
@@ -7555,12 +7640,34 @@ impl NodeServiceImpl {
         // take the one path they already took. Clearing the spec is what
         // makes replay exact — the logged request carries the values, so
         // replay never calls the sidecar and never derives twice.
-        let (doc, analyzed) = self.materialize_proximity(doc, analyzed)?;
-        let (doc, analyzed) = self.materialize_phrases(doc, analyzed)?;
-        let doc = materialize_quality(doc, &analyzed)?;
-        let doc = materialize_geography(doc, &analyzed)?;
-        let doc = self.materialize_columns(doc)?;
+        let (doc, analyzed) = self.materialize_document(doc, analyzed)?;
         let mut guard = self.state.write().expect("shard state lock poisoned");
+        self.apply_document_locked(
+            &mut guard,
+            doc,
+            analyzed,
+            vector,
+            stable_routing_key,
+            added,
+            first_id,
+        )
+    }
+
+    /// The durable-form document of [`Self::materialize_document`],
+    /// applied against a state the caller holds (see
+    /// [`Self::apply_batch_locked`]): id assignment, store insert, WAL
+    /// append, and the mapped vector in lockstep.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_document_locked(
+        &self,
+        guard: &mut ShardState,
+        doc: AddDocumentsRequest,
+        analyzed: crate::postings::AnalyzedDoc,
+        vector: Option<Vec<f32>>,
+        stable_routing_key: Option<Vec<u8>>,
+        added: &mut u64,
+        first_id: &mut u64,
+    ) -> Result<(), Status> {
         // A disk-resident shard that receives more documents is first
         // reloaded into the heap builder (the append path is
         // bulk-load: build in memory, flush back to v3).
@@ -9747,37 +9854,22 @@ impl NodeService for NodeServiceImpl {
             materialize_sha: req.materialize_sha,
         };
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        match guard.mapped_binding.as_ref() {
-            Some(bound) if *bound != incoming => Err(Status::failed_precondition(format!(
-                "replica is bound to plan {} body {:?}, source WAL requires plan {} body {:?}",
-                bound.plan_fingerprint,
-                bound.body_path,
-                incoming.plan_fingerprint,
-                incoming.body_path
-            ))),
-            Some(_) => Ok(Response::new(crate::pb::ApplyWalBindingResponse {
-                already_bound: true,
-            })),
-            None => {
-                if physical_rows(&guard) != 0 {
-                    return Err(Status::failed_precondition(
-                        "cannot apply a WAL mapping binding to a populated unbound shard; install the matching base snapshot",
-                    ));
-                }
-                wal_append_or_degrade(
-                    &mut guard.wal,
-                    wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
-                        plan_fingerprint: incoming.plan_fingerprint.clone(),
-                        body_path: incoming.body_path.clone(),
-                        materialize_sha: incoming.materialize_sha.clone(),
-                    }),
-                );
-                guard.mapped_binding = Some(incoming);
-                Ok(Response::new(crate::pb::ApplyWalBindingResponse {
-                    already_bound: false,
-                }))
-            }
-        }
+        let already_bound = Self::apply_binding_locked(&mut guard, incoming)?;
+        Ok(Response::new(crate::pb::ApplyWalBindingResponse {
+            already_bound,
+        }))
+    }
+
+    async fn compact_shard(
+        &self,
+        request: Request<crate::pb::CompactShardRequest>,
+    ) -> Result<Response<crate::pb::CompactShardResponse>, Status> {
+        let req = request.into_inner();
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.compact_shard(&req))
+            .await
+            .map_err(|e| Status::internal(format!("compaction task failed: {e}")))?
+            .map(Response::new)
     }
 
     async fn health(
@@ -10239,18 +10331,19 @@ impl NodeService for NodeServiceImpl {
             added += batch_added;
             self.seal_if_due().await?;
         }
-        let total = self
-            .state
-            .read()
-            .expect("shard state lock poisoned")
-            .index
-            .as_ref()
-            .map_or(0, |i| i.len() as u64);
+        let (total, wal_generation) = {
+            let guard = self.state.read().expect("shard state lock poisoned");
+            (
+                guard.index.as_ref().map_or(0, |i| i.len() as u64),
+                guard.wal.as_ref().map_or(0, WalWriter::generation),
+            )
+        };
         crate::metrics::add_ingested(0, added);
         Ok(Response::new(AddVectorsResponse {
             added,
             total,
             first_id,
+            wal_generation,
         }))
     }
 
@@ -10499,19 +10592,20 @@ impl NodeService for NodeServiceImpl {
                 Err(status) => return Err(status),
             }
         }
-        let total = self
-            .state
-            .read()
-            .expect("shard state lock poisoned")
-            .bm25
-            .as_ref()
-            .map_or(0, |b| b.doc_count());
+        let (total, wal_generation) = {
+            let guard = self.state.read().expect("shard state lock poisoned");
+            (
+                guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
+                guard.wal.as_ref().map_or(0, WalWriter::generation),
+            )
+        };
         crate::metrics::add_ingested(added, 0);
         self.seal_if_due().await?;
         Ok(Response::new(AddDocumentsResponse {
             added,
             total,
             first_id,
+            wal_generation,
         }))
     }
 
@@ -10521,43 +10615,9 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<DeleteDocumentsResponse>, Status> {
         crate::metrics::inc_request(crate::metrics::Route::DeleteDocuments);
         let req = request.into_inner();
-        let offset = self.config.slot_offset;
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        let rows = physical_rows(&guard);
-        let mut slots = Vec::with_capacity(req.doc_ids.len());
-        for id in &req.doc_ids {
-            let local = id.checked_sub(offset).ok_or_else(|| {
-                Status::invalid_argument(format!("document id {id} is below shard offset {offset}"))
-            })?;
-            if local >= rows {
-                return Err(Status::invalid_argument(format!(
-                    "document id {id} is outside this shard's {rows} physical rows"
-                )));
-            }
-            slots.push((*id, local as usize));
-        }
-        let mut deleted = 0u64;
-        let mut already_deleted = 0u64;
-        for (id, slot) in slots {
-            if guard.live_docs.delete(slot) {
-                deleted += 1;
-                wal_append_or_degrade(
-                    &mut guard.wal,
-                    wal_record::Op::DeleteDocument(LoggedDeleteDocument { doc_id: id }),
-                );
-            } else {
-                already_deleted += 1;
-            }
-        }
-        if deleted > 0 {
-            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
-            guard.parents = None;
-        }
-        Ok(Response::new(DeleteDocumentsResponse {
-            deleted,
-            already_deleted,
-            live_revision: guard.live_docs.revision(),
-        }))
+        self.delete_documents_locked(&mut guard, &req.doc_ids, req.expected_wal_generation)
+            .map(Response::new)
     }
 
     async fn commit_replacements(
@@ -10566,75 +10626,9 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<CommitReplacementsResponse>, Status> {
         crate::metrics::inc_request(crate::metrics::Route::CommitReplacements);
         let req = request.into_inner();
-        let offset = self.config.slot_offset;
         let mut guard = self.state.write().expect("shard state lock poisoned");
-        let artifact_rows = active_artifact_rows(&guard);
-        let rows = artifact_rows.iter().copied().max().unwrap_or(0);
-        let mut seen = std::collections::HashSet::new();
-        let mut pairs = Vec::with_capacity(req.replacements.len());
-        for replacement in &req.replacements {
-            if replacement.old_doc_id == replacement.new_doc_id {
-                return Err(Status::invalid_argument(
-                    "replacement old and new ids must differ",
-                ));
-            }
-            if !seen.insert(replacement.old_doc_id) || !seen.insert(replacement.new_doc_id) {
-                return Err(Status::invalid_argument(
-                    "a replacement batch may mention each id only once",
-                ));
-            }
-            let old = replacement.old_doc_id.checked_sub(offset).ok_or_else(|| {
-                Status::invalid_argument("replacement old id is below this shard's offset")
-            })?;
-            let new = replacement.new_doc_id.checked_sub(offset).ok_or_else(|| {
-                Status::invalid_argument("replacement new id is below this shard's offset")
-            })?;
-            if old >= rows || new >= rows {
-                return Err(Status::invalid_argument(
-                    "replacement ids must name existing rows on this shard",
-                ));
-            }
-            if artifact_rows
-                .iter()
-                .any(|artifact_rows| old >= *artifact_rows || new >= *artifact_rows)
-            {
-                return Err(Status::failed_precondition(
-                    "replacement ids must exist in every active provider, exact-vector, and document artifact",
-                ));
-            }
-            if guard.live_docs.is_deleted(new as usize) {
-                return Err(Status::failed_precondition(format!(
-                    "replacement row {} is already deleted",
-                    replacement.new_doc_id
-                )));
-            }
-            pairs.push((*replacement, old as usize));
-        }
-        let mut committed = 0u64;
-        let mut already_committed = 0u64;
-        for (replacement, old) in pairs {
-            if guard.live_docs.delete(old) {
-                committed += 1;
-                wal_append_or_degrade(
-                    &mut guard.wal,
-                    wal_record::Op::Replacement(LoggedReplacement {
-                        old_doc_id: replacement.old_doc_id,
-                        new_doc_id: replacement.new_doc_id,
-                    }),
-                );
-            } else {
-                already_committed += 1;
-            }
-        }
-        if committed > 0 {
-            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
-            guard.parents = None;
-        }
-        Ok(Response::new(CommitReplacementsResponse {
-            committed,
-            already_committed,
-            live_revision: guard.live_docs.revision(),
-        }))
+        self.commit_replacements_locked(&mut guard, &req.replacements, req.expected_wal_generation)
+            .map(Response::new)
     }
 
     async fn ingest_mapped(
@@ -10709,13 +10703,13 @@ impl NodeService for NodeServiceImpl {
                 Err(status) => return Err(status),
             }
         }
-        let total = self
-            .state
-            .read()
-            .expect("shard state lock poisoned")
-            .bm25
-            .as_ref()
-            .map_or(0, |b| b.doc_count());
+        let (total, wal_generation) = {
+            let guard = self.state.read().expect("shard state lock poisoned");
+            (
+                guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
+                guard.wal.as_ref().map_or(0, WalWriter::generation),
+            )
+        };
         // Each mapped row carries exactly one vector.
         crate::metrics::add_ingested(added, added);
         let parents = match &source {
@@ -10728,6 +10722,7 @@ impl NodeService for NodeServiceImpl {
             first_id,
             fingerprint,
             parents,
+            wal_generation,
         }))
     }
 
@@ -11584,6 +11579,189 @@ impl NodeService for NodeServiceImpl {
 // these in `spawn_blocking`: a postings walk is CPU-bound for as long
 // as the highest-df term takes, and it must not occupy an async runtime
 // worker -- the same discipline every vector scan path follows.
+/// The mutation handlers' bodies against a state the caller holds (see
+/// [`NodeServiceImpl::apply_batch_locked`]).
+impl NodeServiceImpl {
+    /// Refuse an id-addressed mutation whose ids were issued under
+    /// another WAL generation: a compaction or snapshot install
+    /// renumbered the rows since, so the ids name different documents
+    /// now (docs/mutations.md). `None` claims nothing.
+    fn check_wal_generation(guard: &ShardState, expected: Option<u64>) -> Result<u64, Status> {
+        let held = guard.wal.as_ref().map_or(0, WalWriter::generation);
+        if expected.is_some_and(|expected| expected != held) {
+            return Err(Status::failed_precondition(format!(
+                "stale WAL generation: the request's ids were issued under WAL generation \
+                 {} but this shard is at {held}; a compaction or snapshot install renumbered \
+                 its rows since, so those ids no longer name the same documents — resolve them \
+                 again",
+                expected.expect("checked above")
+            )));
+        }
+        Ok(held)
+    }
+
+    pub(crate) fn delete_documents_locked(
+        &self,
+        guard: &mut ShardState,
+        doc_ids: &[u64],
+        expected_wal_generation: Option<u64>,
+    ) -> Result<DeleteDocumentsResponse, Status> {
+        let wal_generation = Self::check_wal_generation(guard, expected_wal_generation)?;
+        let offset = self.config.slot_offset;
+        let rows = physical_rows(guard);
+        let mut slots = Vec::with_capacity(doc_ids.len());
+        for id in doc_ids {
+            let local = id.checked_sub(offset).ok_or_else(|| {
+                Status::invalid_argument(format!("document id {id} is below shard offset {offset}"))
+            })?;
+            if local >= rows {
+                return Err(Status::invalid_argument(format!(
+                    "document id {id} is outside this shard's {rows} physical rows"
+                )));
+            }
+            slots.push((*id, local as usize));
+        }
+        let mut deleted = 0u64;
+        let mut already_deleted = 0u64;
+        for (id, slot) in slots {
+            if guard.live_docs.delete(slot) {
+                deleted += 1;
+                wal_append_or_degrade(
+                    &mut guard.wal,
+                    wal_record::Op::DeleteDocument(LoggedDeleteDocument { doc_id: id }),
+                );
+            } else {
+                already_deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
+            guard.parents = None;
+        }
+        Ok(DeleteDocumentsResponse {
+            deleted,
+            already_deleted,
+            live_revision: guard.live_docs.revision(),
+            wal_generation,
+        })
+    }
+
+    pub(crate) fn commit_replacements_locked(
+        &self,
+        guard: &mut ShardState,
+        replacements: &[Replacement],
+        expected_wal_generation: Option<u64>,
+    ) -> Result<CommitReplacementsResponse, Status> {
+        let wal_generation = Self::check_wal_generation(guard, expected_wal_generation)?;
+        let offset = self.config.slot_offset;
+        let artifact_rows = active_artifact_rows(guard);
+        let rows = artifact_rows.iter().copied().max().unwrap_or(0);
+        let mut seen = std::collections::HashSet::new();
+        let mut pairs = Vec::with_capacity(replacements.len());
+        for replacement in replacements {
+            if replacement.old_doc_id == replacement.new_doc_id {
+                return Err(Status::invalid_argument(
+                    "replacement old and new ids must differ",
+                ));
+            }
+            if !seen.insert(replacement.old_doc_id) || !seen.insert(replacement.new_doc_id) {
+                return Err(Status::invalid_argument(
+                    "a replacement batch may mention each id only once",
+                ));
+            }
+            let old = replacement.old_doc_id.checked_sub(offset).ok_or_else(|| {
+                Status::invalid_argument("replacement old id is below this shard's offset")
+            })?;
+            let new = replacement.new_doc_id.checked_sub(offset).ok_or_else(|| {
+                Status::invalid_argument("replacement new id is below this shard's offset")
+            })?;
+            if old >= rows || new >= rows {
+                return Err(Status::invalid_argument(
+                    "replacement ids must name existing rows on this shard",
+                ));
+            }
+            if artifact_rows
+                .iter()
+                .any(|artifact_rows| old >= *artifact_rows || new >= *artifact_rows)
+            {
+                return Err(Status::failed_precondition(
+                    "replacement ids must exist in every active provider, exact-vector, and document artifact",
+                ));
+            }
+            if guard.live_docs.is_deleted(new as usize) {
+                return Err(Status::failed_precondition(format!(
+                    "replacement row {} is already deleted",
+                    replacement.new_doc_id
+                )));
+            }
+            pairs.push((*replacement, old as usize));
+        }
+        let mut committed = 0u64;
+        let mut already_committed = 0u64;
+        for (replacement, old) in pairs {
+            if guard.live_docs.delete(old) {
+                committed += 1;
+                wal_append_or_degrade(
+                    &mut guard.wal,
+                    wal_record::Op::Replacement(LoggedReplacement {
+                        old_doc_id: replacement.old_doc_id,
+                        new_doc_id: replacement.new_doc_id,
+                    }),
+                );
+            } else {
+                already_committed += 1;
+            }
+        }
+        if committed > 0 {
+            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
+            guard.parents = None;
+        }
+        Ok(CommitReplacementsResponse {
+            committed,
+            already_committed,
+            live_revision: guard.live_docs.revision(),
+            wal_generation,
+        })
+    }
+
+    /// Establish or verify the mapped-plan binding on a state the caller
+    /// holds: `Ok(true)` when it was already bound to exactly `incoming`,
+    /// `Ok(false)` when this call bound it (logging the Bind record); a
+    /// different binding, or a populated unbound shard, refuse by name.
+    pub(crate) fn apply_binding_locked(
+        guard: &mut ShardState,
+        incoming: crate::postings::StoredBinding,
+    ) -> Result<bool, Status> {
+        match guard.mapped_binding.as_ref() {
+            Some(bound) if *bound != incoming => Err(Status::failed_precondition(format!(
+                "replica is bound to plan {} body {:?}, source WAL requires plan {} body {:?}",
+                bound.plan_fingerprint,
+                bound.body_path,
+                incoming.plan_fingerprint,
+                incoming.body_path
+            ))),
+            Some(_) => Ok(true),
+            None => {
+                if physical_rows(guard) != 0 {
+                    return Err(Status::failed_precondition(
+                        "cannot apply a WAL mapping binding to a populated unbound shard; install the matching base snapshot",
+                    ));
+                }
+                wal_append_or_degrade(
+                    &mut guard.wal,
+                    wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
+                        plan_fingerprint: incoming.plan_fingerprint.clone(),
+                        body_path: incoming.body_path.clone(),
+                        materialize_sha: incoming.materialize_sha.clone(),
+                    }),
+                );
+                guard.mapped_binding = Some(incoming);
+                Ok(false)
+            }
+        }
+    }
+}
+
 impl NodeServiceImpl {
     fn run_bm25_query(&self, req: Bm25QueryRequest) -> Result<Bm25QueryResponse, Status> {
         self.run_bm25_query_live(req, None, None)
