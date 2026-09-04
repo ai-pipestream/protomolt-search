@@ -166,6 +166,25 @@ pub fn process_client_tls() -> Option<&'static ClientTls> {
     PROCESS_CLIENT_TLS.get().and_then(Option::as_ref)
 }
 
+/// The URL a client dials for `addr` under `tls`: `https://` with TLS
+/// material, `http://` without, whatever scheme `addr` carried (a bare
+/// `host:port` gets one). `tonic` applies a channel's TLS only to an
+/// `https` URI, so an address normalized to `http://` (the `--nodes`
+/// list, a shard map) would otherwise dial a TLS listener in plaintext.
+pub fn secure_url(addr: &str, tls: Option<&ClientTls>) -> String {
+    let bare = addr
+        .split_once("://")
+        .map_or(addr, |(_, rest)| rest)
+        .trim_end_matches('/');
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    format!("{scheme}://{bare}")
+}
+
+/// [`secure_url`] under the process-wide client TLS material.
+pub fn process_secure_url(addr: &str) -> String {
+    secure_url(addr, process_client_tls())
+}
+
 /// Apply the process-wide client TLS material to an endpoint, when
 /// installed; a plaintext endpoint otherwise.
 #[cfg(feature = "net")]
@@ -197,6 +216,165 @@ pub fn apply_client_tls(
 pub fn is_loopback(addr: &std::net::SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
+
+// ---------------------------------------------------------------------
+// The tools' side: flags, endpoints, and the bearer header
+// ---------------------------------------------------------------------
+
+/// What a tool (the verifier, the ingest driver, the console) takes on
+/// its command line to reach a fleet on TLS: the cluster CA it trusts
+/// (`--tls-ca`), the identity it presents to node listeners
+/// (`--tls-client-cert`, `--tls-client-key`), the name to verify server
+/// certificates against when it is not the address (`--tls-domain`), and
+/// the bearer token the coordinator's public surface asks for
+/// (`--bearer-token-file`, or `--bearer-token` for a literal). Without
+/// `--tls-ca` the tool speaks plaintext, as before; flags the tool does
+/// not know are left to the tool.
+#[cfg(feature = "net")]
+#[derive(Clone, Debug, Default)]
+pub struct ToolClient {
+    tls: Option<ClientTls>,
+    bearer: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+#[cfg(feature = "net")]
+impl ToolClient {
+    /// Read the flags from the process arguments.
+    pub fn from_env_args() -> Result<Self, String> {
+        Self::from_args(std::env::args())
+    }
+
+    /// Read the flags from `args` (each `--key=value`).
+    pub fn from_args<I: IntoIterator<Item = String>>(args: I) -> Result<Self, String> {
+        let mut ca = None;
+        let mut cert = None;
+        let mut key = None;
+        let mut domain = None;
+        let mut token = None;
+        for arg in args {
+            let Some((k, v)) = arg.strip_prefix("--").and_then(|a| a.split_once('=')) else {
+                continue;
+            };
+            match k {
+                "tls-ca" => ca = Some(std::path::PathBuf::from(v)),
+                "tls-client-cert" => cert = Some(std::path::PathBuf::from(v)),
+                "tls-client-key" => key = Some(std::path::PathBuf::from(v)),
+                "tls-domain" => domain = Some(v.to_string()),
+                "bearer-token" => token = Some(v.to_string()),
+                "bearer-token-file" => {
+                    let text = std::fs::read_to_string(v)
+                        .map_err(|e| format!("read bearer token file {v}: {e}"))?;
+                    token = Some(text.trim().to_string());
+                }
+                _ => {}
+            }
+        }
+        let tls = match ca {
+            Some(ca) => Some(ClientTls::load(
+                &ca,
+                cert.as_deref(),
+                key.as_deref(),
+                domain,
+            )?),
+            None => {
+                if cert.is_some() || key.is_some() || domain.is_some() {
+                    return Err(
+                        "--tls-client-cert / --tls-client-key / --tls-domain need --tls-ca"
+                            .to_string(),
+                    );
+                }
+                None
+            }
+        };
+        let bearer = match token {
+            Some(token) => {
+                if token.len() < 16 {
+                    return Err("a bearer token is at least 16 bytes".to_string());
+                }
+                Some(
+                    format!("Bearer {token}")
+                        .parse()
+                        .map_err(|e| format!("bearer token is not a header value: {e}"))?,
+                )
+            }
+            None => None,
+        };
+        Ok(ToolClient { tls, bearer })
+    }
+
+    /// Whether the tool dials TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    /// Whether the tool sends a bearer token.
+    pub fn has_bearer(&self) -> bool {
+        self.bearer.is_some()
+    }
+
+    /// Install the TLS material process-wide, for the library's own
+    /// channels (an in-process coordinator, replica and snapshot
+    /// helpers).
+    pub fn install(&self) {
+        install_client_tls(self.tls.clone());
+    }
+
+    /// `host:port` (or a schemed address) as the URL the tool dials:
+    /// `https://` on TLS, `http://` otherwise, whatever scheme was given.
+    pub fn url(&self, addr: &str) -> String {
+        secure_url(addr, self.tls.as_ref())
+    }
+
+    /// An endpoint for `addr` under the tool's TLS material.
+    pub fn endpoint(&self, addr: &str) -> Result<tonic::transport::Endpoint, String> {
+        let endpoint = tonic::transport::Endpoint::from_shared(self.url(addr))
+            .map_err(|e| format!("bad address {addr:?}: {e}"))?;
+        apply_client_tls(endpoint, self.tls.as_ref())
+    }
+
+    /// A channel to `addr` whose handshake is deferred to the first call.
+    pub fn channel(&self, addr: &str) -> Result<tonic::transport::Channel, String> {
+        Ok(self.endpoint(addr)?.connect_lazy())
+    }
+
+    /// A connected channel to `addr`.
+    pub async fn connect(&self, addr: &str) -> Result<tonic::transport::Channel, String> {
+        self.endpoint(addr)?
+            .connect()
+            .await
+            .map_err(|e| format!("connect {}: {e}", self.url(addr)))
+    }
+
+    /// The interceptor that adds the bearer header to each call (a no-op
+    /// without a token), for `Client::with_interceptor`.
+    pub fn bearer(&self) -> Bearer {
+        Bearer(self.bearer.clone())
+    }
+}
+
+/// A `tonic` interceptor that sets `authorization: Bearer <token>` on
+/// every request; without a token it changes nothing.
+#[cfg(feature = "net")]
+#[derive(Clone, Debug, Default)]
+pub struct Bearer(Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>);
+
+#[cfg(feature = "net")]
+impl tonic::service::Interceptor for Bearer {
+    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        if let Some(value) = &self.0 {
+            request
+                .metadata_mut()
+                .insert("authorization", value.clone());
+        }
+        Ok(request)
+    }
+}
+
+/// The client type a tool holds for the coordinator's public surface: a
+/// channel with the bearer interceptor.
+#[cfg(feature = "net")]
+pub type PublicChannel =
+    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, Bearer>;
 
 // ---------------------------------------------------------------------
 // Bearer principals and quotas
@@ -643,6 +821,23 @@ impl UdpKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_url_follows_the_tls_material_not_the_address() {
+        let tls = ClientTls {
+            ca_pem: b"-----BEGIN CERTIFICATE-----".to_vec(),
+            identity_pem: None,
+            domain: None,
+        };
+        for addr in [
+            "10.0.0.1:19300",
+            "http://10.0.0.1:19300",
+            "https://10.0.0.1:19300/",
+        ] {
+            assert_eq!(secure_url(addr, Some(&tls)), "https://10.0.0.1:19300");
+            assert_eq!(secure_url(addr, None), "http://10.0.0.1:19300");
+        }
+    }
 
     #[test]
     fn hmac_sha256_matches_rfc_4231_vectors() {

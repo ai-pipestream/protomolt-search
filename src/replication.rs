@@ -159,11 +159,12 @@ impl ReplicaState {
 }
 
 fn client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
-    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
-        .map_err(|error| format!("invalid node address {addr}: {error}"))?
-        .tcp_nodelay(true)
-        .initial_stream_window_size(crate::H2_STREAM_WINDOW)
-        .initial_connection_window_size(crate::H2_CONN_WINDOW);
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(crate::security::process_secure_url(addr))
+            .map_err(|error| format!("invalid node address {addr}: {error}"))?
+            .tcp_nodelay(true)
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW);
     let endpoint = crate::security::secure_endpoint(endpoint)?;
     Ok(NodeServiceClient::new(endpoint.connect_lazy())
         .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
@@ -776,8 +777,9 @@ pub async fn atomic_live_cutover(
     state_path: &Path,
     shard_map_path: &Path,
 ) -> Result<LiveReshardState, String> {
-    let endpoint = tonic::transport::Endpoint::from_shared(coordinator.to_string())
-        .map_err(|error| format!("invalid coordinator address: {error}"))?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(crate::security::process_secure_url(coordinator))
+            .map_err(|error| format!("invalid coordinator address: {error}"))?;
     let endpoint = crate::security::secure_endpoint(endpoint)?;
     let mut control = SearchServiceClient::new(endpoint.connect_lazy())
         .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)

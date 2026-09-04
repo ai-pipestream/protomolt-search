@@ -273,7 +273,9 @@ fleet:
 | `LOCAL_SHARDS` | space-separated shard indexes this host starts, serves, verifies, and shuts down |
 | `NODE_LIST` | the whole node address list, comma-separated, in shard order; shard `i` listens on `PORT_BASE + i` wherever it runs |
 | `LISTEN_HOST` | the address the local nodes bind; anything off loopback gets `--allow-plaintext` unless `TLS_ARGS` names a certificate |
-| `TLS_ARGS` | extra flags for each node, driver, and the coordinator (`--tls-cert=... --tls-key=... --tls-client-ca=...`) |
+| `TLS_ARGS` | the security flags for every node, the coordinator, and the tools: the listener identity (`--tls-cert`, `--tls-key`, `--tls-client-ca`), what the coordinator and the tools present to nodes (`--tls-ca`, `--tls-client-cert`, `--tls-client-key`), and the floor lane's `--udp-hmac-key`; each process takes the flags it uses. `mkcerts.sh` issues the files |
+| `BEARER_TOKENS` | the coordinator's public principals (`--bearer-tokens=<toml>`); unset serves anonymous callers |
+| `BEARER_TOKEN_FILE` | the token the tools present to the coordinator (`--bearer-token-file`); the verifier, the console, and the sweeps need it once `BEARER_TOKENS` is set |
 | `SIDECAR_ADDR` | the analysis sidecar URL; the sidecar starts here only when the URL is loopback |
 | `RUN_COORD` / `COORD_HOST` | whether this host starts the coordinator in `serve`, and where it binds |
 | `INGEST_SHARDS` | the shards the ingest stage feeds from this host (a driver needs only the nodes and the sidecar reachable) |
@@ -309,6 +311,41 @@ export EMB_BYTES=89752201376 SEAL_TAIL_DOCS=250000
 LOCAL_SHARDS="5" RUN_COORD=0 ./rebuild.sh plan up       # pi5v2
 LOCAL_SHARDS="6" RUN_COORD=0 ./rebuild.sh plan up       # pi5v3
 LOCAL_SHARDS="7" RUN_COORD=0 ./rebuild.sh plan up       # pi5v1 (the tail shard)
+```
+
+### mTLS on the fleet
+
+Off loopback a node refuses to start without either `--allow-plaintext`
+or a certificate (`docs/security.md`); the runbook adds the plaintext
+flag itself when `TLS_ARGS` names no certificate. To run the fleet on
+mTLS, issue the material once on the operator box and copy each host
+its own files under one path:
+
+```bash
+./mkcerts.sh ~/protomolt-search/tls krick-1=192.168.1.195 pi5v3=192.168.1.236 pi5v1=192.168.1.216
+# each host gets ca.pem, its own <host>.pem/.key as server.pem/server.key,
+# client.pem/client.key, udp.key; the coordinator host also principals.toml;
+# the operator box (a client only) ca.pem, client.pem/.key, bearer.token
+T=$HOME/protomolt-search/tls
+export TLS_ARGS="--tls-cert=$T/server.pem --tls-key=$T/server.key --tls-client-ca=$T/ca.pem \
+  --tls-ca=$T/ca.pem --tls-client-cert=$T/client.pem --tls-client-key=$T/client.key \
+  --udp-hmac-key=$T/udp.key"
+export BEARER_TOKENS=$T/principals.toml BEARER_TOKEN_FILE=$T/bearer.token
+./rebuild.sh down serve      # per host; the whole fleet moves at once
+```
+
+Every server certificate names the host, its addresses, and `127.0.0.1`,
+so the coordinator dials nodes by address with no `--tls-domain`, and
+the readiness probe reaches the local coordinator over loopback. The
+coordinator's channels are process-wide client material, so the fleet
+cannot run mixed: every node moves to TLS in the same `serve`. The
+sidecar stays plaintext (it has no TLS), and the tools address it as
+before. From the operator box:
+
+```bash
+v7_verify --coord=192.168.1.195:19291 --shards=8 \
+  --tls-ca=$T/ca.pem --tls-client-cert=$T/client.pem --tls-client-key=$T/client.key \
+  --bearer-token-file=$T/bearer.token
 ```
 
 `ssh host cmd` runs a non-login shell: on krick-1 Java lives under

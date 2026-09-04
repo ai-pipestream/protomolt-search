@@ -114,8 +114,9 @@ pub async fn install_snapshot_generation(
         }
     });
 
-    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
-        .map_err(|e| Status::unavailable(format!("node at {addr}: {e}")))?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(crate::security::process_secure_url(addr))
+            .map_err(|e| Status::unavailable(format!("node at {addr}: {e}")))?;
     let endpoint =
         crate::security::secure_endpoint(endpoint).map_err(Status::failed_precondition)?;
     let mut client = NodeServiceClient::new(
@@ -161,10 +162,11 @@ async fn send_file(tx: &mpsc::Sender<SnapshotChunk>, path: &Path) -> bool {
 
 /// A channel to a node under the process-wide client TLS material.
 async fn node_client(addr: &str) -> Result<NodeServiceClient<tonic::transport::Channel>, Status> {
-    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
-        .map_err(|e| Status::unavailable(format!("node at {addr}: {e}")))?
-        .initial_stream_window_size(crate::H2_STREAM_WINDOW)
-        .initial_connection_window_size(crate::H2_CONN_WINDOW);
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(crate::security::process_secure_url(addr))
+            .map_err(|e| Status::unavailable(format!("node at {addr}: {e}")))?
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW);
     let endpoint =
         crate::security::secure_endpoint(endpoint).map_err(Status::failed_precondition)?;
     Ok(NodeServiceClient::new(

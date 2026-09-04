@@ -42,8 +42,15 @@
 #   LISTEN_HOST    the address the local nodes bind (default 127.0.0.1);
 #                  off-loopback listeners get --allow-plaintext unless
 #                  TLS_ARGS carries the certificate flags
-#   TLS_ARGS       extra flags for every node and the coordinator
-#                  (e.g. --tls-cert=... --tls-key=... --tls-client-ca=...)
+#   TLS_ARGS       extra flags for every node, the coordinator, and the
+#                  tools (e.g. --tls-cert=... --tls-key=... --tls-client-ca=...
+#                  --tls-ca=... --tls-client-cert=... --tls-client-key=...
+#                  --udp-hmac-key=...); mkcerts.sh issues the files, and
+#                  each process takes the flags it uses (docs/security.md)
+#   BEARER_TOKENS  the coordinator's public principals (a TOML file,
+#                  --bearer-tokens); unset serves anonymous callers
+#   BEARER_TOKEN_FILE  the token the tools (the verifier, the console)
+#                  present to the coordinator (--bearer-token-file)
 #   SIDECAR_ADDR   the analysis sidecar URL every node, driver, and
 #                  coordinator uses (default http://127.0.0.1:$SIDECAR_PORT);
 #                  the sidecar is only started here when it is local
@@ -128,6 +135,13 @@ TLS_ARGS=${TLS_ARGS:-}
 # Read as an array once; a word-split of the same string later would
 # re-split on every use.
 read -r -a TLS_ARG_LIST <<<"$TLS_ARGS"
+BEARER_TOKENS=${BEARER_TOKENS:-}
+BEARER_TOKEN_FILE=${BEARER_TOKEN_FILE:-}
+# What a tool dials the fleet with: the TLS flags it knows (the CA and
+# the client identity; it leaves the listener flags alone) plus the
+# bearer token for the coordinator's public surface.
+CLIENT_ARG_LIST=("${TLS_ARG_LIST[@]}")
+[[ -n $BEARER_TOKEN_FILE ]] && CLIENT_ARG_LIST+=(--bearer-token-file="$BEARER_TOKEN_FILE")
 
 die() { echo "rebuild: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -445,7 +459,7 @@ stage_calibrate() {
   say "fitting the seed calibration (streams $EMB once)"
   "$INGEST" --nodes="$NODE_LIST" --embeddings="$EMB" --chunks="$CHUNKS" \
     --chunk-count="$M" --calibration="$OUT/calibration.json" --fit-only \
-    "${TLS_ARG_LIST[@]}" 2>&1 |
+    "${CLIENT_ARG_LIST[@]}" 2>&1 |
     tee -a "$LOGS/calibrate.log"
 }
 
@@ -486,7 +500,7 @@ stage_ingest() {
         --analysis-addr="$SIDECAR_ADDR" \
         ${INGEST_BLOCK:+--ingest-block="$INGEST_BLOCK"} \
         ${INGEST_RESUME:+--resume} \
-        "${TLS_ARG_LIST[@]}" \
+        "${CLIENT_ARG_LIST[@]}" \
         >>"$LOGS/ingest-$i.log" 2>&1 &
       pids+=($!)
       echo $! >"$RUN/ingest-$i.pid"
@@ -561,6 +575,7 @@ stage_serve() {
     --stream-search \
     --analysis-addr="$SIDECAR_ADDR" \
     "${coord_plain[@]}" "${TLS_ARG_LIST[@]}" \
+    ${BEARER_TOKENS:+--bearer-tokens="$BEARER_TOKENS"} \
     >>"$LOGS/coordinator.log" 2>&1 &
   echo $! >"$RUN/coordinator.pid"
   wait_port "$COORD_PORT" coordinator
@@ -573,7 +588,7 @@ stage_serve() {
   local waited
   for waited in $(seq 1 300); do
     "$VERIFY" --coord="127.0.0.1:$COORD_PORT" --shards="$SHARDS" \
-      --ready-only --wait-ready=2 "${TLS_ARG_LIST[@]}" >/dev/null 2>&1 && break
+      --ready-only --wait-ready=2 "${CLIENT_ARG_LIST[@]}" >/dev/null 2>&1 && break
     sleep 2
   done
   say "fleet ready on :$COORD_PORT"

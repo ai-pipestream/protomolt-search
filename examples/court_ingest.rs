@@ -23,9 +23,9 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastVectorBackendRequest,
-    HealthRequest,
-    DocLineage, DocumentField, FlushRequest, GetDocumentsRequest,
+    DocLineage, DocumentField, FlushRequest, GetDocumentsRequest, HealthRequest,
 };
+use pipestream_search::security::ToolClient;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -288,9 +288,14 @@ fn load_or_fit_calibration(
 /// driver stays in the tens of MB at any corpus size.
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The fleet's security flags (docs/security.md): --tls-ca and the
+    // client identity the node listeners demand. Installed process-wide
+    // so the in-process coordinator's channels carry the same identity.
+    let security = ToolClient::from_env_args()?;
+    security.install();
     let nodes_arg = arg("nodes", "");
     if !nodes_arg.is_empty() {
-        return run_remote(nodes_arg).await;
+        return run_remote(nodes_arg, security).await;
     }
 
     let chunks_path = arg("chunks", "/work/court-corpus/chunks.ndjson");
@@ -424,10 +429,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let spec = spec.clone();
         let case_names = case_names.clone();
         let body_columns = body_columns.clone();
+        let security = security.clone();
         ingest_tasks.push(tokio::spawn(async move {
             let n = block.len();
             // Documents first so doc ids and vector slots align 1:1.
-            let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+            let mut client = NodeServiceClient::new(security.connect(&addr).await.unwrap());
             let (tx, rx) = mpsc::channel::<AddDocumentsRequest>(64);
             let feeder = tokio::spawn(async move {
                 for (i, (chunk, _)) in block.iter().enumerate() {
@@ -511,7 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Flush -------------------------------------------------------------
     for (shard, addr) in node_addrs.iter().enumerate() {
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        let mut client = NodeServiceClient::new(security.connect(addr).await.unwrap());
         let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
         assert!(flushed.written);
         eprintln!(
@@ -552,7 +558,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(top) = hits.first() {
             let owner = node_addrs[top.shard as usize].clone();
-            let mut client = NodeServiceClient::connect(owner).await.unwrap();
+            let mut client = NodeServiceClient::new(security.connect(&owner).await.unwrap());
             let docs = client
                 .get_documents(GetDocumentsRequest {
                     doc_ids: vec![top.doc_id],
@@ -588,20 +594,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Ingest into already-running shard nodes (e.g. on a second host).
 /// Streams both files per shard instead of holding the full join.
-async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_remote(
+    nodes_arg: String,
+    security: ToolClient,
+) -> Result<(), Box<dyn std::error::Error>> {
     let chunks_path = arg("chunks", "/work/court-corpus/chunks.ndjson");
     let embeddings_path = arg("embeddings", "/work/court-corpus/embeddings-static.bin");
     let node_addrs: Vec<String> = nodes_arg
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| {
-            if s.starts_with("http://") || s.starts_with("https://") {
-                s.to_string()
-            } else {
-                format!("http://{s}")
-            }
-        })
+        .map(|s| security.url(s))
         .collect();
     let n_shards = node_addrs.len();
     if n_shards == 0 {
@@ -779,7 +782,7 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         let (start, end) = bounds[shard];
 
         let n = end - start;
-        let mut client = NodeServiceClient::connect(addr.clone()).await?;
+        let mut client = NodeServiceClient::new(security.connect(addr).await?);
 
         // Rows this node already holds, when resuming.
         let mut done = 0usize;

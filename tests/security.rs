@@ -23,7 +23,7 @@ use pipestream_search::pb::{
     RoutedIngestMappedRequest, RoutedMappedDocument,
 };
 use pipestream_search::security::{
-    ClientTls, MeteredIngest, PrincipalConfig, Principals, ServerTls, UdpKey,
+    ClientTls, MeteredIngest, PrincipalConfig, Principals, ServerTls, ToolClient, UdpKey,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -216,7 +216,10 @@ async fn the_coordinator_presents_its_identity_and_serves_bearer_clients() {
     assert_eq!(ingest_over(endpoint(&node, Some(&member)), &docs).await, 8);
 
     // The coordinator: its channels to the node carry the member identity.
-    let coordinator = CoordinatorServiceImpl::new(vec![node.clone()])
+    // The address is handed over as the configuration normalizes it
+    // (`http://`); the scheme follows the material, not the address.
+    let plain_addr = node.replacen("https://", "http://", 1);
+    let coordinator = CoordinatorServiceImpl::new(vec![plain_addr])
         .with_bm25(Some(analysis), Default::default())
         .with_client_tls(member.clone());
     let set = CollectionSet::single(coordinator).with_principals(principals());
@@ -327,6 +330,118 @@ async fn the_coordinator_presents_its_identity_and_serves_bearer_clients() {
     public_handle.abort();
     node_handle.abort();
     mock.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_reaches_a_tls_fleet_from_its_flags() {
+    // The verifier, the driver, and the console take the same flags
+    // (docs/security.md): --tls-ca and the client identity for the node
+    // listeners, --bearer-token-file for the coordinator. Here the tool's
+    // client type reaches a TLS node with the identity and a TLS
+    // coordinator with the bearer; a file token and a literal both load.
+    let (analysis, _mock) = start_mock_analysis().await;
+    let (node, node_handle) = serve_node(
+        NodeConfig {
+            analysis_addr: Some(analysis.clone()),
+            ..Default::default()
+        },
+        &server_tls(true),
+    )
+    .await;
+    let dir = tempdir("tool-client");
+    let token_file = dir.join("bearer.token");
+    std::fs::write(&token_file, format!("{BATCH}\n")).unwrap();
+    let certs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/certs");
+    let args = |extra: &[String]| -> Vec<String> {
+        let mut args = vec![
+            "tool".to_string(),
+            "--k=3".to_string(),
+            format!("--tls-ca={}", certs.join("ca.pem").display()),
+            format!("--tls-client-cert={}", certs.join("client.pem").display()),
+            format!(
+                "--tls-client-key={}",
+                certs.join("client.key.pem").display()
+            ),
+            "--tls-domain=localhost".to_string(),
+            // A listener flag the tool does not take is left alone.
+            "--tls-cert=/nowhere/server.pem".to_string(),
+        ];
+        args.extend_from_slice(extra);
+        args
+    };
+    let member = ToolClient::from_args(args(&[format!(
+        "--bearer-token-file={}",
+        token_file.display()
+    )]))
+    .unwrap();
+    assert!(member.is_tls() && member.has_bearer());
+    // A bare host:port dials https under TLS; a schemed address is rewritten.
+    assert_eq!(member.url("127.0.0.1:1"), "https://127.0.0.1:1");
+    assert_eq!(member.url("http://127.0.0.1:1/"), "https://127.0.0.1:1");
+    assert_eq!(
+        ToolClient::from_args(vec!["tool".to_string()])
+            .unwrap()
+            .url("127.0.0.1:1"),
+        "http://127.0.0.1:1"
+    );
+
+    // The node listener demands the identity: the tool's channel carries it.
+    let mut node_client = NodeServiceClient::new(member.connect(&node).await.unwrap());
+    let health = node_client
+        .health(HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(health.num_vectors, 0);
+
+    // The coordinator's public surface takes the bearer from the interceptor.
+    let coordinator = CoordinatorServiceImpl::new(vec![node.clone()])
+        .with_bm25(Some(analysis), Default::default())
+        .with_client_tls(client_tls(Some(("client.pem", "client.key.pem"))));
+    let set = CollectionSet::single(coordinator).with_principals(principals());
+    let (public, public_handle) = serve_coordinator(set, None, &server_tls(true)).await;
+    let mut client = SearchServiceClient::with_interceptor(
+        member.connect(&public).await.unwrap(),
+        member.bearer(),
+    );
+    let hits = client
+        .bm25_search(search("court", 3))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert!(hits.is_empty(), "an empty node answers with no hits");
+    // Without a token the same client type is refused by name.
+    let anon = ToolClient::from_args(args(&[])).unwrap();
+    assert!(!anon.has_bearer());
+    let mut client = SearchServiceClient::with_interceptor(
+        member.connect(&public).await.unwrap(),
+        anon.bearer(),
+    );
+    let error = client.bm25_search(search("court", 3)).await.unwrap_err();
+    assert_eq!(error.code(), Code::Unauthenticated);
+    // A literal token works the same; a short one and a client identity
+    // without a CA are refused before any connection.
+    assert!(
+        ToolClient::from_args(args(&[format!("--bearer-token={BATCH}")]))
+            .unwrap()
+            .has_bearer()
+    );
+    assert!(
+        ToolClient::from_args(args(&["--bearer-token=short".to_string()]))
+            .unwrap_err()
+            .contains("at least 16 bytes")
+    );
+    assert!(ToolClient::from_args(vec![
+        "tool".to_string(),
+        "--tls-client-cert=/nowhere/client.pem".to_string()
+    ])
+    .unwrap_err()
+    .contains("need --tls-ca"));
+
+    public_handle.abort();
+    node_handle.abort();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

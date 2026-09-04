@@ -124,6 +124,28 @@ material, so a registering node presents `--tls-client-cert`; the
 listeners it opens for placed replicas carry the node's server identity
 and demand a client certificate like every node listener.
 
+## The tools
+
+The verifier (`examples/v7_verify`), the ingest driver
+(`examples/court_ingest`), and the console (`src/bin/console`) take the
+client side of the same flags, through `security::ToolClient`: `--tls-ca`
+(the cluster CA), `--tls-client-cert` and `--tls-client-key` (the
+identity node listeners demand), `--tls-domain` (when the certificate's
+name is not the address), and the bearer for the coordinator's public
+surface as `--bearer-token-file=<path>` (or `--bearer-token=<literal>`).
+A tool dials `https://` once `--tls-ca` is set and `http://` otherwise,
+whatever scheme its address carried, and it leaves listener flags it
+does not take alone, so a runbook can hand every process one flag
+string. The bearer rides a `tonic` interceptor (`security::Bearer`) on
+every call; the driver installs its material process-wide so its
+in-process coordinator's channels carry the identity. The sidecar has
+no TLS; its address is untouched.
+
+`deploy/v7-rebuild/mkcerts.sh` issues a fleet's material with
+`openssl`: the CA, a server identity per host (SANs: the host name, its
+addresses, `127.0.0.1`), the cluster-internal client identity, the UDP
+key, and one principal with its token file.
+
 ## Refusals, named
 
 - listener off loopback without TLS and without `--allow-plaintext`
@@ -150,7 +172,8 @@ and demand a client certificate like every node listener.
 
 ## Tests
 
-`tests/security.rs`: a TLS node accepts a client certificate from the
+`tests/security.rs`: a tool built from its flags reaches a TLS node with the
+identity and a TLS coordinator with the bearer, and the flag refusals; a TLS node accepts a client certificate from the
 cluster CA and rejects plaintext, a certificate-less client, and a
 foreign CA's certificate; a coordinator with its identity reaches TLS
 nodes and serves bearer clients over TLS; the bearer table (missing,

@@ -1289,7 +1289,12 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
         .flush(FlushRequest {})
         .await
         .expect_err("a flush that sealed documents without their vectors");
-    assert_eq!(flushed.code(), tonic::Code::FailedPrecondition, "{}", flushed.message());
+    assert_eq!(
+        flushed.code(),
+        tonic::Code::FailedPrecondition,
+        "{}",
+        flushed.message()
+    );
     let vectors: Vec<f32> = rows[..250].iter().flat_map(|r| r.vector.clone()).collect();
     let status = docs_first
         .add_vectors(tokio_stream::iter([AddVectorsRequest {
@@ -1341,8 +1346,12 @@ async fn a_node_reopened_without_a_flush_rebuilds_its_exact_sidecar_from_segment
     let exact_path = pipestream_search::node::exact_vector_sidecar_path(&index_path);
     assert!(!exact_path.exists(), "no flush, no finalized sidecar");
 
-    let (addr, handle) =
-        start_opened_node(config(Some(index_path.clone()), Layout::Segments, &analysis)).await;
+    let (addr, handle) = start_opened_node(config(
+        Some(index_path.clone()),
+        Layout::Segments,
+        &analysis,
+    ))
+    .await;
     let exact = pipestream_search::exact_vectors::ExactVectorStore::open(&exact_path)
         .expect("the open rebuilt the sidecar from the segments");
     assert_eq!(exact.len(), 256);

@@ -21,6 +21,7 @@ use pipestream_search::pb::{
     HybridLegOptions, HybridSearchRequest, QueryField, SearchRequest, SearchVariant,
     VariantSearchRequest,
 };
+use pipestream_search::security::ToolClient;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -67,12 +68,11 @@ impl Report {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let coord = arg("coord", "127.0.0.1:59291");
-    let coord = if coord.starts_with("http") {
-        coord
-    } else {
-        format!("http://{coord}")
-    };
+    // The fleet's security flags (docs/security.md): --tls-ca and the
+    // client identity for TLS, --bearer-token-file for the coordinator's
+    // public surface. Absent, the verifier speaks plaintext as before.
+    let security = ToolClient::from_env_args()?;
+    let coord = security.url(&arg("coord", "127.0.0.1:59291"));
     let analysis_addr = arg("analysis-addr", "http://127.0.0.1:59202");
     let query = arg("query", "qualified immunity");
     let case_query = arg("case-name-query", "United States");
@@ -82,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shard owns a returned id. 0 = do not report it.
     let offset_stride: u64 = arg("offset-stride", "0").parse()?;
 
-    let mut client = SearchServiceClient::connect(coord.clone()).await?;
+    let mut client =
+        SearchServiceClient::with_interceptor(security.connect(&coord).await?, security.bearer());
     let mut r = Report {
         passed: 0,
         failed: 0,

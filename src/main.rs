@@ -589,7 +589,9 @@ fn secured_server(
 async fn secure_channel(
     addr: &str,
 ) -> Result<tonic::transport::Channel, Box<dyn std::error::Error>> {
-    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())?;
+    let endpoint = tonic::transport::Endpoint::from_shared(
+        pipestream_search::security::process_secure_url(addr),
+    )?;
     let endpoint = pipestream_search::security::secure_endpoint(endpoint)?;
     Ok(endpoint.connect().await?)
 }

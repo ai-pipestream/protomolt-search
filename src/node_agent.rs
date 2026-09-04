@@ -459,9 +459,10 @@ impl NodeAgent {
             return Ok(client.clone());
         }
         let addr = crate::config::normalize_addr(self.inner.config.control_addr.clone());
-        let endpoint = tonic::transport::Endpoint::from_shared(addr.clone())
-            .map_err(|e| format!("control address {addr}: {e}"))?
-            .tcp_nodelay(true);
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(crate::security::process_secure_url(&addr))
+                .map_err(|e| format!("control address {addr}: {e}"))?
+                .tcp_nodelay(true);
         let endpoint = crate::security::secure_endpoint(endpoint)?;
         let client = ClusterControlClient::new(endpoint.connect_lazy())
             .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
@@ -1268,8 +1269,9 @@ fn now_ms() -> u64 {
 }
 
 async fn node_health(addr: &str) -> Result<HealthResponse, String> {
-    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
-        .map_err(|e| format!("node address {addr}: {e}"))?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(crate::security::process_secure_url(addr))
+            .map_err(|e| format!("node address {addr}: {e}"))?;
     let endpoint = crate::security::secure_endpoint(endpoint)?;
     Ok(
         crate::pb::node_service_client::NodeServiceClient::new(endpoint.connect_lazy())

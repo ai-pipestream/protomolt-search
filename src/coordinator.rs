@@ -2769,7 +2769,11 @@ impl CoordinatorServiceImpl {
     /// with the engine's window sizes and the process's client TLS.
     #[cfg(feature = "net")]
     fn connect(&self, addr: &str) -> Result<Channel, Status> {
-        let endpoint = Endpoint::from_shared(addr.to_string())
+        let tls = self
+            .client_tls
+            .as_ref()
+            .or(crate::security::process_client_tls());
+        let endpoint = Endpoint::from_shared(crate::security::secure_url(addr, tls))
             .map_err(|e| Status::unavailable(format!("invalid node address {addr}: {e}")))?
             .tcp_nodelay(true)
             // The client end is the RECEIVER of stream batches, so these
@@ -2777,13 +2781,8 @@ impl CoordinatorServiceImpl {
             // window-update round trips (see H2_STREAM_WINDOW).
             .initial_stream_window_size(crate::H2_STREAM_WINDOW)
             .initial_connection_window_size(crate::H2_CONN_WINDOW);
-        let endpoint = crate::security::apply_client_tls(
-            endpoint,
-            self.client_tls
-                .as_ref()
-                .or(crate::security::process_client_tls()),
-        )
-        .map_err(Status::failed_precondition)?;
+        let endpoint = crate::security::apply_client_tls(endpoint, tls)
+            .map_err(Status::failed_precondition)?;
         Ok(endpoint.connect_lazy())
     }
 

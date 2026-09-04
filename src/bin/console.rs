@@ -20,7 +20,7 @@
 //! fetches), `--analysis` (sidecar address, required for embedding).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,6 +35,7 @@ use pipestream_search::pb::{
     Bm25SearchRequest, BoostRescore, ClusterHealthRequest, FusionMode, GetDocumentsRequest,
     HybridDebug, HybridLegOptions, HybridSearchRequest, ScoreCombination, ScoreNormalization,
 };
+use pipestream_search::security::{PublicChannel, ToolClient};
 
 const CONSOLE_HTML: &str = include_str!("console.html");
 /// Request bodies are tiny JSON; anything bigger is a mistake.
@@ -44,6 +45,24 @@ struct Ctx {
     coordinator: String,
     nodes: Vec<String>,
     analysis: Option<String>,
+    /// The fleet's security flags (docs/security.md): TLS toward the
+    /// coordinator and the nodes, the bearer token for the public surface.
+    security: ToolClient,
+    /// One channel per address, connected lazily and reused across
+    /// requests (a handshake per request would dominate a TLS fleet).
+    channels: Mutex<HashMap<String, Channel>>,
+}
+
+impl Ctx {
+    fn channel(&self, addr: &str) -> Result<Channel, String> {
+        let mut channels = self.channels.lock().expect("channel map poisoned");
+        if let Some(channel) = channels.get(addr) {
+            return Ok(channel.clone());
+        }
+        let channel = self.security.channel(addr)?;
+        channels.insert(addr.to_string(), channel.clone());
+        Ok(channel)
+    }
 }
 
 fn flag(args: &[String], key: &str) -> Option<String> {
@@ -65,23 +84,27 @@ fn grpc_addr(addr: &str) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let listen = flag(&args, "listen").unwrap_or_else(|| "127.0.0.1:8600".to_string());
-    let coordinator = grpc_addr(
-        &flag(&args, "coordinator").unwrap_or_else(|| "http://127.0.0.1:50050".to_string()),
-    );
+    let security = ToolClient::from_env_args()?;
+    let coordinator = security
+        .url(&flag(&args, "coordinator").unwrap_or_else(|| "http://127.0.0.1:50050".to_string()));
     let nodes: Vec<String> = flag(&args, "nodes")
         .map(|list| {
             list.split(',')
                 .filter(|s| !s.is_empty())
-                .map(grpc_addr)
+                .map(|s| security.url(s))
                 .collect()
         })
         .unwrap_or_default();
+    // The sidecar has no TLS (docs/security.md); its address keeps its
+    // own scheme.
     let analysis = flag(&args, "analysis").map(|a| grpc_addr(&a));
 
     let ctx = Arc::new(Ctx {
         coordinator,
         nodes,
         analysis,
+        security,
+        channels: Mutex::new(HashMap::new()),
     });
     let listener = TcpListener::bind(&listen).await?;
     eprintln!(
@@ -209,24 +232,22 @@ async fn respond(
     stream.flush().await
 }
 
-fn search_client(addr: &str) -> Result<SearchServiceClient<Channel>, String> {
+fn search_client(ctx: &Ctx, addr: &str) -> Result<SearchServiceClient<PublicChannel>, String> {
     Ok(
-        SearchServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
+        SearchServiceClient::with_interceptor(ctx.channel(addr)?, ctx.security.bearer())
             .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
             .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES),
     )
 }
 
-fn node_client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
-    Ok(
-        NodeServiceClient::new(analyzer::shared_channel(addr).map_err(|e| e.to_string())?)
-            .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES),
-    )
+fn node_client(ctx: &Ctx, addr: &str) -> Result<NodeServiceClient<Channel>, String> {
+    Ok(NodeServiceClient::new(ctx.channel(addr)?)
+        .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES))
 }
 
 async fn health(ctx: &Ctx) -> Result<Value, String> {
-    let mut client = search_client(&ctx.coordinator)?;
+    let mut client = search_client(ctx, &ctx.coordinator)?;
     let response = client
         .cluster_health(ClusterHealthRequest {
             collection: String::new(),
@@ -463,7 +484,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
         debug: true,
         boost,
     };
-    let mut client = search_client(&ctx.coordinator)?;
+    let mut client = search_client(ctx, &ctx.coordinator)?;
     let response = client
         .hybrid_search(request)
         .await
@@ -511,7 +532,7 @@ async fn search(ctx: &Ctx, body: &[u8]) -> Result<Value, String> {
             let Some(addr) = ctx.nodes.get(shard as usize) else {
                 continue;
             };
-            let mut client = node_client(addr)?;
+            let mut client = node_client(ctx, addr)?;
             let found = client
                 .get_documents(GetDocumentsRequest { doc_ids })
                 .await
@@ -561,7 +582,7 @@ async fn bm25_filtered_search(
     analysis: Option<pipestream_search::pb::AnalysisSpec>,
 ) -> Result<Value, String> {
     let t0 = std::time::Instant::now();
-    let mut client = search_client(&ctx.coordinator)?;
+    let mut client = search_client(ctx, &ctx.coordinator)?;
     let response = client
         .bm25_search(Bm25SearchRequest {
             text: req.text.clone(),
@@ -591,7 +612,7 @@ async fn bm25_filtered_search(
     if req.fetch_docs && !ctx.nodes.is_empty() && !response.hits.is_empty() {
         let doc_ids: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
         for addr in &ctx.nodes {
-            let mut node = node_client(addr)?;
+            let mut node = node_client(ctx, addr)?;
             let found = node
                 .get_documents(GetDocumentsRequest {
                     doc_ids: doc_ids.clone(),
