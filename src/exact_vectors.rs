@@ -306,6 +306,70 @@ impl ExactVectorStore {
         Self::open(path)
     }
 
+    /// Write one store whose rows are `parts` back to back, streaming each
+    /// part's payload with a bounded buffer — the dense whole-shard sidecar
+    /// a compaction assembles from its sealed segments' FP32 files
+    /// (`docs/mutations.md`) without decoding them into heap. Every part
+    /// must be a persisted store of dimension `dim`. Returns the new store
+    /// opened mapped.
+    pub fn write_concatenated(dim: usize, parts: &[&Path], path: &Path) -> io::Result<Self> {
+        if dim == 0 {
+            return Err(invalid(
+                "cannot concatenate exact-vector stores of dimension 0",
+            ));
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let tmp = unique_temp_path(path);
+        let result = (|| -> io::Result<()> {
+            let file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+            let mut out = BufWriter::new(file);
+            out.write_all(&[0u8; HEADER_BYTES])?;
+            let mut digest = crate::sha256::Sha256::new();
+            let mut rows = 0usize;
+            let mut payload_bytes = 0usize;
+            for part in parts {
+                let opened = Self::open(part)?;
+                if opened.dim() != Some(dim) {
+                    return Err(invalid(format!(
+                        "{} has dimension {:?}, expected {dim}",
+                        part.display(),
+                        opened.dim()
+                    )));
+                }
+                let Storage::Mapped { map, .. } = &opened.storage else {
+                    unreachable!("open() maps the file")
+                };
+                for chunk in map[HEADER_BYTES..].chunks(1 << 20) {
+                    digest.update(chunk);
+                    out.write_all(chunk)?;
+                }
+                rows = rows
+                    .checked_add(opened.len())
+                    .ok_or_else(|| invalid("exact-vector row count overflow"))?;
+                payload_bytes = payload_bytes
+                    .checked_add(map.len() - HEADER_BYTES)
+                    .ok_or_else(|| invalid("exact-vector payload size overflow"))?;
+            }
+            out.flush()?;
+            let mut file = out
+                .into_inner()
+                .map_err(|e| io::Error::new(e.error().kind(), e.to_string()))?;
+            let header = make_header(dim, rows, payload_bytes, digest.finalize())?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&header)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            crate::postings::fsync_parent(path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
+        Self::open(path)
+    }
+
     /// Verify the payload against the SHA-256 committed in the header.
     /// This intentionally scans the complete file and is therefore an
     /// explicit integrity operation rather than part of ordinary mmap open.

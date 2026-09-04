@@ -221,6 +221,12 @@ impl SegmentedShard {
         Self::from_catalog(catalog, tail)
     }
 
+    /// [`Self::open`] over a catalog the caller already holds — the staged
+    /// catalog of a compaction shadow (`SegmentCatalog::open_staged`).
+    pub fn open_catalog(catalog: SegmentCatalog, tail: Bm25Store) -> Result<Self, String> {
+        Self::from_catalog(catalog, tail)
+    }
+
     fn from_catalog(catalog: SegmentCatalog, tail: Bm25Store) -> Result<Self, String> {
         if tail.next_doc_id() != 0 {
             return Err("a segmented shard's tail must start empty".to_string());

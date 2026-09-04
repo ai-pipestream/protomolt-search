@@ -121,6 +121,11 @@ struct OpenedSegment {
 pub struct OpenedSegmentSet {
     root: PathBuf,
     manifest: SegmentSetManifest,
+    /// The set's epoch as published. Opens at `manifest.epoch`; a
+    /// compaction cutover raises it past the live set's before it
+    /// commits the shadow set it built earlier (`docs/mutations.md`),
+    /// so publication order stays monotone on disk.
+    epoch: std::sync::atomic::AtomicU64,
     segments: Vec<OpenedSegment>,
 }
 
@@ -129,7 +134,7 @@ impl std::fmt::Debug for OpenedSegmentSet {
         formatter
             .debug_struct("OpenedSegmentSet")
             .field("root", &self.root)
-            .field("epoch", &self.manifest.epoch)
+            .field("epoch", &self.epoch())
             .field("segments", &self.manifest.segments)
             .finish()
     }
@@ -319,13 +324,29 @@ impl OpenedSegmentSet {
         }
         Ok(Self {
             root,
+            epoch: std::sync::atomic::AtomicU64::new(manifest.epoch),
             manifest,
             segments,
         })
     }
 
+    /// The manifest this set was opened from. Its `epoch` is the epoch at
+    /// open; [`Self::epoch`] is the published one.
     pub fn manifest(&self) -> &SegmentSetManifest {
         &self.manifest
+    }
+
+    /// The set's published epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The manifest as it is published: `manifest()` with the current
+    /// epoch.
+    pub fn published_manifest(&self) -> SegmentSetManifest {
+        let mut manifest = self.manifest.clone();
+        manifest.epoch = self.epoch();
+        manifest
     }
 
     /// The catalog root this set was opened from.
@@ -579,6 +600,74 @@ impl SegmentCatalog {
         Arc::clone(&self.current.read().expect("segment catalog lock poisoned"))
     }
 
+    /// A catalog over `root` whose current set is `manifest` — segments
+    /// already staged under `root/segments/` by [`stage_segments`] — with
+    /// NOTHING written to `segments.json`: the shadow of an online
+    /// compaction (`docs/mutations.md`), which serves and tails the log
+    /// in memory until [`Self::commit_current`] publishes it at cutover.
+    /// The live catalog over the same root is untouched until then.
+    pub fn open_staged(
+        root: impl Into<PathBuf>,
+        manifest: SegmentSetManifest,
+        load: VectorLoad,
+    ) -> Result<Self, String> {
+        let root = root.into();
+        let current = OpenedSegmentSet::open_manifest(root.clone(), manifest, load)?;
+        Ok(Self {
+            root,
+            current: Arc::new(RwLock::new(Arc::new(current))),
+            update: Arc::new(Mutex::new(())),
+            load,
+        })
+    }
+
+    /// Publish the current set as it stands, at `epoch`, by writing
+    /// `segments.json` atomically: the manifest swap of a compaction
+    /// cutover. `epoch` must exceed the set's own, so the on-disk epoch
+    /// sequence stays monotone across the swap.
+    pub fn commit_current(&self, epoch: u64) -> Result<Arc<OpenedSegmentSet>, String> {
+        let _guard = self
+            .update
+            .lock()
+            .map_err(|_| "segment update lock poisoned".to_string())?;
+        let current = self.snapshot();
+        if epoch <= current.epoch() {
+            return Err(format!(
+                "compaction commit epoch {epoch} is not newer than the staged set's {}",
+                current.epoch()
+            ));
+        }
+        current
+            .epoch
+            .store(epoch, std::sync::atomic::Ordering::Release);
+        write_json_atomic(&self.root.join(SET_FILE), &current.published_manifest())?;
+        Ok(current)
+    }
+
+    /// The catalog root's set manifest as written on disk, `None` when the
+    /// root has none yet.
+    pub fn read_manifest(root: &Path) -> Result<Option<SegmentSetManifest>, String> {
+        let path = root.join(SET_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("read segment set {}: {error}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("parse segment set {}: {error}", path.display()))
+    }
+
+    /// The set manifest file inside a catalog root.
+    pub fn manifest_path(root: &Path) -> PathBuf {
+        root.join(SET_FILE)
+    }
+
+    /// The directory of segment `id` under a catalog root.
+    pub fn segment_dir(root: &Path, id: &str) -> PathBuf {
+        root.join("segments").join(id)
+    }
+
     pub fn append(&self, source: SegmentSource<'_>) -> Result<Arc<OpenedSegmentSet>, String> {
         let _guard = self
             .update
@@ -587,7 +676,7 @@ impl SegmentCatalog {
         let metadata = stage_segment(&self.root, source)?;
         let staged_id = metadata.segment_id.clone();
         let current = self.snapshot();
-        let mut manifest = current.manifest.clone();
+        let mut manifest = current.published_manifest();
         manifest.epoch = manifest
             .epoch
             .checked_add(1)
@@ -698,7 +787,7 @@ impl SegmentCatalog {
                 "compaction outputs have {output_rows} rows, expected {expected_rows} dense live rows"
             ));
         }
-        let mut manifest = current.manifest.clone();
+        let mut manifest = current.published_manifest();
         manifest.epoch = manifest
             .epoch
             .checked_add(1)
@@ -824,6 +913,44 @@ impl SegmentCatalog {
             .map_err(|_| "segment catalog lock poisoned".to_string())? = Arc::clone(&opened);
         Ok(opened)
     }
+}
+
+/// Stage `sources` under `root/segments/` — copied, hashed, opened,
+/// verified, fsynced, and renamed into their final directories — WITHOUT
+/// publishing them: they join no manifest until a caller commits one.
+/// A compaction stages its dense outputs this way while the live set
+/// keeps serving (`docs/mutations.md`). On any failure every directory
+/// this call created is removed. A source whose directory already exists
+/// refuses by name rather than adopting it.
+pub fn stage_segments(
+    root: &Path,
+    sources: Vec<SegmentSource<'_>>,
+) -> Result<Vec<SegmentMetadata>, String> {
+    std::fs::create_dir_all(root.join("segments"))
+        .map_err(|error| format!("mkdir segment root {}: {error}", root.display()))?;
+    let mut staged = Vec::with_capacity(sources.len());
+    for source in sources {
+        match stage_segment(root, source) {
+            Ok(metadata) => staged.push(metadata),
+            Err(error) => {
+                cleanup_staged(root, &staged);
+                return Err(error);
+            }
+        }
+    }
+    Ok(staged)
+}
+
+/// Write a set manifest to `path` atomically: the copy a compaction
+/// cutover keeps for rollback beside the live one (`docs/mutations.md`).
+pub fn write_manifest_file(path: &Path, manifest: &SegmentSetManifest) -> Result<(), String> {
+    write_json_atomic(path, manifest)
+}
+
+/// Remove the directories of `segments` under `root`: the staged outputs
+/// of a compaction that did not commit, or the inputs one replaced.
+pub fn remove_segment_dirs(root: &Path, segments: &[SegmentMetadata]) {
+    cleanup_staged(root, segments)
 }
 
 fn cleanup_staged(root: &Path, segments: &[SegmentMetadata]) {
