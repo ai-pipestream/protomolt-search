@@ -509,10 +509,10 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
         .browse_shard(BrowseShardRequest {
             k: 100_000,
             first_page: true,
-            sort: Some(BrowseSort {
+            sort: vec![BrowseSort {
                 column: "num".into(),
                 descending: false,
-            }),
+            }],
             ..Default::default()
         })
         .await

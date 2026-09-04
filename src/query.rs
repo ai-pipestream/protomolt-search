@@ -495,7 +495,13 @@ async fn execute_recursive_boolean(
     boolean: &crate::pb::BooleanQuery,
 ) -> Result<QueryResponse, Status> {
     let t_total = std::time::Instant::now();
-    if req.sort.is_some() {
+    if req.collapse.is_some() {
+        return Err(refuse(
+            "collapse over recursive boolean relevance is not served; collapse a single \
+             leaf or a composite",
+        ));
+    }
+    if !req.sort.is_empty() {
         return Err(refuse(
             "column sort over recursive boolean relevance is not served; page its exact score order",
         ));
@@ -593,6 +599,7 @@ async fn execute_recursive_boolean(
             signals: hit.signals,
             matched: hit.matched,
             sort_key: 0.0,
+            sort_values: Vec::new(),
             dimensions: Vec::new(),
         })
         .collect();
@@ -662,22 +669,24 @@ fn refuse(msg: impl Into<String>) -> Status {
 struct Cursor {
     rank: u32,
     score_bits: u32,
-    /// Sorted-browse boundary: the last hit's adjusted sort-key bits.
-    /// `Some` exactly on tokens minted by a sorted browse; a cursor
-    /// from one query shape refuses on another.
-    key_bits: Option<u64>,
+    /// Sorted boundary: the last hit's sort keys in merge form, one per
+    /// sort column. `Some` exactly on tokens minted by a sorted query;
+    /// a cursor from one query shape refuses on another.
+    keys: Option<Vec<crate::sortkeys::Key>>,
     doc_id: u64,
 }
 
 const CURSOR_PREFIX: &str = "tvq1";
-const SORTED_CURSOR_PREFIX: &str = "tvqs1";
+const SORTED_CURSOR_PREFIX: &str = "tvqs2";
 
 impl Cursor {
     fn encode(&self) -> String {
-        match self.key_bits {
-            Some(bits) => format!(
-                "{SORTED_CURSOR_PREFIX}:{}:{bits:016x}:{}",
-                self.rank, self.doc_id
+        match &self.keys {
+            Some(keys) => format!(
+                "{SORTED_CURSOR_PREFIX}:{}:{}:{}",
+                self.rank,
+                crate::sortkeys::encode_keys(keys),
+                self.doc_id
             ),
             None => format!(
                 "{CURSOR_PREFIX}:{}:{:08x}:{}",
@@ -700,15 +709,15 @@ impl Cursor {
         if parts.next().is_some() || rank == 0 {
             return Err(bad());
         }
-        let (score_bits, key_bits) = if sorted {
-            (0, Some(u64::from_str_radix(hex, 16).map_err(|_| bad())?))
+        let (score_bits, keys) = if sorted {
+            (0, Some(crate::sortkeys::decode_keys(hex).ok_or_else(bad)?))
         } else {
             (u32::from_str_radix(hex, 16).map_err(|_| bad())?, None)
         };
         Ok(Cursor {
             rank,
             score_bits,
-            key_bits,
+            keys,
             doc_id,
         })
     }
@@ -728,9 +737,9 @@ fn page(
     let start = match cursor {
         None => 0,
         Some(c) => {
-            if c.key_bits.is_some() {
+            if c.keys.is_some() {
                 return Err(refuse(
-                    "this cursor came from a sorted browse; the rest of the request must \
+                    "this cursor came from a sorted query; the rest of the request must \
                      repeat the query that minted it",
                 ));
             }
@@ -757,7 +766,7 @@ fn page(
                 Cursor {
                     rank: h.rank,
                     score_bits: h.score.to_bits(),
-                    key_bits: None,
+                    keys: None,
                     doc_id: h.doc_id,
                 }
                 .encode()
@@ -937,21 +946,68 @@ pub async fn execute(
         } else {
             crate::coordinator::compile_projections(&req.projections)?
         };
-    if let Some(sort) = &req.sort {
-        if sort.column.is_empty() {
-            return Err(refuse("sort names no column"));
+    if !req.sort.is_empty() {
+        for sort in &req.sort {
+            if sort.column.is_empty() {
+                return Err(refuse("sort names no column"));
+            }
         }
-        if !matches!(plan.shape, Shape::Browse) {
+        match &plan.shape {
+            Shape::Browse => {}
+            Shape::Lexical { query, .. } => {
+                // A column order over a lexical leaf walks the leaf's exact
+                // term membership without scoring; every relevance shape on
+                // the leaf or the request would be silently dropped.
+                let relevance = if query.phrase.is_some() {
+                    Some("a phrase")
+                } else if !query.prefixes.is_empty() {
+                    Some("term prefixes")
+                } else if !query.score_stages.is_empty() {
+                    Some("score stages")
+                } else if !req.boosts.is_empty() {
+                    Some("a boost")
+                } else if scorer.is_some() {
+                    Some("the composite scorer")
+                } else if req.highlight.is_some() {
+                    Some("highlighting")
+                } else {
+                    None
+                };
+                if let Some(what) = relevance {
+                    return Err(refuse(format!(
+                        "sort over a lexical leaf orders the leaf's exact term membership \
+                         (the BM25 positive-score set) by the columns and computes no \
+                         relevance; {what} on the request would be a silent no-op"
+                    )));
+                }
+            }
+            Shape::Dense { .. } | Shape::Composite { .. } => {
+                return Err(refuse(
+                    "sort by column is served on a browse or a single lexical leaf: a \
+                     dense or composite selection has no membership to order (every \
+                     document is a candidate), so a column order over it would be a \
+                     relevance cut in disguise; name the cut as a filter, or collapse",
+                ));
+            }
+        }
+        if req.collapse.is_some() {
             return Err(refuse(
-                "sort by column is served on browse selections only: a column order over \
-                 a SCORED selection must re-argue the pruning certificate (block-max \
-                 bounds the score, not the column), and that path does not exist yet",
+                "collapse and sort do not combine: collapse picks each group's \
+                 representative by relevance, and a sorted query computes none",
             ));
         }
     }
-    // Sort and the scorer can never collide: sort is served on browse
-    // alone, and the scorer refuses a browse — the two existing
-    // refusals partition every request naming both.
+    if let Some(collapse) = &req.collapse {
+        if collapse.column.is_empty() {
+            return Err(refuse("collapse names no column"));
+        }
+        if matches!(plan.shape, Shape::Browse) {
+            return Err(refuse(
+                "collapse needs a SCORED selection: a browse has no order to pick a \
+                 group's representative by",
+            ));
+        }
+    }
 
     // AUTO + FP32 rerank with neither a policy nor a selection_k names no
     // depth; running at selection_k = k would silently serve the raw
@@ -1030,7 +1086,17 @@ pub async fn execute(
     let pooled = matches!(plan.shape, Shape::Composite { .. })
         || scorer.is_some()
         || !req.boosts.is_empty()
-        || fp32_rerank;
+        || fp32_rerank
+        || req.collapse.is_some();
+    // A collapse over a single leaf deepens its pool itself (below), so
+    // the leaf's own depth rules (paging by fetching deeper, a policy
+    // depth) do not apply; every other collapse is a fixed pool.
+    let collapse_may_deepen = req.collapse.is_some()
+        && matches!(plan.shape, Shape::Lexical { .. } | Shape::Dense { .. })
+        && scorer.is_none()
+        && req.boosts.is_empty()
+        && !fp32_rerank
+        && policy_depth.is_none();
     if !pooled && policy_depth.is_none() && selection_k != req.k {
         return Err(refuse(
             "selection_k differs from k but nothing on a single-leaf shape uses the \
@@ -1056,7 +1122,9 @@ pub async fn execute(
         // every page fetches exactly k.
         (Shape::Browse, _) => req.k,
         _ if pooled => {
-            if let Some(c) = &cursor {
+            // Under a collapse the cursor's rank counts groups, and the
+            // group count is what decides exhaustion (below).
+            if let (Some(c), None) = (&cursor, &req.collapse) {
                 if u64::from(c.rank) + u64::from(req.k) > u64::from(selection_k) {
                     return Err(Status::failed_precondition(format!(
                         "the selection_k = {selection_k} candidate set is exhausted at rank {}; \
@@ -1087,95 +1155,54 @@ pub async fn execute(
 
     match &plan.shape {
         Shape::Browse => {
-            if plan.geo_filters.is_empty() && plan.cel.is_empty() {
-                return Err(refuse(
-                    "an empty browse (no filter at all) would page the whole corpus in id \
-                     order; name at least one filter",
-                ));
-            }
-            let compiled = crate::coordinator::RequestFilters::compile(&plan.geo_filters, &filter)?;
-            let sort = req.sort.as_ref().map(|s| crate::pb::BrowseSort {
-                column: s.column.clone(),
-                descending: s.descending,
-            });
-            let after = match &cursor {
-                None => None,
-                Some(c) => {
-                    // A cursor resumes the query that minted it: a
-                    // sorted token carries the key boundary, a plain
-                    // one only the id, and mixing the two shapes is a
-                    // different query.
-                    match (sort.is_some(), c.key_bits) {
-                        (true, Some(key_bits)) => Some(crate::coordinator::BrowseAfter {
-                            id: c.doc_id,
-                            key_bits,
-                        }),
-                        (false, None) => Some(crate::coordinator::BrowseAfter {
-                            id: c.doc_id,
-                            key_bits: 0,
-                        }),
-                        _ => {
-                            return Err(refuse(
-                                "this cursor came from a browse with a different sort; the \
-                                 rest of the request must repeat the query that minted it",
-                            ))
-                        }
-                    }
-                }
-            };
-            let base_rank = cursor.as_ref().map_or(0, |c| c.rank);
-            let t_sel = std::time::Instant::now();
-            let rows = coordinator
-                .fanout_browse(req.k, after, sort.as_ref(), &compiled)
-                .await?;
-            if let Some(p) = prof.as_mut() {
-                p.selection_ms = ms(t_sel);
-            }
-            let hits: Vec<QueryHit> = rows
-                .ids
-                .iter()
-                .enumerate()
-                .map(|(i, &doc_id)| QueryHit {
-                    snippets: Vec::new(),
-                    projected: Vec::new(),
-                    doc_id,
-                    // No relevance score exists on this route; the id
-                    // (or column) order IS the order, and rank counts
-                    // on across pages.
-                    score: 0.0,
-                    rank: base_rank + (i + 1) as u32,
-                    signals: Vec::new(),
-                    matched: matched(Vec::new(), &plan.filter_ids),
-                    sort_key: if rows.sorted { rows.keys[i] } else { 0.0 },
-                    dimensions: Vec::new(),
-                })
-                .collect();
-            let next = if req.k != 0 && hits.len() == req.k as usize {
-                hits.last()
-                    .map(|h| {
-                        Cursor {
-                            rank: h.rank,
-                            score_bits: 0,
-                            key_bits: rows
-                                .sorted
-                                .then(|| *rows.key_bits.last().expect("full page")),
-                            doc_id: h.doc_id,
-                        }
-                        .encode()
-                    })
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let mut hits = hits;
-            fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
-            Ok(done(
-                req.request_id,
-                hits,
+            execute_browse(
+                coordinator,
+                &req,
+                &plan,
+                &filter,
+                cursor.as_ref(),
+                &compiled_projections,
+                Vec::new(),
+                None,
                 "browse",
-                next,
-                finish_prof(prof, t_total),
-            ))
+                prof,
+                t_total,
+            )
+            .await
+        }
+        Shape::Lexical { id, query } if !req.sort.is_empty() => {
+            // A sorted lexical leaf: its exact term membership, walked in
+            // column order (validated above: no relevance shape rides
+            // along). Analysis happens once here; the shards read the
+            // same postings the bitmap route would.
+            let terms = coordinator
+                .analyze_terms(&query.text, query.analysis.as_ref())
+                .await?;
+            if terms.is_empty() {
+                let mut response = done(
+                    req.request_id.clone(),
+                    Vec::new(),
+                    "browse_shard:lexical",
+                    String::new(),
+                    finish_prof(prof, t_total),
+                );
+                response.executed.push_str("(no terms)");
+                return Ok(response);
+            }
+            execute_browse(
+                coordinator,
+                &req,
+                &plan,
+                &filter,
+                cursor.as_ref(),
+                &compiled_projections,
+                terms,
+                Some(id),
+                "browse_shard:lexical",
+                prof,
+                t_total,
+            )
+            .await
         }
         Shape::Lexical { id, query } => {
             let t_sel = std::time::Instant::now();
@@ -1213,20 +1240,39 @@ pub async fn execute(
                     }],
                     matched: matched(vec![id.to_string()], &plan.filter_ids),
                     sort_key: 0.0,
+                    sort_values: Vec::new(),
                     dimensions: Vec::new(),
                 })
                 .collect();
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed =
                 apply_scorer(coordinator, &scorer, &mut hits, "bm25_search", &mut prof).await?;
-            let (hits, next) = page(hits, req.k, cursor.as_ref())?;
-            Ok(done(
+            let (hits, mut groups, next, executed) = match page_or_collapse(
+                coordinator,
+                hits,
+                &req,
+                cursor.as_ref(),
+                fetch_k,
+                collapse_may_deepen,
+                executed,
+                &mut prof,
+            )
+            .await?
+            {
+                Paged::Deepen(depth) => return deepen(coordinator, &req, depth).await,
+                Paged::Done(hits, groups, next, executed) => (hits, groups, next, executed),
+            };
+            fill_projected_groups(coordinator, &compiled_projections, &mut groups, &mut prof)
+                .await?;
+            let mut response = done(
                 req.request_id,
                 hits,
                 &executed,
                 next,
                 finish_prof(prof, t_total),
-            ))
+            );
+            response.groups = groups;
+            Ok(response)
         }
         Shape::Dense { id, query } => {
             let t_sel = std::time::Instant::now();
@@ -1259,6 +1305,7 @@ pub async fn execute(
                     }],
                     matched: matched(vec![id.to_string()], &plan.filter_ids),
                     sort_key: 0.0,
+                    sort_values: Vec::new(),
                     dimensions: Vec::new(),
                 })
                 .collect();
@@ -1294,8 +1341,24 @@ pub async fn execute(
             };
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
-            let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
+            let (mut hits, mut groups, next, executed) = match page_or_collapse(
+                coordinator,
+                hits,
+                &req,
+                cursor.as_ref(),
+                fetch_k,
+                collapse_may_deepen,
+                executed,
+                &mut prof,
+            )
+            .await?
+            {
+                Paged::Deepen(depth) => return deepen(coordinator, &req, depth).await,
+                Paged::Done(hits, groups, next, executed) => (hits, groups, next, executed),
+            };
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
+            fill_projected_groups(coordinator, &compiled_projections, &mut groups, &mut prof)
+                .await?;
             let mut response = done(
                 response.request_id,
                 hits,
@@ -1303,6 +1366,7 @@ pub async fn execute(
                 next,
                 finish_prof(prof, t_total),
             );
+            response.groups = groups;
             if auto_default_depth {
                 if let (Some(outcome), Some(resolution)) =
                     (dense_execution.as_mut(), quality_resolution.as_ref())
@@ -1412,6 +1476,7 @@ pub async fn execute(
                             signals,
                             matched: matched(m, &plan.filter_ids),
                             sort_key: 0.0,
+                            sort_values: Vec::new(),
                             dimensions: Vec::new(),
                         }
                     })
@@ -1459,6 +1524,7 @@ pub async fn execute(
                             signals,
                             matched: matched(m, &plan.filter_ids),
                             sort_key: 0.0,
+                            sort_values: Vec::new(),
                             dimensions: Vec::new(),
                         }
                     })
@@ -1472,8 +1538,24 @@ pub async fn execute(
             };
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
-            let (mut hits, next) = page(hits, req.k, cursor.as_ref())?;
+            let (mut hits, mut groups, next, executed) = match page_or_collapse(
+                coordinator,
+                hits,
+                &req,
+                cursor.as_ref(),
+                fetch_k,
+                collapse_may_deepen,
+                executed,
+                &mut prof,
+            )
+            .await?
+            {
+                Paged::Deepen(depth) => return deepen(coordinator, &req, depth).await,
+                Paged::Done(hits, groups, next, executed) => (hits, groups, next, executed),
+            };
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
+            fill_projected_groups(coordinator, &compiled_projections, &mut groups, &mut prof)
+                .await?;
             let mut response = done(
                 response.request_id,
                 hits,
@@ -1481,6 +1563,7 @@ pub async fn execute(
                 next,
                 finish_prof(prof, t_total),
             );
+            response.groups = groups;
             response.dense_execution = dense_execution;
             Ok(response)
         }
@@ -1599,6 +1682,327 @@ fn finish_prof(
     prof
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn execute_browse(
+    coordinator: &CoordinatorServiceImpl,
+    req: &QueryRequest,
+    plan: &Plan<'_>,
+    filter: &str,
+    cursor: Option<&Cursor>,
+    compiled_projections: &[crate::pb::CompiledProjection],
+    lexical_terms: Vec<String>,
+    leaf_id: Option<&str>,
+    executed: &str,
+    mut prof: Option<crate::pb::QueryProfile>,
+    t_total: std::time::Instant,
+) -> Result<QueryResponse, Status> {
+    {
+        if plan.geo_filters.is_empty() && plan.cel.is_empty() && lexical_terms.is_empty() {
+            return Err(refuse(
+                "an empty browse (no filter at all) would page the whole corpus in id \
+                     order; name at least one filter",
+            ));
+        }
+        let compiled = crate::coordinator::RequestFilters::compile(&plan.geo_filters, filter)?;
+        let sort: Vec<crate::pb::BrowseSort> = req
+            .sort
+            .iter()
+            .map(|s| crate::pb::BrowseSort {
+                column: s.column.clone(),
+                descending: s.descending,
+            })
+            .collect();
+        let after = match cursor {
+            None => None,
+            Some(c) => {
+                // A cursor resumes the query that minted it: a
+                // sorted token carries the key boundary, a plain
+                // one only the id, and mixing the two shapes is a
+                // different query.
+                match (sort.is_empty(), &c.keys) {
+                    (false, Some(keys)) if keys.len() == sort.len() => {
+                        Some(crate::coordinator::BrowseAfter {
+                            id: c.doc_id,
+                            keys: keys.clone(),
+                        })
+                    }
+                    (true, None) => Some(crate::coordinator::BrowseAfter {
+                        id: c.doc_id,
+                        keys: Vec::new(),
+                    }),
+                    _ => {
+                        return Err(refuse(
+                            "this cursor came from a browse with a different sort; the \
+                                 rest of the request must repeat the query that minted it",
+                        ))
+                    }
+                }
+            }
+        };
+        let base_rank = cursor.map_or(0, |c| c.rank);
+        let t_sel = std::time::Instant::now();
+        let rows = coordinator
+            .fanout_browse(req.k, after, &sort, &lexical_terms, &compiled)
+            .await?;
+        if let Some(p) = prof.as_mut() {
+            p.selection_ms = ms(t_sel);
+        }
+        let hits: Vec<QueryHit> = rows
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, &doc_id)| QueryHit {
+                snippets: Vec::new(),
+                projected: Vec::new(),
+                doc_id,
+                // No relevance score exists on this route; the id
+                // (or column) order IS the order, and rank counts
+                // on across pages.
+                score: 0.0,
+                rank: base_rank + (i + 1) as u32,
+                signals: Vec::new(),
+                matched: matched(
+                    leaf_id.map(str::to_string).into_iter().collect(),
+                    &plan.filter_ids,
+                ),
+                sort_key: rows
+                    .values
+                    .get(i)
+                    .and_then(|v| v.first())
+                    .map_or(0.0, crate::sortkeys::Value::as_f64),
+                sort_values: rows
+                    .values
+                    .get(i)
+                    .map(|v| v.iter().map(crate::sortkeys::Value::to_pb).collect())
+                    .unwrap_or_default(),
+                dimensions: Vec::new(),
+            })
+            .collect();
+        let next = if req.k != 0 && hits.len() == req.k as usize {
+            hits.last()
+                .map(|h| {
+                    Cursor {
+                        rank: h.rank,
+                        score_bits: 0,
+                        keys: rows
+                            .sorted
+                            .then(|| rows.keys.last().expect("full page").clone()),
+                        doc_id: h.doc_id,
+                    }
+                    .encode()
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let mut hits = hits;
+        fill_projected(coordinator, compiled_projections, &mut hits, &mut prof).await?;
+        Ok(done(
+            req.request_id.clone(),
+            hits,
+            executed,
+            next,
+            finish_prof(prof, t_total),
+        ))
+    }
+}
+
+/// What a page step produced: the page, or the depth a single-leaf
+/// collapse must re-run at to find its groups.
+enum Paged {
+    Done(Vec<QueryHit>, Vec<crate::pb::QueryGroup>, String, String),
+    Deepen(u32),
+}
+
+/// Re-run the request with a deeper collapse pool (docs/query-api.md
+/// "Collapse"): the leaf's order is depth-independent, so a deeper pool
+/// only adds groups after the ones already found.
+async fn deepen(
+    coordinator: &CoordinatorServiceImpl,
+    req: &QueryRequest,
+    depth: u32,
+) -> Result<QueryResponse, Status> {
+    let mut again = req.clone();
+    again.selection_k = depth;
+    Box::pin(execute(coordinator, again)).await
+}
+
+/// A collapse group's identity: an integer or a facet term.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum GroupKey {
+    Integer(i64),
+    Text(String),
+}
+
+impl GroupKey {
+    fn to_value(&self) -> crate::pb::SortValue {
+        match self {
+            GroupKey::Integer(i) => crate::sortkeys::Value::Integer(*i).to_pb(),
+            GroupKey::Text(t) => crate::sortkeys::Value::Text(t.clone()).to_pb(),
+        }
+    }
+}
+
+/// The collapse key of every candidate: the lineage keys through the
+/// parent resolver, a column through the value seam (an i64 or facet
+/// column; a double or bool is not a group identity). A candidate
+/// without a value is absent.
+async fn collapse_keys(
+    coordinator: &CoordinatorServiceImpl,
+    column: &str,
+    ids: &[u64],
+) -> Result<std::collections::HashMap<u64, GroupKey>, Status> {
+    let mut keys = std::collections::HashMap::with_capacity(ids.len());
+    if column == "parent_id" || column == "group_id" {
+        for (id, (parent, group)) in coordinator.lineage_keys(ids).await? {
+            let v = if column == "parent_id" { parent } else { group };
+            keys.insert(id, GroupKey::Integer(v as i64));
+        }
+        return Ok(keys);
+    }
+    let compiled = crate::coordinator::compile_projections(&[crate::pb::NamedProjection {
+        name: column.to_string(),
+        expression: column.to_string(),
+    }])?;
+    let fetched = coordinator.fetch_values(ids, &compiled, &[]).await?;
+    for (id, values) in fetched.rows {
+        let Some(value) = values.first().and_then(|v| v.value.as_ref()) else {
+            continue;
+        };
+        let key = match value {
+            crate::pb::projected_value::Value::IntValue(i) => GroupKey::Integer(*i),
+            crate::pb::projected_value::Value::StringValue(t) => GroupKey::Text(t.clone()),
+            crate::pb::projected_value::Value::DoubleValue(_) => {
+                return Err(refuse(format!(
+                    "collapse by {column:?}: a double column is not a group identity; \
+                     collapse by an i64 or facet column, or by parent_id / group_id"
+                )))
+            }
+            crate::pb::projected_value::Value::BoolValue(_) => {
+                return Err(refuse(format!(
+                    "collapse by {column:?}: a bool is not a group identity; collapse by an \
+                     i64 or facet column, or by parent_id / group_id"
+                )))
+            }
+        };
+        keys.insert(id, key);
+    }
+    Ok(keys)
+}
+
+/// Cut the page, or collapse the candidate pool into groups and cut
+/// the page of groups (docs/query-api.md "Collapse"). `pool_depth` is
+/// how deep the pool was fetched; a full pool that holds too few
+/// groups either deepens (a single leaf) or refuses naming
+/// selection_k (a fixed pool).
+#[allow(clippy::too_many_arguments)]
+async fn page_or_collapse(
+    coordinator: &CoordinatorServiceImpl,
+    hits: Vec<QueryHit>,
+    req: &QueryRequest,
+    cursor: Option<&Cursor>,
+    pool_depth: u32,
+    may_deepen: bool,
+    executed: String,
+    prof: &mut Option<crate::pb::QueryProfile>,
+) -> Result<Paged, Status> {
+    let Some(collapse) = req.collapse.as_ref() else {
+        let (hits, next) = page(hits, req.k, cursor)?;
+        return Ok(Paged::Done(hits, Vec::new(), next, executed));
+    };
+    let t0 = std::time::Instant::now();
+    let pool_full = hits.len() as u64 >= u64::from(pool_depth);
+    let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
+    let keys = collapse_keys(coordinator, &collapse.column, &ids).await?;
+    // Groups in first-appearance order; the pool's order is the
+    // selection's order, so the first hit of a group is its best.
+    let mut index: std::collections::HashMap<GroupKey, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<(GroupKey, Vec<QueryHit>)> = Vec::new();
+    for hit in hits {
+        let Some(key) = keys.get(&hit.doc_id) else {
+            continue;
+        };
+        match index.get(key) {
+            Some(&g) => groups[g].1.push(hit),
+            None => {
+                index.insert(key.clone(), groups.len());
+                groups.push((key.clone(), vec![hit]));
+            }
+        }
+    }
+    let needed = u64::from(cursor.map_or(0, |c| c.rank)) + u64::from(req.k);
+    if (groups.len() as u64) < needed && pool_full {
+        let max_k = coordinator.max_k();
+        if may_deepen && pool_depth < max_k {
+            return Ok(Paged::Deepen(pool_depth.saturating_mul(2).min(max_k)));
+        }
+        if !may_deepen {
+            return Err(Status::failed_precondition(format!(
+                "the selection_k = {pool_depth} candidate pool holds {} groups by {:?}, \
+                 fewer than the {needed} the page needs; deepening it would change the \
+                 ranking under the cursor; re-run from the first page with a larger \
+                 selection_k",
+                groups.len(),
+                collapse.column
+            )));
+        }
+        // At max_k with too few groups: what the pool holds is served,
+        // and the short page says nothing follows at the served depth.
+    }
+    let reps: Vec<QueryHit> = groups.iter().map(|(_, hits)| hits[0].clone()).collect();
+    let (page_reps, next) = page(reps, req.k, cursor)?;
+    let listed = collapse.inner_hits.max(1) as usize;
+    let mut out_groups = Vec::with_capacity(page_reps.len());
+    for rep in &page_reps {
+        let g = index[keys.get(&rep.doc_id).expect("a representative has a key")];
+        let (key, members) = &groups[g];
+        let pool_hits = members.len();
+        let mut listed_hits: Vec<QueryHit> = members.iter().take(listed).cloned().collect();
+        for (i, hit) in listed_hits.iter_mut().enumerate() {
+            hit.rank = (i + 1) as u32;
+        }
+        out_groups.push(crate::pb::QueryGroup {
+            key: Some(key.to_value()),
+            hits: listed_hits,
+            complete: pool_hits >= listed || !pool_full,
+            pool_hits: pool_hits as u32,
+        });
+    }
+    if let Some(p) = prof.as_mut() {
+        p.collapse_ms = ms(t0);
+    }
+    Ok(Paged::Done(
+        page_reps,
+        out_groups,
+        next,
+        format!("{executed}+collapse"),
+    ))
+}
+
+/// Projections on the listed inner hits, the same seam the page's hits
+/// use.
+async fn fill_projected_groups(
+    coordinator: &CoordinatorServiceImpl,
+    compiled: &[crate::pb::CompiledProjection],
+    groups: &mut [crate::pb::QueryGroup],
+    prof: &mut Option<crate::pb::QueryProfile>,
+) -> Result<(), Status> {
+    if compiled.is_empty() || groups.is_empty() {
+        return Ok(());
+    }
+    let mut all: Vec<QueryHit> = groups.iter().flat_map(|g| g.hits.iter().cloned()).collect();
+    fill_projected(coordinator, compiled, &mut all, prof).await?;
+    let mut filled = all.into_iter();
+    for group in groups.iter_mut() {
+        for hit in &mut group.hits {
+            if let Some(f) = filled.next() {
+                hit.projected = f.projected;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn done(
     request_id: String,
     hits: Vec<QueryHit>,
@@ -1616,6 +2020,7 @@ fn done(
         dense_execution: None,
         served_topology_generation: 0,
         aggregate: None,
+        groups: Vec::new(),
     }
 }
 

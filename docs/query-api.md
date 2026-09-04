@@ -497,7 +497,9 @@ to the route named, bitwise — `tests/query_api.rs` holds it to that):
 | one lexical boost on a composite selection, no scorer | `BoostRescore` (bitwise the original path) |
 | boosts otherwise (dense, single-leaf shapes, several under a scorer) | `Bm25Rescore` / `VectorRescore` candidate-scoped seams, adapter-side |
 | filters only (browse, id order, `after`-floor paging) | `BrowseShard` fan-out |
-| browse + `sort` by i64/f64 column (asc/desc) | `BrowseShard` column-keyed heap |
+| browse + `sort` (i64/f64/facet columns, lineage keys; several keys) | `BrowseShard` key-ordered heap, merged key by key |
+| one lexical leaf + `sort` | `BrowseShard` over the leaf's analyzed terms as an OR membership predicate (the `ResolveLexicalBitmap` rule), no scores |
+| `collapse` on any scored shape | the route above at the pool depth, then the coordinator-side grouping (`collapse_keys`: `ResolveParents` for lineage keys, `FetchValues` for a column) |
 | projections on one lexical leaf | `Bm25Search.projections` (`docs/cel-values.md`) |
 | projections on dense/composite/browse | `FetchValues` post-selection fetch, same semantics |
 | any scored shape + composite scorer | the route above, then the coordinator-side scorer (`src/ltr.rs`) |
@@ -534,6 +536,72 @@ express the same dense/lexical membership as boolean clauses. Unsupported ANN
 membership, nested aggregation, and column sorting of boolean relevance return
 `INVALID_ARGUMENT`; compatibility never authorizes a heuristic substitute.
 
+## Sorting
+
+`QueryRequest.sort` orders the result by columns instead of by
+relevance: most significant key first, ties broken by the next key, then
+by doc id. A key names an i64 or f64 column, a facet column (ordered by
+the term's bytes), or one of the lineage keys `parent_id` / `group_id`.
+A document without a value for any key is excluded, the same stance the
+filters take: absence has no honest position in a column order.
+
+Two selections serve it. A **browse** (filters only) walks its admitted
+set on every shard with a k-bounded heap over the keys, and the
+coordinator merges the shards' rows key by key (numbers travel as
+order-preserving bits, complemented for a descending key; facet terms
+travel as text and the comparison is reversed for a descending key). A
+**single lexical leaf** is served the same way over its exact term
+membership — the documents holding at least one of the leaf's analyzed
+terms, the BM25 positive-score set that `ResolveLexicalBitmap` answers —
+walked without scoring. Nothing is pruned, so no pruning certificate is
+involved; the hits carry `score = 0`, the leaf id in `matched`, and
+`executed = browse_shard:lexical`. A relevance shape on such a leaf
+(phrase, prefixes, score stages, a boost, the scorer, highlighting) would
+be a silent no-op and refuses by name. A dense or composite selection has
+no membership to order (every document is a candidate) and refuses:
+a column order over it would be a relevance cut in disguise.
+
+Each hit reports `sort_values` (one typed value per key) and keeps
+`sort_key` as the first key's numeric view. A sorted page's cursor
+carries the boundary's keys; a column no shard declares refuses by
+name (the typo rule), and a shard without the column contributes no
+rows.
+
+## Collapse
+
+`QueryRequest.collapse` returns one representative per key value: `k`
+means `k` groups, each represented by its best hit in the selection's
+order, with `groups[i]` alongside `hits[i]` carrying the key, the group's
+top `inner_hits` hits (the representative first, ranks counting within
+the group), how many hits the group had in the candidate pool, and
+whether the list is provably complete. The key is an i64 or facet
+column, or `parent_id` / `group_id` from the document's lineage; a
+document without a value forms no group.
+
+The collapse runs over the candidate pool the route fetched, so its
+exactness statement is the pool's. A **single leaf** has a
+depth-independent order (the exact top-k prefix property), so a deeper
+pool can only append groups after the ones already found: the
+coordinator starts at `selection_k` (default `k`), and while a full pool
+holds fewer groups than the page needs it doubles the depth up to
+`max_k`. A **fixed pool** — a composite strategy, the scorer, a boost, an
+FP32 rerank, a policy depth — is never deepened, because its order moves
+with the pool; a full pool short of the groups the page needs refuses
+with `FAILED_PRECONDITION` naming `selection_k`. A pool that came back
+short reached the end of the selection, and what it holds is served.
+
+`complete` is true when the group has at least `inner_hits` hits in the
+pool (any hit outside the pool scores at or below the pool's last, so
+the listed ones are the group's best), or when the pool came back short
+(nothing follows). A full pool with fewer listed hits than asked cannot
+tell the end of the corpus from a cut and reports `false`. Paging
+counts groups: the cursor is the last representative, and resumption
+re-finds it in the group order. A browse has no order to pick a
+representative by and refuses; collapse and sort do not combine, since
+collapse picks representatives by relevance and a sorted query computes
+none. `executed` gains a `+collapse` suffix; the profile reports
+`collapse_ms`.
+
 ## Paging
 
 `QueryRequest.cursor` / `QueryResponse.next_cursor` implement
@@ -556,6 +624,10 @@ the pool is never silently deepened; exhaustion refuses and names
 `selection_k`. A full page
 always mints `next_cursor`; a short page provably has nothing after it
 at the served depth and mints none.
+
+A sorted query's token (`tvqs2:`) carries the boundary's keys and resumes
+strictly after them; a collapsed query's token is its last representative
+and ranks count groups. A token from one shape refuses on another.
 
 A recursive boolean query rebuilds its exact bitmap plan and score order on
 every page and resumes at the same score/id boundary. Its optional aggregation is
