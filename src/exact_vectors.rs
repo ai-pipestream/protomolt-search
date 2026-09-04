@@ -485,7 +485,10 @@ impl ExactVectorStore {
     }
 }
 
-fn dot(row: &[f32], query: &[f32]) -> f32 {
+/// The rerank's dot product: scalar accumulation in row order, so every
+/// consumer that needs the same bits (the quality profile's brute ground
+/// truth) reuses it rather than restating it.
+pub fn dot(row: &[f32], query: &[f32]) -> f32 {
     row.iter().zip(query).map(|(a, b)| a * b).sum()
 }
 

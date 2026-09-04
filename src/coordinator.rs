@@ -10471,15 +10471,34 @@ impl SearchService for CoordinatorServiceImpl {
         #[cfg(feature = "net")]
         let clustered_vector = if let Some(backend) = &self.clustered_vectors {
             Some(match backend.health().await {
-                Ok(health) => ClusteredVectorHealth {
-                    backend_kind: "clustered-turbovec".to_string(),
-                    transport: backend.transport_name().to_string(),
-                    reachable: true,
-                    servable: health.servable,
-                    error: health.error,
-                    rows: health.rows,
-                    topology_generation: health.topology_generation,
-                },
+                Ok(health) => {
+                    // The score-space identity a quality profile binds to;
+                    // a servable cluster that cannot state it reports that
+                    // as its error rather than an empty fingerprint.
+                    let (scoring_fingerprint, dimensions, error) = if health.servable {
+                        match backend.quality_identity().await {
+                            Ok(identity) => (
+                                identity.scoring_fingerprint,
+                                identity.dimensions,
+                                health.error,
+                            ),
+                            Err(status) => (String::new(), 0, status.message().to_string()),
+                        }
+                    } else {
+                        (String::new(), 0, health.error)
+                    };
+                    ClusteredVectorHealth {
+                        backend_kind: "clustered-turbovec".to_string(),
+                        transport: backend.transport_name().to_string(),
+                        reachable: true,
+                        servable: health.servable,
+                        error,
+                        rows: health.rows,
+                        topology_generation: health.topology_generation,
+                        scoring_fingerprint,
+                        dimensions,
+                    }
+                }
                 Err(status) => ClusteredVectorHealth {
                     backend_kind: "clustered-turbovec".to_string(),
                     transport: backend.transport_name().to_string(),
@@ -10488,6 +10507,8 @@ impl SearchService for CoordinatorServiceImpl {
                     error: status.to_string(),
                     rows: 0,
                     topology_generation: 0,
+                    scoring_fingerprint: String::new(),
+                    dimensions: 0,
                 },
             })
         } else {
@@ -10500,6 +10521,7 @@ impl SearchService for CoordinatorServiceImpl {
             targets,
             clustered_vector,
             provider_mismatch,
+            topology_generation: self.topology_generation,
         }))
     }
 

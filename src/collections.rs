@@ -432,6 +432,7 @@ macro_rules! search_service_over_collections {
                         clustered_vector: None,
                         collections,
                         provider_mismatch: String::new(),
+                        topology_generation: 0,
                     }));
                 }
                 let (name, target) = self.members.resolve(&requested)?;

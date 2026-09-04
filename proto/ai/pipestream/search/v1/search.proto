@@ -799,6 +799,12 @@ message ClusterHealthResponse {
   // that serve it. A fleet in this state refuses Search/Query and routed
   // ingest by name until it is repaired (docs/mmap-vectors.md).
   string provider_mismatch = 4;
+  // The coordinator's live topology generation: the value a dense quality
+  // profile (docs/dense-quality-profile.md) or dense execution policy
+  // (docs/dense-execution-policy.md) binds to as `corpus_generation`.
+  // 0 on the per-collection listing of a coordinator with named
+  // collections (each CollectionHealth carries its own).
+  uint64 topology_generation = 5;
 }
 
 // One collection's health, as ClusterHealth would report it alone.
@@ -815,6 +821,12 @@ message ClusteredVectorHealth {
   string error = 5;
   uint64 rows = 6;
   uint64 topology_generation = 7;
+  // The clustered provider's score-space identity and dimension, as the
+  // quality preflight computes them; empty/0 when unreachable. With
+  // `rows` and `topology_generation` this is the identity a measured
+  // profile binds to (docs/dense-quality-profile.md).
+  string scoring_fingerprint = 8;
+  uint32 dimensions = 9;
 }
 
 // One message on the client-to-server leg of `SearchShard`. The first
