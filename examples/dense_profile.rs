@@ -33,6 +33,7 @@ use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::quality::measure::{
     describe_unmet, ladder_table, measure, GroundTruth, MeasureSpec,
 };
+use pipestream_search::security::ToolClient;
 use pipestream_search::MAX_MESSAGE_BYTES;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -200,10 +201,11 @@ async fn main() -> Result<(), Error> {
         None => GroundTruth::FullDepth,
     };
 
-    let mut client = SearchServiceClient::connect(coord.clone())
-        .await?
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let security = ToolClient::from_env_args()?;
+    let mut client =
+        SearchServiceClient::with_interceptor(security.connect(&coord).await?, security.bearer())
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let spec = MeasureSpec {
         collection,
         profile_id,

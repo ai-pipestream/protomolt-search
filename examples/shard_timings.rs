@@ -20,6 +20,7 @@
 use pipestream_search::analyzer;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{AnalysisSpec, FusionMode, HybridLegOptions, HybridSearchRequest};
+use pipestream_search::security::ToolClient;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -74,7 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let mut client = SearchServiceClient::connect(format!("http://{coord}")).await?;
+    let security = ToolClient::from_env_args()?;
+    let mut client =
+        SearchServiceClient::with_interceptor(security.connect(&coord).await?, security.bearer());
 
     // Per-query rows, in run order; each row's shards are in shard order.
     let mut rows: Vec<(f32, f32, f32, Vec<ShardRow>)> = Vec::new(); // total, legs, fusion, shards

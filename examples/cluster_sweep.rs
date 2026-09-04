@@ -45,11 +45,11 @@
 //!   --hedge-ms=off,400,800 --k=10 --queries=200 --concurrency=8
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use pipestream_search::coordinator::{CoordinatorServiceImpl, FanoutLimits};
-use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::security::ToolClient;
 use tokio::sync::Semaphore;
 
 const DEFAULT_DATA_DIR: &str = "/work/opensearch-grpc-knn/distributed_test_data/wikipedia";
@@ -102,18 +102,24 @@ fn node_list_required(key: &str) -> Vec<String> {
     node_list(key).unwrap_or_else(|| panic!("--{key} is required"))
 }
 
+/// The fleet's security flags (docs/security.md), read once: the in-process
+/// coordinator's channels take the material process-wide, and the node
+/// addresses take their scheme from it.
+fn security() -> &'static ToolClient {
+    static SECURITY: OnceLock<ToolClient> = OnceLock::new();
+    SECURITY.get_or_init(|| {
+        let security = ToolClient::from_env_args().unwrap_or_else(|e| panic!("{e}"));
+        security.install();
+        security
+    })
+}
+
 fn node_list(key: &str) -> Option<Vec<String>> {
     arg(key).map(|raw| {
         raw.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| {
-                if s.starts_with("http://") || s.starts_with("https://") {
-                    s.to_string()
-                } else {
-                    format!("http://{s}")
-                }
-            })
+            .map(|s| security().url(s))
             .collect()
     })
 }
@@ -129,8 +135,7 @@ fn replica_list(key: &str, shards: usize) -> Vec<Option<String>> {
         .map(str::trim)
         .map(|s| match s {
             "" => None,
-            s if s.starts_with("http://") || s.starts_with("https://") => Some(s.to_string()),
-            s => Some(format!("http://{s}")),
+            s => Some(security().url(s)),
         })
         .collect();
     assert!(
@@ -159,7 +164,7 @@ fn hedge_list() -> Vec<Option<Duration>> {
 async fn wait_ready(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if NodeServiceClient::connect(addr.to_string()).await.is_ok() {
+        if security().connect(addr).await.is_ok() {
             return;
         }
         assert!(Instant::now() < deadline, "node at {addr} never came up");

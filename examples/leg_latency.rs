@@ -26,6 +26,7 @@ use pipestream_search::pb::{
     AnalysisSpec, Bm25SearchRequest, FusionMode, HybridLegOptions, HybridSearchRequest,
     SearchRequest,
 };
+use pipestream_search::security::ToolClient;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -86,7 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
 
-    let mut client = SearchServiceClient::connect(format!("http://{coord}")).await?;
+    let security = ToolClient::from_env_args()?;
+    let mut client =
+        SearchServiceClient::with_interceptor(security.connect(&coord).await?, security.bearer());
     let (mut vec_ms, mut bm_ms, mut hyb_ms) = (Vec::new(), Vec::new(), Vec::new());
     let (mut vec_hits, mut bm_hits, mut hyb_hits) = (0usize, 0usize, 0usize);
     let mut embed_ms: Vec<f64> = Vec::new();

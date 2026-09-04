@@ -57,9 +57,18 @@ impl ProfileRoute for crate::coordinator::CoordinatorServiceImpl {
     }
 }
 
+/// The gRPC client over any transport the generated client accepts: a
+/// plain channel, or one behind the tools' bearer interceptor
+/// (`security::PublicChannel`).
 #[cfg(feature = "net")]
-impl ProfileRoute
-    for crate::pb::search_service_client::SearchServiceClient<tonic::transport::Channel>
+impl<T> ProfileRoute for crate::pb::search_service_client::SearchServiceClient<T>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send,
+    T::Future: Send,
+    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    T::ResponseBody: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    <T::ResponseBody as http_body::Body>::Error:
+        Into<Box<dyn std::error::Error + Send + Sync>> + Send,
 {
     async fn query(&mut self, request: QueryRequest) -> Result<QueryResponse, Status> {
         crate::pb::search_service_client::SearchServiceClient::query(self, request)

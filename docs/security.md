@@ -127,8 +127,10 @@ and demand a client certificate like every node listener.
 ## The tools
 
 The verifier (`examples/v7_verify`), the ingest driver
-(`examples/court_ingest`), and the console (`src/bin/console`) take the
-client side of the same flags, through `security::ToolClient`: `--tls-ca`
+(`examples/court_ingest`), the console (`src/bin/console`), and the
+measurement tools (`examples/leg_latency`, `shard_timings`,
+`dense_profile`, `cluster_sweep`) take the client side of the same
+flags, through `security::ToolClient`: `--tls-ca`
 (the cluster CA), `--tls-client-cert` and `--tls-client-key` (the
 identity node listeners demand), `--tls-domain` (when the certificate's
 name is not the address), and the bearer for the coordinator's public
