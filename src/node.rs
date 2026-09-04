@@ -3630,6 +3630,39 @@ impl NodeServiceImpl {
                     let dim = first
                         .dim_opt()
                         .ok_or_else(|| "segment vector image has no dimension".to_string())?;
+                    // The whole-shard FP32 sidecar is written at a flush;
+                    // a node that stopped without one (a refused shutdown
+                    // flush, a crash) has its sealed rows' FP32 files in
+                    // the segments, so the sidecar is rebuilt from them
+                    // here rather than refusing the next append by name.
+                    let sealed_rows: usize = (0..set.len())
+                        .filter(|i| set.vector(*i).is_some())
+                        .map(|i| set.metadata(i).rows as usize)
+                        .sum();
+                    let held = exact_vectors.as_ref().map_or(0, ExactVectorStore::len);
+                    if held != sealed_rows {
+                        let parts: Vec<PathBuf> = (0..set.len())
+                            .filter(|i| set.vector(*i).is_some())
+                            .map(|i| {
+                                root.join("segments")
+                                    .join(&set.metadata(i).segment_id)
+                                    .join(&set.metadata(i).exact_vectors.file)
+                            })
+                            .collect();
+                        let part_refs: Vec<&Path> = parts.iter().map(PathBuf::as_path).collect();
+                        eprintln!(
+                            "exact-vector sidecar {} holds {held} rows against {sealed_rows} \
+                             sealed; rebuilding it from {} segment files",
+                            exact_path.display(),
+                            parts.len()
+                        );
+                        exact_vectors = Some(
+                            ExactVectorStore::write_concatenated(dim, &part_refs, &exact_path)
+                                .map_err(|error| {
+                                    format!("rebuild {}: {error}", exact_path.display())
+                                })?,
+                        );
+                    }
                     let tail_image = VectorIndex::from_backend_config(dim, &backend)
                         .map_err(|error| format!("segment tail image: {error}"))?;
                     let provider = SegmentedProvider::open(set, tail_image)
@@ -4369,10 +4402,15 @@ impl NodeServiceImpl {
         // AddVectors for the same rows) is between its calls otherwise,
         // and the seal waits for the vectors rather than sealing a
         // document-only segment the vectors could never join.
-        if docs != 0 && vectors != 0 {
+        if docs == 0 {
+            vectors >= bound
+        } else if guard.index.is_some() {
+            // A provider is configured, so the documents' vectors are
+            // coming; a document-only segment would leave them nowhere
+            // to go (their call is refused by name), so the seal waits.
             docs == vectors && docs >= bound
         } else {
-            docs.max(vectors) >= bound
+            docs >= bound
         }
     }
 

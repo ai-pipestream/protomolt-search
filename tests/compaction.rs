@@ -1262,7 +1262,10 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
     }
     handle.abort();
 
-    // Documents first, every one of them, then vectors.
+    // Documents first, every one of them: the tail waits for their
+    // vectors rather than sealing without them, whatever the bound. A
+    // flush seals what the tail has, documents only, and the vectors
+    // that arrive after that have no segment to join.
     let other_path = dir.join("docs-first.vector");
     let (addr, handle) = start_empty_node(NodeConfig {
         seal_tail_docs: 100,
@@ -1274,6 +1277,19 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
     for r in &rows[..250] {
         add_document(&mut docs_first, r).await;
     }
+    let root = pipestream_search::node::segments_root(&other_path);
+    assert!(
+        pipestream_search::segments::OpenedSegmentSet::open(&root)
+            .map_or(true, |set| set.is_empty()),
+        "no document-only segment sealed on its own"
+    );
+    // The flush seals the document-only segment, then refuses by name
+    // itself: the sidecar and the provider no longer agree.
+    let flushed = docs_first
+        .flush(FlushRequest {})
+        .await
+        .expect_err("a flush that sealed documents without their vectors");
+    assert_eq!(flushed.code(), tonic::Code::FailedPrecondition, "{}", flushed.message());
     let vectors: Vec<f32> = rows[..250].iter().flat_map(|r| r.vector.clone()).collect();
     let status = docs_first
         .add_vectors(tokio_stream::iter([AddVectorsRequest {
@@ -1295,6 +1311,56 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
         "{}",
         status.message()
     );
+    handle.abort();
+}
+
+/// A node that stopped without a flush (a refused shutdown flush, a
+/// crash) never finalized its whole-shard FP32 sidecar, but the sealed
+/// rows' FP32 files live in the segments: the next open rebuilds the
+/// sidecar from them, bit for bit, and appends continue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_reopened_without_a_flush_rebuilds_its_exact_sidecar_from_segments() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let dir = tempdir("reopen");
+    let sample = unit_vectors(64, DIM, SEED);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
+    let rows: Vec<Row> = (0..256).map(|i| row(i, false)).collect();
+    let index_path = dir.join("reopen.vector");
+    let (addr, handle) = start_empty_node(NodeConfig {
+        seal_tail_docs: 64,
+        ..config(Some(index_path.clone()), Layout::Segments, &analysis)
+    })
+    .await;
+    calibrate(&addr, &shift, &scale).await;
+    let mut first = client(&addr).await;
+    for block in rows.chunks(64) {
+        add_block(&mut first, block).await;
+    }
+    // Every block sealed (the bound equals the block); no flush ran.
+    handle.abort();
+    let exact_path = pipestream_search::node::exact_vector_sidecar_path(&index_path);
+    assert!(!exact_path.exists(), "no flush, no finalized sidecar");
+
+    let (addr, handle) =
+        start_opened_node(config(Some(index_path.clone()), Layout::Segments, &analysis)).await;
+    let exact = pipestream_search::exact_vectors::ExactVectorStore::open(&exact_path)
+        .expect("the open rebuilt the sidecar from the segments");
+    assert_eq!(exact.len(), 256);
+    exact.verify_payload().unwrap();
+    assert_eq!(exact.row_values(5, 6), rows[5].vector);
+    assert_eq!(exact.row_values(200, 201), rows[200].vector);
+
+    let mut second = client(&addr).await;
+    let more: Vec<Row> = (256..320).map(|i| row(i, false)).collect();
+    add_block(&mut second, &more).await;
+    let health = second.health(HealthRequest {}).await.unwrap().into_inner();
+    assert_eq!(health.num_vectors, 320);
+    assert_eq!(health.bm25_docs, 320);
+    let flushed = second.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert_eq!(flushed.num_vectors, 320);
+    let exact = pipestream_search::exact_vectors::ExactVectorStore::open(&exact_path).unwrap();
+    assert_eq!(exact.len(), 320);
+    exact.verify_payload().unwrap();
     handle.abort();
 }
 
