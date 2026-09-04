@@ -326,6 +326,13 @@ struct Preflight {
     stats_epoch: u64,
 }
 
+/// A segment-layout tail caught between the two calls of a legacy append:
+/// the documents count and the vectors count differ.
+struct MidRow {
+    documents: usize,
+    vectors: usize,
+}
+
 /// The shadow: a [`ShardState`] over the compacted image whose WAL is the
 /// rewritten generation, plus the id map it extends as the tail applies.
 struct Shadow {
@@ -384,7 +391,7 @@ impl NodeServiceImpl {
             ));
         }
         let _gate = CompactingGuard(std::sync::Arc::clone(&self.compacting));
-        let preflight = self.preflight(request)?;
+        let preflight = self.preflight_at_row_boundary(request)?;
         if request.dry_run {
             return Ok(CompactShardResponse {
                 rows_before: preflight.rows_now,
@@ -430,7 +437,42 @@ impl NodeServiceImpl {
         }
     }
 
-    fn preflight(&self, request: &CompactShardRequest) -> Result<Preflight, Status> {
+    /// Preflight at a row boundary. The cut is the log's high-water mark,
+    /// read under the shard lock; a legacy two-RPC append (AddDocuments,
+    /// then AddVectors) can be halfway through at that instant, and on
+    /// the segment layout the replay through such a cut builds a bucket
+    /// with one document more than vectors, which the layout refuses to
+    /// seal. The row completes with the client's next call, so this waits
+    /// that out for a bounded time, then refuses naming the counts.
+    fn preflight_at_row_boundary(
+        &self,
+        request: &CompactShardRequest,
+    ) -> Result<Preflight, Status> {
+        const ATTEMPTS: usize = 200;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        for attempt in 1..=ATTEMPTS {
+            match self.preflight(request)? {
+                Ok(preflight) => return Ok(preflight),
+                Err(_) if attempt < ATTEMPTS => std::thread::sleep(PAUSE),
+                Err(MidRow { documents, vectors }) => {
+                    return Err(Status::failed_precondition(format!(
+                        "the tail has {documents} documents and {vectors} vectors after {:?}; \
+                         compaction cuts at a row boundary, so finish the append (AddVectors \
+                         after AddDocuments) or ingest through the mapped path, then retry",
+                        PAUSE * ATTEMPTS as u32
+                    )))
+                }
+            }
+        }
+        unreachable!("the last attempt returns")
+    }
+
+    /// One preflight under the read lock: `Ok(Err(_))` when the segment
+    /// layout's tail is mid-row (see [`Self::preflight_at_row_boundary`]).
+    fn preflight(
+        &self,
+        request: &CompactShardRequest,
+    ) -> Result<Result<Preflight, MidRow>, Status> {
         let index_path = self.config.index_path.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "compaction needs a persisted shard (index_path); an in-memory shard has no log \
@@ -529,8 +571,17 @@ impl NodeServiceImpl {
                 }
             }
         }
+        if let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() {
+            if let Some(provider) = guard.index.as_ref().and_then(VectorIndex::as_segmented) {
+                let documents = shard.tail().next_doc_id() as usize;
+                let vectors = provider.tail().len();
+                if documents != vectors {
+                    return Ok(Err(MidRow { documents, vectors }));
+                }
+            }
+        }
         let rows_now = crate::node::physical_rows(&guard);
-        Ok(Preflight {
+        Ok(Ok(Preflight {
             index_path,
             work_dir,
             segmented,
@@ -544,7 +595,7 @@ impl NodeServiceImpl {
             backend_kind,
             scoring_fingerprint,
             stats_epoch: guard.stats_epoch,
-        })
+        }))
     }
 
     /// The analyzer for the replay and the tail: the node's own analysis

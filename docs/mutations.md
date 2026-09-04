@@ -48,7 +48,12 @@ The shape is the live reshard's, in one process:
 
 1. **Cutoff.** Under the read lock the node fixes `(WAL generation, high
    watermark)` and the row and tombstone counts, then fsyncs the log through
-   that clock. Writes keep landing on the live shard.
+   that clock. Writes keep landing on the live shard. The cut sits at a row
+   boundary: on the segment layout a legacy two-RPC append (AddDocuments,
+   then AddVectors) can be halfway through at that instant, and a replay
+   through such a cut would build a bucket with one document more than
+   vectors, which the layout refuses to seal; the preflight waits for the
+   row to complete (up to two seconds), then refuses naming the counts.
 2. **Build.** `reshard::compact_log` replays the generation through the
    cutoff with its deletes and replacements applied and writes the dense
    all-live image under the work directory (`<index>.compact/` by default;
@@ -107,7 +112,8 @@ staged segment; a work directory on another filesystem; a compacted store
 whose field table or analyzer fingerprints differ from the shard's; a
 snapshot installed during the run (the WAL rotates under the tail, and the
 compaction aborts with the live shard untouched); a pending cutover whose
-closing flush has not run.
+closing flush has not run; a segment-layout tail still mid-row after the
+wait.
 
 ### Why the log is rewritten
 

@@ -35,12 +35,13 @@ use pipestream_search::node::{Layout, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    search_query, selection_query, snapshot_chunk, AddDocumentsRequest, AddVectorsRequest,
-    Bm25SearchRequest, BrowseShardRequest, BrowseSort, CommitReplacementsRequest,
-    CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest, DenseQuery, DocLineage,
-    FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest, HybridSearchRequest,
-    IntegerValue, QueryRequest, Replacement, ResolveParentsRequest, SearchQuery, SearchRequest,
-    SelectionQuery, SetCalibrationRequest, SnapshotChunk, SnapshotManifest,
+    search_query, selection_query, snapshot_chunk, AddDocumentsRequest, AddDocumentsResponse,
+    AddVectorsRequest, AddVectorsResponse, Bm25SearchRequest, BrowseShardRequest, BrowseSort,
+    CommitReplacementsRequest, CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest,
+    DenseQuery, DocLineage, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest,
+    HybridSearchRequest, IntegerValue, QueryRequest, Replacement, ResolveParentsRequest,
+    SearchQuery, SearchRequest, SelectionQuery, SetCalibrationRequest, SnapshotChunk,
+    SnapshotManifest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -129,6 +130,19 @@ async fn calibrate(addr: &str, shift: &[f32], scale: &[f32]) {
 /// and the row sits at the vector's id in the new generation (the tail
 /// applied the document at the shadow's tip, where the vector landed).
 async fn append(client: &mut NodeServiceClient<Channel>, row: &Row) -> (u64, u64) {
+    let documents = add_document(client, row).await;
+    let vectors = add_vector(client, row).await;
+    if documents.wal_generation == vectors.wal_generation {
+        assert_eq!(
+            documents.first_id, vectors.first_id,
+            "document and vector legs must land at one id"
+        );
+    }
+    (vectors.first_id, vectors.wal_generation)
+}
+
+/// The document half of a legacy two-RPC append, keyed.
+async fn add_document(client: &mut NodeServiceClient<Channel>, row: &Row) -> AddDocumentsResponse {
     let doc = AddDocumentsRequest {
         text: row.text.clone(),
         lineage: Some(DocLineage {
@@ -150,7 +164,11 @@ async fn append(client: &mut NodeServiceClient<Channel>, row: &Row) -> (u64, u64
         "x-protomolt-stable-key-bin",
         tonic::metadata::MetadataValue::from_bytes(row.key.as_bytes()),
     );
-    let documents = client.add_documents(request).await.unwrap().into_inner();
+    client.add_documents(request).await.unwrap().into_inner()
+}
+
+/// The vector half of a legacy two-RPC append, keyed.
+async fn add_vector(client: &mut NodeServiceClient<Channel>, row: &Row) -> AddVectorsResponse {
     let mut request = Request::new(tokio_stream::iter([AddVectorsRequest {
         vectors: row.vector.clone(),
         dim: DIM as u32,
@@ -159,14 +177,7 @@ async fn append(client: &mut NodeServiceClient<Channel>, row: &Row) -> (u64, u64
         "x-protomolt-stable-key-bin",
         tonic::metadata::MetadataValue::from_bytes(row.key.as_bytes()),
     );
-    let vectors = client.add_vectors(request).await.unwrap().into_inner();
-    if documents.wal_generation == vectors.wal_generation {
-        assert_eq!(
-            documents.first_id, vectors.first_id,
-            "document and vector legs must land at one id"
-        );
-    }
-    (vectors.first_id, vectors.wal_generation)
+    client.add_vectors(request).await.unwrap().into_inner()
 }
 
 /// The product's view of the shard: live rows by key, and the global
@@ -1141,6 +1152,53 @@ async fn slow_shard(
         .unwrap();
     client.flush(FlushRequest {}).await.unwrap();
     (addr, handle, index_path)
+}
+
+/// A legacy two-RPC append caught between its calls holds the cut: the
+/// compaction waits at the row boundary and, when the row never completes,
+/// refuses naming the counts; once the vector lands, the same call runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mid_row_append_holds_the_cut_at_a_row_boundary() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let dir = tempdir("mid_row");
+    let sample = unit_vectors(64, DIM, SEED);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
+    let index_path = dir.join("shard.vector");
+    let (addr, handle) = start_empty_node(config(
+        Some(index_path.clone()),
+        Layout::Segments,
+        &analysis,
+    ))
+    .await;
+    calibrate(&addr, &shift, &scale).await;
+    let mut client = client(&addr).await;
+    for i in 0..2 {
+        append(&mut client, &row(i, false)).await;
+    }
+    let half = row(2, false);
+    add_document(&mut client, &half).await;
+
+    let started = Instant::now();
+    expect_refusal(
+        compact(&addr, CompactShardRequest::default()).await,
+        tonic::Code::FailedPrecondition,
+        "the tail has 3 documents and 2 vectors",
+    )
+    .await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the cut did not wait for the row: {:?}",
+        started.elapsed()
+    );
+
+    add_vector(&mut client, &half).await;
+    let done = compact(&addr, CompactShardRequest::default())
+        .await
+        .unwrap();
+    assert!(!done.dry_run);
+    assert_eq!(done.rows_before, 3);
+    assert_eq!(done.rows_after, 3);
+    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
