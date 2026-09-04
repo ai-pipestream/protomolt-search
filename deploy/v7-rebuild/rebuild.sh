@@ -531,8 +531,14 @@ stage_serve() {
   # build too; this also catches a .bm25 that was never started.)
   local missing=()
   for i in "${LOCAL[@]}"; do
-    [[ -f $OUT/shard-$i.tv ]] || missing+=("shard-$i.tv")
-    [[ -f $OUT/shard-$i.tv.bm25 ]] || missing+=("shard-$i.tv.bm25")
+    if [[ -f $OUT/shard-$i.tv.segments/segments.json ]]; then
+      # The segment layout (the default): a published catalog is the
+      # shard; its artifacts were hashed at each seal.
+      :
+    else
+      [[ -f $OUT/shard-$i.tv ]] || missing+=("shard-$i.tv")
+      [[ -f $OUT/shard-$i.tv.bm25 ]] || missing+=("shard-$i.tv.bm25")
+    fi
     [[ -d $OUT/shard-$i.tv.bm25.build ]] && missing+=("shard-$i: build unfinished")
   done
   ((${#missing[@]} == 0)) || die "not ready to serve: ${missing[*]}"
