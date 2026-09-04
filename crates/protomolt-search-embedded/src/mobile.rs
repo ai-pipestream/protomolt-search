@@ -19,7 +19,8 @@ use pipestream_search::pb::mobile::{
 };
 use pipestream_search::pb::{QueryRequest, QueryResponse, QueryStreamRequest, QueryStreamResponse};
 
-type QueryReceiver = ReceiverStream<Result<QueryStreamResponse, tonic::Status>>;
+type QueryReceiver =
+    pipestream_search::metrics::Timed<ReceiverStream<Result<QueryStreamResponse, tonic::Status>>>;
 
 struct OpenStream {
     owner: u64,

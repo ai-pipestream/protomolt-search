@@ -52,7 +52,7 @@ impl std::fmt::Debug for NodeLink {
 pub enum LinkStream<T> {
     #[cfg(feature = "net")]
     Remote(Box<Streaming<T>>),
-    Local(ReceiverStream<Result<T, Status>>),
+    Local(crate::metrics::Timed<ReceiverStream<Result<T, Status>>>),
 }
 
 impl<T> LinkStream<T> {

@@ -253,7 +253,8 @@ impl EmbeddedSearch {
     pub async fn query_stream(
         &self,
         request: QueryStreamRequest,
-    ) -> Result<ReceiverStream<Result<QueryStreamResponse, Status>>, Status> {
+    ) -> Result<crate::metrics::Timed<ReceiverStream<Result<QueryStreamResponse, Status>>>, Status>
+    {
         SearchService::query_stream(&self.coordinator, Request::new(request))
             .await
             .map(tonic::Response::into_inner)

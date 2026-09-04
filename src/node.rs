@@ -33,6 +33,7 @@ use crate::chunked::{
 use crate::exact_vectors::ExactVectorStore;
 use crate::fusion::{self, Leg};
 use crate::live_docs::LiveDocs;
+use crate::metrics::Route;
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::wal::{
     wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors, LoggedDeleteDocument,
@@ -8707,17 +8708,20 @@ impl NodeServiceImpl {
 
 #[tonic::async_trait]
 impl NodeService for NodeServiceImpl {
-    type SearchShardStream = ReceiverStream<Result<SearchShardResponse, Status>>;
-    type StreamSearchStream = ReceiverStream<Result<StreamSearchResponse, Status>>;
-    type Bm25QueryStreamStream = ReceiverStream<Result<Bm25QueryStreamResponse, Status>>;
-    type ReadWalStream = ReceiverStream<Result<ReadWalResponse, Status>>;
-    type StreamSnapshotStream = ReceiverStream<Result<SnapshotChunk, Status>>;
+    type SearchShardStream =
+        crate::metrics::Timed<ReceiverStream<Result<SearchShardResponse, Status>>>;
+    type StreamSearchStream =
+        crate::metrics::Timed<ReceiverStream<Result<StreamSearchResponse, Status>>>;
+    type Bm25QueryStreamStream =
+        crate::metrics::Timed<ReceiverStream<Result<Bm25QueryStreamResponse, Status>>>;
+    type ReadWalStream = crate::metrics::Timed<ReceiverStream<Result<ReadWalResponse, Status>>>;
+    type StreamSnapshotStream = crate::metrics::Timed<ReceiverStream<Result<SnapshotChunk, Status>>>;
 
     async fn search_shard(
         &self,
         request: Request<Streaming<SearchShardRequest>>,
     ) -> Result<Response<Self::SearchShardStream>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::SearchShard);
+        crate::metrics::timed_stream(Route::SearchShard, request, |request| async move {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
         let state = self.state.clone();
@@ -8883,7 +8887,9 @@ impl NodeService for NodeServiceImpl {
                         Status::failed_precondition("shard index disappeared mid-setup")
                     })?;
                     if index.len() != parents.len() {
-                        return Err(Status::aborted("shard grew between setup and scan; retry"));
+                            return Err(Status::aborted(
+                                "shard grew between setup and scan; retry",
+                            ));
                     }
                     // Filters remove chunks, and a parent's score is the
                     // max over its SURVIVING chunks, so collapse under a
@@ -8987,9 +8993,9 @@ impl NodeService for NodeServiceImpl {
                             } else {
                                 match done_rx.await {
                                     Ok(result) => result,
-                                    Err(_) => {
-                                        Err(Status::internal("scan batch dropped before finishing"))
-                                    }
+                                        Err(_) => Err(Status::internal(
+                                            "scan batch dropped before finishing",
+                                        )),
                                 }
                             }
                         }
@@ -9091,6 +9097,8 @@ impl NodeService for NodeServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     /// Filter-only browse: admitted ids above the floor, ascending, at
@@ -9101,7 +9109,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<crate::pb::BrowseShardRequest>,
     ) -> Result<Response<crate::pb::BrowseShardResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::BrowseShard);
+        crate::metrics::timed(Route::BrowseShard, request, |request| async move {
         let req = request.into_inner();
         if req.k == 0 {
             return Err(Status::invalid_argument("browse requires k > 0"));
@@ -9154,10 +9162,11 @@ impl NodeService for NodeServiceImpl {
             // exactness certificate is trivial; per-shard exact top-k
             // by key means the coordinator's merged union contains the
             // global top-k (local rank <= global rank).
-            let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> = if let Some(ni) =
-                store.numeric_index(&sort.column)
-            {
-                Box::new(move |doc| store.numeric_value(ni, doc).map(|v| (f64_order_bits(v), v)))
+                let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> =
+                    if let Some(ni) = store.numeric_index(&sort.column) {
+                        Box::new(move |doc| {
+                            store.numeric_value(ni, doc).map(|v| (f64_order_bits(v), v))
+                        })
             } else if let Some(ii) = store.integer_index(&sort.column) {
                 Box::new(move |doc| {
                     store
@@ -9238,13 +9247,15 @@ impl NodeService for NodeServiceImpl {
             sort_keys: Vec::new(),
             sort_column_known: req.sort.is_none(),
         }))
+        })
+        .await
     }
 
     async fn resolve_filter_bitmap(
         &self,
         request: Request<crate::pb::FilterBitmapRequest>,
     ) -> Result<Response<crate::pb::FilterBitmapResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::ResolveFilterBitmap);
+        crate::metrics::timed(Route::ResolveFilterBitmap, request, |request| async move {
         let req = request.into_inner();
         let geo_regions = validate_geo_filters(&req.geo_filters)?;
         let guard = self.state.read().expect("shard state lock poisoned");
@@ -9276,6 +9287,8 @@ impl NodeService for NodeServiceImpl {
             geo_columns_known,
             filter_columns_known,
         }))
+        })
+        .await
     }
 
     async fn resolve_lexical_bitmap(
@@ -9344,9 +9357,12 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<crate::pb::AggregateShardRequest>,
     ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::AggregateShard);
+        crate::metrics::timed(Route::AggregateShard, request, |request| async move {
         let req = request.into_inner();
-        if req.aggregations.is_empty() && req.histograms.is_empty() && req.percentiles.is_empty() {
+            if req.aggregations.is_empty()
+                && req.histograms.is_empty()
+                && req.percentiles.is_empty()
+            {
             return Err(Status::invalid_argument(
                 "aggregate requires at least one aggregation, histogram, or percentile",
             ));
@@ -9449,7 +9465,10 @@ impl NodeService for NodeServiceImpl {
                 )));
             }
             let expr = h.expr.as_ref().ok_or_else(|| {
-                Status::invalid_argument(format!("histogram {:?} without an expression", h.name))
+                    Status::invalid_argument(format!(
+                        "histogram {:?} without an expression",
+                        h.name
+                    ))
             })?;
             let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
                 Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
@@ -9486,7 +9505,8 @@ impl NodeService for NodeServiceImpl {
         let mut pcts: Vec<(Option<(crate::values::ResolvedValue, bool)>, PctAcc)> =
             Vec::with_capacity(req.percentiles.len());
         for spec in &req.percentiles {
-            let resolved = resolve_rankable(store, spec.expr.as_ref(), &spec.name, "percentile")?;
+                let resolved =
+                    resolve_rankable(store, spec.expr.as_ref(), &spec.name, "percentile")?;
             pcts.push((resolved, PctAcc::default()));
         }
         let doc_filter = crate::filter::DocFilter {
@@ -9571,7 +9591,8 @@ impl NodeService for NodeServiceImpl {
             }
             for (rv, interval, cap, name, acc) in hists.iter_mut() {
                 let Some(rv) = rv else { continue };
-                if let Some(crate::values::Val::Double(x)) = crate::values::eval(rv, doc, &cols) {
+                    if let Some(crate::values::Val::Double(x)) = crate::values::eval(rv, doc, &cols)
+                    {
                     acc.push(x, *interval, *cap, name)?;
                 }
             }
@@ -9632,13 +9653,15 @@ impl NodeService for NodeServiceImpl {
                 })
                 .collect(),
         }))
+        })
+        .await
     }
 
     async fn quantile_counts(
         &self,
         request: Request<crate::pb::QuantileCountsRequest>,
     ) -> Result<Response<crate::pb::QuantileCountsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::QuantileCounts);
+        crate::metrics::timed(Route::QuantileCounts, request, |request| async move {
         let req = request.into_inner();
         let geo_regions = validate_geo_filters(&req.geo_filters)?;
         let guard = self.state.read().expect("shard state lock poisoned");
@@ -9718,12 +9741,15 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(crate::pb::QuantileCountsResponse { counts }))
+        })
+        .await
     }
 
     async fn read_wal(
         &self,
         request: Request<ReadWalRequest>,
     ) -> Result<Response<Self::ReadWalStream>, Status> {
+        crate::metrics::timed_stream(Route::ReadWal, request, |request| async move {
         let req = request.into_inner();
         let (generation, high_watermark, records, prefix_health) = loop {
             let needs_flush = self
@@ -9762,8 +9788,10 @@ impl NodeService for NodeServiceImpl {
                         wal.high_watermark()
                     )));
                 }
-                let records = wal::read_clocked_records(wal.dir(), req.after_clock)
-                    .map_err(|error| Status::failed_precondition(format!("read WAL: {error}")))?;
+                    let records =
+                        wal::read_clocked_records(wal.dir(), req.after_clock).map_err(|error| {
+                            Status::failed_precondition(format!("read WAL: {error}"))
+                        })?;
                 let num_vectors = guard.index.as_ref().map_or(0, |index| index.len() as u64);
                 let document_slots = guard
                     .bm25
@@ -9836,6 +9864,8 @@ impl NodeService for NodeServiceImpl {
                 .await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     async fn apply_wal_binding(
@@ -9865,12 +9895,15 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<crate::pb::CompactShardRequest>,
     ) -> Result<Response<crate::pb::CompactShardResponse>, Status> {
+        crate::metrics::timed(Route::CompactShard, request, |request| async move {
         let req = request.into_inner();
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.compact_shard(&req))
             .await
             .map_err(|e| Status::internal(format!("compaction task failed: {e}")))?
             .map(Response::new)
+        })
+        .await
     }
 
     async fn health(
@@ -9961,7 +9994,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<StreamSearchRequest>>,
     ) -> Result<Response<Self::StreamSearchStream>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::StreamSearch);
+        crate::metrics::timed_stream(Route::StreamSearch, request, |request| async move {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
         let state = self.state.clone();
@@ -10082,7 +10115,9 @@ impl NodeService for NodeServiceImpl {
                             start.vector.len()
                         )));
                     }
-                    if let Some((_, coord, value)) = first_invalid_coordinate(&start.vector, dim) {
+                        if let Some((_, coord, value)) =
+                            first_invalid_coordinate(&start.vector, dim)
+                        {
                         return Err(Status::invalid_argument(format!(
                             "query coordinate {coord} is invalid: {value}"
                         )));
@@ -10233,6 +10268,8 @@ impl NodeService for NodeServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     async fn get_vector_backend(
@@ -10306,7 +10343,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<AddVectorsRequest>>,
     ) -> Result<Response<AddVectorsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::AddVectors);
+        crate::metrics::timed(Route::AddVectors, request, |request| async move {
         let _ingest = self.claim_ingest()?;
         let stable_routing_key = replication_stable_key(&request)?;
         let mut inbound = request.into_inner();
@@ -10346,6 +10383,8 @@ impl NodeService for NodeServiceImpl {
             first_id,
             wal_generation,
         }))
+        })
+        .await
     }
 
     async fn flush(
@@ -10410,18 +10449,22 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<ExportSnapshotRequest>,
     ) -> Result<Response<ExportSnapshotResponse>, Status> {
+        crate::metrics::timed(Route::ExportSnapshot, request, |request| async move {
         let directory = PathBuf::from(request.into_inner().directory);
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.export_snapshot_blocking(&directory))
             .await
             .map_err(|e| Status::internal(format!("export task failed: {e}")))?
             .map(Response::new)
+        })
+        .await
     }
 
     async fn stream_snapshot(
         &self,
-        _request: Request<StreamSnapshotRequest>,
+        request: Request<StreamSnapshotRequest>,
     ) -> Result<Response<Self::StreamSnapshotStream>, Status> {
+        crate::metrics::timed_stream(Route::StreamSnapshot, request, |_request| async move {
         let path = self.config.index_path.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "shard has no persistence path (index_path); a snapshot export needs one",
@@ -10463,12 +10506,15 @@ impl NodeService for NodeServiceImpl {
             let _ = tokio::fs::remove_dir_all(&staging).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     async fn install_snapshot_from(
         &self,
         request: Request<InstallSnapshotFromRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
+        crate::metrics::timed(Route::InstallSnapshotFrom, request, |request| async move {
         use crate::pb::install_snapshot_from_request::Source;
         let path = self.config.index_path.clone().ok_or_else(|| {
             Status::failed_precondition(
@@ -10525,13 +10571,15 @@ impl NodeService for NodeServiceImpl {
             let _ = tokio::fs::remove_dir_all(&cleanup).await;
         }
         result.map(Response::new)
+        })
+        .await
     }
 
     async fn add_documents(
         &self,
         request: Request<Streaming<AddDocumentsRequest>>,
     ) -> Result<Response<AddDocumentsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::AddDocuments);
+        crate::metrics::timed(Route::AddDocuments, request, |request| async move {
         let _ingest = self.claim_ingest()?;
         let addr = self.config.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
@@ -10608,35 +10656,41 @@ impl NodeService for NodeServiceImpl {
             first_id,
             wal_generation,
         }))
+        })
+        .await
     }
 
     async fn delete_documents(
         &self,
         request: Request<DeleteDocumentsRequest>,
     ) -> Result<Response<DeleteDocumentsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::DeleteDocuments);
+        crate::metrics::timed(Route::DeleteDocuments, request, |request| async move {
         let req = request.into_inner();
         let mut guard = self.state.write().expect("shard state lock poisoned");
         self.delete_documents_locked(&mut guard, &req.doc_ids, req.expected_wal_generation)
             .map(Response::new)
+        })
+        .await
     }
 
     async fn commit_replacements(
         &self,
         request: Request<CommitReplacementsRequest>,
     ) -> Result<Response<CommitReplacementsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::CommitReplacements);
+        crate::metrics::timed(Route::CommitReplacements, request, |request| async move {
         let req = request.into_inner();
         let mut guard = self.state.write().expect("shard state lock poisoned");
         self.commit_replacements_locked(&mut guard, &req.replacements, req.expected_wal_generation)
             .map(Response::new)
+        })
+        .await
     }
 
     async fn ingest_mapped(
         &self,
         request: Request<Streaming<IngestMappedRequest>>,
     ) -> Result<Response<IngestMappedResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::IngestMapped);
+        crate::metrics::timed(Route::IngestMapped, request, |request| async move {
         let _ingest = self.claim_ingest()?;
         let addr = self.config.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
@@ -10725,16 +10779,20 @@ impl NodeService for NodeServiceImpl {
             parents,
             wal_generation,
         }))
+        })
+        .await
     }
 
     async fn term_stats(
         &self,
         request: Request<TermStatsRequest>,
     ) -> Result<Response<TermStatsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::TermStats);
+        crate::metrics::timed(Route::TermStats, request, |request| async move {
         let req = request.into_inner();
         let guard = self.state.read().expect("shard state lock poisoned");
-        let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard.bm25.as_ref()
+            let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard
+                .bm25
+                .as_ref()
         {
             Some(store) => {
                 let index = store.as_index().ok_or_else(|| {
@@ -10807,13 +10865,15 @@ impl NodeService for NodeServiceImpl {
             field_stats,
             stats_epoch: guard.stats_epoch,
         }))
+        })
+        .await
     }
 
     async fn expand_term_prefix(
         &self,
         request: Request<crate::pb::ExpandTermPrefixRequest>,
     ) -> Result<Response<crate::pb::ExpandTermPrefixResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::TermStats);
+        crate::metrics::timed(Route::ExpandTermPrefix, request, |request| async move {
         let req = request.into_inner();
         if req.prefix.is_empty() {
             return Err(Status::invalid_argument("a term prefix must be non-empty"));
@@ -10853,6 +10913,8 @@ impl NodeService for NodeServiceImpl {
             count,
             known: true,
         }))
+        })
+        .await
     }
 
     /// Autocomplete scan over one field's dictionary (`docs/suggest.md`):
@@ -10866,7 +10928,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<crate::pb::SuggestTermsRequest>,
     ) -> Result<Response<crate::pb::SuggestTermsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::SuggestTerms);
+        crate::metrics::timed(Route::SuggestTerms, request, |request| async move {
         let req = request.into_inner();
         if req.prefix.is_empty() {
             return Err(Status::invalid_argument("a term prefix must be non-empty"));
@@ -10921,39 +10983,47 @@ impl NodeService for NodeServiceImpl {
             known: true,
             tombstoned_rows,
         }))
+        })
+        .await
     }
 
     async fn bm25_query(
         &self,
         request: Request<Bm25QueryRequest>,
     ) -> Result<Response<Bm25QueryResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::Bm25Query);
+        crate::metrics::timed(Route::Bm25Query, request, |request| async move {
         let service = self.clone();
         let req = request.into_inner();
         tokio::task::spawn_blocking(move || service.run_bm25_query(req))
             .await
             .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))?
             .map(Response::new)
+        })
+        .await
     }
 
     async fn bm25_phrase_query(
         &self,
         request: Request<crate::pb::Bm25PhraseQueryRequest>,
     ) -> Result<Response<Bm25QueryResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::Bm25Query);
+        crate::metrics::timed(Route::Bm25PhraseQuery, request, |request| async move {
         let service = self.clone();
         let req = request.into_inner();
         tokio::task::spawn_blocking(move || service.run_bm25_phrase_query(req))
             .await
-            .map_err(|error| Status::internal(format!("bm25 phrase query task failed: {error}")))?
+                .map_err(|error| {
+                    Status::internal(format!("bm25 phrase query task failed: {error}"))
+                })?
             .map(Response::new)
+        })
+        .await
     }
 
     async fn bm25_query_stream(
         &self,
         request: Request<Streaming<Bm25QueryStreamRequest>>,
     ) -> Result<Response<Self::Bm25QueryStreamStream>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::Bm25Query);
+        crate::metrics::timed_stream(Route::Bm25QueryStream, request, |request| async move {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<Bm25QueryStreamResponse, Status>>(64);
         let service = self.clone();
@@ -11021,8 +11091,9 @@ impl NodeService for NodeServiceImpl {
             // and hand back the highest coordinator floor seen.
             let share = service.config.share_floors;
             let floor_delta = service.config.floor_delta;
-            let min_interval = (service.config.floor_min_interval_ms > 0)
-                .then(|| std::time::Duration::from_millis(service.config.floor_min_interval_ms));
+                let min_interval = (service.config.floor_min_interval_ms > 0).then(|| {
+                    std::time::Duration::from_millis(service.config.floor_min_interval_ms)
+                });
             let scan_tx = tx.clone();
             let hook_cancelled = Arc::clone(&cancelled);
             let mut last_published = f32::NEG_INFINITY;
@@ -11072,8 +11143,10 @@ impl NodeService for NodeServiceImpl {
                         pending.extend_from_slice(&score.to_le_bytes());
                         if pending.len() >= BATCH_BYTES {
                             let records = (pending.len() / 12) as u64;
-                            let batch =
-                                std::mem::replace(&mut pending, Vec::with_capacity(BATCH_BYTES));
+                                let batch = std::mem::replace(
+                                    &mut pending,
+                                    Vec::with_capacity(BATCH_BYTES),
+                                );
                             if candidate_tx
                                 .blocking_send(Ok(Bm25QueryStreamResponse {
                                     payload: Some(
@@ -11139,26 +11212,30 @@ impl NodeService for NodeServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     async fn bm25_rescore(
         &self,
         request: Request<Bm25RescoreRequest>,
     ) -> Result<Response<Bm25RescoreResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::Bm25Rescore);
+        crate::metrics::timed(Route::Bm25Rescore, request, |request| async move {
         let service = self.clone();
         let req = request.into_inner();
         tokio::task::spawn_blocking(move || service.run_bm25_rescore(req))
             .await
             .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))?
             .map(Response::new)
+        })
+        .await
     }
 
     async fn fetch_values(
         &self,
         request: Request<crate::pb::FetchValuesRequest>,
     ) -> Result<Response<crate::pb::FetchValuesResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::FetchValues);
+        crate::metrics::timed(Route::FetchValues, request, |request| async move {
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let state = self.state.clone();
@@ -11204,7 +11281,8 @@ impl NodeService for NodeServiceImpl {
                     })
                     .collect::<Result<_, Status>>()?;
                 let chain = store.resolve_chain(&specs);
-                let stage_columns_known = chain.stages.iter().map(|s| s.column.is_some()).collect();
+                    let stage_columns_known =
+                        chain.stages.iter().map(|s| s.column.is_some()).collect();
                 let numeric_read = ShardNumericRead(store);
                 let n = u64::from(store.next_doc_id());
                 let mut ids: Vec<u64> = req
@@ -11256,13 +11334,15 @@ impl NodeService for NodeServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("fetch values task failed: {e}")))??;
         Ok(Response::new(resp))
+        })
+        .await
     }
 
     async fn vector_rescore(
         &self,
         request: Request<VectorRescoreRequest>,
     ) -> Result<Response<VectorRescoreResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::VectorRescore);
+        crate::metrics::timed(Route::VectorRescore, request, |request| async move {
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let state = self.state.clone();
@@ -11324,13 +11404,15 @@ impl NodeService for NodeServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
         Ok(Response::new(VectorRescoreResponse { hits }))
+        })
+        .await
     }
 
     async fn exact_vector_rescore(
         &self,
         request: Request<ExactVectorRescoreRequest>,
     ) -> Result<Response<ExactVectorRescoreResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::ExactVectorRescore);
+        crate::metrics::timed(Route::ExactVectorRescore, request, |request| async move {
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let state = self.state.clone();
@@ -11425,13 +11507,15 @@ impl NodeService for NodeServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("exact vector rescore task failed: {e}")))??;
         Ok(Response::new(result))
+        })
+        .await
     }
 
     async fn get_documents(
         &self,
         request: Request<GetDocumentsRequest>,
     ) -> Result<Response<GetDocumentsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::GetDocuments);
+        crate::metrics::timed(Route::GetDocuments, request, |request| async move {
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let guard = self.state.read().expect("shard state lock poisoned");
@@ -11463,14 +11547,16 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(GetDocumentsResponse { documents }))
+        })
+        .await
     }
 
     async fn resolve_parents(
         &self,
         request: Request<ResolveParentsRequest>,
     ) -> Result<Response<ResolveParentsResponse>, Status> {
+        crate::metrics::timed(Route::ResolveParents, request, |request| async move {
         const SELF_PARENT_TAG: u64 = 1 << 63;
-        crate::metrics::inc_request(crate::metrics::Route::ResolveParents);
         let req = request.into_inner();
         let offset = self.config.slot_offset;
         let guard = self.state.read().expect("shard state lock poisoned");
@@ -11503,25 +11589,29 @@ impl NodeService for NodeServiceImpl {
             parents.push(ResolvedParent { doc_id, parent_id });
         }
         Ok(Response::new(ResolveParentsResponse { parents }))
+        })
+        .await
     }
 
     async fn hybrid_shard(
         &self,
         request: Request<HybridShardRequest>,
     ) -> Result<Response<HybridShardResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::HybridShard);
+        crate::metrics::timed(Route::HybridShard, request, |request| async move {
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.run_hybrid(request.into_inner()))
             .await
             .map_err(|e| Status::internal(format!("hybrid task failed: {e}")))?
             .map(Response::new)
+        })
+        .await
     }
 
     async fn shard_legs(
         &self,
         request: Request<ShardLegsRequest>,
     ) -> Result<Response<ShardLegsResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::ShardLegs);
+        crate::metrics::timed(Route::ShardLegs, request, |request| async move {
         let req = request.into_inner();
         if req.terms.len() != req.global_doc_frequencies.len() {
             return Err(Status::invalid_argument(
@@ -11573,6 +11663,8 @@ impl NodeService for NodeServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
         .map(Response::new)
+        })
+        .await
     }
 }
 

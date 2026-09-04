@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status};
 
 use crate::coordinator::{CoordinatorServiceImpl, TopologyRoute};
+use crate::metrics::Route;
 use crate::pb::cluster_control_server::{ClusterControl, ClusterControlServer};
 use crate::pb::{
     ClusterNode, ClusterNodeState, ClusterPlan, CompletePlacementActionRequest, DrainNodeRequest,
@@ -1712,40 +1713,50 @@ impl ClusterControl for ClusterControlService {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<NodeLease>, Status> {
+        crate::metrics::timed(Route::RegisterNode, request, |request| async move {
         self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane
             .register(request.into_inner(), now_ms())
             .map(Response::new)
+        })
+        .await
     }
 
     async fn renew_node_lease(
         &self,
         request: Request<RenewNodeLeaseRequest>,
     ) -> Result<Response<NodeLease>, Status> {
+        crate::metrics::timed(Route::RenewNodeLease, request, |request| async move {
         self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane
             .renew(request.into_inner(), now_ms())
             .map(Response::new)
+        })
+        .await
     }
 
     async fn drain_node(
         &self,
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        crate::metrics::timed(Route::DrainNode, request, |request| async move {
         self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane.drain(request.into_inner(), now_ms())?;
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
         self.publish_if_needed()?;
         Ok(Response::new(plan))
+        })
+        .await
     }
 
     async fn report_shard(
         &self,
         request: Request<ReportShardRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        crate::metrics::timed(Route::ReportShard, request, |request| async move {
         self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         let req = request.into_inner();
@@ -1756,24 +1767,34 @@ impl ClusterControl for ClusterControlService {
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
         self.publish_if_needed()?;
         Ok(Response::new(plan))
+        })
+        .await
     }
 
     async fn complete_placement_action(
         &self,
         request: Request<CompletePlacementActionRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        crate::metrics::timed(
+            Route::CompletePlacementAction,
+            request,
+            |request| async move {
         self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         self.plane.complete_action(request.into_inner(), now_ms())?;
         let (plan, _changed) = self.plane.reconcile(false, now_ms())?;
         self.publish_if_needed()?;
         Ok(Response::new(plan))
+            },
+        )
+        .await
     }
 
     async fn reconcile_cluster(
         &self,
         request: Request<ReconcileClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        crate::metrics::timed(Route::ReconcileCluster, request, |request| async move {
         self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         let request = request.into_inner();
@@ -1782,21 +1803,27 @@ impl ClusterControl for ClusterControlService {
             self.publish_if_needed()?;
         }
         Ok(Response::new(plan))
+        })
+        .await
     }
 
     async fn get_cluster_plan(
         &self,
         _request: Request<GetClusterPlanRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        crate::metrics::timed(Route::GetClusterPlan, _request, |_request| async move {
         self.membership(&_request)?;
         self.admit(&_request.get_ref().collection)?;
         self.plane.plan().map(Response::new)
+        })
+        .await
     }
 
     async fn rollback_cluster(
         &self,
         request: Request<RollbackClusterRequest>,
     ) -> Result<Response<ClusterPlan>, Status> {
+        crate::metrics::timed(Route::RollbackCluster, request, |request| async move {
         self.membership(&request)?;
         self.admit(&request.get_ref().collection)?;
         let (plan, _changed) = self
@@ -1804,6 +1831,8 @@ impl ClusterControl for ClusterControlService {
             .rollback(request.into_inner().topology_generation)?;
         self.publish_if_needed()?;
         Ok(Response::new(plan))
+        })
+        .await
     }
 }
 

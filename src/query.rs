@@ -1180,7 +1180,7 @@ pub async fn execute(
         Shape::Lexical { id, query } => {
             let t_sel = std::time::Instant::now();
             let response = coordinator
-                .bm25_search(Request::new(Bm25SearchRequest {
+                .bm25_search(crate::metrics::nested(Request::new(Bm25SearchRequest {
                     text: query.text.clone(),
                     k: fetch_k,
                     analysis: query.analysis.clone(),
@@ -1192,7 +1192,7 @@ pub async fn execute(
                     projections: req.projections.clone(),
                     highlight: req.highlight.clone(),
                     ..Default::default()
-                }))
+                })))
                 .await?
                 .into_inner();
             if let Some(p) = prof.as_mut() {
@@ -1231,14 +1231,14 @@ pub async fn execute(
         Shape::Dense { id, query } => {
             let t_sel = std::time::Instant::now();
             let response = coordinator
-                .search(Request::new(SearchRequest {
+                .search(crate::metrics::nested(Request::new(SearchRequest {
                     request_id: req.request_id.clone(),
                     k: fetch_k,
                     vector: query.vector.clone(),
                     geo_filters: plan.geo_filters.clone(),
                     filter,
                     ..Default::default()
-                }))
+                })))
                 .await?
                 .into_inner();
             if let Some(p) = prof.as_mut() {
@@ -1354,7 +1354,7 @@ pub async fn execute(
             let boost_id = legacy.as_ref().map(|(id, _)| id.clone());
             let t_sel = std::time::Instant::now();
             let response = coordinator
-                .hybrid_search(Request::new(HybridSearchRequest {
+                .hybrid_search(crate::metrics::nested(Request::new(HybridSearchRequest {
                     request_id: req.request_id.clone(),
                     text: lexical.text.clone(),
                     vector: dense.vector.clone(),
@@ -1369,7 +1369,7 @@ pub async fn execute(
                     geo_filters: plan.geo_filters.clone(),
                     filter,
                     ..Default::default()
-                }))
+                })))
                 .await?
                 .into_inner();
             if let Some(p) = prof.as_mut() {

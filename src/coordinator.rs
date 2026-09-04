@@ -19,6 +19,7 @@ use crate::clustered_turbovec::{
 };
 use crate::fusion::{self, Leg};
 use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
+use crate::metrics::Route;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 #[cfg(feature = "net")]
 use crate::pb::HybridLegHit;
@@ -8618,7 +8619,8 @@ impl CoordinatorServiceImpl {
                 // ignored so the rankings stay comparable.
                 let mut req = req.clone();
                 req.k = k;
-                let resp = SearchService::bm25_search(self, Request::new(req))
+                let resp =
+                    SearchService::bm25_search(self, crate::metrics::nested(Request::new(req)))
                     .await?
                     .into_inner();
                 Ok(resp
@@ -8636,7 +8638,8 @@ impl CoordinatorServiceImpl {
                 // The profile block is per-arm noise here and the caller
                 // asked for a comparison, not a trace.
                 req.debug = false;
-                let resp = SearchService::hybrid_search(self, Request::new(req))
+                let resp =
+                    SearchService::hybrid_search(self, crate::metrics::nested(Request::new(req)))
                     .await?
                     .into_inner();
                 // CASCADE reports in `cascade_hits` and leaves `hits`
@@ -9332,15 +9335,21 @@ impl CoordinatorServiceImpl {
 
 #[tonic::async_trait]
 impl SearchService for CoordinatorServiceImpl {
-    type QueryStreamStream = ReceiverStream<Result<crate::pb::QueryStreamResponse, Status>>;
+    type QueryStreamStream =
+        crate::metrics::Timed<ReceiverStream<Result<crate::pb::QueryStreamResponse, Status>>>;
 
     async fn search(
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        crate::metrics::timed(Route::Search, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::search(&snapshot, request)).await;
+                return Box::pin(SearchService::search(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
         }
         let req = request.into_inner();
         let k = self.resolve_k(req.k)?;
@@ -9443,15 +9452,18 @@ impl SearchService for CoordinatorServiceImpl {
             groups: Vec::new(),
             chunk_floor: 0.0,
         }))
+        })
+        .await
     }
 
     async fn bm25_search(
         &self,
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
+        crate::metrics::timed(Route::Bm25Search, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::bm25_search(&snapshot, request)).await;
+                return Box::pin(SearchService::bm25_search(&snapshot, crate::metrics::nested(request))).await;
         }
         let req = request.into_inner();
         let k = self.resolve_k(req.k)?;
@@ -9628,15 +9640,18 @@ impl SearchService for CoordinatorServiceImpl {
             phrase_routing,
             prefix_expansions,
         }))
+        })
+        .await
     }
 
     async fn phrase_search(
         &self,
         request: Request<crate::pb::PhraseSearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
+        crate::metrics::timed(Route::PhraseSearch, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::phrase_search(&snapshot, request)).await;
+                return Box::pin(SearchService::phrase_search(&snapshot, crate::metrics::nested(request))).await;
         }
         let request = request.into_inner();
         let base = request
@@ -9689,15 +9704,22 @@ impl SearchService for CoordinatorServiceImpl {
             phrase_routing: Vec::new(),
             prefix_expansions: Vec::new(),
         }))
+        })
+        .await
     }
 
     async fn hybrid_search(
         &self,
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
+        crate::metrics::timed(Route::HybridSearch, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::hybrid_search(&snapshot, request)).await;
+                return Box::pin(SearchService::hybrid_search(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
         }
         let req = request.into_inner();
         let k = self.resolve_k(req.k)?;
@@ -9851,6 +9873,8 @@ impl SearchService for CoordinatorServiceImpl {
             cascade_hits,
             debug,
         }))
+        })
+        .await
     }
 
     /// The public query surface: an adapter over the routes above
@@ -9859,24 +9883,37 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::QueryRequest>,
     ) -> Result<Response<crate::pb::QueryResponse>, Status> {
+        crate::metrics::timed(Route::Query, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::query(&snapshot, request)).await;
+                return Box::pin(SearchService::query(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
         }
         let request = request.into_inner();
         self.require_topology_generation(request.required_topology_generation)?;
         let mut response = crate::query::execute(self, request).await?;
         response.served_topology_generation = self.topology_generation;
         Ok(Response::new(response))
+        })
+        .await
     }
 
     async fn query_stream(
         &self,
         request: Request<crate::pb::QueryStreamRequest>,
     ) -> Result<Response<Self::QueryStreamStream>, Status> {
+        crate::metrics::timed_stream(Route::QueryStream, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::query_stream(&snapshot, request)).await;
+                return Box::pin(SearchService::query_stream(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await
+                .map(|response| response.map(crate::metrics::Timed::into_inner));
         }
         let request = request.into_inner();
         if let Some(query) = request.query.as_ref() {
@@ -10138,15 +10175,22 @@ impl SearchService for CoordinatorServiceImpl {
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     async fn plan_index(
         &self,
         request: Request<crate::pb::PlanIndexRequest>,
     ) -> Result<Response<crate::pb::PlanIndexResponse>, Status> {
+        crate::metrics::timed(Route::PlanIndex, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::plan_index(&snapshot, request)).await;
+                return Box::pin(SearchService::plan_index(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
         }
         // Derivation is local and deterministic (docs/descriptor-mappings.md):
         // nothing fans out, nothing binds, and the same request returns the
@@ -10156,24 +10200,30 @@ impl SearchService for CoordinatorServiceImpl {
         Ok(Response::new(crate::pb::PlanIndexResponse {
             plan: Some(plan),
         }))
+        })
+        .await
     }
 
     async fn routed_ingest_mapped(
         &self,
         request: Request<Streaming<RoutedIngestMappedRequest>>,
     ) -> Result<Response<RoutedIngestMappedResponse>, Status> {
+        crate::metrics::timed(Route::RoutedIngestMapped, request, |request| async move {
         let mut inbound = request.into_inner();
         let bind = Self::routed_bind(&mut inbound).await?;
         self.admit(&bind.collection)?;
         self.routed_ingest_mapped_bound(bind, inbound)
             .await
             .map(Response::new)
+        })
+        .await
     }
 
     async fn freeze_topology_writes(
         &self,
         request: Request<FreezeTopologyWritesRequest>,
     ) -> Result<Response<FreezeTopologyWritesResponse>, Status> {
+        crate::metrics::timed(Route::FreezeTopologyWrites, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if self.live_topology.is_none() {
             return Err(Status::failed_precondition(
@@ -10218,12 +10268,15 @@ impl SearchService for CoordinatorServiceImpl {
             topology_generation: requested,
             cutover_token: token,
         }))
+        })
+        .await
     }
 
     async fn publish_topology(
         &self,
         request: Request<PublishTopologyRequest>,
     ) -> Result<Response<PublishTopologyResponse>, Status> {
+        crate::metrics::timed(Route::PublishTopology, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         let req = request.into_inner();
         let routes = req
@@ -10255,12 +10308,15 @@ impl SearchService for CoordinatorServiceImpl {
         Ok(Response::new(PublishTopologyResponse {
             topology_generation: req.generation,
         }))
+        })
+        .await
     }
 
     async fn abort_topology_cutover(
         &self,
         request: Request<AbortTopologyCutoverRequest>,
     ) -> Result<Response<AbortTopologyCutoverResponse>, Status> {
+        crate::metrics::timed(Route::AbortTopologyCutover, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         let token = request.into_inner().cutover_token;
         let mut held = self
@@ -10280,6 +10336,8 @@ impl SearchService for CoordinatorServiceImpl {
         Ok(Response::new(AbortTopologyCutoverResponse {
             topology_generation: self.current_topology_generation(),
         }))
+        })
+        .await
     }
 
     /// Exact aggregates over the filtered corpus
@@ -10290,9 +10348,14 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::AggregateRequest>,
     ) -> Result<Response<crate::pb::AggregateResponse>, Status> {
+        crate::metrics::timed(Route::Aggregate, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::aggregate(&snapshot, request)).await;
+                return Box::pin(SearchService::aggregate(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
         }
         let req = request.into_inner();
         let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
@@ -10300,6 +10363,8 @@ impl SearchService for CoordinatorServiceImpl {
         self.fanout_aggregate(&filters, &compiled, None)
             .await
             .map(Response::new)
+        })
+        .await
     }
 
     /// Autocomplete over one field's dictionary (`docs/suggest.md`):
@@ -10316,7 +10381,7 @@ impl SearchService for CoordinatorServiceImpl {
         &self,
         request: Request<crate::pb::SuggestRequest>,
     ) -> Result<Response<crate::pb::SuggestResponse>, Status> {
-        crate::metrics::inc_request(crate::metrics::Route::Suggest);
+        crate::metrics::timed(Route::Suggest, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::suggest(&snapshot, request)).await;
@@ -10418,19 +10483,22 @@ impl SearchService for CoordinatorServiceImpl {
             dictionary_terms_with_prefix,
             df_includes_tombstoned_rows: tombstoned,
         }))
+        })
+        .await
     }
 
     async fn cluster_health(
         &self,
         _request: Request<ClusterHealthRequest>,
     ) -> Result<Response<ClusterHealthResponse>, Status> {
+        crate::metrics::timed(Route::ClusterHealth, _request, |_request| async move {
         self.admit(&_request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
             return Box::pin(SearchService::cluster_health(
                 &snapshot,
-                Request::new(ClusterHealthRequest {
+                    crate::metrics::nested(Request::new(ClusterHealthRequest {
                     collection: String::new(),
-                }),
+                    })),
             ))
             .await;
         }
@@ -10488,7 +10556,9 @@ impl SearchService for CoordinatorServiceImpl {
         for task in tasks {
             match task.await {
                 Ok(target) => targets.push(target),
-                Err(e) => return Err(Status::internal(format!("health probe task failed: {e}"))),
+                    Err(e) => {
+                        return Err(Status::internal(format!("health probe task failed: {e}")))
+                    }
             }
         }
         // A reachable node that serves another collection is a
@@ -10559,15 +10629,25 @@ impl SearchService for CoordinatorServiceImpl {
             provider_mismatch,
             topology_generation: self.topology_generation,
         }))
+        })
+        .await
     }
 
     async fn broadcast_vector_backend(
         &self,
         request: Request<BroadcastVectorBackendRequest>,
     ) -> Result<Response<BroadcastVectorBackendResponse>, Status> {
+        crate::metrics::timed(
+            Route::BroadcastVectorBackend,
+            request,
+            |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::broadcast_vector_backend(&snapshot, request)).await;
+                    return Box::pin(SearchService::broadcast_vector_backend(
+                        &snapshot,
+                        crate::metrics::nested(request),
+                    ))
+                    .await;
         }
         let req = request.into_inner();
         if req.dim == 0 || req.config.is_none() {
@@ -10577,15 +10657,23 @@ impl SearchService for CoordinatorServiceImpl {
         }
         let results = self.fanout_vector_backend(&req).await;
         Ok(Response::new(BroadcastVectorBackendResponse { results }))
+            },
+        )
+        .await
     }
 
     async fn broadcast_calibration(
         &self,
         request: Request<BroadcastCalibrationRequest>,
     ) -> Result<Response<BroadcastCalibrationResponse>, Status> {
+        crate::metrics::timed(Route::BroadcastCalibration, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::broadcast_calibration(&snapshot, request)).await;
+                return Box::pin(SearchService::broadcast_calibration(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
         }
         let req = request.into_inner();
         if req.shift.len() != req.dim as usize || req.scale.len() != req.dim as usize {
@@ -10595,15 +10683,22 @@ impl SearchService for CoordinatorServiceImpl {
         }
         let results = self.fanout_calibration(&req).await;
         Ok(Response::new(BroadcastCalibrationResponse { results }))
+        })
+        .await
     }
 
     async fn variant_search(
         &self,
         request: Request<VariantSearchRequest>,
     ) -> Result<Response<VariantSearchResponse>, Status> {
+        crate::metrics::timed(Route::VariantSearch, request, |request| async move {
         self.admit(&request.get_ref().collection)?;
         if let Some(snapshot) = self.request_snapshot() {
-            return Box::pin(SearchService::variant_search(&snapshot, request)).await;
+                return Box::pin(SearchService::variant_search(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
         }
         let req = request.into_inner();
         if req.variants.len() < 2 {
@@ -10731,6 +10826,8 @@ impl SearchService for CoordinatorServiceImpl {
             diffs,
             interleaving,
         }))
+        })
+        .await
     }
 }
 
