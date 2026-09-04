@@ -23,6 +23,7 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastVectorBackendRequest,
+    HealthRequest,
     DocLineage, DocumentField, FlushRequest, GetDocumentsRequest,
 };
 use tokio::sync::mpsc;
@@ -395,7 +396,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config: backend.config,
         })
         .await;
+    let resume = std::env::args().any(|a| a == "--resume");
     for r in &results {
+        // A resumed shard's generation already carries its backend and
+        // refuses a second configuration by name; that refusal is the
+        // expected answer, not a failure.
+        if !r.ok && resume && r.error.contains("locked for the generation") {
+            eprintln!("vector backend already configured on {} (resuming)", r.node);
+            continue;
+        }
         assert!(r.ok, "vector backend rejected by {}: {}", r.node, r.error);
     }
     eprintln!("vector backend broadcast to {} shards OK", results.len());
@@ -606,6 +615,12 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
     // sidecar entirely. Used to build vector-leg experiment clusters
     // (shard-count ladders) straight from the embeddings file.
     let vectors_only = std::env::args().any(|a| a == "--vectors-only");
+    // `--resume`: continue a shard from the rows its node already holds
+    // (a driver that died, a node restarted mid-ingest; the WAL keeps
+    // the tail). The node reports documents and vectors; vectors the
+    // last block did not finish are sent first, then the blocks resume
+    // after the documents.
+    let resume = std::env::args().any(|a| a == "--resume");
     // Optional cluster_id -> case name map (--case-names=<tsv>): chunks
     // whose cluster is known carry a "case_name" DocumentField, the
     // second real scoreable field (docs/multi-field.md). Nodes must run
@@ -742,6 +757,13 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
         })
         .await;
     for r in &results {
+        // A resumed shard's generation already carries its backend and
+        // refuses a second configuration by name; that refusal is the
+        // expected answer, not a failure.
+        if !r.ok && resume && r.error.contains("locked for the generation") {
+            eprintln!("vector backend already configured on {} (resuming)", r.node);
+            continue;
+        }
         assert!(r.ok, "vector backend rejected by {}: {}", r.node, r.error);
     }
     eprintln!("vector backend broadcast to {} shards OK", results.len());
@@ -758,6 +780,58 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
 
         let n = end - start;
         let mut client = NodeServiceClient::connect(addr.clone()).await?;
+
+        // Rows this node already holds, when resuming.
+        let mut done = 0usize;
+        if resume && !vectors_only {
+            let health = client.health(HealthRequest {}).await?.into_inner();
+            let docs = health.bm25_docs as usize;
+            let vectors = health.num_vectors as usize;
+            if docs > n || vectors > docs {
+                return Err(format!(
+                    "shard {shard}: node holds {docs} documents and {vectors} vectors; \
+                     expected at most {n} documents and no more vectors than documents"
+                )
+                .into());
+            }
+            if vectors < docs {
+                // The last block's documents landed, its vectors did not.
+                let ep = embeddings_path.clone();
+                let from = start + vectors;
+                let count = docs - vectors;
+                let vf = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, String> {
+                    let mut emb =
+                        EmbBlock::open(&ep, from as u64, dim).map_err(|e| e.to_string())?;
+                    let mut values = Vec::with_capacity(count * dim);
+                    for _ in 0..count {
+                        values.extend(emb.next_vector().map_err(|e| e.to_string())?);
+                    }
+                    Ok(values)
+                });
+                let values = vf.await??;
+                let batches: Vec<AddVectorsRequest> = values
+                    .chunks(512 * dim)
+                    .map(|batch| AddVectorsRequest {
+                        vectors: batch.to_vec(),
+                        dim: dim as u32,
+                    })
+                    .collect();
+                let response = client
+                    .add_vectors(tokio_stream::iter(batches))
+                    .await?
+                    .into_inner();
+                if response.added as usize != count {
+                    return Err(format!(
+                        "shard {shard}: resume sent {count} vectors, node added {}",
+                        response.added
+                    )
+                    .into());
+                }
+                eprintln!("  shard {shard}: resume completed {count} vectors for rows {from}..");
+            }
+            done = docs;
+            eprintln!("  shard {shard}: resuming after {done}/{n} rows");
+        }
 
         if vectors_only {
             // Vectors for rows the shard already holds as documents (an
@@ -809,15 +883,17 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
             let body_columns2 = body_columns.clone();
             let cp = chunks_path.clone();
             let ep = embeddings_path.clone();
+            let first_row = start + done;
             let feeder = tokio::task::spawn_blocking(move || -> Result<(), String> {
                 use std::io::BufRead;
-                let mut emb = EmbBlock::open(&ep, start as u64, dim).map_err(|e| e.to_string())?;
+                let mut emb =
+                    EmbBlock::open(&ep, first_row as u64, dim).map_err(|e| e.to_string())?;
                 let file = std::fs::File::open(&cp).map_err(|e| e.to_string())?;
                 let mut sent = 0usize;
                 let mut docs: Vec<AddDocumentsRequest> = Vec::with_capacity(block_rows);
                 let mut vectors: Vec<f32> = Vec::with_capacity(block_rows * dim);
                 for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
-                    if i < start {
+                    if i < first_row {
                         line.map_err(|e| e.to_string())?;
                         continue;
                     }
@@ -881,14 +957,14 @@ async fn run_remote(nodes_arg: String) -> Result<(), Box<dyn std::error::Error>>
                     btx.blocking_send((docs, vectors))
                         .map_err(|e| e.to_string())?;
                 }
-                if sent != n {
-                    return Err(format!("shard {shard}: sent {sent} of {n} rows"));
+                if sent != n - done {
+                    return Err(format!("shard {shard}: sent {sent} of {} rows", n - done));
                 }
                 Ok(())
             });
-            let mut added_docs = 0usize;
-            let mut added_vectors = 0usize;
-            let mut next_report = 100_000usize;
+            let mut added_docs = done;
+            let mut added_vectors = done;
+            let mut next_report = (done / 100_000 + 1) * 100_000;
             while let Some((docs, vectors)) = brx.recv().await {
                 let rows = docs.len();
                 let response = client

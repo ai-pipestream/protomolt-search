@@ -126,7 +126,9 @@ pub struct OpenedSegmentSet {
     /// commits the shadow set it built earlier (`docs/mutations.md`),
     /// so publication order stays monotone on disk.
     epoch: std::sync::atomic::AtomicU64,
-    segments: Vec<OpenedSegment>,
+    /// Shared with the set this one was published from: a segment that
+    /// is already open and verified stays open across a publish.
+    segments: Vec<Arc<OpenedSegment>>,
 }
 
 impl std::fmt::Debug for OpenedSegmentSet {
@@ -196,11 +198,51 @@ impl OpenedSegmentSet {
         manifest: SegmentSetManifest,
         load: VectorLoad,
     ) -> Result<Self, String> {
+        Self::open_manifest_reusing(root, manifest, load, None)
+    }
+
+    /// Open `manifest`, taking every segment whose metadata is unchanged
+    /// from `reuse` as it is (open, verified, its images prepared) and
+    /// opening and verifying only the rest. A publish adds one segment
+    /// to a set of hundreds; hashing every artifact of every segment on
+    /// each publish made a long ingest quadratic in its seal count
+    /// (measured 2026-09-04: a Pi's rate fell from 1.2k to 340 rows/s
+    /// over 56 seals). A node open passes no `reuse` and verifies all.
+    fn open_manifest_reusing(
+        root: PathBuf,
+        manifest: SegmentSetManifest,
+        load: VectorLoad,
+        reuse: Option<&OpenedSegmentSet>,
+    ) -> Result<Self, String> {
         validate_manifest(&manifest)?;
         let mut segments = Vec::with_capacity(manifest.segments.len());
         let mut scoring_fingerprint: Option<&str> = None;
         let mut analysis_fingerprints: Option<&[u64]> = None;
         for metadata in &manifest.segments {
+            if let Some(held) = reuse.and_then(|set| {
+                set.segments
+                    .iter()
+                    .find(|segment| segment.metadata == *metadata)
+            }) {
+                if held.vector.is_some() {
+                    match scoring_fingerprint {
+                        Some(known) if known != metadata.scoring_fingerprint => {
+                            return Err("segment set mixes vector scoring fingerprints".into())
+                        }
+                        None => scoring_fingerprint = Some(&metadata.scoring_fingerprint),
+                        _ => {}
+                    }
+                }
+                match analysis_fingerprints {
+                    Some(known) if known != metadata.analysis_fingerprints => {
+                        return Err("segment set mixes analysis fingerprints".into())
+                    }
+                    None => analysis_fingerprints = Some(&metadata.analysis_fingerprints),
+                    _ => {}
+                }
+                segments.push(Arc::clone(held));
+                continue;
+            }
             let directory = root.join("segments").join(&metadata.segment_id);
             let has_vectors = !metadata.vector.file.is_empty();
             if has_vectors {
@@ -315,12 +357,12 @@ impl OpenedSegmentSet {
                 None => analysis_fingerprints = Some(&metadata.analysis_fingerprints),
                 _ => {}
             }
-            segments.push(OpenedSegment {
+            segments.push(Arc::new(OpenedSegment {
                 metadata: metadata.clone(),
                 vector,
                 bm25,
                 live_docs,
-            });
+            }));
         }
         Ok(Self {
             root,
@@ -328,6 +370,12 @@ impl OpenedSegmentSet {
             manifest,
             segments,
         })
+    }
+
+    /// Whether segment `i` is the same opened segment as `other`'s
+    /// segment `j` (shared across a publish), for tests.
+    pub fn shares_segment(&self, i: usize, other: &OpenedSegmentSet, j: usize) -> bool {
+        Arc::ptr_eq(&self.segments[i], &other.segments[j])
     }
 
     /// The manifest this set was opened from. Its `epoch` is the epoch at
@@ -901,10 +949,12 @@ impl SegmentCatalog {
     }
 
     fn publish(&self, manifest: SegmentSetManifest) -> Result<Arc<OpenedSegmentSet>, String> {
-        let opened = Arc::new(OpenedSegmentSet::open_manifest(
+        let current = self.snapshot();
+        let opened = Arc::new(OpenedSegmentSet::open_manifest_reusing(
             self.root.clone(),
             manifest.clone(),
             self.load,
+            Some(&current),
         )?);
         write_json_atomic(&self.root.join(SET_FILE), &manifest)?;
         *self
@@ -1372,10 +1422,14 @@ mod tests {
         );
         let catalog = SegmentCatalog::open(a.root.join("catalog")).unwrap();
         let old = catalog.snapshot();
-        catalog.append(source(&a, "s0", 0)).unwrap();
+        let after_first = catalog.append(source(&a, "s0", 0)).unwrap();
         let current = catalog.append(source(&b, "s1", 2)).unwrap();
         assert!(old.manifest().segments.is_empty());
         assert_eq!(current.manifest().epoch, 2);
+        assert!(
+            current.shares_segment(0, &after_first, 0),
+            "a publish keeps the segments it already had open"
+        );
         let vector = current
             .search_vector(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 3)
             .unwrap();

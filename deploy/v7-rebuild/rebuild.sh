@@ -267,6 +267,10 @@ SEAL_TAIL_DOCS=${SEAL_TAIL_DOCS:-}
 # Rows per driver block: a block's documents, then the same rows' vectors
 # (the driver's default is 8192; see README "Running it").
 INGEST_BLOCK=${INGEST_BLOCK:-}
+# INGEST_RESUME=1 passes --resume: each driver asks its node how many
+# rows it holds and continues from there (a driver that died, a node
+# restarted mid-ingest).
+INGEST_RESUME=${INGEST_RESUME:-}
 # The sidecar is started and probed here only when it lives on this host.
 is_local() { local x; for x in "${LOCAL[@]}"; do [[ $x == "$1" ]] && return 0; done; return 1; }
 sidecar_is_local() { [[ $SIDECAR_ADDR == http://127.0.0.1:* || $SIDECAR_ADDR == http://localhost:* ]]; }
@@ -362,8 +366,10 @@ start_node() {
       >>"$LOGS/node-$i.log" 2>&1 &
     local pid=$!
     echo "$pid" >"$RUN/node-$i.pid"
+    # A node with a catalog verifies every sealed artifact before it
+    # listens: about 5 minutes for 60 segments on a Pi (2026-09-04).
     local waited
-    for waited in $(seq 1 120); do
+    for waited in $(seq 1 "${NODE_OPEN_WAIT:-900}"); do
       port_open "$port" && return 0
       kill -0 "$pid" 2>/dev/null || break
       sleep 1
@@ -479,6 +485,7 @@ stage_ingest() {
         --first-shard="$i" --end-shard="$((i + 1))" \
         --analysis-addr="$SIDECAR_ADDR" \
         ${INGEST_BLOCK:+--ingest-block="$INGEST_BLOCK"} \
+        ${INGEST_RESUME:+--resume} \
         "${TLS_ARG_LIST[@]}" \
         >>"$LOGS/ingest-$i.log" 2>&1 &
       pids+=($!)

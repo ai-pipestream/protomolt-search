@@ -280,6 +280,7 @@ fleet:
 | `EMB_BYTES` | the embeddings file's length, for hosts that do not hold the file; the cut plan needs only the length |
 | `SEAL_TAIL_DOCS` | documents per sealed segment (node default 500,000); lower it on a small host to bound ingest memory |
 | `INGEST_BLOCK` | rows per driver block (documents, then their vectors; driver default 8192) |
+| `INGEST_RESUME` | `1` passes `--resume`: a driver continues from the rows its node reports (documents and vectors), finishing a half-sent block's vectors first |
 | `MALLOC_ARENA_MAX` | glibc arenas per node (default 2 here): with the library default a node's resident set grows by a tail per seal |
 
 A four-machine example (the plan in `sea-of-slop-search-parity/design-notes/
