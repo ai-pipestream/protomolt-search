@@ -173,20 +173,31 @@ the old generation and losing a tail.
 
 Classic WAL truncation does not apply — the log is full history, kept
 for replay. "Compaction" means collapsing history into a fresh base
-image:
+image AND a fresh full-history log:
 
-- **One-child reshard = compaction.** Run the reshard tool with `--split=1`.
-  WAL replay applies delete and replacement records, writes a dense all-live
-  provider/BM25/FP32 generation, and drops the overlay. Install that image with
-  `InstallSnapshot` for the crash-safe atomic generation swap, then archive the
-  parent generation.
-- A legacy explicitly addressed generation still needs a write stop because it
-  has no stable product keys. A fully clocked routed generation can use the live
-  catch-up and cutover path, including for a one-child compaction.
-- **Natural triggers:** after a bulk-load phase completes, after any
-  `InstallSnapshot` (rotation already happens; retiring the old
-  generation is the compaction), after a reshard retires its parent,
-  and when the live-row overlay crosses an operator-selected threshold.
+- **Online, per shard: `NodeService.CompactShard`** (`docs/mutations.md`).
+  The node fixes a clock cutoff, replays the log through it into a dense
+  all-live generation (one image, or one sealed segment per WAL bucket),
+  writes the rewritten WAL generation from the same replay, tails the live
+  log into the new generation through the ingest apply functions, and cuts
+  over under a write lock that holds for the last `tail_bound` records.
+  Writes and reads continue throughout. The superseded generation stays on
+  disk as history.
+- **Offline, one-child reshard.** `reshard --split=1` over a generation
+  applies its delete and replacement records and writes a dense
+  provider/BM25/FP32 image; install it with `InstallSnapshot`. That rotation
+  records the image as `preexisting_*`, so the result is not
+  log-reshardable and cannot be compacted again from its log; it is the
+  bulk-load shape, not the maintenance one.
+- The rewritten generation is what keeps the shard reshardable: `reshard`
+  over it rebuilds the compacted shard (pinned in `tests/compaction.rs`), so
+  a compacted shard can be split, merged, compacted again, or tailed by a
+  replica from its new generation. A replica compacts on its own; its
+  primary's ids do not map onto a compacted replica, so a pair re-baselines
+  after either side compacts.
+- **Natural triggers:** when the live-row overlay crosses an operator-selected
+  threshold (the control plane's `--control-compact-tombstone-ppm`), after a
+  bulk-load phase completes, and after a reshard retires its parent.
 - Bucket files keep compaction units small and independent.
 
 ## Cost
@@ -311,6 +322,7 @@ Deliberately deferred:
   the BM25 store by document, and applying its log; today such shards are refused
   rather than mis-resharded.
 
-- **Delete/replacement migration during live split** — the product is
-  append-only today. Catch-up refuses these records instead of inventing an
-  unverified cross-generation tombstone mapping.
+- **Delete/replacement migration during live split** — child catch-up
+  refuses these records instead of inventing an unverified cross-generation
+  tombstone mapping. Node-local compaction maps them through the replay's
+  id map (`docs/mutations.md`); the N-way split does not yet.

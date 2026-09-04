@@ -66,7 +66,8 @@ The node's whole-shard live bitmap and exact-vector sidecar remain the
 serving copies; each sealed segment carries its own slice of both for
 compaction, split, and merge. Deletes after sealing go to the node bitmap
 and the WAL, and compaction replays the WAL, so a segment's own bitmap is its
-state at seal time by design.
+state at seal time by design. `CompactShard` reclaims them online
+(`docs/mutations.md`).
 
 `tests/segment_layout.rs` pins: a fresh shard writes a catalog and no single
 image; two sealed segments plus a tail answer every probe (df, live bitmap
@@ -116,29 +117,51 @@ segment set never merges scores derived from local df or local average length.
 
 `SegmentCatalog::append` copies artifacts to a temporary directory, hashes and
 opens them, fsyncs them, renames the segment, writes the new set manifest
-atomically, and only then swaps the live snapshot.
+atomically, and only then swaps the live snapshot. A sealed segment is named
+by its generation, the set's published epoch plus one (`seg-<generation>`):
+monotone across seals and across a compaction cutover, which renumbers the
+catalog and would otherwise let a fresh `seg-<count>` collide with a replaced
+directory the closing flush has not retired yet.
 
 `replace_many_for_compaction` accepts one or more dense outputs. Their shared
 generation must be newer than every input and their combined row count must
 equal the inputs' live row count. This permits a large compaction to remain a
 set of bounded physical segments rather than rebuilding one large heap image.
 
-`compact_wal_generations` is the blocking worker entry point. It:
+`compact_wal_generations` is the blocking, quiescent worker entry point: it
+replays one WAL hash bucket at a time, applies deletes and replacements from
+the complete WAL, seals each partition as an all-live provider/BM25/FP32
+segment, and publishes all outputs with one manifest swap. Its live-row
+equality check assumes no writes land between the replay and the publish.
 
-1. replays one WAL hash bucket at a time;
-2. applies deletes and replacements from the complete WAL;
-3. seals each partition as an all-live provider/BM25/FP32 segment;
-4. publishes all outputs with one manifest swap.
+The online path is `NodeService.CompactShard` (`docs/mutations.md`): the same
+bucket-bounded build (`reshard::compact_log`), but the outputs are staged
+under the catalog root without a manifest (`stage_segments`,
+`SegmentCatalog::open_staged`), a shadow shard over them with a fresh heap
+tail tails the live log, and the cutover commits the staged set as the
+catalog's manifest at an epoch past the live set's (`commit_current`) — the
+tail-applied rows become the new shard's tail. The row accounting is explicit
+rather than the quiescent check: the dense outputs hold the cutoff's live
+rows, and the tail holds what the log added after it. The closing flush seals
+that tail into one small segment and rewrites the whole-shard FP32 sidecar
+and live bitmap dense; it also removes the commit marker and the replaced
+segment directories. A marker found at open rolls the catalog back to the
+manifest the cutover copied aside.
 
 The node logs one vector or document row per routed WAL record. Replay rejects
 a foreign record whose rows straddle buckets, so additions, replacements, and
 deletions for an id remain in the same bounded replay unit. WAL bucket count is
 the memory-control knob: more buckets create smaller physical segments without
-changing query semantics.
+changing query semantics. A compaction pins the shard's per-field analyzer
+fingerprints on every output segment, so a bucket whose rows never carry an
+optional field still records the field's identity and the outputs open as one
+set.
 
-Old segment directories are not deleted during publication. Reclaim them only
-after old snapshots have drained and the accepted generation has passed its
-soak and backup policy.
+Old segment directories are not deleted by `append` or
+`replace_many_for_compaction`; reclaim them only after old snapshots have
+drained and the accepted generation has passed its soak and backup policy.
+`CompactShard` retires the directories it replaced in its closing flush,
+since its rollback protocol covers the window before it.
 
 ## Control-plane execution
 

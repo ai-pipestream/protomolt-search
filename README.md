@@ -985,10 +985,12 @@ Two operational rules follow from the design:
 - **A shard without a WAL can serve but can never be split or merged —
   only rebuilt from source.** The log IS the resharding input; keep it
   on for any shard you may ever want to reshape.
-- **Live compaction is a self-snapshot.** To bound log growth, push the
-  shard's own flushed image back through InstallSnapshot: the install
-  supersedes the log and rotates to a fresh generation directory, so old
-  `gen-*` directories can be archived once the swap is confirmed.
+- **Compaction is online and keeps full history.** `CompactShard` rebuilds
+  a shard dense from its log while writes continue, tails the log into the
+  rebuild, cuts over under a brief write lock, and rotates to a rewritten
+  full-history generation, so the shard stays reshardable; the superseded
+  `gen-*` directory can be archived once the closing flush is confirmed
+  ([docs/mutations.md](docs/mutations.md)).
 
 Covered by `tests/reshard.rs`: split 1→2 reconstructs the parent's top-k
 bitwise (union of child top-k, ids remapped), a split with
@@ -1235,6 +1237,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   URL with `Range` resume, or a peer's `StreamSnapshot`, verifies every
   artifact, and runs the same install; both layouts, one code path.
   Details: [Snapshot repositories](docs/snapshots.md).
+- **Landed 2026-09-04: online compaction.** `NodeService.CompactShard`
+  reclaims tombstones on both layouts while writes continue: a clock-cut
+  replay builds the dense image and a rewritten full-history WAL generation,
+  a shadow shard tails the live log through the ingest apply functions, and
+  the cutover holds the write lock for the last `tail_bound` records
+  (13–39 ms on the fixture). Commit marker with rollback at open; ingest
+  responses report `wal_generation` and id-addressed mutations may claim it.
+  Details: [Deletes, replacements, and compaction](docs/mutations.md).
 - **Landed 2026-09-03: mmap vector index.** Sealed segment images use the
   `turbovec-pipestream-s20` mapped reader, linear large-k chunk merge, and
   bounded blocked-layout cache;
