@@ -3185,6 +3185,13 @@ pub struct NodeServiceImpl {
     /// shard — every doc logged, none attributable — so the second stream
     /// is refused outright rather than merged.
     ingest_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// A fence on ingest (`docs/cluster-control.md`, "Shard split"): set
+    /// by the node agent when the shard's rows are moving to its split
+    /// children, so no append can land between the children's final
+    /// catch-up and the topology cutover. The reason names the
+    /// children; a fenced shard refuses every ingest stream by name and
+    /// keeps serving queries.
+    ingest_fence: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) config: NodeConfig,
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
@@ -3722,6 +3729,7 @@ impl NodeServiceImpl {
                 pending_compaction: None,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ingest_fence: Arc::new(std::sync::Mutex::new(None)),
             seal_lock: Arc::new(std::sync::Mutex::new(())),
             compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -3940,9 +3948,25 @@ impl NodeServiceImpl {
         }
     }
 
+    /// Fence ingest on this shard: every later ingest stream is refused
+    /// naming `reason`; queries are unaffected. Idempotent.
+    pub fn fence_ingest(&self, reason: String) {
+        *self.ingest_fence.lock().expect("ingest fence lock") = Some(reason);
+    }
+
+    /// The fence reason, when the shard is fenced.
+    pub fn ingest_fence(&self) -> Option<String> {
+        self.ingest_fence.lock().expect("ingest fence lock").clone()
+    }
+
     /// Claim the single-writer ingest gate, or refuse the stream.
     fn claim_ingest(&self) -> Result<IngestGuard, Status> {
         use std::sync::atomic::Ordering;
+        if let Some(reason) = self.ingest_fence() {
+            return Err(Status::failed_precondition(format!(
+                "ingest is fenced on this shard: {reason}"
+            )));
+        }
         if self
             .ingest_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
