@@ -31,6 +31,29 @@
 #   VOCAB / VOCAB_WINDOW_DOCS / VOCAB_TOP_K (vocabulary harvesting, off
 #   unless VOCAB=1; see docs/VOCABULARY-INDEX.md)
 #
+# Multi-host fleets (docs: sea-of-slop design-notes/fleet-4-machine-plan):
+# the cut plan is global, so every host runs THIS script with the same
+# SHARDS/EMB/BLOCK and only starts its own shards. One host per shard:
+#
+#   LOCAL_SHARDS   space-separated shard indexes this host starts, serves,
+#                  and stops (default: all of them, the single-box case)
+#   NODE_LIST      the fleet-wide comma-separated node address list, in
+#                  shard order, when the nodes are not all on this box
+#   LISTEN_HOST    the address the local nodes bind (default 127.0.0.1);
+#                  off-loopback listeners get --allow-plaintext unless
+#                  TLS_ARGS carries the certificate flags
+#   TLS_ARGS       extra flags for every node and the coordinator
+#                  (e.g. --tls-cert=... --tls-key=... --tls-client-ca=...)
+#   SIDECAR_ADDR   the analysis sidecar URL every node, driver, and
+#                  coordinator uses (default http://127.0.0.1:$SIDECAR_PORT);
+#                  the sidecar is only started here when it is local
+#   RUN_COORD      1 (default) to start the coordinator in `serve`; 0 on
+#                  hosts that only serve shards
+#   COORD_HOST     the coordinator's bind address (default 127.0.0.1)
+#   INGEST_SHARDS  shard indexes the ingest stage drives from this host
+#                  (default: all; the drivers only need the nodes and the
+#                  sidecar reachable, so one host can drive the fleet)
+#
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -97,6 +120,14 @@ NICE_PREFIX=()
 
 RUN="$OUT/run"
 LOGS="$OUT/logs"
+
+LISTEN_HOST=${LISTEN_HOST:-127.0.0.1}
+COORD_HOST=${COORD_HOST:-127.0.0.1}
+RUN_COORD=${RUN_COORD:-1}
+TLS_ARGS=${TLS_ARGS:-}
+# Read as an array once; a word-split of the same string later would
+# re-split on every use.
+read -r -a TLS_ARG_LIST <<<"$TLS_ARGS"
 
 die() { echo "rebuild: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -192,10 +223,44 @@ peak_gb() {
     WAVE * $(shard_flushing_bytes) / 1000000000))
 }
 
-NODE_LIST=""
-for ((i = 0; i < SHARDS; i++)); do
-  NODE_LIST="${NODE_LIST:+$NODE_LIST,}127.0.0.1:$((PORT_BASE + i))"
+if [[ -z ${NODE_LIST:-} ]]; then
+  NODE_LIST=""
+  for ((i = 0; i < SHARDS; i++)); do
+    NODE_LIST="${NODE_LIST:+$NODE_LIST,}127.0.0.1:$((PORT_BASE + i))"
+  done
+fi
+IFS=',' read -r -a NODE_ADDRS <<<"$NODE_LIST"
+((${#NODE_ADDRS[@]} == SHARDS)) ||
+  die "NODE_LIST names ${#NODE_ADDRS[@]} nodes but SHARDS=$SHARDS"
+
+# The shards THIS host owns. Default: every shard (one box). A fleet host
+# lists its own; the port of shard i is always PORT_BASE + i so a host
+# owning shards 5 and 7 listens on PORT_BASE+5 and PORT_BASE+7.
+if [[ -n ${LOCAL_SHARDS:-} ]]; then
+  read -r -a LOCAL <<<"$LOCAL_SHARDS"
+else
+  LOCAL=()
+  for ((i = 0; i < SHARDS; i++)); do LOCAL+=("$i"); done
+fi
+for i in "${LOCAL[@]}"; do
+  ((i >= 0 && i < SHARDS)) || die "LOCAL_SHARDS names shard $i outside 0..$((SHARDS - 1))"
 done
+if [[ -n ${INGEST_SHARDS:-} ]]; then
+  read -r -a INGEST_LIST <<<"$INGEST_SHARDS"
+else
+  INGEST_LIST=()
+  for ((i = 0; i < SHARDS; i++)); do INGEST_LIST+=("$i"); done
+fi
+
+SIDECAR_ADDR=${SIDECAR_ADDR:-http://127.0.0.1:$SIDECAR_PORT}
+# The sidecar is started and probed here only when it lives on this host.
+sidecar_is_local() { [[ $SIDECAR_ADDR == http://127.0.0.1:* || $SIDECAR_ADDR == http://localhost:* ]]; }
+# Off-loopback plaintext must be asked for by name (docs/security.md);
+# TLS flags in TLS_ARGS replace it.
+PLAINTEXT_ARGS=()
+if [[ $LISTEN_HOST != 127.0.0.1 && $LISTEN_HOST != localhost && $TLS_ARGS != *--tls-cert* ]]; then
+  PLAINTEXT_ARGS=(--allow-plaintext)
+fi
 
 # --- stages -----------------------------------------------------------
 
@@ -240,11 +305,11 @@ stage_up() {
       die "$OUT already holds ${#existing[@]} shard indexes; this stage builds FRESH shards (FORCE=1 to override)"
   fi
   sidecar_up
-  for ((i = 0; i < SHARDS; i++)); do
+  for i in "${LOCAL[@]}"; do
     [[ -f $RUN/node-$i.pid ]] && kill -0 "$(cat "$RUN/node-$i.pid")" 2>/dev/null &&
       die "node $i already running (pid $(cat "$RUN/node-$i.pid"))"
     start_node "$i"
-    say "node $i on :$((PORT_BASE + i)), offset ${OFFSETS[i]}, ${ROWS[i]} rows expected"
+    say "node $i on $LISTEN_HOST:$((PORT_BASE + i)), offset ${OFFSETS[i]}, ${ROWS[i]} rows expected"
   done
 }
 
@@ -260,14 +325,15 @@ start_node() {
   local i=$1 port=$((PORT_BASE + i)) attempt
   for attempt in 1 2 3 4 5; do
     "${NICE_PREFIX[@]}" "$BIN" --role=node \
-      --node-listen="127.0.0.1:$port" \
+      --node-listen="$LISTEN_HOST:$port" \
       --index="$OUT/shard-$i.tv" \
       --slot-offset="${OFFSETS[i]}" \
       --chunk-blocks="$CHUNK_BLOCKS" \
       --dim="$DIM" --bit-width=4 \
       --bm25-fields="$FIELDS" \
       --stream-search \
-      --analysis-addr="http://127.0.0.1:$SIDECAR_PORT" \
+      --analysis-addr="$SIDECAR_ADDR" \
+      "${PLAINTEXT_ARGS[@]}" "${TLS_ARG_LIST[@]}" \
       ${VOCAB:+--vocab=true} \
       ${VOCAB_WINDOW_DOCS:+--vocab-window-docs="$VOCAB_WINDOW_DOCS"} \
       ${VOCAB_TOP_K:+--vocab-top-k="$VOCAB_TOP_K"} \
@@ -298,10 +364,17 @@ stage_sidecar() { sidecar_up; }
 # embed serves a whole rebuild without complaint and then fails the first
 # hybrid query.
 sidecar_can_embed() {
-  "$PROBE" --addr="http://127.0.0.1:$SIDECAR_PORT" --text=probe --embed >/dev/null 2>&1
+  "$PROBE" --addr="$SIDECAR_ADDR" --text=probe --embed >/dev/null 2>&1
 }
 
 sidecar_up() {
+  if ! sidecar_is_local; then
+    if [[ -x $PROBE ]] && ! sidecar_can_embed; then
+      die "remote analysis sidecar at $SIDECAR_ADDR does not answer an embed probe"
+    fi
+    say "using the remote analysis sidecar at $SIDECAR_ADDR"
+    return
+  fi
   if port_open "$SIDECAR_PORT"; then
     if [[ ! -x $PROBE ]]; then
       say "analysis sidecar already listening on :$SIDECAR_PORT (no probe binary to check it with)"
@@ -343,7 +416,8 @@ stage_calibrate() {
   fi
   say "fitting the seed calibration (streams $EMB once)"
   "$INGEST" --nodes="$NODE_LIST" --embeddings="$EMB" --chunks="$CHUNKS" \
-    --chunk-count="$M" --calibration="$OUT/calibration.json" --fit-only 2>&1 |
+    --chunk-count="$M" --calibration="$OUT/calibration.json" --fit-only \
+    "${TLS_ARG_LIST[@]}" 2>&1 |
     tee -a "$LOGS/calibrate.log"
 }
 
@@ -352,10 +426,10 @@ stage_ingest() {
   [[ -f $OUT/calibration.json ]] || die "run the calibrate stage first"
   [[ -f $CASE_NAMES ]] || die "no case-name table at $CASE_NAMES"
   say "projected peak $(peak_gb) GB with WAVE=$WAVE, $(free_gb) GB free"
-  local first
-  for ((first = 0; first < SHARDS; first += WAVE)); do
+  local first n=${#INGEST_LIST[@]}
+  for ((first = 0; first < n; first += WAVE)); do
     local last=$((first + WAVE - 1))
-    ((last >= SHARDS)) && last=$((SHARDS - 1))
+    ((last >= n)) && last=$((n - 1))
     # A wave adds the building shards' spill on top of whatever is
     # already on disk. Refuse to start one that cannot finish rather
     # than discovering it hours in with a full filesystem.
@@ -364,8 +438,9 @@ stage_ingest() {
     ((have > need + DISK_MARGIN_GB)) ||
       die "wave $first..$last needs ~$need GB (+$DISK_MARGIN_GB margin) but only $have GB is free"
     say "wave: shards $first..$last (~$need GB of spill, $have GB free)"
-    local pids=()
-    for ((i = first; i <= last; i++)); do
+    local pids=() j
+    for ((j = first; j <= last; j++)); do
+      i=${INGEST_LIST[j]}
       "$INGEST" --nodes="$NODE_LIST" \
         --chunks="$CHUNKS" --embeddings="$EMB" \
         --case-names="$CASE_NAMES" \
@@ -374,7 +449,8 @@ stage_ingest() {
         --split-points="$SPLITS" \
         --calibration="$OUT/calibration.json" \
         --first-shard="$i" --end-shard="$((i + 1))" \
-        --analysis-addr="http://127.0.0.1:$SIDECAR_PORT" \
+        --analysis-addr="$SIDECAR_ADDR" \
+        "${TLS_ARG_LIST[@]}" \
         >>"$LOGS/ingest-$i.log" 2>&1 &
       pids+=($!)
       echo $! >"$RUN/ingest-$i.pid"
@@ -391,7 +467,7 @@ stage_ingest() {
 
 stage_down() {
   local pids=() pid
-  for ((i = 0; i < SHARDS; i++)); do
+  for i in "${LOCAL[@]}"; do
     [[ -f $RUN/node-$i.pid ]] || continue
     pid=$(cat "$RUN/node-$i.pid")
     if kill -0 "$pid" 2>/dev/null; then
@@ -418,27 +494,35 @@ stage_serve() {
   # discovering it from a ranking. (The binary refuses an interrupted
   # build too; this also catches a .bm25 that was never started.)
   local missing=()
-  for ((i = 0; i < SHARDS; i++)); do
+  for i in "${LOCAL[@]}"; do
     [[ -f $OUT/shard-$i.tv ]] || missing+=("shard-$i.tv")
     [[ -f $OUT/shard-$i.tv.bm25 ]] || missing+=("shard-$i.tv.bm25")
     [[ -d $OUT/shard-$i.tv.bm25.build ]] && missing+=("shard-$i: build unfinished")
   done
   ((${#missing[@]} == 0)) || die "not ready to serve: ${missing[*]}"
   sidecar_up
-  for ((i = 0; i < SHARDS; i++)); do
+  for i in "${LOCAL[@]}"; do
     start_node "$i"
   done
-  say "serving $SHARDS shards on $NODE_LIST (mmaps page in on first query)"
+  say "serving shards ${LOCAL[*]} of $NODE_LIST (mmaps page in on first query)"
+  if [[ $RUN_COORD != 1 ]]; then
+    say "RUN_COORD=$RUN_COORD: no coordinator on this host; the fleet-wide readiness wait belongs to the coordinator host"
+    return
+  fi
+  local coord_plain=()
+  [[ $COORD_HOST != 127.0.0.1 && $COORD_HOST != localhost && $TLS_ARGS != *--tls-cert* ]] &&
+    coord_plain=(--allow-plaintext)
   "${NICE_PREFIX[@]}" "$BIN" --role=coordinator \
-    --coord-listen="127.0.0.1:$COORD_PORT" \
+    --coord-listen="$COORD_HOST:$COORD_PORT" \
     --nodes="$NODE_LIST" \
     --chunk-blocks="$CHUNK_BLOCKS" \
     --stream-search \
-    --analysis-addr="http://127.0.0.1:$SIDECAR_PORT" \
+    --analysis-addr="$SIDECAR_ADDR" \
+    "${coord_plain[@]}" "${TLS_ARG_LIST[@]}" \
     >>"$LOGS/coordinator.log" 2>&1 &
   echo $! >"$RUN/coordinator.pid"
   wait_port "$COORD_PORT" coordinator
-  say "coordinator on :$COORD_PORT"
+  say "coordinator on $COORD_HOST:$COORD_PORT"
   # An open port is not readiness: a node binds before it opens its
   # .bm25, and opening 50 GB of postings reads every document length.
   # Report when the fleet can actually answer, so the next stage does not
@@ -447,7 +531,7 @@ stage_serve() {
   local waited
   for waited in $(seq 1 300); do
     "$VERIFY" --coord="127.0.0.1:$COORD_PORT" --shards="$SHARDS" \
-      --ready-only --wait-ready=2 >/dev/null 2>&1 && break
+      --ready-only --wait-ready=2 "${TLS_ARG_LIST[@]}" >/dev/null 2>&1 && break
     sleep 2
   done
   say "fleet ready on :$COORD_PORT"
@@ -472,14 +556,14 @@ stage_verify() {
   local bin=${BM25_VERIFY:-$REPO/target/release/examples/bm25_verify}
   [[ -x $bin ]] || die "no bm25_verify at $bin (cargo build --release --examples)"
   local files=()
-  for ((i = 0; i < SHARDS; i++)); do
+  for i in "${LOCAL[@]}"; do
     [[ -f $OUT/shard-$i.tv.bm25 ]] || die "missing $OUT/shard-$i.tv.bm25"
     files+=("$OUT/shard-$i.tv.bm25")
   done
   local rc=0
   "$bin" "${files[@]}" || rc=$?
   case $rc in
-    0) say "all $SHARDS bm25 shards verified" ;;
+    0) say "bm25 shards ${LOCAL[*]} verified" ;;
     2) say "shards predate v8: nothing to verify until the next rebuild" ;;
     *) die "bm25 integrity verification FAILED" ;;
   esac

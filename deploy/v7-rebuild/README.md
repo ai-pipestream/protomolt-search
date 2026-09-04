@@ -252,3 +252,49 @@ The previous shard set is on the NAS at
 deletion), and the inputs are at `/mnt/nas-corpus/turbovec/corpus/`.
 Restoring the old set means restoring the old binary too — the current
 engine cannot read v6 `.tv` files.
+
+## Running it across several hosts
+
+The cut plan is a function of the input files, so each host runs this
+same script with the same `SHARDS`, `EMB`, and `BLOCK`, and starts only
+the shards assigned to it. The variables that make one script serve a
+fleet:
+
+| Variable | Meaning |
+|---|---|
+| `LOCAL_SHARDS` | space-separated shard indexes this host starts, serves, verifies, and shuts down |
+| `NODE_LIST` | the whole node address list, comma-separated, in shard order; shard `i` listens on `PORT_BASE + i` wherever it runs |
+| `LISTEN_HOST` | the address the local nodes bind; anything off loopback gets `--allow-plaintext` unless `TLS_ARGS` names a certificate |
+| `TLS_ARGS` | extra flags for each node, driver, and the coordinator (`--tls-cert=... --tls-key=... --tls-client-ca=...`) |
+| `SIDECAR_ADDR` | the analysis sidecar URL; the sidecar starts here only when the URL is loopback |
+| `RUN_COORD` / `COORD_HOST` | whether this host starts the coordinator in `serve`, and where it binds |
+| `INGEST_SHARDS` | the shards the ingest stage feeds from this host (a driver needs only the nodes and the sidecar reachable) |
+
+A four-machine example (the plan in `sea-of-slop-search-parity/design-notes/
+fleet-4-machine-plan-2026-09.md`), with the sidecar, the coordinator, and
+the drivers on `krick-1`, ports below the ephemeral range so no host needs
+a `sysctl`:
+
+```bash
+# on each host
+export SHARDS=8 PORT_BASE=19300 COORD_PORT=19291 SIDECAR_PORT=19202
+export NODE_LIST=192.168.1.195:19300,192.168.1.195:19301,192.168.1.195:19302,192.168.1.195:19303,192.168.1.195:19304,192.168.1.234:19305,192.168.1.236:19306,192.168.1.216:19307
+export SIDECAR_ADDR=http://192.168.1.195:19202 LISTEN_HOST=0.0.0.0
+export OUT=$HOME/protomolt-search/shards BIN=$HOME/protomolt-search/bin/pipestream-search
+
+# krick-1: shards 0-4, the sidecar, the drivers, the coordinator
+LOCAL_SHARDS="0 1 2 3 4" EMB=/nas/corpus_data/corpus/embeddings-full.bin \
+  CHUNKS=/nas/corpus_data/corpus/chunks-full.ndjson COORD_HOST=0.0.0.0 \
+  ./rebuild.sh plan up calibrate ingest
+# pi5v2, pi5v3, pi5v1: one shard each, no sidecar, no coordinator
+LOCAL_SHARDS="5" RUN_COORD=0 ./rebuild.sh plan up       # pi5v2
+LOCAL_SHARDS="6" RUN_COORD=0 ./rebuild.sh plan up       # pi5v3
+LOCAL_SHARDS="7" RUN_COORD=0 ./rebuild.sh plan up       # pi5v1 (the tail shard)
+```
+
+Each node must be up before `calibrate` and `ingest` run on the driver
+host; the `down` and `serve` stages run per host. The disk gate in
+`ingest` is exact only for shards on the driver host; the other hosts'
+`plan` output is their gate. A node writes shard files under the host's
+assigned offsets, so files need not move between hosts after a build; to
+rebalance later, use the reshard tool rather than a copy.
