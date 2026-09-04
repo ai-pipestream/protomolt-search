@@ -2533,6 +2533,42 @@ impl CoordinatorServiceImpl {
         Ok(outcome)
     }
 
+    /// `DENSE_EXECUTION_MODE_AUTO` with FP32 rerank, no policy, and no
+    /// `selection_k`: resolve through the installed profile's default
+    /// target exactly as an explicit `DenseQualityPolicy` naming it would
+    /// (`docs/dense-quality-profile.md`). No profile, or a profile without
+    /// a default, refuses by name rather than running at `selection_k = k`.
+    pub(crate) async fn resolve_dense_quality_default(
+        &self,
+        k: u32,
+        query_dim: usize,
+    ) -> Result<crate::quality::DenseQualityResolution, Status> {
+        const NEEDS: &str = "AUTO with FP32 rerank needs a measured quality profile with \
+                             default_target_recall_ppm, or an explicit DenseQualityPolicy or \
+                             selection_k";
+        let profile = self.dense_quality_profile.as_ref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "{NEEDS}; this coordinator has no --dense-quality-profile"
+            ))
+        })?;
+        let target = profile.default_target_recall_ppm().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "{NEEDS}; profile {:?} carries no default_target_recall_ppm",
+                profile.profile_id()
+            ))
+        })?;
+        self.resolve_dense_quality(
+            k,
+            query_dim,
+            &crate::pb::DenseQualityPolicy {
+                target_recall_ppm: target,
+                max_candidates: 0,
+                required_profile_fingerprint: String::new(),
+            },
+        )
+        .await
+    }
+
     /// Resolve and prove one measured dense quality request against the live
     /// provider and product exact-row generation. Drift is a hard failure.
     pub(crate) async fn resolve_dense_quality(

@@ -953,6 +953,26 @@ pub async fn execute(
     // alone, and the scorer refuses a browse — the two existing
     // refusals partition every request naming both.
 
+    // AUTO + FP32 rerank with neither a policy nor a selection_k names no
+    // depth; running at selection_k = k would silently serve the raw
+    // quantized top-k (0.544 recall@10 on the challenge fixture). AUTO on
+    // an exhaustive provider therefore resolves the depth through the
+    // installed profile's default target, exactly as an explicit policy
+    // would (docs/dense-quality-profile.md); AUTO through an ANN policy
+    // already fixed its depth and is left alone. EXACT/UNSPECIFIED keep
+    // the pool at k: that is the caller's explicit choice.
+    let auto_default_depth = match &plan.shape {
+        Shape::Dense { query, .. } => {
+            fp32_rerank
+                && query.quality.is_none()
+                && req.selection_k == 0
+                && dense_execution_mode(query)? == DenseExecutionMode::Auto
+                && dense_execution
+                    .as_ref()
+                    .is_some_and(|o| o.resolved_mode == DenseExecutionMode::Exact as i32)
+        }
+        _ => false,
+    };
     let quality_resolution = match &plan.shape {
         Shape::Dense { query, .. } => match &query.quality {
             Some(policy) => {
@@ -967,6 +987,11 @@ pub async fn execute(
                         .await?,
                 )
             }
+            None if auto_default_depth => Some(
+                coordinator
+                    .resolve_dense_quality_default(req.k, query.vector.len())
+                    .await?,
+            ),
             None => None,
         },
         _ => None,
@@ -1278,6 +1303,17 @@ pub async fn execute(
                 next,
                 finish_prof(prof, t_total),
             );
+            if auto_default_depth {
+                if let (Some(outcome), Some(resolution)) =
+                    (dense_execution.as_mut(), quality_resolution.as_ref())
+                {
+                    outcome.planner_reason.push_str(&format!(
+                        "; FP32 rerank depth selection_k={} resolved through quality profile \
+                         {:?} default_target_recall_ppm={} (as an explicit DenseQualityPolicy would)",
+                        resolution.selection_k, resolution.profile_id, resolution.target_recall_ppm
+                    ));
+                }
+            }
             response.dense_quality =
                 quality_resolution.map(|resolution| crate::pb::DenseQualityOutcome {
                     target_recall_ppm: resolution.target_recall_ppm,
