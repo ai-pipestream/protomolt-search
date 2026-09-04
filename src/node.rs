@@ -4169,6 +4169,20 @@ impl NodeServiceImpl {
                 .map_err(|e| Status::internal(format!("republish vectors: {e}")))?;
         }
         guard.stats_epoch += 1;
+        drop(guard);
+        // The frozen tail just went out of scope: hand its freed pages
+        // back to the kernel. glibc keeps freed small chunks in the
+        // arena that allocated them, and a long ingest touches a
+        // different arena per stream, so without this a node's resident
+        // set grows by a tail's worth per seal (measured 4 GB per
+        // million rows; MALLOC_ARENA_MAX=2 in the launch environment
+        // bounds the spread, this returns the rest).
+        #[cfg(all(feature = "net", target_os = "linux", target_env = "gnu"))]
+        // SAFETY: malloc_trim takes an integer pad and touches only the
+        // allocator's own free lists; it has no preconditions.
+        unsafe {
+            libc::malloc_trim(0);
+        }
         Ok(true)
     }
 

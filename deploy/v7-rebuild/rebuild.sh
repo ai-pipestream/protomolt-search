@@ -338,6 +338,12 @@ stage_up() {
 #   sysctl -w net.ipv4.ip_local_reserved_ports=59290-59310
 start_node() {
   local i=$1 port=$((PORT_BASE + i)) attempt
+  # glibc arenas: a node's ingest allocates a tail from whichever thread
+  # serves the stream and frees it at the seal; with one arena per
+  # thread the freed memory is not reused across threads and the
+  # resident set grows by a tail per seal (measured 4 GB per million
+  # rows on 2026-09-04). Two arenas keep it flat.
+  export MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2}
   for attempt in 1 2 3 4 5; do
     "${NICE_PREFIX[@]}" "$BIN" --role=node \
       --node-listen="$LISTEN_HOST:$port" \
