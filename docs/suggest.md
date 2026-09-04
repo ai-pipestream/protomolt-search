@@ -121,6 +121,10 @@ true when any shard reported one. A client that needs exact live df for a
 handful of terms has `TermStats`, which does mask; a fleet that wants the
 flag off compacts.
 
+`SearchService.TermSuggest` (`docs/synonyms.md`, "Did you mean") runs
+the same scan under a term's leading characters and ranks the entries
+within an edit bound of the term.
+
 ## Costs
 
 - Disk and RAM: nothing. No new section, no new column, no new posting

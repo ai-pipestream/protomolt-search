@@ -970,6 +970,8 @@ pub async fn execute(
                     Some("the composite scorer")
                 } else if req.highlight.is_some() {
                     Some("highlighting")
+                } else if !query.synonyms.is_empty() {
+                    Some("synonym rules")
                 } else {
                     None
                 };
@@ -1218,6 +1220,8 @@ pub async fn execute(
                     filter,
                     projections: req.projections.clone(),
                     highlight: req.highlight.clone(),
+                    synonyms: query.synonyms.clone(),
+                    synonyms_off: query.synonyms_off,
                     ..Default::default()
                 })))
                 .await?
@@ -1225,6 +1229,7 @@ pub async fn execute(
             if let Some(p) = prof.as_mut() {
                 p.selection_ms = ms(t_sel);
             }
+            let synonym_expansions = response.synonym_expansions.clone();
             let mut hits: Vec<QueryHit> = response
                 .hits
                 .iter()
@@ -1272,6 +1277,7 @@ pub async fn execute(
                 finish_prof(prof, t_total),
             );
             response.groups = groups;
+            response.synonym_expansions = synonym_expansions;
             Ok(response)
         }
         Shape::Dense { id, query } => {
@@ -2021,6 +2027,7 @@ fn done(
         served_topology_generation: 0,
         aggregate: None,
         groups: Vec::new(),
+        synonym_expansions: Vec::new(),
     }
 }
 

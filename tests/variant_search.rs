@@ -155,6 +155,8 @@ fn body_only(text: &str) -> SearchVariant {
                 b: 0.0,
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
@@ -162,6 +164,8 @@ fn body_only(text: &str) -> SearchVariant {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         })),
     }
 }
@@ -191,6 +195,8 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
                     b: 0.0,
                     phrase: None,
                     prefixes: Vec::new(),
+                    synonyms: Vec::new(),
+                    synonyms_off: false,
                 },
                 QueryField {
                     field: "case_name".to_string(),
@@ -200,6 +206,8 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
                     b: 0.0,
                     phrase: None,
                     prefixes: Vec::new(),
+                    synonyms: Vec::new(),
+                    synonyms_off: false,
                 },
             ],
             range_facet_fields: Vec::new(),
@@ -208,6 +216,8 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         })),
     }
 }
@@ -551,6 +561,8 @@ async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
         cardinality_fields: Vec::new(),
         phrase: None,
         prefixes: Vec::new(),
+        synonyms: Vec::new(),
+        synonyms_off: false,
     };
 
     // Omitted k runs at the default cap: deep enough to find every

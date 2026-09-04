@@ -310,6 +310,8 @@ async fn distributed_prefix_scoring_equals_the_monolith() {
                 prefix: "cour".into(),
                 max_expansions: 0,
             }],
+            synonyms: Vec::new(),
+            synonyms_off: false,
         }],
         ..Default::default()
     };
@@ -333,6 +335,8 @@ async fn distributed_prefix_scoring_equals_the_monolith() {
                             prefix: "cour".into(),
                             max_expansions: 0,
                         }],
+                        synonyms: Vec::new(),
+                        synonyms_off: false,
                     })),
                 })),
             }),
@@ -364,6 +368,8 @@ async fn distributed_prefix_scoring_equals_the_monolith() {
                 b: 0.0,
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }],
             prefixes: vec![TermPrefix {
                 prefix: "cour".into(),

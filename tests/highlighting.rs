@@ -526,6 +526,8 @@ async fn multi_field_hits_snippet_the_stored_body_only() {
         b: 0.0,
         phrase: None,
         prefixes: Vec::new(),
+        synonyms: Vec::new(),
+        synonyms_off: false,
     };
     let fused = |highlight: Option<HighlightSpec>| Bm25SearchRequest {
         text: "court".to_string(),
@@ -602,6 +604,8 @@ async fn the_query_adapter_serves_snippets_on_the_lexical_leaf_and_refuses_elsew
                 score_stages: Vec::new(),
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             })),
         })),
     };

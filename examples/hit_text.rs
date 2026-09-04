@@ -184,6 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b,
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),
@@ -191,6 +193,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         })
         .await?
         .into_inner();

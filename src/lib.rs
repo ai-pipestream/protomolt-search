@@ -76,6 +76,7 @@ pub mod snapshot_repository;
 pub mod sortkeys;
 pub mod stats_cache;
 mod stream_signal;
+pub mod synonyms;
 pub mod values;
 pub mod vector;
 pub mod vocab;

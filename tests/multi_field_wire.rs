@@ -126,6 +126,8 @@ fn query_fields(w_name: f32) -> Vec<QueryField> {
             b: 0.0,
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         },
         QueryField {
             field: "case_name".to_string(),
@@ -135,6 +137,8 @@ fn query_fields(w_name: f32) -> Vec<QueryField> {
             b: 0.0,
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         },
     ]
 }
@@ -697,6 +701,8 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         }),
     )
     .await
@@ -725,6 +731,8 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         }),
     )
     .await

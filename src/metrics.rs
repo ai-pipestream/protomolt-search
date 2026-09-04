@@ -70,6 +70,7 @@ pub enum Route {
     CommitReplacements,
     SuggestTerms,
     Suggest,
+    TermSuggest,
     CompactShard,
     ExportSnapshot,
     StreamSnapshot,
@@ -105,7 +106,7 @@ pub enum Route {
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 55] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 56] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -133,6 +134,7 @@ const REQUEST_ROUTES: [(Route, &str, bool); 55] = [
     (Route::CommitReplacements, "commit_replacements", false),
     (Route::SuggestTerms, "suggest_terms", false),
     (Route::Suggest, "suggest", false),
+    (Route::TermSuggest, "term_suggest", false),
     (Route::CompactShard, "compact_shard", false),
     (Route::ExportSnapshot, "export_snapshot", false),
     (Route::StreamSnapshot, "stream_snapshot", true),
