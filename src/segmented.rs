@@ -1208,6 +1208,35 @@ impl Bm25Index for UnionField<'_> {
             Ok(union)
         }
     }
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
+        // Sum the posting df of each term across the sealed parts and
+        // the heaps: the same term in two parts is one dictionary entry
+        // whose df is the sum, exactly what one image of the rows holds.
+        let mut union: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let mut over: Option<usize> = None;
+        let mut fold = |result: Result<Vec<(String, u32)>, usize>| match result {
+            Ok(entries) => {
+                for (term, df) in entries {
+                    *union.entry(term).or_insert(0) += df;
+                }
+            }
+            Err(count) => over = Some(over.unwrap_or(0).max(count)),
+        };
+        for (_, _, view) in self.parts() {
+            fold(view.suggest_prefix(prefix, max_scan));
+        }
+        for (_, view) in self.heaps() {
+            fold(view.suggest_prefix(prefix, max_scan));
+        }
+        if let Some(count) = over {
+            return Err(count.max(union.len()));
+        }
+        if union.len() > max_scan {
+            Err(union.len())
+        } else {
+            Ok(union.into_iter().collect())
+        }
+    }
 }
 
 /// The shard scores as its body field (field 0), like the other stores.
@@ -1278,5 +1307,8 @@ impl Bm25Index for SegmentedShard {
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)
+    }
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
+        self.field(0).suggest_prefix(prefix, max_scan)
     }
 }

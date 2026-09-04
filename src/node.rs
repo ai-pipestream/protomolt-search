@@ -10040,6 +10040,74 @@ impl NodeService for NodeServiceImpl {
         }))
     }
 
+    /// Autocomplete scan over one field's dictionary (`docs/suggest.md`):
+    /// the prefix scan of [`Self::expand_term_prefix`] with each term's
+    /// posting df read from the directory (heap: the posting list's
+    /// length; file: the directory entry; segmented: the sum over parts
+    /// and tail). Past `max_scan` the shard reports the count and no
+    /// entries. `tombstoned_rows` tells the coordinator the df still
+    /// counts deleted rows until compaction.
+    async fn suggest_terms(
+        &self,
+        request: Request<crate::pb::SuggestTermsRequest>,
+    ) -> Result<Response<crate::pb::SuggestTermsResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::SuggestTerms);
+        let req = request.into_inner();
+        if req.prefix.is_empty() {
+            return Err(Status::invalid_argument("a term prefix must be non-empty"));
+        }
+        if req.max_scan == 0 {
+            return Err(Status::invalid_argument(
+                "max_scan must be positive: it bounds the dictionary scan",
+            ));
+        }
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let tombstoned_rows = guard.live_docs.deleted_count();
+        let unknown = || crate::pb::SuggestTermsResponse {
+            entries: Vec::new(),
+            count: 0,
+            known: false,
+            tombstoned_rows,
+        };
+        let Some(store) = guard.bm25.as_ref() else {
+            return Ok(Response::new(unknown()));
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush first",
+            ));
+        }
+        let Some(fi) = store.field_index(&req.field) else {
+            return Ok(Response::new(unknown()));
+        };
+        let view = store
+            .field_view(fi)
+            .expect("as_index above proves the shard is searchable");
+        let max_scan = usize::try_from(req.max_scan).map_err(|_| {
+            Status::invalid_argument(format!("max_scan {} is out of range", req.max_scan))
+        })?;
+        let (entries, count) = match view.suggest_prefix(&req.prefix, max_scan) {
+            Ok(entries) => {
+                let count = entries.len() as u64;
+                let entries = entries
+                    .into_iter()
+                    .map(|(term, df)| crate::pb::SuggestTermEntry {
+                        term,
+                        df: u64::from(df),
+                    })
+                    .collect();
+                (entries, count)
+            }
+            Err(count) => (Vec::new(), count as u64),
+        };
+        Ok(Response::new(crate::pb::SuggestTermsResponse {
+            entries,
+            count,
+            known: true,
+            tombstoned_rows,
+        }))
+    }
+
     async fn bm25_query(
         &self,
         request: Request<Bm25QueryRequest>,

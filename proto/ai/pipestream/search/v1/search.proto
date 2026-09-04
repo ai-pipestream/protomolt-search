@@ -212,6 +212,13 @@ service NodeService {
   // the byte-sorted directory, reporting the terms up to the cap and
   // the exact count.
   rpc ExpandTermPrefix(ExpandTermPrefixRequest) returns (ExpandTermPrefixResponse);
+  // Autocomplete over one field's dictionary (docs/suggest.md): the
+  // same binary search plus bounded scan as ExpandTermPrefix, but every
+  // matching term comes back with its posting document frequency, so
+  // the coordinator can rank completions by summed df. Past `max_scan`
+  // matches the shard reports the count and no entries; it never
+  // truncates and never walks the dictionary linearly.
+  rpc SuggestTerms(SuggestTermsRequest) returns (SuggestTermsResponse);
 
   // Scores BM25 for the given query terms against this shard's postings,
   // using the GLOBAL corpus stats supplied by the coordinator (never
@@ -508,6 +515,20 @@ service SearchService {
   // parallel rule. Absence is Kleene: a document whose expression is
   // absent is skipped and counted nowhere — never a fabricated zero.
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+
+  // Autocomplete (docs/suggest.md): the terms of one indexed BM25 field
+  // that start with `prefix`, ranked by document frequency summed over
+  // the collection's shards (ties in term byte order), the best `limit`
+  // of them. The prefix is normalized under the field's analysis spec
+  // exactly as a TermPrefix is — its char filters, never its stemmer —
+  // so a stemmed field suggests stems and surface-form completion needs
+  // a field indexed without a stemmer (the cased twin, or a
+  // SOURCE_TOKENS field). The count of dictionary terms under the
+  // prefix rides the response; past `max_scan` of them on any shard, or
+  // fleet-wide, the request is INVALID_ARGUMENT naming the count —
+  // never a quieter match set. df is posting df: a tombstoned row still
+  // counts until compaction, and the response says when that applies.
+  rpc Suggest(SuggestRequest) returns (SuggestResponse);
 }
 
 // Durable cluster membership and placement authority. Query data never flows
@@ -2843,6 +2864,90 @@ message ExpandTermPrefixResponse {
   uint64 count = 2;
   // Whether this shard's field table has the field at all.
   bool known = 3;
+}
+
+// Shard-side autocomplete scan (docs/suggest.md): every term of one
+// field's dictionary under a prefix, with its posting df.
+message SuggestTermsRequest {
+  // The field whose dictionary is scanned ("body" for the body).
+  string field = 1;
+  // The prefix, already normalized by the coordinator; non-empty.
+  string prefix = 2;
+  // Scan bound; past it the shard reports the count and no entries.
+  uint64 max_scan = 3;
+}
+
+// One dictionary term under the prefix and its posting df on the shard.
+message SuggestTermEntry {
+  // The term as the dictionary holds it (a stem on a stemmed field).
+  string term = 1;
+  // Posting document frequency: the number of rows whose posting list
+  // holds the term, tombstoned rows included until compaction.
+  uint64 df = 2;
+}
+
+message SuggestTermsResponse {
+  // Matching terms in byte order with their df; empty when past the
+  // scan bound.
+  repeated SuggestTermEntry entries = 1;
+  // Exact number of matching terms on this shard.
+  uint64 count = 2;
+  // Whether this shard's field table has the field at all.
+  bool known = 3;
+  // The shard's live-docs tombstone count. Non-zero means the df above
+  // still counts rows a delete removed from every search result.
+  uint64 tombstoned_rows = 4;
+}
+
+// Autocomplete over one field's dictionary (docs/suggest.md).
+message SuggestRequest {
+  // The collection the field belongs to (docs/collections.md): empty
+  // names the coordinator's only, unnamed dataset, or its configured
+  // default; an unknown name, or no name where named collections exist
+  // and no default is configured, refuses by name.
+  string collection = 1;
+  // The indexed BM25 field whose dictionary is completed ("body", the
+  // cased twin, the glossary phrase field, any per-field column). A
+  // field no shard indexes refuses by name.
+  string field = 2;
+  // The prefix, in the field's surface form; non-empty. Normalized
+  // under `analysis`'s char filters before the dictionary is searched,
+  // never stemmed.
+  string prefix = 3;
+  // How many suggestions to return; 0 selects the default (10). Values
+  // above the absolute maximum (100) are refused.
+  uint32 limit = 4;
+  // The most dictionary terms under the prefix the request may scan,
+  // per shard and fleet-wide; 0 selects the default (100000). Values
+  // above the absolute maximum (1000000) are refused, as is a prefix
+  // that has more matches than the bound, naming the count.
+  uint64 max_scan = 5;
+  // The field's analysis spec, whose char filters normalize the prefix
+  // (docs/prefix-terms.md). Required: the sidecar's default chain is
+  // not known to the coordinator, so an absent spec refuses by name.
+  AnalysisSpec analysis = 6;
+}
+
+// One completion, ranked by df descending then term bytes ascending.
+message Suggestion {
+  // The dictionary term (a stem on a stemmed field).
+  string term = 1;
+  // Posting df summed over the collection's shards.
+  uint64 df = 2;
+  // How many shards hold the term.
+  uint32 shards = 3;
+}
+
+message SuggestResponse {
+  // The best `limit` completions in rank order.
+  repeated Suggestion suggestions = 1;
+  // How many dictionary terms start with the prefix across the
+  // collection (the union over shards), whether or not they were
+  // returned.
+  uint64 dictionary_terms_with_prefix = 2;
+  // True when any shard reported tombstoned rows: df then counts rows
+  // a delete removed from search until compaction restores exactness.
+  bool df_includes_tombstoned_rows = 3;
 }
 
 // An ordered-window constraint over a lexical query's analyzed terms

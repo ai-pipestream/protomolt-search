@@ -258,6 +258,7 @@ impl NodeLink {
         commit_replacements: CommitReplacementsRequest => CommitReplacementsResponse,
         term_stats: TermStatsRequest => TermStatsResponse,
         expand_term_prefix: ExpandTermPrefixRequest => ExpandTermPrefixResponse,
+        suggest_terms: SuggestTermsRequest => SuggestTermsResponse,
         bm25_query: Bm25QueryRequest => Bm25QueryResponse,
         bm25_phrase_query: Bm25PhraseQueryRequest => Bm25QueryResponse,
         get_documents: GetDocumentsRequest => GetDocumentsResponse,

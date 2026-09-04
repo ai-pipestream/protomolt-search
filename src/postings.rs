@@ -634,6 +634,16 @@ pub trait Bm25Index {
     /// dictionary. A prefix past the cap is refused with the count, never
     /// truncated to a quieter match set.
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize>;
+    /// Every term of this field starting with `prefix` with its posting
+    /// document frequency, in byte order, when there are at most
+    /// `max_scan` of them; `Err(count)` with the exact count otherwise
+    /// (`docs/suggest.md`). The df is the posting list's length as
+    /// stored — tombstoned rows included until compaction — so it costs
+    /// one directory read per term and no posting walk. The scan is the
+    /// prefix scan: lower bound, then forward while the prefix holds,
+    /// never the whole dictionary; past the bound nothing is
+    /// materialized.
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize>;
 }
 
 /// One posting: a term occurrence set within one document.
@@ -3678,6 +3688,25 @@ impl Bm25Index for StoreFieldView<'_> {
             Ok(matches.into_iter().cloned().collect())
         }
     }
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
+        // Borrow through the walk; clone the terms only once the count
+        // is known to fit, so a scan past the bound allocates nothing.
+        let matches: Vec<(&String, u32)> = self
+            .field
+            .postings
+            .range(prefix.to_string()..)
+            .take_while(|(term, _)| term.starts_with(prefix))
+            .map(|(term, postings)| (term, postings.len() as u32))
+            .collect();
+        if matches.len() > max_scan {
+            Err(matches.len())
+        } else {
+            Ok(matches
+                .into_iter()
+                .map(|(term, df)| (term.clone(), df))
+                .collect())
+        }
+    }
 }
 
 /// The store itself scores as its body field (field 0) — the surface
@@ -3725,6 +3754,9 @@ impl Bm25Index for Bm25Store {
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)
+    }
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
+        self.field(0).suggest_prefix(prefix, max_scan)
     }
 }
 
@@ -9153,45 +9185,90 @@ impl Bm25Index for FieldView<'_> {
         )
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
-        let r = self.reader;
-        // Lower bound of `prefix` in the byte-sorted directory, then a
-        // scan while the prefix holds: O(log n) plus O(matches).
-        let n = self.field.n_terms;
-        let term_at = |i: u32| -> &[u8] {
-            if r.v5_runs {
-                r.directory_entry_v5(self.field, i).0
-            } else {
-                r.directory_entry(self.field, i).0
-            }
-        };
-        let (mut lo, mut hi) = (0u32, n);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if term_at(mid) < prefix.as_bytes() {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
         let mut matches = Vec::new();
-        let mut count = 0usize;
-        let mut i = lo;
-        while i < n {
-            let bytes = term_at(i);
-            if !bytes.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            count += 1;
-            if count <= cap {
+        let count = self.scan_prefix(prefix, |i, _, bytes| {
+            if i < cap {
                 matches.push(String::from_utf8_lossy(bytes).into_owned());
             }
-            i += 1;
-        }
+        });
         if count > cap {
             Err(count)
         } else {
             Ok(matches)
         }
+    }
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
+        let mut matches = Vec::new();
+        let count = self.scan_prefix(prefix, |i, entry, bytes| {
+            if i < max_scan {
+                let df = self.directory_df(entry);
+                matches.push((String::from_utf8_lossy(bytes).into_owned(), df));
+            }
+        });
+        if count > max_scan {
+            Err(count)
+        } else {
+            Ok(matches)
+        }
+    }
+}
+
+impl FieldView<'_> {
+    /// The directory entry's term bytes, on either directory shape.
+    fn directory_term(&self, i: u32) -> &[u8] {
+        let r = self.reader;
+        if r.v5_runs {
+            r.directory_entry_v5(self.field, i).0
+        } else {
+            r.directory_entry(self.field, i).0
+        }
+    }
+
+    /// The directory entry's df, on either directory shape: the posting
+    /// list's length as written, tombstones included.
+    fn directory_df(&self, i: u32) -> u32 {
+        let r = self.reader;
+        if r.v5_runs {
+            r.directory_entry_v5(self.field, i).4
+        } else {
+            r.directory_entry(self.field, i).2
+        }
+    }
+
+    /// Lower bound of `prefix` in the byte-sorted directory: the index
+    /// of the first term at or above it. O(log n) directory reads.
+    fn prefix_lower_bound(&self, prefix: &str) -> u32 {
+        let (mut lo, mut hi) = (0u32, self.field.n_terms);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.directory_term(mid) < prefix.as_bytes() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Binary search to the prefix's lower bound, then scan forward
+    /// while the prefix holds, calling `visit(ordinal, directory index,
+    /// term bytes)` on each match; returns the exact match count.
+    /// O(log n) plus O(matches), never the whole dictionary
+    /// (`docs/prefix-terms.md`).
+    fn scan_prefix(&self, prefix: &str, mut visit: impl FnMut(usize, u32, &[u8])) -> usize {
+        let n = self.field.n_terms;
+        let mut count = 0usize;
+        let mut i = self.prefix_lower_bound(prefix);
+        while i < n {
+            let bytes = self.directory_term(i);
+            if !bytes.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            visit(count, i, bytes);
+            count += 1;
+            i += 1;
+        }
+        count
     }
 }
 
@@ -9234,6 +9311,9 @@ impl Bm25Index for Bm25Reader {
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)
+    }
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
+        self.field(0).suggest_prefix(prefix, max_scan)
     }
     fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
         self.field(0).impacts_inner(term)
@@ -9313,6 +9393,78 @@ mod tests {
             }
         }
         store
+    }
+
+    /// Autocomplete over the dictionary (`docs/suggest.md`): the heap
+    /// store's map walk and the reader's binary search return the same
+    /// `(term, posting df)` table in byte order, the df is the posting
+    /// list's length, and past the bound both refuse with the count.
+    #[test]
+    fn suggest_prefix_reports_posting_df_on_both_stores() {
+        let dir = std::env::temp_dir().join(format!("suggest-df-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docs: [&[&str]; 4] = [
+            &["court", "courtesy", "couple"],
+            &["court", "courier"],
+            &["court", "courtesy", "cove"],
+            &["search"],
+        ];
+        let mut store = Bm25Store::new();
+        for (id, terms) in docs.iter().enumerate() {
+            let terms: DocTerms = terms
+                .iter()
+                .map(|t| (t.to_string(), 1, Vec::new()))
+                .collect();
+            let length = terms.len() as u32;
+            store.add_document(id as u32, String::new(), AnalyzedDoc::body(terms, length));
+        }
+        let path = dir.join("suggest.bm25");
+        store.save(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+        let want = |prefix: &str| -> Vec<(String, u32)> {
+            let mut df: std::collections::BTreeMap<String, u32> = Default::default();
+            for terms in docs {
+                for t in terms.iter().filter(|t| t.starts_with(prefix)) {
+                    *df.entry(t.to_string()).or_insert(0) += 1;
+                }
+            }
+            df.into_iter().collect()
+        };
+        for prefix in ["cou", "cour", "court", "c", "s", "z"] {
+            let expected = want(prefix);
+            let bound = expected.len().max(1);
+            assert_eq!(
+                store.suggest_prefix(prefix, bound),
+                Ok(expected.clone()),
+                "{prefix}"
+            );
+            assert_eq!(
+                reader.suggest_prefix(prefix, bound),
+                Ok(expected.clone()),
+                "{prefix}"
+            );
+            for (term, df) in &expected {
+                assert_eq!(reader.df(term), *df, "{term}: df is the posting df");
+            }
+            if !expected.is_empty() {
+                assert_eq!(store.suggest_prefix(prefix, bound - 1), Err(expected.len()));
+                assert_eq!(
+                    reader.suggest_prefix(prefix, bound - 1),
+                    Err(expected.len())
+                );
+            }
+        }
+        assert_eq!(
+            reader.suggest_prefix("cou", 10),
+            Ok(vec![
+                ("couple".to_string(), 1),
+                ("courier".to_string(), 1),
+                ("court".to_string(), 3),
+                ("courtesy".to_string(), 2),
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

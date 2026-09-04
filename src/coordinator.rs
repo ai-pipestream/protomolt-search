@@ -1554,6 +1554,17 @@ pub const DEFAULT_PREFIX_EXPANSIONS: usize = 128;
 /// term, and past this a prefix is a scan, not a query.
 pub const MAX_PREFIX_EXPANSIONS: usize = 1024;
 
+/// Suggestions a `Suggest` request returns when `limit` is unset
+/// (`docs/suggest.md`).
+pub const DEFAULT_SUGGEST_LIMIT: usize = 10;
+/// The most suggestions one request may ask for.
+pub const MAX_SUGGEST_LIMIT: usize = 100;
+/// Dictionary terms under the prefix a `Suggest` request may scan when
+/// `max_scan` is unset, per shard and fleet-wide.
+pub const DEFAULT_SUGGEST_SCAN: usize = 100_000;
+/// The most dictionary terms one request may scan.
+pub const MAX_SUGGEST_SCAN: usize = 1_000_000;
+
 /// Query analysis for one field, or the empty analysis for a
 /// prefix-only query (docs/prefix-terms.md). `cour*` has no text to
 /// analyze — its terms are the expansions alone — so empty text with a
@@ -10253,6 +10264,124 @@ impl SearchService for CoordinatorServiceImpl {
         self.fanout_aggregate(&filters, &compiled, None)
             .await
             .map(Response::new)
+    }
+
+    /// Autocomplete over one field's dictionary (`docs/suggest.md`):
+    /// normalize the prefix as a prefix term is normalized (the field's
+    /// char filters, never its stemmer), ask every shard for the terms
+    /// under it with their posting df, union by term summing df, and
+    /// rank by df descending then term bytes ascending. The union IS the
+    /// dictionary one image of the rows would hold and the summed df is
+    /// that image's posting df, so the fleet's answer equals the
+    /// monolith's bitwise. Past `max_scan` on any shard or in the union
+    /// the request refuses naming the count; nothing is truncated to a
+    /// quieter match set.
+    async fn suggest(
+        &self,
+        request: Request<crate::pb::SuggestRequest>,
+    ) -> Result<Response<crate::pb::SuggestResponse>, Status> {
+        crate::metrics::inc_request(crate::metrics::Route::Suggest);
+        self.admit(&request.get_ref().collection)?;
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(SearchService::suggest(&snapshot, request)).await;
+        }
+        let req = request.into_inner();
+        let limit = match req.limit as usize {
+            0 => DEFAULT_SUGGEST_LIMIT,
+            n if n > MAX_SUGGEST_LIMIT => {
+                return Err(Status::invalid_argument(format!(
+                    "limit {n} exceeds the maximum {MAX_SUGGEST_LIMIT}"
+                )))
+            }
+            n => n,
+        };
+        let max_scan = match req.max_scan {
+            0 => DEFAULT_SUGGEST_SCAN,
+            n if n > MAX_SUGGEST_SCAN as u64 => {
+                return Err(Status::invalid_argument(format!(
+                    "max_scan {n} exceeds the maximum {MAX_SUGGEST_SCAN}"
+                )))
+            }
+            n => n as usize,
+        };
+        if req.field.is_empty() {
+            return Err(Status::invalid_argument(
+                "suggest needs a field: name the indexed BM25 field whose dictionary to \
+                 complete (\"body\" for the body)",
+            ));
+        }
+        let field = req.field.as_str();
+        let normalized = crate::analyzer::normalize_prefix(&req.prefix, req.analysis.as_ref())?;
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (i, node) in self.node_addrs.iter().enumerate() {
+            let mut client = self.node_client(node)?;
+            let request = crate::pb::SuggestTermsRequest {
+                field: field.to_string(),
+                prefix: normalized.clone(),
+                max_scan: max_scan as u64,
+            };
+            tasks.push((
+                i,
+                tokio::spawn(
+                    async move { client.suggest_terms(request).await.map(|r| r.into_inner()) },
+                ),
+            ));
+        }
+        // Term -> (summed df, shards holding it), in byte order.
+        let mut union: std::collections::BTreeMap<String, (u64, u32)> =
+            std::collections::BTreeMap::new();
+        let mut known = false;
+        let mut tombstoned = false;
+        for (shard, task) in tasks {
+            let resp = task
+                .await
+                .map_err(|e| Status::internal(format!("suggest task failed: {e}")))??;
+            tombstoned |= resp.tombstoned_rows > 0;
+            if !resp.known {
+                continue;
+            }
+            known = true;
+            if resp.count as usize > max_scan {
+                return Err(Status::invalid_argument(format!(
+                    "prefix {normalized:?} on field {field:?} matches {} dictionary terms on \
+                     shard {shard}; the scan bound is {max_scan} (raise max_scan up to \
+                     {MAX_SUGGEST_SCAN}, or lengthen the prefix)",
+                    resp.count
+                )));
+            }
+            for entry in resp.entries {
+                let slot = union.entry(entry.term).or_insert((0, 0));
+                slot.0 += entry.df;
+                slot.1 += 1;
+            }
+        }
+        if !known {
+            return Err(Status::invalid_argument(format!(
+                "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary to \
+                 complete in"
+            )));
+        }
+        if union.len() > max_scan {
+            return Err(Status::invalid_argument(format!(
+                "prefix {normalized:?} on field {field:?} matches {} dictionary terms across \
+                 the fleet; the scan bound is {max_scan} (raise max_scan up to \
+                 {MAX_SUGGEST_SCAN}, or lengthen the prefix)",
+                union.len()
+            )));
+        }
+        let dictionary_terms_with_prefix = union.len() as u64;
+        let mut ranked: Vec<(String, (u64, u32))> = union.into_iter().collect();
+        // df descending; the map's byte order breaks ties (stable sort).
+        ranked.sort_by_key(|(_, (df, _))| std::cmp::Reverse(*df));
+        ranked.truncate(limit);
+        Ok(Response::new(crate::pb::SuggestResponse {
+            suggestions: ranked
+                .into_iter()
+                .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
+                .collect(),
+            dictionary_terms_with_prefix,
+            df_includes_tombstoned_rows: tombstoned,
+        }))
     }
 
     async fn cluster_health(
