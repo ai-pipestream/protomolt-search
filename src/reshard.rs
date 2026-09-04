@@ -104,6 +104,11 @@ pub struct ChildImage {
     /// Parent global id per child local vector slot, ascending (the id
     /// remap).
     pub parent_ids: Vec<u64>,
+    /// Parent global id per child local ROW: `parent_ids` followed by the
+    /// document-only rows (documents whose id named no vector), in
+    /// parent-id order — the complete old-to-new id map of the child,
+    /// which compaction extends as the tail applies.
+    pub row_parent_ids: Vec<u64>,
 }
 
 /// The result of one split or merge: the images plus the NEW generation
@@ -211,6 +216,23 @@ fn replay_buckets(
     vectors_only: bool,
     out: &mut Replay,
 ) -> Result<(), String> {
+    replay_buckets_through(gen, buckets, bucket_count, dim, vectors_only, u64::MAX, out)
+}
+
+/// [`replay_buckets`] bounded by the generation clock: records past
+/// `upto_clock` are skipped, which is how an online compaction builds
+/// its dense image from a prefix of a log that keeps growing under it
+/// (`docs/mutations.md`). A legacy unclocked record (clock 0) is refused
+/// under a bound, because it cannot be placed against the cutoff.
+fn replay_buckets_through(
+    gen: &Path,
+    buckets: std::ops::Range<u32>,
+    bucket_count: usize,
+    dim: usize,
+    vectors_only: bool,
+    upto_clock: u64,
+    out: &mut Replay,
+) -> Result<(), String> {
     for bucket in buckets {
         let path = wal::bucket_path(gen, bucket);
         if !path.exists() {
@@ -222,6 +244,18 @@ fn replay_buckets(
             .next_record()
             .map_err(|e| format!("replay {}: {e}", path.display()))?
         {
+            if upto_clock != u64::MAX {
+                if record.clock == 0 {
+                    return Err(format!(
+                        "replay {}: a legacy unclocked record cannot be placed against the \
+                         cutoff clock {upto_clock}",
+                        path.display()
+                    ));
+                }
+                if record.clock > upto_clock {
+                    continue;
+                }
+            }
             match record.op {
                 Some(wal_record::Op::AddVectors(a)) => {
                     if bucket_of(a.first_id, bucket_count) as u32 != bucket {
@@ -448,6 +482,14 @@ fn read_gens_binding(gens: &[PathBuf]) -> Result<Option<crate::postings::StoredB
     Ok(bound.map(|(binding, _)| binding))
 }
 
+/// The mapped-plan binding one generation's markers carry, if any
+/// (`read_gens_binding` over one input).
+pub fn read_generation_binding(
+    gen: &Path,
+) -> Result<Option<crate::postings::StoredBinding>, String> {
+    read_gens_binding(std::slice::from_ref(&gen.to_path_buf()))
+}
+
 /// Provider scoring identity for the merge check (slot offset and generation
 /// legitimately differ between inputs; the shape and provider state must not).
 fn same_backend_config(a: &WalManifest, b: &WalManifest) -> bool {
@@ -466,12 +508,14 @@ fn same_backend_config(a: &WalManifest, b: &WalManifest) -> bool {
 /// whose id also names a vector gets that vector's child slot (the
 /// aligned-ingest case stays aligned); documents with no vector (the doc
 /// side ran ahead) are appended above the vector space in id order.
+#[allow(clippy::too_many_arguments)]
 fn build_child(
     manifest: &WalManifest,
     vectors: Vec<(u64, Vec<f32>)>,
     documents: Vec<(u64, AddDocumentsRequest)>,
     vector_path: &Path,
     bm25_fields: Option<&[String]>,
+    pinned_fingerprints: Option<&[u64]>,
     binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
@@ -508,12 +552,14 @@ fn build_child(
         .map(|(slot, &id)| (id, slot as u32))
         .collect();
     let mut mapped: Vec<(u32, AddDocumentsRequest)> = Vec::with_capacity(documents.len());
+    let mut row_parent_ids = parent_ids.clone();
     let mut spare = vectors.len() as u64;
     for (id, doc) in documents {
         let local = match slot_of.get(&id) {
             Some(&slot) => slot,
             None => {
                 spare += 1;
+                row_parent_ids.push(id);
                 u32::try_from(spare - 1).map_err(|_| "document id space exceeds u32".to_string())?
             }
         };
@@ -701,6 +747,26 @@ fn build_child(
             .with_geo_fields(&geo_names)
             .with_position_fields(&position_names)
             .with_sentence_fields(&sentence_names);
+        // A compaction pins the source shard's per-field analyzer
+        // fingerprints on every output up front, so a bucket whose rows
+        // never carry an optional field still records the field's
+        // identity and the outputs open as one set; a record that
+        // contradicts a pinned fingerprint refuses below as it would at
+        // ingest.
+        if let Some(pinned) = pinned_fingerprints {
+            if pinned.len() != table.len() {
+                return Err(format!(
+                    "pinned analysis fingerprints cover {} fields but the table has {}",
+                    pinned.len(),
+                    table.len()
+                ));
+            }
+            for (fi, fingerprint) in pinned.iter().enumerate() {
+                builder
+                    .set_analysis_fingerprint(fi, *fingerprint)
+                    .map_err(|error| format!("pin field {:?}: {error}", table[fi]))?;
+            }
+        }
         let mut i = 0;
         while i < mapped.len() {
             // Batch by document, one analyzer entry per field (body
@@ -1036,6 +1102,7 @@ fn build_child(
         num_vectors: vectors.len() as u64,
         num_documents,
         parent_ids,
+        row_parent_ids,
     })
 }
 
@@ -1044,6 +1111,35 @@ fn build_child(
 #[allow(clippy::too_many_arguments)]
 fn finish_child(
     manifest: &WalManifest,
+    replay: Replay,
+    ordinal: usize,
+    out_dir: &Path,
+    slot_offset: u64,
+    hash_lo: u64,
+    hash_hi: u64,
+    bm25_fields: Option<&[String]>,
+    binding: Option<&crate::postings::StoredBinding>,
+    analyze: &mut Analyzer,
+) -> Result<ChildImage, String> {
+    finish_child_pinned(
+        manifest,
+        replay,
+        ordinal,
+        out_dir,
+        slot_offset,
+        hash_lo,
+        hash_hi,
+        bm25_fields,
+        None,
+        binding,
+        analyze,
+    )
+}
+
+/// [`finish_child`] with the analyzer fingerprints a compaction pins.
+#[allow(clippy::too_many_arguments)]
+fn finish_child_pinned(
+    manifest: &WalManifest,
     mut replay: Replay,
     ordinal: usize,
     out_dir: &Path,
@@ -1051,6 +1147,7 @@ fn finish_child(
     hash_lo: u64,
     hash_hi: u64,
     bm25_fields: Option<&[String]>,
+    pinned_fingerprints: Option<&[u64]>,
     binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
@@ -1068,6 +1165,7 @@ fn finish_child(
         replay.documents.into_iter().collect(),
         &vector_path,
         bm25_fields,
+        pinned_fingerprints,
         binding,
         analyze,
     )?;
@@ -1563,6 +1661,221 @@ pub fn split_stable_logs(
             children,
         },
         source_cutoffs: cutoffs,
+    })
+}
+
+/// One live row of a compaction's dense image, in the order the sink
+/// receives them: new local slot order, which is also the order the
+/// rewritten log records them in.
+pub struct CompactedRow<'a> {
+    /// The row's local slot in the dense image (the node adds its slot
+    /// offset for the global id).
+    pub new_local: u64,
+    /// The global id the row had in the source generation.
+    pub old_id: u64,
+    pub vector: Option<&'a [f32]>,
+    pub document: Option<&'a AddDocumentsRequest>,
+    pub stable_key: Option<&'a [u8]>,
+}
+
+/// Where a compaction's live rows go besides the image: the rewritten
+/// full-history WAL generation (`docs/mutations.md`). Called once per row
+/// in slot order, before the image is built from the same replay.
+pub type RowSink<'a> = dyn FnMut(CompactedRow<'_>) -> Result<(), String> + 'a;
+
+/// What [`compact_log`] built: the dense image(s), the id map, and the
+/// counts the operator asked for.
+#[derive(Debug)]
+pub struct CompactionBuild {
+    /// The rewritten generation's number: one past the source.
+    pub generation: u64,
+    /// Rows the source generation held through the cutoff, tombstoned or
+    /// not.
+    pub rows_before: u64,
+    /// Rows the cutoff had tombstoned, which the dense image drops.
+    pub tombstones: u64,
+    /// Source global id -> dense LOCAL slot, for every live row.
+    pub id_map: BTreeMap<u64, u64>,
+    /// The dense image(s): one for the single-image layout; one per
+    /// non-empty WAL bucket for the segment layout, each with its
+    /// `slot_offset` set to its local base label.
+    pub images: Vec<ChildImage>,
+    /// The mapped-plan binding the source carried, to be logged first in
+    /// the rewritten generation.
+    pub binding: Option<crate::postings::StoredBinding>,
+}
+
+/// Hand every live row of `replay` to `sink` in dense slot order — the
+/// order [`build_child`] assigns: vector rows in parent-id order, then
+/// the document-only rows in parent-id order — and extend `id_map`
+/// with the mapping. Returns the number of rows emitted.
+fn emit_rows(
+    replay: &Replay,
+    slot_base: u64,
+    id_map: &mut BTreeMap<u64, u64>,
+    sink: &mut RowSink,
+) -> Result<u64, String> {
+    let mut order: Vec<u64> = replay.vectors.keys().copied().collect();
+    order.extend(
+        replay
+            .documents
+            .keys()
+            .filter(|id| !replay.vectors.contains_key(id))
+            .copied(),
+    );
+    for (slot, old_id) in order.iter().enumerate() {
+        let new_local = slot_base + slot as u64;
+        if id_map.insert(*old_id, new_local).is_some() {
+            return Err(format!(
+                "compaction saw source id {old_id} twice; the log is corrupt"
+            ));
+        }
+        sink(CompactedRow {
+            new_local,
+            old_id: *old_id,
+            vector: replay.vectors.get(old_id).map(Vec::as_slice),
+            document: replay.documents.get(old_id),
+            stable_key: replay.stable_keys.get(old_id).map(Vec::as_slice),
+        })?;
+    }
+    Ok(order.len() as u64)
+}
+
+/// Rows a replay holds before its tombstones are applied, and how many of
+/// them are tombstoned: `(present, tombstoned)`.
+fn replay_counts(replay: &Replay) -> (u64, u64) {
+    let present: BTreeSet<&u64> = replay
+        .vectors
+        .keys()
+        .chain(replay.documents.keys())
+        .collect();
+    let tombstoned = replay
+        .deleted
+        .iter()
+        .filter(|id| present.contains(id))
+        .count() as u64;
+    (present.len() as u64, tombstoned)
+}
+
+/// Build the dense all-live image of ONE generation through
+/// `cutoff_clock`, the baseline of an online compaction
+/// (`docs/mutations.md`): the log prefix is replayed with its deletes and
+/// replacements applied, every live row is handed to `sink` in dense slot
+/// order (the rewritten log), and the image is written under `out_dir`.
+/// Local slots start at 0; the caller owns the global offset.
+///
+/// `segmented` selects the bucket-bounded shape: one sealed image per
+/// non-empty WAL bucket, slots dense across them in bucket order, memory
+/// holding one bucket's replay at a time — the same shape
+/// [`split_logs_segmented`] gives a catalog. Otherwise one image over the
+/// whole replay, as [`split`] with a factor of one.
+///
+/// The generation must be full history with a usable provider
+/// configuration, exactly as for a reshard; those checks refuse here
+/// before anything is read.
+#[allow(clippy::too_many_arguments)]
+pub fn compact_log(
+    gen: &Path,
+    cutoff_clock: u64,
+    out_dir: &Path,
+    segmented: bool,
+    bm25_fields: Option<&[String]>,
+    pinned_fingerprints: Option<&[u64]>,
+    analyze: &mut Analyzer,
+    sink: &mut RowSink,
+) -> Result<CompactionBuild, String> {
+    let manifest = read_gen_manifest(gen)?;
+    require_backend_config(&manifest, gen)?;
+    require_complete_history(&manifest, gen)?;
+    let binding = read_gens_binding(std::slice::from_ref(&gen.to_path_buf()))?;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| format!("mkdir {}: {error}", out_dir.display()))?;
+    let bucket_count = manifest.bucket_count as usize;
+    let dim = manifest.dim as usize;
+    let generation = manifest
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| "compaction generation overflow".to_string())?;
+    let mut id_map = BTreeMap::new();
+    let mut images = Vec::new();
+    let mut rows_before = 0u64;
+    let mut tombstones = 0u64;
+    if !segmented {
+        let mut replay = Replay::default();
+        replay_buckets_through(
+            gen,
+            0..manifest.bucket_count,
+            bucket_count,
+            dim,
+            false,
+            cutoff_clock,
+            &mut replay,
+        )?;
+        let (present, tombstoned) = replay_counts(&replay);
+        rows_before = present;
+        tombstones = tombstoned;
+        replay.compact();
+        emit_rows(&replay, 0, &mut id_map, sink)?;
+        images.push(finish_child_pinned(
+            &manifest,
+            replay,
+            0,
+            out_dir,
+            0,
+            0,
+            u64::MAX,
+            bm25_fields,
+            pinned_fingerprints,
+            binding.as_ref(),
+            analyze,
+        )?);
+    } else {
+        let mut next_slot = 0u64;
+        for bucket in 0..manifest.bucket_count {
+            let mut replay = Replay::default();
+            replay_buckets_through(
+                gen,
+                bucket..bucket + 1,
+                bucket_count,
+                dim,
+                false,
+                cutoff_clock,
+                &mut replay,
+            )?;
+            let (present, tombstoned) = replay_counts(&replay);
+            rows_before += present;
+            tombstones += tombstoned;
+            replay.compact();
+            let rows = emit_rows(&replay, next_slot, &mut id_map, sink)?;
+            if rows == 0 {
+                continue;
+            }
+            let ordinal = images.len();
+            images.push(finish_child_pinned(
+                &manifest,
+                replay,
+                ordinal,
+                out_dir,
+                next_slot,
+                0,
+                u64::MAX,
+                bm25_fields,
+                pinned_fingerprints,
+                binding.as_ref(),
+                analyze,
+            )?);
+            next_slot = next_slot
+                .checked_add(rows)
+                .ok_or_else(|| "compaction slot overflow".to_string())?;
+        }
+    }
+    Ok(CompactionBuild {
+        generation,
+        rows_before,
+        tombstones,
+        id_map,
+        images,
+        binding,
     })
 }
 
