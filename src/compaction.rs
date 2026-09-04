@@ -863,7 +863,14 @@ impl NodeServiceImpl {
             index
                 .as_ref()
                 .and_then(VectorIndex::dim_opt)
-                .map(|dim| ExactVectorStore::empty(Some(dim)))
+                .map(|dim| ExactVectorStore::spilling(&exact_path, Some(dim)))
+                .transpose()
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "exact-vector builder {}: {e}",
+                        exact_path.display()
+                    ))
+                })?
         };
         let bm25 = if image.bm25_path.is_some() {
             let shard = Bm25Shard::open(&bm25_path)

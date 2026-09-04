@@ -4093,6 +4093,29 @@ impl NodeServiceImpl {
         Self::adopt_layout(bm25, created)
     }
 
+    /// A fresh, empty exact-vector store for this shard: on disk beside
+    /// the generation's sidecar path when the shard persists, so an
+    /// ingest never holds its FP32 rows in heap (`docs/mmap-vectors.md`);
+    /// in memory for an in-memory shard.
+    fn fresh_exact_store(
+        &self,
+        generation: Option<&PathBuf>,
+        dim: usize,
+    ) -> Result<ExactVectorStore, Status> {
+        match self.config.index_path.as_ref() {
+            Some(index_path) => {
+                let (_, exact_path, _) = storage_paths(index_path, generation);
+                ExactVectorStore::spilling(&exact_path, Some(dim)).map_err(|e| {
+                    Status::internal(format!(
+                        "exact-vector builder {}: {e}",
+                        exact_path.display()
+                    ))
+                })
+            }
+            None => Ok(ExactVectorStore::empty(Some(dim))),
+        }
+    }
+
     /// A new, empty vector index in the shard's layout: the tail image of
     /// a segmented provider over the catalog's sealed images when the
     /// documents are segmented, else the index as created. Every path
@@ -4315,17 +4338,28 @@ impl NodeServiceImpl {
         if self.config.seal_tail_docs == 0 || self.config.index_path.is_none() {
             return false;
         }
-        let bound = self.config.seal_tail_docs;
+        let bound = self.config.seal_tail_docs as usize;
         let guard = self.state.read().expect("shard state lock poisoned");
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
             return false;
         };
-        shard.tail().next_doc_id() >= bound
-            || guard
-                .index
-                .as_ref()
-                .and_then(VectorIndex::as_segmented)
-                .is_some_and(|p| p.tail().len() >= bound as usize)
+        let docs = shard.tail().next_doc_id() as usize;
+        let vectors = guard
+            .index
+            .as_ref()
+            .and_then(VectorIndex::as_segmented)
+            .map_or(0, |p| p.tail().len());
+        // A segment's artifacts cover the same rows, so a tail that holds
+        // both documents and vectors seals only at a moment when the two
+        // agree: the legacy two-call append (AddDocuments, then
+        // AddVectors for the same rows) is between its calls otherwise,
+        // and the seal waits for the vectors rather than sealing a
+        // document-only segment the vectors could never join.
+        if docs != 0 && vectors != 0 {
+            docs == vectors && docs >= bound
+        } else {
+            docs.max(vectors) >= bound
+        }
     }
 
     /// Seal the tail when it reached the configured size, so a long
@@ -5514,7 +5548,8 @@ impl NodeServiceImpl {
             if guard.exact_vectors.is_none()
                 && guard.index.as_ref().is_some_and(VectorIndex::is_empty)
             {
-                guard.exact_vectors = Some(ExactVectorStore::empty(Some(dim)));
+                let store = self.fresh_exact_store(guard.generation.as_ref(), dim)?;
+                guard.exact_vectors = Some(store);
             }
             if let Some(wal) = guard.wal.as_mut() {
                 wal.update_manifest(|manifest| {
@@ -5629,10 +5664,30 @@ impl NodeServiceImpl {
                      rebuild or backfill the generation before appending"
                 )));
             }
-            guard.exact_vectors = Some(ExactVectorStore::empty(Some(dim)));
+            let store = self.fresh_exact_store(guard.generation.as_ref(), dim)?;
+            guard.exact_vectors = Some(store);
         }
         let exact = guard.exact_vectors.as_ref().expect("ensured above");
         if exact.len() != index_len || exact.dim() != Some(dim) {
+            // On the segment layout the provider's length counts every
+            // catalog row, sealed document-only rows included: vectors
+            // arriving after such a seal have no segment to join.
+            let tail_len = guard
+                .index
+                .as_ref()
+                .and_then(VectorIndex::as_segmented)
+                .map_or(index_len, |p| p.tail().len());
+            let sealed_without_vectors = index_len
+                .saturating_sub(tail_len)
+                .saturating_sub(exact.len());
+            if sealed_without_vectors > 0 {
+                return Err(Status::failed_precondition(format!(
+                    "{sealed_without_vectors} rows are sealed in segments without vectors; \
+                     vectors seal with their documents, so send AddVectors for each \
+                     AddDocuments batch before the next (or ingest through IngestMapped), \
+                     or run this shard with --layout=single-image"
+                )));
+            }
             return Err(Status::failed_precondition(format!(
                 "exact-vector sidecar shape {:?}x{} does not match provider shape {dim}x{index_len}",
                 exact.dim(),
@@ -7723,7 +7778,8 @@ impl NodeServiceImpl {
                              sidecar; rebuild or backfill the generation before mapped ingest"
                         )));
                     }
-                    guard.exact_vectors = Some(ExactVectorStore::empty(Some(dim)));
+                    let store = self.fresh_exact_store(guard.generation.as_ref(), dim)?;
+                    guard.exact_vectors = Some(store);
                 }
                 let exact = guard.exact_vectors.as_ref().expect("ensured above");
                 if exact.len() != vector_tip as usize || exact.dim() != Some(dim) {

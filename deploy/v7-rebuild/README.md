@@ -64,6 +64,14 @@ WAVE=2 ./rebuild.sh down       # nodes flush on SIGTERM
 WAVE=2 ./rebuild.sh serve      # nodes on the built shards + coordinator
 ```
 
+The driver sends each shard's rows in blocks of `INGEST_BLOCK` chunks
+(default 8192): a block's documents, then the same rows' vectors, before
+the next block. On the segment layout the tail seals at `--seal-tail-docs`
+only when its document and vector counts agree, so the block is the
+longest a seal ever waits; sending every document before any vector would
+seal document-only segments the vectors can never join, and the first
+vector batch refuses that by name.
+
 `serve` will refuse to start a shard that still has a `.bm25.build`
 directory with no `.bm25` beside it, because `Flush` removes that
 directory on success and the pair can only mean an interrupted build. A
@@ -271,6 +279,7 @@ fleet:
 | `INGEST_SHARDS` | the shards the ingest stage feeds from this host (a driver needs only the nodes and the sidecar reachable) |
 | `EMB_BYTES` | the embeddings file's length, for hosts that do not hold the file; the cut plan needs only the length |
 | `SEAL_TAIL_DOCS` | documents per sealed segment (node default 500,000); lower it on a small host to bound ingest memory |
+| `INGEST_BLOCK` | rows per driver block (documents, then their vectors; driver default 8192) |
 
 A four-machine example (the plan in `sea-of-slop-search-parity/design-notes/
 fleet-4-machine-plan-2026-09.md`), with the sidecar, the coordinator, and

@@ -264,6 +264,9 @@ SIDECAR_ADDR=${SIDECAR_ADDR:-http://127.0.0.1:$SIDECAR_PORT}
 # The heap tail seals into a segment at this many documents (the node's
 # default is 500,000); a small host bounds its ingest memory by lowering it.
 SEAL_TAIL_DOCS=${SEAL_TAIL_DOCS:-}
+# Rows per driver block: a block's documents, then the same rows' vectors
+# (the driver's default is 8192; see README "Running it").
+INGEST_BLOCK=${INGEST_BLOCK:-}
 # The sidecar is started and probed here only when it lives on this host.
 is_local() { local x; for x in "${LOCAL[@]}"; do [[ $x == "$1" ]] && return 0; done; return 1; }
 sidecar_is_local() { [[ $SIDECAR_ADDR == http://127.0.0.1:* || $SIDECAR_ADDR == http://localhost:* ]]; }
@@ -469,6 +472,7 @@ stage_ingest() {
         --calibration="$OUT/calibration.json" \
         --first-shard="$i" --end-shard="$((i + 1))" \
         --analysis-addr="$SIDECAR_ADDR" \
+        ${INGEST_BLOCK:+--ingest-block="$INGEST_BLOCK"} \
         "${TLS_ARG_LIST[@]}" \
         >>"$LOGS/ingest-$i.log" 2>&1 &
       pids+=($!)

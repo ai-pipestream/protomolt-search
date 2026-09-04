@@ -52,7 +52,13 @@ says so. A segment catalog opens its sealed images mapped by default
 (`segments::VectorLoad::Mapped`); the tail and single-image shards stay
 owned, because they take writes. `--vector-mmap=false` (config
 `vector_mmap`) loads sealed images into memory instead. The exact FP32
-sidecar was already mapped (`docs/exact-vectors.md`) and is untouched.
+sidecar was already mapped and is untouched when serving. While a
+persisted shard ingests, the sidecar builds on disk beside its final
+path (`<sidecar>.building`): every appended row goes to that file, reads
+serve rows by offset, the payload digest runs as rows arrive, and a flush
+finalizes it in place (one header write, one rename), so an ingest of any
+length holds none of its FP32 rows in heap. An in-memory shard keeps a
+heap builder.
 
 `tests/segment_layout.rs` pins a segmented shard served mapped against the
 same shard served from memory (Search and Query hits and scores, bit for

@@ -3,14 +3,17 @@
 //! The vector provider owns its native index and score. This sidecar keeps the
 //! original row-major vectors in the product generation so a public dense
 //! query can select candidates with that provider and rescore the fixed pool
-//! with an ordinary FP32 dot product. Persisted stores are memory-mapped; a
-//! fresh or appended store remains a heap builder until [`ExactVectorStore::write`]
-//! atomically replaces the file and reopens it.
+//! with an ordinary FP32 dot product. Persisted stores are memory-mapped. A
+//! persisted shard builds its store on disk ([`ExactVectorStore::spilling`]):
+//! every appended row goes to the file [`ExactVectorStore::write`] later
+//! finalizes in place, so an ingest never holds its FP32 rows in heap. An
+//! in-memory shard keeps a heap builder until `write` persists it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const PAGE_BYTES: usize = 4096;
 const MIN_ROWS_PER_TASK: usize = 256;
@@ -36,6 +39,19 @@ enum Storage {
     Building {
         dim: Option<usize>,
         values: Vec<f32>,
+    },
+    /// An append-only builder on disk: the rows go straight to the file
+    /// that [`ExactVectorStore::write`] finalizes in place (header, then
+    /// a rename onto `target`). Reads serve rows by offset. The payload
+    /// digest runs as rows arrive, so finalizing costs one header write.
+    Spilled {
+        target: PathBuf,
+        path: PathBuf,
+        file: File,
+        dim: Option<usize>,
+        rows: usize,
+        digest: crate::sha256::Sha256,
+        finalized: AtomicBool,
     },
     Mapped {
         path: PathBuf,
@@ -72,6 +88,33 @@ impl ExactVectorStore {
                 values: Vec::new(),
             },
         }
+    }
+
+    /// An appendable empty store that builds on disk next to `target`
+    /// (`<target>.building`; a stale one from an interrupted run is
+    /// truncated). [`Self::write`] to `target` finalizes it in place.
+    pub fn spilling(target: &Path, dim: Option<usize>) -> io::Result<Self> {
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let path = spill_path(target);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        file.write_all_at(&[0u8; HEADER_BYTES], 0)?;
+        Ok(Self {
+            storage: Storage::Spilled {
+                target: target.to_path_buf(),
+                path,
+                file,
+                dim,
+                rows: 0,
+                digest: crate::sha256::Sha256::new(),
+                finalized: AtomicBool::new(false),
+            },
+        })
     }
 
     /// Build an in-memory store from row-major FP32 values.
@@ -183,6 +226,7 @@ impl ExactVectorStore {
     pub fn dim(&self) -> Option<usize> {
         match &self.storage {
             Storage::Building { dim, .. } => *dim,
+            Storage::Spilled { dim, .. } => *dim,
             Storage::Mapped { dim, .. } => Some(*dim),
         }
     }
@@ -190,8 +234,14 @@ impl ExactVectorStore {
     pub fn len(&self) -> usize {
         match &self.storage {
             Storage::Building { dim, values } => dim.map_or(0, |d| values.len() / d),
+            Storage::Spilled { rows, .. } => *rows,
             Storage::Mapped { rows, .. } => *rows,
         }
+    }
+
+    /// Whether the store builds on disk ([`Self::spilling`]).
+    pub fn is_spilled(&self) -> bool {
+        matches!(self.storage, Storage::Spilled { .. })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -205,12 +255,13 @@ impl ExactVectorStore {
     pub fn path(&self) -> Option<&Path> {
         match &self.storage {
             Storage::Mapped { path, .. } => Some(path),
-            Storage::Building { .. } => None,
+            Storage::Building { .. } | Storage::Spilled { .. } => None,
         }
     }
 
-    /// Append complete rows. A mapped store is materialized into the builder
-    /// only when a real append arrives; read-only serving stays mmap-backed.
+    /// Append complete rows. A mapped store becomes a disk builder beside
+    /// its own file (its payload copied, never decoded into heap) only
+    /// when a real append arrives; read-only serving stays mmap-backed.
     pub fn append(&mut self, vectors: &[f32], dim: usize) -> io::Result<()> {
         if vectors.is_empty() {
             return Ok(());
@@ -232,18 +283,59 @@ impl ExactVectorStore {
                 self.dim().expect("checked Some")
             )));
         }
-        if matches!(self.storage, Storage::Mapped { .. }) {
-            let values = self.decode_all();
-            self.storage = Storage::Building {
-                dim: Some(dim),
-                values,
+        if let Storage::Mapped { path, .. } = &self.storage {
+            let target = path.clone();
+            let mut spilled = Self::spilling(&target, Some(dim))?;
+            let Storage::Mapped { map, rows, .. } = &self.storage else {
+                unreachable!("matched above")
             };
+            let Storage::Spilled {
+                file,
+                rows: spilled_rows,
+                digest,
+                ..
+            } = &mut spilled.storage
+            else {
+                unreachable!("spilling() builds a Spilled store")
+            };
+            let payload = &map[HEADER_BYTES..];
+            for (i, chunk) in payload.chunks(1 << 20).enumerate() {
+                digest.update(chunk);
+                file.write_all_at(chunk, (HEADER_BYTES + (i << 20)) as u64)?;
+            }
+            *spilled_rows = *rows;
+            self.storage = std::mem::replace(
+                &mut spilled.storage,
+                Storage::Building {
+                    dim: None,
+                    values: Vec::new(),
+                },
+            );
         }
-        let Storage::Building { dim: known, values } = &mut self.storage else {
-            unreachable!("mapped store converted above")
-        };
-        *known = Some(dim);
-        values.extend_from_slice(vectors);
+        match &mut self.storage {
+            Storage::Building { dim: known, values } => {
+                *known = Some(dim);
+                values.extend_from_slice(vectors);
+            }
+            Storage::Spilled {
+                file,
+                dim: known,
+                rows,
+                digest,
+                ..
+            } => {
+                let mut bytes = Vec::with_capacity(vectors.len() * 4);
+                for value in vectors {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                let offset = HEADER_BYTES as u64 + (*rows as u64) * (dim as u64) * 4;
+                file.write_all_at(&bytes, offset)?;
+                digest.update(&bytes);
+                *known = Some(dim);
+                *rows += vectors.len() / dim;
+            }
+            Storage::Mapped { .. } => unreachable!("mapped store converted above"),
+        }
         Ok(())
     }
 
@@ -256,6 +348,30 @@ impl ExactVectorStore {
         let dim = self
             .dim()
             .ok_or_else(|| invalid("cannot persist an exact-vector store before dim is known"))?;
+        if let Storage::Spilled {
+            target,
+            path: spill,
+            file,
+            rows,
+            digest,
+            finalized,
+            ..
+        } = &self.storage
+        {
+            if target == path {
+                let payload_bytes = rows
+                    .checked_mul(dim)
+                    .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                    .ok_or_else(|| invalid("exact-vector payload size overflow"))?;
+                let header = make_header(dim, *rows, payload_bytes, digest.clone().finalize())?;
+                file.write_all_at(&header, 0)?;
+                file.sync_all()?;
+                std::fs::rename(spill, path)?;
+                crate::postings::fsync_parent(path)?;
+                finalized.store(true, Ordering::Release);
+                return Self::open(path);
+            }
+        }
         let rows = self.len();
         let payload_bytes = rows
             .checked_mul(dim)
@@ -279,6 +395,18 @@ impl ExactVectorStore {
                         }
                         digest.update(&bytes);
                         out.write_all(&bytes)?;
+                    }
+                }
+                Storage::Spilled { file, rows, .. } => {
+                    let payload_bytes = rows * dim * 4;
+                    let mut buf = vec![0u8; 1 << 20];
+                    let mut done = 0usize;
+                    while done < payload_bytes {
+                        let take = buf.len().min(payload_bytes - done);
+                        file.read_exact_at(&mut buf[..take], (HEADER_BYTES + done) as u64)?;
+                        digest.update(&buf[..take]);
+                        out.write_all(&buf[..take])?;
+                        done += take;
                     }
                 }
                 Storage::Mapped { map, .. } => {
@@ -506,6 +634,14 @@ impl ExactVectorStore {
                 let row = &values[slot * dim..(slot + 1) * dim];
                 dot(row, query)
             }
+            Storage::Spilled { file, .. } => {
+                let mut row = vec![0u8; dim * 4];
+                // A short read here is the file vanishing under the
+                // store (an operator removing the spill); zeros score
+                // zero rather than tearing the query down.
+                let _ = file.read_exact_at(&mut row, (HEADER_BYTES + slot * dim * 4) as u64);
+                dot_bytes(&row, query)
+            }
             Storage::Mapped { map, .. } => dot_mapped(
                 &map[HEADER_BYTES + slot * dim * 4..HEADER_BYTES + (slot + 1) * dim * 4],
                 query,
@@ -526,6 +662,16 @@ impl ExactVectorStore {
         }
         match &self.storage {
             Storage::Building { values, .. } => values[from * dim..to * dim].to_vec(),
+            Storage::Spilled { file, .. } => {
+                let mut bytes = vec![0u8; (to - from) * dim * 4];
+                let _ = file.read_exact_at(&mut bytes, (HEADER_BYTES + from * dim * 4) as u64);
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect()
+            }
             Storage::Mapped { map, .. } => map
                 [HEADER_BYTES + from * dim * 4..HEADER_BYTES + to * dim * 4]
                 .as_chunks::<4>()
@@ -535,18 +681,38 @@ impl ExactVectorStore {
                 .collect(),
         }
     }
+}
 
-    fn decode_all(&self) -> Vec<f32> {
-        match &self.storage {
-            Storage::Building { values, .. } => values.clone(),
-            Storage::Mapped { map, .. } => map[HEADER_BYTES..]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|bytes| f32::from_le_bytes(*bytes))
-                .collect(),
+impl Drop for ExactVectorStore {
+    fn drop(&mut self) {
+        if let Storage::Spilled {
+            path, finalized, ..
+        } = &self.storage
+        {
+            if !finalized.load(Ordering::Acquire) {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
+}
+
+/// The disk builder's file: beside its target, never the target itself,
+/// so an interrupted build cannot pass for a finished store.
+fn spill_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    name.push(".building");
+    PathBuf::from(name)
+}
+
+/// [`dot`] over little-endian bytes of unknown alignment: the same
+/// scalar accumulation in row order, so the bits match the heap path.
+fn dot_bytes(row: &[u8], query: &[f32]) -> f32 {
+    row.as_chunks::<4>()
+        .0
+        .iter()
+        .zip(query)
+        .map(|(bytes, q)| f32::from_le_bytes(*bytes) * q)
+        .sum()
 }
 
 /// The rerank's dot product: scalar accumulation in row order, so every
@@ -642,6 +808,87 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The disk builder appends straight to its file, reads rows back
+    /// bit for bit, scores like the heap builder, finalizes in place
+    /// (one header write, one rename) with the payload digest it kept
+    /// while appending, and leaves nothing behind when dropped
+    /// unfinalized.
+    #[test]
+    fn spilled_builder_matches_the_heap_builder_and_finalizes_in_place() {
+        let dir = std::env::temp_dir().join(format!("pm-exact-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("gen").join("vectors.f32");
+        let dim = 5;
+        let rows: Vec<f32> = (0..dim * 37).map(|i| (i as f32 * 0.37).sin()).collect();
+
+        let mut heap = ExactVectorStore::empty(Some(dim));
+        let mut spilled = ExactVectorStore::spilling(&target, None).unwrap();
+        assert!(spilled.is_spilled());
+        assert_eq!(spilled.len(), 0);
+        for batch in rows.chunks(dim * 7) {
+            heap.append(batch, dim).unwrap();
+            spilled.append(batch, dim).unwrap();
+        }
+        assert_eq!(spilled.len(), 37);
+        assert_eq!(spilled.dim(), Some(dim));
+        assert_eq!(spilled.row_values(3, 11), heap.row_values(3, 11));
+        assert_eq!(spilled.row_values(0, 37), rows);
+        let query: Vec<f32> = (0..dim).map(|i| 0.5 - i as f32 * 0.1).collect();
+        let slots = [36usize, 0, 17, 5];
+        assert_eq!(
+            spilled.score_slots(&query, &slots).unwrap(),
+            heap.score_slots(&query, &slots).unwrap()
+        );
+        let spill_file = spill_path(&target);
+        assert!(spill_file.exists());
+        assert!(!target.exists());
+
+        let mapped = spilled.write(&target).unwrap();
+        assert!(mapped.is_mapped());
+        assert!(target.exists(), "finalized in place");
+        assert!(!spill_file.exists(), "renamed onto the target");
+        mapped.verify_payload().unwrap();
+        assert_eq!(mapped.row_values(0, 37), rows);
+        let expected = heap.write(&dir.join("heap.f32")).unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            std::fs::read(dir.join("heap.f32")).unwrap(),
+            "the same bytes either way"
+        );
+        assert_eq!(expected.len(), mapped.len());
+        drop(spilled);
+        assert!(
+            target.exists(),
+            "dropping a finalized builder keeps the store"
+        );
+
+        // Appending to the mapped store builds on disk again beside it.
+        let mut reopened = ExactVectorStore::open(&target).unwrap();
+        reopened.append(&rows[..dim], dim).unwrap();
+        assert!(reopened.is_spilled());
+        assert_eq!(reopened.len(), 38);
+        assert_eq!(reopened.row_values(37, 38), &rows[..dim]);
+        assert_eq!(reopened.row_values(0, 37), rows);
+        let grown = reopened.write(&target).unwrap();
+        assert_eq!(grown.len(), 38);
+        grown.verify_payload().unwrap();
+
+        // Writing a spilled store to ANOTHER path copies it there and
+        // leaves the builder in place.
+        let mut other = ExactVectorStore::spilling(&dir.join("other.f32"), Some(dim)).unwrap();
+        other.append(&rows, dim).unwrap();
+        let elsewhere = other.write(&dir.join("copy.f32")).unwrap();
+        elsewhere.verify_payload().unwrap();
+        assert_eq!(elsewhere.row_values(0, 37), rows);
+        assert!(spill_path(&dir.join("other.f32")).exists());
+        drop(other);
+        assert!(
+            !spill_path(&dir.join("other.f32")).exists(),
+            "an unfinalized builder removes its file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn round_trip_is_mapped_and_scores_fp32() {

@@ -1154,6 +1154,150 @@ async fn slow_shard(
     (addr, handle, index_path)
 }
 
+/// The batched form of the legacy append: one AddDocuments stream for
+/// `rows`, then one AddVectors stream for the same rows, unkeyed (ids
+/// and slots align by order within the block).
+async fn add_block(client: &mut NodeServiceClient<Channel>, rows: &[Row]) {
+    let docs: Vec<AddDocumentsRequest> = rows
+        .iter()
+        .map(|row| AddDocumentsRequest {
+            text: row.text.clone(),
+            lineage: Some(DocLineage {
+                parent_id: row.num as u64,
+                ..Default::default()
+            }),
+            facets: vec![FacetValue {
+                field: "grp".into(),
+                value: row.grp.to_string(),
+            }],
+            integers: vec![IntegerValue {
+                field: "num".into(),
+                value: row.num,
+            }],
+            ..Default::default()
+        })
+        .collect();
+    let added = client
+        .add_documents(tokio_stream::iter(docs))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(added.added as usize, rows.len());
+    let vectors: Vec<f32> = rows.iter().flat_map(|row| row.vector.clone()).collect();
+    let added = client
+        .add_vectors(tokio_stream::iter([AddVectorsRequest {
+            vectors,
+            dim: DIM as u32,
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(added.added as usize, rows.len());
+}
+
+/// The rebuild driver's order on the segment layout: the backend is
+/// configured first, then documents and vectors arrive in blocks. The
+/// seal bound lands mid-block, so the tail must wait for the block's
+/// vectors before sealing; every sealed segment then carries its
+/// vectors and FP32 rows, and the flush succeeds. The old order (every
+/// document, then every vector) seals document-only segments the
+/// vectors can never join, which the first vector batch refuses by
+/// name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let dir = tempdir("blocks");
+    let sample = unit_vectors(64, DIM, SEED);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
+    let rows: Vec<Row> = (0..320).map(|i| row(i, false)).collect();
+
+    // Blocks of 64 with a seal bound of 100: the bound falls inside the
+    // second block (128 documents against 64 vectors).
+    let index_path = dir.join("blocks.vector");
+    let (addr, handle) = start_empty_node(NodeConfig {
+        seal_tail_docs: 100,
+        ..config(Some(index_path.clone()), Layout::Segments, &analysis)
+    })
+    .await;
+    calibrate(&addr, &shift, &scale).await;
+    let mut blocks = client(&addr).await;
+    for block in rows.chunks(64) {
+        add_block(&mut blocks, block).await;
+    }
+    let health = blocks.health(HealthRequest {}).await.unwrap().into_inner();
+    assert_eq!(health.num_vectors, 320);
+    assert_eq!(health.bm25_docs, 320);
+    let root = pipestream_search::node::segments_root(&index_path);
+    let set = pipestream_search::segments::OpenedSegmentSet::open(&root).unwrap();
+    assert!(
+        set.len() >= 2,
+        "the bound sealed segments during ingest: {}",
+        set.len()
+    );
+    let mut sealed_rows = 0usize;
+    for i in 0..set.len() {
+        let image = set
+            .vector(i)
+            .unwrap_or_else(|| panic!("segment {i} sealed without its vectors"));
+        assert_eq!(
+            image.len(),
+            set.metadata(i).rows as usize,
+            "segment {i} rows carry vectors"
+        );
+        sealed_rows += set.metadata(i).rows as usize;
+    }
+    assert!(
+        sealed_rows >= 200 && sealed_rows.is_multiple_of(64),
+        "sealed at block edges: {sealed_rows}"
+    );
+    let flushed = blocks.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert_eq!(flushed.num_vectors, 320);
+    assert_eq!(flushed.num_documents, 320);
+    let exact = pipestream_search::exact_vectors::ExactVectorStore::open(
+        &pipestream_search::node::exact_vector_sidecar_path(&index_path),
+    );
+    if let Ok(exact) = exact {
+        assert_eq!(exact.len(), 320);
+        exact.verify_payload().unwrap();
+    }
+    handle.abort();
+
+    // Documents first, every one of them, then vectors.
+    let other_path = dir.join("docs-first.vector");
+    let (addr, handle) = start_empty_node(NodeConfig {
+        seal_tail_docs: 100,
+        ..config(Some(other_path.clone()), Layout::Segments, &analysis)
+    })
+    .await;
+    calibrate(&addr, &shift, &scale).await;
+    let mut docs_first = client(&addr).await;
+    for r in &rows[..250] {
+        add_document(&mut docs_first, r).await;
+    }
+    let vectors: Vec<f32> = rows[..250].iter().flat_map(|r| r.vector.clone()).collect();
+    let status = docs_first
+        .add_vectors(tokio_stream::iter([AddVectorsRequest {
+            vectors,
+            dim: DIM as u32,
+        }]))
+        .await
+        .expect_err("vectors after document-only seals");
+    assert_eq!(
+        status.code(),
+        tonic::Code::FailedPrecondition,
+        "{}",
+        status.message()
+    );
+    assert!(
+        status
+            .message()
+            .contains("sealed in segments without vectors"),
+        "{}",
+        status.message()
+    );
+    handle.abort();
+}
+
 /// A legacy two-RPC append caught between its calls holds the cut: the
 /// compaction waits at the row boundary and, when the row never completes,
 /// refuses naming the counts; once the vector lands, the same call runs.

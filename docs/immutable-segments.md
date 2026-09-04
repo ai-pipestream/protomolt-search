@@ -50,10 +50,18 @@ bounds a segment: the ingest loop checks the tail between documents and
 seals a full tail before applying the next one, so one long AddDocuments
 stream produces segments of at most that many rows without waiting for the
 stream's end (a vectors-only stream checks between batches). 0 seals on
-flush only. A tail whose document and vector rows disagree refuses to seal
-by name (a segment's artifacts cover the same rows); mapped ingest keeps
-them aligned. A documents-only shard seals documents-only segments (no
-vector artifact); the catalog and its collectors accept them.
+flush only. A tail that holds both documents and vectors seals at the
+bound only at a moment when the two counts agree: the legacy two-call
+append (AddDocuments, then AddVectors for the same rows) is between its
+calls otherwise, and the seal waits for the vectors rather than sealing a
+document-only segment they could never join, so a driver that sends its
+rows in blocks (the rebuild driver's `--ingest-block`) never waits longer
+than one block. A flush with disagreeing counts refuses by name (a
+segment's artifacts cover the same rows); mapped ingest keeps them
+aligned. Vectors that arrive after document-only rows were sealed are
+refused by name ("rows are sealed in segments without vectors"). A
+documents-only shard seals documents-only segments (no vector artifact);
+the catalog and its collectors accept them.
 
 A sealed segment's vector image is served from its file through a memory
 map by default (`docs/mmap-vectors.md`; `--vector-mmap=false` loads it into

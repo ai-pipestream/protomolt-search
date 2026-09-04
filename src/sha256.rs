@@ -10,6 +10,7 @@
 //! digest either matches the registered bytes or it does not.
 
 /// Streaming SHA-256 state.
+#[derive(Clone, Debug)]
 pub struct Sha256 {
     state: [u32; 8],
     /// Total message length in bytes.
