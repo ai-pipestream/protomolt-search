@@ -19,6 +19,11 @@
 //!     --default-target=990000 --out=/etc/protomolt/dense-quality.toml
 //! ```
 //!
+//! `--ground-truth=brute-raw:<rows file>` maps a raw little-endian f32
+//! rows file instead of reading it, for a corpus larger than memory;
+//! `--export-raw=<out> --queries=<court .bin>` writes one from the court
+//! format and exits.
+//!
 //! `--ground-truth=full-depth` (the default) takes the exhaustive FP32
 //! order from the route itself at `selection_k = corpus rows`, which the
 //! coordinator refuses above its `--max-k`; `brute:<rows file>` computes
@@ -114,6 +119,59 @@ fn read_rows(path: &Path, dim: Option<u32>) -> Result<(u32, Vec<f32>), Error> {
     Ok((dim, rows))
 }
 
+/// Raw rows are little-endian; mapping them as f32 needs the host to be.
+const _: () = assert!(cfg!(target_endian = "little"));
+
+/// The brute-force rows: read into memory, or a raw rows file mapped.
+enum BruteRows {
+    Owned(Vec<f32>),
+    Mapped(memmap2::Mmap),
+}
+
+impl BruteRows {
+    fn rows(&self) -> &[f32] {
+        match self {
+            BruteRows::Owned(rows) => rows,
+            BruteRows::Mapped(map) => {
+                // A mapping is page-aligned and its length was checked to
+                // be a multiple of the row stride, so the bytes are whole
+                // f32 values on a little-endian host (pinned below).
+                let (head, floats, tail) = unsafe { map.align_to::<f32>() };
+                assert!(
+                    head.is_empty() && tail.is_empty(),
+                    "mapping is not f32-aligned"
+                );
+                floats
+            }
+        }
+    }
+}
+
+/// Stream a court embeddings file's vectors into a raw little-endian f32
+/// rows file (`--export-raw`), the input `brute-raw:` maps.
+fn export_raw(from: &Path, to: &Path) -> Result<u64, Error> {
+    use std::io::Write;
+    let (dim, reader) = court::EmbeddingReader::open(from)?;
+    let mut out = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(to)?);
+    let mut rows = 0u64;
+    for record in reader {
+        let record = record?;
+        if record.vector.len() != dim as usize {
+            return Err(format!(
+                "row {rows}: {} floats, header says {dim}",
+                record.vector.len()
+            )
+            .into());
+        }
+        for value in &record.vector {
+            out.write_all(&value.to_le_bytes())?;
+        }
+        rows += 1;
+    }
+    out.flush()?;
+    Ok(rows)
+}
+
 /// A seeded partial Fisher-Yates over the row indexes: the first `sample`
 /// positions after shuffling, in shuffled order. splitmix64 keeps the
 /// choice reproducible from `seed` alone.
@@ -144,6 +202,12 @@ fn sample_rows(rows: &[f32], dim: usize, sample: usize, seed: u64) -> Vec<f32> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    if let Some(to) = arg("export-raw") {
+        let from = required("queries")?;
+        let rows = export_raw(Path::new(&from), Path::new(&to))?;
+        println!("{rows} rows from {from} written as raw f32 rows to {to}");
+        return Ok(());
+    }
     let coord = required("coord")?;
     let collection = arg("collection").unwrap_or_default();
     let queries_path = required("queries")?;
@@ -173,8 +237,11 @@ async fn main() -> Result<(), Error> {
     );
     let brute_rows = match ground_truth_arg.as_str() {
         "full-depth" => None,
-        other => match other.strip_prefix("brute:") {
-            Some(path) => {
+        other => match (
+            other.strip_prefix("brute:"),
+            other.strip_prefix("brute-raw:"),
+        ) {
+            (Some(path), _) => {
                 let (rows_dim, rows) = read_rows(Path::new(path), dim_hint)?;
                 if rows_dim != dim {
                     return Err(format!(
@@ -186,18 +253,40 @@ async fn main() -> Result<(), Error> {
                     "brute ground truth over {} rows from {path}",
                     rows.len() / dim as usize
                 );
-                Some(rows)
+                Some(BruteRows::Owned(rows))
             }
-            None => {
+            (_, Some(path)) => {
+                // A raw little-endian f32 rows file, mapped rather than
+                // read: the full court corpus is 89 GB of rows, more than
+                // this box holds twice over, and the page cache serves
+                // the one pass the ground truth makes.
+                let file = std::fs::File::open(path)?;
+                let map = unsafe { memmap2::Mmap::map(&file)? };
+                let stride = dim as usize * 4;
+                if map.is_empty() || !map.len().is_multiple_of(stride) {
+                    return Err(format!(
+                        "{path}: {} bytes is not a positive multiple of {stride} (dimensions={dim} x 4)",
+                        map.len()
+                    )
+                    .into());
+                }
+                eprintln!(
+                    "brute ground truth over {} mapped rows from {path}",
+                    map.len() / stride
+                );
+                Some(BruteRows::Mapped(map))
+            }
+            (None, None) => {
                 return Err(format!(
-                    "--ground-truth={other:?}: expected full-depth or brute:<rows file>"
+                    "--ground-truth={other:?}: expected full-depth, brute:<rows file>, or \
+                     brute-raw:<raw f32 rows file>"
                 )
                 .into())
             }
         },
     };
     let ground_truth = match &brute_rows {
-        Some(rows) => GroundTruth::Brute { rows },
+        Some(rows) => GroundTruth::Brute { rows: rows.rows() },
         None => GroundTruth::FullDepth,
     };
 
