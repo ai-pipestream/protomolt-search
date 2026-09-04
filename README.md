@@ -387,6 +387,10 @@ Facet and map dictionaries are written in byte order too, so CEL string
 ordering (`court < "b"`) and `startsWith` compile to one ordinal range;
 a file with an older first-seen dictionary serves equality and refuses
 ordering by name. See [`docs/prefix-terms.md`](docs/prefix-terms.md).
+The same sorted dictionary serves autocomplete: `Suggest` returns the
+terms under a prefix ranked by df summed over the shards, exactly the
+monolithic answer, and refuses past `max_scan` naming the count. See
+[`docs/suggest.md`](docs/suggest.md).
 
 Server-side highlighting (`HighlightSpec` on `Bm25Search` and on the
 lexical `Query` leaf) returns sentence-bounded snippets per hit with the
@@ -1186,6 +1190,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Landed 2026-09-04: autocomplete.** `SearchService.Suggest` and the
+  `SuggestTerms` shard scan complete a prefix over any indexed BM25 field's
+  byte-sorted dictionary, ranked by summed posting df, ties in term bytes;
+  the prefix folds under the field's char filters and is never stemmed,
+  `max_scan` refuses past the bound naming the count, and the response says
+  when df still counts tombstoned rows. Details and test evidence:
+  [Autocomplete over the sorted dictionary](docs/suggest.md).
 - **Landed 2026-09-03: mmap vector index.** Sealed segment images use the
   `turbovec-pipestream-s20` mapped reader, linear large-k chunk merge, and
   bounded blocked-layout cache;

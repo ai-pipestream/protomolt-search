@@ -496,6 +496,7 @@ The underlying routes:
 | One candidate-scoped lexical boost | `BoostRescore` |
 | Bounded value functions during lexical selection | `ScoreStage` |
 | Named raw leg provenance | `HybridHit.vector_score`, `bm25_score`, and `boost_score` |
+| Autocomplete over one field's dictionary, ranked by summed df | `Suggest` (`docs/suggest.md`), outside `Query`: it returns terms, not hits |
 
 The adapter must execute those ordinary paths rather than fork their scoring
 logic. Vector-plus-CEL has since acquired its ordinary path

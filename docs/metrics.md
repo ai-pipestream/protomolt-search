@@ -32,10 +32,12 @@ traffic, not silence):
     turbovec_requests_total{rpc="search_shard" | "stream_search" |
         "hybrid_shard" | "shard_legs" | "bm25_query" | "term_stats" |
         "vector_rescore" | "bm25_rescore" | "get_documents" |
-        "add_documents" | "add_vectors"}
+        "add_documents" | "add_vectors" | "suggest_terms" | "suggest"}
 
 (`bm25_query` counts both the unary and the streaming transport of the
-same query.)
+same query. `suggest_terms` is the node's dictionary scan and `suggest`
+the coordinator's public route, `docs/suggest.md`; a coordinator process
+exports the latter, a node process the former.)
 
 Vector-scan work, folded in once per completed scan on every route
 through the scheduler (batched or solo):

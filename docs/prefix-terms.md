@@ -45,6 +45,12 @@ Prefixes on a composite strategy, a boolean clause, a boost, or a
 `PhraseSearch` field refuse by name, as does a top-level prefix list on a
 fused request (put it on the `QueryField` it expands in).
 
+The same lower bound and bounded scan serve autocomplete:
+`SearchService.Suggest` (`docs/suggest.md`) returns the terms under a
+prefix ranked by df summed over the shards, normalized under the same
+char-filter chain and never the stemmer, with `max_scan` playing the
+cap's role — past it the request refuses naming the count.
+
 ## String ranges and prefixes in CEL
 
 `docs/cel-filters.md` recorded string ordering as blocked on the sorted
