@@ -561,21 +561,16 @@ impl DurableControlPlane {
             .checked_add(1)
             .ok_or_else(|| Status::resource_exhausted("control revision overflow"))?;
         let before = state.clone();
-        let node = Self::validate_lease(&mut state, &request.node_id, request.lease_token, now)?;
+        let node_addr =
+            Self::validate_lease(&mut state, &request.node_id, request.lease_token, now)?
+                .addr
+                .clone();
         if !replica.node_id.is_empty() && replica.node_id != request.node_id {
             return Err(Status::invalid_argument(
                 "shard report node_id differs from the lease owner",
             ));
         }
-        let addr = if replica.addr.is_empty() {
-            node.addr.clone()
-        } else if replica.addr != node.addr {
-            return Err(Status::invalid_argument(
-                "shard report addr differs from the registered node addr",
-            ));
-        } else {
-            replica.addr
-        };
+        let addr = Self::shard_addr(&state, &request.node_id, &node_addr, replica.addr)?;
         let key = replica_key(&replica.shard_id, &request.node_id);
         state.replicas.insert(
             key,
@@ -605,6 +600,34 @@ impl DurableControlPlane {
         Ok(())
     }
 
+    /// The listener a reported copy is served on: the node's registered
+    /// address when the report leaves it empty, else the address the
+    /// report names — the lease owner vouches for its own listeners
+    /// (one per shard, one per placed replica), and another node's
+    /// registered address is not one of them.
+    fn shard_addr(
+        state: &StoredState,
+        node_id: &str,
+        node_addr: &str,
+        reported: String,
+    ) -> Result<String, Status> {
+        if reported.is_empty() {
+            return Ok(node_addr.to_string());
+        }
+        if let Some(other) = state
+            .nodes
+            .values()
+            .find(|other| other.node_id != node_id && other.addr == reported)
+        {
+            return Err(Status::invalid_argument(format!(
+                "shard addr {reported:?} is the registered address of node {:?}, not a listener \
+                 of node {node_id:?}",
+                other.node_id
+            )));
+        }
+        Ok(reported)
+    }
+
     fn checked_output(
         state: &StoredState,
         target_node_id: &str,
@@ -625,19 +648,13 @@ impl DurableControlPlane {
                 "action output node_id differs from the assigned target",
             ));
         }
-        let node = state
+        let node_addr = state
             .nodes
             .get(target_node_id)
-            .ok_or_else(|| Status::failed_precondition("action target is no longer registered"))?;
-        let addr = if output.addr.is_empty() {
-            node.addr.clone()
-        } else if output.addr == node.addr {
-            output.addr
-        } else {
-            return Err(Status::invalid_argument(
-                "action output addr differs from the registered target",
-            ));
-        };
+            .ok_or_else(|| Status::failed_precondition("action target is no longer registered"))?
+            .addr
+            .clone();
+        let addr = Self::shard_addr(state, target_node_id, &node_addr, output.addr)?;
         let role = match ShardReplicaRole::try_from(output.role) {
             Ok(ShardReplicaRole::Primary) => StoredRole::Primary,
             Ok(ShardReplicaRole::Replica) => StoredRole::Replica,
@@ -1568,6 +1585,17 @@ impl DurableControlPlane {
                 .iter()
                 .map(|topology| topology.generation)
                 .collect(),
+            topology: state
+                .topology
+                .routes
+                .iter()
+                .map(|route| crate::pb::PublishedTopologyShard {
+                    addr: route.addr.clone(),
+                    replica: route.replica.clone().unwrap_or_default(),
+                    hash_lo: route.hash_lo,
+                    hash_hi: route.hash_hi,
+                })
+                .collect(),
         }
     }
 }
@@ -2021,6 +2049,53 @@ mod tests {
         assert_eq!(published.replicas.len(), 1);
         assert_eq!(published.replicas[0].node_id, target.node_id);
         assert_eq!(published.replicas[0].role, ShardReplicaRole::Primary as i32);
+    }
+
+    #[test]
+    fn a_report_names_its_own_listener_but_not_another_nodes_address() {
+        let plane = DurableControlPlane::in_memory(ControlPolicy {
+            replication_factor: 1,
+            ..Default::default()
+        });
+        let a = register(&plane, "a", "http://a:1", "az-a", 100);
+        let _b = register(&plane, "b", "http://b:1", "az-b", 100);
+        let report = |addr: &str| ReportShardRequest {
+            collection: String::new(),
+            node_id: a.node_id.clone(),
+            lease_token: a.lease_token,
+            replica: Some(ShardReplicaState {
+                shard_id: "s0".into(),
+                addr: addr.into(),
+                hash_hi: u64::MAX,
+                rows: 10,
+                role: ShardReplicaRole::Primary as i32,
+                ready: true,
+                scoring_fingerprint: "score-v1".into(),
+                analysis_fingerprint: "analysis-v1".into(),
+                ..Default::default()
+            }),
+        };
+        // A second listener of the same node is the shard's address.
+        plane.report(report("http://a:2"), 100).unwrap();
+        let (plan, _) = plane.reconcile(false, 100).unwrap();
+        assert_eq!(plan.replicas[0].addr, "http://a:2");
+        assert_eq!(plan.topology.len(), 1);
+        assert_eq!(plan.topology[0].addr, "http://a:2");
+        assert_eq!(
+            (plan.topology[0].hash_lo, plan.topology[0].hash_hi),
+            (0, u64::MAX)
+        );
+        // Empty falls back to the registered address.
+        plane.report(report(""), 100).unwrap();
+        assert_eq!(plane.plan().unwrap().replicas[0].addr, "http://a:1");
+        // Another node's registered address is not a listener of a.
+        let error = plane.report(report("http://b:1"), 100).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error.message().contains("registered address of node \"b\""),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]

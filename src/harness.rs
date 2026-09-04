@@ -253,9 +253,14 @@ async fn start_node_inner(
     config: NodeConfig,
     phrases: Option<std::sync::Arc<crate::phrases::PhraseIndex>>,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
+    serve_node(NodeServiceImpl::new(index, config).with_phrase_index(phrases)).await
+}
+
+/// Serve an already-built node service on 127.0.0.1:0. Returns its
+/// `http://` address and the server task (abort to stop).
+pub async fn serve_node(node: NodeServiceImpl) -> (String, JoinHandle<Result<(), TransportError>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let node = NodeServiceImpl::new(index, config).with_phrase_index(phrases);
     // The UDP floor lane shares the gRPC listener's host:port.
     node.spawn_floor_listener(addr);
     let handle = tokio::spawn(

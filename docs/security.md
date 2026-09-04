@@ -118,6 +118,11 @@ reconcile, plan, rollback) require a client certificate when the
 listener runs TLS with a client CA: `ClusterControlService::membership`
 refuses a call without one as `UNAUTHENTICATED` — "a bearer token is
 not membership". The collection set applies the same rule per member.
+A node's own control channel (`--node-id` with `--control-addr`,
+`docs/cluster-control.md`) is opened under the same process-wide client
+material, so a registering node presents `--tls-client-cert`; the
+listeners it opens for placed replicas carry the node's server identity
+and demand a client certificate like every node listener.
 
 ## Refusals, named
 

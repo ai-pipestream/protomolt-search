@@ -34,6 +34,7 @@ use pipestream_search::control_plane::{ClusterControlService, ControlPolicy, Dur
 use pipestream_search::coordinator::{CoordinatorServiceImpl, TopologyRoute};
 use pipestream_search::harness;
 use pipestream_search::node::{NodeConfig, NodeServiceImpl};
+use pipestream_search::node_agent::{NodeAgent, NodeAgentConfig, ServedShard};
 use pipestream_search::pb::cluster_control_server::ClusterControl;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
@@ -123,6 +124,38 @@ fn load_shard_index(
     Ok(Some(index))
 }
 
+/// The `(host, port)` a registered node advertises: `--advertise-addr`,
+/// else the first shard listener when it binds a concrete interface.
+fn resolve_advertise(
+    cfg: &Config,
+    membership: &pipestream_search::config::NodeMembershipConfig,
+) -> Result<(String, u16), String> {
+    if let Some(addr) = &membership.advertise_addr {
+        let (host, port) = addr
+            .rsplit_once(':')
+            .ok_or_else(|| format!("--advertise-addr={addr:?} is not host:port"))?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|e| format!("--advertise-addr={addr:?}: {e}"))?;
+        return Ok((
+            host.trim_matches(|c| c == '[' || c == ']').to_string(),
+            port,
+        ));
+    }
+    let first = cfg
+        .shards
+        .first()
+        .ok_or_else(|| "--node-id with no shards needs --advertise-addr".to_string())?;
+    if first.listen.ip().is_unspecified() {
+        return Err(format!(
+            "shard listener {} binds every interface; pass --advertise-addr=host:port so the \
+             control plane and other nodes can reach this node",
+            first.listen
+        ));
+    }
+    Ok((first.listen.ip().to_string(), first.listen.port()))
+}
+
 /// Wait for SIGINT or SIGTERM (whichever comes first).
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -150,6 +183,15 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = Vec::new();
     let mut node_services = Vec::new();
+    // Membership (docs/cluster-control.md): one agent per collection the
+    // configured shards name, each reporting its shards under their own
+    // listener addresses.
+    let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut served: Vec<(String, ServedShard)> = Vec::new();
+    let advertise = match &cfg.membership {
+        Some(membership) => Some(resolve_advertise(&cfg, membership)?),
+        None => None,
+    };
     let phrase_index = cfg
         .phrase_glossary
         .as_ref()
@@ -217,13 +259,30 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     .with_phrase_index(phrase_index.clone())
             } else {
                 NodeServiceImpl::open(node_config, phrase_index.clone(), cfg.allow_missing_bm25)?
-            };
+            }
+            .with_flush_notify(std::sync::Arc::clone(&flush_notify));
             let listener = TcpListener::bind(shard.listen).await?;
             let addr: SocketAddr = listener.local_addr()?;
             // The UDP stream-signal lane shares the gRPC listener's host:port.
             node.spawn_floor_listener(addr);
             node_services.push(node.clone());
             eprintln!("NodeService listening on {addr}");
+            if let Some((host, _)) = &advertise {
+                let scheme = if cfg.tls.is_some() { "https" } else { "http" };
+                let shard_id = shard
+                    .shard_id
+                    .clone()
+                    .unwrap_or_else(|| format!("slot-{}", shard.slot_offset));
+                served.push((
+                    shard.collection.clone(),
+                    ServedShard::configured(
+                        shard_id,
+                        node.clone(),
+                        format!("{scheme}://{host}:{}", addr.port()),
+                        shard.hash_range,
+                    ),
+                ));
+            }
             let max = cfg.max_message_bytes;
             let mut shutdown = shutdown_rx.clone();
             handles.push(tokio::spawn(
@@ -238,6 +297,116 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                         },
                     ),
             ));
+        }
+    }
+
+    if let (Some(membership), Some((host, port))) = (&cfg.membership, &advertise) {
+        let scheme = if cfg.tls.is_some() { "https" } else { "http" };
+        let mut by_collection: std::collections::BTreeMap<String, Vec<ServedShard>> =
+            std::collections::BTreeMap::new();
+        for (collection, shard) in served {
+            by_collection.entry(collection).or_default().push(shard);
+        }
+        if by_collection.is_empty() {
+            by_collection.insert(String::new(), Vec::new());
+        }
+        let template = NodeConfig {
+            udp_hmac_key: cfg.udp_hmac_key.clone(),
+            layout: cfg.layout,
+            vector_mmap: cfg.vector_mmap,
+            seal_tail_docs: cfg.seal_tail_docs,
+            chunk_blocks: cfg.chunk_blocks,
+            share_floors: cfg.share_floors,
+            block_max: cfg.block_max,
+            coalesce: cfg.coalesce,
+            scan_parallel: cfg.scan_parallel,
+            rerank_parallel: cfg.rerank_parallel,
+            floor_delta: cfg.floor_delta,
+            floor_warmup_chunks: cfg.floor_warmup_chunks,
+            floor_min_interval_ms: cfg.floor_min_interval_ms,
+            bit_width: cfg.bit_width,
+            analysis_addr: cfg
+                .shards
+                .first()
+                .and_then(|s| s.analysis_addr.clone())
+                .or_else(|| cfg.analysis_addr.clone()),
+            bm25_fields: cfg.bm25_fields.clone(),
+            facet_fields: cfg.facet_fields.clone(),
+            numeric_fields: cfg.numeric_fields.clone(),
+            map_facet_fields: cfg.map_facet_fields.clone(),
+            map_numeric_fields: cfg.map_numeric_fields.clone(),
+            integer_fields: cfg.integer_fields.clone(),
+            geo_fields: cfg.geo_fields.clone(),
+            position_fields: cfg.position_fields.clone(),
+            bigram_fields: cfg.bigram_fields.clone(),
+            sentence_fields: cfg.sentence_fields.clone(),
+            vector_backend: cfg
+                .shards
+                .first()
+                .map(|s| s.vector_backend.clone())
+                .unwrap_or_else(|| pipestream_search::vector::EMBEDDED_TURBOVEC.to_string()),
+            wal_buckets: cfg.shards.first().map_or(64, |s| s.wal_buckets),
+            vocab_window_docs: cfg.vocab_window_docs,
+            vocab_top_k: cfg.vocab_top_k,
+            ..NodeConfig::default()
+        };
+        let replica_listen = membership.replica_listen.unwrap_or_else(|| {
+            SocketAddr::new(
+                cfg.shards
+                    .first()
+                    .map_or(std::net::IpAddr::from([0, 0, 0, 0]), |s| s.listen.ip()),
+                0,
+            )
+        });
+        for (collection, shards) in by_collection {
+            let agent = NodeAgent::new(
+                NodeAgentConfig {
+                    node_id: membership.node_id.clone(),
+                    control_addr: membership.control_addr.clone(),
+                    collection: collection.clone(),
+                    failure_domain: membership.failure_domain.clone(),
+                    data_dir: membership.data_dir.clone(),
+                    node_addr: format!("{scheme}://{host}:{port}"),
+                    advertise_host: host.clone(),
+                    replica_listen,
+                    lease_ms: membership.lease_ms,
+                    report_ms: membership.report_ms,
+                    reconcile_ms: membership.reconcile_ms,
+                    lag_bound: membership.lag_bound,
+                    scan_parallel: cfg.scan_parallel,
+                    template: NodeConfig {
+                        collection: collection.clone(),
+                        ..template.clone()
+                    },
+                    phrase_index: phrase_index.clone(),
+                    allow_missing_bm25: cfg.allow_missing_bm25,
+                    tls: cfg.tls.clone(),
+                    max_message_bytes: cfg.max_message_bytes,
+                },
+                shards,
+            );
+            // The configured shards' flushes wake this agent's reporter.
+            let notify = agent.flush_notify();
+            let wake = std::sync::Arc::clone(&flush_notify);
+            tokio::spawn(async move {
+                loop {
+                    wake.notified().await;
+                    notify.notify_one();
+                }
+            });
+            eprintln!(
+                "node {:?}: membership at {} (collection {:?}, data dir {})",
+                membership.node_id,
+                membership.control_addr,
+                collection,
+                membership.data_dir.display()
+            );
+            for handle in agent.start(shutdown_rx.clone()) {
+                handles.push(tokio::spawn(async move {
+                    let _ = handle.await;
+                    Ok(())
+                }));
+            }
         }
     }
 

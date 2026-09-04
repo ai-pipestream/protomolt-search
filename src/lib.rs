@@ -51,6 +51,8 @@ pub mod mapping;
 pub mod merge;
 pub mod metrics;
 pub mod node;
+#[cfg(feature = "net")]
+pub mod node_agent;
 pub mod pb;
 pub mod phrases;
 pub mod postings;

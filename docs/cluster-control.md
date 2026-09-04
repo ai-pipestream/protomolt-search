@@ -48,16 +48,138 @@ refused.
 Lease tokens are not included in `ClusterPlan`. A reused node id at a different
 address is rejected while its lease is live.
 
+Since 2026-09-04 the node side of this is real (`src/node_agent.rs`).
+A node process registers when started with:
+
+```sh
+protomolt-search --role=node --config /etc/protomolt-search/host-b.toml \
+  --node-id=b --control-addr=coordinator:50050 --failure-domain=rack-2 \
+  --data-dir=/var/lib/protomolt-search/placed --advertise-addr=10.0.0.2:50051
+```
+
+- `--node-id` names the node; `--control-addr` is the coordinator's
+  `ClusterControl` endpoint, reached through the same TLS/mTLS material
+  as every cluster-internal channel (`docs/security.md`).
+- `--failure-domain` goes into the capacity report; placement prefers
+  another domain.
+- `--data-dir` is where placed replicas live, `<data-dir>/<shard_id>/`:
+  the shard's files (`shard`, `shard.wal/`, `shard.snap/` or
+  `shard.segments/`) and `placed.toml`, the record of what the plan said
+  and how far the bootstrap got.
+- `--advertise-addr=host:port` is the address the node registers and
+  the host every one of its listeners is advertised under; it defaults
+  to the first shard listener when that binds a concrete interface, and
+  is required when the listener binds `0.0.0.0`.
+- `--replica-listen=ip:port` is the interface and first port placed
+  replicas listen on (port 0, the default, lets the OS choose; the port a
+  replica bound is remembered in `placed.toml` and reused after a
+  restart). Every placed replica has a listener of its own, TLS when the
+  node's listeners have it.
+- `--node-report-ms` (default 10000), `--node-reconcile-ms` (default
+  2000), `--node-lease-ms` (0: the plane's policy), and
+  `--replica-lag-bound` (default 0) are the loops' knobs; the
+  `PIPESTREAM_SEARCH_NODE_*` environment variables and config-file keys
+  match.
+
+Each configured shard is reported under its `shard_id` (config key per
+`[[shards]]` entry; `slot-<offset>` when unset), at its own listener
+address, with the hash range the configuration names (`hash_lo`/`hash_hi`,
+both or neither) — else the range the plane's records hold for that
+shard, else the published topology's route whose primary or replica
+address is this listener (`ClusterPlan.topology` carries the routes for
+that). A shard with no range from any of those is not reported, and the
+log says so once. The plane owns roles: a shard the plane has a record
+of is reported with that record's role (a promotion or demotion
+happened there); a shard it has never seen reports itself primary if
+configured, replica if placed.
+
+The loops: registration retries every second until the plane answers;
+the lease renews every lease/3 (a lease the plane no longer holds
+re-registers); every served shard is reported on the timer, after
+every flush, and right after registration — rows (the larger of the
+vector and document tips), tombstones, bytes on disk, immutable
+segments, generation, scoring and analysis fingerprints, ready; the
+worker reads the plan every reconcile interval and executes the actions
+whose `target_node_id` is this node, in plan order. A shard report names
+the listener serving that shard; the lease owner vouches for its
+listeners, and another node's registered address is refused.
+
+## Replica bootstrap
+
+`COPY_REPLICA` on a target node runs this sequence, idempotent across a
+crash at any point (the durable `placed.toml` says where to resume:
+a half-installed shard installs again, a finished copy reports again
+and re-sends its completion, which the plane acknowledges):
+
+1. Place: open a new shard under `<data-dir>/<shard_id>/` with the
+   source's slot offset, hash range, and collection, on a fresh
+   listener; the node's field tables and layout apply.
+2. Install: `InstallSnapshotFrom{peer_addr}` against the source's
+   listener (`docs/snapshots.md`): the source exports under its read
+   lock, the copy stages, verifies, and installs the image, and learns
+   the WAL cutoff it contains.
+3. Catch up: `replication::sync_once` from that cutoff, repeatedly,
+   until the source's watermark is within `--replica-lag-bound` clocks
+   of the cursor (0 means exactly caught up, which a source under
+   continuous ingest never is — give a bound there). Ready is reported
+   then.
+4. Complete: sync once more, compare the copy's rows and tombstones to
+   the source's live health — a source that moved is synced again before
+   anything is sent — and `CompletePlacementAction` with the copy's
+   state at that clock, generation being the action's
+   `target_generation`. The plane matches the output against the
+   source's last report; a source whose report is behind or ahead of the
+   live copy refuses ("copied replica differs from its source"), and the
+   worker retries on a later tick, after the source has reported. A
+   stale copy is never completed.
+
+After completion the worker keeps a placed replica following its
+primary every reconcile interval (the coordinator's `--replica-sync-ms`
+loop can do the same for mapped replicas; run one of the two for a
+given pair — a replica's single-writer ingest gate makes a race between
+them a loud refusal, not a corruption).
+
+`DROP_REPLICA` closes the copy's listener, removes its directory, and
+completes with no output; the plane lists drops for retired copies
+after a promotion. A drop is refused, and the action stays pending,
+when the plane still lists this node's copy as the shard's primary, or
+when the shard is configured statically on the node (remove it from the
+configuration instead). `COMPACT_SHARD`, `SPLIT_SHARD`, and
+`MERGE_SHARDS` are logged as unhandled by name and stay pending.
+
+Costs: the copy under the source's read lock is the export's copy time
+(`ExportSnapshotResponse.copy_millis`; 7-11 ms for the 195 KB test
+fixture, one sequential read plus write of the generation at scale);
+writes wait for it, queries do not. The transient export staging on the
+source and the placed copy on the target are the disk cost. Nothing
+grows postings or resident memory.
+
+`tests/replica_bootstrap.rs` pins the sequence: A serves s0 and keeps
+ingesting; B registers empty; the plane plans the copy; B's worker
+installs from A, catches up, and is refused once because A moved after
+its last report (the plan still has the action, the copy already
+matches A's live counts); A reports, the retry completes; the plan shows
+B ready as s0's replica and the coordinator's live map lists B's
+listener; with A stopped, every query answers with the same hits and
+scores from B; a restart of B resumes the placed shard at the same
+address; A's lease expiry promotes B and the query still answers; B
+refuses to drop the copy it serves as primary and A refuses to drop a
+configured shard; draining B copies s0 to C, promotes C, and B's worker
+removes its copy when the drop is planned. The export under A's read
+lock is measured with ingest running, and ingest resumes after it.
+
 Placement prefers a different failure domain, then lower disk utilization.
 The reconciler fills replication deficits and can move one large primary when
 active-node disk utilization differs by at least 15 percentage points.
 
 ## Action protocol
 
-`GetClusterPlan` returns durable, idempotent actions. Node workers execute only
+`GetClusterPlan` returns durable, idempotent actions (and, since
+2026-09-04, the published topology routes). Node workers execute only
 actions assigned to their node:
 
-- `COPY_REPLICA`: use the existing snapshot/WAL catch-up path;
+- `COPY_REPLICA`: bootstrap a copy from the source's snapshot and catch
+  its WAL tail up ("Replica bootstrap" above);
 - `DROP_REPLICA`: remove a retired copy after promotion;
 - `COMPACT_SHARD`: run bounded segment compaction;
 - `SPLIT_SHARD`: build every child covering the source range;

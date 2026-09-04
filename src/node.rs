@@ -3193,6 +3193,9 @@ pub struct NodeServiceImpl {
     /// Seals on this shard run one at a time; the frozen part of a seal
     /// in flight is the reason (`docs/immutable-segments.md`).
     seal_lock: Arc<std::sync::Mutex<()>>,
+    /// Woken after every flush: the node agent reports the shard to the
+    /// control plane on it (`docs/cluster-control.md`).
+    flush_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// One compiled MaterializeSpec, cached against spec equality.
@@ -3675,7 +3678,19 @@ impl NodeServiceImpl {
             vocab,
             materialize_cache: Arc::new(std::sync::Mutex::new(None)),
             phrase_index: None,
+            flush_notify: None,
         }
+    }
+
+    /// Wake `notify` after every flush (the node agent's report trigger).
+    pub fn with_flush_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.flush_notify = Some(notify);
+        self
+    }
+
+    /// The shard's configuration.
+    pub fn config(&self) -> &NodeConfig {
+        &self.config
     }
 
     /// Attach the process-wide phrase vocabulary. It is immutable and cheap
@@ -4432,6 +4447,9 @@ impl NodeServiceImpl {
             if let Err(e) = wal.flush() {
                 eprintln!("wal: post-flush marker fsync failed: {e}");
             }
+        }
+        if let Some(notify) = &self.flush_notify {
+            notify.notify_one();
         }
         Ok(FlushResponse {
             path: vector_path.display().to_string(),

@@ -1221,6 +1221,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   `AUTO` with FP32 rerank resolves its depth through the default instead of
   running at `selection_k = k`, or refuses by name.
   Details: [Dense quality profile](docs/dense-quality-profile.md).
+- **Landed 2026-09-04: control-plane replica bootstrap.** Nodes register
+  (`--node-id`, `--control-addr`, `--failure-domain`, `--data-dir`),
+  renew their lease, report every shard under its own listener, and run
+  a worker that executes `COPY_REPLICA` (install from the primary's
+  `StreamSnapshot`, catch up with `sync_once`, complete with counts that
+  match the source) and `DROP_REPLICA`; the coordinator's live shard map
+  lists the placed replica. Details: [Durable cluster
+  control](docs/cluster-control.md).
 - **Landed 2026-09-04: snapshot repository.** `ExportSnapshot` publishes
   a shard's generation as a directory with a hashed manifest (WAL cutoff
   included); `InstallSnapshotFrom` pulls it from a directory, an HTTP(S)

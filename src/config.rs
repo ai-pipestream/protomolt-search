@@ -85,6 +85,38 @@ pub struct ShardConfig {
     /// The collection this shard serves (`docs/collections.md`); empty
     /// for a shard outside any named collection.
     pub collection: String,
+    /// The id this shard is reported under to the control plane
+    /// (`docs/cluster-control.md`); `slot-<offset>` when unset.
+    pub shard_id: Option<String>,
+    /// The inclusive stable-key hash range the shard covers, when the
+    /// configuration names it; else the plane's records or the published
+    /// topology supply it.
+    pub hash_range: Option<(u64, u64)>,
+}
+
+/// Node membership in the control plane (`--node-id` and friends,
+/// docs/cluster-control.md "Node lifecycle").
+#[derive(Debug, Clone)]
+pub struct NodeMembershipConfig {
+    pub node_id: String,
+    /// The coordinator's ClusterControl endpoint.
+    pub control_addr: String,
+    pub failure_domain: String,
+    /// Where placed replicas live (`<data-dir>/<shard_id>/`).
+    pub data_dir: PathBuf,
+    /// `host:port` other nodes and the coordinator reach this node at;
+    /// the host is what every listener is advertised under. Defaults to
+    /// the first shard listener when that binds a concrete address.
+    pub advertise_addr: Option<String>,
+    /// Where placed replicas listen: an interface and a first port
+    /// (port 0 lets the OS choose). Defaults to the first shard
+    /// listener's interface with port 0.
+    pub replica_listen: Option<SocketAddr>,
+    pub report_ms: u64,
+    pub reconcile_ms: u64,
+    /// Requested lease; 0 takes the plane's policy.
+    pub lease_ms: u64,
+    pub lag_bound: u64,
 }
 
 /// One shard entry of a coordinator shard map (`--shard-map`): which node
@@ -347,6 +379,10 @@ pub struct Config {
     pub control_merge_rows: u64,
     pub control_compact_segments: u32,
     pub control_compact_tombstone_ppm: u32,
+    /// Node membership in the control plane (`--node-id`,
+    /// `--control-addr`, `--failure-domain`, `--data-dir`); `None` for a
+    /// node that does not register.
+    pub membership: Option<NodeMembershipConfig>,
     /// Named collections this coordinator serves (`docs/collections.md`);
     /// empty means the one unnamed dataset described by `node_addrs` and
     /// the top-level knobs. When present, `node_addrs` is empty and every
@@ -510,6 +546,16 @@ struct FileConfig {
     control_merge_rows: Option<u64>,
     control_compact_segments: Option<u32>,
     control_compact_tombstone_ppm: Option<u32>,
+    node_id: Option<String>,
+    control_addr: Option<String>,
+    failure_domain: Option<String>,
+    data_dir: Option<String>,
+    advertise_addr: Option<String>,
+    replica_listen: Option<String>,
+    node_report_ms: Option<u64>,
+    node_reconcile_ms: Option<u64>,
+    node_lease_ms: Option<u64>,
+    replica_lag_bound: Option<u64>,
     shards: Vec<FileShard>,
 }
 
@@ -538,6 +584,9 @@ struct FileShard {
     wal: Option<bool>,
     wal_buckets: Option<u32>,
     vocab: Option<bool>,
+    shard_id: Option<String>,
+    hash_lo: Option<u64>,
+    hash_hi: Option<u64>,
 }
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
@@ -553,6 +602,20 @@ fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.windows(2)
         .find(|w| w[0] == flag && !w[1].starts_with("--"))
         .map(|w| w[1].clone())
+}
+
+/// Both bounds or neither; an inverted range is refused.
+fn parse_hash_range(
+    lo: Option<u64>,
+    hi: Option<u64>,
+    what: &str,
+) -> Result<Option<(u64, u64)>, String> {
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo <= hi => Ok(Some((lo, hi))),
+        (Some(lo), Some(hi)) => Err(format!("{what}: range {lo}..={hi} is inverted")),
+        (None, None) => Ok(None),
+        _ => Err(format!("{what}: pass both bounds or neither")),
+    }
 }
 
 fn flag_present(args: &[String], key: &str) -> bool {
@@ -932,6 +995,22 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             slot_offset: cli_offset,
             analysis_addr: None,
             collection: cli_collection.clone().unwrap_or_default(),
+            shard_id: opt(args, "shard-id", "PIPESTREAM_SEARCH_SHARD_ID", None),
+            hash_range: parse_hash_range(
+                opt(args, "hash-lo", "PIPESTREAM_SEARCH_HASH_LO", None)
+                    .map(|v| {
+                        v.parse::<u64>()
+                            .map_err(|e| format!("invalid --hash-lo: {e}"))
+                    })
+                    .transpose()?,
+                opt(args, "hash-hi", "PIPESTREAM_SEARCH_HASH_HI", None)
+                    .map(|v| {
+                        v.parse::<u64>()
+                            .map_err(|e| format!("invalid --hash-hi: {e}"))
+                    })
+                    .transpose()?,
+                "--hash-lo/--hash-hi",
+            )?,
         }]
     } else {
         file.shards
@@ -971,6 +1050,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     slot_offset: shard.slot_offset.unwrap_or(0),
                     analysis_addr: shard.analysis_addr.clone().map(normalize_analysis_backend),
                     collection: shard.collection.clone().unwrap_or_default(),
+                    shard_id: shard.shard_id.clone(),
+                    hash_range: parse_hash_range(
+                        shard.hash_lo,
+                        shard.hash_hi,
+                        &format!("shards[{i}].hash_lo/hash_hi"),
+                    )?,
                 })
             })
             .collect::<Result<_, String>>()?
@@ -1225,6 +1310,130 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     {
         return Err("control plane requires coordinator/both role, positive thresholds and replication factor, lease >= 1000ms, and tombstone ppm <= 1000000".to_string());
     }
+
+    // Node membership (docs/cluster-control.md "Node lifecycle").
+    let node_id = opt(
+        args,
+        "node-id",
+        "PIPESTREAM_SEARCH_NODE_ID",
+        file.node_id.as_deref(),
+    );
+    let control_addr = opt(
+        args,
+        "control-addr",
+        "PIPESTREAM_SEARCH_CONTROL_ADDR",
+        file.control_addr.as_deref(),
+    );
+    let failure_domain = opt(
+        args,
+        "failure-domain",
+        "PIPESTREAM_SEARCH_FAILURE_DOMAIN",
+        file.failure_domain.as_deref(),
+    );
+    let data_dir = opt(
+        args,
+        "data-dir",
+        "PIPESTREAM_SEARCH_DATA_DIR",
+        file.data_dir.as_deref(),
+    );
+    let advertise_addr = opt(
+        args,
+        "advertise-addr",
+        "PIPESTREAM_SEARCH_ADVERTISE_ADDR",
+        file.advertise_addr.as_deref(),
+    );
+    let replica_listen = opt(
+        args,
+        "replica-listen",
+        "PIPESTREAM_SEARCH_REPLICA_LISTEN",
+        file.replica_listen.as_deref(),
+    )
+    .map(|a| {
+        a.parse::<SocketAddr>()
+            .map_err(|e| format!("invalid --replica-listen: {e}"))
+    })
+    .transpose()?;
+    let node_report_ms = parse_control_u64(
+        "node-report-ms",
+        "PIPESTREAM_SEARCH_NODE_REPORT_MS",
+        file.node_report_ms,
+        10_000,
+    )?;
+    let node_reconcile_ms = parse_control_u64(
+        "node-reconcile-ms",
+        "PIPESTREAM_SEARCH_NODE_RECONCILE_MS",
+        file.node_reconcile_ms,
+        2_000,
+    )?;
+    let node_lease_ms = parse_control_u64(
+        "node-lease-ms",
+        "PIPESTREAM_SEARCH_NODE_LEASE_MS",
+        file.node_lease_ms,
+        0,
+    )?;
+    let replica_lag_bound = parse_control_u64(
+        "replica-lag-bound",
+        "PIPESTREAM_SEARCH_REPLICA_LAG_BOUND",
+        file.replica_lag_bound,
+        0,
+    )?;
+    let membership = match node_id {
+        Some(node_id) => {
+            if node_id.trim().is_empty() {
+                return Err("--node-id must not be empty".to_string());
+            }
+            if !matches!(role, Role::Node | Role::Both) {
+                return Err(
+                    "--node-id registers a node: it needs the node or both role".to_string()
+                );
+            }
+            let control_addr = control_addr.ok_or_else(|| {
+                "--node-id needs --control-addr (the coordinator's ClusterControl endpoint)"
+                    .to_string()
+            })?;
+            let data_dir = data_dir.ok_or_else(|| {
+                "--node-id needs --data-dir (where placed replicas live)".to_string()
+            })?;
+            if node_report_ms == 0 || node_reconcile_ms == 0 {
+                return Err("--node-report-ms and --node-reconcile-ms must be positive".to_string());
+            }
+            if let Some(addr) = &advertise_addr {
+                let well_formed = addr
+                    .rsplit_once(':')
+                    .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+                if !well_formed {
+                    return Err(format!("--advertise-addr={addr:?} is not host:port"));
+                }
+            }
+            Some(NodeMembershipConfig {
+                node_id,
+                control_addr: normalize_addr(control_addr),
+                failure_domain: failure_domain.unwrap_or_default(),
+                data_dir: PathBuf::from(data_dir),
+                advertise_addr,
+                replica_listen,
+                report_ms: node_report_ms,
+                reconcile_ms: node_reconcile_ms,
+                lease_ms: node_lease_ms,
+                lag_bound: replica_lag_bound,
+            })
+        }
+        None => {
+            if control_addr.is_some()
+                || data_dir.is_some()
+                || failure_domain.is_some()
+                || advertise_addr.is_some()
+                || replica_listen.is_some()
+            {
+                return Err(
+                    "--control-addr, --data-dir, --failure-domain, --advertise-addr, and \
+                     --replica-listen describe a registered node: pass --node-id with them"
+                        .to_string(),
+                );
+            }
+            None
+        }
+    };
 
     let max_message_bytes = opt(
         args,
@@ -2043,6 +2252,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         control_merge_rows,
         control_compact_segments,
         control_compact_tombstone_ppm,
+        membership,
         collections,
         default_collection,
         tls,
@@ -2480,6 +2690,101 @@ slot_offset = 20000
             "--rerank-parallel=65"
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn membership_flags_need_each_other_and_shards_carry_their_identity() {
+        let cfg = parse(&args(&[
+            "--role=node",
+            "--index=/tmp/x.tv",
+            "--node-id=b",
+            "--control-addr=10.0.0.1:50050",
+            "--failure-domain=rack-2",
+            "--data-dir=/var/lib/placed",
+            "--advertise-addr=10.0.0.2:50051",
+            "--replica-listen=10.0.0.2:0",
+            "--node-report-ms=500",
+            "--shard-id=s7",
+            "--hash-lo=0",
+            "--hash-hi=100",
+        ]))
+        .unwrap();
+        let membership = cfg.membership.as_ref().unwrap();
+        assert_eq!(membership.node_id, "b");
+        assert_eq!(membership.control_addr, "http://10.0.0.1:50050");
+        assert_eq!(membership.failure_domain, "rack-2");
+        assert_eq!(membership.data_dir, PathBuf::from("/var/lib/placed"));
+        assert_eq!(membership.advertise_addr.as_deref(), Some("10.0.0.2:50051"));
+        assert_eq!(
+            membership.replica_listen.map(|a| a.to_string()),
+            Some("10.0.0.2:0".to_string())
+        );
+        assert_eq!(
+            (membership.report_ms, membership.reconcile_ms),
+            (500, 2_000)
+        );
+        assert_eq!((membership.lease_ms, membership.lag_bound), (0, 0));
+        assert_eq!(cfg.shards[0].shard_id.as_deref(), Some("s7"));
+        assert_eq!(cfg.shards[0].hash_range, Some((0, 100)));
+        let plain = parse(&args(&["--role=node", "--index=/tmp/x.tv"])).unwrap();
+        assert!(plain.membership.is_none());
+        assert!(plain.shards[0].shard_id.is_none() && plain.shards[0].hash_range.is_none());
+        for (flags, needle) in [
+            (
+                vec!["--role=node", "--index=/tmp/x.tv", "--node-id=b"],
+                "needs --control-addr",
+            ),
+            (
+                vec![
+                    "--role=node",
+                    "--index=/tmp/x.tv",
+                    "--node-id=b",
+                    "--control-addr=c:1",
+                ],
+                "needs --data-dir",
+            ),
+            (
+                vec!["--role=node", "--index=/tmp/x.tv", "--data-dir=/d"],
+                "pass --node-id",
+            ),
+            (
+                vec![
+                    "--role=coordinator",
+                    "--nodes=a:1",
+                    "--node-id=b",
+                    "--control-addr=c:1",
+                    "--data-dir=/d",
+                ],
+                "node or both role",
+            ),
+            (
+                vec![
+                    "--role=node",
+                    "--index=/tmp/x.tv",
+                    "--node-id=b",
+                    "--control-addr=c:1",
+                    "--data-dir=/d",
+                    "--advertise-addr=nowhere",
+                ],
+                "is not host:port",
+            ),
+            (
+                vec!["--role=node", "--index=/tmp/x.tv", "--hash-lo=5"],
+                "both bounds or neither",
+            ),
+            (
+                vec![
+                    "--role=node",
+                    "--index=/tmp/x.tv",
+                    "--hash-lo=5",
+                    "--hash-hi=4",
+                ],
+                "is inverted",
+            ),
+        ] {
+            let error = parse(&args(&flags)).unwrap_err();
+            assert!(error.contains(needle), "{flags:?}: {error}");
+        }
     }
 
     #[test]

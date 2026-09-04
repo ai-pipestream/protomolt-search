@@ -5215,6 +5215,11 @@ message DrainNodeRequest {
 message ShardReplicaState {
   string shard_id = 1;
   string node_id = 2;
+  // The listener serving this copy. Empty means the node's registered
+  // address; a node with several listeners (one per shard, and one per
+  // replica it placed under --data-dir) reports each shard's own, and
+  // the lease owner vouches for it. Another node's registered address
+  // is refused. The published topology carries this address.
   string addr = 3;
   uint64 generation = 4;
   uint64 hash_lo = 5;
@@ -5310,6 +5315,11 @@ message ClusterPlan {
   repeated uint64 topology_history = 6;
   // The collection this plan governs (docs/collections.md).
   string collection = 7;
+  // The published topology of `topology_generation`: the routes the
+  // live coordinator fans out to. A node whose configuration does not
+  // name its shard's hash range finds it here by its listener address
+  // (docs/cluster-control.md, "Node lifecycle").
+  repeated PublishedTopologyShard topology = 8;
 }
 
 // ---------------------------------------------------------------------------
