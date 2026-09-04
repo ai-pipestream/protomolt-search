@@ -282,9 +282,13 @@ export NODE_LIST=192.168.1.195:19300,192.168.1.195:19301,192.168.1.195:19302,192
 export SIDECAR_ADDR=http://192.168.1.195:19202 LISTEN_HOST=0.0.0.0
 export OUT=$HOME/protomolt-search/shards BIN=$HOME/protomolt-search/bin/pipestream-search
 
-# krick-1: shards 0-4, the sidecar, the drivers, the coordinator
-LOCAL_SHARDS="0 1 2 3 4" EMB=/nas/corpus_data/corpus/embeddings-full.bin \
-  CHUNKS=/nas/corpus_data/corpus/chunks-full.ndjson COORD_HOST=0.0.0.0 \
+# krick-1: shards 0-4, the sidecar, the drivers, the coordinator.
+# Stage the two input files onto local NVMe first: the NAS
+# (/nas/corpus_data/turbovec/corpus/) reads at about 40 MB/s, measured
+# 2026-09-04, which is 1.5 hours of pure I/O per pass over 216 GB.
+LOCAL_SHARDS="0 1 2 3 4" EMB=$HOME/protomolt-search/inputs/embeddings-full.bin \
+  CHUNKS=$HOME/protomolt-search/inputs/chunks-full.ndjson \
+  CASE_NAMES=$HOME/protomolt-search/case-names.tsv COORD_HOST=0.0.0.0 \
   ./rebuild.sh plan up calibrate ingest
 # pi5v2, pi5v3, pi5v1: one shard each, no sidecar, no coordinator
 LOCAL_SHARDS="5" RUN_COORD=0 ./rebuild.sh plan up       # pi5v2
@@ -292,8 +296,10 @@ LOCAL_SHARDS="6" RUN_COORD=0 ./rebuild.sh plan up       # pi5v3
 LOCAL_SHARDS="7" RUN_COORD=0 ./rebuild.sh plan up       # pi5v1 (the tail shard)
 ```
 
-Each node must be up before `calibrate` and `ingest` run on the driver
-host; the `down` and `serve` stages run per host. The disk gate in
+`ssh host cmd` runs a non-login shell: on krick-1 Java lives under
+`~/.sdkman/candidates/java/current/bin` and `protoc` under `~/.local/bin`,
+so remote launches export `PATH` or use absolute paths. Each node must be
+up before `calibrate` and `ingest` run on the driver host; the `down` and `serve` stages run per host. The disk gate in
 `ingest` is exact only for shards on the driver host; the other hosts'
 `plan` output is their gate. A node writes shard files under the host's
 assigned offsets, so files need not move between hosts after a build; to
