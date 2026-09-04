@@ -138,9 +138,17 @@ say() { echo "== $*"; }
 # its length -- no walk of the 126 GB chunks file. The chunk/embedding
 # join is verified per position during ingest, which is the real check.
 
-[[ -f $EMB ]] || die "no embeddings file at $EMB"
+# A host that only serves shards need not hold the embeddings file: the
+# cut plan is a function of its LENGTH, so EMB_BYTES can stand in for it
+# (print it on the driver host with `stat -c%s "$EMB"`).
 REC=$((12 + DIM * 4))
-EMB_BYTES=$(stat -c%s "$EMB")
+if [[ -f $EMB ]]; then
+  EMB_BYTES=$(stat -c%s "$EMB")
+elif [[ -n ${EMB_BYTES:-} ]]; then
+  :
+else
+  die "no embeddings file at $EMB (set EMB_BYTES on hosts that only serve shards)"
+fi
 (((EMB_BYTES - 12) % REC == 0)) ||
   die "$EMB is $EMB_BYTES bytes: not a 12-byte header plus whole dim-$DIM records"
 M=$(((EMB_BYTES - 12) / REC))
@@ -253,7 +261,11 @@ else
 fi
 
 SIDECAR_ADDR=${SIDECAR_ADDR:-http://127.0.0.1:$SIDECAR_PORT}
+# The heap tail seals into a segment at this many documents (the node's
+# default is 500,000); a small host bounds its ingest memory by lowering it.
+SEAL_TAIL_DOCS=${SEAL_TAIL_DOCS:-}
 # The sidecar is started and probed here only when it lives on this host.
+is_local() { local x; for x in "${LOCAL[@]}"; do [[ $x == "$1" ]] && return 0; done; return 1; }
 sidecar_is_local() { [[ $SIDECAR_ADDR == http://127.0.0.1:* || $SIDECAR_ADDR == http://localhost:* ]]; }
 # Off-loopback plaintext must be asked for by name (docs/security.md);
 # TLS flags in TLS_ARGS replace it.
@@ -334,6 +346,7 @@ start_node() {
       --stream-search \
       --analysis-addr="$SIDECAR_ADDR" \
       "${PLAINTEXT_ARGS[@]}" "${TLS_ARG_LIST[@]}" \
+      ${SEAL_TAIL_DOCS:+--seal-tail-docs="$SEAL_TAIL_DOCS"} \
       ${VOCAB:+--vocab=true} \
       ${VOCAB_WINDOW_DOCS:+--vocab-window-docs="$VOCAB_WINDOW_DOCS"} \
       ${VOCAB_TOP_K:+--vocab-top-k="$VOCAB_TOP_K"} \
@@ -433,12 +446,18 @@ stage_ingest() {
     # A wave adds the building shards' spill on top of whatever is
     # already on disk. Refuse to start one that cannot finish rather
     # than discovering it hours in with a full filesystem.
-    local need=$(((last - first + 1) * $(shard_flushing_bytes) / 1000000000))
+    # The gate counts the shards of this wave that build on THIS host's
+    # disk; a driver feeding a node on another host spills there.
+    local here=0 j
+    for ((j = first; j <= last; j++)); do
+      is_local "${INGEST_LIST[j]}" && here=$((here + 1))
+    done
+    local need=$((here * $(shard_flushing_bytes) / 1000000000))
     local have; have=$(free_gb)
     ((have > need + DISK_MARGIN_GB)) ||
       die "wave $first..$last needs ~$need GB (+$DISK_MARGIN_GB margin) but only $have GB is free"
     say "wave: shards $first..$last (~$need GB of spill, $have GB free)"
-    local pids=() j
+    local pids=()
     for ((j = first; j <= last; j++)); do
       i=${INGEST_LIST[j]}
       "$INGEST" --nodes="$NODE_LIST" \

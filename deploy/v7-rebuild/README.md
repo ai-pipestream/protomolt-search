@@ -269,6 +269,8 @@ fleet:
 | `SIDECAR_ADDR` | the analysis sidecar URL; the sidecar starts here only when the URL is loopback |
 | `RUN_COORD` / `COORD_HOST` | whether this host starts the coordinator in `serve`, and where it binds |
 | `INGEST_SHARDS` | the shards the ingest stage feeds from this host (a driver needs only the nodes and the sidecar reachable) |
+| `EMB_BYTES` | the embeddings file's length, for hosts that do not hold the file; the cut plan needs only the length |
+| `SEAL_TAIL_DOCS` | documents per sealed segment (node default 500,000); lower it on a small host to bound ingest memory |
 
 A four-machine example (the plan in `sea-of-slop-search-parity/design-notes/
 fleet-4-machine-plan-2026-09.md`), with the sidecar, the coordinator, and
@@ -290,7 +292,9 @@ LOCAL_SHARDS="0 1 2 3 4" EMB=$HOME/protomolt-search/inputs/embeddings-full.bin \
   CHUNKS=$HOME/protomolt-search/inputs/chunks-full.ndjson \
   CASE_NAMES=$HOME/protomolt-search/case-names.tsv COORD_HOST=0.0.0.0 \
   ./rebuild.sh plan up calibrate ingest
-# pi5v2, pi5v3, pi5v1: one shard each, no sidecar, no coordinator
+# pi5v2, pi5v3, pi5v1: one shard each, no sidecar, no coordinator, no
+# input files (EMB_BYTES carries the length), smaller sealed segments
+export EMB_BYTES=89752201376 SEAL_TAIL_DOCS=250000
 LOCAL_SHARDS="5" RUN_COORD=0 ./rebuild.sh plan up       # pi5v2
 LOCAL_SHARDS="6" RUN_COORD=0 ./rebuild.sh plan up       # pi5v3
 LOCAL_SHARDS="7" RUN_COORD=0 ./rebuild.sh plan up       # pi5v1 (the tail shard)
@@ -300,7 +304,7 @@ LOCAL_SHARDS="7" RUN_COORD=0 ./rebuild.sh plan up       # pi5v1 (the tail shard)
 `~/.sdkman/candidates/java/current/bin` and `protoc` under `~/.local/bin`,
 so remote launches export `PATH` or use absolute paths. Each node must be
 up before `calibrate` and `ingest` run on the driver host; the `down` and `serve` stages run per host. The disk gate in
-`ingest` is exact only for shards on the driver host; the other hosts'
-`plan` output is their gate. A node writes shard files under the host's
+`ingest` counts only the wave's shards that build on the driver host's
+disk; the other hosts' `plan` output is their gate. A node writes shard files under the host's
 assigned offsets, so files need not move between hosts after a build; to
 rebalance later, use the reshard tool rather than a copy.
