@@ -60,6 +60,19 @@ The next benchmark should use the public rerank mode at only the configured
 candidate depth and report scan, rerank, first-hit, and terminal latency
 separately.
 
+## Next
+
+The knob this report asked for now exists as measured data rather than a
+factor (2026-09-04, `docs/dense-quality-profile.md`). A dense quality profile
+carries a ladder like the one above — per depth, mean and worst-query recall
+and the p50 of the public `QueryProfile` phases — and points chosen by the
+worst-query rule (2x here for 99% on every query, 3x for 99.9%, 5x for the
+exact top-10,000 at the rungs this sweep sampled). `examples/dense_profile.rs`
+measures it through the public FP32-rerank route at only the configured
+depths, which is the end-to-end latency this run did not measure, and
+`DENSE_EXECUTION_MODE_AUTO` resolves its rerank depth through the profile's
+default target instead of running at `selection_k = k`.
+
 ## Reproduction
 
 ```bash

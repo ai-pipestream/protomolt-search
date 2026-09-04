@@ -216,6 +216,18 @@ candidate traversal; `score_mode = FP32_RERANK` replaces scores only inside the
 returned candidate pool. FP32 reranking never upgrades an ANN pool to a global
 exact-top-k guarantee.
 
+One rule joins them (2026-09-04): `AUTO` with `FP32_RERANK`, no
+`DenseQualityPolicy`, and `selection_k = 0` resolves the rerank depth through
+the installed quality profile's `default_target_recall_ppm`, bitwise as an
+explicit policy naming that target would, with `dense_quality` set and the
+planner reason naming the profile and default
+(`docs/dense-quality-profile.md`). Without a profile or a default it refuses:
+"AUTO with FP32 rerank needs a measured quality profile with
+default_target_recall_ppm, or an explicit DenseQualityPolicy or selection_k".
+`EXACT` and `UNSPECIFIED` with `FP32_RERANK` and `selection_k = 0` keep the
+pool at `k` — the caller chose the traversal, and `dense_quality` stays
+absent.
+
 ## Dense FP32 rerank
 
 A single dense leaf can set `DenseQuery.score_mode` to
@@ -243,17 +255,18 @@ aligned FP32 rows, so embedded, in-process clustered, and external clustered
 transports produce the same reranked result. Composite dense leaves and dense
 boosts remain provider-native for now.
 
-Candidate depth can be request-explicit (`selection_k`) or measured. A
-`DenseQualityPolicy` supplies `(k, target_recall_ppm)` and the coordinator
-resolves that exact point from the TOML file configured by
-`--dense-quality-profile`. The profile is bound to embedding model, corpus
-generation and row count, dimensions, provider kind, and scoring fingerprint.
-Any mismatch, unmeasured target, fingerprint pin mismatch, or request cap is a
-hard error. There is no interpolation or fallback multiplier. The response's
-`dense_quality` records the selected profile and depth. The current profile
-format describes an all-live generation: any tombstone refuses the measured
-policy until compaction produces a new generation and that generation is
-remeasured.
+Candidate depth can be request-explicit (`selection_k`), measured through a
+`DenseQualityPolicy`, or — under `AUTO` — measured through the profile's
+default target. A `DenseQualityPolicy` supplies `(k, target_recall_ppm)` and
+the coordinator resolves that exact point from the TOML file configured by
+`--dense-quality-profile` (`docs/dense-quality-profile.md`). The profile is
+bound to embedding model, corpus generation and row count, dimensions,
+provider kind, and scoring fingerprint. Any mismatch, unmeasured target,
+fingerprint pin mismatch, or request cap is a hard error. There is no
+interpolation or fallback multiplier. The response's `dense_quality` records
+the selected profile and depth. The profile describes an all-live
+generation: any tombstone refuses the measured policy until compaction
+produces a new generation and that generation is remeasured.
 
 Exact rows are scheduled by 4 KiB page and scored through a bounded worker
 pool shared across concurrent requests (`--rerank-parallel`, automatic and
@@ -263,10 +276,11 @@ and serial score bits match. `--max-rerank-mib` (256 MiB by default) bounds
 logical FP32 row bytes before fan-out; shard deadlines apply to every rescore
 RPC. Query profiles report rows, logical bytes, mmap pages, and tasks.
 
-The configured file uses this strict shape (unknown keys are refused):
+The configured file uses this strict shape (unknown keys are refused;
+`format_version = 1` files with points only still load):
 
 ```toml
-format_version = 1
+format_version = 2
 profile_id = "court-held-out-v1"
 embedding_model = "bge-m3"
 corpus_generation = 42
@@ -275,6 +289,17 @@ dimensions = 1024
 provider_backend = "embedded-turbovec"
 scoring_fingerprint = "<GetVectorBackend descriptor fingerprint>"
 measured_queries = 128
+default_target_recall_ppm = 990000
+
+[[measurements]]
+k = 10000
+candidates = 20850
+queries = 128
+mean_recall_ppm = 996100
+min_recall_ppm = 990500
+p50_total_ms = 61.2
+p50_selection_ms = 38.0
+p50_rerank_ms = 21.4
 
 [[points]]
 k = 10000
@@ -282,9 +307,11 @@ target_recall_ppm = 990000
 candidates = 20850
 ```
 
-Each point should be the maximum candidate depth required across the declared
-held-out queries for that target. `examples/exact_rerank_scale.rs` emits the
-per-query ranks and `every_query_depth` values used to construct these points.
+Each point is the smallest measured depth whose worst held-out query met the
+target, and must be justified by a `[[measurements]]` rung at that depth.
+`examples/dense_profile.rs` measures the ladder through this route and writes
+the file; the format, the tool, and the AUTO rule are in
+`docs/dense-quality-profile.md`.
 
 ## Composite scorer
 

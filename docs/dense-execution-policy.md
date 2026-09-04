@@ -93,6 +93,22 @@ policy: the caller accepted the provider's traversal. It is still marked
 approximate, and `DENSE_SCORE_MODE_FP32_RERANK` on top of it rescores the
 candidate pool without widening it — the outcome stays `ANN` and says so.
 
+## AUTO and FP32 rerank
+
+Landed 2026-09-04. Step 2 resolves the traversal, not the rerank depth. When
+AUTO resolved to `EXACT` and the leaf asks for `DENSE_SCORE_MODE_FP32_RERANK`
+with no `DenseQualityPolicy` and `selection_k = 0`, the candidate depth is
+resolved through the installed dense quality profile's
+`default_target_recall_ppm` (`docs/dense-quality-profile.md`), exactly as an
+explicit policy naming that target would — the same hits, `dense_quality`
+set, and `planner_reason` extended with the profile and default that chose
+the depth. No profile, or one without a default, refuses by name rather than
+running the raw quantized top-`k`. The two files are separate: the execution
+policy qualifies an approximate traversal at a request key; the quality
+profile prices an exhaustive one's FP32 rerank depth. AUTO through a
+qualified ANN point keeps that point's depth and never consults the quality
+profile.
+
 ## Tests
 
 `tests/dense_execution.rs`: AUTO on an exhaustive provider equals `EXACT`

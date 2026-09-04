@@ -1144,6 +1144,8 @@ losslessness at k=1000 over a 24k corpus.
 - `src/harness.rs` — corpus generation, calibration fitting, shard building
   and loopback server startup shared by tests and the sweep binary.
 - `examples/sweep.rs` — the k-sweep benchmark harness.
+- `examples/dense_profile.rs` — measures a dense quality profile against a
+  live coordinator (`docs/dense-quality-profile.md`).
 - `tests/` — lossless e2e (k=10 and k=1000), NodeService loopback with
   mid-scan injection, ingest/calibration rules, a multi-process
   ingest-and-restart acceptance test, BM25 tests with a mock analysis
@@ -1197,6 +1199,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   `max_scan` refuses past the bound naming the count, and the response says
   when df still counts tombstoned rows. Details and test evidence:
   [Autocomplete over the sorted dictionary](docs/suggest.md).
+- **Landed 2026-09-04: measured dense quality profile.** `format_version = 2`
+  carries the measured ladder (per-depth mean and worst-query recall,
+  per-phase p50) and a default target; every point must be justified by a
+  rung. `examples/dense_profile.rs` measures it through the public route;
+  `AUTO` with FP32 rerank resolves its depth through the default instead of
+  running at `selection_k = k`, or refuses by name.
+  Details: [Dense quality profile](docs/dense-quality-profile.md).
 - **Landed 2026-09-03: mmap vector index.** Sealed segment images use the
   `turbovec-pipestream-s20` mapped reader, linear large-k chunk merge, and
   bounded blocked-layout cache;
