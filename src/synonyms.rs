@@ -359,9 +359,12 @@ mod tests {
             .iter()
             .map(|c| (c.term.as_str(), c.distance))
             .collect();
+        // "cort" is one deletion away, like the transposition "court";
+        // "courts" (a transposition and an insertion) and "cour" (two
+        // deletions) are two, and df orders them.
         assert_eq!(
             got,
-            vec![("court", 1), ("cort", 2), ("cour", 2), ("courts", 2)],
+            vec![("court", 1), ("cort", 1), ("courts", 2), ("cour", 2)],
             "distance first, then df, then the term"
         );
         assert!(rank_candidates("court", &entries, 1, 10)
