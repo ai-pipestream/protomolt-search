@@ -662,7 +662,7 @@ impl NodeServiceImpl {
         match outcome {
             Ok((locked_records, write_lock_ms, tail_passes)) => {
                 let closing = Instant::now();
-                self.flush_index()?;
+                self.closing_flush()?;
                 let closing_flush_ms = closing.elapsed().as_millis() as u64;
                 let (rows_after, stats_epoch) = {
                     let guard = self.state.read().expect("shard state lock poisoned");
@@ -696,6 +696,43 @@ impl NodeServiceImpl {
                 Err(status)
             }
         }
+    }
+
+    /// The flush that completes a cutover. On the segment layout a flush
+    /// that meets a legacy two-RPC append mid-row (documents one ahead of
+    /// vectors) refuses to seal, by the layout's own rule; the row
+    /// completes with the client's next call, so the closing flush waits
+    /// that out for a bounded time rather than reporting a committed
+    /// cutover as a failure. Past the bound it returns the seal's refusal
+    /// and names the pending cutover, which the next Flush completes.
+    fn closing_flush(&self) -> Result<(), Status> {
+        const ATTEMPTS: usize = 200;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        for attempt in 1..=ATTEMPTS {
+            match self.flush_index() {
+                Ok(_) => return Ok(()),
+                Err(status)
+                    if attempt < ATTEMPTS
+                        && status.code() == tonic::Code::FailedPrecondition
+                        && status
+                            .message()
+                            .contains("a segment's artifacts cover the same rows") =>
+                {
+                    std::thread::sleep(PAUSE);
+                }
+                Err(status) => {
+                    return Err(Status::new(
+                        status.code(),
+                        format!(
+                            "the compaction cut over and is pending its closing flush, which \
+                             refused: {}; the next Flush completes it",
+                            status.message()
+                        ),
+                    ))
+                }
+            }
+        }
+        unreachable!("the last attempt returns")
     }
 
     /// The single-image shadow: the built image laid out as a generation

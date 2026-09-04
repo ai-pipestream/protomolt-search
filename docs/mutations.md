@@ -87,6 +87,10 @@ The shape is the live reshard's, in one process:
    generation's images, removes the marker, and retires the replaced files:
    `<index>.snap-old` and the legacy single-image files, or the replaced
    segment directories. Any `Flush` completes a pending cutover the same way.
+   On the segment layout a flush that meets a legacy two-RPC append mid-row
+   (documents one ahead of vectors) refuses to seal by the layout's rule;
+   the closing flush waits that out for up to two seconds, then returns the
+   refusal and names the pending cutover.
 
 The response reports rows before and after, tombstones reclaimed, tail
 records applied (and how many under the lock), the write-lock hold and the
