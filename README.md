@@ -1245,6 +1245,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   (13–39 ms on the fixture). Commit marker with rollback at open; ingest
   responses report `wal_generation` and id-addressed mutations may claim it.
   Details: [Deletes, replacements, and compaction](docs/mutations.md).
+- **Landed 2026-09-04: latency and error metrics.** Every node,
+  coordinator, and cluster-control handler runs through one seam
+  (`metrics::timed`) that exports a fixed-bucket latency histogram, error
+  counters by gRPC code, and an in-flight gauge per route; response
+  streams report `first_response` and `complete` phases. Details:
+  [Metrics](docs/metrics.md).
 - **Landed 2026-09-03: mmap vector index.** Sealed segment images use the
   `turbovec-pipestream-s20` mapped reader, linear large-k chunk merge, and
   bounded blocked-layout cache;
