@@ -272,6 +272,122 @@ impl Histogram {
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         self.sum_ns.fetch_add(ns, Ordering::Relaxed);
     }
+
+    fn reading(&self) -> HistogramReading {
+        let mut buckets = [0u64; BUCKETS.len()];
+        for (slot, bucket) in buckets.iter_mut().zip(&self.buckets) {
+            *slot = bucket.load(Ordering::Relaxed);
+        }
+        HistogramReading {
+            buckets,
+            sum_ns: self.sum_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One histogram's values at the moment of a [`read`]: per-bucket
+/// counts (not cumulative) and the sum in nanoseconds.
+#[derive(Clone, Copy)]
+pub struct HistogramReading {
+    buckets: [u64; BUCKETS.len()],
+    sum_ns: u64,
+}
+
+/// The registry at one moment: every counter, gauge, and histogram the
+/// page prints and the snapshot carries. [`render`] and [`snapshot`]
+/// are both views of one of these, so the scraper's page and the
+/// dashboard's values agree by construction when they come from the
+/// same reading, and a caller that needs both takes one [`read`].
+pub struct Reading {
+    requests: [u64; N_ROUTES],
+    in_flight: [u64; N_ROUTES],
+    complete: [HistogramReading; N_ROUTES],
+    first_response: [HistogramReading; N_ROUTES],
+    errors: [[u64; N_CODES]; N_ROUTES],
+    scan: [u64; SCAN_COUNTERS.len()],
+    batches: u64,
+    batched_jobs: u64,
+    shards: Vec<ShardGauges>,
+}
+
+/// The process-wide scan and ingest counters, in page order: name,
+/// help text, the atomic.
+const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 7] = [
+    (
+        "turbovec_scan_chunk_calls_total",
+        "Per-chunk kernel calls made by vector scans.",
+        &SCAN_CHUNK_CALLS,
+    ),
+    (
+        "turbovec_scan_candidates_total",
+        "Real candidates collected by vector scans (floor sharing's savings show here).",
+        &SCAN_CANDIDATES,
+    ),
+    (
+        "turbovec_scan_floors_offered_total",
+        "Floors the scan offered to publish (its own behavior, knob-independent).",
+        &SCAN_FLOORS_OFFERED,
+    ),
+    (
+        "turbovec_scan_floors_published_total",
+        "Floors actually put on the wire (what the floor knobs move).",
+        &SCAN_FLOORS_PUBLISHED,
+    ),
+    (
+        "turbovec_scan_floor_updates_applied_total",
+        "Chunks that ran under a coordinator-pushed floor.",
+        &SCAN_FLOOR_UPDATES_APPLIED,
+    ),
+    (
+        "turbovec_documents_added_total",
+        "Documents ingested over AddDocuments streams.",
+        &DOCUMENTS_ADDED,
+    ),
+    (
+        "turbovec_vectors_added_total",
+        "Vectors ingested over AddVectors batches.",
+        &VECTORS_ADDED,
+    ),
+];
+
+/// Read the registry once. Each value is one relaxed load; the reading
+/// is not a transaction across values, but it is the one set of values
+/// both [`render`] and [`snapshot`] see when they are given it.
+pub fn read(gauges: &[GaugeProvider]) -> Reading {
+    let mut requests = [0u64; N_ROUTES];
+    let mut in_flight = [0u64; N_ROUTES];
+    let mut errors = [[0u64; N_CODES]; N_ROUTES];
+    let empty = HistogramReading {
+        buckets: [0; BUCKETS.len()],
+        sum_ns: 0,
+    };
+    let mut complete = [empty; N_ROUTES];
+    let mut first_response = [empty; N_ROUTES];
+    for i in 0..N_ROUTES {
+        requests[i] = REQUESTS[i].load(Ordering::Relaxed);
+        in_flight[i] = IN_FLIGHT[i].load(Ordering::Relaxed);
+        complete[i] = COMPLETE[i].reading();
+        first_response[i] = FIRST_RESPONSE[i].reading();
+        for (c, slot) in errors[i].iter_mut().enumerate() {
+            *slot = ERRORS[i][c].load(Ordering::Relaxed);
+        }
+    }
+    let mut scan = [0u64; SCAN_COUNTERS.len()];
+    for (slot, (_, _, atomic)) in scan.iter_mut().zip(SCAN_COUNTERS.iter()) {
+        *slot = atomic.load(Ordering::Relaxed);
+    }
+    let (batches, batched_jobs) = crate::node::scan_batch_counters();
+    Reading {
+        requests,
+        in_flight,
+        complete,
+        first_response,
+        errors,
+        scan,
+        batches,
+        batched_jobs,
+        shards: gauges.iter().map(|g| g()).collect(),
+    }
 }
 
 // A `const` here is the repeat-element initializer for the arrays
@@ -594,10 +710,10 @@ const DURATION: &str = "turbovec_request_duration_seconds";
 /// One histogram's exposition rows under `labels` (the `rpc` and, for
 /// a streaming phase, `phase` labels): cumulative buckets, `_sum`,
 /// `_count`. `_count` is the `+Inf` bucket by construction.
-fn write_histogram(out: &mut String, labels: &str, histogram: &Histogram) {
+fn write_histogram(out: &mut String, labels: &str, histogram: &HistogramReading) {
     let mut cumulative = 0u64;
     for (i, (le, _)) in BUCKETS.iter().enumerate() {
-        cumulative += histogram.buckets[i].load(Ordering::Relaxed);
+        cumulative += histogram.buckets[i];
         write_metric(
             out,
             &format!("{DURATION}_bucket"),
@@ -605,18 +721,18 @@ fn write_histogram(out: &mut String, labels: &str, histogram: &Histogram) {
             cumulative,
         );
     }
-    write_metric_seconds(
-        out,
-        &format!("{DURATION}_sum"),
-        labels,
-        histogram.sum_ns.load(Ordering::Relaxed),
-    );
+    write_metric_seconds(out, &format!("{DURATION}_sum"), labels, histogram.sum_ns);
     write_metric(out, &format!("{DURATION}_count"), labels, cumulative);
 }
 
 /// Render the whole exposition page: the process-wide counters, then
-/// every gauge provider in order.
+/// every gauge provider in order. One [`read`], then [`render_reading`].
 pub fn render(gauges: &[GaugeProvider]) -> String {
+    render_reading(&read(gauges))
+}
+
+/// The exposition page for one [`Reading`].
+pub fn render_reading(reading: &Reading) -> String {
     let mut out = String::with_capacity(96 * 1024);
 
     header(
@@ -630,7 +746,7 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
             &mut out,
             "turbovec_requests_total",
             &format!("rpc=\"{name}\""),
-            REQUESTS[i].load(Ordering::Relaxed),
+            reading.requests[i],
         );
     }
 
@@ -645,7 +761,7 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
             &mut out,
             "turbovec_requests_in_flight",
             &format!("rpc=\"{name}\""),
-            IN_FLIGHT[i].load(Ordering::Relaxed),
+            reading.in_flight[i],
         );
     }
 
@@ -662,15 +778,15 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
             write_histogram(
                 &mut out,
                 &format!("rpc=\"{name}\",phase=\"first_response\""),
-                &FIRST_RESPONSE[i],
+                &reading.first_response[i],
             );
             write_histogram(
                 &mut out,
                 &format!("rpc=\"{name}\",phase=\"complete\""),
-                &COMPLETE[i],
+                &reading.complete[i],
             );
         } else {
-            write_histogram(&mut out, &format!("rpc=\"{name}\""), &COMPLETE[i]);
+            write_histogram(&mut out, &format!("rpc=\"{name}\""), &reading.complete[i]);
         }
     }
 
@@ -686,70 +802,38 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
                 &mut out,
                 "turbovec_request_errors_total",
                 &format!("rpc=\"{name}\",code=\"{code}\""),
-                ERRORS[i][c].load(Ordering::Relaxed),
+                reading.errors[i][c],
             );
         }
     }
 
-    for (name, help, counter) in [
-        (
-            "turbovec_scan_chunk_calls_total",
-            "Per-chunk kernel calls made by vector scans.",
-            &SCAN_CHUNK_CALLS,
-        ),
-        (
-            "turbovec_scan_candidates_total",
-            "Real candidates collected by vector scans (floor sharing's savings show here).",
-            &SCAN_CANDIDATES,
-        ),
-        (
-            "turbovec_scan_floors_offered_total",
-            "Floors the scan offered to publish (its own behavior, knob-independent).",
-            &SCAN_FLOORS_OFFERED,
-        ),
-        (
-            "turbovec_scan_floors_published_total",
-            "Floors actually put on the wire (what the floor knobs move).",
-            &SCAN_FLOORS_PUBLISHED,
-        ),
-        (
-            "turbovec_scan_floor_updates_applied_total",
-            "Chunks that ran under a coordinator-pushed floor.",
-            &SCAN_FLOOR_UPDATES_APPLIED,
-        ),
-        (
-            "turbovec_documents_added_total",
-            "Documents ingested over AddDocuments streams.",
-            &DOCUMENTS_ADDED,
-        ),
-        (
-            "turbovec_vectors_added_total",
-            "Vectors ingested over AddVectors batches.",
-            &VECTORS_ADDED,
-        ),
-    ] {
+    for ((name, help, _), value) in SCAN_COUNTERS.iter().zip(reading.scan) {
         header(&mut out, name, "counter", help);
-        write_metric(&mut out, name, "", counter.load(Ordering::Relaxed));
+        write_metric(&mut out, name, "", value);
     }
 
-    let (batches, jobs) = crate::node::scan_batch_counters();
     header(
         &mut out,
         "turbovec_scan_batches_total",
         "counter",
         "Batched kernel passes (coalesced scans).",
     );
-    write_metric(&mut out, "turbovec_scan_batches_total", "", batches);
+    write_metric(&mut out, "turbovec_scan_batches_total", "", reading.batches);
     header(
         &mut out,
         "turbovec_scan_batched_jobs_total",
         "counter",
         "Scan jobs that rode a batched pass.",
     );
-    write_metric(&mut out, "turbovec_scan_batched_jobs_total", "", jobs);
+    write_metric(
+        &mut out,
+        "turbovec_scan_batched_jobs_total",
+        "",
+        reading.batched_jobs,
+    );
 
-    if !gauges.is_empty() {
-        let samples: Vec<ShardGauges> = gauges.iter().map(|g| g()).collect();
+    if !reading.shards.is_empty() {
+        let samples = &reading.shards;
         for (name, help, read) in [
             (
                 "turbovec_shard_vectors",
@@ -768,7 +852,7 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
             ),
         ] {
             header(&mut out, name, "gauge", help);
-            for sample in &samples {
+            for sample in samples {
                 write_metric(
                     &mut out,
                     name,
@@ -793,6 +877,11 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
 /// gauges, and histograms [`render`] prints, in the same order, with the
 /// same names and labels, so a dashboard and a scraper never disagree.
 pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSnapshot {
+    snapshot_reading(process, &read(gauges))
+}
+
+/// The snapshot for one [`Reading`].
+pub fn snapshot_reading(process: &str, reading: &Reading) -> crate::pb::MetricsSnapshot {
     use crate::pb::{
         HistogramBucketSample, HistogramSample, MetricKind, MetricLabel, MetricSample,
     };
@@ -818,11 +907,11 @@ pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSn
             value: value as f64,
         }
     }
-    fn histogram(labels: Vec<MetricLabel>, h: &Histogram) -> HistogramSample {
+    fn histogram(labels: Vec<MetricLabel>, h: &HistogramReading) -> HistogramSample {
         let mut cumulative = 0u64;
         let mut buckets = Vec::with_capacity(BUCKETS.len());
         for (i, (_, le)) in BUCKETS.iter().enumerate() {
-            cumulative += h.buckets[i].load(Ordering::Relaxed);
+            cumulative += h.buckets[i];
             buckets.push(HistogramBucketSample {
                 le: if *le == u64::MAX {
                     f64::INFINITY
@@ -836,7 +925,7 @@ pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSn
             name: DURATION.to_string(),
             labels,
             buckets,
-            sum: h.sum_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            sum: h.sum_ns as f64 / 1e9,
             count: cumulative,
         }
     }
@@ -847,28 +936,28 @@ pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSn
         samples.push(counter(
             "turbovec_requests_total",
             vec![label("rpc", name)],
-            REQUESTS[i].load(Ordering::Relaxed),
+            reading.requests[i],
         ));
     }
     for (i, (_, name, _)) in REQUEST_ROUTES.iter().enumerate() {
         samples.push(gauge(
             "turbovec_requests_in_flight",
             vec![label("rpc", name)],
-            IN_FLIGHT[i].load(Ordering::Relaxed),
+            reading.in_flight[i],
         ));
     }
     for (i, (_, name, streaming)) in REQUEST_ROUTES.iter().enumerate() {
         if *streaming {
             histograms.push(histogram(
                 vec![label("rpc", name), label("phase", "first_response")],
-                &FIRST_RESPONSE[i],
+                &reading.first_response[i],
             ));
             histograms.push(histogram(
                 vec![label("rpc", name), label("phase", "complete")],
-                &COMPLETE[i],
+                &reading.complete[i],
             ));
         } else {
-            histograms.push(histogram(vec![label("rpc", name)], &COMPLETE[i]));
+            histograms.push(histogram(vec![label("rpc", name)], &reading.complete[i]));
         }
     }
     for (i, (_, name, _)) in REQUEST_ROUTES.iter().enumerate() {
@@ -876,36 +965,25 @@ pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSn
             samples.push(counter(
                 "turbovec_request_errors_total",
                 vec![label("rpc", name), label("code", code)],
-                ERRORS[i][c].load(Ordering::Relaxed),
+                reading.errors[i][c],
             ));
         }
     }
-    for (name, atomic) in [
-        ("turbovec_scan_chunk_calls_total", &SCAN_CHUNK_CALLS),
-        ("turbovec_scan_candidates_total", &SCAN_CANDIDATES),
-        ("turbovec_scan_floors_offered_total", &SCAN_FLOORS_OFFERED),
-        (
-            "turbovec_scan_floors_published_total",
-            &SCAN_FLOORS_PUBLISHED,
-        ),
-        (
-            "turbovec_scan_floor_updates_applied_total",
-            &SCAN_FLOOR_UPDATES_APPLIED,
-        ),
-        ("turbovec_documents_added_total", &DOCUMENTS_ADDED),
-        ("turbovec_vectors_added_total", &VECTORS_ADDED),
-    ] {
-        samples.push(counter(name, Vec::new(), atomic.load(Ordering::Relaxed)));
+    for ((name, _, _), value) in SCAN_COUNTERS.iter().zip(reading.scan) {
+        samples.push(counter(name, Vec::new(), value));
     }
-    let (batches, jobs) = crate::node::scan_batch_counters();
-    samples.push(counter("turbovec_scan_batches_total", Vec::new(), batches));
+    samples.push(counter(
+        "turbovec_scan_batches_total",
+        Vec::new(),
+        reading.batches,
+    ));
     samples.push(counter(
         "turbovec_scan_batched_jobs_total",
         Vec::new(),
-        jobs,
+        reading.batched_jobs,
     ));
-    if !gauges.is_empty() {
-        let shards: Vec<ShardGauges> = gauges.iter().map(|g| g()).collect();
+    if !reading.shards.is_empty() {
+        let shards = &reading.shards;
         for (name, read) in [
             (
                 "turbovec_shard_vectors",
@@ -914,7 +992,7 @@ pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSn
             ("turbovec_shard_documents", |s| s.documents),
             ("turbovec_shard_stats_epoch", |s| s.stats_epoch),
         ] {
-            for shard in &shards {
+            for shard in shards {
                 samples.push(gauge(
                     name,
                     vec![label("slot_offset", &shard.slot_offset.to_string())],
@@ -1009,7 +1087,7 @@ mod tests {
         assert_eq!(h.sum_ns.load(Ordering::Relaxed), 1_000_002_000_000);
 
         let mut out = String::new();
-        write_histogram(&mut out, "rpc=\"t\"", &h);
+        write_histogram(&mut out, "rpc=\"t\"", &h.reading());
         let bucket = |le: &str| {
             sample(
                 &out,

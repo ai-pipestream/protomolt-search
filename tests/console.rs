@@ -6,9 +6,11 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use pipestream_search::console::{Console, ConsoleConfig};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::diagnostics::{CoordinatorDiagnostics, RecentRing};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
@@ -109,12 +111,21 @@ async fn start() -> Cluster {
     let coordinator_addr = format!("http://{}", listener.local_addr().unwrap());
     let coordinator =
         CoordinatorServiceImpl::new(nodes.clone()).with_bm25(Some(analysis), Default::default());
+    // The coordinator listener serves diagnostics next to search, as the
+    // product's does (src/main.rs): one unnamed member, no principals.
+    let diagnostics = CoordinatorDiagnostics::new(
+        vec![(String::new(), coordinator.clone())],
+        None,
+        Arc::new(RecentRing::default()),
+    )
+    .into_server(MAX_MESSAGE_BYTES);
     handles.push(tokio::spawn(
         Server::builder()
             .add_service(CoordinatorServiceImpl::into_server(
                 coordinator,
                 MAX_MESSAGE_BYTES,
             ))
+            .add_service(diagnostics)
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     ));
     let console = Console::bind(ConsoleConfig {
@@ -324,10 +335,18 @@ async fn the_facade_transcodes_search_and_diagnostics_and_serves_the_ui() {
     assert_eq!(r.status, 400, "{}", r.body);
     assert!(r.body.contains("QueryRequest"), "{}", r.body);
 
-    // Unserved diagnostics map to 501, on the coordinator and on a node.
+    // Diagnostics are served on the coordinator and on a node, and the
+    // knobs come back with their scope: coordinator knobs from the
+    // coordinator, node knobs from a node.
     let (status, body) = rpc(c, "DiagnosticsService", "GetRuntimeKnobs", json!({})).await;
-    assert_eq!(status, 501, "{body}");
-    assert_eq!(body["code"], "UNIMPLEMENTED");
+    assert_eq!(status, 200, "{body}");
+    let knobs = body["knobs"].as_array().expect("knobs array");
+    assert!(
+        knobs
+            .iter()
+            .any(|k| k["name"] == "max_k" && k["scope"] == "KNOB_SCOPE_COORDINATOR"),
+        "{body}"
+    );
     let r = http(
         c,
         "POST",
@@ -335,7 +354,12 @@ async fn the_facade_transcodes_search_and_diagnostics_and_serves_the_ui() {
         Some("{}"),
     )
     .await;
-    assert_eq!(r.status, 501, "{}", r.body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(
+        r.body.contains("\"segment_pruning\"") && r.body.contains("KNOB_SCOPE_NODE"),
+        "{}",
+        r.body
+    );
     let r = http(
         c,
         "POST",
@@ -500,15 +524,53 @@ async fn the_stream_route_delivers_server_sent_events_and_ends() {
     .await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.body.contains("\"completed\":true"), "{}", r.body);
-    // The diagnostics stream is unserved: a 501 before any event.
+    // The metrics stream is served and never ends on its own: read the
+    // status line and the first event, then drop the connection.
+    let first = sse_first_event(
+        c,
+        "/api/stream/DiagnosticsService/StreamMetrics?interval_ms=200",
+    )
+    .await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(first.contains("text/event-stream"), "{first}");
+    assert!(first.contains("\"samples\""), "{first}");
+    // An interval under the floor is rejected before any event.
     let r = http(
         c,
         "GET",
-        "/api/stream/DiagnosticsService/StreamMetrics?interval_ms=200",
+        "/api/stream/DiagnosticsService/StreamMetrics?interval_ms=50",
         None,
     )
     .await;
-    assert_eq!(r.status, 501, "{}", r.body);
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
+/// GET `path` and return the response head plus the body through the end
+/// of the first SSE event (the first blank line after a `data:` line).
+async fn sse_first_event(addr: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: console\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert!(
+            n > 0,
+            "stream ended before the first event: {}",
+            String::from_utf8_lossy(&raw)
+        );
+        raw.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&raw);
+        if let Some(head_end) = text.find("\r\n\r\n") {
+            let body = &text[head_end + 4..];
+            if let Some(data) = body.find("data:") {
+                if body[data..].contains("\n\n") {
+                    return text.into_owned();
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

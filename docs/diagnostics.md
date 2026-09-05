@@ -66,8 +66,10 @@ request counters, in-flight gauges, latency histograms, error counters,
 scan-work and ingest counters, and per-shard gauges the Prometheus page
 renders (`docs/metrics.md`), with the same names and labels, in the
 same order. A histogram sample lists cumulative bucket counts with
-their upper bounds in seconds, the sum in seconds, and the count. A
-test asserts the snapshot and the rendered page are equal.
+their upper bounds in seconds, the sum in seconds, and the count. Both
+are views of one registry reading (`metrics::read`): the page and the
+snapshot built from the same reading are equal by construction, and a
+test asserts it on one reading rather than on two taken moments apart.
 
 `StreamMetrics` sends one snapshot every `interval_ms` (0 selects 1000;
 below 100 is rejected) until the client hangs up; the producer stops

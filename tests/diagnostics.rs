@@ -469,8 +469,12 @@ async fn the_snapshot_equals_the_rendered_page() {
     let gauges = vec![node.metrics_provider()];
     // Move the registry off zero so the comparison is not trivial.
     metrics::inc_request(metrics::Route::Query);
-    let page = metrics::render(&gauges);
-    let snapshot = metrics::snapshot("test", &gauges);
+    // One reading, two views: other tests in this binary drive the same
+    // process-wide registry from their own threads, so two separate reads
+    // would be two moments, and the claim here is about one.
+    let reading = metrics::read(&gauges);
+    let page = metrics::render_reading(&reading);
+    let snapshot = metrics::snapshot_reading("test", &reading);
     assert_eq!(snapshot.process, "test");
     assert!(snapshot.unix_ms > 0);
     check_snapshot_against_page(&snapshot, &page);
