@@ -356,9 +356,6 @@ service NodeService {
   // stats for the BM25 leg).
   rpc ShardLegs(ShardLegsRequest) returns (ShardLegsResponse);
 
-  // Liveness + shape of this shard: vector count, dim, bit width, BM25
-  // doc count, and whether an ingest stream currently holds the shard's
-  // single-writer slot. Cheap enough to poll.
   // Filter-only browse (docs/query-api.md): the shard's admitted doc
   // ids strictly above `after`, ascending, at most k — a match-all
   // iterator over the slot space gated by the resolved filter at the
@@ -402,6 +399,9 @@ service NodeService {
   // is already running, or the work directory is not empty.
   rpc CompactShard(CompactShardRequest) returns (CompactShardResponse);
 
+  // Liveness + shape of this shard: vector count, dim, bit width, BM25
+  // doc count, and whether an ingest stream currently holds the shard's
+  // single-writer slot. Cheap enough to poll.
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
