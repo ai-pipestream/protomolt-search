@@ -231,11 +231,13 @@ pub async fn start_opened_node(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     node.spawn_floor_listener(addr);
+    let diagnostics = node.diagnostics_server(MAX_MESSAGE_BYTES);
     let handle = tokio::spawn(
         Server::builder()
             .initial_stream_window_size(crate::H2_STREAM_WINDOW)
             .initial_connection_window_size(crate::H2_CONN_WINDOW)
             .add_service(NodeServiceImpl::into_server(node, MAX_MESSAGE_BYTES))
+            .add_service(diagnostics)
             .serve_with_incoming(nodelay_incoming(listener)),
     );
     (format!("http://{addr}"), handle)
@@ -263,11 +265,13 @@ pub async fn serve_node(node: NodeServiceImpl) -> (String, JoinHandle<Result<(),
     let addr: SocketAddr = listener.local_addr().unwrap();
     // The UDP floor lane shares the gRPC listener's host:port.
     node.spawn_floor_listener(addr);
+    let diagnostics = node.diagnostics_server(MAX_MESSAGE_BYTES);
     let handle = tokio::spawn(
         Server::builder()
             .initial_stream_window_size(crate::H2_STREAM_WINDOW)
             .initial_connection_window_size(crate::H2_CONN_WINDOW)
             .add_service(NodeServiceImpl::into_server(node, MAX_MESSAGE_BYTES))
+            .add_service(diagnostics)
             .serve_with_incoming(nodelay_incoming(listener)),
     );
     (format!("http://{addr}"), handle)
