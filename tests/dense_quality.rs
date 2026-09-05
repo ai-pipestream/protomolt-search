@@ -162,6 +162,7 @@ impl Fixture {
             targets: TARGETS.to_vec(),
             default_target_recall_ppm,
             ground_truth,
+            brute_id_map: None,
         }
     }
 

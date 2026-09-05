@@ -128,6 +128,26 @@ pub struct MeasureSpec<'a> {
     pub targets: Vec<u32>,
     pub default_target_recall_ppm: Option<u32>,
     pub ground_truth: GroundTruth<'a>,
+    /// How a brute-force row position becomes the fleet's doc id, when
+    /// the fleet's ids are not the corpus positions: a fleet whose shards
+    /// sit at a slot stride wider than their row count (the runbook's
+    /// `OFFSET_STRIDE`) numbers shard `s`'s rows from `s * stride`.
+    /// `None` takes row `i` as doc id `i`.
+    pub brute_id_map: Option<BruteIdMap>,
+}
+
+/// Row position to doc id for a brute-force rows file laid out in shard
+/// order: `id = (row / rows_per_shard) * slot_stride + row % rows_per_shard`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BruteIdMap {
+    pub rows_per_shard: u64,
+    pub slot_stride: u64,
+}
+
+impl BruteIdMap {
+    pub fn id_of(&self, row: u64) -> u64 {
+        (row / self.rows_per_shard) * self.slot_stride + row % self.rows_per_shard
+    }
 }
 
 /// One rung as measured, with the per-query recall the summary came from
@@ -508,9 +528,14 @@ pub async fn measure<R: ProfileRoute>(
     // id ascending) and a top-k under a total order is prefix-stable.
     let mut truth: Vec<Vec<u64>> = Vec::with_capacity(n_queries);
     let mut brute = match spec.ground_truth {
-        GroundTruth::Brute { rows } => {
-            brute_topk_many(rows, dim, spec.queries, k_max as usize).into_iter()
-        }
+        GroundTruth::Brute { rows } => brute_topk_many(rows, dim, spec.queries, k_max as usize)
+            .into_iter()
+            .map(|ids| match spec.brute_id_map {
+                Some(map) => ids.into_iter().map(|row| map.id_of(row)).collect(),
+                None => ids,
+            })
+            .collect::<Vec<Vec<u64>>>()
+            .into_iter(),
         GroundTruth::FullDepth => Vec::new().into_iter(),
     };
     for (index, vector) in spec.queries.chunks_exact(dim).enumerate() {

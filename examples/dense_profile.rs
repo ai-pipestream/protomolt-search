@@ -290,6 +290,21 @@ async fn main() -> Result<(), Error> {
         None => GroundTruth::FullDepth,
     };
 
+    // The fleet's id layout, when its shards sit at a slot stride wider
+    // than their rows (the runbook's OFFSET_STRIDE): row positions of
+    // the brute file map to `shard * stride + local`.
+    let brute_id_map = match (arg("brute-rows-per-shard"), arg("brute-slot-stride")) {
+        (None, None) => None,
+        (Some(rows), Some(stride)) => Some(pipestream_search::quality::measure::BruteIdMap {
+            rows_per_shard: rows
+                .parse()
+                .map_err(|e| format!("--brute-rows-per-shard: {e}"))?,
+            slot_stride: stride
+                .parse()
+                .map_err(|e| format!("--brute-slot-stride: {e}"))?,
+        }),
+        _ => return Err("--brute-rows-per-shard and --brute-slot-stride go together".into()),
+    };
     let security = ToolClient::from_env_args()?;
     let mut client =
         SearchServiceClient::with_interceptor(security.connect(&coord).await?, security.bearer())
@@ -306,6 +321,7 @@ async fn main() -> Result<(), Error> {
         targets,
         default_target_recall_ppm: default_target,
         ground_truth,
+        brute_id_map,
     };
     let measured = measure(&mut client, &spec).await?;
     eprintln!(
