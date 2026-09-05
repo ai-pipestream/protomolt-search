@@ -1,0 +1,54 @@
+syntax = "proto3";
+package unsigned_mapping;
+
+import "ai/protomolt/proto/index/hints/v1/indexing_hints.proto";
+
+message Detail {
+  optional fixed64 capacity = 1;
+  uint32 defaulted = 2;
+}
+message Record {
+  uint64 id = 1;
+  string body = 2;
+  repeated float embedding = 3;
+  optional uint64 counter = 4;
+  fixed64 fixed = 5;
+  uint32 small = 6;
+  fixed32 small_fixed = 7;
+  oneof choice {
+    uint64 chosen = 8;
+    bytes opaque = 9;
+  }
+  Detail detail = 10;
+  repeated uint64 many = 11;
+  map<string, uint64> counters = 12;
+  uint64 signed_hint = 13 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_INT64];
+}
+message Chunk {
+  uint64 id = 1 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNK_ID,
+    (ai.protomolt.proto.index.hints.v1.index).name = "chunk_id"];
+  string body = 2;
+  repeated float embedding = 3;
+  optional uint64 value = 4;
+}
+message Parent {
+  fixed64 id = 1;
+  repeated Chunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}
+
+message CollidingChunk {
+  uint64 id = 1;
+  string body = 2;
+  repeated float embedding = 3;
+}
+message CollidingParent {
+  uint64 id = 1;
+  repeated CollidingChunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}
+message FlatCollision {
+  uint64 id = 1;
+  string body = 2;
+  repeated float embedding = 3;
+  Detail detail = 4;
+  string detail_capacity = 5;
+}

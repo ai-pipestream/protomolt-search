@@ -286,8 +286,8 @@ fn graph_covers_skipped_recursive_repeated_map_and_well_known_fields() {
         .iter()
         .any(|c| c.contains("epoch microseconds")));
     let counter = &field(report, "report_fixture.Record.counter").projections[0];
-    assert_eq!(counter.query_representation, Query::SignedInteger as i32);
-    assert!(counter.constraints.iter().any(|c| c.contains("i64::MAX")));
+    assert_eq!(counter.query_representation, Query::UnsignedInteger as i32);
+    assert!(!counter.constraints.iter().any(|c| c.contains("i64::MAX")));
     assert!(field(report, "report_fixture.Record.label")
         .descriptor
         .as_ref()

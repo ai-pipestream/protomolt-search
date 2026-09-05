@@ -128,10 +128,9 @@ reads preserve those values across a frozen seal, publication, continued tail
 ingest and reopen; segment summaries keep unsigned ranges in `uint_columns`.
 Schema checks reject a tail or segment with different ordered columns before
 it can change the meaning of a column ordinal. Existing signed storage bytes
-and protobuf contracts are unchanged. This foundation does not yet enable
-mapped unsigned numerics: mapping and value projections still need
-their own unsigned types before support is advertised. The filter increment
-below adds typed filtering and pruning for explicitly declared u64 columns.
+and protobuf contracts are unchanged. Storage alone does not establish mapped unsigned semantics. The following
+increments add typed ingest, filtering and descriptor mapping; unsigned value
+expressions and other query operators remain unfinished.
 See `tests/unsigned_columns.rs` and `docs/range-facets.md`.
 
 The next increment connects `UnsignedIntegerValue` to ordinary protobuf ingest,
@@ -174,6 +173,44 @@ formatting and vendored-proto checks passed. A descriptor comparison against
 `442ec30` confirms that only `FilterBound.uint` field 4 was added; existing
 declarations remain unchanged. These are local checks on the unsigned-numerics
 feature branch, not fleet validation.
+
+The descriptor-mapping increment infers `UINT32`/`UINT64` kinds for all four
+unsigned protobuf encodings and lands singular values in `U64`. Bind validates
+the declared unsigned column table. The schema report distinguishes unsigned
+query representation and names its remaining unsupported operations. The new
+kind/family participates in the existing canonical hash; the checked-in legacy
+fingerprint from mapper `d0a1716` is rejected, while the existing signed plan
+fingerprint remains unchanged. Explicit signed hints retain checked i64
+conversion. Ambiguous column names now refuse during planning, including
+parent/chunk aliases and flattened paths with the same output name.
+
+A regression test reproduced mapped ingest acknowledging an expression over an
+unsigned input that the materialization environment did not represent. Declared
+unsigned reads now refuse at bind and in the node's compiled-spec validation;
+the shared coordinator path checks actual unsigned request inputs before
+building the value environment. This is an explicit unsupported-operation
+boundary while unsigned value evaluation remains unfinished, not unsigned
+materialization support. Unrelated signed expressions remain supported.
+
+`tests/unsigned_mapping.rs` covers optional/implicit presence, oneof clearing,
+merged nested messages, full unsigned parent and chunk keys, repeated/map source
+preservation, signed hint refusal, old binding refusal, and mapped ingest,
+reopen, exact key filtering and repeated compaction on both layouts. Legacy
+mapped ingest still does not publish catalog `DocumentIdentity`; retaining
+indexed key values and original bytes is not completion of the identity,
+conditional-write or receipt contract. Unsigned value expressions, sorting,
+aggregation and the other protobuf shapes also remain required.
+
+Validation of the mapping increment on 2026-09-05: 422 library tests, 527
+integration tests across 89 targets and 11 embedded tests passed; one existing
+sidecar test was ignored. All five Android/iOS Rust target checks passed with
+the three existing relay dead-code warnings. Tests/examples compilation,
+formatting, fixture regeneration and vendored-proto checks passed. Descriptor
+comparison against `d0a1716` confirms that the only wire additions are two
+unsigned mapped kinds, the U64 column family and unsigned query representation;
+existing declarations are unchanged. The materialization regression failed
+before the input validation and passed afterward. These checks are local to
+the unsigned feature branch; no fleet deployment or cutover was performed.
 
 The unsigned storage foundation passed 420 library tests and 510 integration
 tests across 86 targets on the `0effb06` base, with one existing sidecar test

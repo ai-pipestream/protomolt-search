@@ -8351,6 +8351,12 @@ impl NodeServiceImpl {
             }
         }
         let columns = compile_materialize_spec(spec)?;
+        validate_materialize_inputs(&columns, |name| {
+            self.config
+                .unsigned_integer_fields
+                .iter()
+                .any(|field| field == name)
+        })?;
         *cache = Some(CompiledMaterialize {
             spec: spec.clone(),
             columns: columns.clone(),
@@ -8468,6 +8474,32 @@ pub(crate) fn compile_materialize_spec(
     Ok(columns)
 }
 
+// Until the value evaluator represents unsigned inputs, treating one as a
+// missing signed/double value would silently discard the derived column.
+// Validate declared types at the node and actual request types at the shared
+// coordinator entry point, including reads nested inside value expressions.
+fn validate_materialize_inputs(
+    compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
+    is_unsigned: impl Fn(&str) -> bool,
+) -> Result<(), Status> {
+    for (output, expr, _) in compiled {
+        let mut leaves = Vec::new();
+        crate::values::column_leaves(expr, &mut leaves);
+        for leaf in leaves {
+            let name = match &leaf {
+                crate::values::ValueLeaf::Column(name) => name,
+                crate::values::ValueLeaf::Map { column, .. } => column,
+            };
+            if is_unsigned(name) {
+                return Err(Status::invalid_argument(format!(
+                    "materialize: column {output:?} reads unsigned input {name:?}; unsigned value materialization is not supported"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Evaluate compiled materialized columns over one document's own
 /// values and push the results into its `numerics` / `integers`
 /// lists. Shared by node ingest and the coordinator's placement
@@ -8477,6 +8509,13 @@ pub(crate) fn apply_materialize(
     mut doc: AddDocumentsRequest,
     compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
 ) -> Result<AddDocumentsRequest, Status> {
+    if !doc.unsigned_integers.is_empty() {
+        validate_materialize_inputs(compiled, |name| {
+            doc.unsigned_integers
+                .iter()
+                .any(|field| field.field == name)
+        })?;
+    }
     {
         let mut env = crate::values::IngestEnv::default();
         for nv in &doc.numerics {
@@ -9715,6 +9754,11 @@ impl NodeServiceImpl {
                 (&self.config.facet_fields, "--facet-fields")
             } else if field.family == ColumnFamily::I64 as i32 {
                 (&self.config.integer_fields, "--integer-fields")
+            } else if field.family == ColumnFamily::U64 as i32 {
+                (
+                    &self.config.unsigned_integer_fields,
+                    "--unsigned-integer-fields",
+                )
             } else if field.family == ColumnFamily::F64 as i32 {
                 (&self.config.numeric_fields, "--numeric-fields")
             } else {
@@ -9731,6 +9775,9 @@ impl NodeServiceImpl {
                  restart the node, or revise the plan",
                 missing.join(", ")
             )));
+        }
+        if let Some(spec) = &bind.materialize {
+            self.compiled_materialize(spec)?;
         }
         // The durable shard-level binding: the FIRST bind pins the
         // shard to this plan identity (recorded to the WAL now, to the
@@ -14356,5 +14403,34 @@ mod floor_lane_tests {
             .insert(8, Arc::new(StreamSignals::new(f32::NEG_INFINITY)));
         apply_stream_datagram(&signals, Some(&key), &sign(&key, 1, &encode_floor(8, 0.1)));
         assert_eq!(floor_of(&signals, 8), 0.1);
+    }
+}
+
+#[cfg(test)]
+mod unsigned_materialize_tests {
+    use super::*;
+
+    #[test]
+    fn shared_materialization_refuses_unsigned_reads_before_they_become_absent() {
+        let doc = AddDocumentsRequest {
+            unsigned_integers: vec![crate::pb::UnsignedIntegerValue {
+                field: "counter".into(),
+                value: u64::MAX,
+            }],
+            ..Default::default()
+        };
+        for expression in ["counter", "double(counter) + 1.0", "counter > 0 ? 1 : 0"] {
+            let columns = compile_materialize_spec(&crate::pb::MaterializeSpec {
+                columns: vec![crate::pb::MaterializedColumn {
+                    name: "derived".into(),
+                    expression: expression.into(),
+                    kind: crate::pb::MaterializeKind::I64 as i32,
+                }],
+            })
+            .unwrap();
+            let error = apply_materialize(doc.clone(), &columns).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("unsigned input \"counter\""));
+        }
     }
 }

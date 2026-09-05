@@ -42,6 +42,52 @@ The ownership move is decided (descriptor-derived mappings belong to
 pipestream-search, not turbovec-grpc), and the reference implementation
 is frozen in turbovec-grpc git history.
 
+## Unsigned numeric mapping (2026-09-05, feature branch)
+
+Unhinted `uint32`/`fixed32` fields derive `UINT32`; `uint64`/`fixed64` derive
+`UINT64`. Singular values land in the separate `U64` column family, including
+zero and the full unsigned maximum. Declare those columns with
+`--unsigned-integer-fields` (or the corresponding Rust/mobile configuration).
+The extractor preserves optional presence, oneof selection, implicit defaults
+and nested-message presence. Parent and chunk ID reduction retains unsigned
+bits. Repeated scalars and maps remain source-only unless their existing
+structural contract provides a projection; unsigned support does not invent a
+reduction rule.
+
+Explicit `INT32`/`INT64` hints retain the existing signed i64 column contract;
+a value above `i64::MAX` refuses. Explicit keyword hints continue to produce
+exact decimal strings. Shared ProtoMolt hints are unchanged. This change is in
+the search product's inference and column contracts.
+
+Kind and family are already included in the canonical v3 hash, so an inferred
+unsigned projection acquires a different fingerprint. Existing signed and
+explicit keyword projections retain their hashes when no inferred unsigned
+field changes. Old inferred-unsigned bindings require a new generation built
+from original messages and reviewed against the new plan. The node refuses
+both the old fingerprint and a configuration that declares only signed columns.
+The legacy fingerprint fixture comes from the mapper at `d0a1716`, and the
+existing signed plan's pinned fingerprint remains a regression gate.
+
+Planning also refuses two projected fields that land the same column name,
+including flattened paths and parent/chunk collisions. Set distinct indexing
+`name` hints to resolve the error; the planner names both paths. Source-only
+schema description remains available for these descriptors. Previously bound
+ambiguous plans need corrected hints and a new generation.
+
+CEL unsigned filters and presence tests are supported. Unsigned value
+projections, arithmetic, materialized outputs, sorting and aggregation remain
+unfinished and are reported as limitations in the schema report. Materialization
+that reads a declared unsigned column refuses at bind, including when the first
+document omits the value. Ordinary node ingest and shared coordinator
+materialization also reject unsigned reads rather than treating a supplied
+unsigned value as absent. Signed-only expressions still work on documents that
+carry unrelated unsigned columns. Legacy
+`IngestMapped` retains original bytes but does not publish catalog
+`DocumentIdentity` or the source-authority write receipts. The mapped lifecycle
+test verifies unsigned key values, filtering, and byte-preserving source
+storage across compaction; it does not establish those remaining identity and
+publication contracts.
+
 ## 1. The layering rule
 
 Three things are easy to conflate and must not be:

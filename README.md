@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Unsigned descriptor mappings (2026-09-05, feature branch).** All four
+  protobuf unsigned encodings infer unsigned kinds and land in the u64 family.
+  Binding checks the new fingerprint and column declarations. Planning refuses
+  ambiguous column names across flattened paths and parent/chunk scopes.
+  Unsigned value expressions and catalog identity publication remain in progress.
+  See [the mapping contract](docs/descriptor-mappings.md#unsigned-numeric-mapping-2026-09-05-feature-branch).
+
 - **Unsigned numeric filters (2026-09-05, feature branch).** CEL decimal and
   hexadecimal uint literals compile to typed protobuf bounds. Comparisons and
   presence tests retain the full u64 domain across heap, mapped and segmented

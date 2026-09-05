@@ -22,7 +22,8 @@ message Record {
 
 message Chunk {
   fixed64 id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD,
-    (ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNK_ID];
+    (ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNK_ID,
+    (ai.protomolt.proto.index.hints.v1.index).name = "chunk_id"];
   string body = 2;
   repeated float embedding = 3;
 }

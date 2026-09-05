@@ -5613,9 +5613,9 @@ enum MappedKind {
   MAPPED_KIND_TEXT = 1;
   // Exact-value string (enum fields plan as their value names).
   MAPPED_KIND_KEYWORD = 2;
-  // 32-bit integer.
+  // Signed 32-bit integer.
   MAPPED_KIND_INT32 = 3;
-  // 64-bit integer.
+  // Signed 64-bit integer.
   MAPPED_KIND_INT64 = 4;
   // 32-bit float.
   MAPPED_KIND_FLOAT = 5;
@@ -5637,6 +5637,10 @@ enum MappedKind {
   // A repeated or map message field kept as a single un-expanded entry.
   // Recorded, no column family.
   MAPPED_KIND_NESTED = 12;
+  // Unsigned 32-bit integer, inferred from uint32 or fixed32.
+  MAPPED_KIND_UINT32 = 13;
+  // Unsigned 64-bit integer, inferred from uint64 or fixed64.
+  MAPPED_KIND_UINT64 = 14;
 }
 
 // MappedRole is the structural role a field plays, beyond its kind.
@@ -5660,7 +5664,7 @@ enum MappedRole {
 // plan, never silently dropped at ingest.
 enum ColumnFamily {
   // Recorded in the plan, stored nowhere. OBJECT/NESTED/BINARY fields,
-  // and repeated scalars: the facet, i64, and f64 planes hold one value
+  // and repeated scalars: the facet, i64, u64, and f64 planes hold one value
   // per document slot, and this engine does not guess a collapse rule.
   COLUMN_FAMILY_NONE = 0;
   // The analyzed BM25 field plane (multi-field columns, docs/bm25.md).
@@ -5675,6 +5679,8 @@ enum ColumnFamily {
   COLUMN_FAMILY_F64 = 4;
   // The dense vector leg.
   COLUMN_FAMILY_VECTOR = 5;
+  // Full-domain u64 plane with separate presence. UINT32 and UINT64 land here.
+  COLUMN_FAMILY_U64 = 6;
 }
 
 // MappedField is one field of the derived plan.

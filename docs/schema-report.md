@@ -50,7 +50,7 @@ repeated message or a recursive occurrence beyond the listed paths. Thus a
 message reused under two parents does not acquire a projection everywhere just
 because one occurrence is indexed.
 
-The query representation distinguishes analyzed text, string facets, signed
+The query representation distinguishes analyzed text, string facets, signed and unsigned
 integers, floating-point numbers and dense vectors. Constraints describe current
 conversions and value-domain restrictions: finite numerics, f32 vectors, the
 unsigned-to-i64 limit on signed numeric columns, string-rendered enums and
@@ -62,7 +62,9 @@ Explicit integer keywords use exact decimal strings across their full declared
 signed or unsigned domain. In particular, `uint64` and `fixed64` keywords accept
 values through `18446744073709551615`; they do not inherit the numeric i64 limit.
 Their query representation remains `STRING_FACET`, so equality and sorting use
-string semantics. This does not provide full-width unsigned numeric columns.
+string semantics. Unhinted unsigned fields instead use `UNSIGNED_INTEGER`
+query representation and full-domain u64 columns. Their constraints explicitly
+report the remaining value-expression, sorting and aggregation limitations.
 
 Preservation means exact bytes in the retained original protobuf. Unknown fields
 share that rule. `PlanIndex` reports that legacy mapped ingest requires at least

@@ -100,10 +100,10 @@ fn keyword_projection_preserves_all_integer_encodings_and_optional_zero() {
         .iter()
         .find(|f| f.full_name.ends_with(".numeric_value"))
         .unwrap();
-    assert!(numeric
-        .projections
-        .iter()
-        .any(|p| p.constraints.iter().any(|c| c.contains("i64::MAX"))));
+    assert_eq!(numeric.projections.len(), 1);
+    assert!(numeric.projections.iter().all(|p| p.query_representation
+        == pb::MappedQueryRepresentation::UnsignedInteger as i32
+        && !p.constraints.iter().any(|c| c.contains("i64::MAX"))));
 }
 
 #[test]
@@ -159,7 +159,7 @@ async fn large_keyword_values_survive_mapped_ingest_queries_and_persistence() {
             .filter(|f| f.family == pb::ColumnFamily::Facet as i32)
             .map(|f| f.name.clone())
             .collect(),
-        integer_fields: vec!["numeric_value".into()],
+        unsigned_integer_fields: vec!["numeric_value".into()],
         ..Default::default()
     };
     let (addr, server) = common::start_empty_node(config).await;

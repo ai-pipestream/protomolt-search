@@ -206,6 +206,7 @@ fn projection(
             ColumnFamily::TextField => (Use::Value, Query::AnalyzedText),
             ColumnFamily::Facet => (Use::Value, Query::StringFacet),
             ColumnFamily::I64 => (Use::Value, Query::SignedInteger),
+            ColumnFamily::U64 => (Use::Value, Query::UnsignedInteger),
             ColumnFamily::F64 => (Use::Value, Query::FloatingPoint),
         };
     let mut constraints = Vec::new();
@@ -214,6 +215,9 @@ fn projection(
             && matches!(descriptor.r#type(), Type::Uint64 | Type::Fixed64)
         {
             constraints.push("Values above i64::MAX are refused by the current extractor.".into());
+        }
+        if representation == Query::UnsignedInteger {
+            constraints.push("Exact unsigned comparisons and presence are supported; unsigned value projections, arithmetic, sorting and aggregations remain unavailable.".into());
         }
         if representation == Query::DenseVector {
             constraints.push(

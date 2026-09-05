@@ -13,9 +13,9 @@
 //! Fields may carry explicit hints as descriptor options, using the
 //! `(ai.protomolt.proto.index.hints.v1.index)` extension vendored from
 //! protomolt: a proto annotated for protomolt's indexers is understood
-//! here without modification. Where a field carries no hint, its kind
-//! is inferred from the descriptor with protomolt's rules, with one
-//! deliberate deviation the frozen turbovec-grpc reference also made:
+//! here without modification. Unhinted integer kinds retain descriptor
+//! signedness. Other kinds follow protomolt's rules, with the structural
+//! deviation the frozen turbovec-grpc reference also made:
 //! an unannotated singular message field is expanded into dotted paths
 //! rather than kept as a single OBJECT entry, because this is a flat
 //! engine with no native object type. An explicit OBJECT or NESTED hint
@@ -62,10 +62,10 @@ const HINT_EXTENSION_NUMBER: u64 = 59_100_471;
 /// a single OBJECT entry, which also bounds recursive message types.
 const MAX_DEPTH: usize = 8;
 
-/// Version tag mixed into the canonical fingerprint bytes. Bump on ANY
-/// change to derivation semantics or to the canonical encoding: a
-/// changed fingerprint is how drift is caught, and a drift at restore
-/// time is an index compatibility event, not a warning.
+/// Version tag mixed into the canonical fingerprint bytes. Bump when a
+/// semantic or encoding change is not already distinguished by the canonical
+/// plan. Kind and family changes participate directly in the hash. A changed
+/// fingerprint requires a new index binding, never a silent rebind.
 const FINGERPRINT_VERSION: &str = "pipestream-search.plan.v3";
 
 /// One refusal, uniformly shaped: every message begins `plan: `.
@@ -139,6 +139,21 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         return Err(refuse(format!(
             "message type {message_type} has no indexable fields"
         )));
+    }
+
+    let mut column_paths = HashMap::new();
+    for field in &fields {
+        if field.family == pb::ColumnFamily::None as i32
+            || field.family == pb::ColumnFamily::Vector as i32
+        {
+            continue;
+        }
+        if let Some(previous) = column_paths.insert(&field.name, &field.path) {
+            return Err(refuse(format!(
+                "fields {previous:?} and {:?} both land column {:?}; use distinct indexing name hints",
+                field.path, field.name
+            )));
+        }
     }
 
     let chunks_path = resolve_chunks(&fields)?;
@@ -703,12 +718,10 @@ fn inferred_kind(field: &FieldDescriptorProto, shape: &Shape<'_>) -> pb::MappedK
             }
         }
         Shape::Scalar(Type::Bool) => pb::MappedKind::Boolean,
-        Shape::Scalar(
-            Type::Int32 | Type::Uint32 | Type::Sint32 | Type::Fixed32 | Type::Sfixed32,
-        ) => pb::MappedKind::Int32,
-        Shape::Scalar(
-            Type::Int64 | Type::Uint64 | Type::Sint64 | Type::Fixed64 | Type::Sfixed64,
-        ) => pb::MappedKind::Int64,
+        Shape::Scalar(Type::Int32 | Type::Sint32 | Type::Sfixed32) => pb::MappedKind::Int32,
+        Shape::Scalar(Type::Int64 | Type::Sint64 | Type::Sfixed64) => pb::MappedKind::Int64,
+        Shape::Scalar(Type::Uint32 | Type::Fixed32) => pb::MappedKind::Uint32,
+        Shape::Scalar(Type::Uint64 | Type::Fixed64) => pb::MappedKind::Uint64,
         Shape::Scalar(Type::Float) => pb::MappedKind::Float,
         Shape::Scalar(Type::Double) => pb::MappedKind::Double,
         Shape::Scalar(Type::Bytes) => pb::MappedKind::Binary,
@@ -926,7 +939,7 @@ fn well_known_leaf(full: &str) -> bool {
 
 /// The column plane one planned field lands on. `NONE` is a visible
 /// outcome of the dry run, never a silent drop at ingest: the facet,
-/// i64, and f64 planes hold one value per document slot, so repeated
+/// i64, u64, and f64 planes hold one value per document slot, so repeated
 /// scalars do not land, and this engine does not guess a collapse rule.
 fn family(kind: pb::MappedKind, repeated: bool) -> pb::ColumnFamily {
     use pb::MappedKind as K;
@@ -937,6 +950,7 @@ fn family(kind: pb::MappedKind, repeated: bool) -> pb::ColumnFamily {
         K::Text => pb::ColumnFamily::TextField,
         K::Keyword | K::Boolean => pb::ColumnFamily::Facet,
         K::Int32 | K::Int64 | K::Date => pb::ColumnFamily::I64,
+        K::Uint32 | K::Uint64 => pb::ColumnFamily::U64,
         K::Float | K::Double => pb::ColumnFamily::F64,
     }
 }
@@ -1175,7 +1189,9 @@ fn resolve_doc_id(
                     && (f.kind == pb::MappedKind::Keyword as i32
                         || f.kind == pb::MappedKind::Text as i32
                         || f.kind == pb::MappedKind::Int32 as i32
-                        || f.kind == pb::MappedKind::Int64 as i32)
+                        || f.kind == pb::MappedKind::Int64 as i32
+                        || f.kind == pb::MappedKind::Uint32 as i32
+                        || f.kind == pb::MappedKind::Uint64 as i32)
             });
             match fallback {
                 Some(index) => {
@@ -1482,6 +1498,8 @@ enum Land {
     FacetUint,
     /// An i64 column value.
     Int,
+    /// A full-domain u64 column value.
+    Uint,
     /// A google.protobuf.Timestamp, landing as a TimestampValue so the
     /// ordinary epoch-micros conversion (and its refusals) applies.
     Date,
@@ -1505,6 +1523,7 @@ pub struct ExtractedDoc {
 enum Slot {
     Str(String),
     Int(i64),
+    Uint(u64),
     Num(f64),
     Ts { seconds: i64, nanos: i32 },
     Floats(Vec<f32>),
@@ -1812,6 +1831,10 @@ impl Extractor {
                     field: leaf.name.clone(),
                     value,
                 }),
+                Slot::Uint(value) => request.unsigned_integers.push(pb::UnsignedIntegerValue {
+                    field: leaf.name.clone(),
+                    value,
+                }),
                 Slot::Ts { seconds, nanos } => request.timestamps.push(pb::TimestampValue {
                     field: leaf.name.clone(),
                     value: Some(prost_types::Timestamp { seconds, nanos }),
@@ -1902,6 +1925,7 @@ impl Extractor {
 fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
     match (land, slot) {
         (Land::Int, Slot::Int(value)) => Ok(*value as u64),
+        (Land::Uint, Slot::Uint(value)) => Ok(*value),
         (Land::FacetInt | Land::FacetUint, Slot::Str(rendered)) => {
             let parsed = if matches!(land, Land::FacetUint) {
                 rendered.parse::<u64>()
@@ -2013,6 +2037,15 @@ fn land_for(
                     "an i64 column cannot decode descriptor type {:?}",
                     leaf.r#type()
                 ),
+            )),
+        };
+    }
+    if family == pb::ColumnFamily::U64 as i32 {
+        return match leaf.r#type() {
+            Type::Uint32 | Type::Fixed32 | Type::Uint64 | Type::Fixed64 => Ok(Land::Uint),
+            other => Err(refuse_at(
+                &field.path,
+                format!("a u64 column cannot decode descriptor type {other:?}"),
             )),
         };
     }
@@ -2167,6 +2200,8 @@ fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
         (Land::FacetUint, Value::U32(v)) => Slot::Str(v.to_string()),
         (Land::FacetUint, Value::U64(v)) => Slot::Str(v.to_string()),
         (Land::Int, v) => Slot::Int(integer(v)?),
+        (Land::Uint, Value::U32(v)) => Slot::Uint(u64::from(*v)),
+        (Land::Uint, Value::U64(v)) => Slot::Uint(*v),
         (Land::Num, Value::F32(v)) => Slot::Num(f64::from(*v)),
         (Land::Num, Value::F64(v)) => Slot::Num(*v),
         (Land::Date, Value::Message(v)) => Slot::Ts {

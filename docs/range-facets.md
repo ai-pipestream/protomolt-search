@@ -87,10 +87,10 @@ CEL comparisons and presence tests now resolve u64 columns using exact typed
 bounds, including values beyond the signed range. Placement evaluation and
 both topology and segment pruning use the same numeric meaning; see
 [CEL filters](cel-filters.md#numbers-compare-exactly-across-domains).
-Protobuf numeric mapping, value projections, unsigned range facets, sorting
-and aggregation are not yet connected to the u64 family. The schema report
-continues to describe the
-currently supported signed numeric mapping range. Use matching server and
+Unhinted unsigned protobuf fields now map to the u64 family; explicitly signed
+hints retain their checked i64 conversion. Value projections, unsigned range
+facets, sorting and aggregation are not yet connected to the u64 family. The
+schema report records the mapped query type and these remaining restrictions. Use matching server and
 client builds for this feature: older protobuf readers can ignore the new
 request field, and older storage readers refuse kind 11.
 

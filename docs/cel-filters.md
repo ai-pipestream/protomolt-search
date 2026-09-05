@@ -130,9 +130,10 @@ same semantics on ingest requests and exact mixed-domain bounds for fan-out
 pruning. Segment pruning uses unsigned min/max and presence metadata; absent
 metadata remains conservative.
 
-This feature-branch increment covers filters. Unsigned descriptor mappings,
-value projections, arithmetic, sorting and aggregations still require their own
-typed support; a uint value literal in a projection currently refuses by name.
+Unsigned descriptor mappings now land on the u64 family
+([mapping contract](descriptor-mappings.md#unsigned-numeric-mapping-2026-09-05-feature-branch)).
+Value projections, arithmetic, sorting and aggregations still require typed
+unsigned support; a uint value literal in a projection currently refuses by name.
 `tests/unsigned_filters.rs` checks an independent IEEE integer-ratio oracle,
 fixed expected query results across heap and reopened persisted layouts,
 placement evaluation, mixed-domain fan-out proofs, and segment pruning.

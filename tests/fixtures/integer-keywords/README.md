@@ -15,6 +15,7 @@ protoc -I proto -I . --include_imports \
 
 The fields cover all ten protobuf integer encodings as explicit keywords,
 optional zero versus absence, signed and unsigned parent IDs, and a separate
-numeric field that still reports the current signed-column range restriction.
+numeric field that infers unsigned numeric storage. Chunk id names are explicit
+to avoid a collision with the denormalized parent id.
 Query checks use decimal-string equality because that is the keyword contract;
 they do not claim unsigned numeric range support.

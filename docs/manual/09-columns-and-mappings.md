@@ -93,11 +93,11 @@ Each `MappedField` reports its dotted proto `path`, its engine `name` (the name
 filters and projections use), its `kind`, whether it is repeated, its structural
 `role`, and the `family` it is stored in.
 
-- Kinds: TEXT, KEYWORD, INT32, INT64, FLOAT, DOUBLE, BOOLEAN, DATE, BINARY,
+- Kinds: TEXT, KEYWORD, INT32, INT64, UINT32, UINT64, FLOAT, DOUBLE, BOOLEAN, DATE, BINARY,
   VECTOR, OBJECT, NESTED.
 - Families: TEXT_FIELD for analyzed text; FACET for keyword and boolean
   ("true"/"false"); I64 for INT32, INT64, and DATE as epoch microseconds; F64
-  for float and double; VECTOR for the dense side.
+  for float and double; U64 for UINT32 and UINT64; VECTOR for the dense side.
 - `COLUMN_FAMILY_NONE` is recorded in the plan, not silently dropped. Object,
   nested, and binary fields and repeated scalars land there, because the column
   planes hold one value per document and the engine does not guess a collapse

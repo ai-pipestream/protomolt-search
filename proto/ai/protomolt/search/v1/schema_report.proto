@@ -94,6 +94,9 @@ enum MappedQueryRepresentation {
   MAPPED_QUERY_REPRESENTATION_SIGNED_INTEGER = 3;
   MAPPED_QUERY_REPRESENTATION_FLOATING_POINT = 4;
   MAPPED_QUERY_REPRESENTATION_DENSE_VECTOR = 5;
+  // Exact u64 comparisons and presence. Additional query restrictions are
+  // recorded on FieldProjection.constraints.
+  MAPPED_QUERY_REPRESENTATION_UNSIGNED_INTEGER = 6;
 }
 
 message FieldProjection {
