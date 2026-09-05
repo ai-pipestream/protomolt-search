@@ -2258,6 +2258,11 @@ message Bm25QueryRequest {
   PhraseLeg phrase = 20;
   // Snippets to cut for each returned hit (docs/highlighting.md).
   HighlightSpec highlight = 21;
+  // When true, each hit carries `Bm25Hit.explain`: the per-term inputs
+  // and contributions its score was summed from, and the score stages
+  // that transformed the sum (docs/explain.md). Scores and order are
+  // unchanged.
+  bool explain = 22;
 }
 
 // Internal exact phrase scoring request. `phrase_leg` indexes `query.fields`.
@@ -2832,6 +2837,78 @@ message Bm25Hit {
   // Server-side snippets when the request carried a HighlightSpec
   // (docs/highlighting.md), in text order per field.
   repeated Snippet snippets = 5;
+  // The scoring breakdown; present only when the request set `explain`
+  // (docs/explain.md).
+  Bm25Explain explain = 6;
+}
+
+// One BM25 hit's arithmetic (docs/explain.md): the (field, term) pairs
+// that contributed, the sum they made, and the score stages applied to
+// that sum. `score` on the hit is the served value; `bm25` is the
+// pre-stage sum recomputed from the listed contributions in
+// accumulation order.
+message Bm25Explain {
+  // In accumulation order: field legs in request order, terms in leg
+  // order. Pairs the document does not contain are absent.
+  repeated Bm25TermExplain terms = 1;
+  // The BM25 sum before score stages. With a phrase leg this is the
+  // base fields' sum plus the phrase group's maximum.
+  double bm25 = 2;
+  // Score stages in evaluation order (flat route only).
+  repeated ScoreStageExplain stages = 3;
+  // True when a phrase leg contributed by its maximum term rather than
+  // a sum (docs/phrase-search.md); the phrase terms carry
+  // `phrase_group`.
+  bool phrase = 4;
+  // The phrase group's winning contribution (0 when `phrase` is false).
+  double phrase_max = 5;
+}
+
+// One (field, term) contribution: `weight * idf * tf_norm`, with each
+// input spelled out so the value can be recomputed by hand.
+message Bm25TermExplain {
+  // Field name; the body field's name on the flat single-field route.
+  string field = 1;
+  // The analyzed term as it was scored.
+  string term = 2;
+  uint32 tf = 3;
+  uint32 doc_length = 4;
+  double avgdl = 5;
+  double k1 = 6;
+  double b = 7;
+  // `tf * (k1 + 1) / (tf + k1 * (1 - b + b * doc_length / avgdl))`.
+  double tf_norm = 8;
+  // Global corpus document count and this term's global df.
+  uint64 doc_count = 9;
+  uint32 df = 10;
+  // `ln(1 + (doc_count - df + 0.5) / (df + 0.5))`.
+  double idf = 11;
+  // The field leg's query-time weight (1 on the flat route).
+  double weight = 12;
+  // `weight * idf * tf_norm` (times `phrase_weight` in a phrase group).
+  double contribution = 13;
+  // True for terms of a phrase leg, which combine by maximum.
+  bool phrase_group = 14;
+  // The phrase term's weight (1 outside a phrase group).
+  double phrase_weight = 15;
+}
+
+// One score stage's effect on a document (docs/score-functions.md).
+message ScoreStageExplain {
+  // Index into the request's score_stages.
+  uint32 stage = 1;
+  // The stage's column (and map key, when one).
+  string column = 2;
+  string key = 3;
+  // False when the document has no value for the column (or the shard
+  // lacks it): the stage is identity and `input` is unset.
+  bool present = 4;
+  // The column value read (for the geo ops, the distance in meters).
+  double input = 5;
+  // The factor (multiplicative ops) or addend (ADD_LINEAR) applied.
+  double contribution = 6;
+  // The score after this stage.
+  double output = 7;
 }
 
 // A shard's BM25 top-k.
@@ -3146,6 +3223,8 @@ message Bm25SearchRequest {
   // Skip the coordinator's synonym table for this request (the
   // request's own rules still apply).
   bool synonyms_off = 20;
+  // When true, each hit carries `Bm25Hit.explain` (docs/explain.md).
+  bool explain = 21;
 }
 
 // A prefix over a field's term dictionary (docs/prefix-terms.md): every
@@ -3843,6 +3922,11 @@ message HybridHit {
   // ran, the window is ordered by
   // base_weight * fused_score + boost_weight * boost_score.
   float boost_score = 8;
+  // SCORE_BLEND only: each leg's score after the request's
+  // normalization, the value the combination consumed (docs/explain.md).
+  // Absent for the other fusion modes and for a leg the doc is not in.
+  optional double vector_normalized = 9;
+  optional double bm25_normalized = 10;
 }
 
 // Client-facing hybrid search response.

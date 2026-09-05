@@ -117,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for query in ["dogs barking", "running", "fox", "kitchen"] {
         let response = search_client
             .bm25_search(Bm25SearchRequest {
+                explain: false,
                 collection: String::new(),
                 highlight: None,
                 projections: Vec::new(),

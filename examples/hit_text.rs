@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let r = client
         .bm25_search(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),

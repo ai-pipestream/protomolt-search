@@ -351,6 +351,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -384,6 +385,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -500,6 +502,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     // come from the mmapped ords column.
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            explain: false,
             highlight: None,
             projections: Vec::new(),
             filter: None,

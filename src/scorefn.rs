@@ -188,6 +188,41 @@ impl Stage {
     }
 }
 
+impl Stage {
+    /// The value the stage read for the document: the column value, or
+    /// for the geo ops the distance in meters from the origin. `None`
+    /// exactly when [`Stage::contribution`] is `None`.
+    pub fn input(&self, doc_id: u32, columns: &dyn NumericRead) -> Option<f64> {
+        if let StageOp::MultGeoDecay {
+            metric,
+            origin_lat,
+            origin_lon,
+            ..
+        } = self.op
+        {
+            let Some(ColumnRef::Geo(gi)) = self.column else {
+                return None;
+            };
+            let (lat, lon) = columns.geo_value(gi, doc_id)?;
+            return Some(metric.meters(origin_lat, origin_lon, lat, lon));
+        }
+        match self.column {
+            Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
+            Some(ColumnRef::Integer(ii)) => columns.int_value(ii, doc_id).map(|v| v as f64),
+            Some(ColumnRef::MapKey { column, key_ord }) => {
+                columns.map_value(column, key_ord, doc_id)
+            }
+            Some(ColumnRef::Geo(_)) | None => None,
+        }
+    }
+
+    /// Whether the stage adds its contribution (`ADD_LINEAR`) rather
+    /// than multiplying by it.
+    pub fn is_additive(&self) -> bool {
+        matches!(self.op, StageOp::AddLinear { .. })
+    }
+}
+
 /// A resolved score-function chain; empty means identity.
 #[derive(Debug, Clone, Default)]
 pub struct ScoreChain {

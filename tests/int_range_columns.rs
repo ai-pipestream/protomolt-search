@@ -475,6 +475,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),

@@ -2958,6 +2958,7 @@ impl CoordinatorServiceImpl {
             &[],
             false,
             &mut Vec::new(),
+            false,
         )
         .await
         .map(|r| (r.0, r.1, r.2))
@@ -2989,6 +2990,7 @@ impl CoordinatorServiceImpl {
         synonyms: &[crate::pb::SynonymRule],
         synonyms_off: bool,
         synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
+        explain: bool,
     ) -> Result<AggregatedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -3055,6 +3057,7 @@ impl CoordinatorServiceImpl {
                     cardinality_fields,
                     projections,
                     highlight,
+                    explain,
                 )
                 .await
             {
@@ -3091,6 +3094,7 @@ impl CoordinatorServiceImpl {
         cardinality_fields: &[String],
         projections: &[crate::pb::CompiledProjection],
         highlight: Option<&crate::pb::HighlightSpec>,
+        explain: bool,
     ) -> Result<AggregatedHits, Status> {
         if self.node_addrs.is_empty() {
             return Err(Status::failed_precondition("no shard nodes configured"));
@@ -3135,6 +3139,7 @@ impl CoordinatorServiceImpl {
                 stats_fields: stats_fields.to_vec(),
                 cardinality_fields: cardinality_fields.to_vec(),
                 phrase: None,
+                explain,
             };
             let mut client = self.node_client(node)?;
             if let Some((floor_tx, floor_rx)) = relay.clone() {
@@ -3468,6 +3473,7 @@ impl CoordinatorServiceImpl {
             &mut Vec::new(),
             None,
             &mut Vec::new(),
+            false,
         )
         .await
         .map(|(hits, _)| hits)
@@ -3499,6 +3505,7 @@ impl CoordinatorServiceImpl {
         expansions: &mut Vec<crate::pb::PrefixExpansion>,
         highlight: Option<&crate::pb::HighlightSpec>,
         synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
+        explain: bool,
     ) -> Result<(FacetedHits, Vec<crate::pb::PhraseRouting>), Status> {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
@@ -3764,6 +3771,7 @@ impl CoordinatorServiceImpl {
                     t0,
                     t_analyzed,
                     t_stats,
+                    explain,
                 )
                 .await
             {
@@ -3952,6 +3960,7 @@ impl CoordinatorServiceImpl {
                     t0,
                     t_analyzed,
                     t_stats,
+                    base.explain,
                 )
                 .await;
             match round {
@@ -4234,6 +4243,7 @@ impl CoordinatorServiceImpl {
         t0: std::time::Instant,
         t_analyzed: std::time::Duration,
         t_stats: std::time::Duration,
+        explain: bool,
     ) -> Result<FacetedHits, Status> {
         let doc_count = globals.doc_count;
         let totals = &globals.totals;
@@ -4323,6 +4333,7 @@ impl CoordinatorServiceImpl {
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
                 phrase: None,
+                explain,
             };
             let mut client = self.node_client(node)?;
             let phrase_request =
@@ -4827,6 +4838,8 @@ impl CoordinatorServiceImpl {
                 bm25_rank: hit.leg_ranks[1],
                 bm25_score: hit.leg_scores[1].unwrap_or(0.0) as f32,
                 boost_score: 0.0,
+                vector_normalized: hit.leg_norms.first().copied().flatten(),
+                bm25_normalized: hit.leg_norms.get(1).copied().flatten(),
             })
             .collect();
         let debug = debug.then(|| {
@@ -5023,6 +5036,8 @@ impl CoordinatorServiceImpl {
                 bm25_rank: f.leg_ranks[1],
                 bm25_score: f.leg_scores[1].unwrap_or(0.0) as f32,
                 boost_score: 0.0,
+                vector_normalized: f.leg_norms.first().copied().flatten(),
+                bm25_normalized: f.leg_norms.get(1).copied().flatten(),
             })
             .collect();
         let dbg = debug.then(|| {
@@ -5182,6 +5197,8 @@ impl CoordinatorServiceImpl {
                     bm25_rank: source.bm25_rank,
                     bm25_score: source.bm25_score,
                     boost_score: 0.0,
+                    vector_normalized: None,
+                    bm25_normalized: None,
                 }
             })
             .collect();
@@ -5330,6 +5347,8 @@ impl CoordinatorServiceImpl {
                     bm25_rank: source.bm25_rank,
                     bm25_score: source.bm25_score,
                     boost_score: 0.0,
+                    vector_normalized: None,
+                    bm25_normalized: None,
                 }
             })
             .collect();
@@ -5446,6 +5465,7 @@ impl CoordinatorServiceImpl {
                     stats_fields: Vec::new(),
                     cardinality_fields: Vec::new(),
                     phrase: None,
+                    explain: false,
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -5753,6 +5773,8 @@ impl CoordinatorServiceImpl {
                 bm25_rank: bm25_rank.get(&doc).copied(),
                 bm25_score: b,
                 boost_score: 0.0,
+                vector_normalized: None,
+                bm25_normalized: None,
             })
             .collect();
         let dbg = debug.then(|| {
@@ -9707,6 +9729,7 @@ impl SearchService for CoordinatorServiceImpl {
                             &mut prefix_expansions,
                             req.highlight.as_ref(),
                             &mut synonym_expansions,
+                            req.explain,
                         )
                         .await?;
                     phrase_routing = routing;
@@ -9732,6 +9755,7 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.synonyms,
                         req.synonyms_off,
                         &mut synonym_expansions,
+                        req.explain,
                     )
                     .await?
                 } else {
@@ -9794,6 +9818,7 @@ impl SearchService for CoordinatorServiceImpl {
                             &mut prefix_expansions,
                             req.highlight.as_ref(),
                             &mut synonym_expansions,
+                            req.explain,
                         )
                         .await?;
                     phrase_routing = routing;
@@ -10099,6 +10124,11 @@ impl SearchService for CoordinatorServiceImpl {
         let request = request.into_inner();
         if let Some(query) = request.query.as_ref() {
             self.require_topology_generation(query.required_topology_generation)?;
+            if query.explain {
+                return Err(Status::invalid_argument(
+                    "explain is served on the unary Query route: a stream's revisions carry                      candidate hits without their trees, and a tree over a revision that a                      later one replaces would explain a score that was never served",
+                ));
+            }
         }
         let (tx, rx) = mpsc::channel::<Result<crate::pb::QueryStreamResponse, Status>>(8);
         let service = self.clone();
