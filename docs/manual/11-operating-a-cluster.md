@@ -93,6 +93,11 @@ Enforced rules:
   into a child.
 - The shard map is the id-to-shard authority. A flip is metadata, not a data
   move.
+- A split can be keyed by the placement code a row carries instead of the
+  stable-key hash (chapter 10, `docs/placement.md`): one child per code or
+  code range, a `default` child for rows with no code, and no CEL at replay.
+  `SearchService.PlanPlacement` reports, per shard and leaf, what a proposed
+  tree would move before any split runs.
 - A shard without a log can serve but can only be rebuilt, not split or merged.
 - Resharding requires full history. A generation that began from a snapshot
   install records that in its manifest, and the reshard tool rejects it. Such

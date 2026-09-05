@@ -10,6 +10,12 @@
 //!     --slot-base=0 --slot-stride=25000000 --analysis-addr=http://localhost:50051
 //!     --stable-routing
 //!
+//! # Split one shard by the placement code its rows carry (docs/placement.md):
+//! reshard --log=/data/shard-0.vector.wal --placement-column=placement \
+//!     --placement-ranges=0..=0,18014398509481984..=36028797018963967,default \
+//!     --out-dir=/data/split --slot-base=0 --slot-stride=25000000 \
+//!     --analysis-addr=http://localhost:50051
+//!
 //! # Merge several shards -> 1 (identical provider configuration required):
 //! reshard --logs=/data/shard-0.vector.wal,/data/shard-1.vector.wal --out-dir=/data/merged \
 //!     --analysis-addr=http://localhost:50051
@@ -156,6 +162,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let n: usize = arg("split", "2").parse()?;
             let slot_base: u64 = arg("slot-base", "0").parse()?;
             let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
+            if let Some(column) = opt("placement-column") {
+                // --placement-ranges=lo..=hi,lo..=hi[,default]: one child per
+                // entry, in order; `default` is the child that takes rows with
+                // no code or a code outside every range.
+                let spec = opt("placement-ranges")
+                    .ok_or("a placement split needs --placement-ranges=lo..=hi,...[,default]")?;
+                let mut children = Vec::new();
+                let mut default_child = None;
+                for (i, entry) in spec.split(',').map(str::trim).enumerate() {
+                    if entry == "default" {
+                        default_child = Some(i);
+                        children.push(reshard::PlacementChild::NONE);
+                        continue;
+                    }
+                    let (lo, hi) = entry
+                        .split_once("..=")
+                        .ok_or_else(|| format!("placement range {entry:?} is not lo..=hi"))?;
+                    children.push(reshard::PlacementChild {
+                        lo: lo.trim().parse()?,
+                        hi: hi.trim().parse()?,
+                    });
+                }
+                let slot_offsets: Vec<u64> = (0..children.len() as u64)
+                    .map(|i| slot_base + i * slot_stride)
+                    .collect();
+                let placed = reshard::split_placement_logs(
+                    &[gen],
+                    &column,
+                    &children,
+                    default_child,
+                    &out_dir,
+                    &slot_offsets,
+                    vectors_only,
+                    bm25_fields.as_deref(),
+                    &mut analyze,
+                )?;
+                let map = reshard::placement_shard_map_toml(&placed);
+                let map_path = out_dir.join("shard-map.toml");
+                std::fs::write(&map_path, &map)?;
+                eprintln!("wrote {}", map_path.display());
+                for (child, range) in placed.images.children.iter().zip(&placed.ranges) {
+                    eprintln!(
+                        "child {}: {} vectors, {} documents, slot_offset {}, placement {}..={}",
+                        child.vector_path.display(),
+                        child.num_vectors,
+                        child.num_documents,
+                        child.slot_offset,
+                        range.lo,
+                        range.hi
+                    );
+                }
+                print!("{}", reshard::shards_toml(&placed.images));
+                return Ok(());
+            }
             if stable_routing {
                 let stable = reshard::split_stable_logs(
                     &[gen],

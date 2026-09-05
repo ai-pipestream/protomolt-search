@@ -10,10 +10,9 @@ one integer range the segment pruner already reasons about.
 
 Status, 2026-09-05: the contract is reserved (proto messages, the
 `[placement]` table of the shard map, `src/placement.rs` with
-validation and the code arithmetic, `SearchService.PlanPlacement`
-refusing by name). Ingest evaluation, fan-out pruning, the dry run, and
-the leaf reshard follow on their own branches; each section below says
-which parts exist.
+validation and the code arithmetic); the dry run and the offline
+placement split exist. Ingest evaluation and fan-out pruning follow on
+their own branch; each section below says which parts exist.
 
 ## The tree
 
@@ -106,20 +105,55 @@ that shard. `--shard-pruning` mirrors `--segment-pruning`; the profile
 reports `shards_total` and `shards_skipped` next to the segment
 counters. The answer is identical with pruning off.
 
-## The dry run (planned)
+## The dry run
 
 `SearchService.PlanPlacement` takes a proposed tree and reports, per
 shard and per leaf, the rows that would land there and the rows that
-would move from the code they carry now. It reads only. Today it
-validates the tree and refuses by name.
+would move from the code they carry now, plus totals and the rows that
+took a default. It reads only; no row moves. An optional `filter`
+(filter-dialect CEL) restricts the rows considered.
 
-## Changing the tree (planned)
+The counts are exact and come from the filtered counts shards already
+answer, with no per-row evaluation on the coordinator. A row lands on a
+node when the node's predicate is TRUE and no earlier sibling's
+predicate at any level of its path is TRUE (an UNKNOWN sibling falls
+through, like FALSE). Under the three-valued rules that is a difference
+of two counts: `count(A) - count(A && B)`, where `A` ANDs every
+non-default predicate on the path and `B` ORs every earlier sibling's
+predicate along it; `A && B` is TRUE exactly when `A` is TRUE and some
+earlier sibling is TRUE. A default's count is its parent's minus its
+non-default siblings'. The rows that would stay are the same counts
+restricted to `placement == code`; on a shard without the column that
+predicate is absent, so all of its rows count as moving. Counts are
+memoized per node, so a default's subtraction reuses its siblings'.
 
-A leaf edit is a reshard of that leaf only, on the hitless split path
-keyed by the placement value instead of the stable-key hash: tail while
-the parent serves, then freeze, catch up, publish. The freeze and
-publish handshake and the generation checks on routed ingest are the
-ones in use now.
+A predicate naming a column no shard holds is refused by name, the rule
+every filtered route applies to a typo; a tree that fails validation is
+refused before any shard is asked. The arithmetic is in
+`src/placement_plan.rs`; the fan-out is the aggregate route's, one
+`AggregateShard` request per count.
+
+## Changing the tree
+
+A leaf edit is a reshard of that leaf only. The offline path exists:
+`reshard::split_placement_logs` (and `reshard --placement-column=...
+--placement-ranges=lo..=hi,...[,default]`) replays a shard's full
+history and assigns each logged row to a child by the code its
+placement column carries. No CEL runs at replay; the code was written
+at ingest and the log holds it. A child takes one code or a prefix
+range (a subtree); the child named `default` takes rows with no value
+and rows whose code no range covers, and without one any such row
+refuses the split by id. Ranges may not overlap, and only the default
+child may be rangeless. Every child keeps the parent's stable-key hash
+coverage, because routing under a tree is by code first and by hash
+inside the group. The written shard map carries `placement = <code>`
+for a child with one code; a child holding a range is left for the
+operator to place, since the map names one code per shard.
+
+The hitless flow (tail while the parent serves, then freeze, catch up,
+publish) still partitions by the stable-key hash; keying its catch-up
+by the placement value is the next step, on the same
+`LiveReshardState` the hash flow uses.
 
 ## Segments as leaves
 

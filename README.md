@@ -1228,6 +1228,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   `SearchService.PlanPlacement` refusing by name until the dry run
   exists. Ingest evaluation, fan-out pruning, the dry run, and the leaf
   reshard follow on their own branches. [Placement trees](docs/placement.md).
+- **Landed 2026-09-05: the placement dry run and the placement split.**
+  `SearchService.PlanPlacement` reports, per shard and per leaf, the rows a
+  proposed tree would place there and the rows that would move, from exact
+  filtered counts (`src/placement_plan.rs`); `reshard::split_placement_logs`
+  and `reshard --placement-column --placement-ranges` split a shard by the
+  code its rows carry, offline, with no CEL at replay. Tests:
+  `tests/placement_plan.rs`. [Placement trees](docs/placement.md).
 - **Landed 2026-09-05: the diagnostics service.** `DiagnosticsService`
   on every node and coordinator listener: runtime knobs that flip live
   (`floor_sharing`, `segment_pruning`, the floor parameters, `max_k`,
