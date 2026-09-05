@@ -14,8 +14,9 @@ whole collection; its explicit path stays fixed across changes in shard count,
 slot offsets and index generations. Embedded configuration requires every shard
 to name that collection. A second writer cannot open the same catalog file.
 When a catalog is configured, storage parents must exist. Canonical paths reject
-placing the catalog within an index artifact, snapshot tree or WAL tree that a
-shard lifecycle operation can replace or delete.
+placing the catalog within known index artifacts, snapshot/segment trees, BM25
+spill directories, WAL trees or default compaction paths. Custom compaction work
+directories must be empty under the existing compaction preflight.
 
 Every successful mutation increments the document version and the catalog's
 accepted sequence. Version zero means no prior version. A deletion creates a
@@ -96,6 +97,47 @@ error code. Calls block through commit and should run off the UI thread.
 The source store adds no networking. The Rust `accepted_document` lookup is for
 the trusted local application. No network source-fetch service is exposed.
 
+## Ordered source history
+
+`ReadAcceptedDocumentsRequest` and `ReadAcceptedDocumentsResponse` let a local
+projection worker consume original versions in acceptance order. The same
+transaction that accepts the source, version and retry decision also appends its
+sequence-to-version entry. Reading history does not mark a version searchable.
+It includes replaced versions and tombstones, independently of the current head.
+
+Start with `after_sequence=0`, omit `through_sequence`, and supply `limit` and
+`max_bytes`. The response pins the current upper sequence. For subsequent pages,
+reuse that fence and the returned `next_sequence`; later concurrent writes are
+excluded. `complete=true` means the fence was reached. To tail subsequent writes,
+omit the fence again while retaining the last sequence. These cursors belong to
+the same catalog and are not portable to a newly created authority.
+
+Each page reads one database snapshot. Limits are 1 to 1000 versions and 1 byte
+to 64 MiB of summed encoded `AcceptedDocumentVersion` values. Metadata framing
+of the outer response is outside that byte count. A first version exceeding the
+budget returns `RESOURCE_EXHAUSTED`, with no cursor advancement; otherwise the
+page ends before that version. This bounds returned data, not all allocations
+inside the database. A source too large for a page remains available through the
+trusted single-version Rust lookup. Missing sequence/version references fail as
+data loss; the reader never skips a gap.
+
+The Rust entry is `EmbeddedSearch::read_accepted_documents`. Android exposes
+`nativeReadAcceptedDocuments`, and Swift exposes `readAcceptedDocuments`, both
+using protobuf bytes through the local bridge. These operations return original
+sources to the owning application; they introduce no transport. The bridge
+preserves `RESOURCE_EXHAUSTED` and `DATA_LOSS` as distinct mobile error codes.
+
+Catalog format 2 adds the ordered index. Opening a format-1 catalog rebuilds it
+from immutable versions in one immediate transaction, validates sequence
+uniqueness/completeness, and advances the header only with the complete index.
+A failed migration leaves format 1 intact. Original source bytes, keys, versions
+and retry receipts are unchanged. Older binaries refuse format 2. This is a
+source-authority migration; it neither changes physical index formats nor asks
+the application to discard and rebuild its source catalog.
+
+The feed is publisher input, not a complete catalog backup: it does not expose
+operation IDs and cannot reconstruct the persistent idempotency authority.
+
 ## Remaining lifecycle work
 
 This API does not feed legacy `IngestMapped` automatically. Its accepted deletes
@@ -120,3 +162,6 @@ skipping database destruction; its retry and source survive recovery. This is
 process-exit evidence, not a physical power-loss or device-runtime test. The
 mobile bridge test exercises the C ABI and conflict mapping; mobile compilation
 and the no-network dependency gate remain separate required checks.
+History tests cover fixed-fence pagination during new writes, exact byte budgets,
+replaced/deleted sources, successful format-1 upgrades and rollback of an
+incomplete-history migration.

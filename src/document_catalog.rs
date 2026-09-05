@@ -5,14 +5,18 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use prost::Message;
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use tonic::Status;
 
 use crate::pb::storage::{
     DocumentCatalogHeader, DocumentOperation, DocumentVersion, DocumentVersionKey, SourceRecord,
 };
 use crate::pb::{
-    accept_document_request::Mutation, AcceptDocumentRequest, DocumentWriteReceipt, ProtobufSource,
+    accept_document_request::Mutation, AcceptDocumentRequest, AcceptedDocumentVersion,
+    DocumentWriteReceipt, ProtobufSource, ReadAcceptedDocumentsRequest,
+    ReadAcceptedDocumentsResponse,
 };
 use crate::sha256;
 
@@ -22,7 +26,8 @@ const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions")
 const OPERATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("operations");
 const DESCRIPTORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("descriptors");
 const SOURCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sources");
-const FORMAT_VERSION: u32 = 1;
+const CHANGES: TableDefinition<u64, &[u8]> = TableDefinition::new("changes");
+const FORMAT_VERSION: u32 = 2;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -127,7 +132,9 @@ impl DocumentCatalog {
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("existing document catalog header missing"))?;
             let header: DocumentCatalogHeader = decode(bytes.value())?;
-            if header.format_version != FORMAT_VERSION || header.collection != collection {
+            if !(1..=FORMAT_VERSION).contains(&header.format_version)
+                || header.collection != collection
+            {
                 return Err(Status::failed_precondition(
                     "document catalog format or collection differs",
                 ));
@@ -135,6 +142,13 @@ impl DocumentCatalog {
             for definition in [HEADS, VERSIONS, OPERATIONS, DESCRIPTORS, SOURCES] {
                 transaction.open_table(definition).map_err(storage)?;
             }
+            if header.format_version == 1 {
+                drop(bytes);
+                drop(table);
+                drop(transaction);
+                return self.upgrade_ordered_history();
+            }
+            transaction.open_table(CHANGES).map_err(storage)?;
             return Ok(());
         }
         let mut transaction = self.database.begin_write().map_err(storage)?;
@@ -153,6 +167,65 @@ impl DocumentCatalog {
         }
         for definition in [HEADS, VERSIONS, OPERATIONS, DESCRIPTORS, SOURCES] {
             transaction.open_table(definition).map_err(storage)?;
+        }
+        transaction.open_table(CHANGES).map_err(storage)?;
+        transaction.commit().map_err(storage)
+    }
+
+    fn upgrade_ordered_history(&self) -> Result<(), Status> {
+        let mut transaction = self.database.begin_write().map_err(storage)?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(storage)?;
+        {
+            let mut meta = transaction.open_table(META).map_err(storage)?;
+            let mut header: DocumentCatalogHeader = decode(
+                meta.get("header")
+                    .map_err(storage)?
+                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                    .value(),
+            )?;
+            let versions = transaction.open_table(VERSIONS).map_err(storage)?;
+            let mut changes = transaction.open_table(CHANGES).map_err(storage)?;
+            if !changes.is_empty().map_err(storage)? {
+                return Err(Status::data_loss(
+                    "version-1 catalog already contains a change index",
+                ));
+            }
+            for entry in versions.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let version: DocumentVersion = decode(value.value())?;
+                let valid_key =
+                    !version.document_key.is_empty() && version.document_key.len() <= 16 * 1024;
+                let expected = DocumentVersionKey {
+                    document_key: version.document_key,
+                    version: version.version,
+                }
+                .encode_to_vec();
+                if version.version == 0
+                    || !valid_key
+                    || key.value() != expected
+                    || version.accepted_sequence == 0
+                    || version.accepted_sequence > header.accepted_sequence
+                {
+                    return Err(Status::data_loss("invalid version in catalog history"));
+                }
+                if changes
+                    .insert(version.accepted_sequence, key.value())
+                    .map_err(storage)?
+                    .is_some()
+                {
+                    return Err(Status::data_loss("duplicate sequence in catalog history"));
+                }
+            }
+            if changes.len().map_err(storage)? != header.accepted_sequence {
+                return Err(Status::data_loss(
+                    "catalog history has missing accepted versions",
+                ));
+            }
+            header.format_version = FORMAT_VERSION;
+            meta.insert("header", header.encode_to_vec().as_slice())
+                .map_err(storage)?;
         }
         transaction.commit().map_err(storage)
     }
@@ -309,6 +382,15 @@ impl DocumentCatalog {
             .map_err(storage)?
             .insert(version_key.as_slice(), document_bytes.as_slice())
             .map_err(storage)?;
+        if transaction
+            .open_table(CHANGES)
+            .map_err(storage)?
+            .insert(header.accepted_sequence, version_key.as_slice())
+            .map_err(storage)?
+            .is_some()
+        {
+            return Err(Status::data_loss("accepted sequence already exists"));
+        }
         let operation = DocumentOperation {
             request_sha256: request_sha.to_vec(),
             receipt: Some(receipt.clone()),
@@ -335,6 +417,14 @@ impl DocumentCatalog {
         version: Option<u64>,
     ) -> Result<Option<(DocumentVersion, Option<ProtobufSource>)>, Status> {
         let transaction = self.database.begin_read().map_err(storage)?;
+        Self::get_from(&transaction, key, version)
+    }
+
+    fn get_from(
+        transaction: &redb::ReadTransaction,
+        key: &[u8],
+        version: Option<u64>,
+    ) -> Result<Option<(DocumentVersion, Option<ProtobufSource>)>, Status> {
         let version_key = version.map(|version| {
             DocumentVersionKey {
                 document_key: key.to_vec(),
@@ -391,5 +481,129 @@ impl DocumentCatalog {
                 payload: source.payload,
             }),
         )))
+    }
+
+    /// Read an immutable prefix of accepted history, independent of current
+    /// heads and physical rows. Every page uses one database read snapshot.
+    pub fn read_accepted(
+        &self,
+        request: &ReadAcceptedDocumentsRequest,
+    ) -> Result<ReadAcceptedDocumentsResponse, Status> {
+        if !(1..=1000).contains(&request.limit) {
+            return Err(Status::invalid_argument(
+                "accepted history limit must be 1 to 1000",
+            ));
+        }
+        if !(1..=64 * 1024 * 1024).contains(&request.max_bytes) {
+            return Err(Status::invalid_argument(
+                "accepted history max_bytes must be 1 to 64 MiB",
+            ));
+        }
+        let transaction = self.database.begin_read().map_err(storage)?;
+        let meta = transaction.open_table(META).map_err(storage)?;
+        let header: DocumentCatalogHeader = decode(
+            meta.get("header")
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                .value(),
+        )?;
+        let fence = request.through_sequence.unwrap_or(header.accepted_sequence);
+        if fence > header.accepted_sequence || request.after_sequence > fence {
+            return Err(Status::invalid_argument(
+                "accepted history cursor exceeds its fence or committed history",
+            ));
+        }
+        let mut response = ReadAcceptedDocumentsResponse {
+            through_sequence: fence,
+            next_sequence: request.after_sequence,
+            complete: request.after_sequence == fence,
+            documents: Vec::new(),
+        };
+        if response.complete {
+            return Ok(response);
+        }
+        let changes = transaction.open_table(CHANGES).map_err(storage)?;
+        let versions = transaction.open_table(VERSIONS).map_err(storage)?;
+        let mut remaining = request.max_bytes;
+        for sequence in request.after_sequence + 1..=fence {
+            if response.documents.len() == request.limit as usize {
+                break;
+            }
+            let bytes = changes
+                .get(sequence)
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("accepted history sequence missing"))?;
+            let key: DocumentVersionKey = decode(bytes.value())?;
+            let stored = versions
+                .get(bytes.value())
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("accepted history version missing"))?;
+            let metadata: DocumentVersion = decode(stored.value())?;
+            if !metadata.deleted && !Self::source_fits(&transaction, &metadata, remaining)? {
+                if response.documents.is_empty() {
+                    return Err(Status::resource_exhausted(
+                        "accepted version exceeds max_bytes",
+                    ));
+                }
+                break;
+            }
+            let (version, source) =
+                Self::get_from(&transaction, &key.document_key, Some(key.version))?
+                    .ok_or_else(|| Status::data_loss("accepted history version missing"))?;
+            if version.accepted_sequence != sequence {
+                return Err(Status::data_loss(
+                    "accepted history sequence/version mismatch",
+                ));
+            }
+            let document = AcceptedDocumentVersion {
+                document_key: version.document_key,
+                version: version.version,
+                accepted_sequence: sequence,
+                mutation: Some(match source {
+                    Some(source) => crate::pb::accepted_document_version::Mutation::Source(source),
+                    None => crate::pb::accepted_document_version::Mutation::Deleted(true),
+                }),
+            };
+            let size = document.encoded_len() as u64;
+            if size > remaining {
+                if response.documents.is_empty() {
+                    return Err(Status::resource_exhausted(
+                        "accepted version exceeds max_bytes",
+                    ));
+                }
+                break;
+            }
+            remaining -= size;
+            response.documents.push(document);
+            response.next_sequence = sequence;
+        }
+        response.complete = response.next_sequence == fence;
+        Ok(response)
+    }
+
+    // Inspect borrowed blob sizes before copying source/descriptor payloads.
+    // SourceRecord's 32-byte descriptor hash contributes 34 encoded bytes,
+    // replaced by the descriptor itself in the public source envelope.
+    fn source_fits(
+        transaction: &redb::ReadTransaction,
+        version: &DocumentVersion,
+        budget: u64,
+    ) -> Result<bool, Status> {
+        let sources = transaction.open_table(SOURCES).map_err(storage)?;
+        let bytes = sources
+            .get(version.source_sha256.as_slice())
+            .map_err(storage)?
+            .ok_or_else(|| Status::data_loss("document source missing"))?;
+        let lower_bound = (bytes.value().len() as u64).saturating_sub(34);
+        if lower_bound > budget {
+            return Ok(false);
+        }
+        let source: SourceRecord = decode(bytes.value())?;
+        let descriptors = transaction.open_table(DESCRIPTORS).map_err(storage)?;
+        let descriptor = descriptors
+            .get(source.descriptor_sha256.as_slice())
+            .map_err(storage)?
+            .ok_or_else(|| Status::data_loss("document descriptor missing"))?;
+        Ok(lower_bound.saturating_add(descriptor.value().len() as u64) <= budget)
     }
 }

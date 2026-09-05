@@ -32,3 +32,35 @@ message DocumentWriteReceipt {
   bool durable = 6;
   bool replayed = 7;
 }
+
+// Trusted local consumption of accepted versions in commit order. This is
+// source history, not a search result or a searchable acknowledgment.
+message ReadAcceptedDocumentsRequest {
+  uint64 after_sequence = 1;
+  // 1 to 1000 versions per page.
+  uint32 limit = 2;
+  // Omit on the first page to pin the current accepted sequence. Reuse the
+  // returned fence on subsequent pages to exclude concurrent later writes.
+  optional uint64 through_sequence = 3;
+  // 1 byte to 64 MiB, summed encoded AcceptedDocumentVersion sizes. A first
+  // version larger than this budget returns RESOURCE_EXHAUSTED without advancing.
+  uint64 max_bytes = 4;
+}
+
+message AcceptedDocumentVersion {
+  bytes document_key = 1;
+  uint64 version = 2;
+  uint64 accepted_sequence = 3;
+  oneof mutation {
+    ProtobufSource source = 4;
+    bool deleted = 5;
+  }
+}
+
+message ReadAcceptedDocumentsResponse {
+  repeated AcceptedDocumentVersion documents = 1;
+  uint64 through_sequence = 2;
+  // Last returned sequence, or after_sequence when no versions were returned.
+  uint64 next_sequence = 3;
+  bool complete = 4;
+}

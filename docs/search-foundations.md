@@ -138,5 +138,9 @@ or an independently configurable index definition.
 conditional versions and persistent retry decisions. Embedded Rust and mobile
 calls retain originals without requiring any index rows. Its path is independent
 of shard geometry, and source acceptance never claims search visibility.
+An ordered, fenced source feed is persisted with acceptance and exposed to local
+projection consumers through Rust and mobile bridges. It does not publish rows
+or advance searchable state. Format-1 catalogs upgrade their history index
+transactionally, preserving original sources and retry decisions.
 Legacy ingest, public result identity, atomic projection replacement, catalog
 backup/migration, workspace binding and document/field grants remain unfinished.

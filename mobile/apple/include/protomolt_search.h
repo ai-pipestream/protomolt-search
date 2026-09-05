@@ -30,6 +30,11 @@ ProtomoltSearchBuffer protomolt_search_accept_document(
     uint64_t handle,
     const uint8_t *request,
     size_t request_len);
+// Trusted local source history: ReadAcceptedDocumentsRequest/Response.
+ProtomoltSearchBuffer protomolt_search_read_accepted_documents(
+    uint64_t handle,
+    const uint8_t *request,
+    size_t request_len);
 ProtomoltSearchBuffer protomolt_search_query(
     uint64_t handle,
     const uint8_t *request,

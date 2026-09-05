@@ -275,6 +275,14 @@ impl EmbeddedSearch {
         self.document_catalog()?.get(key, version)
     }
 
+    /// Trusted local source history for projection workers and recovery.
+    pub fn read_accepted_documents(
+        &self,
+        request: &ReadAcceptedDocumentsRequest,
+    ) -> Result<ReadAcceptedDocumentsResponse, Status> {
+        self.document_catalog()?.read_accepted(request)
+    }
+
     fn document_catalog(&self) -> Result<&DocumentCatalog, Status> {
         self.document_catalog.as_ref().ok_or_else(|| {
             Status::failed_precondition(
@@ -566,9 +574,13 @@ fn validate_config(config: &mut EmbeddedSearchConfig) -> Result<(), EmbeddedErro
                 for artifact in [
                     index.clone(),
                     bm25_sidecar_path(index),
+                    crate::node::bm25_build_dir(&bm25_sidecar_path(index)),
                     exact_vector_sidecar_path(index),
                     live_docs_sidecar_path(index),
                     generation_dir(index),
+                    crate::node::segments_root(index),
+                    crate::compaction::default_work_dir(index),
+                    crate::compaction::marker_path(index),
                     crate::wal::wal_dir(index),
                 ] {
                     if path.starts_with(canonical_storage_path(&artifact)?) {

@@ -8,7 +8,19 @@ use pipestream_search::embedded::{
 use pipestream_search::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, ProtobufSource,
 };
+use pipestream_search::pb::{accepted_document_version, ReadAcceptedDocumentsRequest};
+use prost::Message;
+use redb::ReadableTable;
 use tonic::Code;
+
+fn page(after_sequence: u64) -> ReadAcceptedDocumentsRequest {
+    ReadAcceptedDocumentsRequest {
+        after_sequence,
+        limit: 1000,
+        through_sequence: None,
+        max_bytes: 1024 * 1024,
+    }
+}
 
 struct Directory(PathBuf);
 impl Directory {
@@ -307,14 +319,162 @@ async fn embedded_sources_need_no_rows_and_authority_survives_shard_layout_chang
 async fn catalog_cannot_live_in_a_disposable_shard_directory() {
     let dir = Directory::new("overlap");
     let index = dir.0.join("shard.index");
-    let wal = pipestream_search::wal::wal_dir(&index);
-    std::fs::create_dir(&wal).unwrap();
-    let mut config = EmbeddedSearchConfig::single(EmbeddedShardConfig::persistent(index, 0));
-    config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
-        collection: String::new(),
-        path: Some(wal.join("documents.redb")),
-    });
-    let error = EmbeddedSearch::open(config).await.err().unwrap();
-    assert!(error.to_string().contains("overlaps shard storage"));
-    assert!(!wal.join("documents.redb").exists());
+    for owned in [
+        pipestream_search::wal::wal_dir(&index),
+        pipestream_search::node::generation_dir(&index),
+        pipestream_search::node::segments_root(&index),
+        pipestream_search::node::bm25_build_dir(&pipestream_search::node::bm25_sidecar_path(
+            &index,
+        )),
+        pipestream_search::compaction::default_work_dir(&index),
+    ] {
+        std::fs::create_dir(&owned).unwrap();
+        let mut config =
+            EmbeddedSearchConfig::single(EmbeddedShardConfig::persistent(index.clone(), 0));
+        config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
+            collection: String::new(),
+            path: Some(owned.join("documents.redb")),
+        });
+        let error = EmbeddedSearch::open(config).await.err().unwrap();
+        assert!(error.to_string().contains("overlaps shard storage"));
+        assert!(!owned.join("documents.redb").exists());
+    }
+}
+
+#[test]
+fn accepted_pages_pin_history_and_retain_replaced_sources() {
+    let catalog = DocumentCatalog::in_memory("books").unwrap();
+    let original = write(b"first", Some(0));
+    catalog.accept(&original).unwrap();
+    let mut second = write(b"second", Some(1));
+    second.mutation = Some(Mutation::Delete(true));
+    catalog.accept(&second).unwrap();
+    let mut request = page(0);
+    request.limit = 1;
+    let first = catalog.read_accepted(&request).unwrap();
+    assert_eq!(
+        (first.through_sequence, first.next_sequence, first.complete),
+        (2, 1, false)
+    );
+    assert_eq!(
+        first.documents[0].mutation,
+        Some(accepted_document_version::Mutation::Source(source()))
+    );
+    catalog.accept(&write(b"third", Some(2))).unwrap();
+    request.after_sequence = first.next_sequence;
+    request.through_sequence = Some(first.through_sequence);
+    let last = catalog.read_accepted(&request).unwrap();
+    assert!(last.complete);
+    assert_eq!((last.documents[0].version, last.next_sequence), (2, 2));
+    assert_eq!(
+        last.documents[0].mutation,
+        Some(accepted_document_version::Mutation::Deleted(true))
+    );
+    let latest = catalog.read_accepted(&page(2)).unwrap();
+    assert_eq!(latest.documents[0].version, 3);
+    request.after_sequence = 0;
+    request.through_sequence = Some(0);
+    assert!(catalog
+        .read_accepted(&request)
+        .unwrap()
+        .documents
+        .is_empty());
+    request.after_sequence = 1;
+    assert_eq!(
+        catalog.read_accepted(&request).unwrap_err().code(),
+        Code::InvalidArgument
+    );
+}
+
+#[test]
+fn history_byte_budget_never_advances_over_an_unreturned_source() {
+    let catalog = DocumentCatalog::in_memory("books").unwrap();
+    catalog.accept(&write(b"first", Some(0))).unwrap();
+    catalog.accept(&write(b"second", Some(1))).unwrap();
+    let whole = catalog.read_accepted(&page(0)).unwrap();
+    let mut request = page(0);
+    request.max_bytes = whole.documents[0].encoded_len() as u64;
+    let first = catalog.read_accepted(&request).unwrap();
+    assert_eq!(
+        (first.documents.len(), first.next_sequence, first.complete),
+        (1, 1, false)
+    );
+    request.max_bytes -= 1;
+    assert_eq!(
+        catalog.read_accepted(&request).unwrap_err().code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(catalog.read_accepted(&page(0)).unwrap(), whole);
+}
+
+fn downgrade_history_for_migration(path: &std::path::Path, break_sequence: bool) {
+    use pipestream_search::pb::storage::DocumentCatalogHeader;
+    let database = redb::Database::open(path).unwrap();
+    let transaction = database.begin_write().unwrap();
+    transaction
+        .delete_table(redb::TableDefinition::<u64, &[u8]>::new("changes"))
+        .unwrap();
+    {
+        let mut meta = transaction
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("metadata"))
+            .unwrap();
+        let mut header =
+            DocumentCatalogHeader::decode(meta.get("header").unwrap().unwrap().value()).unwrap();
+        header.format_version = 1;
+        if break_sequence {
+            header.accepted_sequence += 1;
+        }
+        meta.insert("header", header.encode_to_vec().as_slice())
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn legacy_history_upgrades_atomically_and_keeps_retry_receipts() {
+    let dir = Directory::new("upgrade");
+    let first = write(b"first", Some(0));
+    let before;
+    {
+        let catalog = DocumentCatalog::create(&dir.catalog(), "books").unwrap();
+        catalog.accept(&first).unwrap();
+        catalog.accept(&write(b"second", Some(1))).unwrap();
+        before = catalog.read_accepted(&page(0)).unwrap();
+    }
+    downgrade_history_for_migration(&dir.catalog(), false);
+    {
+        let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+        assert_eq!(catalog.read_accepted(&page(0)).unwrap(), before);
+        assert!(catalog.accept(&first).unwrap().replayed);
+        assert_eq!(
+            catalog
+                .accept(&write(b"third", Some(2)))
+                .unwrap()
+                .accepted_sequence,
+            3
+        );
+    }
+    downgrade_history_for_migration(&dir.catalog(), true);
+    assert_eq!(
+        DocumentCatalog::open(&dir.catalog(), "books")
+            .err()
+            .unwrap()
+            .code(),
+        Code::DataLoss
+    );
+    // Failed migration must not commit the new format or a partial change index.
+    use redb::ReadableDatabase;
+    let database = redb::Database::open(dir.catalog()).unwrap();
+    let transaction = database.begin_read().unwrap();
+    let meta = transaction
+        .open_table(redb::TableDefinition::<&str, &[u8]>::new("metadata"))
+        .unwrap();
+    let header = pipestream_search::pb::storage::DocumentCatalogHeader::decode(
+        meta.get("header").unwrap().unwrap().value(),
+    )
+    .unwrap();
+    assert_eq!(header.format_version, 1);
+    assert!(transaction
+        .open_table(redb::TableDefinition::<u64, &[u8]>::new("changes"))
+        .is_err());
 }

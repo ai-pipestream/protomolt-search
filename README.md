@@ -1212,6 +1212,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Ordered accepted history (2026-09-05, `feat/search-foundations`).**
+  Local projection consumers can page accepted source versions through Rust and
+  mobile APIs using a fixed sequence fence and explicit byte budget. Catalog
+  format 2 persists the ordered index with each acceptance and upgrades format 1
+  transactionally. Searchable publication remains unfinished. See
+  [document writes](docs/document-writes.md#ordered-source-history).
+
 - **Logical source authority (2026-09-05, `feat/search-foundations`).**
   Embedded and mobile document acceptance now uses one collection-wide local
   transaction store for exact keys, conditional versions, original sources and

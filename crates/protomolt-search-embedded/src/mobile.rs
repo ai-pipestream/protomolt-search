@@ -20,6 +20,7 @@ use pipestream_search::pb::mobile::{
 };
 use pipestream_search::pb::{
     AcceptDocumentRequest, QueryRequest, QueryResponse, QueryStreamRequest, QueryStreamResponse,
+    ReadAcceptedDocumentsRequest,
 };
 
 type QueryReceiver =
@@ -119,6 +120,8 @@ fn mobile_code(code: tonic::Code) -> MobileErrorCode {
         tonic::Code::FailedPrecondition => MobileErrorCode::FailedPrecondition,
         tonic::Code::Cancelled => MobileErrorCode::Cancelled,
         tonic::Code::Aborted => MobileErrorCode::Aborted,
+        tonic::Code::ResourceExhausted => MobileErrorCode::ResourceExhausted,
+        tonic::Code::DataLoss => MobileErrorCode::DataLoss,
         _ => MobileErrorCode::Internal,
     }
 }
@@ -371,6 +374,15 @@ fn query_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
     })
 }
 
+fn read_accepted_documents_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
+    response(|| {
+        let request =
+            decode::<ReadAcceptedDocumentsRequest>(input, "ReadAcceptedDocumentsRequest")?;
+        let result = search(handle)?.read_accepted_documents(&request)?;
+        Ok(success(&result))
+    })
+}
+
 fn query_stream_open_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
     response(|| {
         let request = decode::<QueryStreamRequest>(input, "QueryStreamRequest")?;
@@ -555,6 +567,17 @@ pub extern "C" fn protomolt_search_accept_document(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn protomolt_search_read_accepted_documents(
+    handle: u64,
+    request: *const u8,
+    request_len: usize,
+) -> MobileBuffer {
+    ffi_input(request, request_len, |bytes| {
+        read_accepted_documents_bytes(handle, bytes)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn protomolt_search_query(
     handle: u64,
     request: *const u8,
@@ -672,6 +695,20 @@ mod android {
     ) -> JByteArray<'caller> {
         with_input(env, request, |bytes| {
             accept_document_bytes(handle as u64, bytes)
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeReadAcceptedDocuments<
+        'caller,
+    >(
+        env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        handle: jlong,
+        request: JByteArray<'caller>,
+    ) -> JByteArray<'caller> {
+        with_input(env, request, |bytes| {
+            read_accepted_documents_bytes(handle as u64, bytes)
         })
     }
 
@@ -804,6 +841,25 @@ mod tests {
         let retry: DocumentWriteReceipt = payload(&accept_document_bytes(opened.handle, &bytes));
         assert!(retry.replayed);
         assert_eq!(retry.version, receipt.version);
+        let mut history_request = ReadAcceptedDocumentsRequest {
+            limit: 10,
+            max_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let history: pipestream_search::pb::ReadAcceptedDocumentsResponse = payload(
+            &read_accepted_documents_bytes(opened.handle, &history_request.encode_to_vec()),
+        );
+        assert!(history.complete);
+        assert_eq!(history.documents.len(), 1);
+        assert_eq!(history.documents[0].document_key, request.document_key);
+        history_request.max_bytes = 1;
+        let mobile_response::Outcome::Error(error) = outcome(&read_accepted_documents_bytes(
+            opened.handle,
+            &history_request.encode_to_vec(),
+        )) else {
+            panic!("oversized source must fail");
+        };
+        assert_eq!(error.code(), MobileErrorCode::ResourceExhausted);
         request.operation_id = b"stale".to_vec();
         let mobile_response::Outcome::Error(error) = outcome(&accept_document_bytes(
             opened.handle,
