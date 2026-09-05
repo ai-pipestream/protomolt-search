@@ -620,6 +620,7 @@ type AggregatedHits = (
     Vec<crate::pb::RangeFacetCounts>,
     Vec<crate::pb::ColumnStats>,
     Vec<crate::pb::FacetCardinality>,
+    crate::segment_prune::PruneStats,
 );
 
 /// Merge per-shard column stats: counts and sums add, mins and maxes
@@ -1559,6 +1560,9 @@ pub struct BrowseAfter {
 /// One merged browse page.
 #[derive(Debug, Clone)]
 pub struct BrowseRows {
+    /// Sealed segments the shards consulted and ruled out
+    /// (docs/segment-pruning.md).
+    pub prune: crate::segment_prune::PruneStats,
     /// Global doc ids in final order.
     pub ids: Vec<u64>,
     /// Each row's sort keys in merge form, parallel to `ids` (empty
@@ -1580,6 +1584,9 @@ pub struct MembershipSet {
     pub epochs: Vec<u64>,
     pub wire_bytes: u64,
     pub terms: Vec<String>,
+    /// Sealed segments the shards consulted and ruled out while
+    /// resolving this set (docs/segment-pruning.md).
+    pub prune: crate::segment_prune::PruneStats,
     pub(crate) ranges: Vec<(u64, u64)>,
 }
 
@@ -3118,7 +3125,14 @@ impl CoordinatorServiceImpl {
                 .await?,
         );
         if terms.is_empty() || k == 0 {
-            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            return Ok((
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                crate::segment_prune::PruneStats::default(),
+            ));
         }
 
         // (b) each shard's share of the corpus stats, cached per node;
@@ -3265,6 +3279,7 @@ impl CoordinatorServiceImpl {
                             response.stats,
                             response.distinct,
                             response.projection_leaves_known,
+                            (response.segments_total, response.segments_skipped),
                             Some(r.scoring_fingerprint),
                         )
                     })
@@ -3285,12 +3300,14 @@ impl CoordinatorServiceImpl {
                         r.stats,
                         r.distinct,
                         r.projection_leaves_known,
+                        (r.segments_total, r.segments_skipped),
                         None,
                     )
                 })
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut prune = crate::segment_prune::PruneStats::default();
         let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut stage_known = vec![false; score_stages.len()];
@@ -3324,6 +3341,7 @@ impl CoordinatorServiceImpl {
                 sstats,
                 sdistinct,
                 pknown,
+                sprune,
                 fingerprint,
             ) = task
                 .await
@@ -3354,6 +3372,10 @@ impl CoordinatorServiceImpl {
             shard_ranges.push(ranges);
             shard_stats.push(sstats);
             shard_distinct.push(sdistinct);
+            prune.add(crate::segment_prune::PruneStats {
+                segments_total: sprune.0,
+                segments_skipped: sprune.1,
+            });
             if geo.len() != geo_filters.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} geo-column flags for {} filters",
@@ -3511,6 +3533,7 @@ impl CoordinatorServiceImpl {
             ranges,
             stats,
             cardinality,
+            prune,
         ))
     }
 
@@ -3564,7 +3587,7 @@ impl CoordinatorServiceImpl {
             false,
         )
         .await
-        .map(|(hits, _)| hits)
+        .map(|((hits, _), _)| hits)
     }
 
     /// [`Self::fanout_bm25_fused_faceted`] that also reports which
@@ -3594,7 +3617,13 @@ impl CoordinatorServiceImpl {
         highlight: Option<&crate::pb::HighlightSpec>,
         synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
         explain: bool,
-    ) -> Result<(FacetedHits, Vec<crate::pb::PhraseRouting>), Status> {
+    ) -> Result<
+        (
+            (FacetedHits, crate::segment_prune::PruneStats),
+            Vec<crate::pb::PhraseRouting>,
+        ),
+        Status,
+    > {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
         crate::node::validate_range_facet_fields(range_facet_fields)?;
@@ -3702,7 +3731,13 @@ impl CoordinatorServiceImpl {
         }
         let t_analyzed = t0.elapsed();
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
-            return Ok(((Vec::new(), Vec::new(), Vec::new()), Vec::new()));
+            return Ok((
+                (
+                    (Vec::new(), Vec::new(), Vec::new()),
+                    crate::segment_prune::PruneStats::default(),
+                ),
+                Vec::new(),
+            ));
         }
         // (b) every field's stats, served from the per-node cache, plus
         // one PROBE per two-term exact phrase for its bigram column: the
@@ -4056,7 +4091,7 @@ impl CoordinatorServiceImpl {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
-                other => return other,
+                other => return other.map(|(hits, _)| hits),
             }
         }
     }
@@ -4332,7 +4367,7 @@ impl CoordinatorServiceImpl {
         t_analyzed: std::time::Duration,
         t_stats: std::time::Duration,
         explain: bool,
-    ) -> Result<FacetedHits, Status> {
+    ) -> Result<(FacetedHits, crate::segment_prune::PruneStats), Status> {
         let doc_count = globals.doc_count;
         let totals = &globals.totals;
         let dfs = &globals.dfs;
@@ -4463,6 +4498,7 @@ impl CoordinatorServiceImpl {
                         response.range_facets,
                         response.geo_columns_known,
                         response.filter_columns_known,
+                        (response.segments_total, response.segments_skipped),
                         started.elapsed().as_secs_f64() * 1000.0,
                         Some(result.scoring_fingerprint),
                     ))
@@ -4484,6 +4520,7 @@ impl CoordinatorServiceImpl {
                         r.range_facets,
                         r.geo_columns_known,
                         r.filter_columns_known,
+                        (r.segments_total, r.segments_skipped),
                         started.elapsed().as_secs_f64() * 1000.0,
                         None,
                     )
@@ -4491,6 +4528,7 @@ impl CoordinatorServiceImpl {
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut prune = crate::segment_prune::PruneStats::default();
         let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut per_shard: Vec<(u32, f64)> = Vec::new();
@@ -4499,9 +4537,13 @@ impl CoordinatorServiceImpl {
         let mut filter_known = vec![false; filter_leaves];
         let mut scoring_fingerprint: Option<String> = None;
         for task in query_tasks {
-            let (shard, hits, facets, ranges, geo, fknown, ms, fingerprint) = task
-                .await
-                .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            let (shard, hits, facets, ranges, geo, fknown, sprune, ms, fingerprint) =
+                task.await
+                    .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            prune.add(crate::segment_prune::PruneStats {
+                segments_total: sprune.0,
+                segments_skipped: sprune.1,
+            });
             if let Some(fingerprint) = fingerprint {
                 match scoring_fingerprint.as_ref() {
                     Some(expected) if expected != &fingerprint => {
@@ -4623,7 +4665,10 @@ impl CoordinatorServiceImpl {
                 field_terms.iter().map(Vec::len).sum::<usize>(),
             );
         }
-        Ok((all.into_iter().map(|(_, h)| h).collect(), facets, ranges))
+        Ok((
+            (all.into_iter().map(|(_, h)| h).collect(), facets, ranges),
+            prune,
+        ))
     }
 
     /// Hybrid vector + BM25 search:
@@ -7534,11 +7579,16 @@ impl CoordinatorServiceImpl {
             id: u64,
         }
         let mut rows: Vec<Row> = Vec::new();
+        let mut prune = crate::segment_prune::PruneStats::default();
         for task in tasks {
             let response = task
                 .await
                 .map_err(|e| Status::internal(format!("browse task failed: {e}")))??;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            prune.add(crate::segment_prune::PruneStats {
+                segments_total: response.segments_total,
+                segments_skipped: response.segments_skipped,
+            });
             for (known, shard) in sort_known.iter_mut().zip(&response.sort_columns_known) {
                 *known |= shard;
             }
@@ -7592,6 +7642,7 @@ impl CoordinatorServiceImpl {
         rows.sort_by(|a, b| cmp_rows(&a.keys, a.id, &b.keys, b.id, &descending));
         rows.truncate(k as usize);
         Ok(BrowseRows {
+            prune,
             ids: rows.iter().map(|r| r.id).collect(),
             keys: rows.iter().map(|r| r.keys.clone()).collect(),
             values: rows.iter().map(|r| r.values.clone()).collect(),
@@ -7725,9 +7776,15 @@ impl CoordinatorServiceImpl {
                 Status::internal(format!("filter membership task failed: {error}"))
             })??;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            merged.prune.add(crate::segment_prune::PruneStats {
+                segments_total: response.segments_total,
+                segments_skipped: response.segments_skipped,
+            });
             Self::merge_membership_bitmap(
                 &mut merged,
                 &crate::pb::MembershipBitmapResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     base_label: response.base_label,
                     label_count: response.label_count,
                     bits: response.bits,
@@ -7795,6 +7852,10 @@ impl CoordinatorServiceImpl {
                 Status::internal(format!("lexical membership task failed: {error}"))
             })??;
             merged.epochs.push(response.stats_epoch);
+            merged.prune.add(crate::segment_prune::PruneStats {
+                segments_total: response.segments_total,
+                segments_skipped: response.segments_skipped,
+            });
             Self::merge_membership_bitmap(&mut merged, &response)?;
         }
         merged.terms = terms;
@@ -9676,6 +9737,8 @@ impl SearchService for CoordinatorServiceImpl {
                         .clustered_parent_collapse(&request_id, &req.vector, k, &filters)
                         .await?;
                     return Ok(Response::new(SearchResponse {
+                        segments_total: 0,
+                        segments_skipped: 0,
                         request_id,
                         hits: collapsed.hits,
                         groups: collapsed.groups,
@@ -9695,6 +9758,8 @@ impl SearchService for CoordinatorServiceImpl {
                     })
                     .collect();
                 return Ok(Response::new(SearchResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     request_id,
                     hits,
                     groups: Vec::new(),
@@ -9713,6 +9778,8 @@ impl SearchService for CoordinatorServiceImpl {
                         .fanout_stream_search_collapse(&request_id, &req.vector, k, &filters)
                         .await?;
                     return Ok(Response::new(SearchResponse {
+                        segments_total: 0,
+                        segments_skipped: 0,
                         request_id,
                         hits: doc.hits,
                         groups: doc.groups,
@@ -9726,6 +9793,8 @@ impl SearchService for CoordinatorServiceImpl {
                     .fanout_stream_search(&request_id, &req.vector, k, None, &filters)
                     .await?;
                 return Ok(Response::new(SearchResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     request_id,
                     hits: streamed.hits,
                     groups: Vec::new(),
@@ -9735,7 +9804,18 @@ impl SearchService for CoordinatorServiceImpl {
                 self.fanout_search(&request_id, &req.vector, k, false, &filters)
                     .await?
             };
+            let (segments_total, segments_skipped) = result.shard_stats.iter().flatten().fold(
+                (0u32, 0u32),
+                |(total, skipped), stats| {
+                    (
+                        total.saturating_add(stats.segments_total),
+                        skipped.saturating_add(stats.segments_skipped),
+                    )
+                },
+            );
             Ok(Response::new(SearchResponse {
+                segments_total,
+                segments_skipped,
                 request_id,
                 hits: result.hits,
                 groups: Vec::new(),
@@ -9781,7 +9861,7 @@ impl SearchService for CoordinatorServiceImpl {
             let mut phrase_routing = Vec::new();
             let mut prefix_expansions = Vec::new();
             let mut synonym_expansions = Vec::new();
-            let (hits, facets, range_facets, stats, cardinality) =
+            let (hits, facets, range_facets, stats, cardinality, prune) =
                 if req.fields.is_empty() && req.phrase.is_some() {
                     // A phrase on the flat route is the body field's phrase on
                     // the fused route (docs/phrase-proximity.md); the fused
@@ -9815,7 +9895,7 @@ impl SearchService for CoordinatorServiceImpl {
                         synonyms: req.synonyms.clone(),
                         synonyms_off: req.synonyms_off,
                     }];
-                    let ((hits, facets, ranges), routing) = self
+                    let (((hits, facets, ranges), fused_prune), routing) = self
                         .fanout_bm25_fused_routed(
                             &req.text,
                             k,
@@ -9833,7 +9913,7 @@ impl SearchService for CoordinatorServiceImpl {
                         )
                         .await?;
                     phrase_routing = routing;
-                    (hits, facets, ranges, Vec::new(), Vec::new())
+                    (hits, facets, ranges, Vec::new(), Vec::new(), fused_prune)
                 } else if req.fields.is_empty() {
                     self.fanout_bm25_aggregated(
                         &req.text,
@@ -9904,7 +9984,7 @@ impl SearchService for CoordinatorServiceImpl {
                          the prefixes on the QueryField whose dictionary they expand in",
                     ));
                     }
-                    let ((hits, facets, ranges), routing) = self
+                    let (((hits, facets, ranges), fused_prune), routing) = self
                         .fanout_bm25_fused_routed(
                             &req.text,
                             k,
@@ -9922,7 +10002,7 @@ impl SearchService for CoordinatorServiceImpl {
                         )
                         .await?;
                     phrase_routing = routing;
-                    (hits, facets, ranges, Vec::new(), Vec::new())
+                    (hits, facets, ranges, Vec::new(), Vec::new(), fused_prune)
                 };
             // The merged k-th best: one f32 ULP below the last hit's score
             // when k hits were returned (see `bm25::floor_seed` — a later
@@ -9935,6 +10015,8 @@ impl SearchService for CoordinatorServiceImpl {
                 0.0
             };
             Ok(Response::new(Bm25SearchResponse {
+                segments_total: prune.segments_total,
+                segments_skipped: prune.segments_skipped,
                 hits,
                 kth_best,
                 facets,
@@ -10000,6 +10082,8 @@ impl SearchService for CoordinatorServiceImpl {
             0.0
         };
         Ok(Response::new(Bm25SearchResponse {
+            segments_total: 0,
+            segments_skipped: 0,
             hits,
             kth_best,
             facets,

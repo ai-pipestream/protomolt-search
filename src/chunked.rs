@@ -56,6 +56,12 @@ pub struct ScanStats {
     pub floors_published: u64,
     /// Chunks that ran with an external (coordinator-pushed) floor in effect.
     pub floor_updates_applied: u64,
+    /// Sealed segments in the shard's snapshot, and how many the
+    /// request's filter ruled out before the scan opened them
+    /// (`docs/segment-pruning.md`). Set by the node after the scan;
+    /// the kernel does not know about segments.
+    pub segments_total: u32,
+    pub segments_skipped: u32,
 }
 
 /// `true` when `a` ranks ahead of `b` in top-k order: score descending,

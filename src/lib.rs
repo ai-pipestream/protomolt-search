@@ -68,6 +68,7 @@ pub mod replication;
 pub mod reshard;
 pub mod scorefn;
 pub mod security;
+pub mod segment_prune;
 pub mod segmented;
 pub mod segmented_vectors;
 pub mod segments;

@@ -26,7 +26,7 @@ use crate::postings::{
     AnalyzedDoc, Bm25Index, Bm25Store, DocLineage, FileImpacts, ImpactCursor, PostingCallback,
     StoredBinding,
 };
-use crate::segments::{OpenedSegmentSet, SegmentCatalog};
+use crate::segments::{OpenedSegmentSet, SegmentCatalog, SegmentSummary};
 
 /// One column's global dictionary over the sealed parts and the tail.
 #[derive(Debug, Default)]
@@ -643,7 +643,60 @@ impl SegmentedShard {
 
     /// The read surface of field `f` across every part.
     pub fn field(&self, f: usize) -> UnionField<'_> {
-        UnionField { shard: self, fi: f }
+        UnionField {
+            shard: self,
+            fi: f,
+            mask: None,
+        }
+    }
+
+    /// The read surface of field `f` over the sealed parts `mask`
+    /// admits (one flag per sealed part, `false` = skipped) plus the
+    /// heaps (`docs/segment-pruning.md`). Walks over postings, impacts,
+    /// and dictionary scans skip the masked-out parts; reads addressed
+    /// by document id answer for every row, so a hit's text, offsets,
+    /// and positions resolve whichever part holds it.
+    pub fn field_masked(&self, f: usize, mask: Arc<[bool]>) -> UnionField<'_> {
+        debug_assert_eq!(mask.len(), self.parts.len());
+        UnionField {
+            shard: self,
+            fi: f,
+            mask: Some(mask),
+        }
+    }
+
+    /// The whole shard scored as its body field over the parts `mask`
+    /// admits: the [`Bm25Index`] the scorers take when a filter has
+    /// ruled sealed segments out (`docs/segment-pruning.md`).
+    pub fn masked(&self, mask: Arc<[bool]>) -> MaskedShard<'_> {
+        MaskedShard { shard: self, mask }
+    }
+
+    /// `(base, rows)` of every sealed part, in catalog order: the local
+    /// document id range each segment covers.
+    pub fn sealed_ranges(&self) -> Vec<(u32, u32)> {
+        self.parts.iter().map(|p| (p.base, p.rows)).collect()
+    }
+
+    /// The summary of every sealed part, in catalog order; `None` for a
+    /// segment sealed before summaries were written.
+    pub fn part_summaries(&self) -> Vec<Option<&SegmentSummary>> {
+        (0..self.parts.len())
+            .map(|i| self.set.metadata(i).summary.as_ref())
+            .collect()
+    }
+
+    /// One flag per sealed part: `true` where NONE of `terms` occurs in
+    /// field `f` of that part, so a walk over those terms would touch
+    /// no posting there. A dictionary lookup per term per part, no
+    /// postings read.
+    pub fn parts_lacking_terms(&self, f: usize, terms: &[String]) -> Vec<bool> {
+        (0..self.parts.len())
+            .map(|i| {
+                let view = self.reader(i).field(f);
+                terms.iter().all(|term| view.df(term) == 0)
+            })
+            .collect()
     }
 
     // ---- facets ----
@@ -1028,9 +1081,16 @@ impl SegmentedShard {
 pub struct UnionField<'a> {
     shard: &'a SegmentedShard,
     fi: usize,
+    /// Sealed parts to walk (`docs/segment-pruning.md`); `None` walks
+    /// them all.
+    mask: Option<Arc<[bool]>>,
 }
 
 impl<'a> UnionField<'a> {
+    fn admits(&self, part: usize) -> bool {
+        self.mask.as_ref().is_none_or(|mask| mask[part])
+    }
+
     fn parts(&self) -> impl Iterator<Item = (u32, u32, crate::postings::FieldView<'a>)> + '_ {
         let shard = self.shard;
         let fi = self.fi;
@@ -1038,6 +1098,7 @@ impl<'a> UnionField<'a> {
             .parts
             .iter()
             .enumerate()
+            .filter(move |(i, _)| self.admits(*i))
             .map(move |(i, p)| (p.base, p.rows, shard.reader(i).field(fi)))
     }
 
@@ -1132,6 +1193,7 @@ impl Bm25Index for UnionField<'_> {
             .parts
             .iter()
             .enumerate()
+            .filter(|(i, _)| self.admits(*i))
             .filter_map(|(i, p)| {
                 self.shard
                     .reader(i)
@@ -1316,5 +1378,98 @@ impl Bm25Index for SegmentedShard {
     }
     fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
         self.field(0).suggest_prefix(prefix, max_scan)
+    }
+}
+
+/// A [`SegmentedShard`] scored as its body field over a subset of its
+/// sealed parts (`docs/segment-pruning.md`). Every walk (postings,
+/// document frequency, impacts, dictionary scans) covers the admitted
+/// parts and the heaps; every read by document id covers the whole
+/// shard, so a surviving hit resolves its text, offsets, and positions
+/// as usual.
+pub struct MaskedShard<'a> {
+    shard: &'a SegmentedShard,
+    mask: Arc<[bool]>,
+}
+
+impl MaskedShard<'_> {
+    fn body(&self) -> UnionField<'_> {
+        self.shard.field_masked(0, Arc::clone(&self.mask))
+    }
+}
+
+impl Bm25Index for MaskedShard<'_> {
+    fn doc_count(&self) -> u64 {
+        Bm25Index::doc_count(self.shard)
+    }
+    fn total_doc_length(&self) -> u64 {
+        Bm25Index::total_doc_length(self.shard)
+    }
+    fn doc_length(&self, doc_id: u32) -> u32 {
+        Bm25Index::doc_length(self.shard, doc_id)
+    }
+    fn df(&self, term: &str) -> u32 {
+        self.body().df(term)
+    }
+    fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
+        self.body().for_each_posting(term, f)
+    }
+    fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
+        self.body().for_each_doc_tf(term, f)
+    }
+    fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
+        Bm25Index::posting_offsets(self.shard, term, doc_id)
+    }
+    fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
+        // The chain borrows the sealed readers, which outlive the view.
+        if self.shard.field(0).heap_df(term) > 0 {
+            return None;
+        }
+        let parts: Vec<(u32, u32, FileImpacts<'_>)> = self
+            .shard
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.mask[*i])
+            .filter_map(|(i, p)| {
+                self.shard
+                    .reader(i)
+                    .field(0)
+                    .file_impacts(term)
+                    .map(|c| (p.base, p.rows, c))
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(ImpactCursor::chain(parts))
+        }
+    }
+    fn has_impacts(&self, term: &str) -> bool {
+        self.body().has_impacts(term)
+    }
+    fn text(&self, doc_id: u32) -> Option<String> {
+        SegmentedShard::text(self.shard, doc_id)
+    }
+    fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
+        SegmentedShard::lineage(self.shard, doc_id)
+    }
+    fn has_positions(&self) -> bool {
+        self.shard.field_has_positions(0)
+    }
+    fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        Bm25Index::posting_positions(self.shard, term, doc_id)
+    }
+    fn has_sentences(&self) -> bool {
+        self.shard.field_has_sentences(0)
+    }
+    fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
+        self.shard.field_doc_sentences(0, doc_id)
+    }
+    fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
+        self.body().expand_prefix(prefix, cap)
+    }
+    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
+        self.body().suggest_prefix(prefix, max_scan)
     }
 }
