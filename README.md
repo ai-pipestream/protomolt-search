@@ -1212,6 +1212,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Deletion order correctness (2026-09-05, `feat/search-foundations`).**
+  Deleting or replacing a lower row no longer discards higher tombstones from
+  the live bitmap. Regression coverage spans multiple bitmap words, retries,
+  shared read snapshots, search/statistics/fetch and persisted reopening. See
+  [mutations](docs/mutations.md).
+
 - **Row identity storage (2026-09-05, `feat/search-foundations`).** Exact
   document keys, source versions and chunk ordinals can be retained with rows
   through images, WAL, compaction and resharding, and returned by node fetch.

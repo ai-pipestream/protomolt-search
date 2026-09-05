@@ -25,6 +25,16 @@ provider bytes in place. Health reports live rows, deleted rows, and the overlay
 revision. `Flush` persists `<index>.live`; snapshot generations use
 `live-docs.bin`. Delete and replacement records also enter the bucketed WAL.
 
+Deletion order does not affect earlier tombstones. The bitmap grows when a
+newly deleted slot needs another word; deleting a lower slot cannot truncate
+higher words. Regression coverage deletes rows across three words in descending
+order, replaces another lower row, retries those deletes and verifies live
+statistics, lexical results, browse, fetch and exact rescoring before and after
+reopening. Older binaries could discard higher tombstones on a lower-row delete;
+the fix preserves existing bits but cannot reconstruct bits already lost from
+a persisted overlay. Such an overlay requires recovery from retained deletion
+history.
+
 Positional ids are scoped to a WAL generation. A compaction or a snapshot
 install renumbers a shard's rows, so a client that holds ids across one and
 then deletes or replaces by id would name whichever rows carry those ids

@@ -19,6 +19,171 @@ use tonic::Request;
 const DIM: usize = 64;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn descending_deletes_and_replacement_stay_hidden_after_reopen() {
+    const ROWS: usize = 131;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "protomolt_descending_mutations_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = NodeConfig {
+        index_path: Some(dir.join("shard.vector")),
+        analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    };
+    let corpus = common::unit_vectors(ROWS, DIM, 0xD311_7002);
+    let (shift, scale) = common::fit_calibration(DIM, 4, &corpus);
+    let (addr, handle) = common::start_empty_node(config.clone()).await;
+    let mut node = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    node.set_calibration(SetCalibrationRequest {
+        dim: DIM as u32,
+        bit_width: 4,
+        shift,
+        scale,
+    })
+    .await
+    .unwrap();
+    node.add_documents(tokio_stream::iter((0..ROWS).map(|id| {
+        AddDocumentsRequest {
+            text: format!("common row {id}"),
+            analysis: Some(pipestream_search::analyzer::body_spec()),
+            ..Default::default()
+        }
+    })))
+    .await
+    .unwrap();
+    node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+        vectors: corpus.clone(),
+        dim: DIM as u32,
+    }]))
+    .await
+    .unwrap();
+    let deleted = node
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![129, 64, 0],
+            expected_wal_generation: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((deleted.deleted, deleted.already_deleted), (3, 0));
+    node.commit_replacements(CommitReplacementsRequest {
+        replacements: vec![Replacement {
+            old_doc_id: 1,
+            new_doc_id: 130,
+        }],
+        expected_wal_generation: None,
+    })
+    .await
+    .unwrap();
+    let retried = node
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![0, 1, 64, 129],
+            expected_wal_generation: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((retried.deleted, retried.already_deleted), (0, 4));
+    assert_eq!(retried.live_revision, deleted.live_revision + 1);
+
+    async fn assert_visible(addr: &str, vector: &[f32]) {
+        let expected = (0..ROWS as u64)
+            .filter(|id| ![0, 1, 64, 129].contains(id))
+            .collect::<Vec<_>>();
+        let mut node = NodeServiceClient::connect(addr.to_owned()).await.unwrap();
+        let health = node.health(HealthRequest {}).await.unwrap().into_inner();
+        assert_eq!((health.live_docs, health.deleted_docs), (127, 4));
+        let stats = node
+            .term_stats(TermStatsRequest {
+                terms: vec!["common".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stats.doc_count, 127);
+        assert_eq!(stats.doc_frequencies, vec![127]);
+        let browse = node
+            .browse_shard(BrowseShardRequest {
+                k: ROWS as u32,
+                first_page: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(browse.doc_ids, expected);
+        let fetched = node
+            .get_documents(GetDocumentsRequest {
+                doc_ids: (0..ROWS as u64).collect(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            fetched
+                .documents
+                .iter()
+                .map(|doc| doc.doc_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let rescored = node
+            .exact_vector_rescore(ExactVectorRescoreRequest {
+                vector: vector.to_vec(),
+                candidate_ids: (0..ROWS as u64).collect(),
+                max_logical_bytes: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut ids = rescored
+            .hits
+            .iter()
+            .map(|hit| hit.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, expected);
+        let coordinator = CoordinatorServiceImpl::new(vec![addr.to_owned()]).with_bm25(
+            Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+            Default::default(),
+        );
+        let lexical = SearchService::bm25_search(
+            &coordinator,
+            Request::new(Bm25SearchRequest {
+                text: "common".into(),
+                k: ROWS as u32,
+                analysis: Some(pipestream_search::analyzer::body_spec()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut ids = lexical
+            .hits
+            .iter()
+            .map(|hit| hit.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
+    assert_visible(&addr, &corpus[..DIM]).await;
+    node.flush(FlushRequest {}).await.unwrap();
+    drop(node);
+    handle.abort();
+    let _ = handle.await;
+    let (addr, handle) = common::start_opened_node(config).await;
+    assert_visible(&addr, &corpus[..DIM]).await;
+    handle.abort();
+    let _ = handle.await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     let (analysis, analysis_handle) = common::mock::start_mock_analysis().await;
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

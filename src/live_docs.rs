@@ -144,9 +144,12 @@ impl LiveDocs {
 
     pub fn delete(&mut self, slot: usize) -> bool {
         let words = Arc::make_mut(&mut self.deleted);
-        words.resize((slot + 1).div_ceil(64), 0);
+        let word_index = slot / 64;
+        if words.len() <= word_index {
+            words.resize(word_index + 1, 0);
+        }
         let mask = 1u64 << (slot % 64);
-        let word = &mut words[slot / 64];
+        let word = &mut words[word_index];
         if *word & mask != 0 {
             return false;
         }
@@ -236,6 +239,31 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_lower_slots_preserves_higher_tombstones_and_snapshots() {
+        let mut live = LiveDocs::default();
+        assert!(live.delete(255));
+        assert!(live.delete(64));
+        let snapshot = live.clone();
+        assert!(live.delete(0));
+        assert_eq!(live.deleted_count(), 3);
+        assert_eq!(live.revision(), 3);
+        for slot in [0, 64, 255] {
+            assert!(live.is_deleted(slot), "slot {slot} revived");
+            assert!(
+                !live.delete(slot),
+                "retry of slot {slot} was not idempotent"
+            );
+        }
+        assert_eq!(live.deleted_count(), 3);
+        assert_eq!(live.revision(), 3);
+        assert!(!snapshot.is_deleted(0));
+        assert!(snapshot.is_deleted(64));
+        assert!(snapshot.is_deleted(255));
+        assert_eq!(snapshot.deleted_count(), 2);
+        assert_eq!(snapshot.revision(), 2);
+    }
 
     #[test]
     fn round_trip_and_idempotent_delete() {
