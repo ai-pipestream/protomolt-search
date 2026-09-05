@@ -151,7 +151,11 @@ upper bound over every unvisited block is below the current inclusive floor:
 That proof is node-local and would still produce a node-issued
 `completed=true`. The current TurboVec streaming API exposes live floor control
 but no remaining-range bound, so nodes currently traverse every logical scan
-chunk unless cancelled. UDP `CANCEL` can never substitute for this proof.
+chunk of each segment they open unless cancelled. Since 2026-09-05 a sealed
+segment whose column summary rules out the request's filter is not opened at
+all (`docs/segment-pruning.md`); that is exact skipping at segment
+granularity, not early termination inside a segment. UDP `CANCEL` can never
+substitute for this proof.
 
 The same ownership model now applies to ordinary lexical search. BM25 shards
 stream compact `(document id, score)` candidates, block-max scorers consume the
