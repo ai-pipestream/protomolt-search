@@ -1322,6 +1322,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Proposed 2026-09-05: scale-out coordination.** A relay coordinator
+  that presents itself to its parent as one shard over the existing
+  node-facing surface, a standby-then-Raft control plane, a scan rate
+  observed on each node and carried on its lease, and a balance dry run
+  within a placement leaf's node set. Nothing built; the reserved contract
+  is on `feat/scale-out-reservation-2026-09` awaiting contract revisions.
+  [Scale-out coordination](docs/scale-out-coordination.md).
+  The [2026-09-05 review](docs/scale-out-coordination-review-2026-09-05.md)
+  requests contract changes and defines the restricted query relay and scan
+  instrumentation that can proceed. Transparent route composition, automatic
+  standby promotion and segment movement are not cleared; phone shards stay
+  on their originating devices.
 - **Landed 2026-09-05: placement ingest and shard pruning.** Under a
   placement tree the coordinator evaluates the tree per routed document
   and hashes inside the leaf; a node declares the column
