@@ -676,16 +676,71 @@ async fn sealed_segments_serve_mapped_and_equal_the_heap_load_bit_for_bit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(target_os = "linux")]
-fn rss_bytes() -> usize {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
-    let resident_pages: usize = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
-    resident_pages * 4096
+// --- per-thread heap accounting ---------------------------------------
+//
+// The mapped-versus-heap claim is about what an open retains on the heap,
+// so it is measured on the heap: a wrapping allocator keeps a per-thread
+// count of live bytes (allocated minus freed on this thread). Other tests
+// in this binary run on other threads and do not move the count, and a
+// memory map is not an allocation, so the measurement is exact and the
+// same on every run. Process RSS was the earlier gauge; it is process-wide
+// and moved with whatever else the binary was doing at the time.
+
+thread_local! {
+    static LIVE_HEAP_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Opening a catalog whose sealed image is large costs the headers when
-/// mapped and the image when loaded; both answer the same top-k.
-#[cfg(target_os = "linux")]
+struct ThreadCounting;
+
+impl ThreadCounting {
+    fn adjust(delta: isize) {
+        // `try_with` rather than `with`: a const-initialized Cell has no
+        // destructor, so this cannot fail, but an allocator must never panic.
+        let _ = LIVE_HEAP_BYTES.try_with(|cell| {
+            let next = (cell.get() as isize).saturating_add(delta).max(0);
+            cell.set(next as usize);
+        });
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for ThreadCounting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if !ptr.is_null() {
+            Self::adjust(layout.size() as isize);
+        }
+        ptr
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            Self::adjust(layout.size() as isize);
+        }
+        ptr
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        Self::adjust(-(layout.size() as isize));
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let next = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !next.is_null() {
+            Self::adjust(new_size as isize - layout.size() as isize);
+        }
+        next
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: ThreadCounting = ThreadCounting;
+
+fn live_heap_bytes() -> usize {
+    LIVE_HEAP_BYTES.with(|cell| cell.get())
+}
+
+/// Opening a catalog whose sealed image is large retains the headers on
+/// the heap when mapped and the image when loaded; both answer the same
+/// top-k. Measured per thread on the allocator, not on process RSS.
 #[test]
 fn a_mapped_sealed_image_opens_without_the_heap_load() {
     use pipestream_search::exact_vectors::ExactVectorStore;
@@ -751,20 +806,25 @@ fn a_mapped_sealed_image_opens_without_the_heap_load() {
 
     // Both opens verify every artifact and open the BM25 and exact
     // stores; the image is the difference between them.
-    let before = rss_bytes();
+    let before = live_heap_bytes();
     let mapped = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
-    let mapped_growth = rss_bytes().saturating_sub(before);
+    let mapped_growth = live_heap_bytes().saturating_sub(before);
     assert!(mapped.vector(0).unwrap().is_mapped());
-    let before = rss_bytes();
+    let before = live_heap_bytes();
     let heap = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
-    let heap_growth = rss_bytes().saturating_sub(before);
+    let heap_growth = live_heap_bytes().saturating_sub(before);
+    assert!(!heap.vector(0).unwrap().is_mapped());
     assert!(
         mapped_growth < image_bytes / 2,
-        "mapped open grew RSS by {mapped_growth} bytes for a {image_bytes}-byte image"
+        "mapped open retained {mapped_growth} heap bytes for a {image_bytes}-byte image"
+    );
+    assert!(
+        heap_growth >= image_bytes,
+        "a heap load retained {heap_growth} heap bytes for a {image_bytes}-byte image"
     );
     assert!(
         heap_growth > mapped_growth + image_bytes / 2,
-        "a heap load grew RSS by {heap_growth} bytes against {mapped_growth} mapped for a \
+        "a heap load retained {heap_growth} heap bytes against {mapped_growth} mapped for a \
          {image_bytes}-byte image"
     );
     let query = &corpus[7 * DIM..8 * DIM];
