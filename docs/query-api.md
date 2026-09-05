@@ -547,7 +547,7 @@ membership, nested aggregation, and column sorting of boolean relevance return
 
 `QueryRequest.sort` orders the result by columns instead of by
 relevance: most significant key first, ties broken by the next key, then
-by doc id. A key names an i64 or f64 column, a facet column (ordered by
+by doc id. A key names an i64, u64 or f64 column, a facet column (ordered by
 the term's bytes), or one of the lineage keys `parent_id` / `group_id`.
 A document without a value for any key is excluded, the same stance the
 filters take: absence has no honest position in a column order.
@@ -574,6 +574,27 @@ carries the boundary's keys; a column no shard declares refuses by
 name (the typo rule), and a shard without the column contributes no
 rows.
 
+Unsigned columns and lineage keys use `SortKey.unsigned_bits` and report
+`SortValue.unsigned_integer`; zero and values through `u64::MAX` retain all bits.
+The legacy `sort_key` double is a display value and may round large integers;
+it is never used to order or resume the query. Unsigned cursor components use
+`u` plus hexadecimal bits, so a signed/double component cannot resume an
+unsigned column. Old lineage-sort cursors must restart from the first page.
+Compaction can renumber row slots; these tests start fresh pages after a
+compaction and do not establish cursor validity across generation changes.
+
+Each shard reports its resolved column types even when no rows match. The
+coordinator checks vector widths, known flags, type agreement and each row's
+wire types before merging. A column declared differently across shards refuses
+with `FAILED_PRECONDITION`. Candidate-scoped value fetches carry the same type
+metadata, so those fetched projections and collapse cannot silently mix signed,
+unsigned, floating-point, string or boolean results. This check covers sorted
+browse and `FetchValues`; the native `Bm25Search` projection merge remains a
+separate type-consistency audit. Matching node/coordinator builds are
+required: missing type metadata refuses instead of implying a compatible type.
+Sorted lexical selections also fetch requested projections after selecting the
+page, exactly like filter-only browse.
+
 ## Collapse
 
 `QueryRequest.collapse` returns one representative per key value: `k`
@@ -581,9 +602,10 @@ means `k` groups, each represented by its best hit in the selection's
 order, with `groups[i]` alongside `hits[i]` carrying the key, the group's
 top `inner_hits` hits (the representative first, ranks counting within
 the group), how many hits the group had in the candidate pool, and
-whether the list is provably complete. The key is an i64 or facet
+whether the list is provably complete. The key is an i64, u64 or facet
 column, or `parent_id` / `group_id` from the document's lineage; a
-document without a value forms no group.
+document without a value forms no group. Lineage keys, including small IDs,
+are now reported as unsigned values rather than through an i64 cast.
 
 The collapse runs over the candidate pool the route fetched, so its
 exactness statement is the pool's. A **single leaf** has a
@@ -694,3 +716,10 @@ pool at `selection_k`, so paging moves inside it and each page reports
 the same fold. `AggregateResponse.matched` is the pool's size. The hits
 are unchanged by the aggregation. Details, including CARDINALITY and
 calendar histograms: `docs/aggregations.md`, sections 8 to 10.
+
+The unsigned sort/collapse contract is covered by `tests/unsigned_order.rs`:
+independent total-order expectations, both directions, text tie-breaks, paged
+browse and lexical selections, group representatives and inner hits, source-key
+reads after reopen and compaction on both layouts, and type disagreement with
+empty and populated results. This work changes query messages and execution;
+it introduces no persisted index format or mapping fingerprint change.

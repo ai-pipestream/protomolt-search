@@ -128,6 +128,33 @@ pub enum ValueType {
     Unknown,
 }
 
+/// Wire type used to validate projection results across shards.
+impl From<ValueType> for pb::ScalarValueType {
+    fn from(value: ValueType) -> Self {
+        match value {
+            ValueType::Unknown => Self::Unspecified,
+            ValueType::Int => Self::Integer,
+            ValueType::Uint => Self::UnsignedInteger,
+            ValueType::Double => Self::Number,
+            ValueType::Str => Self::Text,
+            ValueType::Bool => Self::Boolean,
+        }
+    }
+}
+
+/// The actual projected scalar, with absence represented by UNSPECIFIED.
+pub fn projected_type(value: &pb::ProjectedValue) -> pb::ScalarValueType {
+    use pb::projected_value::Value as V;
+    match &value.value {
+        None => pb::ScalarValueType::Unspecified,
+        Some(V::IntValue(_)) => pb::ScalarValueType::Integer,
+        Some(V::UintValue(_)) => pb::ScalarValueType::UnsignedInteger,
+        Some(V::DoubleValue(_)) => pb::ScalarValueType::Number,
+        Some(V::StringValue(_)) => pb::ScalarValueType::Text,
+        Some(V::BoolValue(_)) => pb::ScalarValueType::Boolean,
+    }
+}
+
 impl ValueType {
     fn name(self) -> &'static str {
         match self {

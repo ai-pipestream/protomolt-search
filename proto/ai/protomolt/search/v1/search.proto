@@ -927,13 +927,16 @@ message BrowseShardRequest {
 }
 
 // One key of a sorted row on the wire, in the form the merge compares:
-// an order-preserving u64 for i64/f64/id keys (already complemented for
+// order-preserving bits for i64/f64 keys or typed u64 bits for unsigned and
+// lineage keys (already complemented for
 // a descending order), or the term text of a facet key (compared as
 // bytes; the merge reverses the comparison for a descending order).
 message SortKey {
   oneof key {
     uint64 bits = 1;
     string text = 2;
+    // Full-domain unsigned key, complemented for descending order.
+    uint64 unsigned_bits = 3;
   }
 }
 
@@ -949,14 +952,27 @@ message SortValue {
     double number = 1;
     sint64 integer = 2;
     string text = 3;
+    // u64 columns and lineage identities, without narrowing.
+    uint64 unsigned_integer = 4;
   }
 }
 
-// One sort key: an i64, f64, or facet column, or one of the lineage
+// One sort key: an i64, u64, f64, or facet column, or one of the lineage
 // keys `parent_id` / `group_id`, ascending or descending.
 message BrowseSort {
   string column = 1;
   bool descending = 2;
+}
+
+// Resolved scalar type for sorting and projected-value merging. UNSPECIFIED
+// means absent on this shard. Concrete types must agree across contributors.
+enum ScalarValueType {
+  SCALAR_VALUE_TYPE_UNSPECIFIED = 0;
+  SCALAR_VALUE_TYPE_INTEGER = 1;
+  SCALAR_VALUE_TYPE_NUMBER = 2;
+  SCALAR_VALUE_TYPE_TEXT = 3;
+  SCALAR_VALUE_TYPE_UNSIGNED_INTEGER = 4;
+  SCALAR_VALUE_TYPE_BOOLEAN = 5;
 }
 
 message BrowseShardResponse {
@@ -975,6 +991,7 @@ message BrowseShardResponse {
   // (negative: all bits flipped; positive: sign bit set); a DESCENDING
   // sort complements the result — so the heap order, the merged order,
   // and the cursor boundary are one ascending comparison per key.
+  // u64 and lineage keys use unsigned_bits without a sign transform.
   // Facet keys travel as their term text.
   repeated SortKeyRow sort_rows = 7;
   // Per sort key, whether this shard resolves the column (typo rule:
@@ -987,6 +1004,10 @@ message BrowseShardResponse {
   // (docs/segment-pruning.md). The answer is the same with pruning off.
   uint32 segments_total = 9;
   uint32 segments_skipped = 10;
+  // Parallel to sort_columns_known. UNSPECIFIED means the column is absent.
+  // Required for sorted responses, even when sort_rows is empty.
+  repeated ScalarValueType sort_column_types = 11;
+
 }
 
 message FilterBitmapRequest {
@@ -4525,6 +4546,11 @@ message FetchValuesResponse {
   // Bm25QueryResponse.projection_leaves_known; the coordinator applies
   // the same typo rule.
   repeated bool projection_leaves_known = 3;
+  // Resolved type of each projection, including when no candidates are owned.
+  // UNSPECIFIED means the expression is absent everywhere on this shard.
+  // Coordinators require compatible types before publishing rows.
+  repeated ScalarValueType projection_types = 4;
+
 }
 
 // Candidate-scoped vector scoring (see NodeService.VectorRescore).

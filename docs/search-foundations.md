@@ -130,7 +130,7 @@ Schema checks reject a tail or segment with different ordered columns before
 it can change the meaning of a column ordinal. Existing signed storage bytes
 and protobuf contracts are unchanged. Storage alone does not establish mapped unsigned semantics. The following
 increments add typed ingest, filtering, descriptor mapping and value expressions;
-unsigned sorting, collapse and aggregation remain unfinished.
+unsigned range facets and aggregation remain unfinished.
 See `tests/unsigned_columns.rs` and `docs/range-facets.md`.
 
 The next increment connects `UnsignedIntegerValue` to ordinary protobuf ingest,
@@ -161,9 +161,9 @@ semantics. Extreme exclusive floating bounds no longer overflow i128 during
 signed normalization. `tests/unsigned_filters.rs` compares numeric behavior
 with an independent IEEE integer-ratio oracle and fixed expected rows through
 heap, reopened single-image and reopened segmented searches, monolithic and
-distributed. Unsigned mapping, value expressions, sorting and aggregation
-remain unfinished; these filter checks do not establish complete unsigned
-protobuf semantics.
+distributed. These filter checks alone do not establish complete unsigned
+protobuf semantics; the subsequent increments cover mapping, value expressions
+and ordering, while unsigned aggregation remains unfinished.
 
 Validation of the filter increment on 2026-09-05: 421 library tests, 521
 integration tests across 88 targets and 11 embedded tests passed, with one
@@ -197,8 +197,27 @@ preservation, signed hint refusal, old binding refusal, and mapped ingest,
 reopen, exact key filtering and repeated compaction on both layouts. Legacy
 mapped ingest still does not publish catalog `DocumentIdentity`; retaining
 indexed key values and original bytes is not completion of the identity,
-conditional-write or receipt contract. Unsigned sorting, collapse, aggregation
-and the other protobuf shapes also remain required.
+conditional-write or receipt contract. Unsigned range facets, aggregation and the other protobuf shapes also remain required.
+
+The unsigned ordering increment carries u64 columns and lineage keys through
+sort values, distinct unsigned cursor components, collapse representatives and
+inner hits. Sorted browse and candidate-scoped `FetchValues` publish scalar
+metadata, including empty responses; coordinators refuse missing metadata,
+incompatible shard types and rows that disagree with their declared type. The
+native BM25 projection merge still needs the corresponding type-consistency
+audit. Sorted lexical queries now return requested projections; a lifecycle
+test reproduced their previous silent omission. Tests restart pagination after
+compaction and do not claim cursor validity across generation changes.
+
+Validation of the ordering increment on 2026-09-05: 422 library tests, 533
+integration tests across 91 targets and 11 embedded tests passed; one existing
+sidecar test was ignored. All five Android/iOS Rust target checks passed with
+three existing relay dead-code warnings. Tests/examples compilation, formatting,
+vendored-proto and diff checks passed. Descriptor comparison against `35ea12d`
+confirms four additive fields and one scalar-type enum, with existing
+declarations unchanged. No persisted format or mapping fingerprint changed.
+This remains feature-branch validation; this work does not update main or
+deploy to the fleet.
 
 Validation of the unsigned value-expression increment on 2026-09-05: 422
 library tests, 530 integration tests across 90 targets and 11 embedded tests

@@ -10591,6 +10591,7 @@ impl NodeService for NodeServiceImpl {
                     filter_columns_known,
                     sort_rows: Vec::new(),
                     sort_columns_known: vec![false; req.sort.len()],
+                    sort_column_types: vec![0; req.sort.len()],
                 }));
             };
             if store.as_index().is_none() {
@@ -10663,17 +10664,25 @@ impl NodeService for NodeServiceImpl {
                 enum Column {
                     Numeric(usize),
                     Integer(usize),
+                    UnsignedInteger(usize),
                     Facet(usize),
                     Parent,
                     Group,
                 }
                 let mut columns = Vec::with_capacity(req.sort.len());
                 let mut known = Vec::with_capacity(req.sort.len());
+                let mut column_types = Vec::with_capacity(req.sort.len());
                 for sort in &req.sort {
+                    let families = [store.numeric_index(&sort.column), store.integer_index(&sort.column), store.unsigned_integer_index(&sort.column), store.facet_index(&sort.column)];
+                    if families.iter().filter(|c| c.is_some()).count() > 1 {
+                        return Err(Status::invalid_argument(format!("sort column {:?} exists in more than one family on this shard", sort.column)));
+                    }
                     let column = if let Some(ni) = store.numeric_index(&sort.column) {
                         Some(Column::Numeric(ni))
                     } else if let Some(ii) = store.integer_index(&sort.column) {
                         Some(Column::Integer(ii))
+                    } else if let Some(ui) = store.unsigned_integer_index(&sort.column) {
+                        Some(Column::UnsignedInteger(ui))
                     } else if let Some(fi) = store.facet_index(&sort.column) {
                         Some(Column::Facet(fi))
                     } else if sort.column == "parent_id" {
@@ -10683,6 +10692,13 @@ impl NodeService for NodeServiceImpl {
                     } else {
                         None
                     };
+                    column_types.push(match column {
+                        Some(Column::Integer(_)) => crate::pb::ScalarValueType::Integer,
+                        Some(Column::Numeric(_)) => crate::pb::ScalarValueType::Number,
+                        Some(Column::UnsignedInteger(_) | Column::Parent | Column::Group) => crate::pb::ScalarValueType::UnsignedInteger,
+                        Some(Column::Facet(_)) => crate::pb::ScalarValueType::Text,
+                        None => crate::pb::ScalarValueType::Unspecified,
+                    } as i32);
                     known.push(column.is_some());
                     columns.push(column);
                 }
@@ -10699,6 +10715,7 @@ impl NodeService for NodeServiceImpl {
                         filter_columns_known,
                         sort_rows: Vec::new(),
                         sort_columns_known: known,
+                        sort_column_types: column_types,
                     }));
                 }
                 let columns: Vec<Column> = columns.into_iter().flatten().collect();
@@ -10722,6 +10739,11 @@ impl NodeService for NodeServiceImpl {
                                 keys.push(KeyRef::Bits(adjust(i64_order_bits(v))));
                                 values.push(Value::Integer(v));
                             }
+                            Column::UnsignedInteger(ui) => {
+                                let v = store.unsigned_integer_value(*ui, doc)?;
+                                keys.push(KeyRef::UnsignedBits(adjust(v)));
+                                values.push(Value::UnsignedInteger(v));
+                            }
                             Column::Facet(fi) => {
                                 let ord = store.facet_ord(*fi, doc)?;
                                 let text = store.facet_value(*fi, ord);
@@ -10735,8 +10757,8 @@ impl NodeService for NodeServiceImpl {
                                 } else {
                                     lineage.group_id
                                 };
-                                keys.push(KeyRef::Bits(adjust(v)));
-                                values.push(Value::Integer(v as i64));
+                                keys.push(KeyRef::UnsignedBits(adjust(v)));
+                                values.push(Value::UnsignedInteger(v));
                             }
                         }
                     }
@@ -10755,6 +10777,12 @@ impl NodeService for NodeServiceImpl {
                             keys.len(),
                             req.sort.len()
                         )));
+                    }
+                    for (key, kind) in keys.iter().zip(&column_types) {
+                        let kind = crate::pb::ScalarValueType::try_from(*kind).expect("resolved column type");
+                        if !crate::sortkeys::key_matches_type(key, kind) {
+                            return Err(Status::invalid_argument("sorted browse boundary key type disagrees with the sort column; restart from the first page"));
+                        }
                     }
                     Some(keys)
                 };
@@ -10824,6 +10852,7 @@ impl NodeService for NodeServiceImpl {
                     filter_columns_known,
                     sort_rows,
                     sort_columns_known: known,
+                    sort_column_types: column_types,
                 }));
             }
             let mut doc_ids = Vec::new();
@@ -10843,6 +10872,7 @@ impl NodeService for NodeServiceImpl {
                 filter_columns_known,
                 sort_rows: Vec::new(),
                 sort_columns_known: Vec::new(),
+                sort_column_types: Vec::new(),
             }))
         })
         .await
@@ -13068,6 +13098,7 @@ impl NodeService for NodeServiceImpl {
                             rows: Vec::new(),
                             stage_columns_known: vec![false; req.stages.len()],
                             projection_leaves_known: vec![false; projection_leaves.len()],
+                            projection_types: vec![0; req.projections.len()],
                         });
                     };
                     let projection_leaves_known: Vec<bool> = projection_leaves
@@ -13077,16 +13108,22 @@ impl NodeService for NodeServiceImpl {
                     // Projections resolve against this shard's tables once
                     // per request; type conflicts refuse here, by name —
                     // the same rule as the lexical route.
-                    let resolved: Vec<crate::values::ResolvedValue> = req
-                        .projections
+                    let resolved: Vec<(crate::values::ResolvedValue, crate::values::ValueType)> =
+                        req.projections
+                            .iter()
+                            .map(|p| {
+                                let expr = p.expr.as_ref().ok_or_else(|| {
+                                    Status::invalid_argument(
+                                        "projection: empty compiled expression",
+                                    )
+                                })?;
+                                crate::values::resolve(expr, store)
+                            })
+                            .collect::<Result<_, Status>>()?;
+                    let projection_types = resolved
                         .iter()
-                        .map(|p| {
-                            let expr = p.expr.as_ref().ok_or_else(|| {
-                                Status::invalid_argument("projection: empty compiled expression")
-                            })?;
-                            crate::values::resolve(expr, store).map(|(rv, _)| rv)
-                        })
-                        .collect::<Result<_, Status>>()?;
+                        .map(|(_, vt)| crate::pb::ScalarValueType::from(*vt) as i32)
+                        .collect();
                     let chain = store.resolve_chain(&specs);
                     let stage_columns_known =
                         chain.stages.iter().map(|s| s.column.is_some()).collect();
@@ -13112,7 +13149,7 @@ impl NodeService for NodeServiceImpl {
                                 doc_id: id,
                                 values: resolved
                                     .iter()
-                                    .map(|rv| {
+                                    .map(|(rv, _)| {
                                         projected_value(
                                             crate::values::eval(rv, local, &numeric_read),
                                             store,
@@ -13135,6 +13172,7 @@ impl NodeService for NodeServiceImpl {
                         rows,
                         stage_columns_known,
                         projection_leaves_known,
+                        projection_types,
                     })
                 },
             )

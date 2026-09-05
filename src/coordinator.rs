@@ -8013,10 +8013,33 @@ impl CoordinatorServiceImpl {
         };
         let mut stage_known = vec![false; stages.len()];
         let mut projection_known = vec![false; projection_leaves.len()];
+        let mut projection_types = vec![crate::pb::ScalarValueType::Unspecified; projections.len()];
         for task in tasks {
             let resp = task
                 .await
                 .map_err(|e| Status::internal(format!("fetch values task failed: {e}")))??;
+            if resp.projection_types.len() != projections.len()
+                || resp.projection_leaves_known.len() != projection_leaves.len()
+                || resp.stage_columns_known.len() != stages.len()
+            {
+                return Err(Status::failed_precondition("shard omitted projection type or known-column metadata; use matching server builds"));
+            }
+            for (i, &raw) in resp.projection_types.iter().enumerate() {
+                let ty = crate::pb::ScalarValueType::try_from(raw).map_err(|_| {
+                    Status::failed_precondition("unknown projection type from shard")
+                })?;
+                if ty != crate::pb::ScalarValueType::Unspecified {
+                    if projection_types[i] != crate::pb::ScalarValueType::Unspecified
+                        && projection_types[i] != ty
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "projection {:?} has incompatible types across shards: {:?} and {:?}",
+                            projections[i].name, projection_types[i], ty
+                        )));
+                    }
+                    projection_types[i] = ty;
+                }
+            }
             for (known, shard) in stage_known.iter_mut().zip(&resp.stage_columns_known) {
                 *known |= shard;
             }
@@ -8027,6 +8050,19 @@ impl CoordinatorServiceImpl {
                 *known |= shard;
             }
             for row in resp.rows {
+                if row.values.len() != projections.len() || row.stage_values.len() != stages.len() {
+                    return Err(Status::failed_precondition(
+                        "shard returned a projection row with the wrong width",
+                    ));
+                }
+                for (value, &raw) in row.values.iter().zip(&resp.projection_types) {
+                    let actual = crate::values::projected_type(value);
+                    if actual != crate::pb::ScalarValueType::Unspecified && actual as i32 != raw {
+                        return Err(Status::failed_precondition(
+                            "shard projected value disagrees with its declared type",
+                        ));
+                    }
+                }
                 for (i, sv) in row.stage_values.iter().enumerate() {
                     if let Some(crate::pb::projected_value::Value::DoubleValue(v)) = sv.value {
                         out.stage_rows[i].insert(row.doc_id, v);
@@ -8237,6 +8273,7 @@ impl CoordinatorServiceImpl {
         }
         let mut known = Self::filter_known(filters, mask.as_ref());
         let mut sort_known = vec![false; sort.len()];
+        let mut sort_types = vec![crate::pb::ScalarValueType::Unspecified; sort.len()];
         struct Row {
             keys: Vec<Key>,
             values: Vec<Value>,
@@ -8253,8 +8290,37 @@ impl CoordinatorServiceImpl {
                 segments_total: response.segments_total,
                 segments_skipped: response.segments_skipped,
             });
-            for (known, shard) in sort_known.iter_mut().zip(&response.sort_columns_known) {
-                *known |= shard;
+            if response.sort_columns_known.len() != sort.len()
+                || response.sort_column_types.len() != sort.len()
+            {
+                return Err(Status::failed_precondition("shard omitted sorted column type metadata; all nodes must use the matching sort contract"));
+            }
+            for (i, (&known, &raw_type)) in response
+                .sort_columns_known
+                .iter()
+                .zip(&response.sort_column_types)
+                .enumerate()
+            {
+                let kind = crate::pb::ScalarValueType::try_from(raw_type).map_err(|_| {
+                    Status::failed_precondition("shard returned an unknown sort column type")
+                })?;
+                if kind == crate::pb::ScalarValueType::Boolean
+                    || known != (kind != crate::pb::ScalarValueType::Unspecified)
+                {
+                    return Err(Status::failed_precondition(
+                        "shard sort column type disagrees with its known flag",
+                    ));
+                }
+                if known {
+                    if sort_known[i] && sort_types[i] != kind {
+                        return Err(Status::failed_precondition(format!(
+                            "sort column {:?} has incompatible types across shards: {:?} and {:?}",
+                            sort[i].column, sort_types[i], kind
+                        )));
+                    }
+                    sort_known[i] = true;
+                    sort_types[i] = kind;
+                }
             }
             if sort.is_empty() {
                 rows.extend(response.doc_ids.iter().map(|&id| Row {
@@ -8288,6 +8354,16 @@ impl CoordinatorServiceImpl {
                         sort.len()
                     )));
                 }
+                for (i, (key, value)) in keys.iter().zip(&values).enumerate() {
+                    let kind = crate::pb::ScalarValueType::try_from(response.sort_column_types[i])
+                        .expect("validated metadata");
+                    if value.column_type() != kind || !crate::sortkeys::key_matches_type(key, kind)
+                    {
+                        return Err(Status::failed_precondition(
+                            "shard sort row disagrees with its declared column type",
+                        ));
+                    }
+                }
                 rows.push(Row { keys, values, id });
             }
         }
@@ -8295,8 +8371,8 @@ impl CoordinatorServiceImpl {
         for (sort, known) in sort.iter().zip(&sort_known) {
             if !known {
                 return Err(Status::invalid_argument(format!(
-                    "sort column {:?} is not declared on any shard's numeric, integer, or \
-                     facet table (--numeric-fields / --integer-fields / --facet-fields), \
+                    "sort column {:?} is not declared on any shard's numeric, integer, unsigned integer, or \
+                     facet table (--numeric-fields / --integer-fields / --unsigned-integer-fields / --facet-fields), \
                      and is not a lineage key (parent_id, group_id)",
                     sort.column
                 )));

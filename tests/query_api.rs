@@ -2060,8 +2060,8 @@ async fn collapse_groups_the_pool_by_key_with_inner_hits_and_pages() {
         assert_eq!(
             group.key,
             Some(pipestream_search::pb::SortValue {
-                value: Some(pipestream_search::pb::sort_value::Value::Integer(
-                    *parent as i64
+                value: Some(pipestream_search::pb::sort_value::Value::UnsignedInteger(
+                    *parent
                 ))
             })
         );

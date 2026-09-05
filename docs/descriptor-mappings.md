@@ -78,8 +78,8 @@ CEL unsigned filters, presence tests, typed projections, checked arithmetic and
 `MATERIALIZE_KIND_U64` outputs preserve the full unsigned domain. `double()` is
 an explicit, potentially lossy conversion. Materialization validates declared
 input types before documents arrive, so a uint input assigned to an I64 output
-refuses even when the input is absent. Unsigned sorting, collapse and
-aggregation remain unfinished and are reported as limitations in the schema
+refuses even when the input is absent. Unsigned sorting and collapse are
+supported; unsigned aggregation remains unfinished and are reported as limitations in the schema
 report. See [the value dialect](cel-values.md). Legacy
 `IngestMapped` retains original bytes but does not publish catalog
 `DocumentIdentity` or the source-authority write receipts. The mapped lifecycle

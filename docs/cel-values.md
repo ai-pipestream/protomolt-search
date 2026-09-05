@@ -239,7 +239,8 @@ The uint forms of `math.abs` and `math.sign` follow the
 [CEL math extension](https://github.com/cel-expr/cel-go/blob/master/ext/math.go).
 The engine retains its documented single-type rule for comparisons, ternaries
 and `greatest`/`least`, and requires explicit double conversion for the other
-math functions. Unsigned sorting, collapse and aggregate accumulators remain
+math functions. Unsigned sorting and collapse are supported with typed keys and results
+([query contract](query-api.md#sorting)). Unsigned aggregate accumulators remain
 separate unfinished query work; they do not silently narrow a uint result.
 
 `tests/unsigned_values.rs` compares arithmetic against an independent u128

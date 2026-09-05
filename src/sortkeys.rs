@@ -2,9 +2,9 @@
 //! sorted row is ordered by on the node's heap, in the coordinator's
 //! merge, and at a cursor boundary.
 //!
-//! A key is either order-preserving u64 bits (an i64 or f64 column
+//! A key is either typed unsigned bits, order-preserving u64 bits (an i64 or f64 column
 //! through the node's offset-binary / sign-flip mapping, or a lineage
-//! id as is) or a facet term's text. Bits are complemented on the node
+//! id uses the unsigned variant) or a facet term's text. Bits are complemented on the node
 //! for a descending key, so they always compare ascending; text cannot
 //! be complemented, so its comparison is reversed per key instead. Rows
 //! compare key by key, most significant first, then by doc id.
@@ -17,6 +17,7 @@ use crate::pb;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Key {
     Bits(u64),
+    UnsignedBits(u64),
     Text(String),
 }
 
@@ -25,6 +26,7 @@ pub enum Key {
 #[derive(Clone, Copy, Debug)]
 pub enum KeyRef<'a> {
     Bits(u64),
+    UnsignedBits(u64),
     Text(&'a str),
 }
 
@@ -32,6 +34,7 @@ impl Key {
     pub fn as_ref(&self) -> KeyRef<'_> {
         match self {
             Key::Bits(b) => KeyRef::Bits(*b),
+            Key::UnsignedBits(b) => KeyRef::UnsignedBits(*b),
             Key::Text(t) => KeyRef::Text(t),
         }
     }
@@ -40,6 +43,7 @@ impl Key {
         pb::SortKey {
             key: Some(match self {
                 Key::Bits(b) => pb::sort_key::Key::Bits(*b),
+                Key::UnsignedBits(b) => pb::sort_key::Key::UnsignedBits(*b),
                 Key::Text(t) => pb::sort_key::Key::Text(t.clone()),
             }),
         }
@@ -48,6 +52,7 @@ impl Key {
     pub fn from_pb(key: &pb::SortKey) -> Option<Key> {
         match key.key.as_ref()? {
             pb::sort_key::Key::Bits(b) => Some(Key::Bits(*b)),
+            pb::sort_key::Key::UnsignedBits(b) => Some(Key::UnsignedBits(*b)),
             pb::sort_key::Key::Text(t) => Some(Key::Text(t.clone())),
         }
     }
@@ -57,20 +62,35 @@ impl<'a> KeyRef<'a> {
     pub fn to_owned(self) -> Key {
         match self {
             KeyRef::Bits(b) => Key::Bits(b),
+            KeyRef::UnsignedBits(b) => Key::UnsignedBits(b),
             KeyRef::Text(t) => Key::Text(t.to_string()),
         }
     }
+}
+
+/// Validate the key's encoding against the declared column family.
+pub fn key_matches_type(key: &Key, kind: pb::ScalarValueType) -> bool {
+    matches!(
+        (key, kind),
+        (
+            Key::Bits(_),
+            pb::ScalarValueType::Integer | pb::ScalarValueType::Number
+        ) | (Key::UnsignedBits(_), pb::ScalarValueType::UnsignedInteger)
+            | (Key::Text(_), pb::ScalarValueType::Text)
+    )
 }
 
 /// Compare two keys of the same position under the key's direction:
 /// bits compare ascending as they are (a descending key's bits were
 /// complemented at the source); text compares by bytes, reversed for a
 /// descending key. Two keys of different kinds never meet (a column has
-/// one kind); should a shard disagree, bits order before text so the
-/// comparison stays total.
+/// one kind); the coordinator refuses disagreeing declarations before merging.
+/// The helper retains a total order for callers comparing malformed keys.
 pub fn cmp_key(a: KeyRef<'_>, b: KeyRef<'_>, descending: bool) -> Ordering {
     match (a, b) {
-        (KeyRef::Bits(x), KeyRef::Bits(y)) => x.cmp(&y),
+        (KeyRef::Bits(x), KeyRef::Bits(y)) | (KeyRef::UnsignedBits(x), KeyRef::UnsignedBits(y)) => {
+            x.cmp(&y)
+        }
         (KeyRef::Text(x), KeyRef::Text(y)) => {
             let o = x.as_bytes().cmp(y.as_bytes());
             if descending {
@@ -79,8 +99,11 @@ pub fn cmp_key(a: KeyRef<'_>, b: KeyRef<'_>, descending: bool) -> Ordering {
                 o
             }
         }
-        (KeyRef::Bits(_), KeyRef::Text(_)) => Ordering::Less,
-        (KeyRef::Text(_), KeyRef::Bits(_)) => Ordering::Greater,
+        // Callers validate types first; keep this helper total for malformed input.
+        (KeyRef::Bits(_), _) => Ordering::Less,
+        (_, KeyRef::Bits(_)) => Ordering::Greater,
+        (KeyRef::UnsignedBits(_), _) => Ordering::Less,
+        (_, KeyRef::UnsignedBits(_)) => Ordering::Greater,
     }
 }
 
@@ -116,13 +139,15 @@ pub fn cmp_candidate(
     a_id.cmp(&b_id)
 }
 
-/// The cursor form of a key list: `b<16 hex>` for bits, `t<hex of the
+/// The cursor form of a key list: `b<16 hex>` for signed/double bits,
+/// `u<16 hex>` for unsigned bits, `t<hex of the
 /// UTF-8>` for text, joined by `,`. Hex keeps the token free of the
 /// cursor's own separators whatever the term holds.
 pub fn encode_keys(keys: &[Key]) -> String {
     keys.iter()
         .map(|k| match k {
             Key::Bits(b) => format!("b{b:016x}"),
+            Key::UnsignedBits(b) => format!("u{b:016x}"),
             Key::Text(t) => {
                 let mut out = String::with_capacity(1 + t.len() * 2);
                 out.push('t');
@@ -147,8 +172,10 @@ pub fn decode_keys(text: &str) -> Option<Vec<Key>> {
                 part.split_at(part.char_indices().nth(1).map_or(part.len(), |(i, _)| i));
             match tag {
                 "b" => u64::from_str_radix(body, 16).ok().map(Key::Bits),
+                "u" => u64::from_str_radix(body, 16).ok().map(Key::UnsignedBits),
                 "t" => {
-                    if !body.len().is_multiple_of(2) {
+                    if !body.len().is_multiple_of(2) || !body.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
                         return None;
                     }
                     let bytes: Option<Vec<u8>> = (0..body.len())
@@ -168,6 +195,7 @@ pub fn value_from_pb(value: &pb::SortValue) -> Option<Value> {
     match value.value.as_ref()? {
         pb::sort_value::Value::Number(n) => Some(Value::Number(*n)),
         pb::sort_value::Value::Integer(i) => Some(Value::Integer(*i)),
+        pb::sort_value::Value::UnsignedInteger(i) => Some(Value::UnsignedInteger(*i)),
         pb::sort_value::Value::Text(t) => Some(Value::Text(t.clone())),
     }
 }
@@ -177,6 +205,7 @@ pub fn value_from_pb(value: &pb::SortValue) -> Option<Value> {
 pub enum Value {
     Number(f64),
     Integer(i64),
+    UnsignedInteger(u64),
     Text(String),
 }
 
@@ -186,8 +215,18 @@ impl Value {
             value: Some(match self {
                 Value::Number(n) => pb::sort_value::Value::Number(*n),
                 Value::Integer(i) => pb::sort_value::Value::Integer(*i),
+                Value::UnsignedInteger(i) => pb::sort_value::Value::UnsignedInteger(*i),
                 Value::Text(t) => pb::sort_value::Value::Text(t.clone()),
             }),
+        }
+    }
+
+    pub fn column_type(&self) -> pb::ScalarValueType {
+        match self {
+            Self::Integer(_) => pb::ScalarValueType::Integer,
+            Self::UnsignedInteger(_) => pb::ScalarValueType::UnsignedInteger,
+            Self::Number(_) => pb::ScalarValueType::Number,
+            Self::Text(_) => pb::ScalarValueType::Text,
         }
     }
 
@@ -197,6 +236,7 @@ impl Value {
         match self {
             Value::Number(n) => *n,
             Value::Integer(i) => *i as f64,
+            Value::UnsignedInteger(i) => *i as f64,
             Value::Text(_) => 0.0,
         }
     }

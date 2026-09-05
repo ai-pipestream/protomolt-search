@@ -89,8 +89,8 @@ both topology and segment pruning use the same numeric meaning; see
 [CEL filters](cel-filters.md#numbers-compare-exactly-across-domains).
 Unhinted unsigned protobuf fields now map to the u64 family; explicitly signed
 hints retain their checked i64 conversion. [Value projections and materialized
-columns](cel-values.md) also retain uint values. Unsigned range facets, sorting,
-collapse and aggregation are not yet connected to the u64 family. The schema
+columns](cel-values.md) also retain uint values. Unsigned range facets
+and aggregation are not yet connected to the u64 family. The schema
 report records the mapped query type and remaining restrictions. Use matching server and
 client builds for this feature: older protobuf readers can ignore the new
 request field, and older storage readers refuse kind 11.

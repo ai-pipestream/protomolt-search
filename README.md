@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Unsigned sort and collapse (2026-09-05, feature branch).** u64 columns and
+  lineage IDs retain their full domain in sort results, cursor keys, collapse
+  groups and inner hits. Shards advertise scalar types before merging sort or
+  fetched projection values, including empty results. Incompatible types refuse.
+  Sorted lexical queries now return their requested projections. Regenerate
+  clients and use matching node/coordinator builds; index bytes are unchanged.
+  See [sorting and collapse](docs/query-api.md#sorting).
+
 - **Unsigned value expressions (2026-09-05, feature branch).** Projections and
   materialized U64 columns now retain uint values through checked arithmetic,
   comparisons and conditional expressions. `double()` converts explicitly;

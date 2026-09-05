@@ -993,16 +993,17 @@ pub async fn execute(
         _ => None,
     };
     // Projections: the lexical route carries them natively (bitwise the
-    // path that always served them); every other shape — browse
+    // path that always served them); a sorted lexical leaf and every other shape — browse
     // included — fetches them post-selection by id through the
     // FetchValues seam. The selection is already fixed when that runs,
     // so no pruning certificate is involved.
-    let compiled_projections =
-        if req.projections.is_empty() || matches!(plan.shape, Shape::Lexical { .. }) {
-            Vec::new()
-        } else {
-            crate::coordinator::compile_projections(&req.projections)?
-        };
+    let compiled_projections = if req.projections.is_empty()
+        || (req.sort.is_empty() && matches!(plan.shape, Shape::Lexical { .. }))
+    {
+        Vec::new()
+    } else {
+        crate::coordinator::compile_projections(&req.projections)?
+    };
     if !req.sort.is_empty() {
         for sort in &req.sort {
             if sort.column.is_empty() {
@@ -2052,6 +2053,7 @@ async fn deepen(
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum GroupKey {
     Integer(i64),
+    UnsignedInteger(u64),
     Text(String),
 }
 
@@ -2059,6 +2061,7 @@ impl GroupKey {
     fn to_value(&self) -> crate::pb::SortValue {
         match self {
             GroupKey::Integer(i) => crate::sortkeys::Value::Integer(*i).to_pb(),
+            GroupKey::UnsignedInteger(i) => crate::sortkeys::Value::UnsignedInteger(*i).to_pb(),
             GroupKey::Text(t) => crate::sortkeys::Value::Text(t.clone()).to_pb(),
         }
     }
@@ -2077,7 +2080,7 @@ async fn collapse_keys(
     if column == "parent_id" || column == "group_id" {
         for (id, (parent, group)) in coordinator.lineage_keys(ids).await? {
             let v = if column == "parent_id" { parent } else { group };
-            keys.insert(id, GroupKey::Integer(v as i64));
+            keys.insert(id, GroupKey::UnsignedInteger(v));
         }
         return Ok(keys);
     }
@@ -2091,11 +2094,7 @@ async fn collapse_keys(
             continue;
         };
         let key = match value {
-            crate::pb::projected_value::Value::UintValue(_) => {
-                return Err(refuse(format!(
-                    "collapse by {column:?}: uint group identities are not supported yet"
-                )));
-            }
+            crate::pb::projected_value::Value::UintValue(v) => GroupKey::UnsignedInteger(*v),
             crate::pb::projected_value::Value::IntValue(i) => GroupKey::Integer(*i),
             crate::pb::projected_value::Value::StringValue(t) => GroupKey::Text(t.clone()),
             crate::pb::projected_value::Value::DoubleValue(_) => {
