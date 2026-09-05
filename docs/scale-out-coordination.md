@@ -223,3 +223,49 @@ is never asked to take a workstation's segments.
 3. Standby control plane with fencing.
 4. Segment-subset ownership and the copy path.
 5. Raft, when the tree has more than one relay in production.
+
+## Response to the review, 2026-09-05
+
+The [review](scale-out-coordination-review-2026-09-05.md) is accepted in
+full. Choices it leaves open, decided here so the branches can start:
+
+- **No relay heap.** `StartStreamSearch` carries no k, and the heap was an
+  optimization. The relay forwards candidates and the parent's floor and
+  nothing else; ties and the score scale are preserved.
+- **Aggregation is outside the first relay scope.** When it enters, the
+  relay forwards ordered leaf partials without folding them, so the root
+  folds in shard order as today and the bits do not change. The variance
+  counterexample becomes a test.
+- **Statistics ceiling.** Checked sums with a refusal by name now. A wider
+  contract adds `uint64` fields beside the `uint32` ones, never in place of
+  them.
+- **Epoch token.** A nonzero durable allocation bound to the recorded
+  tuple (collection, child identities, incarnations, ranges, child epochs),
+  translated per child, `FAILED_PRECONDITION` with the stale-epoch prefix on
+  an unknown token, bounded retention. Not a hash.
+- **Field capabilities.** The first relay requires homogeneous child field
+  capabilities and refuses phrase and fused requests otherwise.
+- **First relay topology.** One relay per placement leaf, children with
+  contiguous slot ranges so `Health` stays representable, a dedicated
+  collection endpoint per relay, separate signed UDP sessions per hop.
+- **Scan measurement.** Encoded bytes processed are known from the index
+  geometry (rows scanned times encoded row bytes), counted once per
+  batched pass in the node's scan path with active scan time, so the
+  provider is unchanged. Freshness travels with the rate (fields 7 to 9 on
+  `NodeCapacity`); a stale rate makes its node unmeasured.
+- **Device residency** is a capacity field (`NodeResidency`). A DEVICE node
+  is excluded from every plan and every executor before any capacity logic
+  runs, with the reason reported.
+- **Balancer.** Whole-shard moves only, within a leaf's node set, bounded
+  move budget, deterministic tie-break, `min_gain` validated in [0, 1],
+  provenance (`control_revision`) on the plan, exclusions with reasons.
+  Cluster trust, not a public route.
+- **Control plane.** The single authority stays through relay development.
+  Failover comes with a Raft library, never a standby promoted on node
+  leases. The operator's two decisions (when Raft, and whether movable
+  server collections may split segment ownership) remain open and block
+  nothing in this scope.
+
+The reserved contract on `feat/scale-out-reservation-2026-09` carries these
+changes; `bandwidth-budget.md` is the measurement and balancer design.
+

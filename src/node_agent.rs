@@ -582,9 +582,15 @@ impl NodeAgent {
             memory_bytes: memory_bytes(),
             search_threads,
             failure_domain: self.inner.config.failure_domain.clone(),
-            // Measured by the budget branch (docs/bandwidth-budget.md);
-            // zero means not yet measured.
+            // Observed by the budget branch (docs/bandwidth-budget.md);
+            // zero means unknown until then. A server process: the
+            // device residency is declared by the phone transport, which
+            // does not register through this agent.
             scan_bytes_per_second: 0,
+            scan_rate_observed_unix_ms: 0,
+            scan_rate_samples: 0,
+            scan_rate_window_ms: 0,
+            residency: crate::pb::NodeResidency::Server as i32,
         }
     }
 

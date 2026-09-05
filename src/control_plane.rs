@@ -65,9 +65,18 @@ struct StoredCapacity {
     memory_bytes: u64,
     search_threads: u32,
     failure_domain: String,
-    /// Absent in state files written before the field existed.
+    /// Absent in state files written before the fields existed.
     #[serde(default)]
     scan_bytes_per_second: u64,
+    #[serde(default)]
+    scan_rate_observed_unix_ms: u64,
+    #[serde(default)]
+    scan_rate_samples: u32,
+    #[serde(default)]
+    scan_rate_window_ms: u64,
+    /// `NodeResidency` as its wire number; 0 is unspecified.
+    #[serde(default)]
+    residency: i32,
 }
 
 impl From<NodeCapacity> for StoredCapacity {
@@ -79,6 +88,10 @@ impl From<NodeCapacity> for StoredCapacity {
             search_threads: value.search_threads,
             failure_domain: value.failure_domain,
             scan_bytes_per_second: value.scan_bytes_per_second,
+            scan_rate_observed_unix_ms: value.scan_rate_observed_unix_ms,
+            scan_rate_samples: value.scan_rate_samples,
+            scan_rate_window_ms: value.scan_rate_window_ms,
+            residency: value.residency,
         }
     }
 }
@@ -92,6 +105,10 @@ impl From<&StoredCapacity> for NodeCapacity {
             search_threads: value.search_threads,
             failure_domain: value.failure_domain.clone(),
             scan_bytes_per_second: value.scan_bytes_per_second,
+            scan_rate_observed_unix_ms: value.scan_rate_observed_unix_ms,
+            scan_rate_samples: value.scan_rate_samples,
+            scan_rate_window_ms: value.scan_rate_window_ms,
+            residency: value.residency,
         }
     }
 }
