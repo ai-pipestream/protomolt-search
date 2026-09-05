@@ -6594,9 +6594,9 @@ message Aggregation {
 }
 
 // The aggregate operations. Typing: COUNT serves every expression
-// type, strings included; SUM, MIN, and MAX serve int and double
+// type, strings included; SUM, MIN, and MAX serve int, uint and double
 // expressions in their own type; MEAN, VARIANCE, and STDDEV serve
-// doubles only (an int expression converts with double()). A boolean
+// doubles only (integer expressions convert explicitly with double()). A boolean
 // expression aggregates nowhere — filter on it instead and read
 // `matched`.
 enum AggregateOp {
@@ -6604,8 +6604,9 @@ enum AggregateOp {
   AGGREGATE_OP_UNSPECIFIED = 0;
   // Documents where the expression holds a value.
   AGGREGATE_OP_COUNT = 1;
-  // Exact sum. Int expressions accumulate in 128-bit integers and a
-  // total outside i64 REFUSES naming double() as the fix; double
+  // Exact sum. Int and uint expressions accumulate in signed and unsigned
+  // 128-bit integers respectively; totals outside i64/u64 refuse, naming
+  // explicit double() conversion as an alternative. Double
   // expressions sum Neumaier-compensated in doc order per shard,
   // partials folded in shard order.
   AGGREGATE_OP_SUM = 2;
@@ -6681,6 +6682,9 @@ message PercentileValue {
 
     // Int-typed answer.
     sint64 int_value = 4;
+
+    // Uint-typed result, preserving the full u64 domain.
+    uint64 uint_value = 5;
   }
 }
 
@@ -6746,6 +6750,9 @@ message AggregateResult {
 
     // Int-typed result.
     sint64 int_value = 4;
+
+    // Uint-typed result, preserving the full u64 domain.
+    uint64 uint_value = 5;
   }
 }
 
@@ -6865,7 +6872,7 @@ message AggregateShardResponse {
 
 // One shard's phase-1 percentile statistics.
 message PercentilePartial {
-  // The type this shard resolved the expression to (INT or DOUBLE;
+  // The type this shard resolved the expression to (INT, UINT or DOUBLE;
   // ABSENT when it can never hold a value here).
   AggregateValueType vtype = 1;
 
@@ -6876,7 +6883,8 @@ message PercentilePartial {
   uint64 unrankable = 3;
 
   // Order bits of the smallest and largest rankable values here;
-  // meaningful only when present > 0.
+  // meaningful only when present > 0. UINT uses the raw u64 value,
+  // INT uses offset-binary and DOUBLE uses sign-flipped ordered bits.
   fixed64 min_bits = 4;
   fixed64 max_bits = 5;
 }
@@ -6982,6 +6990,14 @@ message AggregatePartial {
   repeated fixed64 distinct_double_bits = 14;
   repeated string distinct_strings = 15;
   repeated bool distinct_bools = 16;
+  // Exact unsigned 128-bit sum: (hi << 64) | lo.
+  fixed64 uint_sum_hi = 17;
+  fixed64 uint_sum_lo = 18;
+  // Unsigned extrema, meaningful when present > 0.
+  uint64 uint_min = 19;
+  uint64 uint_max = 20;
+  // CARDINALITY over uint expressions: exact distinct values.
+  repeated uint64 distinct_uints = 21;
 }
 
 // The type a shard resolved one aggregation expression to.
@@ -6998,6 +7014,8 @@ enum AggregateValueType {
   AGGREGATE_VALUE_TYPE_STRING = 4;
   // A boolean expression; admitted under CARDINALITY only.
   AGGREGATE_VALUE_TYPE_BOOL = 5;
+  // CEL uint.
+  AGGREGATE_VALUE_TYPE_UINT = 6;
 }
 
 // Comparison operations over value subexpressions.

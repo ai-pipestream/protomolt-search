@@ -356,7 +356,7 @@ function hitNode(h) {
   for (const s of h.signals || []) meta.append(el('span', { text: `${s.id}=${Number(s.score).toFixed(4)}` }));
   for (const d of h.dimensions || []) meta.append(el('span', { text: `${d.id}: ${d.skipped ? 'skipped' : `raw ${fmtNum(d.raw)} norm ${fmtNum(d.normalized)} → ${fmtNum(d.contribution)}`}` }));
   if (h.matched?.length) meta.append(el('span', { text: `matched ${h.matched.join(',')}` }));
-  for (const p of h.projected || []) meta.append(el('span', { text: `${p.name ?? ''}=${p.stringValue ?? p.intValue ?? p.doubleValue ?? p.boolValue}` }));
+  for (const p of h.projected || []) meta.append(el('span', { text: `${p.name ?? ''}=${p.stringValue ?? p.uintValue ?? p.intValue ?? p.doubleValue ?? p.boolValue}` }));
   node.append(meta);
   if (h.explain) {
     const drawer = el('details', { class: 'tree' }, [el('summary', { class: 'muted small', text: 'explain' })]);
@@ -407,7 +407,7 @@ function renderAggregate(agg) {
   const out = clear($('agg-out'));
   if (!agg) { out.textContent = 'none requested'; return; }
   out.append(el('div', { class: 'small mono', text: `matched ${fmtNum(agg.matched)}${agg.ungrouped ? `, ungrouped ${fmtNum(agg.ungrouped)}` : ''}` }));
-  const results = (r) => (r || []).map((x) => `${x.name} = ${x.intValue ?? x.doubleValue ?? '–'} (${fmtNum(x.present)} present)`);
+  const results = (r) => (r || []).map((x) => `${x.name} = ${x.uintValue ?? x.intValue ?? x.doubleValue ?? '–'} (${fmtNum(x.present)} present)`);
   for (const line of results(agg.results)) out.append(el('div', { class: 'small', text: line }));
   if (agg.groups?.length) {
     const max = Math.max(...agg.groups.map((g) => Number(g.matched)));
@@ -432,7 +432,7 @@ function renderAggregate(agg) {
     out.append(box);
   }
   for (const p of agg.percentiles || []) {
-    out.append(el('div', { class: 'small', text: `${p.name}: ${(p.values || []).map((v) => `p${v.percentile} = ${v.intValue ?? v.doubleValue}`).join(', ')} (${fmtNum(p.present)} present)` }));
+    out.append(el('div', { class: 'small', text: `${p.name}: ${(p.values || []).map((v) => `p${v.percentile} = ${v.uintValue ?? v.intValue ?? v.doubleValue}`).join(', ')} (${fmtNum(p.present)} present)` }));
   }
 }
 

@@ -252,8 +252,9 @@ The uint forms of `math.abs` and `math.sign` follow the
 The engine retains its documented single-type rule for comparisons, ternaries
 and `greatest`/`least`, and requires explicit double conversion for the other
 math functions. Unsigned sorting and collapse are supported with typed keys and results
-([query contract](query-api.md#sorting)). Unsigned aggregate accumulators remain
-separate unfinished query work; they do not silently narrow a uint result.
+([query contract](query-api.md#sorting)). Unsigned aggregate accumulators and exact percentiles preserve uint results
+([aggregation contract](aggregations.md#11-unsigned-aggregates-2026-09-05-feature-branch));
+range facets and scoring remain separate work.
 
 `tests/unsigned_values.rs` compares arithmetic against an independent u128
 oracle and stock CEL where CEL produces values. It covers numeric boundaries,

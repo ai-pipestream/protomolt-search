@@ -220,14 +220,27 @@ fn projection(expression: &str) -> pb::NamedProjection {
 async fn verify_queries(addresses: Vec<String>, expected: &[Option<u64>]) {
     let coordinator = CoordinatorServiceImpl::new(addresses)
         .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default());
-    // Until typed uint aggregates land, these routes must refuse instead of
-    // folding narrowed values or treating the known column as absent.
-    for op in [
-        pb::AggregateOp::Count,
-        pb::AggregateOp::Sum,
-        pb::AggregateOp::Cardinality,
+    let present: Vec<u64> = expected.iter().flatten().copied().collect();
+    for (op, value) in [
+        (
+            pb::AggregateOp::Count,
+            pb::aggregate_result::Value::IntValue(present.len() as i64),
+        ),
+        (
+            pb::AggregateOp::Cardinality,
+            pb::aggregate_result::Value::IntValue(
+                present
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len() as i64,
+            ),
+        ),
+        (
+            pb::AggregateOp::Max,
+            pb::aggregate_result::Value::UintValue(*present.iter().max().unwrap()),
+        ),
     ] {
-        let error = coordinator
+        let response = coordinator
             .aggregate(tonic::Request::new(pb::AggregateRequest {
                 aggregations: vec![pb::Aggregation {
                     name: "n".into(),
@@ -238,23 +251,28 @@ async fn verify_queries(addresses: Vec<String>, expected: &[Option<u64>]) {
                 ..Default::default()
             }))
             .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("uint accumulators"), "{error}");
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.results[0].value, Some(value));
     }
-    let error = coordinator
+    let response = coordinator
         .aggregate(tonic::Request::new(pb::AggregateRequest {
             percentiles: vec![pb::PercentileSpec {
                 name: "p".into(),
                 expression: "counter".into(),
-                percentiles: vec![50.0],
+                percentiles: vec![100.0],
             }],
             ..Default::default()
         }))
         .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    assert!(error.message().contains("uint rank expressions"), "{error}");
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.percentiles[0].values[0].value,
+        Some(pb::percentile_value::Value::UintValue(
+            *present.iter().max().unwrap()
+        ))
+    );
     let expressions = [
         "key",
         "counter",

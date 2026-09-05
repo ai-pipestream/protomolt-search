@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Unsigned aggregation (2026-09-05, feature branch).** Exact uint counts,
+  sums, extrema, distinct unions and percentiles now work over filtered,
+  grouped and query-pool selections. Uint sums use u128 partials and refuse
+  totals outside u64. Percentile ranks retain exact counts above 2^53; the
+  console displays uint values without narrowing them. Statistical folds
+  still require explicit double conversion. Index formats are unchanged.
+  See [unsigned aggregates](docs/aggregations.md#11-unsigned-aggregates-2026-09-05-feature-branch).
+
 - **Lexical projection type agreement (2026-09-05, feature branch).** BM25
   responses declare each projection's scalar type even when no hits match.
   Unary, streamed and nested relay merges refuse inconsistent types or malformed

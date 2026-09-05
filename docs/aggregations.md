@@ -1,6 +1,6 @@
 # Aggregations: exact folds over the filtered corpus
 
-Status: complete (2026-08-27) — COUNT / SUM / MIN / MAX / MEAN /
+Introduced 2026-08-27: COUNT / SUM / MIN / MAX / MEAN /
 VARIANCE / STDDEV of CEL value expressions over the filter-admitted
 document set, per-shard partials merged exactly; group-by-facet
 (every aggregation folded per facet value); fixed-interval
@@ -28,8 +28,12 @@ one it takes everywhere else — **exactness is the argument**:
 - **Int sums are exact.** Shards accumulate i128; the coordinator
   merges in i128. A total outside i64 REFUSES naming `double()` as
   the fix — never a silent wrap, never a quiet float. (Summing an
-  epoch-micros column over a large corpus genuinely overflows i64;
+  epoch-micros column over a large corpus can overflow i64;
   the refusal is reachable, and tested.)
+- **Uint sums are exact.** Shards and coordinator accumulate u128. SUM
+  returns `uint_value` when the total fits u64 and refuses otherwise, reporting
+  the exact total. MIN/MAX retain the unsigned type, including `u64::MAX`.
+  Explicit `double()` requests a separate floating-point calculation.
 - **Double sums are Neumaier-compensated**, folded in doc order per
   shard; the coordinator folds each shard's (sum, compensation) pair
   — in that order — with its own running compensation.
@@ -54,10 +58,10 @@ value (COUNT answers the honest 0).
 
 Typing refuses by name, naming the aggregation:
 
-- COUNT serves every expression type — a bare facet read counts
+- COUNT serves numeric and string expressions — a bare facet read counts
   documents carrying the value.
-- SUM/MIN/MAX serve int and double expressions in their own type.
-- MEAN/VARIANCE/STDDEV serve doubles only; an int expression refuses
+- SUM/MIN/MAX serve int, uint and double expressions in their own type.
+- MEAN/VARIANCE/STDDEV serve doubles only; an int or uint expression refuses
   naming `double()`.
 - A boolean expression aggregates nowhere: filter on it and read
   `matched`.
@@ -132,7 +136,7 @@ interpolation, never an estimate.
 
 The algorithm is a coordinator-driven binary search over the
 ORDER-BITS domain (the same order-preserving u64 keys sorted browse
-uses: offset-binary for i64, sign-flip for f64), which makes
+uses: raw bits for u64, offset-binary for i64, sign-flip for f64), which makes
 convergence exact and bounded: at most 64 count-below rounds close
 every window, no epsilon anywhere. Phase 1 rides the ordinary
 AggregateShard fan-out (per-expression type vote, rankable count,
@@ -144,8 +148,8 @@ document. Cost is O(rounds) admitted-set scans, bounded by 64 total
 regardless of how many percentiles are asked: exactness paid in
 scans, not in memory or error.
 
-Typing and absence: int expressions answer ints, double expressions
-doubles (the type vote refuses cross-shard divergence); p = 0 is the
+Typing and absence: int expressions answer ints, uint expressions uints,
+double expressions doubles (the type vote refuses cross-shard divergence); p = 0 is the
 minimum, p = 100 the maximum, p = 50 the lower median on even
 counts, and every answer reports its rank k. A computed NaN is
 `unrankable` — reported, excluded from ranking, never dropped
@@ -249,3 +253,39 @@ Shapes that refuse by name: a calendar with a nonzero `interval`, an
 offset outside the bound, an offset without a calendar, an unknown
 unit, and a double or string expression (convert nothing; name the
 timestamp column).
+
+
+## 11. Unsigned aggregates (2026-09-05, feature branch)
+
+COUNT, SUM, MIN, MAX, CARDINALITY and exact percentiles accept uint expressions.
+They preserve the full u64 domain across shard partials, filtered and grouped
+folds, and public query-pool aggregation. Missing values remain absent. COUNT
+and CARDINALITY retain their int result contract; an out-of-range count refuses
+instead of wrapping. Empty SUM/MIN/MAX results have no value; a present zero
+uses the uint oneof member. Distinct-value caps apply both per shard and to the
+fleet union. The type vote includes zero-hit shards and refuses int/uint/double
+mismatches before returning any result.
+
+Percentile ranks are computed from the supplied IEEE percentile and the exact
+u64 count using integer arithmetic. Counts above 2^53 therefore retain their
+rank; the unsigned value search uses raw u64 bits and returns `uint_value`.
+This does not change the existing multi-round query's snapshot semantics.
+MEAN/VARIANCE/STDDEV and fixed-width histograms still require explicit double
+expressions; calendar histograms require signed epoch-microsecond expressions.
+Typed unsigned range facets and scoring remain separate work. Relay coordinators
+still refuse AggregateShard and QuantileCounts; this increment does not enable
+those relay routes.
+
+Regenerate clients and use matching builds. The protobuf additions are uint
+result variants, a UINT type vote, and unsigned sum/extrema/distinct partial
+fields. Stored index formats and analyzer fingerprints do not change. The
+console displays uint result strings without converting them to JavaScript
+numbers.
+
+`tests/unsigned_aggregate.rs` checks independent integer and sorted-value
+oracles through three shards (including one with no unsigned column), reversed
+shard order, grouping, empty filters, overflow, both distinct caps, and a
+one-hit public page aggregating its whole lexical pool. It repeats after reopen
+and compaction on both storage layouts. `tests/unsigned_order.rs` also checks
+cross-shard type refusal for aggregates and percentiles with empty selections.
+Coordinator unit tests cover wide-count percentile ranks and partial overflows.

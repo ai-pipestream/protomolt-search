@@ -2184,6 +2184,13 @@ enum AggAcc {
         /// CARDINALITY: the distinct values seen.
         distinct: Option<std::collections::HashSet<i64>>,
     },
+    Uint {
+        present: u64,
+        sum: u128,
+        min: u64,
+        max: u64,
+        distinct: Option<std::collections::HashSet<u64>>,
+    },
     Double {
         present: u64,
         /// Neumaier-compensated running sum.
@@ -2249,6 +2256,30 @@ impl AggAcc {
                 }
                 *present += 1;
                 *sum += i128::from(x);
+                if let Some(set) = distinct {
+                    set.insert(x);
+                }
+            }
+            (
+                AggAcc::Uint {
+                    present,
+                    sum,
+                    min,
+                    max,
+                    distinct,
+                },
+                crate::values::Val::Uint(x),
+            ) => {
+                if *present == 0 {
+                    *min = x;
+                    *max = x;
+                } else {
+                    *min = (*min).min(x);
+                    *max = (*max).max(x);
+                }
+                *present += 1;
+                // A shard has at most u32::MAX rows, so u128 cannot overflow.
+                *sum += u128::from(x);
                 if let Some(set) = distinct {
                     set.insert(x);
                 }
@@ -2335,6 +2366,7 @@ impl AggAcc {
         match self {
             AggAcc::Absent => None,
             AggAcc::Int { distinct, .. } => distinct.as_ref().map(|s| s.len()),
+            AggAcc::Uint { distinct, .. } => distinct.as_ref().map(|s| s.len()),
             AggAcc::Double { distinct, .. } => distinct.as_ref().map(|s| s.len()),
             AggAcc::Str { distinct, .. } => distinct.as_ref().map(|s| s.len()),
             AggAcc::Bool {
@@ -2373,6 +2405,25 @@ impl AggAcc {
                     let mut values: Vec<i64> = set.iter().copied().collect();
                     values.sort_unstable();
                     p.distinct_ints = values;
+                }
+            }
+            AggAcc::Uint {
+                present,
+                sum,
+                min,
+                max,
+                distinct,
+            } => {
+                p.vtype = T::Uint as i32;
+                p.present = *present;
+                p.uint_sum_hi = (*sum >> 64) as u64;
+                p.uint_sum_lo = *sum as u64;
+                p.uint_min = *min;
+                p.uint_max = *max;
+                if let Some(set) = distinct {
+                    let mut values: Vec<u64> = set.iter().copied().collect();
+                    values.sort_unstable();
+                    p.distinct_uints = values;
                 }
             }
             AggAcc::Double {
@@ -2442,9 +2493,13 @@ impl AggAcc {
 fn acc_of(vt: crate::values::ValueType, cardinality: bool) -> AggAcc {
     match vt {
         crate::values::ValueType::Unknown => AggAcc::Absent,
-        crate::values::ValueType::Uint => {
-            unreachable!("check_agg_type refuses uint until typed accumulators are available")
-        }
+        crate::values::ValueType::Uint => AggAcc::Uint {
+            present: 0,
+            sum: 0,
+            min: 0,
+            max: 0,
+            distinct: cardinality.then(Default::default),
+        },
         crate::values::ValueType::Int => AggAcc::Int {
             present: 0,
             sum: 0,
@@ -2586,25 +2641,23 @@ impl PctAcc {
     }
 }
 
-/// Resolve one percentile expression: only int and double rank.
+/// Resolve one percentile expression: int, uint and double rank.
 /// `Ok(None)` = the expression can never hold a value on this shard.
 fn resolve_rankable(
     store: &Bm25Shard,
     expr: Option<&crate::pb::ValueExpr>,
     name: &str,
     what: &str,
-) -> Result<Option<(crate::values::ResolvedValue, bool)>, Status> {
+) -> Result<Option<(crate::values::ResolvedValue, crate::pb::AggregateValueType)>, Status> {
     let expr = expr.ok_or_else(|| {
         Status::invalid_argument(format!("{what} {name:?} without an expression"))
     })?;
     let (rv, vt) = crate::values::resolve(expr, store)
         .map_err(|e| Status::invalid_argument(format!("{what} {name:?}: {}", e.message())))?;
     match vt {
-        crate::values::ValueType::Uint => Err(Status::invalid_argument(format!(
-            "{what} {name:?}: uint rank expressions are not supported yet"
-        ))),
-        crate::values::ValueType::Int => Ok(Some((rv, true))),
-        crate::values::ValueType::Double => Ok(Some((rv, false))),
+        crate::values::ValueType::Uint => Ok(Some((rv, crate::pb::AggregateValueType::Uint))),
+        crate::values::ValueType::Int => Ok(Some((rv, crate::pb::AggregateValueType::Int))),
+        crate::values::ValueType::Double => Ok(Some((rv, crate::pb::AggregateValueType::Double))),
         crate::values::ValueType::Unknown => Ok(None),
         crate::values::ValueType::Str => Err(Status::invalid_argument(format!(
             "{what} {name:?} ranks numbers; a string does not order here"
@@ -2617,12 +2670,15 @@ fn resolve_rankable(
 
 /// Order bits of one evaluated rankable value; `None` = computed NaN
 /// (present but unrankable).
-fn rankable_bits(v: crate::values::Val, int_typed: bool) -> Option<u64> {
+fn rankable_bits(v: crate::values::Val, vtype: crate::pb::AggregateValueType) -> Option<u64> {
     match v {
         crate::values::Val::Int(x) => {
-            debug_assert!(int_typed);
-            let _ = int_typed;
+            debug_assert_eq!(vtype, crate::pb::AggregateValueType::Int);
             Some(i64_order_bits(x))
+        }
+        crate::values::Val::Uint(x) => {
+            debug_assert_eq!(vtype, crate::pb::AggregateValueType::Uint);
+            Some(x)
         }
         crate::values::Val::Double(x) => {
             if x.is_nan() {
@@ -2644,11 +2700,6 @@ fn check_agg_type(
 ) -> Result<(), Status> {
     use crate::pb::AggregateOp as O;
     use crate::values::ValueType as V;
-    if vt == V::Uint {
-        return Err(Status::invalid_argument(format!(
-            "aggregation {name:?}: uint accumulators are not supported yet"
-        )));
-    }
     if op == O::Cardinality {
         // Distinct values exist for every type, booleans included.
         return Ok(());
@@ -2661,7 +2712,7 @@ fn check_agg_type(
         V::Str if op != O::Count => Err(Status::invalid_argument(format!(
             "aggregation {name:?}: a string expression aggregates only under COUNT"
         ))),
-        V::Int if matches!(op, O::Mean | O::Variance | O::Stddev) => {
+        V::Int | V::Uint if matches!(op, O::Mean | O::Variance | O::Stddev) => {
             Err(Status::invalid_argument(format!(
                 "aggregation {name:?}: {} takes a double; convert explicitly with double()",
                 agg_op_name(op)
@@ -11203,8 +11254,10 @@ impl NodeService for NodeServiceImpl {
                     HistAcc::default(),
                 ));
             }
-            let mut pcts: Vec<(Option<(crate::values::ResolvedValue, bool)>, PctAcc)> =
-                Vec::with_capacity(req.percentiles.len());
+            let mut pcts: Vec<(
+                Option<(crate::values::ResolvedValue, crate::pb::AggregateValueType)>,
+                PctAcc,
+            )> = Vec::with_capacity(req.percentiles.len());
             for spec in &req.percentiles {
                 let resolved =
                     resolve_rankable(store, spec.expr.as_ref(), &spec.name, "percentile")?;
@@ -11319,11 +11372,11 @@ impl NodeService for NodeServiceImpl {
                     }
                 }
                 for (resolved, acc) in pcts.iter_mut() {
-                    let Some((rv, int_typed)) = resolved else {
+                    let Some((rv, vtype)) = resolved else {
                         continue;
                     };
                     if let Some(v) = crate::values::eval(rv, doc, &cols) {
-                        acc.push(rankable_bits(v, *int_typed));
+                        acc.push(rankable_bits(v, *vtype));
                     }
                 }
             }
@@ -11377,8 +11430,7 @@ impl NodeService for NodeServiceImpl {
                         crate::pb::PercentilePartial {
                             vtype: match resolved {
                                 None => T::Absent as i32,
-                                Some((_, true)) => T::Int as i32,
-                                Some((_, false)) => T::Double as i32,
+                                Some((_, vtype)) => *vtype as i32,
                             },
                             present: acc.present,
                             unrankable: acc.unrankable,
@@ -11466,8 +11518,8 @@ impl NodeService for NodeServiceImpl {
                 }
                 for (slot, resolved) in bits_of.iter_mut().zip(&exprs) {
                     *slot = match resolved {
-                        Some((rv, int_typed)) => crate::values::eval(rv, doc, &cols)
-                            .and_then(|v| rankable_bits(v, *int_typed)),
+                        Some((rv, vtype)) => crate::values::eval(rv, doc, &cols)
+                            .and_then(|v| rankable_bits(v, *vtype)),
                         None => None,
                     };
                 }

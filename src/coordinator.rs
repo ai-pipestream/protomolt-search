@@ -958,6 +958,30 @@ pub(crate) fn compile_aggregations(
     })
 }
 
+/// Exact nearest rank for a validated IEEE percentile in [0, 100].
+/// Integer arithmetic avoids rounding the count or p/100 before taking ceil.
+fn nearest_percentile_rank(p: f64, count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let bits = p.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as u32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mantissa, shift) = if exponent == 0 {
+        (fraction, 1074)
+    } else {
+        (fraction | (1u64 << 52), 1075 - exponent)
+    };
+    // The numerator has at most 117 bits. A denominator too large for
+    // u128 therefore yields a fractional rank below one (or zero).
+    if shift > 121 {
+        return 1;
+    }
+    let numerator = u128::from(mantissa) * u128::from(count);
+    let denominator = 100u128 << shift;
+    (numerator.div_ceil(denominator) as u64).clamp(1, count)
+}
+
 /// One percentile expression's merged phase-1 statistics.
 struct PctMerge {
     vt: Option<crate::pb::AggregateValueType>,
@@ -983,6 +1007,7 @@ impl PctMerge {
         let vt = match T::try_from(p.vtype) {
             Ok(T::Absent) => return Ok(()),
             Ok(T::Int) => T::Int,
+            Ok(T::Uint) => T::Uint,
             Ok(T::Double) => T::Double,
             _ => {
                 return Err(Status::internal(
@@ -1002,7 +1027,11 @@ impl PctMerge {
             }
             Some(_) => {}
         }
-        self.unrankable += p.unrankable;
+        self.unrankable = self.unrankable.checked_add(p.unrankable).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "percentile {name:?}: unrankable count overflows u64"
+            ))
+        })?;
         if p.present == 0 {
             return Ok(());
         }
@@ -1013,7 +1042,9 @@ impl PctMerge {
             self.min_bits = self.min_bits.min(p.min_bits);
             self.max_bits = self.max_bits.max(p.max_bits);
         }
-        self.present += p.present;
+        self.present = self.present.checked_add(p.present).ok_or_else(|| {
+            Status::failed_precondition(format!("percentile {name:?}: present count overflows u64"))
+        })?;
         Ok(())
     }
 }
@@ -1030,6 +1061,9 @@ struct AggMerge {
     /// values, typed by the vote. A BTreeSet so the union is
     /// deterministic whatever the shard order.
     distinct: Distinct,
+    uint_sum: u128,
+    uint_min: u64,
+    uint_max: u64,
     int_sum: i128,
     int_min: i64,
     int_max: i64,
@@ -1046,6 +1080,7 @@ struct AggMerge {
 #[derive(Default)]
 struct Distinct {
     ints: std::collections::BTreeSet<i64>,
+    uints: std::collections::BTreeSet<u64>,
     doubles: std::collections::BTreeSet<u64>,
     strings: std::collections::BTreeSet<String>,
     bools: std::collections::BTreeSet<bool>,
@@ -1053,7 +1088,11 @@ struct Distinct {
 
 impl Distinct {
     fn len(&self) -> usize {
-        self.ints.len() + self.doubles.len() + self.strings.len() + self.bools.len()
+        self.ints.len()
+            + self.uints.len()
+            + self.doubles.len()
+            + self.strings.len()
+            + self.bools.len()
     }
 }
 
@@ -1063,6 +1102,9 @@ impl AggMerge {
             vt: None,
             present: 0,
             distinct: Distinct::default(),
+            uint_sum: 0,
+            uint_min: 0,
+            uint_max: 0,
             int_sum: 0,
             int_min: 0,
             int_max: 0,
@@ -1119,15 +1161,40 @@ impl AggMerge {
         if p.present == 0 {
             return Ok(());
         }
+        let next_present = self.present.checked_add(p.present).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "aggregation {name:?}: present count overflows u64"
+            ))
+        })?;
         match vt {
             T::Int => {
-                self.int_sum += (i128::from(p.int_sum_hi) << 64) | i128::from(p.int_sum_lo);
+                let sum = (i128::from(p.int_sum_hi) << 64) | i128::from(p.int_sum_lo);
+                self.int_sum = self.int_sum.checked_add(sum).ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "aggregation {name:?}: int partial sum overflows i128"
+                    ))
+                })?;
                 if self.present == 0 {
                     self.int_min = p.int_min;
                     self.int_max = p.int_max;
                 } else {
                     self.int_min = self.int_min.min(p.int_min);
                     self.int_max = self.int_max.max(p.int_max);
+                }
+            }
+            T::Uint => {
+                let sum = (u128::from(p.uint_sum_hi) << 64) | u128::from(p.uint_sum_lo);
+                self.uint_sum = self.uint_sum.checked_add(sum).ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "aggregation {name:?}: uint partial sum overflows u128"
+                    ))
+                })?;
+                if self.present == 0 {
+                    self.uint_min = p.uint_min;
+                    self.uint_max = p.uint_max;
+                } else {
+                    self.uint_min = self.uint_min.min(p.uint_min);
+                    self.uint_max = self.uint_max.max(p.uint_max);
                 }
             }
             T::Double => {
@@ -1160,9 +1227,10 @@ impl AggMerge {
             T::String | T::Bool => {}
             T::Absent | T::Unspecified => unreachable!("handled above"),
         }
-        self.present += p.present;
+        self.present = next_present;
         if agg.op == crate::pb::AggregateOp::Cardinality as i32 {
             self.distinct.ints.extend(p.distinct_ints.iter().copied());
+            self.distinct.uints.extend(p.distinct_uints.iter().copied());
             self.distinct
                 .doubles
                 .extend(p.distinct_double_bits.iter().copied());
@@ -1191,8 +1259,11 @@ impl AggMerge {
         use crate::pb::aggregate_result::Value as W;
         use crate::pb::{AggregateOp as O, AggregateValueType as T};
         let int_typed = self.vt == Some(T::Int);
+        let uint_typed = self.vt == Some(T::Uint);
         let value = match op {
-            O::Count => Some(W::IntValue(self.present as i64)),
+            O::Count => Some(W::IntValue(i64::try_from(self.present).map_err(|_| {
+                Status::failed_precondition(format!("aggregation {name:?}: count does not fit the int result; tighten the filter"))
+            })?)),
             O::Cardinality => Some(W::IntValue(self.distinct.len() as i64)),
             _ if self.present == 0 => None,
             O::Sum if int_typed => match i64::try_from(self.int_sum) {
@@ -1205,9 +1276,17 @@ impl AggMerge {
                     )));
                 }
             },
+            O::Sum if uint_typed => Some(W::UintValue(u64::try_from(self.uint_sum).map_err(|_| {
+                Status::failed_precondition(format!(
+                    "aggregation {name:?}: the exact uint sum {} does not fit u64; aggregate double(...) for an IEEE sum",
+                    self.uint_sum
+                ))
+            })?)),
             O::Sum => Some(W::DoubleValue(self.dsum + self.dcomp)),
+            O::Min if uint_typed => Some(W::UintValue(self.uint_min)),
             O::Min if int_typed => Some(W::IntValue(self.int_min)),
             O::Min => Some(W::DoubleValue(self.dmin)),
+            O::Max if uint_typed => Some(W::UintValue(self.uint_max)),
             O::Max if int_typed => Some(W::IntValue(self.int_max)),
             O::Max => Some(W::DoubleValue(self.dmax)),
             O::Mean => Some(W::DoubleValue(self.mean)),
@@ -1228,6 +1307,7 @@ fn agg_vt_name(vt: crate::pb::AggregateValueType) -> &'static str {
     use crate::pb::AggregateValueType as T;
     match vt {
         T::Int => "int",
+        T::Uint => "uint",
         T::Double => "double",
         T::String => "string",
         T::Bool => "bool",
@@ -9471,7 +9551,7 @@ impl CoordinatorServiceImpl {
             for (pi, &p) in spec.percentiles.iter().enumerate() {
                 // Nearest rank: the k-th smallest, k = ceil(p/100 * n)
                 // clamped into [1, n].
-                let k = ((p / 100.0 * m.present as f64).ceil() as u64).clamp(1, m.present);
+                let k = nearest_percentile_rank(p, m.present);
                 targets.push(Target {
                     spec: si,
                     pct_index: pi,
@@ -9532,6 +9612,8 @@ impl CoordinatorServiceImpl {
                             k,
                             Some(if int_typed {
                                 W::IntValue(crate::node::i64_from_order_bits(bits))
+                            } else if m.vt == Some(crate::pb::AggregateValueType::Uint) {
+                                W::UintValue(bits)
                             } else {
                                 W::DoubleValue(crate::node::f64_from_order_bits(bits))
                             }),
@@ -13172,5 +13254,157 @@ mod stream_cancel_tests {
             crate::stream_signal::decode(&frame),
             Some(crate::stream_signal::StreamSignal::Cancel { token })
         );
+    }
+}
+
+#[cfg(test)]
+mod unsigned_aggregate_tests {
+    use super::*;
+    use crate::pb::{AggregateOp as O, AggregateValueType as T};
+
+    #[test]
+    fn percentile_ranks_preserve_wide_counts_and_adjacent_ieee_percentiles() {
+        for count in [0, 1, 2, 3, (1u64 << 53) - 1, (1u64 << 53) + 1, u64::MAX] {
+            for (p, numerator, denominator) in [
+                (0.0, 0, 1),
+                (25.0, 1, 4),
+                (50.0, 1, 2),
+                (75.0, 3, 4),
+                (100.0, 1, 1),
+            ] {
+                let expected = if count == 0 {
+                    0
+                } else {
+                    ((u128::from(count) * numerator).div_ceil(denominator) as u64).max(1)
+                };
+                assert_eq!(
+                    nearest_percentile_rank(p, count),
+                    expected,
+                    "p={p} n={count}"
+                );
+            }
+            assert_eq!(
+                nearest_percentile_rank(f64::from_bits(1), count),
+                u64::from(count > 0)
+            );
+        }
+        assert_eq!(
+            nearest_percentile_rank(f64::from_bits(50.0f64.to_bits() - 1), 2),
+            1
+        );
+        assert_eq!(
+            nearest_percentile_rank(f64::from_bits(50.0f64.to_bits() + 1), 2),
+            2
+        );
+    }
+
+    #[test]
+    fn unsigned_partials_merge_wide_before_checked_result_narrowing() {
+        let agg = crate::pb::CompiledAggregation {
+            name: "total".into(),
+            op: O::Sum as i32,
+            ..Default::default()
+        };
+        let mut merged = AggMerge::new();
+        let partial = crate::pb::AggregatePartial {
+            vtype: T::Uint as i32,
+            present: 1,
+            uint_sum_lo: u64::MAX,
+            uint_min: u64::MAX,
+            uint_max: u64::MAX,
+            ..Default::default()
+        };
+        merged.fold(&partial, &agg).unwrap();
+        assert_eq!(
+            merged.result("total", O::Sum).unwrap().value,
+            Some(crate::pb::aggregate_result::Value::UintValue(u64::MAX))
+        );
+        merged.fold(&partial, &agg).unwrap();
+        assert_eq!(merged.uint_sum, 2 * u128::from(u64::MAX));
+        assert!(merged
+            .result("total", O::Sum)
+            .unwrap_err()
+            .message()
+            .contains("does not fit u64"));
+        assert_eq!(
+            merged.result("total", O::Max).unwrap().value,
+            Some(crate::pb::aggregate_result::Value::UintValue(u64::MAX))
+        );
+        let conflicting = crate::pb::AggregatePartial {
+            vtype: T::Int as i32,
+            present: 0,
+            ..Default::default()
+        };
+        assert!(merged
+            .fold(&conflicting, &agg)
+            .unwrap_err()
+            .message()
+            .contains("shards disagree"));
+        let mut pct = PctMerge::new();
+        pct.fold(
+            &crate::pb::PercentilePartial {
+                vtype: T::Uint as i32,
+                ..Default::default()
+            },
+            "p",
+        )
+        .unwrap();
+        assert!(pct
+            .fold(
+                &crate::pb::PercentilePartial {
+                    vtype: T::Int as i32,
+                    ..Default::default()
+                },
+                "p"
+            )
+            .unwrap_err()
+            .message()
+            .contains("shards disagree"));
+    }
+
+    #[test]
+    fn aggregate_count_and_partial_overflows_refuse_without_wrapping() {
+        let agg = crate::pb::CompiledAggregation {
+            name: "total".into(),
+            op: O::Sum as i32,
+            ..Default::default()
+        };
+        let mut merged = AggMerge::new();
+        let huge = crate::pb::AggregatePartial {
+            vtype: T::Uint as i32,
+            present: u64::MAX,
+            ..Default::default()
+        };
+        merged.fold(&huge, &agg).unwrap();
+        assert!(merged
+            .result("total", O::Count)
+            .unwrap_err()
+            .message()
+            .contains("does not fit"));
+        let single = crate::pb::AggregatePartial {
+            vtype: T::Uint as i32,
+            present: 1,
+            uint_sum_lo: 1,
+            ..Default::default()
+        };
+        assert!(merged
+            .fold(&single, &agg)
+            .unwrap_err()
+            .message()
+            .contains("count overflows"));
+        let mut merged = AggMerge::new();
+        let bad_sum = crate::pb::AggregatePartial {
+            vtype: T::Uint as i32,
+            present: 1,
+            uint_sum_hi: u64::MAX,
+            uint_sum_lo: u64::MAX,
+            ..Default::default()
+        };
+        merged.fold(&bad_sum, &agg).unwrap();
+        assert!(merged
+            .fold(&single, &agg)
+            .unwrap_err()
+            .message()
+            .contains("sum overflows u128"));
     }
 }

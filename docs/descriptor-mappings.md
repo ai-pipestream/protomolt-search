@@ -79,8 +79,10 @@ CEL unsigned filters, presence tests, typed projections, checked arithmetic and
 an explicit, potentially lossy conversion. Materialization validates declared
 input types before documents arrive, so a uint input assigned to an I64 output
 refuses even when the input is absent. Unsigned sorting and collapse are
-supported; unsigned aggregation remains unfinished and are reported as limitations in the schema
-report. See [the value dialect](cel-values.md). Legacy
+supported, as are exact unsigned scalar aggregates and percentiles. The schema
+report names the remaining unsigned range-facet and scoring limitations and the
+explicit conversion required by statistical folds. See [the value dialect](cel-values.md)
+and [aggregations](aggregations.md). Legacy
 `IngestMapped` retains original bytes but does not publish catalog
 `DocumentIdentity` or the source-authority write receipts. The mapped lifecycle
 test verifies unsigned key values, filtering, and byte-preserving source

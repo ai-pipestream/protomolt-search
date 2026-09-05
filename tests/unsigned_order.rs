@@ -450,6 +450,39 @@ async fn incompatible_shard_types_refuse_even_when_no_rows_match() {
             "{error}"
         );
     }
+    for filter in ["key == 'found'", "key == 'missing'"] {
+        for percentile in [false, true] {
+            let req = pb::AggregateRequest {
+                filter: filter.into(),
+                aggregations: if percentile {
+                    vec![]
+                } else {
+                    vec![pb::Aggregation {
+                        name: "count".into(),
+                        expression: "value".into(),
+                        op: pb::AggregateOp::Count as i32,
+                        ..Default::default()
+                    }]
+                },
+                percentiles: if percentile {
+                    vec![pb::PercentileSpec {
+                        name: "p".into(),
+                        expression: "value".into(),
+                        percentiles: vec![50.0],
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let error = coordinator
+                .aggregate(tonic::Request::new(req))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(error.message().contains("shards disagree"), "{error}");
+        }
+    }
     let mut req = request(lexical());
     req.collapse = Some(pb::CollapseSpec {
         column: "value".into(),

@@ -99,10 +99,18 @@ fn unsigned_descriptors_preserve_types_presence_and_oneof_selection() {
                     projection.query_representation,
                     pb::MappedQueryRepresentation::UnsignedInteger as i32
                 );
-                assert!(projection
-                    .constraints
-                    .iter()
-                    .any(|c| c.contains("value projections")));
+                let capabilities = projection.constraints.join(" ");
+                for supported in [
+                    "value projections",
+                    "COUNT, SUM, MIN, MAX, CARDINALITY",
+                    "exact percentiles",
+                ] {
+                    assert!(capabilities.contains(supported), "{capabilities}");
+                }
+                assert!(capabilities.contains("statistical folds require explicit double()"));
+                assert!(
+                    capabilities.contains("unsigned range facets and scoring remain unavailable")
+                );
             }
         }
     }

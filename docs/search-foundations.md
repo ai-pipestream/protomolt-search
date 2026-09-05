@@ -130,7 +130,7 @@ Schema checks reject a tail or segment with different ordered columns before
 it can change the meaning of a column ordinal. Existing signed storage bytes
 and protobuf contracts are unchanged. Storage alone does not establish mapped unsigned semantics. The following
 increments add typed ingest, filtering, descriptor mapping and value expressions;
-unsigned range facets and aggregation remain unfinished.
+unsigned range facets and scoring remain unfinished.
 See `tests/unsigned_columns.rs` and `docs/range-facets.md`.
 
 The next increment connects `UnsignedIntegerValue` to ordinary protobuf ingest,
@@ -163,7 +163,8 @@ with an independent IEEE integer-ratio oracle and fixed expected rows through
 heap, reopened single-image and reopened segmented searches, monolithic and
 distributed. These filter checks alone do not establish complete unsigned
 protobuf semantics; the subsequent increments cover mapping, value expressions
-and ordering, while unsigned aggregation remains unfinished.
+and ordering, followed by exact scalar aggregation and percentiles. Unsigned
+range facets and scoring remain unfinished.
 
 Validation of the filter increment on 2026-09-05: 421 library tests, 521
 integration tests across 88 targets and 11 embedded tests passed, with one
@@ -197,7 +198,7 @@ preservation, signed hint refusal, old binding refusal, and mapped ingest,
 reopen, exact key filtering and repeated compaction on both layouts. Legacy
 mapped ingest still does not publish catalog `DocumentIdentity`; retaining
 indexed key values and original bytes is not completion of the identity,
-conditional-write or receipt contract. Unsigned range facets, aggregation and the other protobuf shapes also remain required.
+conditional-write or receipt contract. Unsigned range facets, scoring and the other protobuf shapes also remain required.
 
 The unsigned ordering increment carries u64 columns and lineage keys through
 sort values, distinct unsigned cursor components, collapse representatives and
@@ -384,3 +385,33 @@ verified exactly one additive field, `Bm25QueryResponse.projection_types = 13`,
 and no changes to existing declarations. This checkpoint remains on the unsigned
 feature branch; the broader shape, authorization and document-lifecycle goals
 are not complete.
+
+
+The unsigned aggregate increment adds exact u128 partial sums, typed uint
+extrema and results, exact distinct unions, and unsigned nearest-rank
+percentiles over filtered, grouped and query-pool selections. Sums outside u64
+refuse with the exact total; statistical folds still require explicit double
+conversion. Percentile ranks use integer arithmetic over the supplied IEEE
+percentile and full u64 count. The schema report advertises these capabilities,
+and the console displays uint values without narrowing them to JavaScript
+numbers. Unsigned range facets and scoring remain unfinished; no new relay
+aggregation routes are enabled. See `docs/aggregations.md` section 11.
+
+Validation on 2026-09-05: 425 library tests, 538 integration tests across 93
+targets and 11 embedded tests passed (974 total); one existing sidecar test was
+ignored. The first integration attempt hit a transport error during fixture
+ingest in `query_api::unsupported_shapes_refuse_by_name`, before query assertions.
+Its full six-target group passed unchanged on rerun, followed by the remaining
+groups. The final library run includes the updated capability-report wording.
+This repeats the earlier fixture transport symptom; the address-keyed,
+process-global analyzer channel cache is a follow-up for a deterministic runtime
+lifecycle investigation, not an established cause yet.
+
+All five Android/iOS Rust targets passed, with the three existing relay
+dead-code warnings. Tests/examples compilation, formatting, vendored-proto
+identity, console JavaScript syntax and whitespace checks passed. Descriptor
+comparison against `d864208` verified exactly two uint result variants, five
+unsigned partial fields and one UINT enum value, with existing declarations
+unchanged. Stored formats and analyzer fingerprints are unchanged by this
+increment. Work remains on the unsigned feature branch, and the broader
+protobuf-shape, permission and document-lifecycle goals remain incomplete.
