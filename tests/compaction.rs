@@ -548,7 +548,35 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
             .iter()
             .map(|h| (h.vector_id, h.score.to_bits()))
             .collect();
-        dense.push(resolve(&mut nodes, hits, None).await);
+        let identities = response
+            .hits
+            .iter()
+            .map(|hit| (hit.vector_id, hit.identity.clone()))
+            .collect();
+        let classic = resolve(&mut nodes, hits, Some(&identities)).await;
+        let streamed = SearchService::search(
+            &coordinator.clone().with_stream_search(true),
+            Request::new(SearchRequest {
+                k: 20,
+                vector: query.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let hits = streamed
+            .hits
+            .iter()
+            .map(|hit| (hit.vector_id, hit.score.to_bits()))
+            .collect();
+        let identities = streamed
+            .hits
+            .iter()
+            .map(|hit| (hit.vector_id, hit.identity.clone()))
+            .collect();
+        assert_eq!(resolve(&mut nodes, hits, Some(&identities)).await, classic);
+        dense.push(classic);
         let response = SearchService::hybrid_search(
             &coordinator,
             Request::new(HybridSearchRequest {

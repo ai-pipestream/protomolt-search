@@ -3963,6 +3963,7 @@ pub fn scan_batch_counters() -> (u64, u64) {
 /// coordinator refuse a filter column no shard resolves.
 struct ScanOutcome {
     hits: Vec<ChunkHit>,
+    identities: crate::source_archive::IdentitySnapshot,
     stats: ScanStats,
     geo_columns_known: Vec<bool>,
     filter_columns_known: Vec<bool>,
@@ -4100,6 +4101,20 @@ fn run_scan_batch(
     if dones.is_empty() {
         return;
     }
+    let identities = match guard
+        .bm25
+        .as_ref()
+        .map(Bm25Shard::identity_snapshot)
+        .transpose()
+    {
+        Ok(identities) => identities.unwrap_or_default(),
+        Err(error) => {
+            for done in dones {
+                let _ = done.send(Err(Status::internal(error.clone())));
+            }
+            return;
+        }
+    };
     let queries: Vec<BatchQuery> = specs
         .iter()
         .zip(&allows)
@@ -4125,6 +4140,7 @@ fn run_scan_batch(
         crate::metrics::record_scan(&stats);
         let _ = done.send(Ok(ScanOutcome {
             hits,
+            identities: identities.clone(),
             stats,
             geo_columns_known,
             filter_columns_known,
@@ -10047,14 +10063,26 @@ impl NodeService for NodeServiceImpl {
                         );
                         stats.segments_total = prune.segments_total;
                         stats.segments_skipped = prune.segments_skipped;
-                        Ok((hits, stats, known))
+                        let identities = guard
+                            .bm25
+                            .as_ref()
+                            .map(Bm25Shard::identity_snapshot)
+                            .transpose()
+                            .map_err(Status::internal)?
+                            .unwrap_or_default();
+                        Ok((hits, stats, known, identities))
                     });
                     let outcome = match scan.await {
                         Ok(result) => result,
                         Err(e) => Err(Status::internal(format!("collapse scan task failed: {e}"))),
                     };
                     match outcome {
-                        Ok((hits, stats, (geo_columns_known, filter_columns_known))) => {
+                        Ok((
+                            hits,
+                            stats,
+                            (geo_columns_known, filter_columns_known),
+                            identities,
+                        )) => {
                             let done = SearchShardDone {
                                 hits: hits
                                     .into_iter()
@@ -10062,6 +10090,7 @@ impl NodeService for NodeServiceImpl {
                                         vector_id: slot_offset + u64::from(h.slot),
                                         score: h.score,
                                         parent_id: h.parent,
+                                        identity: identities.identity(h.slot),
                                     })
                                     .collect(),
                                 stats: Some(ShardScanStats {
@@ -10179,6 +10208,13 @@ impl NodeService for NodeServiceImpl {
                             crate::metrics::record_scan(&stats);
                             Ok(ScanOutcome {
                                 hits,
+                                identities: guard
+                                    .bm25
+                                    .as_ref()
+                                    .map(Bm25Shard::identity_snapshot)
+                                    .transpose()
+                                    .map_err(Status::internal)?
+                                    .unwrap_or_default(),
                                 stats,
                                 geo_columns_known,
                                 filter_columns_known,
@@ -10194,6 +10230,7 @@ impl NodeService for NodeServiceImpl {
                 match outcome {
                     Ok(ScanOutcome {
                         hits,
+                        identities,
                         stats,
                         geo_columns_known,
                         filter_columns_known,
@@ -10205,6 +10242,7 @@ impl NodeService for NodeServiceImpl {
                                     vector_id: slot_offset + u64::from(h.slot),
                                     score: h.score,
                                     parent_id: 0,
+                                    identity: identities.identity(h.slot),
                                 })
                                 .collect(),
                             stats: Some(ShardScanStats {
@@ -11411,6 +11449,15 @@ impl NodeService for NodeServiceImpl {
                         .await;
                     return;
                 }
+                let identity_limits = start.identity_limits.clone();
+                let identity_timeout = match identity_limits.as_ref()
+                    .map(crate::query_identity::validate_limits).transpose() {
+                    Ok(timeout) => timeout,
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        return;
+                    }
+                };
                 // Shape-only filter validation before any scan work, the
                 // same order the lexical routes use.
                 let geo_regions = match validate_geo_filters(&start.geo_filters) {
@@ -11441,7 +11488,10 @@ impl NodeService for NodeServiceImpl {
                         .insert(token, Arc::clone(&signals));
                 }
                 let pump_signals = Arc::clone(&signals);
-                tokio::spawn(async move {
+                let identity_ready = Arc::new(AtomicBool::new(false));
+                let pump_ready = Arc::clone(&identity_ready);
+                let identity_enabled = identity_limits.is_some();
+                let mut pump = tokio::spawn(async move {
                     loop {
                         match inbound.message().await {
                             Ok(Some(StreamSearchRequest {
@@ -11453,14 +11503,31 @@ impl NodeService for NodeServiceImpl {
                                 pump_signals
                                     .cancelled
                                     .store(true, std::sync::atomic::Ordering::Release);
-                                break;
+                                return Ok(None);
+                            }
+                            Ok(Some(StreamSearchRequest {
+                                payload: Some(stream_search_request::Payload::ResolveIdentities(selection)),
+                            })) => {
+                                if !identity_enabled || !pump_ready.load(AtomicOrdering::Acquire) {
+                                    pump_signals.cancelled.store(true, AtomicOrdering::Release);
+                                    return Err(Status::failed_precondition(
+                                        "ResolveStreamIdentities requires this stream's IdentityReady",
+                                    ));
+                                }
+                                return Ok(Some(selection));
                             }
                             // Duplicate Start or empty payload: ignore.
                             Ok(Some(_)) => {}
                             // Client closed or the stream broke: no more
                             // raises can arrive; the scan finishes (or hits
                             // the dead response channel) on its own.
-                            Ok(None) | Err(_) => break,
+                            Ok(None) | Err(_) => {
+                                if identity_enabled {
+                                    pump_signals.cancelled.store(true, AtomicOrdering::Release);
+                                    return Err(Status::cancelled("identity request stream closed"));
+                                }
+                                return Ok(None);
+                            }
                         }
                     }
                 });
@@ -11468,7 +11535,7 @@ impl NodeService for NodeServiceImpl {
                 let scan_tx = tx.clone();
                 let scan_signals = Arc::clone(&signals);
                 let scan =
-                    tokio::task::spawn_blocking(move || -> Result<StreamSearchSummary, Status> {
+                    tokio::task::spawn_blocking(move || -> Result<(StreamSearchSummary, Option<crate::query_identity::ScanIdentities>), Status> {
                         // Document mode: resolve each emitted slot's parent.
                         // parent_map takes its own locks (read to build,
                         // write to cache), so it runs before the scan's read
@@ -11612,7 +11679,15 @@ impl NodeService for NodeServiceImpl {
                                 },
                             )
                             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                        Ok(StreamSearchSummary {
+                        let identities = if identity_enabled {
+                            let identities = guard.bm25.as_ref()
+                                .map(Bm25Shard::identity_snapshot).transpose()
+                                .map_err(Status::internal)?.unwrap_or_default();
+                            Some(crate::query_identity::ScanIdentities::new(
+                                slot_offset, index.len(), identities, allow,
+                            )?)
+                        } else { None };
+                        Ok((StreamSearchSummary {
                             completed: summary.completed
                                 && !scan_signals
                                     .cancelled
@@ -11625,7 +11700,7 @@ impl NodeService for NodeServiceImpl {
                             scoring_fingerprint,
                             segments_total: prune.segments_total,
                             segments_skipped: prune.segments_skipped,
-                        })
+                        }, identities))
                     });
                 let outcome = scan.await;
                 if let Some(token) = udp_token {
@@ -11634,22 +11709,55 @@ impl NodeService for NodeServiceImpl {
                         .expect("stream signal registry poisoned")
                         .remove(&token);
                 }
-                match outcome {
-                    Ok(Ok(summary)) => {
-                        let _ = tx
-                            .send(Ok(StreamSearchResponse {
-                                payload: Some(stream_search_response::Payload::Summary(summary)),
-                            }))
-                            .await;
+                let identity_deadline = identity_timeout.map(|timeout| std::time::Instant::now() + timeout);
+                let exchange = async {
+                    let (mut summary, identities) = outcome
+                        .map_err(|e| Status::internal(format!("stream scan panicked: {e}")))??;
+                    if let (Some(limits), Some(identities)) = (identity_limits.as_ref(), identities) {
+                        if summary.completed {
+                            identity_ready.store(true, AtomicOrdering::Release);
+                            tx.send(Ok(StreamSearchResponse {
+                                payload: Some(stream_search_response::Payload::IdentityReady(
+                                    crate::pb::StreamIdentityReady { scan: Some(summary.clone()) },
+                                )),
+                            })).await.map_err(|_| Status::cancelled("identity response stream closed"))?;
+                            let selection = (&mut pump).await
+                                .map_err(|e| Status::internal(format!("identity request task failed: {e}")))??;
+                            match selection {
+                                Some(selection) => {
+                                    let limits = limits.clone();
+                                    let cancelled = Arc::clone(&signals);
+                                    let response = tokio::task::spawn_blocking(move || {
+                                        identities.resolve_until(selection, &limits,
+                                            identity_deadline.expect("identity timeout validated"), &cancelled.cancelled)
+                                    }).await.map_err(|e| Status::internal(format!("identity selection task failed: {e}")))??;
+                                    tx.send(Ok(response)).await
+                                        .map_err(|_| Status::cancelled("identity response stream closed"))?;
+                                }
+                                None => summary.completed = false,
+                            }
+                        } else if pump.is_finished() {
+                            (&mut pump).await.map_err(|e| Status::internal(format!("identity request task failed: {e}")))??;
+                        }
+                    } else if pump.is_finished() {
+                        (&mut pump).await.map_err(|e| Status::internal(format!("stream request task failed: {e}")))??;
                     }
-                    Ok(Err(status)) => {
-                        let _ = tx.send(Err(status)).await;
+                    tx.send(Ok(StreamSearchResponse {
+                        payload: Some(stream_search_response::Payload::Summary(summary)),
+                    })).await.map_err(|_| Status::cancelled("response stream closed"))
+                };
+                let result = if let Some(timeout) = identity_timeout {
+                    tokio::select! {
+                        _ = tx.closed() => Err(Status::cancelled("identity response stream closed")),
+                        result = tokio::time::timeout(timeout, exchange) => result.unwrap_or_else(|_| {
+                            Err(Status::deadline_exceeded("stream identity resolution timed out"))
+                        }),
                     }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!("stream scan panicked: {e}"))))
-                            .await;
-                    }
+                } else { exchange.await };
+                pump.abort();
+                if let Err(status) = result {
+                    signals.cancelled.store(true, AtomicOrdering::Release);
+                    let _ = tx.send(Err(status)).await;
                 }
             });
 

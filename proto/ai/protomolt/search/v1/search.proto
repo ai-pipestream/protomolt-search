@@ -1418,6 +1418,9 @@ message ScoredHit {
   // (lineage parent_id, or a high-bit-tagged global id for slots
   // without lineage). 0 outside collapse mode.
   uint64 parent_id = 3;
+  // Exact source identity captured with this score. Absent for rows without
+  // imported identity and execution paths that do not yet carry it.
+  DocumentIdentity identity = 4;
 }
 
 // One message on the client-to-shard leg of `StreamSearch`.
@@ -1431,6 +1434,9 @@ message StreamSearchRequest {
     // Abandons the scan: emissions stop, the terminal summary arrives
     // with `completed = false`, and the stream closes.
     StopStreamSearch stop = 3;
+    // Only after IdentityReady, exactly once. Select the final winning IDs
+    // from this stream's scan snapshot; an empty selection releases it.
+    ResolveStreamIdentities resolve_identities = 4;
   }
 }
 
@@ -1481,6 +1487,49 @@ message StartStreamSearch {
   // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
   // when both are set. Absent = no filter.
   FilterExpr filter = 7;
+  // Opt in to snapshot-bound identity resolution after the candidate scan.
+  // Absent preserves the Batch -> Summary protocol. A requesting client
+  // must require IdentityReady; a legacy Summary is not identity support.
+  StreamIdentityLimits identity_limits = 8;
+}
+
+// Bounds for the post-scan identity exchange. All fields must be positive.
+message StreamIdentityLimits {
+  // Maximum selected IDs, including rows with no imported identity.
+  // At most 1,000,000; duplicates are refused.
+  uint32 max_rows = 1;
+  // Maximum encoded StreamSearchResponse containing identities, including
+  // framing within that protobuf message. At most 64 MiB; transport limits
+  // still apply. Overflow refuses the whole selection, never truncates it.
+  uint32 max_response_bytes = 2;
+  // Time from finishing the scan through delivering identities and Summary.
+  // At most 60,000 ms. Expiry releases the metadata view and refuses.
+  uint32 timeout_ms = 3;
+}
+
+message ResolveStreamIdentities {
+  // Global IDs, in caller order. Every ID must belong to this scan's range
+  // and pass its captured live/filter selection. This is not a current-row
+  // fetch and cannot resolve a different stream's or generation's IDs.
+  repeated uint64 vector_ids = 1;
+}
+
+message StreamIdentityReady {
+  // The completed scan's certificate and statistics. Nonterminal: the node
+  // retains identity metadata until ResolveStreamIdentities, cancellation,
+  // disconnect or timeout. No more candidate batches follow this message.
+  StreamSearchSummary scan = 1;
+}
+
+message StreamIdentity {
+  uint64 vector_id = 1;
+  // Absent explicitly means this captured row has no imported identity.
+  DocumentIdentity identity = 2;
+}
+
+message StreamIdentities {
+  // Exactly one entry per requested ID, preserving request order.
+  repeated StreamIdentity rows = 1;
 }
 
 // Authoritative abandon request for a streaming scan. The coordinator may
@@ -1497,6 +1546,10 @@ message StreamSearchResponse {
     // Terminal message: exactly one per stream; the server closes the
     // stream after it.
     StreamSearchSummary summary = 2;
+    // Opt-in protocol: Batch* -> IdentityReady -> Identities -> Summary.
+    // A stopped scan sends completed=false Summary directly instead.
+    StreamIdentityReady identity_ready = 3;
+    StreamIdentities identities = 4;
   }
 }
 

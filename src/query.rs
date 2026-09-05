@@ -1420,7 +1420,7 @@ pub async fn execute(
                 .hits
                 .iter()
                 .map(|h| QueryHit {
-                    identity: None,
+                    identity: h.identity.clone(),
                     snippets: Vec::new(),
                     projected: Vec::new(),
                     doc_id: h.vector_id,

@@ -1328,6 +1328,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Landed 2026-09-05: dense identity on product-owned nodes.** Classic and
+  coalesced top-k capture source identity with their scored snapshot. Streaming
+  top-k resolves only winners through a bounded exchange on the same stream,
+  preserving identities across row reuse without holding shard locks. Dense
+  `Query` and its terminal stream carry those identities. Nodes/relays must
+  support the opt-in handshake for the new coordinator path; remote-provider
+  and remaining query-shape integration are still pending.
+  [Dense identity](docs/dense-identity.md).
+
 - **Proposed 2026-09-05: scale-out coordination.** A relay coordinator
   that presents itself to its parent as one shard over the existing
   node-facing surface, a standby-then-Raft control plane, a scan rate

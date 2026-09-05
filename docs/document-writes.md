@@ -148,8 +148,10 @@ and simple lexical selection carries it into `QueryHit`, including the final
 compaction and reopening; `doc_id` remains a generation-local locator.
 Rows ingested without an identity report absence rather than a fabricated key.
 
-This does not yet cover dense, hybrid, Boolean or browse result identity,
-nor provisional candidate revisions. It reports the imported row metadata;
+The product-owned dense paths also retain scored identities through classic and
+streaming scans; see [Dense identity](dense-identity.md). Remote-provider,
+streaming parent-collapse, hybrid, Boolean and browse identities remain,
+as do provisional candidate revisions. These paths report imported row metadata;
 it does not certify that the catalog accepted that version or that it is the
 current authorized version. Publication and authorization must supply those
 guarantees before this becomes the complete document-facing search contract.

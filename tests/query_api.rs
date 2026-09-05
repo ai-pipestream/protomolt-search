@@ -160,6 +160,44 @@ async fn start_cluster_with_identities(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dense_results_preserve_identity_in_classic_and_streaming_scans() {
+    let ((coordinator, vector, handles), _) = start_cluster_with_identities(true).await;
+    let request = QueryRequest {
+        k: N_DOCS as u32,
+        selection: Some(dense_leaf("vec", &vector)),
+        ..Default::default()
+    };
+    let mut expected = None;
+    for stream in [false, true] {
+        let coordinator = coordinator.clone().with_stream_search(stream);
+        let response = query(&coordinator, request.clone()).await.unwrap();
+        assert_eq!(response.hits.len(), N_DOCS);
+        for hit in &response.hits {
+            assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+        }
+        let signature: Vec<_> = response
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id, hit.score.to_bits(), hit.identity.clone()))
+            .collect();
+        if let Some(expected) = expected.as_ref() {
+            assert_eq!(&signature, expected);
+        }
+        expected = Some(signature);
+        let events = streamed_query(&coordinator, Some(request.clone()), 0).await;
+        let (_, completion) = stream_parts(&events);
+        let terminal = completion.response.as_ref().unwrap();
+        assert_eq!(terminal.hits.len(), N_DOCS);
+        for hit in &terminal.hits {
+            assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+        }
+    }
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lexical_results_preserve_imported_identity_through_public_and_streamed_queries() {
     let ((coordinator, _, handles), addrs) = start_cluster_with_identities(true).await;
     let request = QueryRequest {

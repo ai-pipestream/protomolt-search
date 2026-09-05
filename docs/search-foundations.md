@@ -180,8 +180,12 @@ backup/migration, workspace binding and document/field grants remain unfinished.
 versions and chunk ordinals independently of physical rows. Node fetch and
 lexical hits expose that metadata, and compaction tests verify it after row
 renumbering and recovery. Simple lexical `Query` selection and its streamed
-terminal response preserve the scored row's identity. Dense, hybrid, Boolean,
-browse and provisional result identities remain.
+terminal response preserve the scored row's identity. Dense identity on the
+product-owned node paths now travels with the scored snapshot through classic/
+coalesced and streaming top-k, public dense `Query` and its terminal stream.
+[Dense identity](dense-identity.md) describes the bounded winner-only exchange
+and relay requirements. Remote-provider, streaming parent-collapse, hybrid,
+Boolean, browse and provisional result identities remain.
 Identity-bearing archives use format 2, and their WAL records require format 3.
 This storage/import capability does not establish authority over versions on
 legacy ingest or propagate identity through every query response. The publisher

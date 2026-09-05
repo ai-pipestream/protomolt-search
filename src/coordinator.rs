@@ -6290,6 +6290,13 @@ impl CoordinatorServiceImpl {
                         fanout.mark_completed(shard);
                         remaining -= 1;
                     }
+                    Some(_) => {
+                        return fanout
+                            .cancel_with(Status::internal(
+                                "unexpected identity exchange on a legacy stream",
+                            ))
+                            .await
+                    }
                     None => {}
                 }
             }
@@ -6674,6 +6681,7 @@ impl CoordinatorServiceImpl {
         drop(done_tx);
 
         let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = Vec::with_capacity(n_nodes);
+        let mut identities = HashMap::new();
         let mut shard_stats: Vec<Option<ShardScanStats>> = Vec::with_capacity(n_nodes);
         let mut shard_wall_ms: Vec<(u32, f32)> = Vec::with_capacity(n_nodes);
         // A skipped shard is a shard with no matching row: no hits, no
@@ -6689,6 +6697,11 @@ impl CoordinatorServiceImpl {
             match done_rx.recv().await {
                 Some((shard, wall_ms, Ok(done))) => {
                     known.merge(&done.geo_columns_known, &done.filter_columns_known)?;
+                    for hit in &done.hits {
+                        if let Some(identity) = hit.identity.as_ref() {
+                            identities.insert((shard, hit.vector_id), identity.clone());
+                        }
+                    }
                     shard_hits.push((
                         shard,
                         done.hits
@@ -6713,6 +6726,7 @@ impl CoordinatorServiceImpl {
         let hits = merge_topk(shard_hits.iter().cloned(), k as usize)
             .into_iter()
             .map(|h| ScoredHit {
+                identity: identities.get(&(h.shard, h.vector_id)).cloned(),
                 vector_id: h.vector_id,
                 score: h.score,
                 parent_id: 0,
@@ -6740,6 +6754,25 @@ impl CoordinatorServiceImpl {
         collapse_parents: bool,
         filters: &RequestFilters,
     ) -> Result<StreamFanout, Status> {
+        self.open_stream_fanout_with_identities(
+            request_id,
+            vector,
+            initial_floor,
+            collapse_parents,
+            filters,
+            None,
+        )
+    }
+
+    fn open_stream_fanout_with_identities(
+        &self,
+        request_id: &str,
+        vector: &[f32],
+        initial_floor: Option<f32>,
+        collapse_parents: bool,
+        filters: &RequestFilters,
+        identity_limits: Option<crate::pb::StreamIdentityLimits>,
+    ) -> Result<StreamFanout, Status> {
         let n_nodes = self.node_addrs.len();
         let udp_socket = self.floor_socket().cloned();
         let (merged_tx, merged_rx) =
@@ -6747,6 +6780,7 @@ impl CoordinatorServiceImpl {
         let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
             Vec::with_capacity(n_nodes);
         let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
+        let mut readers = tokio::task::JoinSet::new();
         let mask = self.shard_mask(filters.tree.as_ref());
         for shard in 0..n_nodes {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
@@ -6769,13 +6803,14 @@ impl CoordinatorServiceImpl {
                         collapse_parents,
                         geo_filters: filters.geo.clone(),
                         filter: filters.tree.clone(),
+                        identity_limits: identity_limits.clone(),
                     })),
                 })
                 .expect("fresh channel accepts the Start message");
             floor_txs.push(Some(req_tx));
             udp_lanes.push(lane);
             let merged_tx = merged_tx.clone();
-            tokio::spawn(async move {
+            readers.spawn(async move {
                 let mut inbound = match client
                     .stream_search(Request::new(ReceiverStream::new(req_rx)))
                     .await
@@ -6806,6 +6841,7 @@ impl CoordinatorServiceImpl {
             });
         }
         Ok(StreamFanout {
+            readers,
             merged_rx,
             floor_txs,
             udp_lanes,
@@ -6888,8 +6924,20 @@ impl CoordinatorServiceImpl {
 
         let mask = self.shard_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
-        let mut fanout =
-            self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
+        let identity_limits = crate::pb::StreamIdentityLimits {
+            max_rows: k,
+            max_response_bytes: 32 * 1024 * 1024,
+            timeout_ms: 60_000,
+        };
+        crate::query_identity::validate_limits(&identity_limits)?;
+        let mut fanout = self.open_stream_fanout_with_identities(
+            request_id,
+            vector,
+            initial_floor,
+            false,
+            filters,
+            Some(identity_limits.clone()),
+        )?;
 
         // The global top-k: a max-heap whose top is the WORST survivor
         // under the merge's total order, so peek() is the k-th best.
@@ -6906,17 +6954,23 @@ impl CoordinatorServiceImpl {
                 remaining -= 1;
             }
         }
+        let mut terminal = summaries.clone();
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
         let mut floors_sent = 0u64;
         let mut scoring_fingerprint: Option<String> = None;
         while remaining > 0 {
-            let (shard, msg) = match fanout.next_message(&summaries).await {
+            let (shard, msg) = match fanout.next_message(&terminal).await {
                 Ok(Some(pair)) => pair,
                 Ok(None) => continue,
                 Err(status) => return fanout.cancel_with(status).await,
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
+                    if summaries[shard].is_some() {
+                        return fanout
+                            .cancel_with(Status::internal("candidate batch after IdentityReady"))
+                            .await;
+                    }
                     // Packed 12-byte LE records: u64 global id, f32
                     // score (see StreamSearchBatch).
                     if batch.hits.len() % 12 != 0 {
@@ -6965,7 +7019,17 @@ impl CoordinatorServiceImpl {
                         scoring_fingerprint.clone().unwrap_or_default(),
                     );
                 }
-                Some(stream_search_response::Payload::Summary(summary)) => {
+                Some(stream_search_response::Payload::IdentityReady(ready)) => {
+                    if summaries[shard].is_some() {
+                        return fanout
+                            .cancel_with(Status::internal("duplicate IdentityReady"))
+                            .await;
+                    }
+                    let Some(summary) = ready.scan else {
+                        return fanout
+                            .cancel_with(Status::internal("IdentityReady has no scan certificate"))
+                            .await;
+                    };
                     if !summary.completed {
                         let status = Status::internal(format!(
                             "shard {shard} stopped before completing its scan"
@@ -6998,10 +7062,20 @@ impl CoordinatorServiceImpl {
                         return fanout.cancel_with(e).await;
                     }
                     summaries[shard] = Some(summary);
-                    fanout.mark_completed(shard);
                     remaining -= 1;
                 }
-                None => {}
+                Some(stream_search_response::Payload::Summary(_)) => {
+                    return fanout
+                        .cancel_with(Status::failed_precondition(
+                            "stream ended without snapshot-bound identity support or completion",
+                        ))
+                        .await;
+                }
+                Some(stream_search_response::Payload::Identities(_)) | None => {
+                    return fanout
+                        .cancel_with(Status::internal("unexpected message before IdentityReady"))
+                        .await;
+                }
             }
         }
 
@@ -7017,6 +7091,9 @@ impl CoordinatorServiceImpl {
 
         let mut all: Vec<MergedHit> = heap.into_iter().map(|e| e.0).collect();
         all.sort_by(cmp_hits);
+        let identities = fanout
+            .resolve_identities(&all, &summaries, &mut terminal, &identity_limits)
+            .await?;
         Ok(StreamFanoutResult {
             hits: all
                 .into_iter()
@@ -7024,6 +7101,7 @@ impl CoordinatorServiceImpl {
                     vector_id: h.vector_id,
                     score: h.score,
                     parent_id: 0,
+                    identity: identities.get(&(h.shard, h.vector_id)).cloned().flatten(),
                 })
                 .collect(),
             summaries: summaries
@@ -7174,6 +7252,13 @@ impl CoordinatorServiceImpl {
                     fanout.mark_completed(shard);
                     remaining -= 1;
                 }
+                Some(_) => {
+                    return fanout
+                        .cancel_with(Status::internal(
+                            "unexpected identity exchange on a legacy stream",
+                        ))
+                        .await
+                }
                 None => {}
             }
         }
@@ -7201,6 +7286,7 @@ impl CoordinatorServiceImpl {
         let mut groups = Vec::with_capacity(ranked.len());
         for (parent, agg) in ranked {
             hits.push(ScoredHit {
+                identity: None,
                 vector_id: agg.best_id,
                 score: agg.best_score,
                 parent_id: parent,
@@ -7216,6 +7302,7 @@ impl CoordinatorServiceImpl {
                 chunks: chunks
                     .into_iter()
                     .map(|(doc, score)| ScoredHit {
+                        identity: None,
                         vector_id: doc,
                         score,
                         parent_id: parent,
@@ -7321,11 +7408,19 @@ impl CoordinatorServiceImpl {
                         done.hits.iter().map(|h| (h.vector_id, h.score)).collect(),
                     ));
                     for hit in done.hits {
-                        let entry = best.entry(hit.parent_id).or_insert(hit);
-                        if hit.score > entry.score
-                            || (hit.score == entry.score && hit.vector_id < entry.vector_id)
-                        {
-                            *entry = hit;
+                        match best.entry(hit.parent_id) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(hit);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                let previous = entry.get();
+                                if hit.score > previous.score
+                                    || (hit.score == previous.score
+                                        && hit.vector_id < previous.vector_id)
+                                {
+                                    entry.insert(hit);
+                                }
+                            }
                         }
                     }
                     shard_stats.push(done.stats);
@@ -8850,6 +8945,7 @@ impl CoordinatorServiceImpl {
         let mut groups = Vec::with_capacity(ranked.len());
         for (parent, agg) in ranked {
             hits.push(ScoredHit {
+                identity: None,
                 vector_id: agg.best_id,
                 score: agg.best_score,
                 parent_id: parent,
@@ -8865,6 +8961,7 @@ impl CoordinatorServiceImpl {
                 chunks: chunks
                     .into_iter()
                     .map(|(vector_id, score)| ScoredHit {
+                        identity: None,
                         vector_id,
                         score,
                         parent_id: parent,
@@ -9636,6 +9733,9 @@ fn decomposed_floor(s_lb: f64, wb_b1: f64, w_v: f64) -> f32 {
 /// and the decomposed hybrid — which differ only in what they do with
 /// the batches and which floor they derive.
 struct StreamFanout {
+    // Own response readers so cancellation, setup failure and successful
+    // completion all release the underlying RPC streams.
+    readers: tokio::task::JoinSet<()>,
     merged_rx: mpsc::Receiver<(usize, Result<Option<StreamSearchResponse>, Status>)>,
     floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>>,
     udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>>,
@@ -9648,6 +9748,95 @@ struct StreamFanout {
 }
 
 impl StreamFanout {
+    async fn resolve_identities(
+        &mut self,
+        hits: &[MergedHit],
+        scans: &[Option<StreamSearchSummary>],
+        terminal: &mut [Option<StreamSearchSummary>],
+        limits: &crate::pb::StreamIdentityLimits,
+    ) -> Result<HashMap<(u32, u64), Option<crate::pb::DocumentIdentity>>, Status> {
+        let exchange = async {
+            let mut expected = vec![Vec::new(); self.floor_txs.len()];
+            for hit in hits {
+                expected[hit.shard as usize].push(hit.vector_id);
+            }
+            let mut remaining = 0usize;
+            for (shard, tx) in self.floor_txs.iter().enumerate() {
+                if let Some(tx) = tx {
+                    remaining += 1;
+                    tx.send(StreamSearchRequest {
+                        payload: Some(stream_search_request::Payload::ResolveIdentities(
+                            crate::pb::ResolveStreamIdentities {
+                                vector_ids: expected[shard].clone(),
+                            },
+                        )),
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("identity request stream closed"))?;
+                }
+            }
+            let mut received = vec![false; expected.len()];
+            let mut identities = HashMap::with_capacity(hits.len());
+            while remaining > 0 {
+                let Some((shard, message)) = self.next_message(terminal).await? else {
+                    continue;
+                };
+                if terminal[shard].is_some() {
+                    return Err(Status::internal("identity message after terminal summary"));
+                }
+                if prost::Message::encoded_len(&message) > limits.max_response_bytes as usize {
+                    return Err(Status::resource_exhausted(
+                        "shard exceeded the identity response budget",
+                    ));
+                }
+                match message.payload {
+                    Some(stream_search_response::Payload::Identities(found)) => {
+                        if received[shard] || found.rows.len() != expected[shard].len() {
+                            return Err(Status::internal(
+                                "shard identity response count or sequence differs",
+                            ));
+                        }
+                        for (row, expected_id) in found.rows.into_iter().zip(&expected[shard]) {
+                            if row.vector_id != *expected_id {
+                                return Err(Status::internal(
+                                    "shard returned another ID's identity",
+                                ));
+                            }
+                            identities.insert((shard as u32, row.vector_id), row.identity);
+                        }
+                        received[shard] = true;
+                    }
+                    Some(stream_search_response::Payload::Summary(summary)) => {
+                        if !received[shard] || Some(&summary) != scans[shard].as_ref() {
+                            return Err(Status::failed_precondition(
+                                "identity exchange did not certify the captured scan",
+                            ));
+                        }
+                        terminal[shard] = Some(summary);
+                        self.mark_completed(shard);
+                        remaining -= 1;
+                    }
+                    _ => {
+                        return Err(Status::internal(
+                            "unexpected message during identity selection",
+                        ))
+                    }
+                }
+            }
+            Ok(identities)
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(u64::from(limits.timeout_ms)),
+            exchange,
+        )
+        .await
+        .unwrap_or_else(|_| Err(Status::deadline_exceeded("identity fan-out timed out")));
+        match result {
+            Ok(identities) => Ok(identities),
+            Err(status) => self.cancel_with(status).await,
+        }
+    }
+
     /// Send one typed frame to a lane, signed when a key is configured.
     fn send_signal(
         &self,
@@ -9685,20 +9874,15 @@ impl StreamFanout {
     }
 
     /// Abandon every unfinished shard. UDP goes first for low latency; the
-    /// matching gRPC Stop is then awaited on every open request stream and is
-    /// the authoritative signal. A stopped node can only return
-    /// `completed = false`.
+    /// matching gRPC Stop is enqueued within one bounded grace period. If a
+    /// peer no longer drains requests, abort its response reader to close the
+    /// RPC instead of waiting forever. Neither path certifies completion.
     async fn cancel(&mut self) {
         self.send_udp_cancel();
         let senders: Vec<mpsc::Sender<StreamSearchRequest>> =
             self.floor_txs.iter_mut().filter_map(Option::take).collect();
-        for tx in senders {
-            let _ = tx
-                .send(StreamSearchRequest {
-                    payload: Some(stream_search_request::Payload::Stop(StopStreamSearch {})),
-                })
-                .await;
-        }
+        send_stream_stops(senders).await;
+        self.readers.abort_all();
     }
 
     async fn cancel_with<T>(&mut self, status: Status) -> Result<T, Status> {
@@ -9747,19 +9931,34 @@ impl Drop for StreamFanout {
         self.send_udp_cancel();
         let senders: Vec<mpsc::Sender<StreamSearchRequest>> =
             self.floor_txs.iter_mut().filter_map(Option::take).collect();
+        let readers = std::mem::take(&mut self.readers);
         let send_stops = async move {
-            for tx in senders {
-                let _ = tx
-                    .send(StreamSearchRequest {
-                        payload: Some(stream_search_request::Payload::Stop(StopStreamSearch {})),
-                    })
-                    .await;
-            }
+            send_stream_stops(senders).await;
+            drop(readers);
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(send_stops);
         }
     }
+}
+
+/// One grace period for the entire fan-out, including full request lanes.
+/// Dropping the owned senders and reader tasks then closes abandoned RPCs.
+async fn send_stream_stops(senders: Vec<mpsc::Sender<StreamSearchRequest>>) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), async move {
+        let mut sends = tokio::task::JoinSet::new();
+        for tx in senders {
+            sends.spawn(async move {
+                let _ = tx
+                    .send(StreamSearchRequest {
+                        payload: Some(stream_search_request::Payload::Stop(StopStreamSearch {})),
+                    })
+                    .await;
+            });
+        }
+        while sends.join_next().await.is_some() {}
+    })
+    .await;
 }
 
 /// Everything one shard-stream attempt needs, cheap to clone per attempt
@@ -10561,6 +10760,7 @@ impl SearchService for CoordinatorServiceImpl {
                     .hits
                     .into_iter()
                     .map(|(vector_id, score)| ScoredHit {
+                        identity: None,
                         vector_id,
                         score,
                         parent_id: 0,
@@ -12334,6 +12534,153 @@ fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
 mod stream_cancel_tests {
     use super::*;
 
+    fn identity_fanout() -> (
+        StreamFanout,
+        mpsc::Sender<(usize, Result<Option<StreamSearchResponse>, Status>)>,
+        mpsc::Receiver<StreamSearchRequest>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let (request_tx, request_rx) = mpsc::channel(1);
+        (
+            StreamFanout {
+                readers: tokio::task::JoinSet::new(),
+                merged_rx: rx,
+                floor_txs: vec![Some(request_tx)],
+                udp_lanes: vec![None],
+                udp_socket: None,
+                udp_key: None,
+                udp_seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            },
+            tx,
+            request_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn completed_fanout_releases_a_peer_that_never_closes_its_response() {
+        let (mut fanout, _tx, _requests) = identity_fanout();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (retained, released) = tokio::sync::oneshot::channel::<()>();
+        fanout.readers.spawn(async move {
+            let _retained = retained;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        fanout.mark_completed(0);
+        drop(fanout);
+        assert!(tokio::time::timeout(Duration::from_secs(1), released)
+            .await
+            .expect("terminal completion must release response readers")
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn identity_timeout_is_bounded_even_when_the_request_lane_is_full() {
+        let (mut fanout, _tx, mut requests) = identity_fanout();
+        let limits = crate::pb::StreamIdentityLimits {
+            max_rows: 1,
+            max_response_bytes: 1024,
+            timeout_ms: 10,
+        };
+        let scan = StreamSearchSummary {
+            completed: true,
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            fanout.resolve_identities(&[], &[Some(scan)], &mut [None], &limits),
+        )
+        .await
+        .expect("error cleanup must not wait forever behind the unanswered selection");
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        assert!(matches!(
+            requests.recv().await.unwrap().payload,
+            Some(stream_search_request::Payload::ResolveIdentities(_))
+        ));
+        assert!(requests.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_exchange_rejects_wrong_ids_missing_or_changed_certificates_and_early_close() {
+        let scan = StreamSearchSummary {
+            completed: true,
+            emitted: 1,
+            ..Default::default()
+        };
+        let rows = |id| StreamSearchResponse {
+            payload: Some(stream_search_response::Payload::Identities(
+                crate::pb::StreamIdentities {
+                    rows: vec![crate::pb::StreamIdentity {
+                        vector_id: id,
+                        identity: None,
+                    }],
+                },
+            )),
+        };
+        let summary = |scan| StreamSearchResponse {
+            payload: Some(stream_search_response::Payload::Summary(scan)),
+        };
+        let cases = [
+            (vec![Some(rows(999))], tonic::Code::Internal),
+            (
+                vec![Some(summary(scan.clone()))],
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                vec![
+                    Some(rows(100)),
+                    Some(summary(StreamSearchSummary {
+                        emitted: 2,
+                        ..scan.clone()
+                    })),
+                ],
+                tonic::Code::FailedPrecondition,
+            ),
+            (vec![Some(rows(100)), None], tonic::Code::Internal),
+            (
+                vec![Some(rows(100)), Some(rows(100))],
+                tonic::Code::Internal,
+            ),
+        ];
+        for (messages, expected) in cases {
+            let (mut fanout, tx, mut requests) = identity_fanout();
+            let child = tokio::spawn(async move {
+                let request = requests.recv().await.unwrap();
+                assert!(matches!(
+                    request.payload,
+                    Some(stream_search_request::Payload::ResolveIdentities(_))
+                ));
+                for message in messages {
+                    tx.send((0, Ok(message))).await.unwrap();
+                }
+                assert!(matches!(
+                    requests.recv().await.unwrap().payload,
+                    Some(stream_search_request::Payload::Stop(_))
+                ));
+            });
+            let limits = crate::pb::StreamIdentityLimits {
+                max_rows: 1,
+                max_response_bytes: 1024,
+                timeout_ms: 1000,
+            };
+            let hit = MergedHit {
+                shard: 0,
+                vector_id: 100,
+                score: 1.0,
+            };
+            assert_eq!(
+                fanout
+                    .resolve_identities(&[hit], &[Some(scan.clone())], &mut [None], &limits)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected
+            );
+            child.await.unwrap();
+        }
+    }
+
     fn route(addr: &str, lo: u64, hi: u64) -> TopologyRoute {
         TopologyRoute {
             addr: addr.to_string(),
@@ -12536,6 +12883,7 @@ mod stream_cancel_tests {
         let (_merged_tx, merged_rx) = mpsc::channel(1);
         let token = 0x0A11_CE11_u64;
         let mut fanout = StreamFanout {
+            readers: tokio::task::JoinSet::new(),
             merged_rx,
             floor_txs: vec![Some(request_tx)],
             udp_lanes: vec![Some((token, target))],
@@ -12579,6 +12927,7 @@ mod stream_cancel_tests {
         let (_merged_tx, merged_rx) = mpsc::channel(1);
         let token = 0x0D09_CE11_u64;
         drop(StreamFanout {
+            readers: tokio::task::JoinSet::new(),
             merged_rx,
             floor_txs: vec![Some(request_tx)],
             udp_lanes: vec![Some((token, target))],
