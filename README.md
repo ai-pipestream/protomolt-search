@@ -6,6 +6,8 @@ quality claims. Vector engines plug in behind one descriptor/configuration
 contract. The shipped `embedded-turbovec` adapter provides exhaustive
 TurboQuant scoring and collaborative live-floor streaming.
 
+New here? The user manual is [docs/manual/README.md](docs/manual/README.md).
+
 ## Repository map
 
 | Repository | Role | Depends on |
