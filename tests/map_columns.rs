@@ -64,6 +64,7 @@ async fn add_documents_mapped(
         tx.send(AddDocumentsRequest {
             original_source: None,
             source_chunk_ordinal: None,
+            identity: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),
@@ -592,6 +593,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     let bad_facet = |field: &str, key: &str, value: &str| AddDocumentsRequest {
         original_source: None,
         source_chunk_ordinal: None,
+        identity: None,
         collection: String::new(),
         cased_field: String::new(),
         sentence_fields: Vec::new(),

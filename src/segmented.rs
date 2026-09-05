@@ -203,6 +203,14 @@ impl std::fmt::Debug for SegmentedShard {
 }
 
 impl SegmentedShard {
+    pub fn document_identity(&self, doc: u32) -> Option<crate::pb::DocumentIdentity> {
+        match self.place(doc) {
+            Placement::Sealed { part, local } => self.reader(part).document_identity(local),
+            Placement::Frozen { local } => self.frozen_store().document_identity(local),
+            Placement::Tail { local } => self.tail.document_identity(local),
+        }
+    }
+
     pub fn protobuf_source(
         &self,
         doc: u32,

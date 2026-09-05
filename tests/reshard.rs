@@ -153,6 +153,7 @@ async fn ingest(
             tx.send(AddDocumentsRequest {
                 original_source: None,
                 source_chunk_ordinal: None,
+                identity: None,
                 collection: String::new(),
                 cased_field: String::new(),
                 sentence_fields: Vec::new(),
@@ -1143,6 +1144,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
             tx.send(AddDocumentsRequest {
                 original_source: None,
                 source_chunk_ordinal: None,
+                identity: None,
                 collection: String::new(),
                 cased_field: String::new(),
                 sentence_fields: Vec::new(),

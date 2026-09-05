@@ -1212,6 +1212,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Row identity storage (2026-09-05, `feat/search-foundations`).** Exact
+  document keys, source versions and chunk ordinals can be retained with rows
+  through images, WAL, compaction and resharding, and returned by node fetch.
+  Archive metadata interns keys per source version. Legacy import still lacks
+  version authority; atomic publication and identity on all search responses
+  remain unfinished. See [original storage](docs/protobuf-source-storage.md).
+
 - **Ordered accepted history (2026-09-05, `feat/search-foundations`).**
   Local projection consumers can page accepted source versions through Rust and
   mobile APIs using a fixed sequence fence and explicit byte budget. Catalog

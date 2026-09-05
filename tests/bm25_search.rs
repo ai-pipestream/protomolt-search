@@ -39,6 +39,7 @@ async fn add_documents(
         tx.send(AddDocumentsRequest {
             original_source: None,
             source_chunk_ordinal: None,
+            identity: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),

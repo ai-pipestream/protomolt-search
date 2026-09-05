@@ -461,6 +461,15 @@ impl Bm25Shard {
         }
     }
 
+    pub fn document_identity(&self, doc: u32) -> Option<crate::pb::DocumentIdentity> {
+        match self {
+            Bm25Shard::Building(s) => s.document_identity(doc),
+            Bm25Shard::Spilling(s) => s.document_identity(doc),
+            Bm25Shard::Resident(s) => s.document_identity(doc),
+            Bm25Shard::Segmented(s) => s.document_identity(doc),
+        }
+    }
+
     pub(crate) fn analysis_fingerprint(&self, f: usize) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
@@ -2985,7 +2994,7 @@ pub(crate) fn wal_manifest(
         bucket_count: config.wal_buckets,
         preexisting_vectors: preexisting.0,
         preexisting_documents: preexisting.1,
-        format_version: wal::FORMAT_VERSION,
+        format_version: wal::BASE_FORMAT_VERSION,
     }
 }
 
@@ -7814,6 +7823,15 @@ impl NodeServiceImpl {
             }
             _ => {}
         }
+        if let Some(identity) = &doc.identity {
+            if doc.original_source.is_none() {
+                return Err(Status::invalid_argument(
+                    "document identity requires an original source",
+                ));
+            }
+            crate::source_archive::validate_identity(identity, doc.source_chunk_ordinal)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        }
         // A disk-resident shard that receives more documents is first
         // reloaded into the heap builder (the append path is
         // bulk-load: build in memory, flush back to v3).
@@ -8318,7 +8336,12 @@ impl NodeServiceImpl {
                 if let Some(source) = &doc.original_source {
                     store
                         .source_archive_mut()
-                        .attach_source(local, source, doc.source_chunk_ordinal)
+                        .attach_source_with_identity(
+                            local,
+                            source,
+                            doc.source_chunk_ordinal,
+                            doc.identity.as_ref(),
+                        )
                         .map_err(|e| Status::internal(format!("retain source: {e}")))?;
                 }
                 store.add_document_with_lineage(local, doc.text.clone(), analyzed, lineage);
@@ -8346,7 +8369,12 @@ impl NodeServiceImpl {
                 if let Some(source) = &doc.original_source {
                     store
                         .source_archive_mut()
-                        .attach_source(doc_id, source, doc.source_chunk_ordinal)
+                        .attach_source_with_identity(
+                            doc_id,
+                            source,
+                            doc.source_chunk_ordinal,
+                            doc.identity.as_ref(),
+                        )
                         .map_err(|e| Status::internal(format!("retain source: {e}")))?;
                 }
                 store.add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage);
@@ -8373,7 +8401,12 @@ impl NodeServiceImpl {
                 if let Some(source) = &doc.original_source {
                     builder
                         .source_archive_mut()
-                        .attach_source(doc_id, source, doc.source_chunk_ordinal)
+                        .attach_source_with_identity(
+                            doc_id,
+                            source,
+                            doc.source_chunk_ordinal,
+                            doc.identity.as_ref(),
+                        )
                         .map_err(|e| Status::internal(format!("retain source: {e}")))?;
                 }
                 builder
@@ -11696,6 +11729,7 @@ impl NodeService for NodeServiceImpl {
             let guard = self.state.read().expect("shard state lock poisoned");
             let mut documents = Vec::new();
             if let Some(store) = guard.bm25.as_ref() {
+                let source_metadata = store;
                 let store = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
@@ -11703,13 +11737,16 @@ impl NodeService for NodeServiceImpl {
                     if id < offset {
                         continue;
                     }
-                    let local = (id - offset) as u32;
+                    let Ok(local) = u32::try_from(id - offset) else {
+                        continue;
+                    };
                     if guard.live_docs.is_deleted(local as usize) {
                         continue;
                     }
                     if let Some(text) = store.text(local) {
                         documents.push(StoredDocument {
                             doc_id: id,
+                            identity: source_metadata.document_identity(local),
                             text,
                             lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
                                 parent_id: l.parent_id,

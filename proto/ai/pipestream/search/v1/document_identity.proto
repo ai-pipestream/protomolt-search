@@ -1,0 +1,12 @@
+syntax = "proto3";
+package ai.pipestream.search.v1;
+
+// Collection-scoped logical identity. Physical slots may change independently.
+message DocumentIdentity {
+  // Exact bytes, length 1 to 16384.
+  bytes document_key = 1;
+  // Positive source version; zero is invalid for a bound identity.
+  uint64 version = 2;
+  // Absent identifies a flat document; present identifies a chunk of its source.
+  optional uint32 chunk_ordinal = 3;
+}

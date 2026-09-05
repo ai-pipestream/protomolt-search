@@ -10,13 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use prost::Message;
 
-use crate::pb::storage::{SourceArchiveIndex, SourceBlob, SourceRecord, SourceRow};
-use crate::pb::ProtobufSource;
+use crate::pb::storage::{SourceArchiveIndex, SourceBlob, SourceIdentity, SourceRecord, SourceRow};
+use crate::pb::{DocumentIdentity, ProtobufSource};
 use crate::sha256;
 
 const MAGIC: &[u8; 8] = b"PMSOURCE";
 const HEADER_BYTES: usize = 48;
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -44,6 +44,8 @@ pub struct SourceArchive {
     sources: Vec<([u8; 32], ArchiveBlob)>,
     source_ids: BTreeMap<[u8; 32], u32>,
     rows: Vec<SourceRow>,
+    identities: Vec<SourceIdentity>,
+    identity_ids: BTreeMap<(Vec<u8>, u64), u32>,
     spill: Option<Mutex<File>>,
 }
 
@@ -115,6 +117,14 @@ impl SourceArchive {
     /// The caller validates schema and indexing policy; this layer preserves
     /// opaque bytes, including shapes the current decoder cannot interpret.
     pub fn insert(&mut self, source: &ProtobufSource) -> io::Result<u32> {
+        self.insert_checked(source, None)
+    }
+
+    fn insert_checked(
+        &mut self,
+        source: &ProtobufSource,
+        expected_source: Option<u32>,
+    ) -> io::Result<u32> {
         if source.descriptor_set.is_empty() || source.message_type.is_empty() {
             return Err(invalid(
                 "source requires descriptor bytes and a message type",
@@ -128,6 +138,11 @@ impl SourceArchive {
         }
         .encode_to_vec();
         let source_sha = sha256::digest(&record);
+        if expected_source.is_some_and(|id| self.sources[id as usize - 1].0 != source_sha) {
+            return Err(invalid(
+                "logical source version has different original bytes",
+            ));
+        }
         if let Some(bytes) = self.descriptors.get(&descriptor_sha) {
             if self.blob_bytes(bytes)? != source.descriptor_set {
                 return Err(invalid("descriptor content-address collision"));
@@ -166,6 +181,7 @@ impl SourceArchive {
         self.rows[row] = SourceRow {
             source,
             chunk_ordinal,
+            identity: 0,
         };
         Ok(())
     }
@@ -176,11 +192,64 @@ impl SourceArchive {
         source: &ProtobufSource,
         chunk_ordinal: Option<u32>,
     ) -> io::Result<()> {
+        self.attach_source_with_identity(row, source, chunk_ordinal, None)
+    }
+
+    pub fn attach_source_with_identity(
+        &mut self,
+        row: u32,
+        source: &ProtobufSource,
+        chunk_ordinal: Option<u32>,
+        identity: Option<&DocumentIdentity>,
+    ) -> io::Result<()> {
         if self.rows.get(row as usize).is_some_and(|r| r.source != 0) {
             return Err(invalid("row already has a source"));
         }
-        let id = self.insert(source)?;
-        self.attach(row, id, chunk_ordinal)
+        if let Some(identity) = identity {
+            validate_identity(identity, chunk_ordinal)?;
+        }
+        let existing_identity = identity.and_then(|identity| {
+            self.identity_ids
+                .get(&(identity.document_key.clone(), identity.version))
+                .copied()
+        });
+        let expected_source = existing_identity.map(|id| self.identities[id as usize - 1].source);
+        let id = self.insert_checked(source, expected_source)?;
+        let identity = if let Some(identity) = identity {
+            let key = (identity.document_key.clone(), identity.version);
+            match self.identity_ids.get(&key).copied() {
+                Some(ordinal) => {
+                    if self.identities[ordinal as usize - 1].source != id {
+                        return Err(invalid(
+                            "logical source version has different original bytes",
+                        ));
+                    }
+                    ordinal
+                }
+                None => {
+                    let ordinal = u32::try_from(self.identities.len())
+                        .ok()
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or_else(|| invalid("identity count exceeds u32"))?;
+                    self.identities.push(SourceIdentity {
+                        document_key: identity.document_key.clone(),
+                        version: identity.version,
+                        source: id,
+                    });
+                    self.identity_ids.insert(key, ordinal);
+                    ordinal
+                }
+            }
+        } else {
+            0
+        };
+        self.attach(row, id, chunk_ordinal)?;
+        self.rows[row as usize].identity = identity;
+        Ok(())
+    }
+
+    pub fn identity(&self, row: u32) -> Option<DocumentIdentity> {
+        row_identity(&self.rows, &self.identities, row)
     }
 
     fn index(&self, row_count: u32) -> io::Result<SourceArchiveIndex> {
@@ -212,10 +281,15 @@ impl SourceArchive {
         let mut rows = self.rows.clone();
         rows.resize_with(row_count as usize, SourceRow::default);
         Ok(SourceArchiveIndex {
-            format_version: FORMAT_VERSION,
+            format_version: if self.identities.is_empty() {
+                1
+            } else {
+                FORMAT_VERSION
+            },
             descriptors,
             sources,
             rows,
+            identities: self.identities.clone(),
         })
     }
 
@@ -260,6 +334,19 @@ impl SourceArchive {
                 return Err(invalid("duplicate source record"));
             }
         }
+        archive.identity_ids = reader
+            .index
+            .identities
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| {
+                (
+                    (identity.document_key.clone(), identity.version),
+                    index as u32 + 1,
+                )
+            })
+            .collect();
+        archive.identities = reader.index.identities;
         archive.rows = reader.index.rows;
         Ok(archive)
     }
@@ -319,7 +406,9 @@ impl SourceArchiveReader {
         }
         let index = SourceArchiveIndex::decode(encoded_index)
             .map_err(|e| invalid(format!("source index: {e}")))?;
-        if index.format_version != FORMAT_VERSION {
+        if !(1..=FORMAT_VERSION).contains(&index.format_version)
+            || (index.format_version == 1 && !index.identities.is_empty())
+        {
             return Err(invalid("unsupported source archive version"));
         }
         if index.rows.len() != row_count as usize {
@@ -342,8 +431,25 @@ impl SourceArchiveReader {
         for row in &index.rows {
             if row.source as usize > index.sources.len()
                 || (row.source == 0 && row.chunk_ordinal.is_some())
+                || row.identity as usize > index.identities.len()
             {
                 return Err(invalid("invalid source row reference"));
+            }
+            if row.identity != 0 && index.identities[row.identity as usize - 1].source != row.source
+            {
+                return Err(invalid("row identity refers to a different source"));
+            }
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for identity in &index.identities {
+            if identity.document_key.is_empty()
+                || identity.document_key.len() > 16 * 1024
+                || identity.version == 0
+                || identity.source == 0
+                || identity.source as usize > index.sources.len()
+                || !identities.insert((&identity.document_key, identity.version))
+            {
+                return Err(invalid("invalid or duplicate logical source identity"));
             }
         }
         let descriptors: BTreeMap<_, _> = index
@@ -413,6 +519,10 @@ impl SourceArchiveReader {
         )))
     }
 
+    pub fn identity(&self, row: u32) -> Option<DocumentIdentity> {
+        row_identity(&self.index.rows, &self.index.identities, row)
+    }
+
     pub fn verify(&self, bytes: &[u8]) -> io::Result<()> {
         for descriptor in &self.index.descriptors {
             self.blob(bytes, descriptor)?;
@@ -422,6 +532,35 @@ impl SourceArchiveReader {
         }
         Ok(())
     }
+}
+
+pub fn validate_identity(identity: &DocumentIdentity, ordinal: Option<u32>) -> io::Result<()> {
+    if identity.document_key.is_empty()
+        || identity.document_key.len() > 16 * 1024
+        || identity.version == 0
+    {
+        return Err(invalid(
+            "identity requires a 1 to 16384 byte document key and a positive version",
+        ));
+    }
+    if identity.chunk_ordinal != ordinal {
+        return Err(invalid("identity and source chunk ordinals differ"));
+    }
+    Ok(())
+}
+
+fn row_identity(
+    rows: &[SourceRow],
+    identities: &[SourceIdentity],
+    row: u32,
+) -> Option<DocumentIdentity> {
+    let row = rows.get(row as usize)?;
+    let identity = identities.get(row.identity.checked_sub(1)? as usize)?;
+    Some(DocumentIdentity {
+        document_key: identity.document_key.clone(),
+        version: identity.version,
+        chunk_ordinal: row.chunk_ordinal,
+    })
 }
 
 #[cfg(test)]
@@ -436,6 +575,78 @@ mod tests {
             // Noncanonical varint and an unknown field, retained without decode.
             payload: vec![8, 0x81, 0, 0xa0, 6, 99],
         }
+    }
+
+    #[test]
+    fn logical_identity_is_interned_and_survives_archive_reload() {
+        let mut archive = SourceArchive::default();
+        let key = vec![0xfe; 16 * 1024];
+        let source = source();
+        for (row, ordinal) in [(0, 0), (2, 1)] {
+            let identity = DocumentIdentity {
+                document_key: key.clone(),
+                version: 17,
+                chunk_ordinal: Some(ordinal),
+            };
+            archive
+                .attach_source_with_identity(row, &source, Some(ordinal), Some(&identity))
+                .unwrap();
+        }
+        let mut bytes = Vec::new();
+        archive.write(&mut bytes, 3).unwrap();
+        let reader = SourceArchiveReader::open(&bytes, 3).unwrap();
+        assert_eq!(reader.index.format_version, 2);
+        assert_eq!(reader.index.identities.len(), 1);
+        assert_eq!(reader.index.sources.len(), 1);
+        assert_eq!(
+            bytes
+                .windows(key.len())
+                .filter(|window| *window == key)
+                .count(),
+            1
+        );
+        let restored = SourceArchive::read(&bytes, 3).unwrap();
+        for row in [0, 1, 2] {
+            assert_eq!(reader.identity(row), archive.identity(row));
+            assert_eq!(restored.identity(row), archive.identity(row));
+        }
+        assert!(reader.identity(1).is_none());
+        let mut rewritten = Vec::new();
+        restored.write(&mut rewritten, 3).unwrap();
+        assert_eq!(rewritten, bytes);
+    }
+
+    #[test]
+    fn conflicting_source_version_and_chunk_metadata_are_refused_before_row_attachment() {
+        let mut archive = SourceArchive::default();
+        let mut identity = DocumentIdentity {
+            document_key: b"key".to_vec(),
+            version: 1,
+            chunk_ordinal: Some(0),
+        };
+        archive
+            .attach_source_with_identity(0, &source(), Some(0), Some(&identity))
+            .unwrap();
+        identity.chunk_ordinal = Some(1);
+        assert!(archive
+            .attach_source_with_identity(1, &source(), Some(0), Some(&identity))
+            .is_err());
+        let mut different = source();
+        different.payload.push(0);
+        assert!(archive
+            .attach_source_with_identity(1, &different, Some(1), Some(&identity))
+            .is_err());
+        assert!(archive.row(1).unwrap().is_none());
+        let mut bytes = Vec::new();
+        archive.write(&mut bytes, 1).unwrap();
+        let reader = SourceArchiveReader::open(&bytes, 1).unwrap();
+        // A format-1 label must not hide identity metadata from an older reader.
+        let mut index = reader.index;
+        index.format_version = 1;
+        let encoded = index.encode_to_vec();
+        bytes[16..48].copy_from_slice(&sha256::digest(&encoded));
+        bytes[48..48 + encoded.len()].copy_from_slice(&encoded);
+        assert!(SourceArchiveReader::open(&bytes, 1).is_err());
     }
 
     #[test]

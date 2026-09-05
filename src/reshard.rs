@@ -997,10 +997,15 @@ fn build_child(
                 if let Some(source) = &doc.original_source {
                     builder
                         .source_archive_mut()
-                        .attach_source(*local, source, doc.source_chunk_ordinal)
+                        .attach_source_with_identity(
+                            *local,
+                            source,
+                            doc.source_chunk_ordinal,
+                            doc.identity.as_ref(),
+                        )
                         .map_err(|e| format!("restore original source: {e}"))?;
-                } else if doc.source_chunk_ordinal.is_some() {
-                    return Err("source chunk ordinal has no original source".into());
+                } else if doc.source_chunk_ordinal.is_some() || doc.identity.is_some() {
+                    return Err("source chunk ordinal or identity has no original source".into());
                 }
                 builder
                     .add_document_with_lineage(

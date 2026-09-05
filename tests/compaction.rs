@@ -152,12 +152,21 @@ fn original_source(row: &Row) -> (pipestream_search::pb::ProtobufSource, Option<
     )
 }
 
+fn logical_identity(row: &Row) -> pipestream_search::pb::DocumentIdentity {
+    pipestream_search::pb::DocumentIdentity {
+        document_key: format!("parent/{}", row.num / 4).into_bytes(),
+        version: (row.num % 2) as u64 + 1,
+        chunk_ordinal: original_source(row).1,
+    }
+}
+
 /// The document half of a legacy two-RPC append, keyed.
 async fn add_document(client: &mut NodeServiceClient<Channel>, row: &Row) -> AddDocumentsResponse {
     let doc = AddDocumentsRequest {
         text: row.text.clone(),
         original_source: Some(original_source(row).0),
         source_chunk_ordinal: original_source(row).1,
+        identity: Some(logical_identity(row)),
         lineage: Some(DocLineage {
             parent_id: row.num as u64,
             ..Default::default()
@@ -413,7 +422,20 @@ async fn texts_of(
     .into_inner()
     .documents
     .into_iter()
-    .map(|d| (d.doc_id, (d.text, d.lineage)))
+    .map(|d| {
+        let number: usize = d
+            .text
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .strip_prefix("row")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected = logical_identity(&row(number, d.text.contains("revised")));
+        assert_eq!(d.identity, Some(expected));
+        (d.doc_id, (d.text, d.lineage))
+    })
     .collect()
 }
 
@@ -803,6 +825,7 @@ async fn run_online_compaction(layout: Layout) {
                 reader.protobuf_source(local).unwrap(),
                 Some(original_source(row))
             );
+            assert_eq!(reader.document_identity(local), Some(logical_identity(row)));
         }
     };
     match layout {

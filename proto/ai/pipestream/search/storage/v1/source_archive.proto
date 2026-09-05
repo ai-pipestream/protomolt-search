@@ -4,10 +4,19 @@ package ai.pipestream.search.storage.v1;
 // The archive's index precedes its blob area. Offsets are relative to that
 // area. Descriptors precede source records; all blobs tile it without gaps.
 message SourceArchiveIndex {
+  // 1 for source-only archives; 2 permits interned logical identities.
   uint32 format_version = 1;
   repeated SourceBlob descriptors = 2;
   repeated SourceBlob sources = 3;
   repeated SourceRow rows = 4;
+  repeated SourceIdentity identities = 5;
+}
+
+// Interned once per logical source version, independent of chunk row count.
+message SourceIdentity {
+  bytes document_key = 1;
+  uint64 version = 2;
+  uint32 source = 3;
 }
 
 message SourceBlob {
@@ -30,4 +39,6 @@ message SourceRow {
   // Otherwise this is the one-based ordinal in SourceArchiveIndex.sources.
   uint32 source = 1;
   optional uint32 chunk_ordinal = 2;
+  // One-based ordinal in SourceArchiveIndex.identities; zero is legacy/unbound.
+  uint32 identity = 3;
 }

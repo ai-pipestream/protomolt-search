@@ -55,6 +55,7 @@ fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
     AddDocumentsRequest {
         original_source: None,
         source_chunk_ordinal: None,
+        identity: None,
         collection: String::new(),
         cased_field: String::new(),
         sentence_fields: Vec::new(),
@@ -377,6 +378,7 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
     let bad = |field: &str, text: &str| AddDocumentsRequest {
         original_source: None,
         source_chunk_ordinal: None,
+        identity: None,
         collection: String::new(),
         cased_field: String::new(),
         sentence_fields: Vec::new(),
@@ -512,6 +514,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
         tx.send(AddDocumentsRequest {
             original_source: None,
             source_chunk_ordinal: None,
+            identity: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),

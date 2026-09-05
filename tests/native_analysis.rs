@@ -15,6 +15,45 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use common::start_empty_node;
 
+#[tokio::test]
+async fn document_fetch_retains_identity_and_does_not_alias_large_physical_ids() {
+    use pipestream_search::pb::{DocumentIdentity, GetDocumentsRequest};
+    let offset = 100;
+    let (addr, node) = start_empty_node(NodeConfig {
+        slot_offset: offset,
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        ..Default::default()
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    let identity = DocumentIdentity {
+        document_key: b"key\0\xff".to_vec(),
+        version: 7,
+        chunk_ordinal: None,
+    };
+    client
+        .add_documents(tokio_stream::iter([AddDocumentsRequest {
+            text: "private source".into(),
+            analysis: Some(body_spec()),
+            original_source: Some(common::protobuf_source("private source", "key")),
+            identity: Some(identity.clone()),
+            ..Default::default()
+        }]))
+        .await
+        .unwrap();
+    let found = client
+        .get_documents(GetDocumentsRequest {
+            doc_ids: vec![offset + (1u64 << 32), offset, u64::MAX],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(found.documents.len(), 1);
+    assert_eq!(found.documents[0].doc_id, offset);
+    assert_eq!(found.documents[0].identity, Some(identity));
+    node.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_streamed_ingest_and_query_share_term_identity() {
     let (addr, node) = start_empty_node(NodeConfig {

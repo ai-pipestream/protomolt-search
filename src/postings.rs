@@ -1699,6 +1699,10 @@ impl Default for Bm25Store {
 }
 
 impl Bm25Store {
+    pub fn document_identity(&self, row: u32) -> Option<crate::pb::DocumentIdentity> {
+        self.sources.identity(row)
+    }
+
     pub fn source_archive_mut(&mut self) -> &mut crate::source_archive::SourceArchive {
         &mut self.sources
     }
@@ -4597,6 +4601,10 @@ pub struct SpillBuilder {
 }
 
 impl SpillBuilder {
+    pub fn document_identity(&self, row: u32) -> Option<crate::pb::DocumentIdentity> {
+        self.sources.identity(row)
+    }
+
     pub fn source_archive_mut(&mut self) -> &mut crate::source_archive::SourceArchive {
         &mut self.sources
     }
@@ -7498,6 +7506,12 @@ pub struct Bm25Reader {
 }
 
 impl Bm25Reader {
+    pub fn document_identity(&self, row: u32) -> Option<crate::pb::DocumentIdentity> {
+        self.source_section
+            .as_ref()
+            .and_then(|(_, _, reader)| reader.identity(row))
+    }
+
     pub fn protobuf_source(
         &self,
         row: u32,

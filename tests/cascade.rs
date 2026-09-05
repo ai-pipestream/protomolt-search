@@ -120,6 +120,7 @@ async fn start_cluster(
                     tx.send(pipestream_search::pb::AddDocumentsRequest {
                         original_source: None,
                         source_chunk_ordinal: None,
+                        identity: None,
                         collection: String::new(),
                         cased_field: String::new(),
                         sentence_fields: Vec::new(),

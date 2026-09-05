@@ -22,6 +22,7 @@ package ai.pipestream.search.v1;
 
 import "google/protobuf/timestamp.proto";
 import "ai/pipestream/search/v1/source.proto";
+import "ai/pipestream/search/v1/document_identity.proto";
 import "ai/pipestream/search/v1/schema_report.proto";
 
 // NodeService is the internal shard-owner API. Exactly one node owns a given
@@ -1861,6 +1862,10 @@ message AddDocumentsRequest {
   // Present for a chunk row, including ordinal zero. It is independent of
   // the generation-local physical row id.
   optional uint32 source_chunk_ordinal = 24;
+  // Logical source metadata retained with the row. The legacy AddDocuments
+  // route does not itself enforce version preconditions or persistent retries.
+  // Requires original_source and the same chunk ordinal as above.
+  DocumentIdentity identity = 25;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share
@@ -2919,6 +2924,8 @@ message StoredDocument {
   string text = 2;
   // Lineage, when the document was ingested with it.
   optional DocLineage lineage = 3;
+  // Present only for rows explicitly bound to a logical source version.
+  DocumentIdentity identity = 4;
 }
 
 // Stored documents, in request order, omitting unknown ids.
@@ -4738,7 +4745,7 @@ enum QueryStreamPhase {
   QUERY_STREAM_PHASE_FINAL = 5;
 }
 
-// One provisional ranked hit. It deliberately carries only stable identity
+// One provisional ranked hit. It carries a generation-local row id
 // and score: highlights, projections, boosts, and scorer dimensions become
 // authoritative in the terminal QueryResponse after their phases complete.
 message QueryStreamHit {
@@ -4817,8 +4824,7 @@ message QueryProfile {
 
 // One public hit with score provenance.
 message QueryHit {
-  // Global doc id (stable across identical corpus layouts; lineage
-  // identity arrives with the document store).
+  // Generation-local row locator. Compaction may renumber it.
   uint64 doc_id = 1;
   // Final score under the executed strategy.
   float score = 2;

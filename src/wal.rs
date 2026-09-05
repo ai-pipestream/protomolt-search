@@ -122,7 +122,9 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Current on-disk format version (manifest `format_version`).
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
+/// Source references without logical row identity remain readable by format-2 binaries.
+pub const BASE_FORMAT_VERSION: u32 = 2;
 
 /// The WAL directory of a shard: `<index path>.wal/`.
 pub fn wal_dir(index_path: &Path) -> PathBuf {
@@ -1194,14 +1196,31 @@ impl WalWriter {
                     "WAL append requires resolved source references",
                 ));
             }
+            let mut required_version = BASE_FORMAT_VERSION;
+            for document in &batch.documents {
+                if let Some(identity) = &document.identity {
+                    if document.original_source.is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "WAL identity requires original source",
+                        ));
+                    }
+                    crate::source_archive::validate_identity(
+                        identity,
+                        document.source_chunk_ordinal,
+                    )
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                    required_version = FORMAT_VERSION;
+                }
+            }
             if batch
                 .documents
                 .iter()
                 .any(|d| d.original_source.is_some() || d.source_chunk_ordinal.is_some())
             {
-                if self.manifest.format_version < FORMAT_VERSION {
+                if self.manifest.format_version < required_version {
                     let mut upgraded = self.manifest.clone();
-                    upgraded.format_version = FORMAT_VERSION;
+                    upgraded.format_version = required_version;
                     write_manifest(&self.dir, &upgraded)?;
                     self.manifest = upgraded;
                 }
@@ -1374,6 +1393,7 @@ mod tests {
                 bigram_fields: Vec::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
+                identity: None,
             }],
             stable_routing_keys: Vec::new(),
             source_references: Vec::new(),
@@ -1430,6 +1450,47 @@ mod tests {
         batch.documents[0].original_source = Some(source.clone());
         batch.documents[0].source_chunk_ordinal = Some(id as u32);
         wal_record::Op::AddDocuments(batch)
+    }
+
+    #[test]
+    fn identified_rows_upgrade_the_wal_and_survive_replay() {
+        let dir = tempdir("identity");
+        let source = crate::pb::ProtobufSource {
+            descriptor_set: b"original descriptor".to_vec(),
+            message_type: "example.Record".into(),
+            payload: vec![8, 0x81, 0],
+        };
+        let mut base = manifest(2);
+        base.format_version = BASE_FORMAT_VERSION;
+        let mut writer = WalWriter::create(&dir, base).unwrap();
+        let mut op = source_op(0, &source);
+        let wal_record::Op::AddDocuments(batch) = &mut op else {
+            unreachable!()
+        };
+        batch.documents[0].identity = Some(crate::pb::DocumentIdentity {
+            document_key: b"key\0\xff".to_vec(),
+            version: 7,
+            chunk_ordinal: Some(1),
+        });
+        assert_eq!(
+            writer.append(op.clone()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(writer.manifest().format_version, BASE_FORMAT_VERSION);
+        assert_eq!(writer.high_watermark(), 0);
+        let wal_record::Op::AddDocuments(batch) = &mut op else {
+            unreachable!()
+        };
+        batch.documents[0].identity.as_mut().unwrap().chunk_ordinal = Some(0);
+        writer.append(op.clone()).unwrap();
+        writer.flush().unwrap();
+        let generation = writer.dir().to_path_buf();
+        drop(writer);
+        assert_eq!(read_manifest(&generation).unwrap().format_version, 3);
+        let records = read_clocked_records(&generation, 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].op, Some(op));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

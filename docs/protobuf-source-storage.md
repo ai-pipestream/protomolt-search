@@ -9,10 +9,10 @@ projection contract still determines which fields can be indexed and queried.
 This is an increment toward the [search foundations](search-foundations.md),
 not a completed logical document store. A mapped document with zero chunks still
 produces no storage row and is counted by the existing ingest response without
-being retained. The standalone archive can hold originals without rows, but the
-node needs a logical document catalog independent of its segment row geometry
-before that capability is exposed. Stable keys, versioned writes, idempotency and
-per-write durability receipts remain separate, outstanding work.
+being retained. The separate [logical catalog](document-writes.md) now retains
+accepted source versions without any rows and supplies local conditional writes,
+retry history and acceptance receipts. Connecting that authority to atomic index
+publication and every public identity path remains unfinished.
 
 ## Index images
 
@@ -21,6 +21,20 @@ and exact payload with the SHA-256 of the original descriptor bytes. A source
 archive interns descriptors and source records independently; chunk rows carry a
 source ordinal and their original chunk ordinal. Content addresses identify
 bytes within storage, not public logical document identity.
+
+Rows may also carry a `DocumentIdentity`: an exact collection-local document key,
+a positive source version, and optional chunk ordinal. `AddDocumentsRequest`
+retains this metadata with `original_source`; its chunk ordinal must agree with
+`source_chunk_ordinal`. The legacy route imports the metadata but does not enforce
+conditional version writes or persistent retries.
+
+The archive interns each key/version pair once in `SourceArchiveIndex.identities`.
+Rows reference that entry and retain their own chunk ordinal. A key/version pair
+cannot refer to different source bytes within one archive. The metadata resides
+in the archive index, so identity lookup does not load the original payload.
+This keeps long keys from being repeated on every chunk row. Archive format 2
+marks this extension; source-only archives continue to write format 1, and this
+reader accepts both. Older format-1 readers refuse identified archives.
 
 The current TVBM2508 writer adds a kind-9 column-table entry named
 `protobuf-sources`. Its offset and length address the final payload section.
@@ -47,7 +61,11 @@ logs. Descriptors and original sources are each interned once per generation.
 Chunk records contain `SourceReference` addresses instead of repeating the
 parent's payload and descriptor. A legacy format-1 manifest is upgraded before
 the writer appends its first source reference; this build reads both versions.
-Old binaries reject format 2.
+Pre-source-storage binaries reject format 2. A document carrying logical identity
+upgrades the WAL manifest to format 3 before the referencing record is appended,
+so a format-2 reader cannot silently discard that metadata during replay. This
+build reads formats 1 through 3; ordinary new node logs start at format 2 and
+advance only when identity is used. The source-blob framing remains unchanged.
 
 Source blobs are written before referencing row frames and fsynced before the
 row logs at Flush. The generation directory is also synced. An incomplete,
@@ -62,6 +80,7 @@ chunk. Offline resharding and online compaction use the same reader and retain
 source bytes for surviving rows. A compaction's new WAL interns the surviving
 sources again, so deleting the first chunk cannot invalidate another chunk's
 source. Snapshot installation carries source archives inside the image.
+The same paths retain logical identity while compaction renumbers physical rows.
 
 This does not change the existing acknowledgment contract: applying a row is
 volatile until Flush, and WAL failures still use the existing degraded-mode
@@ -75,8 +94,17 @@ and field authorization must cover any future disclosure API. The embedded
 library continues to keep source, WAL and index files on the phone and has no
 network transport dependency.
 
+`StoredDocument.identity` exposes imported identity on the existing node fetch
+route. `GetDocuments.doc_ids` still addresses current-generation physical rows;
+it is not a stable-key lookup or a way to recover the identity of an earlier
+unfenced search after compaction. Query/stream hit propagation and versioned
+publication remain outstanding. Oversized physical IDs are rejected from lookup
+instead of narrowing to another row's u32 slot.
+
 Tests cover byte equality through heap/spill/mapped images, snapshots, replica
 catch-up, resharding and both compaction layouts; archive truncation and bit
 corruption; WAL deduplication across buckets and restart; source corruption;
 and incomplete unreferenced WAL tails. These are local correctness checks,
 not fleet performance or mobile device measurements.
+Compaction tests additionally compare exact keys, source versions and chunk
+ordinals in image readers and node fetches after renumbering, reopen and replay.

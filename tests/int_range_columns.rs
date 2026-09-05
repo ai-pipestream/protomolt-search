@@ -65,6 +65,7 @@ async fn add_documents_integer(
         tx.send(AddDocumentsRequest {
             original_source: None,
             source_chunk_ordinal: None,
+            identity: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),
@@ -865,6 +866,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
     let stamped = |text: &str, seconds: i64, nanos: i32| AddDocumentsRequest {
         original_source: None,
         source_chunk_ordinal: None,
+        identity: None,
         collection: String::new(),
         cased_field: String::new(),
         sentence_fields: Vec::new(),
