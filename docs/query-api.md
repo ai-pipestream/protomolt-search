@@ -651,3 +651,17 @@ Filters appear in matched-clause provenance but never in score dimensions.
 Unknown query ids, duplicate ids, non-finite weights, impossible strategy
 combinations, analyzer drift, missing columns, mixed calibration, stale stats,
 or incomplete shards are request failures.
+
+### Explain
+
+`explain = true` adds an `Explanation` tree to each hit: the arithmetic
+that produced its score, with the root's value equal to the served score
+and each node's description stating how its value follows from its
+children. A lexical leaf reports every (field, term) contribution with
+the BM25 inputs under it, expansions grouped under their prefix or source
+term, then the score stages in order; a dense leaf its native or exact
+FP32 score; a composite one node per leg with the fusion's formula; a
+boolean root the sum of its clauses; a scorer its dimensions with the
+selection tree kept as provenance. Results are unchanged with the flag
+on. A browse, a sorted lexical leaf, and `QueryStream` refuse it by name.
+Details: [The explain tree](explain.md).
