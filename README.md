@@ -1223,6 +1223,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Assembled from numbers the engine already computed, so hits and order
   are bitwise unchanged with the flag on. Details:
   [The explain tree](docs/explain.md).
+- **Landed 2026-09-05: segment pruning from summaries.** A sealed
+  segment's column summary rules it out of a request whose filter it
+  cannot match: the vector scan never opens the image, the postings walks
+  skip the part, the slot loops skip the rows, and the boolean planner
+  skips the segments a required keyword is absent from. Sound by
+  construction (`AND` prunes on any child, `OR` on all, `NOT` never;
+  facet, map, geo, and string leaves never), off with
+  `--segment-pruning=false`, and counted on every route and in
+  `QueryProfile`. Results are bitwise unchanged. Details:
+  [Segment pruning from summaries](docs/segment-pruning.md).
 - **Landed 2026-09-04 (evening): synonyms and did-you-mean.** Query-time
   synonym rules (symmetric or one-way) on the coordinator's table
   (`--synonyms=<toml>`) and on the request, analyzed under the field's spec

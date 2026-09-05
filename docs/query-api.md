@@ -666,6 +666,16 @@ selection tree kept as provenance. Results are unchanged with the flag
 on. A browse, a sorted lexical leaf, and `QueryStream` refuse it by name.
 Details: [The explain tree](explain.md).
 
+### Segment pruning
+
+With `profile` set, `QueryProfile.segments_total` and `segments_skipped`
+report how many sealed segments the shards consulted for the selection
+and how many they ruled out from their column summaries without opening
+them, for a dense or lexical leaf under a filter, a browse, and a boolean
+root. The counts describe work, never results: the hits and scores are the
+same with `--segment-pruning=false`, and a test holds that on every route.
+Details: [Segment pruning from summaries](segment-pruning.md).
+
 ## Aggregation
 
 `QueryRequest.aggregate` folds an `AggregateRequest` over the candidate
