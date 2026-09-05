@@ -61,6 +61,26 @@
 #                  (default: all; the drivers only need the nodes and the
 #                  sidecar reachable, so one host can drive the fleet)
 #
+# Placement leaves (docs/placement.md), 2026-09-05: one run of this script
+# builds ONE leaf's shard set from that leaf's input files; a fleet with
+# several leaves runs it once per leaf with disjoint OUT, ports, and slot
+# ranges, and a root coordinator over a shard map that names them all:
+#
+#   SLOT_BASE      added to every slot offset (default 0), so a later
+#                  leaf's id range sits above an earlier leaf's
+#   CONTIGUOUS_SLOTS=1  offset[i] = SLOT_BASE + rows of shards before i
+#                  (no stride headroom), which a relay coordinator
+#                  requires of its children (docs/relay-coordinators.md)
+#   CLUSTER_META   court_ingest --cluster-meta table; when set the nodes
+#                  also declare --facet-fields=court --integer-fields=year,decided
+#   NODE_EXTRA_ARGS / COORD_EXTRA_ARGS  extra flags appended to every
+#                  node / to the coordinator (word-split), e.g.
+#                  --placement-column=placement --placement-leaf=<code>
+#   SHARD_MAP      the coordinator takes --shard-map=<toml> instead of
+#                  --nodes=$NODE_LIST
+#   CALIBRATION    an existing calibration.json the calibrate stage copies
+#                  into $OUT instead of fitting a new one
+#
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -137,6 +157,17 @@ TLS_ARGS=${TLS_ARGS:-}
 read -r -a TLS_ARG_LIST <<<"$TLS_ARGS"
 BEARER_TOKENS=${BEARER_TOKENS:-}
 BEARER_TOKEN_FILE=${BEARER_TOKEN_FILE:-}
+SLOT_BASE=${SLOT_BASE:-0}
+CONTIGUOUS_SLOTS=${CONTIGUOUS_SLOTS:-}
+CLUSTER_META=${CLUSTER_META:-}
+SHARD_MAP=${SHARD_MAP:-}
+CALIBRATION=${CALIBRATION:-}
+read -r -a NODE_EXTRA_ARG_LIST <<<"${NODE_EXTRA_ARGS:-}"
+read -r -a COORD_EXTRA_ARG_LIST <<<"${COORD_EXTRA_ARGS:-}"
+# Typed columns the nodes declare when the ingest carries cluster
+# metadata (court facet, filing year, filing date).
+COLUMN_ARGS=()
+[[ -n $CLUSTER_META ]] && COLUMN_ARGS=(--facet-fields=court --integer-fields=year,decided)
 # What a tool dials the fleet with: the TLS flags it knows (the CA and
 # the client identity; it leaves the listener flags alone) plus the
 # bearer token for the coordinator's public surface.
@@ -200,7 +231,14 @@ else
 fi
 ((STRIDE % BLOCK == 0)) || die "OFFSET_STRIDE=$STRIDE is not a multiple of $BLOCK"
 ((STRIDE >= MAXROWS)) || die "OFFSET_STRIDE=$STRIDE is smaller than the largest shard ($MAXROWS)"
-for ((i = 0; i < SHARDS; i++)); do OFFSETS[i]=$((i * STRIDE)); done
+((SLOT_BASE % BLOCK == 0)) || die "SLOT_BASE=$SLOT_BASE is not a multiple of $BLOCK"
+if [[ $CONTIGUOUS_SLOTS == 1 ]]; then
+  # Contiguous: shard i starts where shard i-1's rows end, so a relay
+  # coordinator can present the set as one range. No append headroom.
+  for ((i = 0; i < SHARDS; i++)); do OFFSETS[i]=$((SLOT_BASE + STARTS[i])); done
+else
+  for ((i = 0; i < SHARDS; i++)); do OFFSETS[i]=$((SLOT_BASE + i * STRIDE)); done
+fi
 
 SPLITS=""
 for ((i = 1; i < SHARDS; i++)); do SPLITS="${SPLITS:+$SPLITS,}${STARTS[i]}"; done
@@ -370,6 +408,7 @@ start_node() {
       --stream-search \
       --analysis-addr="$SIDECAR_ADDR" \
       "${PLAINTEXT_ARGS[@]}" "${TLS_ARG_LIST[@]}" \
+      "${COLUMN_ARGS[@]}" "${NODE_EXTRA_ARG_LIST[@]}" \
       ${SEAL_TAIL_DOCS:+--seal-tail-docs="$SEAL_TAIL_DOCS"} \
       ${VOCAB:+--vocab=true} \
       ${VOCAB_WINDOW_DOCS:+--vocab-window-docs="$VOCAB_WINDOW_DOCS"} \
@@ -453,6 +492,12 @@ stage_calibrate() {
     say "calibration already at $OUT/calibration.json"
     return
   fi
+  if [[ -n $CALIBRATION ]]; then
+    [[ -f $CALIBRATION ]] || die "CALIBRATION=$CALIBRATION does not exist"
+    cp "$CALIBRATION" "$OUT/calibration.json"
+    say "calibration copied from $CALIBRATION (shared across leaves; scores stay comparable)"
+    return
+  fi
   say "fitting the seed calibration (streams $EMB once)"
   "$INGEST" --nodes="$NODE_LIST" --embeddings="$EMB" --chunks="$CHUNKS" \
     --chunk-count="$M" --calibration="$OUT/calibration.json" --fit-only \
@@ -489,6 +534,7 @@ stage_ingest() {
       "$INGEST" --nodes="$NODE_LIST" \
         --chunks="$CHUNKS" --embeddings="$EMB" \
         --case-names="$CASE_NAMES" \
+        ${CLUSTER_META:+--cluster-meta="$CLUSTER_META"} \
         ${BODY_COLUMNS:+--body-columns="$BODY_COLUMNS"} \
         --chunk-count="$M" \
         --split-points="$SPLITS" \
@@ -565,13 +611,15 @@ stage_serve() {
   local coord_plain=()
   [[ $COORD_HOST != 127.0.0.1 && $COORD_HOST != localhost && $TLS_ARGS != *--tls-cert* ]] &&
     coord_plain=(--allow-plaintext)
+  local topology_args=(--nodes="$NODE_LIST")
+  [[ -n $SHARD_MAP ]] && topology_args=(--shard-map="$SHARD_MAP")
   "${NICE_PREFIX[@]}" "$BIN" --role=coordinator \
     --coord-listen="$COORD_HOST:$COORD_PORT" \
-    --nodes="$NODE_LIST" \
+    "${topology_args[@]}" \
     --chunk-blocks="$CHUNK_BLOCKS" \
     --stream-search \
     --analysis-addr="$SIDECAR_ADDR" \
-    "${coord_plain[@]}" "${TLS_ARG_LIST[@]}" \
+    "${coord_plain[@]}" "${TLS_ARG_LIST[@]}" "${COORD_EXTRA_ARG_LIST[@]}" \
     ${BEARER_TOKENS:+--bearer-tokens="$BEARER_TOKENS"} \
     >>"$LOGS/coordinator.log" 2>&1 &
   echo $! >"$RUN/coordinator.pid"
