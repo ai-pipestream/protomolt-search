@@ -1962,8 +1962,7 @@ pub(crate) fn validate_geo_filter(
 /// always floors toward negative infinity and the unit contract holds
 /// on both sides of the epoch. Everything that could make the stored
 /// value a lie instead refuses: `nanos` outside its declared range,
-/// an overflowing conversion, and a result that would collide with the
-/// column's absence sentinel.
+/// an overflowing conversion. Integer presence is tracked separately.
 pub(crate) fn timestamp_to_epoch_micros(
     field: &str,
     ts: &prost_types::Timestamp,
@@ -1985,12 +1984,6 @@ pub(crate) fn timestamp_to_epoch_micros(
                 ts.seconds
             ))
         })?;
-    if micros == crate::postings::INTEGER_ABSENT {
-        return Err(Status::invalid_argument(format!(
-            "timestamp field {field:?}: this instant converts to i64::MIN epoch micros, \
-             which is the column's absence sentinel"
-        )));
-    }
     Ok(micros)
 }
 
@@ -7957,6 +7950,16 @@ pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> Stri
         return String::new();
     }
     let mut hasher = crate::sha256::Sha256::new();
+    // Earlier I64 materialization silently discarded a valid MIN result.
+    // Refuse appends to those bindings instead of mixing projection semantics.
+    // F64-only specs retain their unchanged interpretation and hash.
+    if spec
+        .columns
+        .iter()
+        .any(|column| column.kind == crate::pb::MaterializeKind::I64 as i32)
+    {
+        hasher.update(b"pipestream-search.materialize.i64-presence.v1\0");
+    }
     for column in &spec.columns {
         for part in [column.name.as_str(), column.expression.as_str()] {
             hasher.update(&(part.len() as u64).to_be_bytes());
@@ -8448,13 +8451,6 @@ pub(crate) fn apply_materialize(
                              expression evaluated int on this document; write \
                              double(...) to land it in the f64 family"
                         )));
-                    }
-                    // i64::MIN is the i64 column's absence sentinel, so
-                    // the one unrepresentable computed value stores as
-                    // ABSENT — the same edge the checked arithmetic
-                    // already maps to absence.
-                    if v == i64::MIN {
-                        continue;
                     }
                     doc.integers.push(crate::pb::IntegerValue {
                         field: name.clone(),
@@ -9310,9 +9306,7 @@ impl NodeServiceImpl {
         };
         // Integer values, and timestamps as sugar over them: both land
         // in the SAME i64 table, so "repeats in one document" spans the
-        // two lists. Same refuse-before-mutating shape as the others,
-        // plus the sentinel rule — i64::MIN means absent in the column,
-        // so a document may not hold it.
+        // two lists. Every i64 value is valid; omission represents absence.
         let integer_slots: Vec<(usize, i64)> = {
             let shard = guard.bm25.as_ref().expect("builder just ensured");
             let mut seen: Vec<&str> = Vec::new();
@@ -9334,13 +9328,6 @@ impl NodeServiceImpl {
             for iv in &doc.integers {
                 let ii = resolve(&iv.field, &seen)?;
                 seen.push(&iv.field);
-                if iv.value == crate::postings::INTEGER_ABSENT {
-                    return Err(Status::invalid_argument(format!(
-                        "integer field {:?}: i64::MIN is the column's absence sentinel and \
-                         cannot be a value; omit absent values instead",
-                        iv.field
-                    )));
-                }
                 slots.push((ii, iv.value));
             }
             for tv in &doc.timestamps {
@@ -9676,8 +9663,8 @@ impl NodeServiceImpl {
                 }
                 Err(Status::failed_precondition(format!(
                     "this shard is durably bound to another mapping; {} differ{}. An index \
-                     only ever pairs with the plan it was written under — rebuild or \
-                     reshard to change the mapping",
+                     only ever pairs with the plan it was written under — rebuild from \
+                     original documents to change the mapping",
                     differs.join(" and "),
                     if differs.len() == 1 { "s" } else { "" }
                 )))

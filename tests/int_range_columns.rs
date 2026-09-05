@@ -996,8 +996,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
     mock.abort();
 }
 
-/// The integer ingest refusal matrix: unknown field, repeat, and the
-/// absence sentinel, each refused before anything mutates.
+/// Unknown fields and repeated values are refused before anything mutates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn integer_ingest_refusals_are_loud() {
     let (analysis, mock) = start_mock_analysis().await;
@@ -1006,7 +1005,6 @@ async fn integer_ingest_refusals_are_loud() {
     let cases: &[(Integers, &str)] = &[
         (&[("cite", 1)], "unknown integer field"),
         (&[("citations", 1), ("citations", 2)], "repeats"),
-        (&[("citations", i64::MIN)], "absence sentinel"),
     ];
     for (integers, needle) in cases {
         let err = add_documents_integer(&addrs[0], &[("some text", integers)])

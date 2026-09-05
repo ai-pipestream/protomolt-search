@@ -38,8 +38,7 @@ use crate::pb;
 
 /// The field width (bits per level) when the tree does not say.
 pub const DEFAULT_LEVEL_BITS: u32 = 9;
-/// Usable bits: `i64` without its sign, so codes are never negative and
-/// never the `i64::MIN` absence sentinel.
+/// Usable bits: `i64` without its sign, so placement codes stay nonnegative.
 pub const CODE_BITS: u32 = 63;
 
 /// One node as written in a shard map's `[placement]` table.

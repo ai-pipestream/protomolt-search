@@ -97,6 +97,31 @@ entire 16-test LTR target passed on retry. The cause was not established.
 All five Android/iOS Rust target checks passed with the three existing relay
 dead-code warnings. These are local checks, not fleet deployment evidence.
 
+Signed numeric columns now preserve the entire i64 domain with a separate
+presence bitmap in storage kind 10. Heap and spill writers agree byte-for-byte;
+heap and mapped readers validate section geometry, canonical absence bytes,
+bitmap padding and min/max. Legacy kind 4 still decodes its original sentinel
+semantics and rewrites into kind 10. Older binaries refuse the new kind.
+Mapped extraction and materialization preserve a real `i64::MIN`, including
+through flush/reopen and WAL replay during compaction on both layouts.
+
+I64 materialization now contributes a semantic-version marker to the binding
+hash: old bindings can contain silently omitted MIN values and refuse new
+appends until rebuilt from original documents. F64-only bindings and the v3
+base mapping fingerprint remain unchanged. Startup still reconciles ordinary
+shard WAL records to the flushed image; this increment does not add automatic
+roll-forward recovery or stronger write receipts. Unsigned numeric columns,
+other protobuf shapes and the remaining authorization/publication work remain
+required.
+
+The presence increment passed 420 library tests, 505 integration tests across
+85 targets and 10 embedded tests on 2026-09-05, with one existing sidecar test
+ignored and no failures in the final run. All five Android/iOS target checks
+passed with the three existing relay dead-code warnings. Tests/examples
+compilation, formatting, fixture regeneration and vendored-proto checks passed;
+the public search descriptor remains byte-identical when source comments are
+excluded. No fleet benchmark, rebuild or cutover was performed.
+
 `tests/protobuf_semantics.rs` uses generated prost messages as differential
 oracles and adversarial wire encodings. `tests/descriptor_mappings.rs` pins the
 new fingerprint. `tests/mapped_ingest.rs` exercises binding, column landing,

@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Full-domain signed numeric columns (2026-09-05).** Integer presence now
+  has its own bitmap, so `i64::MIN` survives ingest, materialization, querying,
+  reopen and compaction. New files use kind 10; older readers refuse it.
+  Existing I64 materialization bindings require a rebuild from original
+  documents because the previous implementation could silently drop that value.
+  See [integer storage](docs/range-facets.md).
+
 - **Fleet rebuild guidance (2026-09-05).** The rebuild runbook now distinguishes
   the current v7 vector container and shared calibration from the abandoned
   per-block branch, and records staged generation and acceptance requirements.

@@ -53,8 +53,7 @@ because one occurrence is indexed.
 The query representation distinguishes analyzed text, string facets, signed
 integers, floating-point numbers and dense vectors. Constraints describe current
 conversions and value-domain restrictions: finite numerics, f32 vectors, the
-unsigned-to-i64 limit on signed numeric columns, the signed absence sentinel,
-string-rendered enums and
+unsigned-to-i64 limit on signed numeric columns, string-rendered enums and
 epoch-microsecond timestamp storage. Bind-time analyzer configuration,
 materialization and authorization are separate contracts. The report grants no
 access and adds no source-fetch route.

@@ -88,6 +88,9 @@ const COLUMN_KIND_MAP_F64: u8 = 3;
 /// a citation count, or an epoch-micros timestamp must come back the
 /// integer it went in as.
 const COLUMN_KIND_I64: u8 = 4;
+/// Full-domain i64: fixed-width values followed by an LSB-first presence bitmap.
+/// Same table payload as kind 4; absent slots have canonical zero value bytes.
+const COLUMN_KIND_I64_PRESENT: u8 = 10;
 /// v7 column-table kind: geo-point column (`docs/geo-columns.md`), a
 /// per-slot (lat, lon) f64 pair at a fixed 16 B stride. BOTH halves NaN
 /// means absent; a half-NaN pair is refused at open as corruption,
@@ -425,8 +428,14 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:pairs"), u64_at(base + 20)));
                     cursor = base + 28;
                 }
-                COLUMN_KIND_I64 => {
+                COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
                     starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
+                    if kind == COLUMN_KIND_I64_PRESENT {
+                        starts.push((
+                            format!("column:{name}:presence"),
+                            u64_at(base + 16) + 8 * u64::from(u32_at(12)),
+                        ));
+                    }
                     cursor = base + 24;
                 }
                 COLUMN_KIND_GEO => {
@@ -941,10 +950,8 @@ impl FieldStore {
 /// field" in a facet column, in heap and on disk alike.
 pub const FACET_ABSENT: u32 = u32::MAX;
 
-/// The value marking "this document has no value" in an i64 column
-/// (`docs/range-facets.md`). An i64 column has no NaN to spend, so one
-/// value of the domain pays for absence; ingest refuses it explicitly
-/// rather than letting a real `i64::MIN` disappear.
+/// Legacy kind-4 absence marker. New integer columns use a presence bitmap;
+/// this constant is only used when decoding the old on-disk representation.
 pub const INTEGER_ABSENT: i64 = i64::MIN;
 
 /// The pair marking "this document has no point" in a geo-point column
@@ -1106,18 +1113,18 @@ impl NumericStore {
     }
 }
 
-/// One i64 column (`docs/range-facets.md`): per-slot values parallel
-/// to the shared slot space, [`INTEGER_ABSENT`] = the document has no
-/// value. The exact-integer sibling of [`NumericStore`] — same shape,
-/// same fixed stride, no rounding above 2^53. min/max over present
-/// values are computed at write time into the v7 column table.
+/// One full-domain integer column. Presence never consumes a numeric value.
 #[derive(Debug)]
 struct IntStore {
-    /// Integer field name from the schema.
     name: String,
-    /// Per-slot value ([`INTEGER_ABSENT`] = no value). May be shorter
-    /// than the slot count; missing trailing slots read as absent.
     vals: Vec<i64>,
+    present: Vec<u8>,
+}
+
+fn integer_present(bitmap: &[u8], slot: usize) -> bool {
+    bitmap
+        .get(slot / 8)
+        .is_some_and(|byte| byte & (1 << (slot % 8)) != 0)
 }
 
 impl IntStore {
@@ -1125,53 +1132,50 @@ impl IntStore {
         Self {
             name: name.to_string(),
             vals: Vec::new(),
+            present: Vec::new(),
         }
     }
 
     fn value(&self, slot: usize) -> Option<i64> {
-        match self.vals.get(slot).copied() {
-            None | Some(INTEGER_ABSENT) => None,
-            some => some,
-        }
+        integer_present(&self.present, slot).then(|| self.vals[slot])
     }
 
-    /// Record `doc_id`'s value. [`INTEGER_ABSENT`] is refused (callers
-    /// validate it into a loud refusal first); one value per (document,
-    /// field), a second write panics.
+    /// One value per document and field; a second write is a caller error.
     fn set(&mut self, doc_id: u32, value: i64) {
-        assert!(
-            value != INTEGER_ABSENT,
-            "integer field {:?}: i64::MIN is the absence sentinel and cannot be a value \
-             (doc {doc_id})",
-            self.name
-        );
         let slot = doc_id as usize;
-        if self.vals.len() <= slot {
-            self.vals.resize(slot + 1, INTEGER_ABSENT);
-        }
         assert!(
-            self.vals[slot] == INTEGER_ABSENT,
+            !integer_present(&self.present, slot),
             "doc {doc_id} already has a value for integer field {:?}",
             self.name
         );
+        if self.vals.len() <= slot {
+            self.vals.resize(slot + 1, 0);
+            self.present.resize((slot + 1).div_ceil(8), 0);
+        }
         self.vals[slot] = value;
+        self.present[slot / 8] |= 1 << (slot % 8);
     }
 
-    /// (min, max) over present values. A column with none folds to
-    /// `(i64::MAX, i64::MIN)` — min > max is the empty range, which is
-    /// self-describing and cannot collide with any real pair (the NaN
-    /// role, played by an impossible interval instead of a value).
+    /// The inverted range (MAX, MIN) means no values; a real MIN is present.
     fn min_max(&self) -> (i64, i64) {
-        let mut min = i64::MAX;
-        let mut max = i64::MIN;
-        for &v in &self.vals {
-            if v == INTEGER_ABSENT {
-                continue;
-            }
-            min = min.min(v);
-            max = max.max(v);
+        self.vals
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| integer_present(&self.present, *slot))
+            .fold((i64::MAX, i64::MIN), |(min, max), (_, &v)| {
+                (min.min(v), max.max(v))
+            })
+    }
+
+    fn write(&self, w: &mut impl Write, n_slots: usize) -> io::Result<()> {
+        for slot in 0..n_slots {
+            write_u64(w, self.value(slot).unwrap_or(0) as u64)?;
         }
-        (min, max)
+        let bytes = n_slots.div_ceil(8);
+        let held = self.present.len().min(bytes);
+        w.write_all(&self.present[..held])?;
+        io::copy(&mut io::repeat(0).take((bytes - held) as u64), w)?;
+        Ok(())
     }
 }
 
@@ -2020,7 +2024,7 @@ impl Bm25Store {
     }
 
     /// Record `doc_id`'s value for integer field `ii`; see
-    /// [`IntStore::set`] for the contract (never [`INTEGER_ABSENT`]).
+    /// [`IntStore::set`] for the contract.
     pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
         self.integers[ii].set(doc_id, value);
     }
@@ -2882,16 +2886,13 @@ impl Bm25Store {
             map_numeric_offs.push((keys_off, offsets_off, pairs_off));
             cursor = pairs_off + 12 * total_pairs;
         }
-        // vals_off per i64 column, last in table order (a new kind
-        // appends; the earlier kinds' geometry must not shift).
+        // Integer values followed by their explicit presence bitmap.
         let mut integer_offs: Vec<u64> = Vec::with_capacity(self.integers.len());
         for _ in &self.integers {
             integer_offs.push(cursor);
-            cursor += 8 * n_slots;
+            cursor += 8 * n_slots + n_slots.div_ceil(8);
         }
-        // vals_off per geo column, last in table order. Kind 5 appends
-        // for the same reason kind 4 did: kinds 0 through 4 must keep
-        // byte-for-byte the geometry they already have.
+        // Geo sections follow the integer groups.
         let mut geo_offs: Vec<u64> = Vec::with_capacity(self.geos.len());
         for _ in &self.geos {
             geo_offs.push(cursor);
@@ -3009,7 +3010,7 @@ impl Bm25Store {
                 let (min, max) = c.min_max();
                 write_u16(w, c.name.len() as u16)?;
                 w.write_all(c.name.as_bytes())?;
-                w.write_all(&[COLUMN_KIND_I64])?;
+                w.write_all(&[COLUMN_KIND_I64_PRESENT])?;
                 write_u64(w, min as u64)?;
                 write_u64(w, max as u64)?;
                 write_u64(w, vals_off)?;
@@ -3074,12 +3075,7 @@ impl Bm25Store {
             write_map_numeric_column(w, c, n_slots as usize, byte_order)?;
         }
         for c in &self.integers {
-            for slot in 0..n_slots as usize {
-                write_u64(
-                    w,
-                    c.vals.get(slot).copied().unwrap_or(INTEGER_ABSENT) as u64,
-                )?;
-            }
+            c.write(w, n_slots as usize)?;
         }
         for c in &self.geos {
             for slot in 0..n_slots as usize {
@@ -3292,6 +3288,7 @@ impl Bm25Store {
 
     fn read_from(r: &mut &[u8]) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+        let original = *r;
         let magic = take(r, 8)?;
         if magic == MAGIC_V8 {
             // Rebuild the full-file view (the trailer's offsets are
@@ -3311,13 +3308,16 @@ impl Bm25Store {
                     )));
                 }
             }
+            validate_structure_v6(&full[..table.payload_len as usize], table.base_v7)?;
             let mut payload = &full[8..table.payload_len as usize];
             return Self::read_v6v7_from(&mut payload, table.base_v7);
         }
         if magic == MAGIC_V7 {
+            validate_structure_v6(original, true)?;
             return Self::read_v6v7_from(r, true);
         }
         if magic == MAGIC_V6 {
+            validate_structure_v6(original, false)?;
             return Self::read_v6v7_from(r, false);
         }
         if magic == MAGIC_V5 {
@@ -4129,7 +4129,7 @@ impl Bm25Store {
         let mut map_facet_metas: Vec<(String, u32, u32, u64, u64, u64, u64)> = Vec::new();
         // (name, n_keys, keys, offsets, pairs)
         let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
-        let mut integer_metas: Vec<(String, u64)> = Vec::new();
+        let mut integer_metas: Vec<(String, u64, bool)> = Vec::new();
         let mut geo_metas: Vec<(String, u64)> = Vec::new();
         // (field name, section_off) per kind-7 entry.
         let mut positions_metas: Vec<(String, u64)> = Vec::new();
@@ -4181,8 +4181,12 @@ impl Bm25Store {
                         ));
                         cursor = base + 28;
                     }
-                    COLUMN_KIND_I64 => {
-                        integer_metas.push((name, u64_at(base + 16)?));
+                    COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
+                        integer_metas.push((
+                            name,
+                            u64_at(base + 16)?,
+                            kind == COLUMN_KIND_I64_PRESENT,
+                        ));
                         cursor = base + 24;
                     }
                     COLUMN_KIND_GEO => {
@@ -4439,14 +4443,25 @@ impl Bm25Store {
                 pairs,
             });
         }
-        // i64 columns (v7 only): n_slots x i64, INTEGER_ABSENT = absent.
+        // Translate legacy sentinel columns into explicit in-memory presence.
         let mut integers = Vec::with_capacity(integer_metas.len());
-        for (name, vals_off) in integer_metas {
-            let mut vals = Vec::with_capacity(n_slots);
-            for slot in 0..n_slots as u64 {
-                vals.push(u64_at(vals_off + 8 * slot)? as i64);
+        for (name, vals_off, has_presence) in integer_metas {
+            let mut column = IntStore::new(&name);
+            let bitmap = if has_presence {
+                Some(at(
+                    vals_off + 8 * n_slots as u64,
+                    (n_slots as u64).div_ceil(8),
+                )?)
+            } else {
+                None
+            };
+            for slot in 0..n_slots {
+                let value = u64_at(vals_off + 8 * slot as u64)? as i64;
+                if bitmap.map_or(value != INTEGER_ABSENT, |bits| integer_present(bits, slot)) {
+                    column.set(slot as u32, value);
+                }
             }
-            integers.push(IntStore { name, vals });
+            integers.push(column);
         }
         // Geo columns (v7 only): n_slots x (f64 lat, f64 lon) at a
         // 16 B stride, (NaN, NaN) = absent. Validation already refused a
@@ -5469,16 +5484,13 @@ impl SpillBuilder {
             map_numeric_offs.push((keys_off, offsets_off, pairs_off));
             cursor = pairs_off + 12 * total_pairs;
         }
-        // vals_off per i64 column, last in table order (a new kind
-        // appends; the earlier kinds' geometry must not shift).
+        // Integer values followed by their explicit presence bitmap.
         let mut integer_offs: Vec<u64> = Vec::with_capacity(self.integers.len());
         for _ in &self.integers {
             integer_offs.push(cursor);
-            cursor += 8 * n_slots;
+            cursor += 8 * n_slots + n_slots.div_ceil(8);
         }
-        // vals_off per geo column, last in table order. Kind 5 appends
-        // for the same reason kind 4 did: kinds 0 through 4 must keep
-        // byte-for-byte the geometry they already have.
+        // Geo sections follow the integer groups.
         let mut geo_offs: Vec<u64> = Vec::with_capacity(self.geos.len());
         for _ in &self.geos {
             geo_offs.push(cursor);
@@ -5590,7 +5602,7 @@ impl SpillBuilder {
                     let (min, max) = c.min_max();
                     write_u16(&mut w, c.name.len() as u16)?;
                     w.write_all(c.name.as_bytes())?;
-                    w.write_all(&[COLUMN_KIND_I64])?;
+                    w.write_all(&[COLUMN_KIND_I64_PRESENT])?;
                     write_u64(&mut w, min as u64)?;
                     write_u64(&mut w, max as u64)?;
                     write_u64(&mut w, vals_off)?;
@@ -5704,12 +5716,7 @@ impl SpillBuilder {
                 write_map_numeric_column(&mut w, c, n_slots as usize, true)?;
             }
             for c in &self.integers {
-                for slot in 0..n_slots as usize {
-                    write_u64(
-                        &mut w,
-                        c.vals.get(slot).copied().unwrap_or(INTEGER_ABSENT) as u64,
-                    )?;
-                }
+                c.write(&mut w, n_slots as usize)?;
             }
             for c in &self.geos {
                 for slot in 0..n_slots as usize {
@@ -6608,7 +6615,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     // (n_keys, keys, offsets, pairs)
     let mut map_numerics: Vec<(u32, u64, u64, u64)> = Vec::new();
     // (min_bits, max_bits, vals)
-    let mut integers: Vec<(u64, u64, u64)> = Vec::new();
+    let mut integers: Vec<(u64, u64, u64, bool)> = Vec::new();
     // (min_lat, max_lat, min_lon, max_lon bits, vals)
     let mut geos: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
     // (field name, section_off, total occurrences) per kind-7 entry.
@@ -6667,8 +6674,13 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     ));
                     cursor = base + 28;
                 }
-                COLUMN_KIND_I64 => {
-                    integers.push((u64_at(base)?, u64_at(base + 8)?, u64_at(base + 16)?));
+                COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
+                    integers.push((
+                        u64_at(base)?,
+                        u64_at(base + 8)?,
+                        u64_at(base + 16)?,
+                        kind == COLUMN_KIND_I64_PRESENT,
+                    ));
                     cursor = base + 24;
                 }
                 COLUMN_KIND_GEO => {
@@ -7110,19 +7122,17 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         }
         expected_start = group_end;
     }
-    // Integer groups (docs/range-facets.md): one n_slots x i64 vals
-    // section each, tiling from the last map-numeric group to EOF. The
-    // table's min/max must agree with a full scan over the NON-sentinel
-    // values — i64::MIN is absence, so a column of nothing but absences
-    // folds to the empty range (i64::MAX, i64::MIN), which is exactly
-    // what the writer emits.
-    for (i, &(min_bits, max_bits, vals_off)) in integers.iter().enumerate() {
+    // Integer groups: values plus optional presence, tiling without gaps.
+    // Metadata is checked against present values. Legacy kind 4 keeps its
+    // sentinel semantics; kind 10 validates the bitmap and canonical absences.
+    for (i, &(min_bits, max_bits, vals_off, has_presence)) in integers.iter().enumerate() {
         if vals_off != expected_start {
             return Err(invalid(format!(
                 "integer field {i}: vals section does not start at the previous section's end"
             )));
         }
-        let group_end = vals_off + 8 * n_slots;
+        let bitmap_off = vals_off + 8 * n_slots;
+        let group_end = bitmap_off + if has_presence { n_slots.div_ceil(8) } else { 0 };
         let expected_end = integers
             .get(i + 1)
             .map(|c| c.2)
@@ -7134,11 +7144,29 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                 "integer field {i}: vals section does not end at the next section's start"
             )));
         }
+        let bitmap = if has_presence {
+            let bits = bytes_at(bitmap_off, n_slots.div_ceil(8))?;
+            if n_slots % 8 != 0 && bits.last().is_some_and(|b| b >> (n_slots % 8) != 0) {
+                return Err(invalid(format!(
+                    "integer field {i}: nonzero presence padding"
+                )));
+            }
+            Some(bits)
+        } else {
+            None
+        };
         let mut min = i64::MAX;
         let mut max = i64::MIN;
         for slot in 0..n_slots {
             let v = u64_at(vals_off + 8 * slot)? as i64;
-            if v == INTEGER_ABSENT {
+            if !bitmap.map_or(v != INTEGER_ABSENT, |bits| {
+                integer_present(bits, slot as usize)
+            }) {
+                if has_presence && v != 0 {
+                    return Err(invalid(format!(
+                        "integer field {i}: nonzero absent value at slot {slot}"
+                    )));
+                }
                 continue;
             }
             min = min.min(v);
@@ -7446,6 +7474,8 @@ struct IntegerSlice {
     max: i64,
     /// Absolute offset of the vals section (n_slots x i64).
     vals_off: u64,
+    /// None decodes the legacy kind-4 sentinel.
+    presence_off: Option<u64>,
 }
 
 /// Per-geo-column read state of one open v7 file: the bounding-box
@@ -7737,7 +7767,7 @@ impl Bm25Reader {
     }
 
     /// `doc_id`'s value for numeric field `ni`, `None` when absent.
-    /// One 8 B read of the mmapped fixed-stride vals section.
+    /// One fixed-width value read and, for kind 10, one presence-bit read.
     pub fn numeric_value(&self, ni: usize, doc_id: u32) -> Option<f64> {
         let numeric = &self.numerics[ni];
         let slot = doc_id as usize;
@@ -7779,7 +7809,7 @@ impl Bm25Reader {
     }
 
     /// `doc_id`'s value for integer field `ii`, `None` when absent.
-    /// One 8 B read of the mmapped fixed-stride vals section.
+    /// One fixed-width value read and, for kind 10, one presence-bit read.
     pub fn integer_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         let integer = &self.integers[ii];
         let slot = doc_id as usize;
@@ -7788,11 +7818,13 @@ impl Bm25Reader {
         }
         let off = integer.vals_off as usize + 8 * slot;
         let v = u64::from_le_bytes(self.map[off..off + 8].try_into().expect("8 bytes")) as i64;
-        if v == INTEGER_ABSENT {
-            None
-        } else {
-            Some(v)
-        }
+        let present = integer.presence_off.map_or(v != INTEGER_ABSENT, |off| {
+            integer_present(
+                &self.map[off as usize..off as usize + self.n_slots().div_ceil(8)],
+                slot,
+            )
+        });
+        present.then_some(v)
     }
 
     /// Number of geo fields in the geo table (0 pre-v7).
@@ -8288,12 +8320,14 @@ impl Bm25Reader {
                         });
                         cursor = base + 28;
                     }
-                    COLUMN_KIND_I64 => {
+                    COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
                         integers.push(IntegerSlice {
                             name,
                             min: u64_at(base) as i64,
                             max: u64_at(base + 8) as i64,
                             vals_off: u64_at(base + 16),
+                            presence_off: (kind == COLUMN_KIND_I64_PRESENT)
+                                .then(|| u64_at(base + 16) + 8 * n_slots as u64),
                         });
                         cursor = base + 24;
                     }

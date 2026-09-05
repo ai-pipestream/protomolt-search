@@ -184,12 +184,18 @@ quality and geography layers use (`docs/quality-columns.md`):
    request carries the values, so **replay never evaluates twice** and
    a later spec change cannot silently rewrite history.
 
-An absent result stores nothing (Kleene again). One storage edge: a
-computed i64 equal to `i64::MIN` — the i64 column's absence sentinel —
-stores as absent, the same edge the checked arithmetic already maps to
-absence. A name the document does not carry is absent, not a typo:
+An absent result stores nothing (Kleene again). Every computed i64 value,
+including `i64::MIN`, is stored with explicit presence. Arithmetic overflow
+still evaluates absent; a valid minimum integer does not. A name the document
+does not carry is absent, not a typo:
 at ingest there is no fleet-wide table to check a spelling against, and
 the declared-column check on the OUTPUT name is where typos surface.
+
+The corrected I64 presence behavior has a versioned materialization hash.
+Mapped binds with an I64 output refuse their old hash, even for the same
+expression; rebuild from original documents to recompute the previously
+omitted values. F64-only specs retain their old hash. Replaying already-derived
+WAL records preserves their recorded values; it does not repair old omissions.
 
 Changing a materialization expression changes what an index means, so
 it is an index compatibility event — rebuild, not mutate. Mapped

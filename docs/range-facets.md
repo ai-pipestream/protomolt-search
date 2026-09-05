@@ -14,30 +14,42 @@ engine's entire argument is that its results are exact. A column that
 quietly returns a neighbouring integer is the same failure as a
 coordinator that quietly returns a neighbouring ranking.
 
-So integers get kind 4: a true i64 column, same fixed stride and same
-per-slot shape as the f64 column, no rounding anywhere in storage.
+Integers use a true i64 column, with no rounding in storage. New writers use
+kind 10, which stores presence separately from the value bits:
 
 ```text
-kind 4 (i64) table entry:
-  u16 name_len | name | u8 kind=4 | u64 min_bits | u64 max_bits | u64 vals_off
-section: n_slots x i64, i64::MIN = absent
+kind 10 (i64 with presence) table entry:
+  u16 name_len | name | u8 kind=10 | u64 min_bits | u64 max_bits | u64 vals_off
+sections:
+  n_slots x little-endian i64
+  ceil(n_slots / 8) presence bytes; bit (slot % 8) of byte (slot / 8)
 ```
 
-`min_bits`/`max_bits` are the i64 two's-complement bits, validated at
-open against a full scan of the section, exactly as the f64 column's
-are. i64 groups tile after the map-numeric groups and before EOF; the
-kinded table meant this needed no new magic and touched no existing
-kind, which is now the third time that has paid off (`docs/facets.md`
-called the shot, `docs/map-columns.md` collected once already).
+A set bit means present, including zero and `i64::MIN`. Unset slots have
+canonical zero value bytes; unused bits in the last byte must also be zero.
+Both readers validate these rules, exact section extents and min/max over
+present values. The inverted range `(i64::MAX, i64::MIN)` denotes an empty
+column, while `(i64::MIN, i64::MIN)` describes a column whose only value is
+that minimum. Values and presence receive separate v8 CRC entries.
 
-**`i64::MIN` is the absence sentinel and ingest refuses it by name.**
-An i64 column has no NaN to spend, so absence costs one value of the
-domain. The alternative — a presence bitmap — is 1 bit per slot per
-column plus a branch on every read, to buy back one integer nobody
-sends. Spending the value is right; hiding the cost would not be, so
-`IntegerValue.value == INT64_MIN` is INVALID_ARGUMENT, and a column
-that no document valued folds its metadata to the empty range
-(`min = i64::MAX`, `max = i64::MIN`) rather than to a value.
+Legacy kind 4 has the same table entry width but only a values section, with
+`i64::MIN` meaning absent. Its interpretation is unchanged. Loading it into a
+heap store recovers explicit presence; the next write emits kind 10. Previously
+stored numeric values need no reindex. Older binaries refuse kind 10, so retain the
+old binary with its old shard generation for rollback and upgrade readers
+before producing new files. Stores without integer columns keep their format.
+The public `IntegerValue` wire shape and existing mapped-plan fingerprints are
+unchanged; the schema report no longer advertises the obsolete sentinel limit.
+An existing mapped binding with I64 materialized outputs is different: the old
+implementation could silently omit a computed `i64::MIN`. Its materialization
+hash now includes a semantic version, so new appends refuse the old binding.
+Rebuild that projection from original documents. Resharding or compaction of
+already-derived values cannot recover a missing materialized value. F64-only
+materialization hashes keep their existing semantics and remain unchanged.
+
+Presence costs one bit per row per integer column. It preserves the full
+protobuf signed domain without making a valid numeric value disappear. The
+separate unsigned column/query representation remains under development.
 
 Score stages read i64 columns transparently: `ScoreStage.column` with
 no `key` resolves against the f64 table first and the i64 table second
@@ -68,7 +80,7 @@ unit contract reads the same on both sides of the epoch. A producer
 that needs nanosecond identity sends an `IntegerValue` and owns the
 unit itself. Everything that could make the stored number a lie
 refuses instead: `nanos` outside `[0, 1e9)`, a conversion that
-overflows i64, and a result that would land on the absence sentinel.
+overflows i64.
 
 The WAL keeps the request verbatim, so replay redoes the conversion
 from the same instant rather than copying a copy — and reshard derives

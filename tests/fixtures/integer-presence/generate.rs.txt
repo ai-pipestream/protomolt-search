@@ -1,0 +1,12 @@
+use pipestream_search::postings::{AnalyzedDoc, Bm25Store};
+#[test]
+fn generate() {
+    let mut store = Bm25Store::with_fields(&["body"]).with_integers(&["value"]);
+    for row in 0..4 {
+        store.add_document(row, "word".into(), AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1));
+    }
+    for (row, value) in [(0, -7), (2, 0), (3, i64::MAX)] {
+        store.set_integer(0, row, value);
+    }
+    store.save(std::path::Path::new("tests/fixtures/integer-presence/legacy-kind4.bm25")).unwrap();
+}

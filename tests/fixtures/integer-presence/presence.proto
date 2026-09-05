@@ -1,0 +1,9 @@
+syntax = "proto3";
+package integer_presence;
+import "ai/protomolt/proto/index/hints/v1/indexing_hints.proto";
+message Record {
+  string id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  string body = 2;
+  repeated float embedding = 3;
+  optional int64 value = 4;
+}

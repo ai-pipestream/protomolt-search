@@ -211,15 +211,6 @@ fn projection(
     let mut constraints = Vec::new();
     if usage == Use::Value {
         if representation == Query::SignedInteger
-            && (matches!(
-                descriptor.r#type(),
-                Type::Int64 | Type::Sint64 | Type::Sfixed64
-            ) || mapped.kind == pb::MappedKind::Date as i32)
-        {
-            constraints
-                .push("i64::MIN is reserved for absence and is refused as a column value.".into());
-        }
-        if representation == Query::SignedInteger
             && matches!(descriptor.r#type(), Type::Uint64 | Type::Fixed64)
         {
             constraints.push("Values above i64::MAX are refused by the current extractor.".into());

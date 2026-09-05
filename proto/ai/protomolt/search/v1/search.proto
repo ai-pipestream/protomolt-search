@@ -2067,9 +2067,9 @@ message IntegerValue {
   // across `integers` and `timestamps`, which target the same
   // columns). Unknown names are INVALID_ARGUMENT.
   string field = 1;
-  // The value. INT64_MIN is INVALID_ARGUMENT: it is the column's
-  // absence sentinel, so a document cannot hold it. A document without
-  // a value for an integer field simply omits the entry.
+  // The value, over the full signed 64-bit domain including INT64_MIN.
+  // A document without a value for this field omits the entry; presence
+  // is stored separately from the numeric bits.
   sint64 value = 2;
 }
 
@@ -2092,8 +2092,7 @@ message TimestampValue {
   // valued by both `integers` and `timestamps` in one document is
   // INVALID_ARGUMENT — a document holds one value per column.
   string field = 1;
-  // The instant. Refused when the epoch-micros conversion overflows
-  // i64 or lands exactly on INT64_MIN (the absence sentinel).
+  // The instant. Refused when the epoch-micros conversion overflows i64.
   google.protobuf.Timestamp value = 2;
 }
 
