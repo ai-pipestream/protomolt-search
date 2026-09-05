@@ -3,9 +3,9 @@
 # v7 rebuild driver: build a fresh multi-field shard set from the raw
 # chunk texts + embeddings, with block-aligned shard cuts.
 #
-# The .tv format is v7 (per-block TQ+ calibration) and the .bm25 format is
-# v6 (multi-field). Neither reads an older file, so adoption is a rebuild,
-# never a migration -- see docs/multi-field.md and README-block-max.md.
+# The directory name is historical. The pinned vector backend uses the v7
+# container with one shared calibration; the current BM25 writer emits v8.
+# Check actual reader compatibility before deciding to rebuild; see README.md.
 #
 # Usage: rebuild.sh <stage> [stage...]
 #
@@ -174,11 +174,8 @@ BASE_BLOCKS=$((FULL_BLOCKS / SHARDS))
 EXTRA=$((FULL_BLOCKS % SHARDS))
 
 # Rows per shard: whole blocks everywhere, with the corpus tail landing on
-# the LAST shard. Whole-block shards are what makes a distributed scan
-# bitwise-equal to a monolithic one under per-block calibration: a sealed
-# block refits on exactly its own rows, so aligned cuts give every shard
-# the same block content the monolith had. The tail rides its shard's last
-# seal, which is the monolith's last seal too -- hence the tail goes last.
+# the LAST shard. These cuts preserve corpus geometry; shared calibration
+# no longer requires block alignment for distributed score equivalence.
 declare -a ROWS STARTS OFFSETS
 start=0
 for ((i = 0; i < SHARDS; i++)); do

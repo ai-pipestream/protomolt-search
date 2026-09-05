@@ -3,22 +3,34 @@
 Building a fresh shard set from the raw chunk texts and embeddings, with
 block-aligned cuts and the multi-field BM25 index.
 
-## Why this is a rebuild and not a migration
+## Current rebuild contract (2026-09-05)
 
-Two format breaks land together:
+Pin one tested search commit and its lockfile for every node, coordinator and
+client tool. Build into a new `OUT` directory on each host, with disjoint node
+and coordinator ports, and retain the previous binary and shard generation
+through verification and soak. Keep the recorded corpus, embeddings, analyzer
+configuration and mTLS client identity. Run `plan` with the actual host's disk
+headroom before `up`; the historical size measurements below are estimates,
+not a current capacity guarantee.
 
-- **`.tv` v7** — TQ+ calibration is now per 8192-vector block. Each block
-  fits and freezes its own shift/scale, so cross-shard score comparability
-  is free by construction. v6 files do not load.
-- **`.bm25` v6** — per-field sections sharing one slot space, so a shard
-  can score `body` and `case_name` separately and fused. v5 and earlier
-  hold one field.
+The current `turbovec-pipestream-s20` lockfile pins `0c6cf820`, whose reader and
+writer use the v7 container. The normal loader refuses v5/v6 vector images.
+This v7 container is different from the abandoned per-block calibration branch
+that originally gave this directory its name. Calibration is one explicit
+shared shift/scale pair: fit once and seed every shard from the same
+`calibration.json`. Do not fit independent shard calibrations.
 
-Neither reader accepts the older file, and back-compat is deliberately not
-a goal here: these formats have no external clients. The resolution for
-any break is to rebuild from the inputs we keep for exactly this purpose
-(`chunks-full.ndjson` + `embeddings-full.bin`, both mirrored to the NAS),
-never to migrate in place.
+The current BM25 writer emits the CRC-protected `TVBM2508` container; readers
+accept v3 through v8. New query/coordinator behavior alone does not require
+reindexing. Rebuild when the actual stored vector format is refused, term
+identity or required columns change, or corpus/model inputs change. The dense
+identity and integer keyword fixes do not themselves change stored formats.
+
+Keep the original chunk texts and embeddings. For a fresh corpus build use
+those inputs rather than overwriting an incompatible shard in place. Run
+`verify` for local BM25 integrity and the separate `v7_verify` acceptance matrix
+against the new coordinator, followed by relevance and latency canaries. A
+successful `serve` readiness probe alone is not acceptance.
 
 ## What you need before starting
 
@@ -109,23 +121,16 @@ and runs anyway rather than passing quietly.
 
 ## Why the cuts are block-aligned
 
-Under per-block calibration a sealed block refits on exactly its own rows,
-which makes its quantization a deterministic function of its content. So a
-distributed scan is bitwise-equal to a monolithic one **only when every
-shard holds whole blocks** — an arbitrary cut leaves a shard's first and
-last blocks holding different rows than the monolith's, and they quantize
-differently.
+The script retains block-aligned cuts for stable corpus geometry and puts the
+leftover tail on the last shard. Current shared calibration does not require
+block-aligned cuts for score equivalence. For 86,633,399 chunks over eight
+shards, the plan has 1322 blocks each for shards 0–6 and 1321 blocks plus 2999
+rows for shard 7.
 
-`rebuild.sh` derives the cuts from the corpus size: whole blocks
-everywhere, the leftover tail on the LAST shard. The tail matters because
-an unsealed (open) block rides its index's most recent fit; putting it on
-the final shard means it rides the same last seal the monolith's tail
-would. For 86,633,399 chunks over 8 shards that is 1322 blocks each for
-shards 0-6 and 1321 blocks + 2999 rows for shard 7.
-
-Slot offsets are block-aligned too (`i * 21659648` by default, 100%
-headroom over the largest shard), so `global_id / 8192` stays a unique
-(shard, block) pair.
+Slot offsets retain headroom above each shard's initial row count. Preserve the
+plan's offsets on every host; changing cuts or compacting rows invalidates
+position-based ground truth. Stable product identity comes from source lineage
+or document keys, not those row positions.
 
 ## Disk: the part that actually constrains the run
 

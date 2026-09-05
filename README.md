@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Fleet rebuild guidance (2026-09-05).** The rebuild runbook now distinguishes
+  the current v7 vector container and shared calibration from the abandoned
+  per-block branch, and records staged generation and acceptance requirements.
+  See [the rebuild contract](deploy/v7-rebuild/README.md#current-rebuild-contract-2026-09-05).
+
 - **Full-range integer keywords (2026-09-05).** Explicit keyword mappings
   preserve exact decimal strings for every protobuf integer encoding, including
   `uint64` and `fixed64` above `i64::MAX`. Parent IDs preserve their integer
