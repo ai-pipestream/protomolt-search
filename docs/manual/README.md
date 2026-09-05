@@ -25,11 +25,14 @@ float precision on top, an exact rerank over the candidate pool is one flag, and
 the depth that meets a recall target comes from a profile built by measurement,
 and not from a rule of thumb.
 
-**Shards share score cutoffs, so the fleet stops early together.** As soon as
-any shard has k candidates, its k-th best is a lower bound on the global k-th
-best. The coordinator collects those bounds, takes the highest, and pushes it
-back to every shard, which then skips work that cannot reach the answer.
-No correct hit is discarded: this is early termination, not sampling.
+**Shards share score cutoffs.** As soon as any shard has k candidates, its
+k-th best is a lower bound on the global k-th best. The coordinator collects
+those bounds, takes the highest, and pushes it back to every shard. A lexical
+shard then skips index blocks whose best possible score is under the cutoff,
+and a vector shard drops candidates under it before they cost heap work or a
+trip to the coordinator. The vector scan still visits its rows in full, which
+is what lets a shard certify that its part of the answer is complete. No
+correct hit is discarded: this is pruning, not sampling.
 
 **BM25 scores over global statistics.** Before scoring, the coordinator collects
 per-term document frequencies and corpus totals from every shard and sends the
