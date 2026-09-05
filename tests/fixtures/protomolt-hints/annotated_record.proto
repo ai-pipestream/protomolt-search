@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package namespace_fixture.v1;
+
+import "ai/protomolt/proto/index/hints/v1/indexing_hints.proto";
+
+// Field names deliberately avoid the engine's id/vector inference names.
+message AnnotatedRecord {
+  string opaque_key = 1 [
+    (ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_DOC_ID
+  ];
+  repeated float signal = 2 [
+    (ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR
+  ];
+}

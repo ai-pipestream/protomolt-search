@@ -49,7 +49,7 @@ Three things are easy to conflate and must not be:
 1. **Descriptors are vocabulary.** A `google.protobuf.FileDescriptorSet`
    says what fields a message type has and what their proto types are.
    The shared gRPC descriptor-exchange contract (protomolt's
-   `ai.pipestream.proto.schema.registry.v1`, `descriptor_exchange.proto`)
+   `ai.protomolt.proto.schema.registry.v1`, `descriptor_exchange.proto`)
    is only a way to move those bytes around: nouns `DescriptorSet` and
    `DescriptorSetVersion`, verbs Register/Get/List plus a bidirectional
    Sync, content-addressed by SHA-256, descriptor bytes opaque.
@@ -66,13 +66,13 @@ Three things are easy to conflate and must not be:
    we link.
 
 The dependency consequence is the point of the layering: pipestream-search
-has **no dependency on protomolt**, compile-time or runtime. It vendors
-one proto file (section 5) exactly as it already vendors the OpenNLP
-sidecar's `analysis.proto`, and it consumes the exchange service as one
-gRPC client among any. Protomolt is a future client of pipestream-search,
+has **no dependency on ProtoMolt code**, compile-time or runtime. It vendors
+three ProtoMolt vocabulary protos (section 5), exactly as it vendors the
+OpenNLP sidecar's `analysis.proto`, and it consumes the exchange service as
+one gRPC client among any. ProtoMolt is a future client of pipestream-search,
 and any other system that can register a FileDescriptorSet is equally a
-client. Nothing in the engine's build, wire contract, or ranking path
-names protomolt.
+client. The product's own protocol and ranking path remain independent of
+ProtoMolt implementation code.
 
 ## 2. What the reference implementation provides
 
@@ -305,7 +305,7 @@ fingerprint as everywhere).
 The exchange contract is vendored, never depended on:
 
 - The file is copied from the owning protomolt repository into this
-  repo's vendored tree (package `ai.pipestream.proto.schema.registry.v1`,
+  repo's vendored tree (package `ai.protomolt.proto.schema.registry.v1`,
   import path following the same convention as
   `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`), and it must
   remain **byte-identical** to the source. Copy it from the owning repo;
@@ -313,9 +313,15 @@ The exchange contract is vendored, never depended on:
 - Byte identity is enforced by a check, not by convention:
   `scripts/check-vendored-protos.sh` pins the SHA-256 of each vendored
   file (descriptor_exchange.proto, its validate.proto import, and
-  indexing_hints.proto) against protomolt rev `74d172d9`, and diffs
+  indexing_hints.proto) against ProtoMolt rev `75ae2c60`, and diffs
   byte-for-byte against a checkout when `PROTOMOLT_DIR` names one. Run
   locally today; wire into CI when CI exists.
+- The `ai.pipestream.proto.index.hints.v1` declaration is retired. A
+  descriptor set that declares it is refused by name rather than treated as
+  an alias: recompile the source schema against
+  `ai.protomolt.proto.index.hints.v1`, then bind a new generation and rebuild
+  from retained original sources. Do not rewrite an existing plan fingerprint
+  or replay reduced columns to make it appear compatible.
 - Descriptor bytes are opaque to the ranking path. The engine consumes
   Register/Get/List/Sync as a client; a descriptor set is bytes plus a
   SHA-256 until the mapping layer derives a plan from it.

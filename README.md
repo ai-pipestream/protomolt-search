@@ -1212,6 +1212,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **ProtoMolt namespace alignment (2026-09-05).** Vendored descriptor
+  exchange, validation and indexing hints now use `ai.protomolt.proto.*`,
+  matching their owner. Pipestream Search retains `ai.pipestream.search.*`.
+  Old descriptor sets declaring the retired hint type require recompilation
+  against ProtoMolt's current imports and a new mapped generation. See
+  [descriptor mappings](docs/descriptor-mappings.md).
+
 - **In progress after PRE_ASTRA: workspace capabilities.** Public search,
   ingest and admin operations require separate workspace/collection grants.
   Revisioned policies invalidate pending query streams and deny cached responses

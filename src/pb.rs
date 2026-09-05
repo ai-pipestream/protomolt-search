@@ -28,23 +28,23 @@ pub mod tei {
 }
 
 /// The vendored descriptor exchange contract
-/// (`proto/ai/pipestream/proto/schema/registry/v1/descriptor_exchange.proto`,
+/// (`proto/ai/protomolt/proto/schema/registry/v1/descriptor_exchange.proto`,
 /// byte-identical to protomolt — `scripts/check-vendored-protos.sh`).
 /// This engine consumes the exchange service as one gRPC client among
 /// any; descriptor bytes stay opaque until the mapping layer derives a
 /// plan from them (`docs/descriptor-mappings.md`).
 pub mod exchange {
-    tonic::include_proto!("ai.pipestream.proto.schema.registry.v1");
+    tonic::include_proto!("ai.protomolt.proto.schema.registry.v1");
 }
 
 /// The vendored indexing-hint extension vocabulary
-/// (`proto/ai/pipestream/proto/index/hints/v1/indexing_hints.proto`,
+/// (`proto/ai/protomolt/proto/index/hints/v1/indexing_hints.proto`,
 /// byte-identical to protomolt). Derivation decodes the
-/// `(ai.pipestream.proto.index.hints.v1.index)` field-option extension
+/// `(ai.protomolt.proto.index.hints.v1.index)` field-option extension
 /// into these types; a proto annotated for protomolt's indexers is
 /// understood here without modification.
 pub mod hints {
-    tonic::include_proto!("ai.pipestream.proto.index.hints.v1");
+    tonic::include_proto!("ai.protomolt.proto.index.hints.v1");
 }
 
 /// The per-shard write-ahead log envelope

@@ -1,12 +1,12 @@
 syntax = "proto3";
 
-package ai.pipestream.proto.schema.registry.v1;
+package ai.protomolt.proto.schema.registry.v1;
 
-import "ai/pipestream/proto/validate/v1/validate.proto";
+import "ai/protomolt/proto/validate/v1/validate.proto";
 import "google/protobuf/timestamp.proto";
 
 option java_multiple_files = true;
-option java_package = "ai.pipestream.proto.schema.registry.v1";
+option java_package = "ai.protomolt.proto.schema.registry.v1";
 
 // ============================================================================
 // DESCRIPTOR EXCHANGE: language-neutral transfer of protobuf descriptor sets
@@ -29,14 +29,14 @@ message DescriptorSet {
   // publisher produced. The bytes are opaque to the exchange contract: a
   // peer stores and forwards them without interpreting them.
   bytes descriptor_set = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       required: true
       bytes: {min_len: 1}
     }
   ];
   // Lowercase hex SHA-256 of descriptor_set; the set's content identity.
   string sha256 = 2 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       required: true
       string: {len: 64, pattern: "^[0-9a-f]{64}$"}
     }
@@ -47,7 +47,7 @@ message DescriptorSet {
 message DescriptorSetVersion {
   // Lowercase hex SHA-256 of the canonical bytes; the version identity.
   string sha256 = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       required: true
       string: {len: 64, pattern: "^[0-9a-f]{64}$"}
     }
@@ -65,7 +65,7 @@ message DescriptorSetVersion {
 message RegisterDescriptorSetRequest {
   // The set to register. Required.
   DescriptorSet set = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {required: true}
+    (ai.protomolt.proto.validate.v1.field) = {required: true}
   ];
 }
 
@@ -82,7 +82,7 @@ message RegisterDescriptorSetResponse {
 message GetDescriptorSetRequest {
   // Digest of the set to fetch. Required.
   string sha256 = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       required: true
       string: {len: 64, pattern: "^[0-9a-f]{64}$"}
     }
@@ -103,13 +103,13 @@ message ListDescriptorSetsRequest {
   // Maximum versions to return. Zero asks for the peer's default page size;
   // over-cap requests are refused, not clamped.
   int32 page_size = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       int32: {gte: 0, lte: 1000}
     }
   ];
   // Continuation token from a previous response; empty for the first page.
   string page_token = 2 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       string: {max_len: 1024}
     }
   ];
@@ -127,7 +127,7 @@ message ListDescriptorSetsResponse {
 message VersionAnnouncement {
   // Digest of the announced set. Required.
   string sha256 = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       required: true
       string: {len: 64, pattern: "^[0-9a-f]{64}$"}
     }
@@ -141,7 +141,7 @@ message VersionAnnouncement {
 message VersionAck {
   // Digest of the acknowledged set. Required.
   string sha256 = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       required: true
       string: {len: 64, pattern: "^[0-9a-f]{64}$"}
     }
@@ -151,7 +151,7 @@ message VersionAck {
   bool accepted = 2;
   // Why the version was declined; empty when accepted.
   string reason = 3 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       string: {max_len: 512}
     }
   ];
@@ -161,7 +161,7 @@ message VersionAck {
 message DescriptorSetFetch {
   // Digest of the set to deliver. Required.
   string sha256 = 1 [
-    (ai.pipestream.proto.validate.v1.field) = {
+    (ai.protomolt.proto.validate.v1.field) = {
       required: true
       string: {len: 64, pattern: "^[0-9a-f]{64}$"}
     }

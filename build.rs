@@ -27,8 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // exchange contract this engine consumes as a client, and
                 // the indexing-hint extension vocabulary the mapping
                 // derivation reads off field options.
-                "proto/ai/pipestream/proto/schema/registry/v1/descriptor_exchange.proto",
-                "proto/ai/pipestream/proto/index/hints/v1/indexing_hints.proto",
+                "proto/ai/protomolt/proto/schema/registry/v1/descriptor_exchange.proto",
+                "proto/ai/protomolt/proto/index/hints/v1/indexing_hints.proto",
             ],
             &["proto"],
         )?;

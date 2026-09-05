@@ -521,7 +521,7 @@ service SearchService {
   // that contradicts the field it sits on all fail INVALID_ARGUMENT
   // naming the field and the hint that would fix it. Fields may carry
   // explicit hints as descriptor options using the vendored
-  // ai.pipestream.proto.index.hints.v1 extension; a proto annotated for
+  // ai.protomolt.proto.index.hints.v1 extension; a proto annotated for
   // protomolt's indexers is understood here without modification.
   //
   // Binding and protobuf-native ingest are later increments; this RPC
@@ -4908,7 +4908,7 @@ message PlanIndexResponse {
 }
 
 // MappedKind is the resolved index type of one planned field, aligned with
-// the ai.pipestream hint vocabulary where the concepts coincide. Every
+// the ai.protomolt hint vocabulary where the concepts coincide. Every
 // planned field has a definite kind.
 enum MappedKind {
   // Zero value. Never present in a derived plan.

@@ -11,7 +11,7 @@
 //! every node and every run.
 //!
 //! Fields may carry explicit hints as descriptor options, using the
-//! `(ai.pipestream.proto.index.hints.v1.index)` extension vendored from
+//! `(ai.protomolt.proto.index.hints.v1.index)` extension vendored from
 //! protomolt: a proto annotated for protomolt's indexers is understood
 //! here without modification. Where a field carries no hint, its kind
 //! is inferred from the descriptor with protomolt's rules, with one
@@ -48,8 +48,8 @@ use crate::pb::{self, hints};
 use crate::sha256;
 
 /// Full name of the field-option extension carrying indexing hints,
-/// owned by protomolt and vendored under `proto/ai/pipestream/`.
-const HINT_EXTENSION_NAME: &str = "ai.pipestream.proto.index.hints.v1.index";
+/// owned by ProtoMolt and vendored under `proto/ai/protomolt/`.
+const HINT_EXTENSION_NAME: &str = "ai.protomolt.proto.index.hints.v1.index";
 
 /// The extension's registered field number on
 /// `google.protobuf.FieldOptions`.
@@ -362,7 +362,7 @@ fn qualify(package: &str, name: &str) -> String {
 /// unconditionally, so a descriptor set that declares a DIFFERENT
 /// extension under that number would decode garbage as a hint. Refuse
 /// such a set by name instead: the number is registered to the
-/// pipestream hint vocabulary, and a modified indexing_hints.proto is
+/// ProtoMolt hint vocabulary, and a modified indexing_hints.proto is
 /// exactly the drift the byte-identity check exists to catch.
 fn check_extension_declarations(set: &FileDescriptorSet) -> Result<(), Status> {
     fn check_list(extensions: &[FieldDescriptorProto]) -> Result<(), Status> {
@@ -370,7 +370,17 @@ fn check_extension_declarations(set: &FileDescriptorSet) -> Result<(), Status> {
             let extends_field_options = extension.extendee() == ".google.protobuf.FieldOptions";
             let claims_hint_number = extension.number() == HINT_EXTENSION_NUMBER as i32;
             let is_the_hint =
-                extension.type_name() == ".ai.pipestream.proto.index.hints.v1.FieldIndexHint";
+                extension.type_name() == ".ai.protomolt.proto.index.hints.v1.FieldIndexHint";
+            if extends_field_options
+                && claims_hint_number
+                && extension.type_name() == ".ai.pipestream.proto.index.hints.v1.FieldIndexHint"
+            {
+                return Err(refuse(format!(
+                    "the descriptor set declares retired ai.pipestream.proto.index.hints.v1.\
+                     FieldIndexHint at extension number {HINT_EXTENSION_NUMBER}; recompile the \
+                     schema against ai.protomolt.proto.index.hints.v1 and bind a new generation"
+                )));
+            }
             if extends_field_options && claims_hint_number && !is_the_hint {
                 return Err(refuse(format!(
                     "the descriptor set declares extension number {HINT_EXTENSION_NUMBER} on \
@@ -480,7 +490,7 @@ fn each_len_delimited(
 }
 
 /// Walk the raw FileDescriptorSet bytes and collect every
-/// `(ai.pipestream.proto.index.hints.v1.index)` extension payload,
+/// `(ai.protomolt.proto.index.hints.v1.index)` extension payload,
 /// keyed by (message address, field index). Multiple occurrences of
 /// the extension on one field concatenate, protobuf's own merge rule
 /// for embedded messages.
@@ -1029,7 +1039,7 @@ fn resolve_vector(
                 0 => {
                     return Err(refuse(
                         "no vector field: hint exactly one repeated float field with \
-                         (ai.pipestream.proto.index.hints.v1.index).type = \
+                         (ai.protomolt.proto.index.hints.v1.index).type = \
                          INDEX_FIELD_TYPE_VECTOR, or name it vector/embedding",
                     ))
                 }
@@ -1038,7 +1048,7 @@ fn resolve_vector(
                         candidates.iter().map(|&i| &fields[i]).collect();
                     return Err(refuse(format!(
                         "several fields look like the vector ({}); hint the intended one with \
-                         (ai.pipestream.proto.index.hints.v1.index).type = \
+                         (ai.protomolt.proto.index.hints.v1.index).type = \
                          INDEX_FIELD_TYPE_VECTOR",
                         paths(&named)
                     )));
@@ -1095,7 +1105,7 @@ fn resolve_doc_id(
                 None => {
                     return Err(refuse(
                         "no document id field: hint exactly one integer or string field with \
-                         (ai.pipestream.proto.index.hints.v1.index).block_role = \
+                         (ai.protomolt.proto.index.hints.v1.index).block_role = \
                          BLOCK_ROLE_DOC_ID, or declare a singular top-level field named \"id\"",
                     ))
                 }

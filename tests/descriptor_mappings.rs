@@ -845,7 +845,7 @@ fn chunk_scope_rules_are_enforced() {
 }
 
 /// A descriptor set that declares extension number 59100471 on
-/// FieldOptions as something OTHER than the pipestream hint is refused:
+/// FieldOptions as something OTHER than the ProtoMolt hint is refused:
 /// the raw pass would otherwise decode garbage as hints.
 #[test]
 fn a_conflicting_extension_declaration_is_refused() {
@@ -873,6 +873,40 @@ fn a_conflicting_extension_declaration_is_refused() {
     });
     let set = encode_set(vec![file]);
     expect_refusal(&set, "evil.v1.Doc", "modified copy of indexing_hints.proto");
+}
+
+#[test]
+fn protoc_generated_protomolt_hints_plan_nonconventional_fields() {
+    let set = include_bytes!("fixtures/protomolt-hints/descriptor.bin");
+    let plan = derive_plan(set, "namespace_fixture.v1.AnnotatedRecord").unwrap();
+    assert_eq!(plan.doc_id_path, "opaque_key");
+    assert_eq!(plan.vector_path, "signal");
+}
+
+#[test]
+fn a_mutated_legacy_hint_declaration_names_the_migration() {
+    let mut set = FileDescriptorSet::decode(
+        include_bytes!("fixtures/protomolt-hints/descriptor.bin").as_slice(),
+    )
+    .unwrap();
+    for file in &mut set.file {
+        if file.name.as_deref() == Some("ai/protomolt/proto/index/hints/v1/indexing_hints.proto") {
+            file.name = Some("ai/pipestream/proto/index/hints/v1/indexing_hints.proto".to_string());
+            file.package = Some("ai.pipestream.proto.index.hints.v1".to_string());
+            file.extension[0].type_name =
+                Some(".ai.pipestream.proto.index.hints.v1.FieldIndexHint".to_string());
+        }
+        for dependency in &mut file.dependency {
+            if dependency == "ai/protomolt/proto/index/hints/v1/indexing_hints.proto" {
+                *dependency = "ai/pipestream/proto/index/hints/v1/indexing_hints.proto".to_string();
+            }
+        }
+    }
+    expect_refusal(
+        &set.encode_to_vec(),
+        "namespace_fixture.v1.AnnotatedRecord",
+        "recompile the schema against ai.protomolt.proto.index.hints.v1",
+    );
 }
 
 // ---------------------------------------------------------------------

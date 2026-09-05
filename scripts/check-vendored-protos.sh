@@ -3,8 +3,8 @@
 # (docs/descriptor-mappings.md section 5). The vendored copies must stay
 # byte-identical to the owning repository; this repo never edits them.
 #
-# Pinned upstream: protomolt rev 74d172d9
-#   ("Add descriptor exchange contract under schema/registry")
+# Pinned upstream: protomolt rev 75ae2c60
+#   (contains the ai.protomolt.proto namespace migration)
 #
 # Two checks, one always-on and one opt-in:
 #   1. Each vendored file's SHA-256 must match the sum pinned below. The
@@ -41,17 +41,17 @@ check() {
     fi
 }
 
-check proto/ai/pipestream/proto/schema/registry/v1/descriptor_exchange.proto \
-    d5804506d4522b8259cbb3f7ce76601f0e1d30c389348637d54c1d7d66976cde \
-    schema/registry/proto/src/main/proto/ai/pipestream/proto/schema/registry/v1/descriptor_exchange.proto
+check proto/ai/protomolt/proto/schema/registry/v1/descriptor_exchange.proto \
+    70a67352e5d32a8eb88ce62cfdb6f3864cbb5892ac610e7c9d342d9756f1d352 \
+    schema/registry/proto/src/main/proto/ai/protomolt/proto/schema/registry/v1/descriptor_exchange.proto
 
-check proto/ai/pipestream/proto/validate/v1/validate.proto \
-    ea91109e2f3c33e3272a10039b1564c200a6a16d76f609eef98e75c6290df79e \
-    protobuf/validation/src/main/proto/ai/pipestream/proto/validate/v1/validate.proto
+check proto/ai/protomolt/proto/validate/v1/validate.proto \
+    e0c9c4d255860ddfaa3b8efdcca021d5b452996be8bc35a0a7e2e90e8f32127d \
+    protobuf/validation/src/main/proto/ai/protomolt/proto/validate/v1/validate.proto
 
-check proto/ai/pipestream/proto/index/hints/v1/indexing_hints.proto \
-    69942c35f182fb967ce713fcc50a1f74dd7cf61a727859dd7c58bdabc8c0422b \
-    search/index/spi/src/main/proto/ai/pipestream/proto/index/hints/v1/indexing_hints.proto
+check proto/ai/protomolt/proto/index/hints/v1/indexing_hints.proto \
+    e5660c2feddf83bd821936dc0f8a3673e79d92ecc4a475a3f81eea278672f3db \
+    search/index/spi/src/main/proto/ai/protomolt/proto/index/hints/v1/indexing_hints.proto
 
 if [ "$fail" -ne 0 ]; then
     echo "vendored protos have drifted; re-copy from protomolt and re-pin" >&2
