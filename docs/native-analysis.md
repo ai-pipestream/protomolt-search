@@ -140,3 +140,33 @@ host bridge selected by that application, such as JNI/UniFFI for Android and a
 C/UniFFI or Swift-facing wrapper for iOS. That bridge is intentionally outside
 the term-analysis crate so it does not impose one mobile framework on every
 consumer.
+
+
+## Sidecar connection lifetime
+
+Network-enabled builds pool sidecar channels by Tokio runtime and address.
+Tonic's channel worker belongs to the runtime that created it. Reusing a channel
+from a retired runtime can fail with `Service was not ready: transport error`
+even while the sidecar remains healthy. A process-global, address-only cache
+previously allowed this failure after client runtime replacement.
+
+Each runtime now owns its pool through a task that lives until shutdown. The
+process registry holds weak references and removes expired entries on access;
+shutdown releases the pool and its cached channels, even if the owner task was
+never polled. Calls within one live runtime share a channel per address, with
+creation serialized to prevent competing connections. Calls outside a Tokio
+runtime return a named failed-precondition error. Callers must obtain a fresh
+channel after replacing their runtime; a retained Channel clone cannot migrate
+its worker to another runtime.
+
+This changes connection ownership, not request retry behavior. It does not
+replay ingest, alter protobufs or index formats, or change the native provider.
+The manifest requires Tokio 1.49 or newer for the stable runtime ID API; the
+existing lockfile remains on 1.53.1.
+
+`tests/analyzer_runtime.rs` keeps a healthy sidecar on a separate runtime while
+replacing the client runtime four times, and while shutting down one of two
+concurrent client runtimes. The former reproduces the old failure deterministically
+on the second client runtime. Library tests verify pool release on shutdown and
+the error returned outside a runtime. Stream, query and ranking tests exercise
+the same shared client path.

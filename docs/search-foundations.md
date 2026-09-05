@@ -415,3 +415,33 @@ unsigned partial fields and one UINT enum value, with existing declarations
 unchanged. Stored formats and analyzer fingerprints are unchanged by this
 increment. Work remains on the unsigned feature branch, and the broader
 protobuf-shape, permission and document-lifecycle goals remain incomplete.
+
+
+The analyzer-channel follow-up reproduced the transport failure without any
+server restart or port reuse: a sidecar stayed healthy on one runtime while a
+client runtime was destroyed and replaced. The first runtime analyzed twice;
+the second failed immediately with `Service was not ready: transport error`.
+The process-global address-only cache had retained a tonic channel whose worker
+belonged to the retired runtime.
+
+Channels now pool by runtime and address. A task owned by each runtime retains
+its pool until shutdown, while the process registry holds only weak references.
+Shutdown releases the cached channels even if that owner task was never polled.
+Concurrent callers share creation under the pool lock. A caller outside a Tokio
+runtime receives a named failed-precondition error. No request replay was added.
+The manifest records Tokio 1.49 as the minimum for the stable runtime ID API;
+the existing lockfile remains at 1.53.1. See `docs/native-analysis.md`.
+
+Validation on 2026-09-05: the new fixed-endpoint runtime-replacement regression
+failed on the previous implementation and passes after the ownership change.
+A second regression closes one of two concurrent client runtimes while the
+other continues to use the same sidecar. Two library tests cover pool release
+and the outside-runtime refusal. The full suite passed without retries: 427
+library tests, 540 integration tests across 94 targets, and 11 embedded tests
+(978 total), with one existing sidecar conformance test ignored. All five
+Android/iOS Rust target checks passed with three existing relay dead-code
+warnings. Tests/examples compilation, formatting, vendored-proto identity,
+whitespace checks, and descriptor comparison against `aa399e2` passed; the
+search, schema-report and mobile descriptors are unchanged. This remains a
+feature-branch checkpoint. The unsigned range-facet, scoring, wider protobuf
+shape, permission and document-lifecycle work is still incomplete.

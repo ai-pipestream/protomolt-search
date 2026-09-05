@@ -10,7 +10,7 @@
 #[cfg(feature = "net")]
 use std::collections::HashMap;
 #[cfg(feature = "net")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(feature = "net")]
 use tokio_stream::wrappers::ReceiverStream;
@@ -316,21 +316,56 @@ pub fn normalize_prefix(prefix: &str, spec: Option<&AnalysisSpec>) -> Result<Str
 }
 
 #[cfg(feature = "net")]
-pub fn shared_channel(addr: &str) -> Result<Channel, Status> {
-    static CHANNELS: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
-    let map = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(ch) = map.lock().expect("channel map poisoned").get(addr) {
-        return Ok(ch.clone());
+type AnalysisChannels = Mutex<HashMap<String, Channel>>;
+#[cfg(feature = "net")]
+type RuntimeChannelPools = Mutex<HashMap<tokio::runtime::Id, Weak<AnalysisChannels>>>;
+#[cfg(feature = "net")]
+static CHANNEL_POOLS: OnceLock<RuntimeChannelPools> = OnceLock::new();
+
+/// A tonic channel's worker belongs to the runtime that created it. A weak
+/// registry lets callers share one pool per runtime without keeping retired
+/// pools or their channels alive for the rest of the process.
+#[cfg(feature = "net")]
+fn runtime_channel_pool() -> Result<Arc<AnalysisChannels>, Status> {
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        Status::failed_precondition("analysis channels require an active Tokio runtime")
+    })?;
+    let registry = CHANNEL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut pools = registry.lock().expect("channel pool registry poisoned");
+    pools.retain(|_, pool| pool.strong_count() != 0);
+    if let Some(pool) = pools.get(&handle.id()).and_then(Weak::upgrade) {
+        return Ok(pool);
     }
-    // connect_lazy defers the handshake to the first RPC, so this never
-    // blocks the caller; tonic reconnects inside the channel on failure.
-    let ch = Channel::from_shared(addr.to_string())
-        .map_err(|e| Status::invalid_argument(format!("bad sidecar address {addr:?}: {e}")))?
+    let pool = Arc::new(Mutex::new(HashMap::new()));
+    pools.insert(handle.id(), Arc::downgrade(&pool));
+    // The runtime owns this strong reference, including when it shuts down
+    // before ever polling the task. Dropping the task releases the pool.
+    let owner = Arc::clone(&pool);
+    handle.spawn(async move {
+        std::future::pending::<()>().await;
+        drop(owner);
+    });
+    Ok(pool)
+}
+
+/// Reuse an analysis channel within the current Tokio runtime. Call again
+/// after replacing that runtime; an existing Channel cannot outlive its worker.
+#[cfg(feature = "net")]
+pub fn shared_channel(addr: &str) -> Result<Channel, Status> {
+    let pool = runtime_channel_pool()?;
+    let mut channels = pool.lock().expect("analysis channel pool poisoned");
+    if let Some(channel) = channels.get(addr) {
+        return Ok(channel.clone());
+    }
+    // Creation is synchronous and remains under the pool lock so concurrent
+    // callers cannot open competing channels for the same address.
+    let channel = Channel::from_shared(addr.to_string())
+        .map_err(|error| {
+            Status::invalid_argument(format!("bad sidecar address {addr:?}: {error}"))
+        })?
         .connect_lazy();
-    map.lock()
-        .expect("channel map poisoned")
-        .insert(addr.to_string(), ch.clone());
-    Ok(ch)
+    channels.insert(addr.to_string(), channel.clone());
+    Ok(channel)
 }
 
 /// Analyze `text` into an [`AnalyzedDoc`] (term, tf, original-text offsets,
@@ -2014,5 +2049,39 @@ mod tests {
         .err()
         .expect("quality must remain an OpenNLP capability");
         assert_eq!(layer.code(), tonic::Code::FailedPrecondition);
+    }
+}
+
+#[cfg(all(test, feature = "net"))]
+mod channel_pool_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_shutdown_releases_even_an_unpolled_pool_owner() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let weak = runtime.block_on(async {
+            let first = runtime_channel_pool().unwrap();
+            let second = runtime_channel_pool().unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+            let _channel = shared_channel("http://127.0.0.1:12345").unwrap();
+            assert_eq!(first.lock().unwrap().len(), 1);
+            Arc::downgrade(&first)
+        });
+        assert!(weak.upgrade().is_some(), "the runtime owns the idle pool");
+        drop(runtime);
+        assert!(
+            weak.upgrade().is_none(),
+            "shutdown must release cached channels"
+        );
+    }
+
+    #[test]
+    fn channels_outside_a_runtime_refuse_instead_of_panicking() {
+        let error = shared_channel("http://127.0.0.1:12345").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("Tokio runtime"));
     }
 }

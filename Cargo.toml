@@ -27,7 +27,8 @@ prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
+# Runtime-scoped channel pools use runtime::Id, stable since Tokio 1.49.
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 memmap2 = "0.9"
 protomolt-analyzer = { path = "crates/protomolt-analyzer" }
@@ -110,7 +111,7 @@ required-features = ["net"]
 tonic-build = "0.12"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 bzip2 = "0.6"
 csv = "1"
 bytes = "1"

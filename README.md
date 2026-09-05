@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Analyzer channel lifetime (2026-09-05, feature branch).** Sidecar channels
+  are pooled within their creating Tokio runtime and released at shutdown.
+  Replacing a client runtime no longer reuses a dead worker against a healthy
+  sidecar. This fixes a deterministic reproduction of the transport error seen
+  during test fixture ingest, without adding request replay. The manifest now
+  requires Tokio 1.49; the locked version remains unchanged. See
+  [connection lifetime](docs/native-analysis.md#sidecar-connection-lifetime).
+
 - **Unsigned aggregation (2026-09-05, feature branch).** Exact uint counts,
   sums, extrema, distinct unions and percentiles now work over filtered,
   grouped and query-pool selections. Uint sums use u128 partials and refuse
