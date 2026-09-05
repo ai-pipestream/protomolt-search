@@ -838,6 +838,197 @@ fn impossible_walk(
     }
 }
 
+/// Leaf indices (walk order, the order `impossible_under` and the
+/// known handshake use) of the request's filter leaves that hold for
+/// every row a leaf with `bounds` serves, counting only leaves reachable
+/// from the root through `AND` nodes. A clause under `OR` or `NOT` is
+/// never listed: removing it there would change the tree's value.
+///
+/// Soundness: a row in the leaf made every predicate on the leaf's path
+/// true, so its columns lie inside `bounds`. A number clause whose
+/// interval contains the leaf's interval, a facet clause whose value set
+/// contains the leaf's admitted set, and a presence test on a column the
+/// leaf constrains are therefore true for every row the shard holds, and
+/// an `AND` child that is always true can be dropped from that shard's
+/// tree without changing which rows pass (`docs/placement.md`).
+pub fn implied_under(filter: &pb::FilterExpr, bounds: &ColumnBounds) -> Vec<usize> {
+    let mut next = 0usize;
+    let mut out = Vec::new();
+    implied_walk(filter, bounds, &mut next, true, &mut out);
+    out
+}
+
+fn implied_walk(
+    expr: &pb::FilterExpr,
+    bounds: &ColumnBounds,
+    next: &mut usize,
+    spine: bool,
+    out: &mut Vec<usize>,
+) {
+    use pb::filter_expr::Expr;
+    match &expr.expr {
+        Some(Expr::And(list)) => {
+            for child in &list.exprs {
+                implied_walk(child, bounds, next, spine, out);
+            }
+        }
+        Some(Expr::Or(list)) => {
+            for child in &list.exprs {
+                implied_walk(child, bounds, next, false, out);
+            }
+        }
+        Some(Expr::Not(child)) => implied_walk(child, bounds, next, false, out),
+        Some(Expr::Number(p)) => {
+            let index = *next;
+            *next += 1;
+            if spine && number_implied(p, bounds) {
+                out.push(index);
+            }
+        }
+        Some(Expr::Facet(p)) => {
+            let index = *next;
+            *next += 1;
+            if spine && facet_implied(p, bounds) {
+                out.push(index);
+            }
+        }
+        Some(Expr::Has(p)) => {
+            let index = *next;
+            *next += 1;
+            if spine && (bounds.number(&p.column).is_some() || bounds.facet(&p.column).is_some()) {
+                out.push(index);
+            }
+        }
+        Some(Expr::StringRange(_))
+        | Some(Expr::StringPrefix(_))
+        | Some(Expr::MapFacet(_))
+        | Some(Expr::MapNumber(_))
+        | Some(Expr::MapHasKey(_))
+        | Some(Expr::Geo(_)) => {
+            *next += 1;
+        }
+        None => {}
+    }
+}
+
+/// Whether every value inside the leaf's interval on the clause's
+/// column satisfies the clause. A clause bound the leaf does not bound
+/// on that side is not implied; a clause with no bound at all is left
+/// as it is.
+fn number_implied(p: &pb::NumberPredicate, bounds: &ColumnBounds) -> bool {
+    let Some((blo, bhi)) = bounds.number(&p.column) else {
+        return false;
+    };
+    let cmin = p.min.as_ref().and_then(edge_of);
+    let cmax = p.max.as_ref().and_then(edge_of);
+    if cmin.is_none() && cmax.is_none() {
+        return false;
+    }
+    let lower = match (cmin.as_ref(), blo.as_ref()) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(c), Some(l)) => lower_dominates(l, c),
+    };
+    let upper = match (cmax.as_ref(), bhi.as_ref()) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(c), Some(h)) => upper_dominates(h, c),
+    };
+    lower && upper
+}
+
+/// Every x with `x >= l` (or `> l`) also has `x >= c` (or `> c`).
+fn lower_dominates(l: &Edge, c: &Edge) -> bool {
+    match cmp_bound(&l.value, &c.value) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => !(c.exclusive && !l.exclusive),
+    }
+}
+
+/// Every x with `x <= h` (or `< h`) also has `x <= c` (or `< c`).
+fn upper_dominates(h: &Edge, c: &Edge) -> bool {
+    match cmp_bound(&h.value, &c.value) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => !(c.exclusive && !h.exclusive),
+    }
+}
+
+/// Every value the leaf admits on the column is one the clause lists.
+fn facet_implied(p: &pb::FacetPredicate, bounds: &ColumnBounds) -> bool {
+    match bounds.facet(&p.column) {
+        Some(admitted) => {
+            !admitted.is_empty() && admitted.iter().all(|v| p.values.iter().any(|w| w == v))
+        }
+        None => false,
+    }
+}
+
+/// `filter` with the leaves at `dropped` (walk-order indices, as
+/// [`implied_under`] lists them) removed. An `AND` left with one child
+/// becomes that child; an `AND` left with none is removed, and a removed
+/// root is `None`, no filter. Indices under `OR` or `NOT` are never
+/// listed by `implied_under`, and this walk leaves those subtrees intact.
+pub fn without_leaves(filter: &pb::FilterExpr, dropped: &[usize]) -> Option<pb::FilterExpr> {
+    if dropped.is_empty() {
+        return Some(filter.clone());
+    }
+    let dropped: BTreeSet<usize> = dropped.iter().copied().collect();
+    let mut next = 0usize;
+    strip_walk(filter, &dropped, &mut next)
+}
+
+fn strip_walk(
+    expr: &pb::FilterExpr,
+    dropped: &BTreeSet<usize>,
+    next: &mut usize,
+) -> Option<pb::FilterExpr> {
+    use pb::filter_expr::Expr;
+    match &expr.expr {
+        Some(Expr::And(list)) => {
+            let mut kept = Vec::with_capacity(list.exprs.len());
+            for child in &list.exprs {
+                if let Some(child) = strip_walk(child, dropped, next) {
+                    kept.push(child);
+                }
+            }
+            match kept.len() {
+                0 => None,
+                1 => kept.pop(),
+                _ => Some(pb::FilterExpr {
+                    expr: Some(Expr::And(pb::FilterList { exprs: kept })),
+                }),
+            }
+        }
+        Some(Expr::Or(_)) | Some(Expr::Not(_)) => {
+            count_leaves(expr, next);
+            Some(expr.clone())
+        }
+        Some(_) => {
+            let index = *next;
+            *next += 1;
+            (!dropped.contains(&index)).then(|| expr.clone())
+        }
+        None => Some(expr.clone()),
+    }
+}
+
+/// Advance the walk-order index past every leaf under `expr`.
+fn count_leaves(expr: &pb::FilterExpr, next: &mut usize) {
+    use pb::filter_expr::Expr;
+    match &expr.expr {
+        Some(Expr::And(list)) | Some(Expr::Or(list)) => {
+            for child in &list.exprs {
+                count_leaves(child, next);
+            }
+        }
+        Some(Expr::Not(child)) => count_leaves(child, next),
+        Some(_) => *next += 1,
+        None => {}
+    }
+}
+
 /// One request's verdict over a topology: which shards the filter
 /// cannot match, and which filter leaves proved it (they count as
 /// resolved for the typo handshake, since the leaf predicate that
@@ -845,8 +1036,15 @@ fn impossible_walk(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShardMask {
     pub skipped: Vec<bool>,
-    /// Filter-leaf indices that took part in at least one exclusion.
+    /// Filter-leaf indices that took part in at least one exclusion, or
+    /// that a consulted shard's leaf implies (they count as resolved:
+    /// the leaf predicate that decided them named the same column, and
+    /// the shard holds a value for it on every row).
     pub known: Vec<usize>,
+    /// Per shard, the filter leaves its placement leaf implies
+    /// ([`implied_under`]); empty for a skipped shard or one without a
+    /// code. [`ShardMask::filter_for`] removes them from that shard's tree.
+    pub implied: Vec<Vec<usize>>,
 }
 
 impl ShardMask {
@@ -858,8 +1056,10 @@ impl ShardMask {
     /// produces.
     pub fn compute(placement: &Placement, codes: &[Option<i64>], filter: &pb::FilterExpr) -> Self {
         let mut skipped = vec![false; codes.len()];
+        let mut implied = vec![Vec::new(); codes.len()];
         let mut known = BTreeSet::new();
         let mut verdicts: HashMap<i64, Option<Vec<usize>>> = HashMap::new();
+        let mut implications: HashMap<i64, Vec<usize>> = HashMap::new();
         for (shard, code) in codes.iter().enumerate() {
             let Some(code) = code else { continue };
             let verdict = verdicts.entry(*code).or_insert_with(|| {
@@ -870,7 +1070,16 @@ impl ShardMask {
             if let Some(leaves) = verdict {
                 skipped[shard] = true;
                 known.extend(leaves.iter().copied());
+                continue;
             }
+            let leaves = implications.entry(*code).or_insert_with(|| {
+                placement
+                    .leaf_by_code(*code)
+                    .map(|leaf| implied_under(filter, &leaf.bounds))
+                    .unwrap_or_default()
+            });
+            known.extend(leaves.iter().copied());
+            implied[shard] = leaves.clone();
         }
         if !skipped.is_empty() && skipped.iter().all(|s| *s) {
             skipped[0] = false;
@@ -878,6 +1087,18 @@ impl ShardMask {
         ShardMask {
             skipped,
             known: known.into_iter().collect(),
+            implied,
+        }
+    }
+
+    /// The tree to send to `shard`: `tree` with the leaves the shard's
+    /// placement leaf implies removed ([`without_leaves`]); `None` when
+    /// the shard's leaf implies the entire tree, which is a request with
+    /// no filter on that shard.
+    pub fn filter_for(&self, shard: usize, tree: &pb::FilterExpr) -> Option<pb::FilterExpr> {
+        match self.implied.get(shard) {
+            Some(dropped) if !dropped.is_empty() => without_leaves(tree, dropped),
+            _ => Some(tree.clone()),
         }
     }
 
@@ -988,6 +1209,132 @@ mod tests {
         );
         let round = PlacementTreeConfig::from_proto(&config.to_proto());
         assert_eq!(round, config);
+    }
+
+    fn compiled(cel: &str) -> pb::FilterExpr {
+        crate::cel::compile_filter(cel).unwrap().unwrap()
+    }
+
+    fn leaf_bounds(cel: &str) -> ColumnBounds {
+        ColumnBounds::of_conjunction(&[compiled(cel)])
+    }
+
+    #[test]
+    fn a_leaf_implies_the_clauses_its_interval_and_facet_contain() {
+        let recent = leaf_bounds("year >= 2015 && court == \"scotus\"");
+        // Contained ranges on the AND spine are implied; the live clause
+        // and anything under OR or NOT is not.
+        let filter = compiled(
+            "year >= 2010 && court in [\"scotus\", \"ca9\"] && has(year) && pages > 3 \
+             && (year >= 2000 || court == \"x\") && !(year >= 2000)",
+        );
+        assert_eq!(implied_under(&filter, &recent), vec![0, 1, 2]);
+        let sent = without_leaves(&filter, &[0, 1, 2]).unwrap();
+        let mut names = Vec::new();
+        crate::filter::walk_leaves(&sent, &mut |leaf| match leaf {
+            crate::filter::LeafRef::Number(p) => names.push(p.column.clone()),
+            crate::filter::LeafRef::Facet(p) => names.push(p.column.clone()),
+            _ => names.push("other".into()),
+        });
+        assert_eq!(names, vec!["pages", "year", "court", "year"]);
+
+        // Edges: an equal bound is implied unless the clause is strict
+        // where the leaf is not; a bound the leaf lacks is never implied.
+        assert_eq!(implied_under(&compiled("year >= 2015"), &recent), vec![0]);
+        assert_eq!(
+            implied_under(&compiled("year > 2015"), &recent),
+            Vec::<usize>::new()
+        );
+        assert_eq!(implied_under(&compiled("year > 2014"), &recent), vec![0]);
+        assert_eq!(
+            implied_under(&compiled("year <= 2030"), &recent),
+            Vec::<usize>::new()
+        );
+        // Two clauses on one column: the contained one goes, the other stays.
+        assert_eq!(
+            implied_under(&compiled("year >= 2010 && year < 2030"), &recent),
+            vec![0]
+        );
+        let strict = leaf_bounds("year > 2015");
+        assert_eq!(implied_under(&compiled("year >= 2015"), &strict), vec![0]);
+        assert_eq!(implied_under(&compiled("year > 2015"), &strict), vec![0]);
+        // A float clause against an integer interval compares exactly.
+        assert_eq!(implied_under(&compiled("year >= 2014.5"), &recent), vec![0]);
+        assert_eq!(
+            implied_under(&compiled("year >= 2015.5"), &recent),
+            Vec::<usize>::new()
+        );
+        // Facets: the admitted set must sit inside the clause's values.
+        assert_eq!(
+            implied_under(&compiled("court == \"ca9\""), &recent),
+            Vec::<usize>::new()
+        );
+        assert_eq!(implied_under(&compiled("has(court)"), &recent), vec![0]);
+        assert_eq!(
+            implied_under(&compiled("has(pages)"), &recent),
+            Vec::<usize>::new()
+        );
+        // A default leaf constrains nothing.
+        let default = ColumnBounds::default();
+        assert_eq!(
+            implied_under(&compiled("year >= 1"), &default),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn stripping_leaves_keeps_the_shape_it_must() {
+        let filter = compiled("year >= 2010 && court == \"scotus\"");
+        // Both implied: no filter at all.
+        assert_eq!(without_leaves(&filter, &[0, 1]), None);
+        // One left: the AND unwraps to it.
+        let one = without_leaves(&filter, &[0]).unwrap();
+        assert!(matches!(one.expr, Some(pb::filter_expr::Expr::Facet(_))));
+        // A single implied root is no filter.
+        assert_eq!(without_leaves(&compiled("year >= 2010"), &[0]), None);
+        // Nothing dropped: the tree as it was.
+        assert_eq!(without_leaves(&filter, &[]), Some(filter.clone()));
+        // Indices under OR are counted so later spine leaves keep their
+        // numbers, and the OR itself is untouched.
+        let mixed = compiled("(year >= 1 || court == \"a\") && year >= 2010");
+        assert_eq!(implied_under(&mixed, &leaf_bounds("year >= 2015")), vec![2]);
+        let sent = without_leaves(&mixed, &[2]).unwrap();
+        assert!(matches!(sent.expr, Some(pb::filter_expr::Expr::Or(_))));
+    }
+
+    #[test]
+    fn the_mask_lists_implied_leaves_per_consulted_shard() {
+        let mut recent = leaf("recent", Some("year >= 2015"));
+        recent.children = vec![
+            leaf("scotus", Some("court == \"scotus\"")),
+            leaf("rest", None),
+        ];
+        let config = tree(vec![recent, leaf("other", None)]);
+        let placement = Placement::validate(&config).unwrap();
+        let code = |name: &str| Some(placement.leaf_by_name(name).unwrap().code);
+        let codes = [
+            code("recent.scotus"),
+            code("recent.rest"),
+            code("other"),
+            None,
+        ];
+        let filter = compiled("year >= 2010 && has(court)");
+        let mask = ShardMask::compute(&placement, &codes, &filter);
+        assert_eq!(mask.skipped, vec![false; 4]);
+        assert_eq!(mask.implied[0], vec![0, 1], "scotus pins both");
+        assert_eq!(mask.implied[1], vec![0], "rest pins the year");
+        assert!(mask.implied[2].is_empty(), "the default pins nothing");
+        assert!(mask.implied[3].is_empty(), "no code, no claim");
+        assert_eq!(mask.known, vec![0, 1]);
+        assert_eq!(mask.filter_for(0, &filter), None);
+        let rest = mask.filter_for(1, &filter).unwrap();
+        assert!(matches!(rest.expr, Some(pb::filter_expr::Expr::Has(_))));
+        assert_eq!(mask.filter_for(2, &filter), Some(filter.clone()));
+        assert_eq!(mask.filter_for(3, &filter), Some(filter.clone()));
+        // A skipped shard implies nothing; the exclusion is what counts.
+        let excluded = ShardMask::compute(&placement, &codes, &compiled("year < 2000"));
+        assert!(excluded.skipped[0] && excluded.skipped[1] && !excluded.skipped[2]);
+        assert!(excluded.implied.iter().all(Vec::is_empty));
     }
 
     #[test]

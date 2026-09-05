@@ -55,17 +55,30 @@ enum PlannedSearchKind {
 
 struct PlannedSearchLeaf {
     id: String,
+    /// Empty when `universal`.
     membership: BTreeSet<u64>,
+    /// A dense clause matches every row that has a vector, which is
+    /// every live row on the mainline engine, so its membership is not
+    /// fetched: it is the universe, and the group's other clauses (or
+    /// the live-document bitmap, for a group of universal clauses) name
+    /// the rows. A row the rescore returns no product for has no vector
+    /// and is dropped from the group, the same rows the vector bitmap
+    /// used to exclude.
+    universal: bool,
     kind: PlannedSearchKind,
 }
 
 struct PlannedMatcher {
     id: String,
     membership: BTreeSet<u64>,
+    universal: bool,
 }
 
 struct PlannedBooleanNode {
+    /// Empty when `universal`.
     membership: BTreeSet<u64>,
+    /// The node matches every row; only a lone dense clause is.
+    universal: bool,
     searches: Vec<PlannedSearchLeaf>,
     matchers: Vec<PlannedMatcher>,
     membership_wire_bytes: u64,
@@ -154,12 +167,29 @@ fn plan_boolean_selection<'a>(
                                 search.id
                             )));
                         }
-                        let membership = coordinator.vector_membership().await?;
                         let kind = PlannedSearchKind::Dense {
                             vector: query.vector.clone(),
                             exact_fp32: dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
                         };
-                        (membership, kind)
+                        // The universe, not a fetched set: see
+                        // `PlannedSearchLeaf::universal`.
+                        return Ok(PlannedBooleanNode {
+                            membership: BTreeSet::new(),
+                            universal: true,
+                            searches: vec![PlannedSearchLeaf {
+                                id: search.id.clone(),
+                                membership: BTreeSet::new(),
+                                universal: true,
+                                kind,
+                            }],
+                            matchers: vec![PlannedMatcher {
+                                id: search.id.clone(),
+                                membership: BTreeSet::new(),
+                                universal: true,
+                            }],
+                            membership_wire_bytes: 0,
+                            prune: Default::default(),
+                        });
                     }
                     None => {
                         return Err(refuse(format!(
@@ -171,14 +201,17 @@ fn plan_boolean_selection<'a>(
                 let ids = membership.ids;
                 Ok(PlannedBooleanNode {
                     membership: ids.clone(),
+                    universal: false,
                     searches: vec![PlannedSearchLeaf {
                         id: search.id.clone(),
                         membership: ids.clone(),
+                        universal: false,
                         kind,
                     }],
                     matchers: vec![PlannedMatcher {
                         id: search.id.clone(),
                         membership: ids,
+                        universal: false,
                     }],
                     membership_wire_bytes: membership.wire_bytes,
                     prune: membership.prune,
@@ -194,10 +227,12 @@ fn plan_boolean_selection<'a>(
                 let ids = membership.ids;
                 Ok(PlannedBooleanNode {
                     membership: ids.clone(),
+                    universal: false,
                     searches: Vec::new(),
                     matchers: vec![PlannedMatcher {
                         id: filter.id.clone(),
                         membership: ids,
+                        universal: false,
                     }],
                     membership_wire_bytes: membership.wire_bytes,
                     prune: membership.prune,
@@ -254,44 +289,64 @@ fn plan_boolean_group<'a>(
         } else {
             boolean.minimum_should_match as usize
         };
-        // Seed MUST intersections from the cheapest bitmap. With no MUST,
-        // count SHOULD memberships directly; a negative-only group starts
-        // from the live-document bitmap rather than a paged browse.
-        let mut membership =
-            if let Some(seed) = must.iter().min_by_key(|clause| clause.membership.len()) {
-                let mut ids = seed.membership.clone();
-                for clause in &must {
-                    if !std::ptr::eq(clause, seed) {
-                        ids.retain(|id| clause.membership.contains(id));
-                    }
+        // Seed MUST intersections from the cheapest bitmap, skipping the
+        // universal clauses (they contain every id). With no MUST, count
+        // SHOULD memberships directly, a universal SHOULD counting for
+        // every id; a group whose positive clauses are all universal, and
+        // a negative-only group, start from the live-document bitmap
+        // rather than a paged browse.
+        let universal_should = should.iter().filter(|clause| clause.universal).count();
+        let live_docs = |coordinator: &'a CoordinatorServiceImpl| async move {
+            let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
+            Ok::<_, Status>(coordinator.filter_membership(&empty).await?.ids)
+        };
+        let mut membership = if let Some(seed) = must
+            .iter()
+            .filter(|clause| !clause.universal)
+            .min_by_key(|clause| clause.membership.len())
+        {
+            let mut ids = seed.membership.clone();
+            for clause in &must {
+                if !clause.universal && !std::ptr::eq(clause, seed) {
+                    ids.retain(|id| clause.membership.contains(id));
                 }
-                ids
-            } else if minimum_should_match > 0 {
-                let mut counts = BTreeMap::<u64, usize>::new();
-                for clause in &should {
-                    for &id in &clause.membership {
-                        *counts.entry(id).or_default() += 1;
-                    }
+            }
+            ids
+        } else if !must.is_empty()
+            || minimum_should_match == 0
+            || universal_should >= minimum_should_match
+        {
+            live_docs(coordinator).await?
+        } else {
+            let mut counts = BTreeMap::<u64, usize>::new();
+            for clause in should.iter().filter(|clause| !clause.universal) {
+                for &id in &clause.membership {
+                    *counts.entry(id).or_default() += 1;
                 }
-                counts
-                    .into_iter()
-                    .filter_map(|(id, count)| (count >= minimum_should_match).then_some(id))
-                    .collect()
-            } else {
-                let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
-                coordinator.filter_membership(&empty).await?.ids
-            };
-        if !must.is_empty() && minimum_should_match > 0 {
+            }
+            counts
+                .into_iter()
+                .filter_map(|(id, count)| {
+                    (count + universal_should >= minimum_should_match).then_some(id)
+                })
+                .collect()
+        };
+        if !must.is_empty() && minimum_should_match > universal_should {
             membership.retain(|id| {
-                should
-                    .iter()
-                    .filter(|clause| clause.membership.contains(id))
-                    .count()
+                universal_should
+                    + should
+                        .iter()
+                        .filter(|clause| !clause.universal && clause.membership.contains(id))
+                        .count()
                     >= minimum_should_match
             });
         }
         for clause in &must_not {
-            membership.retain(|id| !clause.membership.contains(id));
+            if clause.universal {
+                membership.clear();
+            } else {
+                membership.retain(|id| !clause.membership.contains(id));
+            }
         }
 
         let membership_wire_bytes =
@@ -317,6 +372,7 @@ fn plan_boolean_group<'a>(
         }
         Ok(PlannedBooleanNode {
             membership,
+            universal: false,
             searches,
             matchers,
             membership_wire_bytes,
@@ -336,6 +392,12 @@ async fn score_boolean_plan(
         .map(|id| (id, BooleanHit::default()))
         .collect();
     for matcher in &plan.matchers {
+        if matcher.universal {
+            for hit in hits.values_mut() {
+                hit.matched.push(matcher.id.clone());
+            }
+            continue;
+        }
         for &id in plan.membership.intersection(&matcher.membership) {
             hits.get_mut(&id)
                 .expect("planned membership owns every matcher id")
@@ -343,13 +405,25 @@ async fn score_boolean_plan(
                 .push(matcher.id.clone());
         }
     }
+    // Rows a universal dense clause returns no product for have no
+    // vector; they leave the group after every clause has scored.
+    let mut without_vector: Vec<u64> = Vec::new();
     for leaf in &plan.searches {
-        let candidates: Vec<u64> = plan
-            .membership
-            .intersection(&leaf.membership)
-            .copied()
-            .collect();
-        for chunk in candidates.chunks(coordinator.max_k() as usize) {
+        let candidates: Vec<u64> = if leaf.universal {
+            plan.membership.iter().copied().collect()
+        } else {
+            plan.membership
+                .intersection(&leaf.membership)
+                .copied()
+                .collect()
+        };
+        // Survivors go to the shards in `signal_batch` ids per rescore
+        // call, a wire bound, not max_k pieces: a lexical call is a
+        // cursor walk over its candidates and a dense call is one masked
+        // scan of the shard, so per-call cost is what the pieces multiply
+        // (docs/query-api.md, "Recursive boolean execution").
+        let batch = coordinator.signal_batch();
+        for chunk in candidates.chunks(batch.max(1)) {
             let scores = match &leaf.kind {
                 PlannedSearchKind::Lexical {
                     terms,
@@ -370,6 +444,10 @@ async fn score_boolean_plan(
             };
             for &id in chunk {
                 let Some(&score) = scores.get(&id) else {
+                    if leaf.universal {
+                        without_vector.push(id);
+                        continue;
+                    }
                     return Err(Status::failed_precondition(format!(
                         "boolean membership selected doc {id} for scoring clause {:?}, but candidate rescore did not return it",
                         leaf.id
@@ -385,6 +463,9 @@ async fn score_boolean_plan(
                 });
             }
         }
+    }
+    for id in without_vector {
+        hits.remove(&id);
     }
     Ok(hits)
 }

@@ -156,6 +156,29 @@ boolean root resolves each clause on its own shard set and reports no
 plan-level skip. The answer is identical with pruning off, and
 `tests/placement.rs` holds that on every shape.
 
+### Implied clauses
+
+The same bounds work the other way on a shard that is consulted. A row
+in a leaf made every predicate on the leaf's path true, so a request
+clause the path implies is true for every row the shard holds: a number
+range that contains the leaf's interval on that column (`year >= 2010`
+on a leaf pinned to `year >= 2015`, edges compared exactly across the
+integer and float domains), a facet list that contains every value the
+leaf admits (`court in ["scotus", "ca9"]` on `court == "scotus"`), or a
+presence test on a column the leaf constrains. Such a clause is removed
+from the tree that shard receives (`placement::implied_under`,
+`placement::without_leaves`, `ShardMask::filter_for`), so the shard
+resolves one bitmap less; an `AND` left with one child becomes that
+child, and a tree implied whole becomes no filter on that shard. Only
+clauses reachable from the root through `AND` are considered: under
+`OR` or `NOT` a clause's value is part of a larger one and stays. The
+leaves a shard was spared count as resolved for the typo rule, and the
+shard's known flags, which cover only the tree it received, are mapped
+back to the request's leaves by the coordinator. The switch is the same
+`shard_pruning` knob, the answer is identical either way, and
+`tests/placement.rs` holds it on the shapes that drop one clause, drop
+the whole tree, or keep an implied clause under `OR`.
+
 ## The dry run
 
 `SearchService.PlanPlacement` takes a proposed tree and reports, per

@@ -394,6 +394,7 @@ fn answer(r: &QueryResponse) -> Answer {
     }
 }
 
+#[derive(Clone)]
 struct Measured {
     label: &'static str,
     p50_ms: f64,
@@ -711,6 +712,14 @@ async fn main() {
     let part_on = measure(&coord, &cases, p.queries).await;
     let before: Vec<(Measured, Vec<Vec<String>>)> = bucket_on.into_iter().zip(bucket_ids).collect();
     let ties = assert_stable(None, &before, &addr, &part_on).await;
+    // The boolean cases once more with the survivors sent in max_k
+    // pieces, the batch before `signal_batch` existed.
+    coord
+        .knobs()
+        .set("signal_batch", &coord.max_k().to_string())
+        .unwrap();
+    let part_old_batch = measure(&coord, &cases, p.queries).await;
+    assert_bitwise("partitioned layout, max_k batch", &part_on, &part_old_batch);
     handle.abort();
     let _ = handle.await;
 
@@ -723,6 +732,8 @@ async fn main() {
     let _ = handle.await;
 
     let bucket_on: Vec<Measured> = before.into_iter().map(|(m, _)| m).collect();
+    let coord_batch = pipestream_search::coordinator::DEFAULT_SIGNAL_BATCH;
+    let coord_max_k = pipestream_search::coordinator::DEFAULT_MAX_K;
     let mut report = String::new();
     report.push_str("# Partitioned layout and segment pruning: one local shard\n\n");
     report.push_str(&format!(
@@ -754,6 +765,25 @@ async fn main() {
         &part_off,
     ));
     report.push('\n');
+    let boolean_new: Vec<Measured> = part_on
+        .iter()
+        .filter(|m| m.label.starts_with("boolean"))
+        .cloned()
+        .collect();
+    let boolean_old: Vec<Measured> = part_old_batch
+        .into_iter()
+        .filter(|m| m.label.starts_with("boolean"))
+        .collect();
+    report.push_str(&table(
+        &format!(
+            "Partitioned layout, boolean cases: signal_batch = {} (on) against \
+             the max_k batch of {} (off)",
+            coord_batch, coord_max_k
+        ),
+        &boolean_new,
+        &boolean_old,
+    ));
+    report.push('\n');
     report.push_str(&format!(
         "Equality: with pruning on and off, the hits, score bits, order, and counts are \
          identical on both layouts. Across the compaction, which renumbers positional ids, \
@@ -768,9 +798,12 @@ async fn main() {
          `year` predicate rules no segment out and pruning changes no time. On the \
          partitioned layout the same predicate rules out the segments whose range sits \
          below it, and the filtered dense, lexical, browse, and aggregation cases skip \
-         them without opening them; the unfiltered dense scan and the keyword-gated \
-         boolean cases read what they always read, since the vector kernel still visits \
-         every row of a segment it opens and the boolean planner scores per surviving id.\n",
+         them without opening them; the unfiltered dense scan reads what it always \
+         read, since the vector kernel still visits every row of a segment it opens. The \
+         keyword-gated boolean cases score their survivors per candidate on both clauses \
+         (a cursor walk for the term, one masked scan for the vector), so they do not \
+         skip segments either; the third table is the survivors sent in max_k pieces \
+         against one call per shard, on the linear candidate scorer.\n",
     );
     println!("{report}");
     if let Some(parent) = p.out.parent() {
