@@ -133,6 +133,14 @@ a worker that executes placement actions. `--advertise-addr` is required when a
 shard listener binds `0.0.0.0`. `--replica-listen` with port 0 lets the OS
 choose, and the bound port is remembered across restarts.
 
+Every lease renewal carries the node's observed scan rate (encoded
+index bytes per second of kernel time, over its last scans) with its
+observation time and sample count, and the node's residency: a phone
+declares `DEVICE` and is never a source or a destination of any plan.
+`ClusterControl.PlanBalance` is a read-only dry run that reports the
+whole-shard moves that would lower the slowest node's estimated scan
+time, with every excluded node and its reason (`docs/bandwidth-budget.md`).
+
 Policy settings and defaults: `--control-reconcile-ms` 1000,
 `--control-lease-ms` 15000, `--control-replication-factor` 2 (the primary
 included), `--control-split-rows` 25000000, `--control-merge-rows` 2000000,
