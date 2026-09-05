@@ -1325,8 +1325,9 @@ enum Slot {
 impl Extractor {
     /// Compile the extractor for one plan. `body_path` picks the TEXT
     /// field that is the document body; empty binds the plan's only
-    /// one. Refusals here are BIND-time: chunked plans, no or ambiguous
-    /// body, a TEXT document id.
+    /// one; on a chunked plan the body must be a TEXT field inside the
+    /// CHUNKS scope. Refusals here are BIND-time: no or ambiguous body,
+    /// a TEXT document id.
     pub fn new(
         descriptor_set: &[u8],
         message_type: &str,

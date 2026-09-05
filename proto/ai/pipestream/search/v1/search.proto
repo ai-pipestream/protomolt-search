@@ -223,9 +223,10 @@ service NodeService {
   // The node re-derives the plan locally and refuses a fingerprint
   // mismatch (FAILED_PRECONDITION naming both): binding is agreement on
   // the PLAN. Bind also refuses, up front and by name, a plan whose
-  // landing columns this shard does not declare, a chunked plan (a
-  // later increment), and a plan with no TEXT field to serve as the
-  // body.
+  // landing columns this shard does not declare, and a plan with no
+  // TEXT field to serve as the body. A chunked plan binds: its rows
+  // are the chunks of the CHUNKS scope, so the body must be a TEXT
+  // field inside that scope.
   //
   // Each mapped document carries its vector, and the two legs append in
   // LOCKSTEP under one lock: the document takes the next id and its
