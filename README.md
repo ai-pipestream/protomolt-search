@@ -1322,6 +1322,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Proposed 2026-09-05: replicated control authority.** The foundations
+  work owns OpenRaft state, storage, transport and recovery; Fable owns relay
+  consumers of the complete revisioned map. The design covers deterministic
+  commands, retry receipts, durable ownership fencing, learner trust, migration
+  and recovery gates. Implementation follows design review and the budget
+  merge. The current relay build keeps the single authority.
+  [Raft control design](docs/raft-control-design.md).
+
 - **Proposed 2026-09-05: scale-out coordination.** A relay coordinator
   that presents itself to its parent as one shard over the existing
   node-facing surface, a standby-then-Raft control plane, a scan rate

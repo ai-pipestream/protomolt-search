@@ -269,3 +269,11 @@ full. Choices it leaves open, decided here so the branches can start:
 The reserved contract on `feat/scale-out-reservation-2026-09` carries these
 changes; `bandwidth-budget.md` is the measurement and balancer design.
 
+### Raft ownership and review handoff
+
+The foundations work owns the OpenRaft state machine, storage, transport and
+recovery integration. Fable owns relay consumers of the published map.
+[The Raft design](raft-control-design.md) is ready for Fable's review before
+implementation, which follows the budget branch merge. It defines the complete
+map envelope and distinguishes trusted control learners from narrower map
+subscribers. The current single authority remains during relay development.
