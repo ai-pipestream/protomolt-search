@@ -782,23 +782,23 @@ promoted rather than the list shrinking, blend statistics see only the
 filtered set, and in cascade it tightens the phase-1 gate ahead of the
 rescore fan-out. Score-defined, hence layout-invariant. 0 = off.
 
-### The console (test harness UI)
+### The console (JSON facade and web UI)
 
 `cargo run --release --bin console -- --coordinator=host:port
---nodes=host:port,... --analysis=host:port [--listen=127.0.0.1:8600]`
-serves a single-file web UI for exercising every hybrid knob by hand
-against a RUNNING cluster (the console is purely a client). Query text
-is embedded through the sidecar's Model2Vec model (`EmbeddingOptions`,
-sentence embeddings mean-pooled and L2-normalized), the search runs
-through the coordinator's `HybridSearch` with `debug` always on, and
-hit texts come from the owning nodes (`GetDocuments`, which is why the
-console takes the node list in shard order). The UI exposes fusion
-mode, leg_k/rrf_k/weights, score-blend normalization + combination,
-boost rescore, and the analysis spec (tokenizer/stemmer/term source —
-must match ingest); renders per-hit provenance with term highlighting,
-the phase-timing bar, and the per-shard waterfall (cascade scan stats
-included); and holds any result as "A" for side-by-side comparison
-with movement markers.
+[--nodes=host:port,...] [--analysis=host:port] [--listen=127.0.0.1:8600]`
+serves the operator's front end for a running cluster; it is a client
+only and holds the TLS material and bearer token so a browser carries
+neither. `POST /api/rpc/<Service>/<Method>` transcodes proto3 JSON to
+any unary method of `SearchService` and `DiagnosticsService` and back,
+from the compiled descriptor set, and `/api/stream/...` exposes the
+server-streaming ones as server-sent events. The search page builds a
+`Query` from a form (lexical, dense, hybrid composite, boolean tree,
+browse; CEL filter, sort, collapse, highlight, aggregations, explain,
+profile, cursor paging), with typeahead and did-you-mean, the streaming
+query, an A/B panel over `VariantSearch`, and a raw view that yields a
+working `grpcurl` line. The dashboard streams the metrics registry,
+edits runtime knobs, draws the shard map from segment summaries, and
+lists recent queries. Details: [The console](docs/console-facade.md).
 
 ### Boost rescore (any mode)
 
@@ -1228,6 +1228,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   through the ordinary online cutover. Details: [Immutable aligned
   segments](docs/immutable-segments.md), "Segment summaries" and
   "Partitioned layout".
+- **Landed 2026-09-05: the console facade and web UI.** The `console`
+  binary transcodes proto3 JSON to every unary public RPC and back from
+  the compiled descriptor set (`/api/rpc/<Service>/<Method>`), exposes
+  the streaming ones as server-sent events, and serves a two-page UI: a
+  search page that builds the unified `Query` from a form with typeahead,
+  did-you-mean, explain trees, aggregations, collapse, paging, the
+  streaming query, and an A/B panel; and a dashboard over the
+  diagnostics service. Details: [The console](docs/console-facade.md).
 - **Landed 2026-09-05: segment pruning from summaries.** A sealed
   segment's column summary rules it out of a request whose filter it
   cannot match: the vector scan never opens the image, the postings walks
