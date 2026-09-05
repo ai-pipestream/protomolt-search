@@ -44,7 +44,8 @@ for renamed surfaces, compatibility aliases, and rebuild impact.
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
 The implemented public query contract is [docs/query-api.md](docs/query-api.md):
 selection first, candidate-scoped boosts second, then a named-signal composite
-scorer. [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
+scorer, with multi-key sort and collapse over the result. Query-time synonyms
+and did-you-mean are [docs/synonyms.md](docs/synonyms.md). [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
 provisional replacement revisions and an explicit terminal certificate.
 `DENSE_EXECUTION_MODE_AUTO` chooses a dense traversal only through the
 generation-bound policy in
@@ -1209,6 +1210,48 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Landed 2026-09-04 (evening): synonyms and did-you-mean.** Query-time
+  synonym rules (symmetric or one-way) on the coordinator's table
+  (`--synonyms=<toml>`) and on the request, analyzed under the field's spec
+  so a rule written as words matches stems; an expansion is an ordinary
+  query term with its own statistics, reported per matched term.
+  `SearchService.TermSuggest` proposes dictionary terms within an edit bound
+  of each analyzed term over the same bounded scan autocomplete uses.
+  Details: [Synonyms and did-you-mean](docs/synonyms.md).
+- **Landed 2026-09-04 (evening): the online shard split.** The node worker
+  executes `SPLIT_SHARD`: two children built from the source's own WAL by
+  stable-key range, placed on fresh listeners, tailed by key, the source
+  fenced for the final drain, completion with the children as primaries, the
+  source retired; durable in `split.toml`. Details: [Durable cluster
+  control](docs/cluster-control.md), "Shard split".
+- **Landed 2026-09-04 (evening): multi-key sort and collapse.** Sort over
+  i64, f64, and facet columns and the lineage keys on the browse route and
+  on a single lexical leaf (its exact term membership walked without
+  scores); collapse with inner hits on every scored shape, a single leaf
+  deepening its pool until the page has its groups. Details:
+  [Public query contract](docs/query-api.md), "Sorting" and "Collapse".
+- **Landed 2026-09-04 (evening): the fleet's measurement pass.** The
+  four-machine fleet (86,633,399 court chunks, 8 shards) rebuilt on the
+  segment layout, compacted online on the Pi shards, and moved to mTLS with
+  bearer principals; measured over TLS at k=10: vector 287 ms p50 (an
+  exhaustive scan of every row), BM25 265 ms, hybrid 842 ms, and the dense
+  quality profile exact at 5x expansion for k=10 through k=10,000 with the
+  selection flat near 300 ms through 10,000 candidates. Numbers, traps, and
+  the run history: `sea-of-slop-search-parity/design-notes/fleet-4-machine-plan-2026-09.md`.
+- **Landed 2026-09-04: the tools dial a TLS fleet.** The verifier, the
+  ingest driver, the console, and the measurement tools take `--tls-ca`,
+  `--tls-client-cert`, `--tls-client-key`, `--tls-domain`, and
+  `--bearer-token-file` (`security::ToolClient`); the coordinator's node
+  channels take their URL scheme from the client material (tonic applies
+  TLS to `https` URIs only); `deploy/v7-rebuild/mkcerts.sh` issues a fleet's
+  certificates, keys, and principals. Details: [Security](docs/security.md).
+- **Landed 2026-09-04: segment-layout ingest at scale.** The driver
+  interleaves documents and vectors per block, seals wait for the two to
+  align, the FP32 sidecar builds on disk, a node trims its allocator after
+  each seal, a publish reopens only the added segment, a node reopening
+  without a flush rebuilds its sidecar from the segments, and the driver
+  resumes. Details: [Immutable segments](docs/immutable-segments.md),
+  [mmap vectors](docs/mmap-vectors.md), and the runbook README.
 - **Landed 2026-09-04: autocomplete.** `SearchService.Suggest` and the
   `SuggestTerms` shard scan complete a prefix over any indexed BM25 field's
   byte-sorted dictionary, ranked by summed posting df, ties in term bytes;
