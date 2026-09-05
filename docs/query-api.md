@@ -651,3 +651,15 @@ Filters appear in matched-clause provenance but never in score dimensions.
 Unknown query ids, duplicate ids, non-finite weights, impossible strategy
 combinations, analyzer drift, missing columns, mixed calibration, stale stats,
 or incomplete shards are request failures.
+
+## Aggregation
+
+`QueryRequest.aggregate` folds an `AggregateRequest` over the candidate
+pool the page was drawn from, on every pooled shape (a single leaf, a
+composite, a scorer or boost pool, with or without a collapse) and over
+the exact match set of a browse; a boolean root carries its aggregation
+on `BooleanQuery.aggregate` instead. Naming an aggregation fixes the
+pool at `selection_k`, so paging moves inside it and each page reports
+the same fold. `AggregateResponse.matched` is the pool's size. The hits
+are unchanged by the aggregation. Details, including CARDINALITY and
+calendar histograms: `docs/aggregations.md`, sections 8 to 10.

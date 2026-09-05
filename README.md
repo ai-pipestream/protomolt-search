@@ -1221,6 +1221,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   `SearchService.TermSuggest` proposes dictionary terms within an edit bound
   of each analyzed term over the same bounded scan autocomplete uses.
   Details: [Synonyms and did-you-mean](docs/synonyms.md).
+- **Landed 2026-09-05: aggregation over a query's pool, cardinality, and
+  calendar histograms.** `QueryRequest.aggregate` folds the Aggregate
+  route's exact folds over the candidate pool a page was drawn from, on
+  a leaf, a composite, a scorer or boost pool, under a collapse, and over
+  a browse's exact filter match set, so a hybrid page carries its facet
+  counts; `AGGREGATE_OP_CARDINALITY` counts distinct values exactly
+  (shard distinct sets unioned, a loud `max_distinct` cap, never a
+  sketch); `HistogramSpec.calendar` buckets epoch-micros timestamps at
+  minute, hour, day, ISO-week, month, quarter, and year boundaries in a
+  fixed UTC offset with hand-rolled proleptic Gregorian arithmetic.
+  Details: [Aggregations](docs/aggregations.md), sections 8 to 10.
 - **Landed 2026-09-04 (evening): the online shard split.** The node worker
   executes `SPLIT_SHARD`: two children built from the source's own WAL by
   stable-key range, placed on fresh listeners, tailed by key, the source
