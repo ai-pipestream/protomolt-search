@@ -1631,18 +1631,21 @@ message ParentGroup {
 // sidecar's enums; 0 always means "sidecar default". Mirroring the enums
 // here would just duplicate the vendored definitions.
 message AnalysisSpec {
-  // AnalysisOptions.Tokenizer value (1 = WHITESPACE, 2 = SIMPLE).
+  // AnalysisOptions.Tokenizer value (1 = WHITESPACE, 2 = SIMPLE,
+  // 3 = UAX29).
   int32 tokenizer = 1;
   // AnalysisOptions.Stemmer value (1 = NONE, 2 = PORTER, ...). Required to
   // be non-NONE when term_vector_source selects stems.
   int32 stemmer = 2;
   // TermVectorOptions.Mode value (1 = FULL with offsets, 2 = SCORING_ONLY).
   int32 term_vector_mode = 3;
-  // TermVectorOptions.Source value (1 = TOKENS, 2 = STEMS). Ingest and
-  // query MUST use the same source or term identities will not match.
+  // TermVectorOptions.Source value (1 = TOKENS, 2 = STEMS,
+  // 3 = NORMALIZED_STEMS). Ingest and query MUST use the same source or
+  // term identities will not match.
   int32 term_vector_source = 4;
   // Character filters applied before tokenization, in order, defining
-  // term identity (IGNORED when source is STEMS). "Char filter" is
+  // term identity (IGNORED when source is STEMS; applied before the
+  // stemmer under NORMALIZED_STEMS). "Char filter" is
   // Lucene's name for this stage and OpenNLP implements them as
   // CharSequenceNormalizer; the sidecar's wire enum spells them
   // TermVectorOptions.NormalizerStep, whose values these are.
