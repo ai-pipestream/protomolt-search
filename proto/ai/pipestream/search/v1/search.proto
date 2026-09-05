@@ -429,13 +429,14 @@ service SearchService {
   // exact phrase signal. This never synthesizes arbitrary n-grams.
   rpc PhraseSearch(PhraseSearchRequest) returns (Bm25SearchResponse);
 
-  // Hybrid vector + BM25 search with RRF fusion. Default
-  // (FUSION_MODE_GLOBAL_RANK): shards return raw per-leg lists and the
-  // coordinator merges each leg by raw score into global rankings, then
-  // applies single-level RRF — EXACTLY the monolithic result for
-  // k <= leg_k when scores are globally comparable per leg (see
-  // FusionMode). FUSION_MODE_TWO_LEVEL is the rank-based fallback for
-  // incomparable scores. Hits carry global per-leg ranks and raw scores.
+  // Hybrid vector + BM25 search. An unset fusion_mode resolves to
+  // FUSION_MODE_CASCADE. FUSION_MODE_GLOBAL_RANK has shards return raw
+  // per-leg lists and the coordinator merge each leg by raw score into
+  // global rankings, then apply single-level RRF — EXACTLY the
+  // monolithic result for k <= leg_k when scores are globally comparable
+  // per leg (see FusionMode). FUSION_MODE_TWO_LEVEL is the rank-based
+  // fallback for incomparable scores. Hits carry global per-leg ranks
+  // and raw scores.
   rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
 
   // Pushes one provider configuration to every known shard. The scoring
@@ -3533,7 +3534,7 @@ enum FusionMode {
   // Unused zero value; resolves to FUSION_MODE_CASCADE.
   FUSION_MODE_UNSPECIFIED = 0;
 
-  // Default. Shards return RAW per-leg lists (ShardLegs); the coordinator
+  // Shards return RAW per-leg lists (ShardLegs); the coordinator
   // merges each leg across shards by raw score into GLOBAL rankings and
   // applies single-level RRF over them. With globally comparable scores
   // per leg (shared calibration for vectors, global stats for BM25) this
@@ -3550,10 +3551,11 @@ enum FusionMode {
   // result can differ from a monolithic index.
   FUSION_MODE_TWO_LEVEL = 2;
 
-  // Default. Cascade, no score fusion: phase 1 generates vector
-  // candidates through the floor-sharing bidi path (cross-shard early
-  // termination applies — the cutoff IS the savings, no leg_k hits per
-  // shard), with a TIE-COMPLETE cutoff: the candidate pool is
+  // What an unset fusion_mode resolves to. Cascade, no score fusion:
+  // phase 1 generates vector candidates through the floor-sharing bidi
+  // path (cross-shard early termination applies — the cutoff IS the
+  // savings, no leg_k hits per shard), with a TIE-COMPLETE cutoff:
+  // the candidate pool is
   // {score >= s_k} where s_k is the global k-th vector score, so the
   // pool can exceed k by the boundary tie-group size. Phase 2 reranks
   // the pool by BM25 (global stats, candidate-scoped scoring per owning
@@ -3660,7 +3662,7 @@ enum ScoreCombination {
 // Per-leg options for hybrid (RRF-fused) search. Every field is optional;
 // 0 selects the documented default.
 message HybridLegOptions {
-  // Fusion strategy. Absent = FUSION_MODE_GLOBAL_RANK.
+  // Fusion strategy. Absent = FUSION_MODE_CASCADE.
   FusionMode fusion_mode = 5;
   // How deep each leg is fetched before fusion. 0 = default
   // max(k, rrf_k): the RRF constant should never exceed a leg's depth, or
