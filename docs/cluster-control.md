@@ -45,6 +45,13 @@ refused.
 4. `DrainNode` stops new placements on the node and schedules copy-before-drop.
 5. An expired primary is replaced by the newest compatible ready replica.
 
+That last rule describes the current implementation, not safe writable failover
+under a network partition. Lease expiry does not stop the old primary from
+accepting writes. The [Raft design](raft-control-design.md) requires durable
+ownership fencing before replacement-writer activation; its first release
+leaves activation unavailable when the old owner cannot be fenced. Replicating
+control decisions alone does not supply this data-plane guarantee.
+
 Lease tokens are not included in `ClusterPlan`. A reused node id at a different
 address is rejected while its lease is live.
 

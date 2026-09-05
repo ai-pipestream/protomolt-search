@@ -1,15 +1,16 @@
 # Replicated control authority with OpenRaft
 
-Status: proposed for Fable's review, 2026-09-05. Design baseline: main
+Status: accepted with additions in [Fable's review](raft-control-review-2026-09-05.md),
+2026-09-05; additions incorporated below. Design baseline: main
 `c094125ca2572e47e383a0060ee8c6f7e6233570`, including the revised scale-out
 reservation at `f2ff569`. No Raft dependency, wire allocation, migration or
 runtime implementation is introduced by this note.
 
 The foundations work owns the replicated state machine, durable storage,
 OpenRaft transport adapter and recovery. Fable owns relay consumers and their
-generation checks. Implementation starts after the budget branch merges and
-this design is reviewed. The current relay and scan-rate work keeps its single
-control authority and does not wait for Raft.
+generation checks and the data-plane enforcement of published write epochs.
+Implementation starts after the budget branch merges. The current relay and
+scan-rate work keeps its single control authority and does not wait for Raft.
 
 ## Scope and deployment
 
@@ -74,6 +75,10 @@ collection binds its workspace/resource identity explicitly. Replicate:
 - Control revision, token/action/write-epoch allocators and policy version.
 - Node identities/incarnations, registration leases, residency restrictions,
   capacity observations and replica facts with their generations/watermarks.
+- Per-collection provider geometry (dimensions, bits per component and encoded
+  row-byte formula version), failure domains and node draining/expiry state.
+  Budget planning reads these committed inputs and the full placement map;
+  it must not query coordinator health or placement during apply.
 - Pending placement intents, durable preparation/completion facts and terminal
   decisions. Preserve completed action payload fingerprints, not only an ID set.
 - Control-operation deduplication results, retry fences and the committed
@@ -107,8 +112,9 @@ mutation requests that cannot identify retries safely.
 Persist deduplication with the effect and response. Start without automatic
 expiry. A later bounded-retention mechanism requires acknowledged client
 sequence floors and persistent rejection of older requests, so garbage
-collection cannot turn an old retry into a second mutation. Capacity exhaustion
-must refuse new work rather than evict safety-critical history silently.
+collection cannot turn an old retry into a second mutation. Configure a capacity
+and expose usage and the limit as metrics. Capacity exhaustion must refuse new
+work with a named error rather than evict safety-critical history silently.
 
 Apply all entries in order, including membership and no-op entries. Business
 rejections return deterministic recorded results; storage errors are fatal
@@ -218,6 +224,14 @@ per-shard write epoch scoped by authority incarnation and index generation;
 data mutations and action execution validate it at their actual commit boundary.
 An old epoch remains invalid after node restart.
 
+Fable owns the data-plane checks at mutation commit boundaries. This work owns
+epoch allocation, durable prepare/activate state and publication. A local check
+against a cached map does not fence a partitioned old owner; the durable
+preparation or external-fencing evidence below is still required. Keep owner
+node ID, process incarnation and write epoch distinct. A process restart changes
+its incarnation, while the accepted write fence survives restart. Relay stats
+tokens bind the process incarnation as well as their existing generation inputs.
+
 Ownership changes use committed prepare -> fenced-ready facts -> activate (or
 abort) transitions. The old owner durably stops new writes, drains admitted
 writes and records its final watermark before acknowledging preparation. The
@@ -248,6 +262,7 @@ fields already exist on `ClusterPlan`:
 - Cluster ID and authority incarnation; explicit workspace/collection identity.
 - Control revision and topology generation, with distinct documented meanings.
 - Complete ordered routes, stable logical shard identities, hash ranges,
+  slot bases, replica addresses, owner node IDs and process incarnations,
   placement codes and the full predicate-partition tree.
 - Canonical map digest and schema/format version. Include activated ownership
   epochs needed by data-plane requests, without inventing segment-subset fields
@@ -260,8 +275,9 @@ after apply; a remote subscriber receives them from that same applied feed.
 No consumer observes an uncommitted proposal.
 
 Consumers validate identity, format, digest and complete routing constraints,
-then swap the map atomically. Same revision with different content is an error;
-older revisions are ignored/refused. Capacity-only changes may advance control
+then swap the map atomically. Every subscription frame carries the canonical
+digest, including full reset snapshots. Same revision with different content is
+an error; older revisions are ignored/refused. Capacity-only changes may advance control
 revision without changing topology generation. A topology generation cannot
 name two different maps. Keep a query's original map until its readers finish;
 never splice two generations into one fan-out or BM25 statistics set.
@@ -270,7 +286,9 @@ Reconnect with a retained revision replays available updates. If history was
 compacted, send a complete snapshot with an explicit reset marker; never claim
 that a missing range of revisions was delivered. A slow consumer may coalesce
 full map snapshots; it cannot coalesce or execute placement commands through
-this interface. Expose applied/served revisions and lag. Mutation admission
+this interface. A reset or capacity-only revision that preserves the topology
+generation must not cancel an in-flight query on that generation. Expose
+applied/served revisions and lag. Mutation admission
 must enforce the activated epoch rather than assuming a connected watch means
 the consumer is current.
 
@@ -288,6 +306,9 @@ narrower access and to avoid making thousands of relays direct replication
 targets of one leader. Fable owns the consumer of `PublishedMap` in either
 case; this work owns the learner runtime and applied-state producer. Phones
 use their permitted query/session metadata interface, never a control learner.
+Map subscriptions authenticate the relay's cluster certificate and authorize
+its collection scope. Trusting that certificate does not enroll it as a learner;
+learner membership remains an explicit operator action.
 
 ## Migration and recovery rules
 
@@ -295,6 +316,9 @@ use their permitted query/session metadata interface, never a control learner.
    legacy file, policy and full live map together. Quiesce the old control
    authority and its placement workers. Record a digest and explicit recovery
    point; reconcile unresolved actions before enabling automatic execution.
+   Fable first moves the budget's geometry and placement inputs into committed
+   state, including ordered updates for backend/calibration changes. Validate
+   that dry runs no longer fetch these inputs from live coordinator state.
 2. Validate one import payload containing every counter, lease, action/result,
    collection binding and full map. Preserve allocated IDs and generations.
    Missing placement state is an import error until supplied and verified from
@@ -320,8 +344,8 @@ Clients must rebind rather than comparing revision numbers across incarnations.
 
 ## Implementation sequence and acceptance
 
-1. Fable reviews this note and the map handoff. No dependency/proto allocation
-   until that review and the budget merge establish the shared base.
+1. Fable's review is accepted with the additions recorded here. No
+   dependency/proto allocation until the budget merge establishes the shared base.
 2. Extract deterministic transitions and full-map state. Run the existing
    single-authority control, placement and budget tests through that adapter.
 3. Implement storage and its conformance/fault tests; then the tonic adapter
