@@ -60,6 +60,8 @@ async fn add_documents_faceted(
     let (tx, rx) = mpsc::channel(8);
     for (text, facets) in docs {
         tx.send(AddDocumentsRequest {
+            original_source: None,
+            source_chunk_ordinal: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),

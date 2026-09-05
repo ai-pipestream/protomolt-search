@@ -663,6 +663,7 @@ impl NodeServiceImpl {
                             first_id,
                             documents: vec![document.clone()],
                             stable_routing_keys: keys.clone(),
+                            source_references: Vec::new(),
                         }))
                         .map_err(|e| format!("rewrite document record: {e}"))?;
                 }

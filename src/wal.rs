@@ -17,6 +17,9 @@
 //! - `markers.wal` — FlushMarker / SnapshotMarker / LoggedBinding records (the first two carry no
 //!   id, so they get their own small file instead of fanning out to every
 //!   bucket).
+//! - `sources.wal` — format-2 descriptor and original-source blobs shared
+//!   by the generation's document records. Readers resolve their addresses
+//!   before replay or replication; Flush syncs sources before row logs.
 //!
 //! Frames keep the `[u32 len LE][u32 crc32 IEEE of payload LE][prost
 //! bytes]` format; `seq` is 1-based and gapless PER FILE. Durability:
@@ -41,6 +44,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::pb::wal::{wal_record, WalRecord};
 use crate::reshard::bucket_of;
+
+#[path = "wal_sources.rs"]
+mod sources;
 
 // ---------------------------------------------------------------------------
 // CRC32 (IEEE, table-based; hand-rolled to avoid a crate dependency)
@@ -116,7 +122,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Current on-disk format version (manifest `format_version`).
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The WAL directory of a shard: `<index path>.wal/`.
 pub fn wal_dir(index_path: &Path) -> PathBuf {
@@ -314,11 +320,11 @@ pub fn read_manifest(gen_dir: &Path) -> io::Result<WalManifest> {
     let text = std::fs::read_to_string(manifest_path(gen_dir))?;
     let manifest: WalManifest = toml::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad manifest: {e}")))?;
-    if manifest.format_version != FORMAT_VERSION {
+    if !(1..=FORMAT_VERSION).contains(&manifest.format_version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported WAL format version {} (this build understands {FORMAT_VERSION})",
+                "unsupported WAL format version {} (this build understands 1 through {FORMAT_VERSION})",
                 manifest.format_version
             ),
         ));
@@ -365,6 +371,14 @@ fn read_up_to(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 fn read_frame(reader: &mut impl Read, offset: &mut u64) -> io::Result<FrameRead> {
+    read_frame_limited(reader, offset, u32::MAX as u64)
+}
+
+fn read_frame_limited(
+    reader: &mut impl Read,
+    offset: &mut u64,
+    max_payload: u64,
+) -> io::Result<FrameRead> {
     let start = *offset;
     let mut len_buf = [0u8; 4];
     match read_up_to(reader, &mut len_buf)? {
@@ -374,6 +388,12 @@ fn read_frame(reader: &mut impl Read, offset: &mut u64) -> io::Result<FrameRead>
     }
     *offset += 4;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len as u64 > max_payload {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WAL frame exceeds its source address",
+        ));
+    }
     let mut crc_buf = [0u8; 4];
     if read_up_to(reader, &mut crc_buf)? < 4 {
         return Ok(FrameRead::Torn { offset: start });
@@ -413,6 +433,7 @@ pub struct RecordReader {
     offset: u64,
     next_seq: u64,
     done: bool,
+    sources: Option<sources::Reader>,
 }
 
 impl RecordReader {
@@ -423,6 +444,7 @@ impl RecordReader {
             offset: 0,
             next_seq: 1,
             done: false,
+            sources: None,
         })
     }
 
@@ -439,6 +461,7 @@ impl RecordReader {
             offset,
             next_seq,
             done: false,
+            sources: None,
         })
     }
 
@@ -471,7 +494,7 @@ impl RecordReader {
                 return Ok(None);
             }
         };
-        let record = WalRecord::decode(frame.as_slice()).map_err(|e| {
+        let mut record = WalRecord::decode(frame.as_slice()).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -490,6 +513,16 @@ impl RecordReader {
                     record.seq
                 ),
             ));
+        }
+        if let Some(wal_record::Op::AddDocuments(batch)) = record.op.as_mut() {
+            if !batch.source_references.is_empty() {
+                if self.sources.is_none() {
+                    self.sources = Some(sources::Reader::open(
+                        self.path.parent().unwrap_or(Path::new(".")),
+                    )?);
+                }
+                self.sources.as_mut().expect("opened").restore(batch)?;
+            }
         }
         self.next_seq += 1;
         Ok(Some(record))
@@ -911,6 +944,7 @@ pub struct WalWriter {
     next_clock: u64,
     legacy_clock_records: bool,
     dirty: bool,
+    sources: Option<sources::Writer>,
 }
 
 impl WalWriter {
@@ -938,6 +972,7 @@ impl WalWriter {
             next_clock: 1,
             legacy_clock_records: false,
             dirty: false,
+            sources: None,
         })
     }
 
@@ -983,6 +1018,7 @@ impl WalWriter {
                         next_clock: 1,
                         legacy_clock_records: false,
                         dirty: false,
+                        sources: None,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match read_manifest(&dir) {
@@ -1036,6 +1072,7 @@ impl WalWriter {
             next_clock: max_clock.saturating_add(1).max(1),
             legacy_clock_records,
             dirty: false,
+            sources: None,
         })
     }
 
@@ -1149,7 +1186,34 @@ impl WalWriter {
     /// NOTE a `LoggedAddVectors` batch must not straddle buckets: the
     /// caller (the node) splits batches into per-vector records, so
     /// `first_id` routes the whole record.
-    pub fn append(&mut self, op: wal_record::Op) -> io::Result<()> {
+    pub fn append(&mut self, mut op: wal_record::Op) -> io::Result<()> {
+        if let wal_record::Op::AddDocuments(batch) = &mut op {
+            if !batch.source_references.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "WAL append requires resolved source references",
+                ));
+            }
+            if batch
+                .documents
+                .iter()
+                .any(|d| d.original_source.is_some() || d.source_chunk_ordinal.is_some())
+            {
+                if self.manifest.format_version < FORMAT_VERSION {
+                    let mut upgraded = self.manifest.clone();
+                    upgraded.format_version = FORMAT_VERSION;
+                    write_manifest(&self.dir, &upgraded)?;
+                    self.manifest = upgraded;
+                }
+                if self.sources.is_none() {
+                    self.sources = Some(sources::Writer::open(&self.dir)?);
+                }
+                self.sources
+                    .as_mut()
+                    .expect("opened")
+                    .intern_documents(batch)?;
+            }
+        }
         let bucket = match &op {
             wal_record::Op::AddVectors(a) => {
                 Some(bucket_of(a.first_id, self.manifest.bucket_count as usize) as u32)
@@ -1185,12 +1249,17 @@ impl WalWriter {
     /// Flush all buffers and fsync every open file. Called on Flush and
     /// on generation rotation.
     pub fn flush(&mut self) -> io::Result<()> {
+        // Source bytes must be durable before any referencing row is fsynced.
+        if let Some(sources) = self.sources.as_mut() {
+            sources.flush()?;
+        }
         for (bucket, writer) in &mut self.buckets {
             writer
                 .flush()
                 .map_err(|e| io::Error::new(e.kind(), format!("bucket {bucket}: {e}")))?;
         }
         self.markers.flush()?;
+        File::open(&self.dir)?.sync_all()?;
         self.dirty = false;
         Ok(())
     }
@@ -1303,8 +1372,11 @@ mod tests {
                 phrase_field: "phrases".to_string(),
                 position_fields: Vec::new(),
                 bigram_fields: Vec::new(),
+                original_source: None,
+                source_chunk_ordinal: None,
             }],
             stable_routing_keys: Vec::new(),
+            source_references: Vec::new(),
         })
     }
 
@@ -1349,6 +1421,142 @@ mod tests {
         assert_eq!(resumed.high_watermark(), 3);
         assert!(!resumed.has_legacy_clock_records());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn source_op(id: u64, source: &crate::pb::ProtobufSource) -> wal_record::Op {
+        let wal_record::Op::AddDocuments(mut batch) = doc_op(id) else {
+            unreachable!()
+        };
+        batch.documents[0].original_source = Some(source.clone());
+        batch.documents[0].source_chunk_ordinal = Some(id as u32);
+        wal_record::Op::AddDocuments(batch)
+    }
+
+    #[test]
+    fn original_sources_are_interned_across_buckets_resume_and_replication() {
+        let dir = tempdir("source-intern");
+        let source = crate::pb::ProtobufSource {
+            descriptor_set: b"exact producer descriptor".to_vec(),
+            message_type: "example.Parent".into(),
+            payload: vec![0xab; 128 * 1024],
+        };
+        let mut old_manifest = manifest(8);
+        old_manifest.format_version = 1;
+        let mut writer = WalWriter::create(&dir, old_manifest).unwrap();
+        writer.append(source_op(0, &source)).unwrap();
+        writer.flush().unwrap();
+        let generation = writer.dir().to_path_buf();
+        assert_eq!(read_manifest(&generation).unwrap().format_version, 2);
+        let source_path = generation.join("sources.wal");
+        let source_size = std::fs::metadata(&source_path).unwrap().len();
+        for id in 1..100 {
+            writer.append(source_op(id, &source)).unwrap();
+        }
+        writer.flush().unwrap();
+        assert_eq!(std::fs::metadata(&source_path).unwrap().len(), source_size);
+        drop(writer);
+        let mut writer =
+            WalWriter::resume(&generation, read_manifest(&generation).unwrap()).unwrap();
+        writer.append(source_op(100, &source)).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(std::fs::metadata(&source_path).unwrap().len(), source_size);
+        let row_bytes: u64 = std::fs::read_dir(&generation)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| parse_bucket_name(&e.file_name().to_string_lossy()).is_some())
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(
+            row_bytes < source.payload.len() as u64,
+            "chunk records duplicated the original"
+        );
+        // A replica tail beginning after the original's first row remains
+        // self-contained; it does not depend on that earlier row or bucket.
+        let tail = read_clocked_records(&generation, 100).unwrap();
+        assert_eq!(tail.len(), 1);
+        let Some(wal_record::Op::AddDocuments(batch)) = &tail[0].op else {
+            panic!()
+        };
+        assert!(batch.source_references.is_empty());
+        assert_eq!(batch.documents[0].original_source.as_ref(), Some(&source));
+        assert_eq!(batch.documents[0].source_chunk_ordinal, Some(100));
+        let replica_dir = dir.join("replica");
+        let mut replica = WalWriter::create(&replica_dir, manifest(8)).unwrap();
+        replica.append(tail[0].op.clone().unwrap()).unwrap();
+        replica.flush().unwrap();
+        let replay = read_clocked_records(replica.dir(), 0).unwrap();
+        assert_eq!(replay[0].op, tail[0].op);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn source_replay_refuses_missing_corrupt_and_truncated_referenced_bytes() {
+        let dir = tempdir("source-corruption");
+        let source = crate::pb::ProtobufSource {
+            descriptor_set: vec![1, 2, 3],
+            message_type: "x.Doc".into(),
+            payload: vec![4, 5, 6],
+        };
+        let mut writer = WalWriter::create(&dir, manifest(2)).unwrap();
+        writer.append(source_op(0, &source)).unwrap();
+        writer.flush().unwrap();
+        let generation = writer.dir().to_path_buf();
+        drop(writer);
+        let path = generation.join("sources.wal");
+        let bytes = std::fs::read(&path).unwrap();
+        for at in 0..bytes.len() {
+            std::fs::write(&path, &bytes[..at]).unwrap();
+            assert!(
+                read_clocked_records(&generation, 0).is_err(),
+                "truncation {at}"
+            );
+            let mut corrupt = bytes.clone();
+            corrupt[at] ^= 1;
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(
+                read_clocked_records(&generation, 0).is_err(),
+                "corruption {at}"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_clocked_records(&generation, 0).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unused_torn_source_tail_is_removed_before_the_next_source_append() {
+        let dir = tempdir("source-torn-tail");
+        let mut source = crate::pb::ProtobufSource {
+            descriptor_set: vec![1, 2, 3],
+            message_type: "x.Doc".into(),
+            payload: vec![4, 5, 6],
+        };
+        let mut writer = WalWriter::create(&dir, manifest(2)).unwrap();
+        writer.append(source_op(0, &source)).unwrap();
+        writer.flush().unwrap();
+        let generation = writer.dir().to_path_buf();
+        drop(writer);
+        let path = generation.join("sources.wal");
+        let valid_bytes = std::fs::read(&path).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[99, 0, 0, 0, 1, 2])
+            .unwrap();
+        let mut writer =
+            WalWriter::resume(&generation, read_manifest(&generation).unwrap()).unwrap();
+        source.payload.push(7);
+        writer.append(source_op(1, &source)).unwrap();
+        writer.flush().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..valid_bytes.len()], valid_bytes);
+        let records = read_clocked_records(&generation, 0).unwrap();
+        let Some(wal_record::Op::AddDocuments(batch)) = &records[1].op else {
+            panic!()
+        };
+        assert_eq!(batch.documents[0].original_source.as_ref(), Some(&source));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

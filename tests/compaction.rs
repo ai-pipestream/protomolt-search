@@ -141,10 +141,23 @@ async fn append(client: &mut NodeServiceClient<Channel>, row: &Row) -> (u64, u64
     (vectors.first_id, vectors.wal_generation)
 }
 
+// Adjacent rows share a parent source. Row zero is deleted before
+// compaction, so row one's source must survive without its first chunk.
+fn original_source(row: &Row) -> (pipestream_search::pb::ProtobufSource, Option<u32>) {
+    let parent = format!("parent/{}", row.num / 4);
+    let version = format!("version/{}", row.num % 2);
+    (
+        common::protobuf_source(&parent, &version),
+        Some(((row.num / 2) % 2) as u32),
+    )
+}
+
 /// The document half of a legacy two-RPC append, keyed.
 async fn add_document(client: &mut NodeServiceClient<Channel>, row: &Row) -> AddDocumentsResponse {
     let doc = AddDocumentsRequest {
         text: row.text.clone(),
+        original_source: Some(original_source(row).0),
+        source_chunk_ordinal: original_source(row).1,
         lineage: Some(DocLineage {
             parent_id: row.num as u64,
             ..Default::default()
@@ -781,6 +794,36 @@ async fn run_online_compaction(layout: Layout) {
 
     // Every read path equals a shard built fresh from the final set.
     let final_rows: Vec<Row> = tracked.lock().unwrap().live.values().cloned().collect();
+    let verify_sources = |reader: &pipestream_search::postings::Bm25Reader| {
+        use pipestream_search::postings::Bm25Index;
+        for local in 0..reader.next_doc_id() {
+            let text = reader.text(local).unwrap();
+            let row = final_rows.iter().find(|r| r.text == text).unwrap();
+            assert_eq!(
+                reader.protobuf_source(local).unwrap(),
+                Some(original_source(row))
+            );
+        }
+    };
+    match layout {
+        Layout::SingleImage => {
+            let generation = pipestream_search::node::generation_dir(&index_path);
+            let reader = pipestream_search::postings::Bm25Reader::open(
+                &pipestream_search::node::generation_bm25(&generation),
+            )
+            .unwrap();
+            verify_sources(&reader);
+        }
+        Layout::Segments => {
+            let set = pipestream_search::segments::OpenedSegmentSet::open(
+                pipestream_search::node::segments_root(&index_path),
+            )
+            .unwrap();
+            for part in 0..set.manifest().segments.len() {
+                verify_sources(set.bm25(part));
+            }
+        }
+    }
     let (reference, reference_handle) = reference_shard(
         &dir,
         "reference.vector",
@@ -844,6 +887,9 @@ async fn run_online_compaction(layout: Layout) {
     let child = &replayed.children[0];
     assert_eq!(child.num_vectors, live_rows);
     assert_eq!(child.num_documents, live_rows);
+    verify_sources(
+        &pipestream_search::postings::Bm25Reader::open(child.bm25_path.as_ref().unwrap()).unwrap(),
+    );
     let (replayed_addr, replayed_handle) = start_opened_node(config(
         Some(child.vector_path.clone()),
         Layout::SingleImage,

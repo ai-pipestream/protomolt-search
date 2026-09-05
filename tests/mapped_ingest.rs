@@ -9,6 +9,7 @@
 //! that is exactly what the extractor consumes in production.
 
 mod common;
+use pipestream_search::pb::ProtobufSource;
 
 use common::mock::start_mock_analysis;
 use pipestream_search::coordinator::CoordinatorServiceImpl;
@@ -452,6 +453,17 @@ async fn clocked_wal_catches_a_replica_up_idempotently() {
     )
     .unwrap();
     assert_eq!(replica_store.binding(), Some(&expected_binding()));
+    assert_eq!(
+        replica_store.protobuf_source(0).unwrap(),
+        Some((
+            ProtobufSource {
+                descriptor_set: case_set(),
+                message_type: "law.v1.Case".into(),
+                payload: doc(0).encode(),
+            },
+            None
+        ))
+    );
 
     primary_handle.abort();
     replica_handle.abort();
@@ -1275,6 +1287,19 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     let bm25_path = pipestream_search::node::bm25_sidecar_path(&index_path);
     let store = pipestream_search::postings::Bm25Store::load(&bm25_path).unwrap();
     assert_eq!(store.binding(), Some(&expected_binding()));
+    for row in 0..3 {
+        assert_eq!(
+            store.protobuf_source(row).unwrap(),
+            Some((
+                ProtobufSource {
+                    descriptor_set: case_set(),
+                    message_type: "law.v1.Case".into(),
+                    payload: doc(row as usize).encode(),
+                },
+                None
+            ))
+        );
+    }
 
     // Restart from disk, no in-memory state carried over. The wider
     // bm25_fields table (title added) is only there to let the
@@ -1419,6 +1444,22 @@ async fn reshard_replay_carries_the_binding() {
     let child = pipestream_search::postings::Bm25Store::load(child_bm25).unwrap();
     assert_eq!(child.doc_count(), 4);
     assert_eq!(child.binding(), Some(&expected_binding()));
+    for row in 0..4 {
+        let original = (0..4)
+            .find(|i| child.text(row) == doc(*i).title.as_deref())
+            .unwrap();
+        assert_eq!(
+            child.protobuf_source(row).unwrap(),
+            Some((
+                ProtobufSource {
+                    descriptor_set: case_set(),
+                    message_type: "law.v1.Case".into(),
+                    payload: doc(original).encode(),
+                },
+                None
+            ))
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

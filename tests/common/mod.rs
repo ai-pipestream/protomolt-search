@@ -12,6 +12,18 @@
 pub mod files;
 pub mod mock;
 
+pub fn protobuf_source(text: &str, key: &str) -> pipestream_search::pb::ProtobufSource {
+    let mut payload = Vec::new();
+    prost::encoding::string::encode(2, &text.to_string(), &mut payload);
+    payload.extend([122, 0]); // Required bytes field, explicitly present empty.
+    prost::encoding::string::encode(99, &key.to_string(), &mut payload); // Unknown field.
+    pipestream_search::pb::ProtobufSource {
+        descriptor_set: include_bytes!("../fixtures/protobuf-semantics/descriptor.bin").to_vec(),
+        message_type: "semantics.Doc".into(),
+        payload,
+    }
+}
+
 use pipestream_search::harness::{self, build_monolithic, build_shards};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::vector::VectorIndex;

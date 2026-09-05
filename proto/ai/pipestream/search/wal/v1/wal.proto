@@ -2,11 +2,9 @@ syntax = "proto3";
 
 // Per-shard write-ahead log (WAL) for Pipestream Search nodes.
 //
-// Every mutation a shard applies (vector batches, document batches, flush
-// points, snapshot installs) is framed into append-only bucket files
-// BEFORE it hits the index, so a shard's full ingest history can be
-// replayed offline — which is what makes split/merge of live shards a
-// replay-from-log operation instead of a re-embed (see `examples/reshard.rs`).
+// Mutations are applied in memory and then logged under the shard lock.
+// Flush syncs the log before persisting index images. Full logged history
+// supports offline replay and resharding without embedding again.
 //
 // On-disk layout (no protobuf framing of its own):
 //
@@ -14,6 +12,7 @@ syntax = "proto3";
 //     manifest.toml       shard shape + locked calibration + bucket count
 //     bucket-<NNN>.wal    records, routed by fnv1a64(id) >> (64 - bucket_bits)
 //     markers.wal         FlushMarker / SnapshotMarker records
+//     sources.wal         format-2 interned descriptor and source blobs
 //
 // Each frame is `[u32 payload_len LE][u32 crc32-IEEE of payload LE][prost
 // bytes]` carrying one WalRecord; seq is 1-based and gapless per FILE. A
@@ -22,6 +21,7 @@ syntax = "proto3";
 package ai.pipestream.search.wal.v1;
 
 import "ai/pipestream/search/v1/search.proto";
+import "ai/pipestream/search/storage/v1/source_archive.proto";
 
 // A logged `AddVectors` batch with its server-assigned id base.
 // `AddVectorsRequest` does not carry assigned ids, so the envelope adds
@@ -48,6 +48,25 @@ message LoggedAddDocuments {
   repeated ai.pipestream.search.v1.AddDocumentsRequest documents = 2;
   // Optional stable product identities parallel to `documents`.
   repeated bytes stable_routing_keys = 3;
+  // Storage-only references parallel to documents. Empty for legacy records
+  // and on the replication wire, where readers restore original_source.
+  // A default entry means that document has no original protobuf source.
+  repeated SourceReference source_references = 4;
+}
+
+// Both addresses refer to framed blobs in this generation's sources.wal.
+// SHA-256 covers the encoded SourceWalBlob; length includes frame overhead.
+message SourceReference {
+  ai.pipestream.search.storage.v1.SourceBlob descriptor = 1;
+  ai.pipestream.search.storage.v1.SourceBlob source = 2;
+}
+
+// Append-only, shared across all bucket files in one WAL generation.
+message SourceWalBlob {
+  oneof value {
+    bytes descriptor = 1;
+    ai.pipestream.search.storage.v1.SourceRecord source = 2;
+  }
 }
 
 // The shard flushed its indexes to disk at this point.

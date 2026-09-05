@@ -1,0 +1,33 @@
+syntax = "proto3";
+package ai.pipestream.search.storage.v1;
+
+// The archive's index precedes its blob area. Offsets are relative to that
+// area. Descriptors precede source records; all blobs tile it without gaps.
+message SourceArchiveIndex {
+  uint32 format_version = 1;
+  repeated SourceBlob descriptors = 2;
+  repeated SourceBlob sources = 3;
+  repeated SourceRow rows = 4;
+}
+
+message SourceBlob {
+  bytes sha256 = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}
+
+// Sources reference exact descriptor bytes by their content address. Several
+// source records can share a descriptor, and several chunk rows can share one
+// source record. Content addresses are not stable logical document keys.
+message SourceRecord {
+  bytes descriptor_sha256 = 1;
+  string message_type = 2;
+  bytes payload = 3;
+}
+
+message SourceRow {
+  // Zero means this legacy or explicitly non-protobuf row has no source.
+  // Otherwise this is the one-based ordinal in SourceArchiveIndex.sources.
+  uint32 source = 1;
+  optional uint32 chunk_ordinal = 2;
+}

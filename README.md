@@ -1219,6 +1219,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   against ProtoMolt's current imports and a new mapped generation. See
   [descriptor mappings](docs/descriptor-mappings.md).
 
+- **Source-preservation increment (2026-09-05, `feat/search-foundations`).**
+  Row-bearing mapped ingest retains exact original protobuf and descriptor
+  bytes through snapshots, replication, resharding and compaction. Image
+  archives and the format-2 WAL intern sources across chunk rows; spill
+  builders keep source payloads on disk. No source-fetch RPC was added.
+  Zero-row logical documents and transactional write receipts remain
+  outstanding. See [source storage](docs/protobuf-source-storage.md).
+
 - **In progress after PRE_ASTRA: workspace capabilities.** Public search,
   ingest and admin operations require separate workspace/collection grants.
   Revisioned policies invalidate pending query streams and deny cached responses

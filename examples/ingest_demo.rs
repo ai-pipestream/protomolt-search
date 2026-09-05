@@ -54,6 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel(8);
     for text in DOCS {
         tx.send(AddDocumentsRequest {
+            original_source: None,
+            source_chunk_ordinal: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),

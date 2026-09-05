@@ -21,6 +21,7 @@ syntax = "proto3";
 package ai.pipestream.search.v1;
 
 import "google/protobuf/timestamp.proto";
+import "ai/pipestream/search/v1/source.proto";
 
 // NodeService is the internal shard-owner API. Exactly one node owns a given
 // shard; the coordinator is the only intended client.
@@ -1852,6 +1853,13 @@ message AddDocumentsRequest {
   // sidecar must advertise GetCapabilities.dual_term_identity_available, or
   // ingest refuses by name. The field's fingerprint is the twin spec's.
   string cased_field = 22;
+  // Original producer bytes associated with this row. Mapped ingest fills
+  // this before the ordinary WAL/apply path. Storage interns shared sources
+  // and descriptors; these bytes are not a searchable column.
+  ProtobufSource original_source = 23;
+  // Present for a chunk row, including ordinal zero. It is independent of
+  // the generation-local physical row id.
+  optional uint32 source_chunk_ordinal = 24;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share

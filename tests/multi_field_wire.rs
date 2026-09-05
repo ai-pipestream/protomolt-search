@@ -53,6 +53,8 @@ const OFFSETS: [u64; 2] = [0, 3];
 
 fn doc_request(body: &str, name: Option<&str>) -> AddDocumentsRequest {
     AddDocumentsRequest {
+        original_source: None,
+        source_chunk_ordinal: None,
         collection: String::new(),
         cased_field: String::new(),
         sentence_fields: Vec::new(),
@@ -373,6 +375,8 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
     };
 
     let bad = |field: &str, text: &str| AddDocumentsRequest {
+        original_source: None,
+        source_chunk_ordinal: None,
         collection: String::new(),
         cased_field: String::new(),
         sentence_fields: Vec::new(),
@@ -506,6 +510,8 @@ async fn shard_legs_bm25_params_reach_scoring() {
         "court of appeals for the ninth circuit en banc",
     ] {
         tx.send(AddDocumentsRequest {
+            original_source: None,
+            source_chunk_ordinal: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),

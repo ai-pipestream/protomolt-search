@@ -441,6 +441,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  shard {shard}: {i}/{n} documents analyzed");
                     }
                     tx.send(AddDocumentsRequest {
+                        original_source: None,
+                        source_chunk_ordinal: None,
                         collection: String::new(),
                         cased_field: String::new(),
                         sentence_fields: Vec::new(),
@@ -918,6 +920,8 @@ async fn run_remote(
                     let fields =
                         chunk_fields(&case_names2, chunk.cluster_id, &body_columns2, &chunk.text);
                     docs.push(AddDocumentsRequest {
+                        original_source: None,
+                        source_chunk_ordinal: None,
                         collection: String::new(),
                         cased_field: String::new(),
                         sentence_fields: Vec::new(),

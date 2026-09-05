@@ -106,6 +106,20 @@ const COLUMN_KIND_GEO: u8 = 5;
 /// declared under the reserved name collides with the table's
 /// name-uniqueness rule and refuses at save, loudly.
 const COLUMN_KIND_BINDING: u8 = 6;
+const COLUMN_KIND_SOURCES: u8 = 9;
+const SOURCES_ENTRY_NAME: &str = "protobuf-sources";
+const SOURCE_ENTRY_BYTES: u64 = 2 + SOURCES_ENTRY_NAME.len() as u64 + 1 + 16;
+
+fn write_source_entry(w: &mut impl Write, section: Option<(u64, u64)>) -> io::Result<()> {
+    if let Some((offset, length)) = section {
+        write_u16(w, SOURCES_ENTRY_NAME.len() as u16)?;
+        w.write_all(SOURCES_ENTRY_NAME.as_bytes())?;
+        w.write_all(&[COLUMN_KIND_SOURCES])?;
+        write_u64(w, offset)?;
+        write_u64(w, length)?;
+    }
+    Ok(())
+}
 /// The binding record's reserved entry name.
 const BINDING_ENTRY_NAME: &str = "plan-binding";
 /// Kind 7 (`docs/phrase-proximity.md`): one BM25 field's token
@@ -421,6 +435,10 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                 }
                 COLUMN_KIND_POSITIONS | COLUMN_KIND_SENTENCES => {
                     starts.push((format!("column:{name}:vals"), u64_at(base)));
+                    cursor = base + 16;
+                }
+                COLUMN_KIND_SOURCES => {
+                    starts.push((format!("column:{name}:sources"), u64_at(base)));
                     cursor = base + 16;
                 }
                 COLUMN_KIND_BINDING => {
@@ -1659,6 +1677,7 @@ pub struct Bm25Store {
     /// The mapped-plan binding, persisted as the kind-6 table entry.
     /// `Some` forces v7 even with no columns.
     binding: Option<StoredBinding>,
+    sources: crate::source_archive::SourceArchive,
 }
 
 impl Default for Bm25Store {
@@ -1674,11 +1693,23 @@ impl Default for Bm25Store {
             integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            sources: Default::default(),
         }
     }
 }
 
 impl Bm25Store {
+    pub fn source_archive_mut(&mut self) -> &mut crate::source_archive::SourceArchive {
+        &mut self.sources
+    }
+
+    pub fn protobuf_source(
+        &self,
+        row: u32,
+    ) -> io::Result<Option<(crate::pb::ProtobufSource, Option<u32>)>> {
+        self.sources.row(row)
+    }
+
     /// The mapped-plan binding this store was written under, if any.
     pub fn binding(&self) -> Option<&StoredBinding> {
         self.binding.as_ref()
@@ -1721,6 +1752,7 @@ impl Bm25Store {
             integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            sources: Default::default(),
         }
     }
 
@@ -2600,6 +2632,12 @@ impl Bm25Store {
     ///   u32 blob_off, u16 term_len), then the term blob)
     /// ```
     fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        if !self.sources.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "v5 cannot preserve protobuf sources",
+            ));
+        }
         if self.fields.len() > 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2705,6 +2743,7 @@ impl Bm25Store {
             || !self.integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
+            || !self.sources.is_empty()
             || self.fields.iter().any(|f| f.positions || f.sentences);
         let column_table_size: u64 = if !has_columns {
             0
@@ -2752,6 +2791,11 @@ impl Bm25Store {
                     .map(|f| 2 + (SENTENCES_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
+                + if self.sources.is_empty() {
+                    0
+                } else {
+                    SOURCE_ENTRY_BYTES
+                }
         };
         let header_size: u64 = 8
             + 4
@@ -2877,6 +2921,12 @@ impl Bm25Store {
             cursor += sentences_section_size(n_slots, total);
         }
 
+        let source_section = if self.sources.is_empty() {
+            None
+        } else {
+            Some((cursor, self.sources.encoded_len(n_slots as u32)?))
+        };
+
         w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
         write_u32(w, self.fields.len() as u32)?;
         write_u32(w, n_slots as u32)?;
@@ -2903,7 +2953,8 @@ impl Bm25Store {
                     + self.geos.len()
                     + positions_offs.len()
                     + sentences_offs.len()
-                    + usize::from(self.binding.is_some())) as u32,
+                    + usize::from(self.binding.is_some())
+                    + usize::from(!self.sources.is_empty())) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                 write_u16(w, facet.name.len() as u16)?;
@@ -2983,6 +3034,7 @@ impl Bm25Store {
                 write_u64(w, total)?;
             }
             write_binding_entry(w, self.binding.as_ref())?;
+            write_source_entry(w, source_section)?;
         }
         self.write_shared_sections(w, 0)?;
         for (fi, field) in self.fields.iter().enumerate() {
@@ -3072,6 +3124,9 @@ impl Bm25Store {
                 }
             }
         }
+        if source_section.is_some() {
+            self.sources.write(w, n_slots as u32)?;
+        }
         Ok(())
     }
 
@@ -3097,6 +3152,12 @@ impl Bm25Store {
     ///   term blob) — binary-searchable by term
     /// ```
     fn write_v4_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        if !self.sources.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy writer cannot preserve protobuf sources",
+            ));
+        }
         if self.fields.len() > 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3217,6 +3278,7 @@ impl Bm25Store {
             integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            sources: Default::default(),
         }
     }
 
@@ -4065,6 +4127,7 @@ impl Bm25Store {
         let mut positions_metas: Vec<(String, u64)> = Vec::new();
         let mut sentences_metas: Vec<(String, u64)> = Vec::new();
         let mut binding_meta: Option<StoredBinding> = None;
+        let mut sources_meta = None;
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
             cursor += 4;
@@ -4136,6 +4199,10 @@ impl Bm25Store {
                             })?
                             .to_string();
                         sentences_metas.push((field, u64_at(base)?));
+                        cursor = base + 16;
+                    }
+                    COLUMN_KIND_SOURCES => {
+                        sources_meta = Some((u64_at(base)?, u64_at(base + 8)?));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_BINDING => {
@@ -4398,6 +4465,12 @@ impl Bm25Store {
             integers,
             geos,
             binding: binding_meta,
+            sources: match sources_meta {
+                Some((offset, length)) => {
+                    crate::source_archive::SourceArchive::read(at(offset, length)?, n_slots as u32)?
+                }
+                None => Default::default(),
+            },
         })
     }
 }
@@ -4518,11 +4591,23 @@ pub struct SpillBuilder {
     /// when `finish` writes v7 (`Some` forces v7). The v4 oracle
     /// format cannot carry it and refuses.
     binding: Option<StoredBinding>,
+    sources: crate::source_archive::SourceArchive,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
 }
 
 impl SpillBuilder {
+    pub fn source_archive_mut(&mut self) -> &mut crate::source_archive::SourceArchive {
+        &mut self.sources
+    }
+
+    pub fn protobuf_source(
+        &self,
+        row: u32,
+    ) -> io::Result<Option<(crate::pb::ProtobufSource, Option<u32>)>> {
+        self.sources.row(row)
+    }
+
     /// Default sort-buffer capacity before runs are spilled.
     pub const DEFAULT_BUF_BYTES: usize = 256 << 20;
 
@@ -4575,6 +4660,7 @@ impl SpillBuilder {
             integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            sources: crate::source_archive::SourceArchive::spilling(&dir.join("sources.spill"))?,
             v4_only,
         })
     }
@@ -5240,6 +5326,7 @@ impl SpillBuilder {
             || !self.integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
+            || !self.sources.is_empty()
             || self.fields.iter().any(|f| f.positions || f.sentences);
         let column_table_size: u64 = if !has_columns {
             0
@@ -5287,6 +5374,11 @@ impl SpillBuilder {
                     .map(|f| 2 + (SENTENCES_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
+                + if self.sources.is_empty() {
+                    0
+                } else {
+                    SOURCE_ENTRY_BYTES
+                }
         };
         let header_size: u64 = 8
             + 4
@@ -5400,6 +5492,11 @@ impl SpillBuilder {
             cursor += sentences_section_size(n_slots_u64, total);
         }
 
+        let source_section = if self.sources.is_empty() {
+            None
+        } else {
+            Some((cursor, self.sources.encoded_len(n_slots as u32)?))
+        };
         let tmp = path.with_extension("bm25tmp");
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -5429,7 +5526,8 @@ impl SpillBuilder {
                         + self.geos.len()
                         + positions_offs.len()
                         + sentences_offs.len()
-                        + usize::from(self.binding.is_some())) as u32,
+                        + usize::from(self.binding.is_some())
+                        + usize::from(!self.sources.is_empty())) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                     write_u16(&mut w, facet.name.len() as u16)?;
@@ -5509,6 +5607,7 @@ impl SpillBuilder {
                     write_u64(&mut w, total)?;
                 }
                 write_binding_entry(&mut w, self.binding.as_ref())?;
+                write_source_entry(&mut w, source_section)?;
             }
             // texts: byte-copy of the spill (already section-encoded).
             let mut spill = std::fs::File::open(self.dir.join("texts.spill"))?;
@@ -5637,6 +5736,9 @@ impl SpillBuilder {
                     }
                 }
             }
+            if source_section.is_some() {
+                self.sources.write(&mut w, n_slots as u32)?;
+            }
             w.flush()?;
         }
         finalize_v8(&tmp)?;
@@ -5649,6 +5751,12 @@ impl SpillBuilder {
     /// Merge the runs and assemble the v4 file at `path` (the pre-v5
     /// behavior, kept for benchmarking and migration checks).
     fn finish_v4(&mut self, path: &Path) -> io::Result<()> {
+        if !self.sources.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy writer cannot preserve protobuf sources",
+            ));
+        }
         if self.fields[0].positions {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -6490,6 +6598,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     // (field name, section_off, total occurrences) per kind-7 entry.
     let mut positions: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     let mut sentences: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+    let mut source_section = None;
     if v7 {
         let n_columns = u64::from(u32_at(cursor)?);
         if n_columns == 0 {
@@ -6611,6 +6720,14 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     sentences.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
                     cursor = base + 16;
                 }
+                COLUMN_KIND_SOURCES => {
+                    if column_names.last().map(Vec::as_slice) != Some(SOURCES_ENTRY_NAME.as_bytes())
+                    {
+                        return Err(invalid("invalid source entry name".into()));
+                    }
+                    source_section = Some((u64_at(base)?, u64_at(base + 8)?));
+                    cursor = base + 16;
+                }
                 COLUMN_KIND_BINDING => {
                     // The reserved binding record: pinned name, inline
                     // payload, no sections. Duplicates fall to the
@@ -6638,6 +6755,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             }
         }
     }
+    let columns_end = source_section.map_or(file_len, |(off, _)| off);
     let header_end = cursor;
     // Shared sections: contiguous from the header end, in order.
     if texts_off != header_end || texts_off > file_len {
@@ -6669,7 +6787,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         .or_else(|| geos.first().map(|c| c.4))
         .or_else(|| positions.first().map(|p| p.1))
         .or_else(|| sentences.first().map(|s| s.1))
-        .unwrap_or(file_len);
+        .unwrap_or(columns_end);
     let mut expected_start = lineage_end;
     for (i, &(total_length, dl_off, postings_off, directory_off)) in fields.iter().enumerate() {
         if dl_off != expected_start {
@@ -6732,7 +6850,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
             .or_else(|| positions.first().map(|p| p.1))
-            .unwrap_or(file_len);
+            .unwrap_or(columns_end);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "facet field {i}: ords section does not end at the next section's start"
@@ -6769,7 +6887,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
             .or_else(|| positions.first().map(|p| p.1))
-            .unwrap_or(file_len);
+            .unwrap_or(columns_end);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "numeric field {i}: vals section does not end at the next section's start"
@@ -6848,7 +6966,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
             .or_else(|| positions.first().map(|p| p.1))
-            .unwrap_or(file_len);
+            .unwrap_or(columns_end);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "map-facet column {i}: pairs section does not end at the next section's start"
@@ -6919,7 +7037,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .or_else(|| integers.first().map(|c| c.2))
             .or_else(|| geos.first().map(|c| c.4))
             .or_else(|| positions.first().map(|p| p.1))
-            .unwrap_or(file_len);
+            .unwrap_or(columns_end);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "map-numeric column {i}: pairs section does not end at the next section's start"
@@ -6994,7 +7112,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .map(|c| c.2)
             .or_else(|| geos.first().map(|c| c.4))
             .or_else(|| positions.first().map(|p| p.1))
-            .unwrap_or(file_len);
+            .unwrap_or(columns_end);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "integer field {i}: vals section does not end at the next section's start"
@@ -7044,7 +7162,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .get(i + 1)
             .map(|c| c.4)
             .or_else(|| positions.first().map(|p| p.1))
-            .unwrap_or(file_len);
+            .unwrap_or(columns_end);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "geo field {i}: vals section does not end at the next section's start"
@@ -7142,7 +7260,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             .get(i + 1)
             .map(|p| p.1)
             .or_else(|| sentences.first().map(|s| s.1))
-            .unwrap_or(file_len);
+            .unwrap_or(columns_end);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "positions {i}: section does not end at the next section's start"
@@ -7183,13 +7301,19 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             )));
         }
         let group_end = off + sentences_section_size(n_slots, *total);
-        let expected_end = sentences.get(i + 1).map_or(file_len, |s| s.1);
+        let expected_end = sentences.get(i + 1).map_or(columns_end, |s| s.1);
         if group_end != expected_end {
             return Err(invalid(format!(
                 "sentences {i}: section does not end at the next section's start"
             )));
         }
         expected_start = group_end;
+    }
+    if let Some((off, len)) = source_section {
+        if off != expected_start || off.checked_add(len) != Some(file_len) {
+            return Err(invalid("source section does not tile the file".into()));
+        }
+        crate::source_archive::SourceArchiveReader::open(bytes_at(off, len)?, n_slots as u32)?;
     }
     Ok(())
 }
@@ -7367,12 +7491,25 @@ pub struct Bm25Reader {
     /// nothing to verify). Open has already checked the table itself
     /// The mapped-plan binding read from the kind-6 table entry.
     binding: Option<StoredBinding>,
+    source_section: Option<(u64, u64, crate::source_archive::SourceArchiveReader)>,
     /// and the eagerly-read sections; [`Self::verify_integrity`]
     /// checks everything.
     integrity: Option<IntegrityTable>,
 }
 
 impl Bm25Reader {
+    pub fn protobuf_source(
+        &self,
+        row: u32,
+    ) -> io::Result<Option<(crate::pb::ProtobufSource, Option<u32>)>> {
+        match &self.source_section {
+            Some((off, len, reader)) => {
+                reader.row(&self.map[*off as usize..(off + len) as usize], row)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// The mapped-plan binding this file was written under, if any.
     pub fn binding(&self) -> Option<&StoredBinding> {
         self.binding.as_ref()
@@ -7938,6 +8075,7 @@ impl Bm25Reader {
             facets: Vec::new(),
             numerics: Vec::new(),
             binding: None,
+            source_section: None,
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
@@ -8020,6 +8158,7 @@ impl Bm25Reader {
         let mut integers = Vec::new();
         let mut geos = Vec::new();
         let mut binding = None;
+        let mut source_section = None;
         if v7 {
             // Decode a length-prefixed dictionary of `n` entries
             // starting at `off`, returning (entries, end offset).
@@ -8166,6 +8305,16 @@ impl Bm25Reader {
                         fields[fi].sentences_off = Some(u64_at(base));
                         cursor = base + 16;
                     }
+                    COLUMN_KIND_SOURCES => {
+                        let off = u64_at(base);
+                        let len = u64_at(base + 8);
+                        let reader = crate::source_archive::SourceArchiveReader::open(
+                            &map[off as usize..(off + len) as usize],
+                            n_slots as u32,
+                        )?;
+                        source_section = Some((off, len, reader));
+                        cursor = base + 16;
+                    }
                     COLUMN_KIND_BINDING => {
                         let mut vals: Vec<String> = Vec::with_capacity(3);
                         let mut cur = base;
@@ -8208,6 +8357,7 @@ impl Bm25Reader {
             v5_runs: true,
             blob_relative: true,
             binding,
+            source_section,
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
         })

@@ -6,6 +6,13 @@
 
 tonic::include_proto!("ai.pipestream.search.v1");
 
+pub mod storage {
+    pub mod v1 {
+        tonic::include_proto!("ai.pipestream.search.storage.v1");
+    }
+    pub use v1::*;
+}
+
 /// Host-language-neutral embedded mobile bridge messages
 /// (`proto/ai/pipestream/search/mobile/v1/mobile.proto`).
 pub mod mobile {

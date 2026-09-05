@@ -1,0 +1,11 @@
+syntax = "proto3";
+package ai.pipestream.search.v1;
+
+// Original producer bytes. Preservation does not imply that a field is indexed
+// or queryable. Neither payload nor descriptor_set is decoded and reserialized
+// by the source store.
+message ProtobufSource {
+  bytes descriptor_set = 1;
+  string message_type = 2;
+  bytes payload = 3;
+}

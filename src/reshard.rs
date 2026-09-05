@@ -994,6 +994,14 @@ fn build_child(
                     }
                 }
                 let text = std::mem::take(&mut doc.text);
+                if let Some(source) = &doc.original_source {
+                    builder
+                        .source_archive_mut()
+                        .attach_source(*local, source, doc.source_chunk_ordinal)
+                        .map_err(|e| format!("restore original source: {e}"))?;
+                } else if doc.source_chunk_ordinal.is_some() {
+                    return Err("source chunk ordinal has no original source".into());
+                }
                 builder
                     .add_document_with_lineage(
                         *local,

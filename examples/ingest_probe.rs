@@ -60,6 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let feeder = tokio::spawn(async move {
         for i in 0..docs {
             tx.send(AddDocumentsRequest {
+                original_source: None,
+                source_chunk_ordinal: None,
                 collection: String::new(),
                 cased_field: String::new(),
                 sentence_fields: Vec::new(),

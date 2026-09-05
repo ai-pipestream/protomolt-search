@@ -449,6 +449,18 @@ impl Bm25Shard {
         }
     }
 
+    pub fn protobuf_source(
+        &self,
+        doc: u32,
+    ) -> std::io::Result<Option<(crate::pb::ProtobufSource, Option<u32>)>> {
+        match self {
+            Bm25Shard::Building(s) => s.protobuf_source(doc),
+            Bm25Shard::Spilling(s) => s.protobuf_source(doc),
+            Bm25Shard::Resident(s) => s.protobuf_source(doc),
+            Bm25Shard::Segmented(s) => s.protobuf_source(doc),
+        }
+    }
+
     pub(crate) fn analysis_fingerprint(&self, f: usize) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
@@ -6690,6 +6702,7 @@ struct MappedSource<'a> {
     /// Rows decoded but not yet handed to the pipeline: a chunked
     /// document explodes into one row per chunk.
     rows: std::collections::VecDeque<IngestDoc>,
+    original_source: crate::pb::ProtobufSource,
 }
 
 impl IngestSource<'_> {
@@ -6722,7 +6735,8 @@ impl MappedSource<'_> {
     async fn next(&mut self) -> Result<Option<IngestDoc>, Status> {
         use crate::pb::ingest_mapped_request::Payload;
         loop {
-            if let Some(row) = self.rows.pop_front() {
+            if let Some(mut row) = self.rows.pop_front() {
+                row.req.original_source = Some(self.original_source.clone());
                 return Ok(Some(row));
             }
             match self.stream.message().await? {
@@ -6766,8 +6780,18 @@ impl MappedSource<'_> {
             )
         })?;
         self.parents += 1;
-        for extracted in rows {
+        self.original_source.payload = bytes.to_vec();
+        let chunked = !self.extractor.plan().chunks_path.is_empty();
+        for (ordinal, extracted) in rows.into_iter().enumerate() {
             let mut req = extracted.request;
+            req.source_chunk_ordinal = if chunked {
+                Some(
+                    u32::try_from(ordinal)
+                        .map_err(|_| Status::invalid_argument("chunk ordinal exceeds u32"))?,
+                )
+            } else {
+                None
+            };
             req.analysis = self.analysis.clone();
             req.materialize = self.materialize.clone();
             self.rows.push_back(IngestDoc {
@@ -7777,6 +7801,19 @@ impl NodeServiceImpl {
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
+        match &doc.original_source {
+            Some(source) if source.descriptor_set.is_empty() || source.message_type.is_empty() => {
+                return Err(Status::invalid_argument(
+                    "original source requires descriptor bytes and message type",
+                ));
+            }
+            None if doc.source_chunk_ordinal.is_some() => {
+                return Err(Status::invalid_argument(
+                    "source chunk ordinal requires an original source",
+                ));
+            }
+            _ => {}
+        }
         // A disk-resident shard that receives more documents is first
         // reloaded into the heap builder (the append path is
         // bulk-load: build in memory, flush back to v3).
@@ -8278,6 +8315,12 @@ impl NodeServiceImpl {
             Bm25Shard::Segmented(g) => {
                 let local = doc_id - g.tail_base();
                 let store = g.tail_mut();
+                if let Some(source) = &doc.original_source {
+                    store
+                        .source_archive_mut()
+                        .attach_source(local, source, doc.source_chunk_ordinal)
+                        .map_err(|e| Status::internal(format!("retain source: {e}")))?;
+                }
                 store.add_document_with_lineage(local, doc.text.clone(), analyzed, lineage);
                 for (fi, value) in &facet_slots {
                     store.set_facet(*fi, local, value);
@@ -8300,6 +8343,12 @@ impl NodeServiceImpl {
                 g.sync_tail();
             }
             Bm25Shard::Building(store) => {
+                if let Some(source) = &doc.original_source {
+                    store
+                        .source_archive_mut()
+                        .attach_source(doc_id, source, doc.source_chunk_ordinal)
+                        .map_err(|e| Status::internal(format!("retain source: {e}")))?;
+                }
                 store.add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage);
                 for (fi, value) in &facet_slots {
                     store.set_facet(*fi, doc_id, value);
@@ -8321,6 +8370,12 @@ impl NodeServiceImpl {
                 }
             }
             Bm25Shard::Spilling(builder) => {
+                if let Some(source) = &doc.original_source {
+                    builder
+                        .source_archive_mut()
+                        .attach_source(doc_id, source, doc.source_chunk_ordinal)
+                        .map_err(|e| Status::internal(format!("retain source: {e}")))?;
+                }
                 builder
                     .add_document_with_lineage(doc_id, doc.text.clone(), analyzed, lineage)
                     .map_err(|e| Status::internal(format!("spill write: {e}")))?;
@@ -8353,6 +8408,7 @@ impl NodeServiceImpl {
                 first_id: global_id,
                 documents: vec![doc],
                 stable_routing_keys: stable_routing_key.clone().into_iter().collect(),
+                source_references: Vec::new(),
             }),
         );
         // The mapped document's vector, at the same id, under the same
@@ -10836,6 +10892,11 @@ impl NodeService for NodeServiceImpl {
                 position: 0,
                 parents: 0,
                 rows: std::collections::VecDeque::new(),
+                original_source: crate::pb::ProtobufSource {
+                    descriptor_set: bind.descriptor_set.clone(),
+                    message_type: bind.message_type.clone(),
+                    payload: Vec::new(),
+                },
             }));
             if let Some(first) = source.next().await? {
                 match crate::analyzer::AnalyzeStream::open_with_vocab(

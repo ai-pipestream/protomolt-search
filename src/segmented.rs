@@ -203,6 +203,16 @@ impl std::fmt::Debug for SegmentedShard {
 }
 
 impl SegmentedShard {
+    pub fn protobuf_source(
+        &self,
+        doc: u32,
+    ) -> std::io::Result<Option<(crate::pb::ProtobufSource, Option<u32>)>> {
+        match self.place(doc) {
+            Placement::Sealed { part, local } => self.reader(part).protobuf_source(local),
+            Placement::Frozen { local } => self.frozen_store().protobuf_source(local),
+            Placement::Tail { local } => self.tail.protobuf_source(local),
+        }
+    }
     /// Open the catalog under `root` with `tail` as the mutable part.
     /// The tail must be an EMPTY store declared with the same field and
     /// column tables every sealed segment has; a mismatch refuses by

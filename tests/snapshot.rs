@@ -94,6 +94,10 @@ fn build_bm25(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
     }
     let length = terms.iter().map(|(_, f, _)| f).sum();
     store.add_document_with_lineage(0, text.to_string(), AnalyzedDoc::body(terms, length), None);
+    store
+        .source_archive_mut()
+        .attach_source(0, &common::protobuf_source(text, "snapshot"), None)
+        .unwrap();
     let path = dir.join("source.tv.bm25");
     store.save(&path).unwrap();
     path
@@ -199,6 +203,14 @@ async fn seeded_install_serves_and_persists() {
         .into_inner();
     assert_eq!(docs.documents.len(), 1);
     assert_eq!(docs.documents[0].text, "rust search engines");
+    let stored = pipestream_search::postings::Bm25Reader::open(&generation_bm25(&gen)).unwrap();
+    assert_eq!(
+        stored.protobuf_source(0).unwrap(),
+        Some((
+            common::protobuf_source("rust search engines", "snapshot"),
+            None
+        ))
+    );
 
     // Persistence without Flush: the generation holds both files, and the
     // legacy layout was never written.

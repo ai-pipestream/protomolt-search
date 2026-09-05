@@ -78,6 +78,8 @@ async fn add_documents_geo(
     let (tx, rx) = mpsc::channel(64);
     for (text, points) in docs {
         tx.send(AddDocumentsRequest {
+            original_source: None,
+            source_chunk_ordinal: None,
             collection: String::new(),
             cased_field: String::new(),
             sentence_fields: Vec::new(),

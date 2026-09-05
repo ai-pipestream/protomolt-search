@@ -30,6 +30,8 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
     let feeder = tokio::spawn(async move {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                original_source: None,
+                source_chunk_ordinal: None,
                 collection: String::new(),
                 cased_field: String::new(),
                 sentence_fields: Vec::new(),
