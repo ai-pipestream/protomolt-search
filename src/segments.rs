@@ -223,6 +223,9 @@ impl std::fmt::Debug for OpenedSegmentSet {
 struct NoColumns;
 
 impl crate::scorefn::NumericRead for NoColumns {
+    fn uint_value(&self, _ii: usize, _doc_id: u32) -> Option<u64> {
+        None
+    }
     fn value(&self, _ni: usize, _doc_id: u32) -> Option<f64> {
         None
     }

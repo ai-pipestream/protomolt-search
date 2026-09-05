@@ -11,7 +11,7 @@ decided >= timestamp("2015-01-01T00:00:00Z") && !(court in ["ca5", "ca9"])
 This lands the selection half of the two-language split
 `docs/score-functions.md` pinned: **CEL selects, function chains
 score.** A filter is a predicate over the column plane — facet, f64,
-i64, map, geo — compiled once and executed as dictionary-resolved
+i64, u64, map, geo — compiled once and executed as dictionary-resolved
 ordinal tests. Scoring stays in the fixed stage vocabulary, because
 pruning needs a derivable upper bound per stage and an arbitrary
 expression has none. Nothing in this feature touches a score.
@@ -55,7 +55,7 @@ differential oracle below.
 |---|---|---|
 | `court == "scotus"`, `!=` | `FacetPredicate` (`!=` wraps NOT) | facet table; value → ordinal per shard |
 | `court in ["a", "b"]` | `FacetPredicate` with several values | same |
-| `year >= 1990`, `<`, `==`, ... | `NumberPredicate` bounds | i64 table first, then f64 |
+| `year >= 1990`, `<`, `==`, ... | `NumberPredicate` bounds | i64, u64, then f64 table |
 | `year in [1990, 1995]` | OR of point ranges | same |
 | `tags["color"] == "red"`, `in [...]` | `MapFacetPredicate` | map-facet column + key ordinal |
 | `cites["k"] >= 3` | `MapNumberPredicate` | map-numeric column + key ordinal |
@@ -79,7 +79,7 @@ byte-sorted dictionary resolves prefixes and ranges, not suffixes or
 substrings), the comprehension macros (`all`/`exists`/`filter`/`map`),
 `size()`, type conversions, `duration()`, cross-column comparisons,
 constant comparisons, bare columns and literals in boolean position,
-uint/raw/bytes literals, and unknown functions. String ordering and
+raw/bytes literals, and unknown functions. String ordering and
 `startsWith` compile since 2026-09-02 (`docs/prefix-terms.md`): every
 dictionary is written in byte order at flush, and a file whose
 dictionary predates that refuses them by name rather than walking
@@ -110,6 +110,32 @@ as the absent case, which is exact: its documents genuinely hold no
 value. The same argument as geo filters, one level up.
 
 ## Numbers compare exactly, across domains
+
+Unsigned decimal and hexadecimal literals use the `u` or `U` suffix, including
+`18446744073709551615u` and `0xffffffffffffffffU`. They compile to the
+`FilterBound.uint` protobuf oneof member and retain their type across transport.
+Comparisons, numeric membership lists and `has` support u64 columns declared
+with `--unsigned-integer-fields`. Absent unsigned values remain UNKNOWN in
+comparisons, including under negation; `has` distinguishes absent from zero.
+Negative unsigned literals, out-of-range literals and floating-point literals
+with a uint suffix refuse at compilation.
+
+Signed, unsigned and double bounds compare without rounding integer bounds to
+doubles. For example, a stored double equal to 2^64 is greater than the bound
+`18446744073709551615u`, while the unsigned maximum itself equals that bound.
+Double bounds against u64 columns normalize to inclusive u64 edges with
+exclusive boundaries folded in. Bounds outside the unsigned domain produce an
+empty or unbounded interval as appropriate; they never wrap. Placement uses the
+same semantics on ingest requests and exact mixed-domain bounds for fan-out
+pruning. Segment pruning uses unsigned min/max and presence metadata; absent
+metadata remains conservative.
+
+This feature-branch increment covers filters. Unsigned descriptor mappings,
+value projections, arithmetic, sorting and aggregations still require their own
+typed support; a uint value literal in a projection currently refuses by name.
+`tests/unsigned_filters.rs` checks an independent IEEE integer-ratio oracle,
+fixed expected query results across heap and reopened persisted layouts,
+placement evaluation, mixed-domain fan-out proofs, and segment pruning.
 
 An i64 bound against an f64 column is compared AS THE INTEGER IT SAYS
 (`filter::cmp_f64_i64`: piecewise over the 2^63 edges, integer part,

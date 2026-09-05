@@ -439,6 +439,14 @@ impl<'a> DocColumns<'a> {
             .map(|v| v.value)
     }
 
+    fn unsigned_integer(&self, column: &str) -> Option<u64> {
+        self.doc
+            .unsigned_integers
+            .iter()
+            .find(|v| v.field == column)
+            .map(|v| v.value)
+    }
+
     fn map_facet(&self, column: &str, key: &str) -> Option<&str> {
         self.doc
             .map_facets
@@ -466,6 +474,7 @@ impl<'a> DocColumns<'a> {
     fn has(&self, column: &str) -> bool {
         self.facet(column).is_some()
             || self.integer(column).is_some()
+            || self.unsigned_integer(column).is_some()
             || self.numeric(column).is_some()
             || self.geo(column).is_some()
     }
@@ -475,6 +484,10 @@ fn in_number_range(value: NumberValue, min: Option<Edge>, max: Option<Edge>) -> 
     match value {
         NumberValue::Int(v) => {
             let (lo, hi) = int_range(&min, &max);
+            v >= lo && v <= hi
+        }
+        NumberValue::Uint(v) => {
+            let (lo, hi) = crate::filter::uint_range(&min, &max);
             v >= lo && v <= hi
         }
         NumberValue::Float(v) => {
@@ -487,6 +500,7 @@ fn in_number_range(value: NumberValue, min: Option<Edge>, max: Option<Edge>) -> 
 #[derive(Clone, Copy)]
 enum NumberValue {
     Int(i64),
+    Uint(u64),
     Float(f64),
 }
 
@@ -533,6 +547,8 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
             let max = p.max.as_ref().and_then(edge_of);
             if let Some(v) = doc.integer(&p.column) {
                 Tri::from(in_number_range(NumberValue::Int(v), min, max))
+            } else if let Some(v) = doc.unsigned_integer(&p.column) {
+                Tri::from(in_number_range(NumberValue::Uint(v), min, max))
             } else if let Some(v) = doc.numeric(&p.column) {
                 Tri::from(in_number_range(NumberValue::Float(v), min, max))
             } else {
@@ -597,6 +613,11 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
 fn cmp_bound(a: &NumBound, b: &NumBound) -> Ordering {
     match (a, b) {
         (NumBound::I(x), NumBound::I(y)) => x.cmp(y),
+        (NumBound::U(x), NumBound::U(y)) => x.cmp(y),
+        (NumBound::U(x), NumBound::I(y)) => i128::from(*x).cmp(&i128::from(*y)),
+        (NumBound::I(x), NumBound::U(y)) => i128::from(*x).cmp(&i128::from(*y)),
+        (NumBound::F(x), NumBound::U(y)) => crate::filter::cmp_f64_u64(*x, *y),
+        (NumBound::U(x), NumBound::F(y)) => crate::filter::cmp_f64_u64(*y, *x).reverse(),
         (NumBound::F(x), NumBound::F(y)) => x.total_cmp(y),
         (NumBound::F(x), NumBound::I(y)) => cmp_f64_i64(*x, *y),
         (NumBound::I(x), NumBound::F(y)) => cmp_f64_i64(*y, *x).reverse(),

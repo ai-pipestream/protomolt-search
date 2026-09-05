@@ -828,6 +828,15 @@ impl Bm25Shard {
         }
     }
 
+    fn unsigned_integer_value(&self, ii: usize, doc_id: u32) -> Option<u64> {
+        match self {
+            Bm25Shard::Building(s) => s.unsigned_integer_value(ii, doc_id),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.unsigned_integer_value(ii, doc_id),
+            Bm25Shard::Segmented(g) => g.unsigned_integer_value(ii, doc_id),
+        }
+    }
+
     /// The geo-table index of the geo field named `name`, if the
     /// active table has it.
     fn geo_index(&self, name: &str) -> Option<usize> {
@@ -952,6 +961,9 @@ impl Bm25Shard {
                     let leaf = if let Some(ii) = self.integer_index(&p.column) {
                         let (lo, hi) = crate::filter::int_range(&lo, &hi);
                         ResolvedLeaf::IntRange { column: ii, lo, hi }
+                    } else if let Some(ii) = self.unsigned_integer_index(&p.column) {
+                        let (lo, hi) = crate::filter::uint_range(&lo, &hi);
+                        ResolvedLeaf::UintRange { column: ii, lo, hi }
                     } else if let Some(ni) = self.numeric_index(&p.column) {
                         ResolvedLeaf::F64Range { column: ni, lo, hi }
                     } else {
@@ -1006,6 +1018,7 @@ impl Bm25Shard {
                     facet: self.facet_index(&p.column),
                     numeric: self.numeric_index(&p.column),
                     integer: self.integer_index(&p.column),
+                    unsigned_integer: self.unsigned_integer_index(&p.column),
                     geo: self.geo_index(&p.column),
                 }),
                 Expr::Geo(g) => ResolvedFilter::Leaf(ResolvedLeaf::Geo {
@@ -1243,6 +1256,7 @@ impl Bm25Shard {
                 LeafRef::Facet(p) => self.facet_index(&p.column).is_some(),
                 LeafRef::Number(p) => {
                     self.integer_index(&p.column).is_some()
+                        || self.unsigned_integer_index(&p.column).is_some()
                         || self.numeric_index(&p.column).is_some()
                 }
                 LeafRef::MapFacet(p) => self
@@ -1261,6 +1275,7 @@ impl Bm25Shard {
                     self.facet_index(&p.column).is_some()
                         || self.numeric_index(&p.column).is_some()
                         || self.integer_index(&p.column).is_some()
+                        || self.unsigned_integer_index(&p.column).is_some()
                         || self.geo_index(&p.column).is_some()
                 }
                 LeafRef::Geo(g) => self.geo_index(&g.column).is_some(),
@@ -2082,6 +2097,9 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     }
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
+    }
+    fn uint_value(&self, ii: usize, doc_id: u32) -> Option<u64> {
+        self.0.unsigned_integer_value(ii, doc_id)
     }
     fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
         self.0.geo_value(gi, doc_id)

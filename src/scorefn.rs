@@ -42,6 +42,8 @@ pub trait NumericRead {
     /// `None` when absent. Kept i64 here and cast at the eval site so
     /// the storage stays exact and only the arithmetic is float.
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64>;
+    /// Exact u64 column value, with absence separate from every numeric value.
+    fn uint_value(&self, ii: usize, doc_id: u32) -> Option<u64>;
     /// `doc_id`'s (lat, lon) in geo column `gi` (`docs/geo-columns.md`),
     /// `None` when absent. Also the read surface geo FILTERS use — one
     /// column read serves selection and scoring alike.
@@ -341,6 +343,9 @@ mod tests {
         }
     }
     impl NumericRead for Cols {
+        fn uint_value(&self, _ii: usize, _doc_id: u32) -> Option<u64> {
+            None
+        }
         fn geo_value(&self, _gi: usize, doc_id: u32) -> Option<(f64, f64)> {
             match doc_id {
                 0 => Some((38.8977, -77.0365)),

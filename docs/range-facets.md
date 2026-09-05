@@ -83,8 +83,13 @@ schema from the records present; it cannot reconstruct an entirely absent
 column declaration from those records. Flush remains the ordinary shard's
 durability boundary; this does not strengthen AddDocuments receipts.
 
-Protobuf numeric mapping, query expressions and unsigned pruning are not yet
-connected to the u64 family. The schema report continues to describe the
+CEL comparisons and presence tests now resolve u64 columns using exact typed
+bounds, including values beyond the signed range. Placement evaluation and
+both topology and segment pruning use the same numeric meaning; see
+[CEL filters](cel-filters.md#numbers-compare-exactly-across-domains).
+Protobuf numeric mapping, value projections, unsigned range facets, sorting
+and aggregation are not yet connected to the u64 family. The schema report
+continues to describe the
 currently supported signed numeric mapping range. Use matching server and
 client builds for this feature: older protobuf readers can ignore the new
 request field, and older storage readers refuse kind 11.

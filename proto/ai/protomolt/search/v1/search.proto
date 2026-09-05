@@ -2750,7 +2750,7 @@ message FilterExpr {
     FilterExpr not = 3;
     // String equality/membership on a plain facet column.
     FacetPredicate facet = 4;
-    // Range or equality on an i64 or f64 column.
+    // Range or equality on an i64, u64, or f64 column.
     NumberPredicate number = 5;
     // String equality/membership on one key of a map-facet column.
     MapFacetPredicate map_facet = 6;
@@ -2787,16 +2787,18 @@ message FilterList {
 // One bound of a NumberPredicate / MapNumberPredicate range.
 message FilterBound {
   // The bound's value. Exactly one must be set. Integer bounds against
-  // i64 columns compare in i64 (exact); against f64 columns the
-  // comparison is performed exactly across the two domains — an i64
+  // i64/u64 columns compare exactly; against f64 columns the
+  // comparison is performed exactly across the domains — an integer
   // bound is never rounded through f64, so a bound above 2^53 still
   // means the integer it says. Double bounds must be finite; against
-  // i64 columns they are normalized to exact integer bounds
+  // i64/u64 columns they are normalized to exact integer bounds
   // (ceil/floor with the exclusivity folded in), never compared in
   // float.
   oneof value {
     int64 int = 1;
     double num = 2;
+    // Full-domain unsigned bound, compared exactly against every numeric kind.
+    uint64 uint = 4;
   }
   // When true the bound itself is outside the range (`>` / `<` rather
   // than `>=` / `<=`).
@@ -2819,8 +2821,9 @@ message FacetPredicate {
   repeated string values = 2;
 }
 
-// Range or equality on an i64 column (--integer-fields) or an f64
-// column (--numeric-fields), resolved in that order per shard. At
+// Range or equality on an i64 (--integer-fields), u64
+// (--unsigned-integer-fields), or f64 (--numeric-fields) column,
+// resolved in that order per shard. At
 // least one bound is required (use `has` for bare presence); both with
 // min > max is a legal empty range that no present value satisfies.
 // Equality is min == max, both inclusive.
@@ -3316,7 +3319,7 @@ message Bm25QueryResponse {
   // tree, positionally over the leaves in depth-first order (empty
   // when no filter was sent). What "resolve" means is per leaf kind —
   // see each predicate message: facet = the facet table has the
-  // column; number = the i64 or f64 table has it; map predicates =
+  // column; number = an i64, u64, or f64 table has it; map predicates =
   // column and key (column alone for map_has_key); has = any family;
   // geo = the geo table. A shard that cannot resolve a leaf evaluates
   // it as the absent case for every document — exact — but the

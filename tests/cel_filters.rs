@@ -744,6 +744,9 @@ impl NumericRead for ReaderCols<'_> {
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
     }
+    fn uint_value(&self, ii: usize, doc_id: u32) -> Option<u64> {
+        self.0.unsigned_integer_value(ii, doc_id)
+    }
     fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
         self.0.geo_value(gi, doc_id)
     }

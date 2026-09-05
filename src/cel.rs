@@ -73,6 +73,7 @@ fn refuse(msg: impl Into<String>) -> Status {
 enum Tok {
     Ident(String),
     Int(i128),
+    Uint(u64),
     Float(f64),
     Str(String),
     LParen,
@@ -335,8 +336,8 @@ fn lex_string(b: &[u8], start: usize) -> Result<(Tok, usize), Status> {
     )))
 }
 
-/// An integer or float literal. Hex ints compile; uint suffixes
-/// refuse (the engine's integer domain is i64).
+/// A signed integer, unsigned integer, or float literal. Decimal and
+/// hexadecimal integers accept a `u`/`U` suffix for the full u64 domain.
 fn lex_number(b: &[u8], start: usize) -> Result<(Tok, usize), Status> {
     let mut i = start;
     if b[i] == b'0' && matches!(b.get(i + 1), Some(b'x') | Some(b'X')) {
@@ -354,9 +355,7 @@ fn lex_number(b: &[u8], start: usize) -> Result<(Tok, usize), Status> {
             .filter(|v| *v <= i128::from(u64::MAX))
             .ok_or_else(|| refuse(format!("hex literal 0x{text} is out of range")))?;
         if matches!(b.get(i), Some(b'u') | Some(b'U')) {
-            return Err(refuse(
-                "uint literal (u suffix); the engine's integer domain is i64",
-            ));
+            return Ok((Tok::Uint(v as u64), i + 1));
         }
         return Ok((Tok::Int(v), i));
     }
@@ -384,12 +383,16 @@ fn lex_number(b: &[u8], start: usize) -> Result<(Tok, usize), Status> {
             }
         }
     }
-    if matches!(b.get(i), Some(b'u') | Some(b'U')) {
-        return Err(refuse(
-            "uint literal (u suffix); the engine's integer domain is i64",
-        ));
-    }
     let text = std::str::from_utf8(&b[start..i]).expect("ascii digits");
+    if matches!(b.get(i), Some(b'u') | Some(b'U')) {
+        if is_float {
+            return Err(refuse("uint suffix on a floating-point literal"));
+        }
+        let value = text
+            .parse::<u64>()
+            .map_err(|_| refuse(format!("uint literal {text} is out of u64 range")))?;
+        return Ok((Tok::Uint(value), i + 1));
+    }
     if is_float {
         let v: f64 = text
             .parse()
@@ -431,6 +434,7 @@ enum Ast {
     /// A function call on bare identifiers/literals.
     Call(String, Vec<Ast>),
     Int(i128),
+    Uint(u64),
     Float(f64),
     Str(String),
     List(Vec<Ast>),
@@ -652,6 +656,7 @@ impl Parser {
             // else — negating a column is arithmetic.
             return match self.unary()? {
                 Ast::Int(v) => Ok(Ast::Int(-v)),
+                Ast::Uint(_) => Err(refuse("unary minus is not defined for uint literals")),
                 Ast::Float(v) => Ok(Ast::Float(-v)),
                 _ => Err(refuse(
                     "unary minus on a non-literal; negating a column is arithmetic, \
@@ -761,6 +766,7 @@ impl Parser {
                 }
             }
             Some(Tok::Int(v)) => Ok(Ast::Int(v)),
+            Some(Tok::Uint(v)) => Ok(Ast::Uint(v)),
             Some(Tok::Float(v)) => Ok(Ast::Float(v)),
             Some(Tok::Str(v)) => Ok(Ast::Str(v)),
             Some(other) => Err(refuse(format!(
@@ -879,6 +885,7 @@ impl Parser {
             // node, because stock CEL negates (and -0.0 is not 0-x).
             return match self.value_unary()? {
                 Ast::Int(v) => Ok(Ast::Int(-v)),
+                Ast::Uint(_) => Err(refuse("unary minus is not defined for uint literals")),
                 Ast::Float(v) => Ok(Ast::Float(-v)),
                 other => Ok(Ast::Neg(Box::new(other))),
             };
@@ -897,6 +904,7 @@ enum Side {
     MapAccess(String, String),
     Str(String),
     Int(i64),
+    Uint(u64),
     Float(f64),
     List(Vec<Ast>),
 }
@@ -944,7 +952,7 @@ fn compile(ast: &Ast) -> Result<pb::FilterExpr, Status> {
             "bare map access {col}[{key:?}] is not a predicate; compare it against a \
              value, or test the key with '{key}' in {col}"
         ))),
-        Ast::Int(_) | Ast::Float(_) | Ast::Str(_) => {
+        Ast::Int(_) | Ast::Uint(_) | Ast::Float(_) | Ast::Str(_) => {
             Err(refuse("a bare literal is not a predicate"))
         }
         Ast::List(_) => Err(refuse(
@@ -977,6 +985,7 @@ fn side_of(ast: &Ast) -> Result<Side, Status> {
         Ast::MapAccess(col, key) => Ok(Side::MapAccess(col.clone(), key.clone())),
         Ast::Str(v) => Ok(Side::Str(v.clone())),
         Ast::Int(v) => Ok(Side::Int(int_literal(*v)?)),
+        Ast::Uint(v) => Ok(Side::Uint(*v)),
         Ast::Float(v) => Ok(Side::Float(*v)),
         Ast::List(items) => Ok(Side::List(items.clone())),
         Ast::Call(name, args) if name == "timestamp" => Ok(Side::Int(timestamp_argument(args)?)),
@@ -1031,6 +1040,9 @@ fn compile_relation(l: &Ast, op: RelOp, r: &Ast) -> Result<pb::FilterExpr, Statu
             match lit {
                 Side::Str(v) => compile_string_relation(col, op, v),
                 Side::Int(v) => compile_number_relation(col, op, pb::filter_bound::Value::Int(*v)),
+                Side::Uint(v) => {
+                    compile_number_relation(col, op, pb::filter_bound::Value::Uint(*v))
+                }
                 Side::Float(v) => {
                     if !v.is_finite() {
                         return Err(refuse(format!(
@@ -1155,6 +1167,7 @@ fn compile_in(lhs: Side, rhs: Side) -> Result<pb::FilterExpr, Status> {
                 match side_of(item)? {
                     Side::Str(v) => strings.push(v),
                     Side::Int(v) => numbers.push(pb::filter_bound::Value::Int(v)),
+                    Side::Uint(v) => numbers.push(pb::filter_bound::Value::Uint(v)),
                     Side::Float(v) if v.is_finite() => {
                         numbers.push(pb::filter_bound::Value::Num(v))
                     }
@@ -1607,6 +1620,7 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
             None,
         )),
         Ast::Int(v) => Ok((value_of(V::IntLiteral(int_literal(*v)?)), Some(VType::Int))),
+        Ast::Uint(_) => Err(refuse("uint value projections are not implemented")),
         Ast::Float(v) => {
             if !v.is_finite() {
                 return Err(refuse(format!(
@@ -2004,6 +2018,7 @@ fn compile_value_tail(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<
         Ast::Ident(_)
         | Ast::MapAccess(..)
         | Ast::Int(_)
+        | Ast::Uint(_)
         | Ast::Float(_)
         | Ast::Neg(_)
         | Ast::Arith(..)
@@ -2495,7 +2510,7 @@ mod tests {
         refused("court == 'a' 'b'", "trailing input");
         refused("r\"raw\" == court", "raw string literal");
         refused("b'bytes' == court", "bytes string literal");
-        refused("5u == year", "uint literal");
+        refused("5.0u == year", "uint suffix");
         refused("court = \"x\"", "single `=`");
         refused("a && (b == \"x\"", "expected `)`");
         refused("m[court] == \"x\"", "string literal key");

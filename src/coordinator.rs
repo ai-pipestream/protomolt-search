@@ -1553,8 +1553,8 @@ fn refuse_unknown_filter_leaves(
         return Err(Status::invalid_argument(format!(
             "no shard can resolve filter {}: filtering on an unknown name would read as \
              an empty result set. Check the spelling and the literal's type (a string \
-             literal selects the facet tables, a number the i64/f64 tables), or the \
-             nodes' --facet-fields / --numeric-fields / --integer-fields / \
+             literal selects the facet tables, a number the i64/u64/f64 tables), or the \
+             nodes' --facet-fields / --numeric-fields / --integer-fields / --unsigned-integer-fields / \
              --map-facet-fields / --map-numeric-fields / --geo-fields.",
             unknown.join(", ")
         )));

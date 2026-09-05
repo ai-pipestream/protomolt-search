@@ -30,6 +30,8 @@ use crate::segments::SegmentSummary;
 pub trait ColumnNames {
     /// The name of integer column `ii`, if the index is in range.
     fn integer_name(&self, ii: usize) -> Option<&str>;
+    /// The name of unsigned column `ii`.
+    fn unsigned_integer_name(&self, ii: usize) -> Option<&str>;
     /// The name of double column `ni`, if the index is in range.
     fn numeric_name(&self, ni: usize) -> Option<&str>;
 }
@@ -37,6 +39,9 @@ pub trait ColumnNames {
 impl ColumnNames for crate::segmented::SegmentedShard {
     fn integer_name(&self, ii: usize) -> Option<&str> {
         (ii < self.integer_count()).then(|| self.integer_name(ii))
+    }
+    fn unsigned_integer_name(&self, ii: usize) -> Option<&str> {
+        (ii < self.unsigned_integer_count()).then(|| self.unsigned_integer_name(ii))
     }
     fn numeric_name(&self, ni: usize) -> Option<&str> {
         (ni < self.numeric_count()).then(|| self.numeric_name(ni))
@@ -94,6 +99,15 @@ fn leaf_impossible(leaf: &ResolvedLeaf, summary: &SegmentSummary, names: &dyn Co
             };
             int_range_impossible(summary, name, *lo, *hi)
         }
+        ResolvedLeaf::UintRange { column, lo, hi } => {
+            let Some(name) = names.unsigned_integer_name(*column) else {
+                return false;
+            };
+            let Some(range) = summary.uint_columns.iter().find(|range| range.name == name) else {
+                return false;
+            };
+            range.present == 0 || lo > hi || *lo > range.max || *hi < range.min
+        }
         ResolvedLeaf::F64Range { column, lo, hi } => {
             let Some(name) = names.numeric_name(*column) else {
                 return false;
@@ -107,6 +121,7 @@ fn leaf_impossible(leaf: &ResolvedLeaf, summary: &SegmentSummary, names: &dyn Co
             facet,
             numeric,
             integer,
+            unsigned_integer,
             geo,
         } => {
             if facet.is_some() || geo.is_some() {
@@ -117,6 +132,15 @@ fn leaf_impossible(leaf: &ResolvedLeaf, summary: &SegmentSummary, names: &dyn Co
                     .integer_name(ii)
                     .is_some_and(|name| int_present(summary, name) == Some(0))
             });
+            let uint_empty = unsigned_integer.is_none_or(|ii| {
+                names.unsigned_integer_name(ii).is_some_and(|name| {
+                    summary
+                        .uint_columns
+                        .iter()
+                        .find(|range| range.name == name)
+                        .is_some_and(|range| range.present == 0)
+                })
+            });
             let num_empty = numeric.is_none_or(|ni| {
                 names
                     .numeric_name(ni)
@@ -124,7 +148,10 @@ fn leaf_impossible(leaf: &ResolvedLeaf, summary: &SegmentSummary, names: &dyn Co
             });
             // A `has` that resolved to no family at all is False on
             // every row already; leave that verdict to the evaluator.
-            (integer.is_some() || numeric.is_some()) && int_empty && num_empty
+            (integer.is_some() || unsigned_integer.is_some() || numeric.is_some())
+                && int_empty
+                && uint_empty
+                && num_empty
         }
         ResolvedLeaf::Facet { .. }
         | ResolvedLeaf::NumberUnknown
@@ -239,6 +266,9 @@ mod tests {
 
     struct Names;
     impl ColumnNames for Names {
+        fn unsigned_integer_name(&self, _ii: usize) -> Option<&str> {
+            None
+        }
         fn integer_name(&self, ii: usize) -> Option<&str> {
             [Some("year"), Some("pages")].get(ii).copied().flatten()
         }
@@ -439,6 +469,7 @@ mod tests {
                 facet,
                 numeric,
                 integer,
+                unsigned_integer: None,
                 geo,
             })
         };

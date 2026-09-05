@@ -23,10 +23,10 @@
 //!   `has(col)`, `"k" in m` — are TOTAL, true or false, never unknown:
 //!   they are the one thing absence can pass, and the escape hatch a
 //!   query uses to see it.
-//! - **Numbers compare exactly, across domains.** An i64 bound against
-//!   an f64 column is compared as the integer it says
-//!   ([`cmp_f64_i64`]), never rounded through f64; an f64 bound
-//!   against an i64 column is normalized to exact integer bounds with
+//! - **Numbers compare exactly, across domains.** An i64 or u64 bound
+//!   against an f64 column is compared as the integer it says
+//!   ([`cmp_f64_i64`], [`cmp_f64_u64`]), never rounded through f64; an f64
+//!   bound against an integer column is normalized to exact bounds with
 //!   the exclusivity folded in. No comparison in this module is
 //!   performed in a domain that could reorder it.
 //! - **A filter only REMOVES documents.** Every block-max bound stays
@@ -109,6 +109,8 @@ impl Not for Tri {
 pub enum NumBound {
     /// An integer bound.
     I(i64),
+    /// A full-domain unsigned integer bound.
+    U(u64),
     /// A float bound (finite; validation refuses the rest). `-0.0` is
     /// normalized to `+0.0` at resolve so [`f64::total_cmp`] agrees
     /// with IEEE equality on the one pair where they differ.
@@ -165,6 +167,23 @@ pub fn cmp_f64_i64(x: f64, n: i64) -> Ordering {
     }
 }
 
+/// Exact ordering of a non-NaN double against an unsigned integer.
+/// The 2^64 boundary is exact; within it the integer part fits in u64.
+pub fn cmp_f64_u64(x: f64, n: u64) -> Ordering {
+    debug_assert!(!x.is_nan(), "stored column values are never NaN");
+    if x < 0.0 {
+        return Ordering::Less;
+    }
+    if x >= 18_446_744_073_709_551_616.0 {
+        return Ordering::Greater;
+    }
+    let floor = x.floor();
+    match (floor as u64).cmp(&n) {
+        Ordering::Equal if x > floor => Ordering::Greater,
+        order => order,
+    }
+}
+
 impl Edge {
     /// Whether column value `v` (non-NaN) sits at or above this edge
     /// as a LOWER bound.
@@ -173,6 +192,7 @@ impl Edge {
         let ord = match self.value {
             NumBound::F(b) => v.total_cmp(&b),
             NumBound::I(n) => cmp_f64_i64(v, n),
+            NumBound::U(n) => cmp_f64_u64(v, n),
         };
         if self.exclusive {
             ord == Ordering::Greater
@@ -188,6 +208,7 @@ impl Edge {
         let ord = match self.value {
             NumBound::F(b) => v.total_cmp(&b),
             NumBound::I(n) => cmp_f64_i64(v, n),
+            NumBound::U(n) => cmp_f64_u64(v, n),
         };
         if self.exclusive {
             ord == Ordering::Less
@@ -204,9 +225,10 @@ impl Edge {
 fn int_lower(b: &Edge) -> Option<i64> {
     let lo: i128 = match b.value {
         NumBound::I(n) => i128::from(n) + i128::from(b.exclusive),
+        NumBound::U(n) => i128::from(n) + i128::from(b.exclusive),
         NumBound::F(x) => {
             if b.exclusive {
-                (x.floor() as i128) + 1
+                (x.floor() as i128).saturating_add(1)
             } else {
                 x.ceil() as i128
             }
@@ -224,9 +246,10 @@ fn int_lower(b: &Edge) -> Option<i64> {
 fn int_upper(b: &Edge) -> Option<i64> {
     let hi: i128 = match b.value {
         NumBound::I(n) => i128::from(n) - i128::from(b.exclusive),
+        NumBound::U(n) => i128::from(n) - i128::from(b.exclusive),
         NumBound::F(x) => {
             if b.exclusive {
-                (x.ceil() as i128) - 1
+                (x.ceil() as i128).saturating_sub(1)
             } else {
                 x.floor() as i128
             }
@@ -254,6 +277,59 @@ pub fn int_range(min: &Option<Edge>, max: &Option<Edge>) -> (i64, i64) {
     match (lo, hi) {
         (Some(lo), Some(hi)) => (lo, hi),
         // A bound past the end of i64 admits nothing.
+        _ => (1, 0),
+    }
+}
+
+/// Normalize signed, unsigned or finite double bounds onto inclusive u64
+/// edges. The inverted range (1, 0) is empty; absence is evaluated separately.
+pub fn uint_range(min: &Option<Edge>, max: &Option<Edge>) -> (u64, u64) {
+    const TWO_64: f64 = 18_446_744_073_709_551_616.0;
+    let lower = |b: &Edge| -> Option<u64> {
+        let value = match b.value {
+            NumBound::I(n) => i128::from(n) + i128::from(b.exclusive),
+            NumBound::U(n) => i128::from(n) + i128::from(b.exclusive),
+            NumBound::F(x) => {
+                if x < 0.0 {
+                    return Some(0);
+                }
+                if x >= TWO_64 {
+                    return None;
+                }
+                if b.exclusive {
+                    (x.floor() as i128) + 1
+                } else {
+                    x.ceil() as i128
+                }
+            }
+        };
+        u64::try_from(value.max(0)).ok()
+    };
+    let upper = |b: &Edge| -> Option<u64> {
+        let value = match b.value {
+            NumBound::I(n) => i128::from(n) - i128::from(b.exclusive),
+            NumBound::U(n) => i128::from(n) - i128::from(b.exclusive),
+            NumBound::F(x) => {
+                if x < 0.0 {
+                    return None;
+                }
+                if x >= TWO_64 {
+                    return Some(u64::MAX);
+                }
+                if b.exclusive {
+                    (x.ceil() as i128) - 1
+                } else {
+                    x.floor() as i128
+                }
+            }
+        };
+        u64::try_from(value.min(i128::from(u64::MAX))).ok()
+    };
+    match (
+        min.as_ref().map_or(Some(0), lower),
+        max.as_ref().map_or(Some(u64::MAX), upper),
+    ) {
+        (Some(lo), Some(hi)) => (lo, hi),
         _ => (1, 0),
     }
 }
@@ -309,6 +385,15 @@ pub enum ResolvedLeaf {
         /// Inclusive upper edge.
         hi: i64,
     },
+    /// Range over a u64 column, normalized by [`uint_range`].
+    UintRange {
+        /// Index into the shard's unsigned integer table.
+        column: usize,
+        /// Inclusive lower edge.
+        lo: u64,
+        /// Inclusive upper edge.
+        hi: u64,
+    },
     /// Range over an f64 column, edges compared exactly in whichever
     /// domain each bound was written.
     F64Range {
@@ -319,7 +404,7 @@ pub enum ResolvedLeaf {
         /// Upper edge, `None` = unbounded above.
         hi: Option<Edge>,
     },
-    /// A number predicate whose column this shard has in NEITHER
+    /// A number predicate whose column this shard has in no
     /// numeric family: every document is the absent (unknown) case.
     NumberUnknown,
     /// Map-facet membership under one key.
@@ -349,6 +434,8 @@ pub enum ResolvedLeaf {
         numeric: Option<usize>,
         /// ... in the i64 table.
         integer: Option<usize>,
+        /// ... in the u64 table.
+        unsigned_integer: Option<usize>,
         /// ... in the geo table.
         geo: Option<usize>,
     },
@@ -398,6 +485,10 @@ impl ResolvedLeaf {
                 None => Tri::Unknown,
                 Some(v) => Tri::from(v >= *lo && v <= *hi),
             },
+            ResolvedLeaf::UintRange { column, lo, hi } => match cols.uint_value(*column, doc_id) {
+                None => Tri::Unknown,
+                Some(v) => Tri::from(v >= *lo && v <= *hi),
+            },
             ResolvedLeaf::F64Range { column, lo, hi } => match cols.value(*column, doc_id) {
                 None => Tri::Unknown,
                 Some(v) => Tri::from(
@@ -441,11 +532,13 @@ impl ResolvedLeaf {
                 facet,
                 numeric,
                 integer,
+                unsigned_integer,
                 geo,
             } => Tri::from(
                 facet.is_some_and(|fi| cols.facet_ord(fi, doc_id).is_some())
                     || numeric.is_some_and(|ni| cols.value(ni, doc_id).is_some())
                     || integer.is_some_and(|ii| cols.int_value(ii, doc_id).is_some())
+                    || unsigned_integer.is_some_and(|ii| cols.uint_value(ii, doc_id).is_some())
                     || geo.is_some_and(|gi| cols.geo_value(gi, doc_id).is_some()),
             ),
             ResolvedLeaf::Geo { column, region } => match column {
@@ -688,6 +781,7 @@ pub fn edge_of(b: &crate::pb::FilterBound) -> Option<Edge> {
     use crate::pb::filter_bound::Value;
     let value = match b.value.as_ref()? {
         Value::Int(n) => NumBound::I(*n),
+        Value::Uint(n) => NumBound::U(*n),
         Value::Num(x) => NumBound::F(if *x == 0.0 { 0.0 } else { *x }),
     };
     Some(Edge {
@@ -991,6 +1085,9 @@ mod tests {
     /// doc 0 holds every value, doc 1 holds none.
     struct TwoDocs;
     impl NumericRead for TwoDocs {
+        fn uint_value(&self, _ii: usize, _doc_id: u32) -> Option<u64> {
+            None
+        }
         fn value(&self, _ni: usize, doc_id: u32) -> Option<f64> {
             (doc_id == 0).then_some(2.5)
         }
@@ -1116,6 +1213,7 @@ mod tests {
             facet: Some(0),
             numeric: None,
             integer: None,
+            unsigned_integer: None,
             geo: None,
         };
         assert_eq!(has.eval(0, &cols), Tri::True);

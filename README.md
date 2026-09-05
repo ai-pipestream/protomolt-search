@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Unsigned numeric filters (2026-09-05, feature branch).** CEL decimal and
+  hexadecimal uint literals compile to typed protobuf bounds. Comparisons and
+  presence tests retain the full u64 domain across heap, mapped and segmented
+  shards, placement routing and pruning, with exact mixed numeric comparisons.
+  Descriptor mapping and unsigned value expressions remain in progress.
+  See [CEL filters](docs/cel-filters.md#numbers-compare-exactly-across-domains).
+
 - **Unsigned numeric storage and ingest (2026-09-05, feature branch).** A
   distinct u64 column kind and protobuf ingest entries preserve the entire
   unsigned domain with explicit presence. Server, Rust and mobile configuration

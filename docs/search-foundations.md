@@ -129,8 +129,9 @@ ingest and reopen; segment summaries keep unsigned ranges in `uint_columns`.
 Schema checks reject a tail or segment with different ordered columns before
 it can change the meaning of a column ordinal. Existing signed storage bytes
 and protobuf contracts are unchanged. This foundation does not yet enable
-mapped unsigned numerics: mapping, query/projection and pruning still need
-their own unsigned types before support is advertised.
+mapped unsigned numerics: mapping and value projections still need
+their own unsigned types before support is advertised. The filter increment
+below adds typed filtering and pruning for explicitly declared u64 columns.
 See `tests/unsigned_columns.rs` and `docs/range-facets.md`.
 
 The next increment connects `UnsignedIntegerValue` to ordinary protobuf ingest,
@@ -151,6 +152,28 @@ The descriptor comparison against `ee2abb1` confirms that the only wire
 changes are the unsigned value message, ingest field 26 and mobile config
 field 28; existing declarations are unchanged. This branch includes the
 relay-BM25 main checkpoint `4dedddb`. No fleet rebuild or deployment ran.
+
+Unsigned numeric filters now preserve typed `FilterBound.uint` values from
+CEL decimal/hexadecimal uint literals through protobuf transport, per-shard
+resolution, placement evaluation and both topology and segment pruning.
+Mixed signed/unsigned/double comparisons are exact, including beyond 2^53 and
+at the domain boundaries. Empty and absent columns retain three-valued
+semantics. Extreme exclusive floating bounds no longer overflow i128 during
+signed normalization. `tests/unsigned_filters.rs` compares numeric behavior
+with an independent IEEE integer-ratio oracle and fixed expected rows through
+heap, reopened single-image and reopened segmented searches, monolithic and
+distributed. Unsigned mapping, value expressions, sorting and aggregation
+remain unfinished; these filter checks do not establish complete unsigned
+protobuf semantics.
+
+Validation of the filter increment on 2026-09-05: 421 library tests, 521
+integration tests across 88 targets and 11 embedded tests passed, with one
+existing sidecar test ignored. All five Android/iOS Rust target checks passed
+with the three existing relay dead-code warnings. Tests/examples compilation,
+formatting and vendored-proto checks passed. A descriptor comparison against
+`442ec30` confirms that only `FilterBound.uint` field 4 was added; existing
+declarations remain unchanged. These are local checks on the unsigned-numerics
+feature branch, not fleet validation.
 
 The unsigned storage foundation passed 420 library tests and 510 integration
 tests across 86 targets on the `0effb06` base, with one existing sidecar test
