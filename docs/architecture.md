@@ -317,7 +317,11 @@ first one badly.
 
 Everything speaks gRPC except the one UDP lane. Client to coordinator is
 the SearchService: public query and query stream, search, BM25 search, hybrid
-search, variant search, and ingest administration. Coordinator to node is the
+search, variant search, aggregation, autocomplete, and ingest administration,
+over TLS with a bearer principal once the coordinator is configured for it
+(`docs/security.md`). Node to cluster control is the ClusterControlService:
+registration, leases, shard reports, and placement actions such as replica
+bootstrap and the online split (`docs/cluster-control.md`). Coordinator to node is the
 NodeService: vector and lexical candidate streams with their floor relays,
 rescoring,
 document ingestion, and snapshot install. Node and coordinator to sidecar

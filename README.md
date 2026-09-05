@@ -1209,6 +1209,28 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Landed 2026-09-04 (evening): the fleet's measurement pass.** The
+  four-machine fleet (86,633,399 court chunks, 8 shards) rebuilt on the
+  segment layout, compacted online on the Pi shards, and moved to mTLS with
+  bearer principals; measured over TLS at k=10: vector 287 ms p50 (an
+  exhaustive scan of every row), BM25 265 ms, hybrid 842 ms, and the dense
+  quality profile exact at 5x expansion for k=10 through k=10,000 with the
+  selection flat near 300 ms through 10,000 candidates. Numbers, traps, and
+  the run history: `sea-of-slop-search-parity/design-notes/fleet-4-machine-plan-2026-09.md`.
+- **Landed 2026-09-04: the tools dial a TLS fleet.** The verifier, the
+  ingest driver, the console, and the measurement tools take `--tls-ca`,
+  `--tls-client-cert`, `--tls-client-key`, `--tls-domain`, and
+  `--bearer-token-file` (`security::ToolClient`); the coordinator's node
+  channels take their URL scheme from the client material (tonic applies
+  TLS to `https` URIs only); `deploy/v7-rebuild/mkcerts.sh` issues a fleet's
+  certificates, keys, and principals. Details: [Security](docs/security.md).
+- **Landed 2026-09-04: segment-layout ingest at scale.** The driver
+  interleaves documents and vectors per block, seals wait for the two to
+  align, the FP32 sidecar builds on disk, a node trims its allocator after
+  each seal, a publish reopens only the added segment, a node reopening
+  without a flush rebuilds its sidecar from the segments, and the driver
+  resumes. Details: [Immutable segments](docs/immutable-segments.md),
+  [mmap vectors](docs/mmap-vectors.md), and the runbook README.
 - **Landed 2026-09-04: autocomplete.** `SearchService.Suggest` and the
   `SuggestTerms` shard scan complete a prefix over any indexed BM25 field's
   byte-sorted dictionary, ranked by summed posting df, ties in term bytes;
