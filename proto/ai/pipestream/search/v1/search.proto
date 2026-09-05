@@ -644,6 +644,208 @@ message TermCandidate {
   uint32 shards = 4;
 }
 
+// DiagnosticsService is the operator's window into a running node or
+// coordinator (docs/diagnostics.md): the runtime knobs and their live
+// values, structured metrics snapshots and a stream of them, per-shard
+// layout diagnostics, and the coordinator's recent query log. Served on
+// the same listener as the data services. With bearer principals
+// configured every call needs a principal marked `admin`; without
+// principals it is open like the rest of the surface. Nothing here
+// changes what a query answers except SetRuntimeKnob, and a knob that
+// cannot be changed live is rejected by name.
+service DiagnosticsService {
+  rpc GetRuntimeKnobs(GetRuntimeKnobsRequest) returns (RuntimeKnobs);
+  // Sets one knob live. Rejected by name when the knob is unknown, not
+  // mutable at runtime, or the value does not parse for its kind.
+  rpc SetRuntimeKnob(SetRuntimeKnobRequest) returns (RuntimeKnobs);
+  // One structured snapshot of the process's metrics registry: the same
+  // counters, gauges, and histograms the Prometheus page renders
+  // (docs/metrics.md), as values rather than text.
+  rpc GetMetricsSnapshot(MetricsSnapshotRequest) returns (MetricsSnapshot);
+  // A snapshot every `interval_ms` until the client hangs up.
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream MetricsSnapshot);
+  // Layout of the shards this process serves (a node: its own; a
+  // coordinator: what its nodes report): segments, their summaries and
+  // partition ranges, rows, tombstones, fingerprints.
+  rpc GetShardDiagnostics(ShardDiagnosticsRequest) returns (ShardDiagnostics);
+  // The coordinator's bounded ring of recent public requests with their
+  // outcome and profile figures; a node answers with an empty list.
+  rpc RecentQueries(RecentQueriesRequest) returns (RecentQueriesResponse);
+}
+
+message GetRuntimeKnobsRequest {}
+
+enum KnobScope {
+  KNOB_SCOPE_UNSPECIFIED = 0;
+  KNOB_SCOPE_NODE = 1;
+  KNOB_SCOPE_COORDINATOR = 2;
+}
+
+enum KnobKind {
+  KNOB_KIND_UNSPECIFIED = 0;
+  KNOB_KIND_BOOL = 1;
+  KNOB_KIND_INT = 2;
+  KNOB_KIND_FLOAT = 3;
+  KNOB_KIND_STRING = 4;
+}
+
+// One runtime setting. `value` is the current value rendered as text
+// (`true`, `0.05`, `cascade`); `mutable` says whether SetRuntimeKnob may
+// change it in this process; `startup_value` is what the process began
+// with, so an A/B run can be put back.
+message RuntimeKnob {
+  string name = 1;
+  KnobScope scope = 2;
+  KnobKind kind = 3;
+  string value = 4;
+  string startup_value = 5;
+  bool mutable = 6;
+  string description = 7;
+}
+
+message RuntimeKnobs {
+  repeated RuntimeKnob knobs = 1;
+  // Process identity so a dashboard can tell nodes apart.
+  string process = 2;
+}
+
+message SetRuntimeKnobRequest {
+  string name = 1;
+  string value = 2;
+}
+
+message MetricsSnapshotRequest {}
+
+message StreamMetricsRequest {
+  // Zero selects 1000 ms; below 100 ms is rejected.
+  uint32 interval_ms = 1;
+}
+
+message MetricLabel {
+  string name = 1;
+  string value = 2;
+}
+
+enum MetricKind {
+  METRIC_KIND_UNSPECIFIED = 0;
+  METRIC_KIND_COUNTER = 1;
+  METRIC_KIND_GAUGE = 2;
+}
+
+// A counter or gauge sample: the metric's Prometheus name, its labels,
+// and the value.
+message MetricSample {
+  string name = 1;
+  repeated MetricLabel labels = 2;
+  MetricKind kind = 3;
+  double value = 4;
+}
+
+message HistogramBucketSample {
+  // Upper bound of the bucket (`le`); infinity for the last one.
+  double le = 1;
+  uint64 cumulative_count = 2;
+}
+
+message HistogramSample {
+  string name = 1;
+  repeated MetricLabel labels = 2;
+  repeated HistogramBucketSample buckets = 3;
+  double sum = 4;
+  uint64 count = 5;
+}
+
+message MetricsSnapshot {
+  // Wall clock of the snapshot, milliseconds since the Unix epoch.
+  uint64 unix_ms = 1;
+  string process = 2;
+  repeated MetricSample samples = 3;
+  repeated HistogramSample histograms = 4;
+}
+
+message ShardDiagnosticsRequest {
+  // Coordinator only: limit to one shard index; absent means all.
+  optional uint32 shard = 1;
+}
+
+message SegmentColumnRange {
+  string column = 1;
+  // Integer columns carry lo/hi; double columns carry lo_f/hi_f.
+  sint64 lo = 2;
+  sint64 hi = 3;
+  double lo_f = 4;
+  double hi_f = 5;
+  uint64 present = 6;
+  bool floating = 7;
+}
+
+message SegmentDiagnostics {
+  string segment_id = 1;
+  uint64 generation = 2;
+  uint64 base = 3;
+  uint64 rows = 4;
+  uint64 live_rows = 5;
+  bool has_summary = 6;
+  repeated SegmentColumnRange columns = 7;
+  // Present on a segment produced by a partitioned compaction.
+  optional SegmentColumnRange partition = 8;
+  bool mapped = 9;
+}
+
+message ShardLayoutDiagnostics {
+  uint32 shard = 1;
+  string address = 2;
+  // `segments` or `single-image`.
+  string layout = 3;
+  uint64 catalog_epoch = 4;
+  uint64 rows = 5;
+  uint64 live_rows = 6;
+  uint64 tombstones = 7;
+  uint64 tail_rows = 8;
+  string partition_key = 9;
+  string scoring_fingerprint = 10;
+  repeated SegmentDiagnostics segments = 11;
+  bool segment_pruning = 12;
+  bool floor_sharing = 13;
+}
+
+message ShardDiagnostics {
+  string process = 1;
+  uint64 topology_generation = 2;
+  repeated ShardLayoutDiagnostics shards = 3;
+}
+
+message RecentQueriesRequest {
+  // Zero selects 50; the ring holds at most 256.
+  uint32 limit = 1;
+}
+
+message RecentQuery {
+  uint64 unix_ms = 1;
+  string request_id = 2;
+  // Metrics route name (docs/metrics.md), e.g. `query`, `hybrid_search`.
+  string route = 3;
+  // The `executed` label a Query reports, when the route has one.
+  string executed = 4;
+  uint32 k = 5;
+  float total_ms = 6;
+  // gRPC status code name; `OK` on success.
+  string status = 7;
+  string principal = 8;
+  uint32 segments_total = 9;
+  uint32 segments_skipped = 10;
+  uint64 candidates_collected = 11;
+  uint32 hits = 12;
+  string collection = 13;
+}
+
+message RecentQueriesResponse {
+  repeated RecentQuery queries = 1;
+  // Requests seen since the process started, including those the ring
+  // no longer holds.
+  uint64 total_seen = 2;
+}
+
 // Durable cluster membership and placement authority. Query data never flows
 // through this service. Nodes lease capacity, report ready shard generations,
 // and poll idempotent placement actions; the authority alone publishes a new
