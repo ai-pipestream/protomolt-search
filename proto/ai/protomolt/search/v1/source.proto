@@ -1,5 +1,5 @@
 syntax = "proto3";
-package ai.pipestream.search.v1;
+package ai.protomolt.search.v1;
 
 // Original producer bytes. Preservation does not imply that a field is indexed
 // or queryable. Neither payload nor descriptor_set is decoded and reserialized

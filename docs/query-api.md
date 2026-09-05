@@ -382,7 +382,7 @@ block-max or live-floor pruning unsound.
 ## Protobuf shape
 
 The excerpt below explains the public model. The compiled contract in
-`proto/ai/pipestream/search/v1/search.proto` is authoritative for field numbers
+`proto/ai/protomolt/search/v1/search.proto` is authoritative for field numbers
 and includes later paging, projection, scoring, and streaming additions.
 
 ```proto

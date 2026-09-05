@@ -73,9 +73,26 @@ pub(super) fn build(
         }
     }
 
+    inventory(&plan.message_type, pool, bindings, skipped_fields, true)
+}
+
+pub(super) fn describe(
+    pool: &DescriptorPool,
+    message_type: &str,
+) -> Result<pb::SchemaReport, Status> {
+    inventory(message_type, pool, BTreeMap::new(), &HashSet::new(), false)
+}
+
+fn inventory(
+    message_type: &str,
+    pool: &DescriptorPool,
+    mut bindings: Bindings,
+    skipped_fields: &HashSet<String>,
+    requires_index_rows_for_preservation: bool,
+) -> Result<pb::SchemaReport, Status> {
     let mut messages = Vec::new();
     let mut enums = BTreeMap::new();
-    for message in super::reachable_messages(pool, &plan.message_type) {
+    for message in super::reachable_messages(pool, message_type) {
         let mut fields = Vec::new();
         let mut add_field = |full_name: &str,
                              descriptor: &prost_types::FieldDescriptorProto,
@@ -98,7 +115,9 @@ pub(super) fn build(
                 .into_values()
                 .collect();
             let excluded_by_hint = skipped_fields.contains(full_name);
-            let disposition = if excluded_by_hint {
+            let disposition = if !requires_index_rows_for_preservation {
+                "Retained in the original; no indexing projection was requested."
+            } else if excluded_by_hint {
                 "Indexing disabled by the ProtoMolt SKIP hint; retained in the original."
             } else if projections.iter().any(|p| p.r#use == Use::Value as i32) {
                 "Only listed value paths are projected; other occurrences are source-only."
@@ -152,6 +171,11 @@ pub(super) fn build(
             map_entry: message.is_map_entry(),
             fields,
             oneofs: message.descriptor_proto().oneof_decl.clone(),
+            message_set_wire_format: message
+                .descriptor_proto()
+                .options
+                .as_ref()
+                .is_some_and(|options| options.message_set_wire_format()),
         });
     }
     if !bindings.is_empty() {
@@ -159,11 +183,11 @@ pub(super) fn build(
     }
     Ok(pb::SchemaReport {
         report_version: 1,
-        root_message: plan.message_type.clone(),
+        root_message: message_type.into(),
         messages,
         enums: enums.into_values().collect(),
         unknown_fields: pb::SourcePreservation::OriginalBytes as i32,
-        requires_index_rows_for_preservation: true,
+        requires_index_rows_for_preservation,
     })
 }
 

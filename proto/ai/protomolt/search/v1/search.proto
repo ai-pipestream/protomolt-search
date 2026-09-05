@@ -18,12 +18,12 @@ syntax = "proto3";
 // or below the max published floor can never drop a true global top-k hit.
 // turbovec keeps candidates scoring exactly at the floor, so ties at the
 // boundary survive.
-package ai.pipestream.search.v1;
+package ai.protomolt.search.v1;
 
 import "google/protobuf/timestamp.proto";
-import "ai/pipestream/search/v1/source.proto";
-import "ai/pipestream/search/v1/document_identity.proto";
-import "ai/pipestream/search/v1/schema_report.proto";
+import "ai/protomolt/search/v1/source.proto";
+import "ai/protomolt/search/v1/document_identity.proto";
+import "ai/protomolt/search/v1/schema_report.proto";
 
 // NodeService is the internal shard-owner API. Exactly one node owns a given
 // shard; the coordinator is the only intended client.
@@ -531,6 +531,10 @@ service SearchService {
   // is the part an operator argues with first.
   rpc PlanIndex(PlanIndexRequest) returns (PlanIndexResponse);
 
+  // Describe source preservation for any supported descriptor graph, including
+  // types without index roles. Does not derive, bind, ingest, or publish a plan.
+  rpc DescribeSchema(DescribeSchemaRequest) returns (DescribeSchemaResponse);
+
   // Product-level mapped ingest routed by opaque stable document identity.
   // The coordinator snapshots one topology generation for the whole stream,
   // hashes every document key into that generation's complete range table,
@@ -737,7 +741,7 @@ message ReadWalRequest {
 message ReadWalResponse {
   uint64 generation = 1;
   uint64 high_watermark = 2;
-  // Encoded ai.pipestream.search.wal.v1.WalRecord. Empty only on the final
+  // Encoded ai.protomolt.search.wal.v1.WalRecord. Empty only on the final
   // completion frame.
   bytes record = 3;
   bool completed = 4;
@@ -771,8 +775,8 @@ message CompactShardRequest {
   // failure, and a retry then refuses it by name.
   string work_dir = 1;
   // The tail loop keeps applying the live log to the shadow with no
-  // lock held until fewer than this many records remain; the final
-  // write-locked apply is bounded by it. 0 = 256.
+  // lock held until a pass consumes fewer than this many records, then
+  // attempts cutover. Final tail preparation also runs unlocked. 0 = 256.
   uint32 tail_bound = 2;
   // Run the preflight only: every refusal, the cutoff, and the row and
   // tombstone counts the compaction would work from, with no build and
@@ -791,12 +795,13 @@ message CompactShardResponse {
   // not reclaimed; the next compaction takes them.
   uint64 tombstones_reclaimed = 3;
   // Live WAL records applied to the shadow after the cutoff, over every
-  // tail pass and the final write-locked apply.
+  // tail pass and cutover preparation.
   uint64 tail_records_applied = 4;
-  // Records applied inside the write-locked cutover (at most tail_bound).
+  // Records applied inside the write-locked cutover. Always zero with
+  // unlocked tail preparation; retained for older server responses.
   uint64 locked_tail_records = 5;
   // Wall time the cutover held the shard's write lock, in milliseconds:
-  // the final tail apply, the marker, the renames, and the state swap.
+  // the WAL fence, the marker, the renames, and the state swap.
   uint64 write_lock_ms = 6;
   // The rewritten full-history WAL generation the shard logs to after
   // the cutover; the superseded generation stays on disk as history.

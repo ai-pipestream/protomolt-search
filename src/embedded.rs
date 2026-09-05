@@ -345,6 +345,15 @@ impl EmbeddedSearch {
             .map(tonic::Response::into_inner)
     }
 
+    pub async fn describe_schema(
+        &self,
+        request: DescribeSchemaRequest,
+    ) -> Result<DescribeSchemaResponse, Status> {
+        SearchService::describe_schema(&self.coordinator, Request::new(request))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
     pub async fn search(&self, request: SearchRequest) -> Result<SearchResponse, Status> {
         SearchService::search(&self.coordinator, Request::new(request))
             .await

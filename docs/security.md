@@ -111,7 +111,7 @@ Every public route in `CollectionSet` declares one capability:
 |---|---|
 | `search` | Search, Bm25Search, PhraseSearch, HybridSearch, VariantSearch, Query, QueryStream, Aggregate, Suggest |
 | `ingest` | RoutedIngestMapped |
-| `admin` | PlanIndex, BroadcastVectorBackend, BroadcastCalibration, FreezeTopologyWrites, PublishTopology, AbortTopologyCutover, ClusterHealth |
+| `admin` | PlanIndex, DescribeSchema, BroadcastVectorBackend, BroadcastCalibration, FreezeTopologyWrites, PublishTopology, AbortTopologyCutover, ClusterHealth |
 
 No capability implies another. An administrator who also needs to search or
 write needs those grants explicitly. Names are exact; there are no implicit

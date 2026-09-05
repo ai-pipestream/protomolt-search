@@ -1,5 +1,5 @@
 syntax = "proto3";
-package ai.pipestream.search.storage.v1;
+package ai.protomolt.search.storage.v1;
 
 // The archive's index precedes its blob area. Offsets are relative to that
 // area. Descriptors precede source records; all blobs tile it without gaps.

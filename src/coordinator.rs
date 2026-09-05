@@ -10207,6 +10207,26 @@ impl SearchService for CoordinatorServiceImpl {
         .await
     }
 
+    async fn describe_schema(
+        &self,
+        request: Request<crate::pb::DescribeSchemaRequest>,
+    ) -> Result<Response<crate::pb::DescribeSchemaResponse>, Status> {
+        crate::metrics::timed(Route::DescribeSchema, request, |request| async move {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
+                return Box::pin(SearchService::describe_schema(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
+            }
+            let req = request.into_inner();
+            crate::mapping::describe_schema(&req.descriptor_set, &req.message_type)
+                .map(Response::new)
+        })
+        .await
+    }
+
     async fn routed_ingest_mapped(
         &self,
         request: Request<Streaming<RoutedIngestMappedRequest>>,

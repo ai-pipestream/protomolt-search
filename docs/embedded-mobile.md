@@ -41,7 +41,7 @@ The runtime exposes all public search routes:
 
 - `Search`, `Bm25Search`, `PhraseSearch`, `HybridSearch`, and `VariantSearch`;
 - `Query` and terminally certified `QueryStream`;
-- `PlanIndex` and exact `Aggregate`;
+- `PlanIndex`, source-only `DescribeSchema` and exact `Aggregate`;
 - vector-backend/calibration broadcasts and cluster health.
 
 It also provides the local lifecycle needed to own a private index:

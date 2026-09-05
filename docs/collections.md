@@ -96,7 +96,7 @@ which flags such a node in its `error` text rather than counting it.
 
 `string collection` on every `SearchService` request (`Search`,
 `Bm25Search`, `PhraseSearch`, `HybridSearch`, `VariantSearch`, `Query`,
-`QueryStream`, `Aggregate`, `PlanIndex`, the topology and broadcast
+`QueryStream`, `Aggregate`, `PlanIndex`, `DescribeSchema`, the topology and broadcast
 calls, `ClusterHealth`) and on the routed mapped ingest's first message
 (`RoutedMappedBind`). On nodes: `AddDocumentsRequest.collection`
 (refused when it names another node's; written when empty),

@@ -186,6 +186,7 @@ async fn each_public_unary_route_enforces_its_declared_action() {
     for principal in ["reader", "writer"] {
         refuses!(principal; broadcast_vector_backend: BroadcastVectorBackendRequest,
             broadcast_calibration: BroadcastCalibrationRequest, plan_index: PlanIndexRequest,
+            describe_schema: DescribeSchemaRequest,
             freeze_topology_writes: FreezeTopologyWritesRequest, publish_topology: PublishTopologyRequest,
             abort_topology_cutover: AbortTopologyCutoverRequest, cluster_health: ClusterHealthRequest);
     }
@@ -203,6 +204,36 @@ async fn each_public_unary_route_enforces_its_declared_action() {
     .await
     .unwrap_err();
     assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn schema_description_requires_admin_in_the_resolved_workspace() {
+    let authority = Arc::new(PolicyAuthority::new(policy()).unwrap());
+    let set = set(authority.clone());
+    let input = DescribeSchemaRequest {
+        descriptor_set: include_bytes!("fixtures/schema-report/source-only.bin").to_vec(),
+        message_type: "source_report.Empty".into(),
+        collection: String::new(),
+    };
+    let response = SearchService::describe_schema(&set, request(input.clone(), "admin"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.report.unwrap().root_message, "source_report.Empty");
+    let mut other_workspace = input.clone();
+    other_workspace.collection = "b".into();
+    let error = SearchService::describe_schema(&set, request(other_workspace, "admin"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    let mut revoked = policy();
+    revoked.revision = 2;
+    revoked.grants.clear();
+    authority.replace(revoked).unwrap();
+    let error = SearchService::describe_schema(&set, request(input, "admin"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 syntax = "proto3";
-package ai.pipestream.search.v1;
+package ai.protomolt.search.v1;
 
 // Collection-scoped logical identity. Physical slots may change independently.
 message DocumentIdentity {

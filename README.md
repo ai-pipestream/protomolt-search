@@ -97,7 +97,7 @@ up — coordinator on `localhost:50050`, rustfs console on
 [deploy/court-e2e/README.md](deploy/court-e2e/README.md).
 
 Query it with any gRPC client generated from
-[search.proto](proto/ai/pipestream/search/v1/search.proto) — `Query` or
+[search.proto](proto/ai/protomolt/search/v1/search.proto) — `Query` or
 `QueryStream` for the public contract, plus `Search` (vector top-k with floor
 sharing), `Bm25Search` (distributed lexical), and `HybridSearch` (cascade,
 RRF, or score-blend fusion) — or with the
@@ -1067,7 +1067,7 @@ runs shard 1. Static membership — both configs list the same node set.
 
    (spins a throwaway coordinator against the running nodes and prints the
    merged top-10). Or call `SearchService.Search` with any gRPC client
-   against `host-a:50050` — proto at `proto/ai/pipestream/search/v1/search.proto`.
+   against `host-a:50050` — proto at `proto/ai/protomolt/search/v1/search.proto`.
 
 6. **The large-k two-machine experiment** uses `cluster_sweep`, which
    drives a pre-existing cluster over the network (no in-process shards).
@@ -1135,7 +1135,7 @@ losslessness at k=1000 over a 24k corpus.
 
 ## Layout
 
-- `proto/ai/pipestream/search/v1/search.proto` — the wire API (heavily
+- `proto/ai/protomolt/search/v1/search.proto` — the wire API (heavily
   commented), codegen via `build.rs` + tonic-build.
 - `src/chunked.rs` — the chunked scan (mask per chunk, floor seeding,
   running heap, publish/poll points). Pure and unit-tested, including
@@ -1212,6 +1212,28 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Search protocol namespace (2026-09-05, `feat/search-foundations`).**
+  Search-owned public, node, storage, WAL and mobile protobuf contracts now
+  use `ai.protomolt.search.*` under `proto/ai/protomolt/search/`. Regenerate
+  clients: gRPC full method names and Search message Any URLs changed. See
+  [migration](docs/pipestream-search-migration.md).
+
+- **Compaction analysis lock (2026-09-05, `feat/search-foundations`).**
+  Final tail analysis runs without the live shard's write lock. A commit
+  reservation yields writers asynchronously while reads remain available;
+  cutover checks the WAL generation and high watermark before installing.
+  This removes an observed analysis
+  and ingest lock stall. See [mutations](docs/mutations.md).
+
+- **Independent schema description (2026-09-05, `feat/search-foundations`).**
+  `DescribeSchema` inventories source-only protobuf graphs without requiring
+  vector, body or ID roles. The public RPC requires collection administration;
+  embedded Rust and Android/iOS bridges describe the same graph locally.
+  The mobile bridge also exposes `PlanIndex` for local plan-to-ingest workflows.
+  Both planning and inspection reject unsupported syntax before reflection,
+  avoiding the descriptor library's panic on that input.
+  Mapping and query support remain separate. See [schema reports](docs/schema-report.md).
+
 - **Deletion order correctness (2026-09-05, `feat/search-foundations`).**
   Deleting or replacing a lower row no longer discards higher tombstones from
   the live bitmap. Regression coverage spans multiple bitmap words, retries,
@@ -1248,7 +1270,7 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 - **ProtoMolt namespace alignment (2026-09-05).** Vendored descriptor
   exchange, validation and indexing hints now use `ai.protomolt.proto.*`,
-  matching their owner. Pipestream Search retains `ai.pipestream.search.*`.
+  matching their owner. Search's package migration is recorded above.
   Old descriptor sets declaring the retired hint type require recompilation
   against ProtoMolt's current imports and a new mapped generation. See
   [descriptor mappings](docs/descriptor-mappings.md).

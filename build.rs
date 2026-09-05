@@ -1,7 +1,7 @@
 //! Wire codegen for the protobuf APIs.
 //!
-//! Regenerates the tonic stubs for `ai.pipestream.search.v1` (this service),
-//! the `ai.pipestream.search.wal.v1` WAL envelope, and
+//! Regenerates the tonic stubs for `ai.protomolt.search.v1` (this service),
+//! the `ai.protomolt.search.wal.v1` WAL envelope, and
 //! `ai.pipestream.opennlp.analysis.v1` (the vendored analysis-sidecar API)
 //! into `OUT_DIR` whenever a proto changes; `src/pb.rs` pulls them in with
 //! `tonic::include_proto!`.
@@ -16,16 +16,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_transport(net)
         .compile_protos(
             &[
-                "proto/ai/pipestream/search/v1/search.proto",
-                "proto/ai/pipestream/search/v1/authorization.proto",
-                "proto/ai/pipestream/search/v1/source.proto",
-                "proto/ai/pipestream/search/v1/document_write.proto",
-                "proto/ai/pipestream/search/v1/document_identity.proto",
-                "proto/ai/pipestream/search/storage/v1/document_catalog.proto",
-                "proto/ai/pipestream/search/v1/schema_report.proto",
-                "proto/ai/pipestream/search/storage/v1/source_archive.proto",
-                "proto/ai/pipestream/search/mobile/v1/mobile.proto",
-                "proto/ai/pipestream/search/wal/v1/wal.proto",
+                "proto/ai/protomolt/search/v1/search.proto",
+                "proto/ai/protomolt/search/v1/authorization.proto",
+                "proto/ai/protomolt/search/v1/source.proto",
+                "proto/ai/protomolt/search/v1/document_write.proto",
+                "proto/ai/protomolt/search/v1/document_identity.proto",
+                "proto/ai/protomolt/search/storage/v1/document_catalog.proto",
+                "proto/ai/protomolt/search/v1/schema_report.proto",
+                "proto/ai/protomolt/search/storage/v1/source_archive.proto",
+                "proto/ai/protomolt/search/mobile/v1/mobile.proto",
+                "proto/ai/protomolt/search/wal/v1/wal.proto",
                 "proto/ai/pipestream/opennlp/analysis/v1/analysis.proto",
                 "proto/tei/v1/tei.proto",
                 // Vendored from protomolt, byte-identical (see

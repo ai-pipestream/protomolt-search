@@ -9,8 +9,8 @@ establish completion of the three workstreams.
 | Requirement | Required evidence | Current state |
 |---|---|---|
 | Faithful protobuf decoding and compatible index binding | Generated-runtime differential fixtures for presence, oneofs, merges, scalar encodings, unknown values and schema evolution | Oneof, presence, merged messages, int32, enum openness, required fields and groups corrected; v3 includes reachable extensions; coverage expanding |
-| Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Accepted mapped plans return an exhaustive reachable schema graph and exact projection/query dispositions; standalone reporting of unbindable schemas and configurable index definitions remain |
-| Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing mapped sources retained byte-for-byte through images, WAL, replicas, snapshots, compaction and resharding; zero-row logical documents remain |
+| Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Mapped plans report their graph and projection/query dispositions; DescribeSchema also reports source-only graphs; configurable index definitions remain |
+| Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing sources survive image/WAL lifecycle byte-for-byte; the catalog retains zero-row sources across restart; catalog backup and publication remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public routes enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
 | Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Not implemented |
@@ -131,6 +131,33 @@ shapes. Exact projection paths distinguish source-only occurrences, traversed
 containers and query values; constraints expose current value-domain losses.
 This does not supply the remaining scalar/nested/extension query implementations
 or an independently configurable index definition.
+
+`DescribeSchema` now inventories source-only graphs without requiring an index
+plan, including empty messages and MessageSet. The source-only report applies no
+indexing hints and promises no query projections. The collection-admin RPC and
+embedded/mobile calls share the same implementation and graph contract.
+
+Validation on 2026-09-05 encountered two 600-second stalls in
+`single_image_shard_compacts_online`, despite successful isolated runs. Captured
+stacks showed compaction waiting for asynchronous analysis while holding the
+live shard's write lock, with ingest blocked on that lock. Cutover now prepares
+and analyzes the tail unlocked, then checks the WAL generation and high
+watermark under the lock before installing. An optimistic-only attempt then
+failed under sustained writes by exhausting its 16 retries. Final preparation
+now reserves commits through an asynchronous gate, allowing reads and analysis
+to proceed while new commits wait. The WAL fence remains defensive coverage
+against an uncoordinated mutation. A deterministic regression failed on the previous
+implementation and now checks both read availability during analysis and
+inclusion of a write committed during final preparation. This fixes the observed
+lock cycle without extending the integration test's timeout.
+
+The combined schema, namespace and compaction tree passed 356 library tests,
+431 integration tests across 70 targets (one existing ignored test), and 10
+embedded tests, including the no-network dependency gate. All five Android/iOS
+Rust target checks, examples/tests compilation, Java wrapper and C header
+compilation, protobuf bundle compilation, and vendored byte-identity checks
+passed. These are local validation results, not device-run or fleet deployment
+claims.
 
 ## Logical source authority increment
 

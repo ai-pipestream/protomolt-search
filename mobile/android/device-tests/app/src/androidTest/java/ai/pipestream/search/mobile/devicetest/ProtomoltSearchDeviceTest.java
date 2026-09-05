@@ -20,8 +20,8 @@ import androidx.test.filters.RequiresDevice;
 import androidx.test.platform.app.InstrumentationRegistry;
 
 import ai.pipestream.search.mobile.ProtomoltSearch;
-import ai.pipestream.search.mobile.v1.Mobile;
-import ai.pipestream.search.v1.Search;
+import ai.protomolt.search.mobile.v1.Mobile;
+import ai.protomolt.search.v1.Search;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedOutputStream;

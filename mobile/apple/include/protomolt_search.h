@@ -15,7 +15,7 @@ typedef struct ProtomoltSearchBuffer {
 } ProtomoltSearchBuffer;
 
 // Each returned buffer contains one encoded
-// ai.pipestream.search.mobile.v1.MobileResponse and must be released once.
+// ai.protomolt.search.mobile.v1.MobileResponse and must be released once.
 ProtomoltSearchBuffer protomolt_search_open(
     const uint8_t *request,
     size_t request_len,
@@ -27,6 +27,16 @@ ProtomoltSearchBuffer protomolt_search_ingest_mapped(
 // AcceptDocumentRequest -> DocumentWriteReceipt inside MobileResponse.
 // Blocks through the local source/history commit; does not publish search rows.
 ProtomoltSearchBuffer protomolt_search_accept_document(
+    uint64_t handle,
+    const uint8_t *request,
+    size_t request_len);
+// DescribeSchemaRequest -> DescribeSchemaResponse inside MobileResponse.
+ProtomoltSearchBuffer protomolt_search_describe_schema(
+    uint64_t handle,
+    const uint8_t *request,
+    size_t request_len);
+// PlanIndexRequest -> PlanIndexResponse inside MobileResponse.
+ProtomoltSearchBuffer protomolt_search_plan_index(
     uint64_t handle,
     const uint8_t *request,
     size_t request_len);

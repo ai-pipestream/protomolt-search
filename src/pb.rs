@@ -4,20 +4,20 @@
 // lint bar.
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]
 
-tonic::include_proto!("ai.pipestream.search.v1");
+tonic::include_proto!("ai.protomolt.search.v1");
 
 pub mod storage {
     pub mod v1 {
-        tonic::include_proto!("ai.pipestream.search.storage.v1");
+        tonic::include_proto!("ai.protomolt.search.storage.v1");
     }
     pub use v1::*;
 }
 
 /// Host-language-neutral embedded mobile bridge messages
-/// (`proto/ai/pipestream/search/mobile/v1/mobile.proto`).
+/// (`proto/ai/protomolt/search/mobile/v1/mobile.proto`).
 pub mod mobile {
     pub mod v1 {
-        tonic::include_proto!("ai.pipestream.search.mobile.v1");
+        tonic::include_proto!("ai.protomolt.search.mobile.v1");
     }
     pub use v1::*;
 }
@@ -55,10 +55,10 @@ pub mod hints {
 }
 
 /// The per-shard write-ahead log envelope
-/// (`proto/ai/pipestream/search/wal/v1/wal.proto`).
+/// (`proto/ai/protomolt/search/wal/v1/wal.proto`).
 pub mod wal {
     pub mod v1 {
-        tonic::include_proto!("ai.pipestream.search.wal.v1");
+        tonic::include_proto!("ai.protomolt.search.wal.v1");
     }
     pub use v1::*;
 }

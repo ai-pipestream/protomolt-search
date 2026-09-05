@@ -42,8 +42,8 @@ fi
 stage="$(mktemp -d)"
 cleanup() { rm -rf "$stage"; }
 trap cleanup EXIT
-mkdir -p "$stage/jni" "$stage/assets/ai/pipestream/search/mobile/v1" \
-  "$stage/assets/ai/pipestream/search/v1" "$(dirname "$output")"
+mkdir -p "$stage/jni" "$stage/assets/ai/protomolt/search/mobile/v1" \
+  "$stage/assets/ai/protomolt/search/v1" "$(dirname "$output")"
 
 targets=(
   "aarch64-linux-android|arm64-v8a|aarch64-linux-android"
@@ -82,10 +82,10 @@ rm -rf "$classes"
 cp "$repo_dir/mobile/android/AndroidManifest.xml" "$stage/AndroidManifest.xml"
 cp "$repo_dir/mobile/android/proguard.txt" "$stage/proguard.txt"
 cp "$repo_dir/mobile/android/R.txt" "$stage/R.txt"
-cp "$repo_dir/proto/ai/pipestream/search/mobile/v1/mobile.proto" \
-  "$stage/assets/ai/pipestream/search/mobile/v1/mobile.proto"
-cp "$repo_dir/proto/ai/pipestream/search/v1/"*.proto \
-  "$stage/assets/ai/pipestream/search/v1/"
+cp "$repo_dir/proto/ai/protomolt/search/mobile/v1/mobile.proto" \
+  "$stage/assets/ai/protomolt/search/mobile/v1/mobile.proto"
+cp "$repo_dir/proto/ai/protomolt/search/v1/"*.proto \
+  "$stage/assets/ai/protomolt/search/v1/"
 
 if [[ -e "$output" ]]; then
   echo "refusing to overwrite existing AAR: $output" >&2

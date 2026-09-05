@@ -1,0 +1,61 @@
+syntax = "proto2";
+package source_report;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+
+enum State {
+  option allow_alias = true;
+  UNKNOWN = 0;
+  READY = 1;
+  AVAILABLE = 1;
+}
+
+message Empty {}
+
+message LegacySet {
+  option message_set_wire_format = true;
+  extensions 4 to max;
+}
+
+message AllShapes {
+  optional double double_value = 1;
+  optional float float_value = 2;
+  optional int64 int64_value = 3;
+  optional uint64 uint64_value = 4;
+  optional int32 int32_value = 5;
+  optional fixed64 fixed64_value = 6;
+  optional fixed32 fixed32_value = 7;
+  optional bool bool_value = 8 [default = true];
+  optional string string_value = 9;
+  optional group Legacy = 10 {
+    required bytes required_value = 1;
+  }
+  optional Empty message_value = 11;
+  optional bytes bytes_value = 12;
+  optional uint32 uint32_value = 13;
+  optional State enum_value = 14 [default = READY];
+  optional sfixed32 sfixed32_value = 15;
+  optional sfixed64 sfixed64_value = 16;
+  optional sint32 sint32_value = 17;
+  optional sint64 sint64_value = 18;
+  oneof choice {
+    string selected_text = 19;
+    AllShapes selected_message = 20;
+  }
+  map<string, AllShapes> map_value = 21;
+  repeated AllShapes children = 22;
+  optional LegacySet legacy_set = 23;
+  optional google.protobuf.Any dynamic_message = 24;
+  optional google.protobuf.Value json_value = 25;
+  repeated uint64 packed_values = 26 [packed = true];
+  extensions 1000 to max;
+}
+
+extend AllShapes {
+  optional uint64 extra = 1000;
+}
+
+extend LegacySet {
+  optional AllShapes legacy_entry = 100;
+}

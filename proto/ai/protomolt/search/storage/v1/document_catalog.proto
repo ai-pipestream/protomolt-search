@@ -1,6 +1,6 @@
 syntax = "proto3";
-package ai.pipestream.search.storage.v1;
-import "ai/pipestream/search/v1/document_write.proto";
+package ai.protomolt.search.storage.v1;
+import "ai/protomolt/search/v1/document_write.proto";
 
 message DocumentCatalogHeader {
   uint32 format_version = 1;
@@ -20,5 +20,5 @@ message DocumentVersion {
 }
 message DocumentOperation {
   bytes request_sha256 = 1;
-  ai.pipestream.search.v1.DocumentWriteReceipt receipt = 2;
+  ai.protomolt.search.v1.DocumentWriteReceipt receipt = 2;
 }

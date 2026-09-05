@@ -19,8 +19,8 @@ use pipestream_search::pb::mobile::{
     MobileQueryStreamOpenResponse, MobileResponse, MobileShardConfig,
 };
 use pipestream_search::pb::{
-    AcceptDocumentRequest, QueryRequest, QueryResponse, QueryStreamRequest, QueryStreamResponse,
-    ReadAcceptedDocumentsRequest,
+    AcceptDocumentRequest, DescribeSchemaRequest, PlanIndexRequest, QueryRequest, QueryResponse,
+    QueryStreamRequest, QueryStreamResponse, ReadAcceptedDocumentsRequest,
 };
 
 type QueryReceiver =
@@ -365,6 +365,24 @@ fn accept_document_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
     })
 }
 
+fn describe_schema_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
+    response(|| {
+        let request = decode::<DescribeSchemaRequest>(input, "DescribeSchemaRequest")?;
+        let search = search(handle)?;
+        let result = runtime()?.block_on(search.describe_schema(request))?;
+        Ok(success(&result))
+    })
+}
+
+fn plan_index_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
+    response(|| {
+        let request = decode::<PlanIndexRequest>(input, "PlanIndexRequest")?;
+        let search = search(handle)?;
+        let result = runtime()?.block_on(search.plan_index(request))?;
+        Ok(success(&result))
+    })
+}
+
 fn query_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
     response(|| {
         let request = decode::<QueryRequest>(input, "QueryRequest")?;
@@ -567,6 +585,17 @@ pub extern "C" fn protomolt_search_accept_document(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn protomolt_search_describe_schema(
+    handle: u64,
+    request: *const u8,
+    request_len: usize,
+) -> MobileBuffer {
+    ffi_input(request, request_len, |bytes| {
+        describe_schema_bytes(handle, bytes)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn protomolt_search_read_accepted_documents(
     handle: u64,
     request: *const u8,
@@ -574,6 +603,17 @@ pub extern "C" fn protomolt_search_read_accepted_documents(
 ) -> MobileBuffer {
     ffi_input(request, request_len, |bytes| {
         read_accepted_documents_bytes(handle, bytes)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn protomolt_search_plan_index(
+    handle: u64,
+    request: *const u8,
+    request_len: usize,
+) -> MobileBuffer {
+    ffi_input(request, request_len, |bytes| {
+        plan_index_bytes(handle, bytes)
     })
 }
 
@@ -699,6 +739,32 @@ mod android {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "system" fn Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeDescribeSchema<
+        'caller,
+    >(
+        env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        handle: jlong,
+        request: JByteArray<'caller>,
+    ) -> JByteArray<'caller> {
+        with_input(env, request, |bytes| {
+            describe_schema_bytes(handle as u64, bytes)
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_ai_pipestream_search_mobile_ProtomoltSearch_nativePlanIndex<
+        'caller,
+    >(
+        env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        handle: jlong,
+        request: JByteArray<'caller>,
+    ) -> JByteArray<'caller> {
+        with_input(env, request, |bytes| plan_index_bytes(handle as u64, bytes))
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "system" fn Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeReadAcceptedDocuments<
         'caller,
     >(
@@ -796,6 +862,46 @@ mod tests {
             .expect("response envelope")
             .outcome
             .expect("response outcome")
+    }
+
+    #[test]
+    fn mobile_schema_description_needs_no_index_rows_or_source_catalog() {
+        let opened: MobileOpenResponse = payload(&open_bytes(
+            &MobileOpenRequest {
+                shards: vec![MobileShardConfig {
+                    in_memory: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            true,
+        ));
+        assert!(opened.no_egress);
+        let request = DescribeSchemaRequest {
+            descriptor_set: include_bytes!("../../../tests/fixtures/schema-report/source-only.bin")
+                .to_vec(),
+            message_type: "source_report.AllShapes".into(),
+            ..Default::default()
+        };
+        let expected = pipestream_search::mapping::describe_schema(
+            &request.descriptor_set,
+            &request.message_type,
+        )
+        .unwrap();
+        let bytes = request.encode_to_vec();
+        let buffer = protomolt_search_describe_schema(opened.handle, bytes.as_ptr(), bytes.len());
+        let actual: pipestream_search::pb::DescribeSchemaResponse =
+            payload(unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) });
+        unsafe { protomolt_search_buffer_free(buffer) };
+        assert_eq!(actual, expected);
+        let _: MobileCloseResponse = payload(&close_bytes(opened.handle));
+        let mobile_response::Outcome::Error(error) =
+            outcome(&describe_schema_bytes(opened.handle, &bytes))
+        else {
+            panic!("closed schema handle remained accessible");
+        };
+        assert_eq!(error.code, MobileErrorCode::NotFound as i32);
     }
 
     #[test]
@@ -1140,8 +1246,17 @@ mod tests {
         assert!(opened.no_egress);
 
         let descriptor_set = record_descriptor();
-        let plan = pipestream_search::mapping::derive_plan(&descriptor_set, "private.v1.Record")
-            .expect("derive mobile fixture plan");
+        let planning = PlanIndexRequest {
+            descriptor_set: descriptor_set.clone(),
+            message_type: "private.v1.Record".into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let buffer = protomolt_search_plan_index(opened.handle, planning.as_ptr(), planning.len());
+        let planned: pipestream_search::pb::PlanIndexResponse =
+            payload(unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) });
+        unsafe { protomolt_search_buffer_free(buffer) };
+        let plan = planned.plan.expect("mobile fixture plan");
         let ingest = MobileIngestMappedBatch {
             shard: 0,
             requests: vec![

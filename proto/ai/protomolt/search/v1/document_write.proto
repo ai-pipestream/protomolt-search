@@ -1,6 +1,6 @@
 syntax = "proto3";
-package ai.pipestream.search.v1;
-import "ai/pipestream/search/v1/source.proto";
+package ai.protomolt.search.v1;
+import "ai/protomolt/search/v1/source.proto";
 
 // Acceptance of a logical document, independent of physical index rows.
 // Version 1 persists source and retry history. It does not publish a search

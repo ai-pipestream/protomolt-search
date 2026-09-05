@@ -42,9 +42,10 @@ use crate::pb::{
     Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
     BroadcastCalibrationResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse,
     ClusterHealthRequest, ClusterHealthResponse, ClusterPlan, CollectionHealth,
-    CompletePlacementActionRequest, DrainNodeRequest, FreezeTopologyWritesRequest,
-    FreezeTopologyWritesResponse, GetClusterPlanRequest, HybridSearchRequest, HybridSearchResponse,
-    NodeLease, PhraseSearchRequest, PlanIndexRequest, PlanIndexResponse, PublishTopologyRequest,
+    CompletePlacementActionRequest, DescribeSchemaRequest, DescribeSchemaResponse,
+    DrainNodeRequest, FreezeTopologyWritesRequest, FreezeTopologyWritesResponse,
+    GetClusterPlanRequest, HybridSearchRequest, HybridSearchResponse, NodeLease,
+    PhraseSearchRequest, PlanIndexRequest, PlanIndexResponse, PublishTopologyRequest,
     PublishTopologyResponse, QueryRequest, QueryResponse, QueryStreamRequest,
     ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest, ReportShardRequest,
     RollbackClusterRequest, RoutedIngestMappedRequest, RoutedIngestMappedResponse, SearchRequest,
@@ -196,6 +197,7 @@ impl RequestK for QueryStreamRequest {
 impl RequestK for PhraseSearchRequest {}
 impl RequestK for AggregateRequest {}
 impl RequestK for PlanIndexRequest {}
+impl RequestK for DescribeSchemaRequest {}
 impl RequestK for BroadcastVectorBackendRequest {}
 impl RequestK for BroadcastCalibrationRequest {}
 impl RequestK for FreezeTopologyWritesRequest {}
@@ -509,6 +511,7 @@ search_service_over_collections! {
     variant_search [Search]: VariantSearchRequest => VariantSearchResponse,
     query [Search]: QueryRequest => QueryResponse,
     plan_index [Admin]: PlanIndexRequest => PlanIndexResponse,
+    describe_schema [Admin]: DescribeSchemaRequest => DescribeSchemaResponse,
     freeze_topology_writes [Admin]: FreezeTopologyWritesRequest => FreezeTopologyWritesResponse,
     publish_topology [Admin]: PublishTopologyRequest => PublishTopologyResponse,
     abort_topology_cutover [Admin]: AbortTopologyCutoverRequest => AbortTopologyCutoverResponse,

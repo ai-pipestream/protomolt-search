@@ -34,6 +34,16 @@ public enum ProtomoltSearchMobile {
         call(request) { protomolt_search_accept_document(handle, $0, $1) }
     }
 
+    /// DescribeSchemaRequest -> DescribeSchemaResponse. Call off the UI thread.
+    public static func describeSchema(handle: UInt64, request: Data) -> Data {
+        call(request) { protomolt_search_describe_schema(handle, $0, $1) }
+    }
+
+    /// PlanIndexRequest -> PlanIndexResponse. Call off the UI thread.
+    public static func planIndex(handle: UInt64, request: Data) -> Data {
+        call(request) { protomolt_search_plan_index(handle, $0, $1) }
+    }
+
     /// Reads original source history locally. Call off the UI thread.
     public static func readAcceptedDocuments(handle: UInt64, request: Data) -> Data {
         call(request) { protomolt_search_read_accepted_documents(handle, $0, $1) }

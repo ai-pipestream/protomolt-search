@@ -1,12 +1,13 @@
 syntax = "proto3";
-package ai.pipestream.search.v1;
+package ai.protomolt.search.v1;
 
 import "google/protobuf/descriptor.proto";
 
 // A finite graph of every message, enum, ordinary field and registered
 // extension reachable from the root. Message type names are graph edges;
 // recursive, repeated and map edges are never dropped or expanded forever.
-// This describes mapped projection, before bind-time materialization or policy.
+// PlanIndex includes mapped projection, before materialization or policy.
+// DescribeSchema describes source preservation without requesting a projection.
 // It is not a replacement for the original FileDescriptorSet: unknown custom
 // option bytes belong to source preservation, not these decoded descriptors.
 message SchemaReport {
@@ -15,9 +16,9 @@ message SchemaReport {
   repeated SchemaMessage messages = 3;
   repeated SchemaEnum enums = 4;
   SourcePreservation unknown_fields = 5;
-  // Source retention currently requires at least one mapped row. A parent
-  // without chunks is not retained by the node, even though the archive can
-  // represent it. This report does not promise source-only document ingest.
+  // True for legacy mapped ingest, which retains sources only with rows.
+  // False for DescribeSchema's logical catalog preservation contract: source
+  // acceptance is independent of index rows. Neither report accepts a document.
   bool requires_index_rows_for_preservation = 6;
 }
 
@@ -34,6 +35,7 @@ message SchemaMessage {
   bool map_entry = 3;
   repeated SchemaField fields = 4;
   repeated google.protobuf.OneofDescriptorProto oneofs = 5;
+  bool message_set_wire_format = 6;
 }
 
 message SchemaEnum {
@@ -56,7 +58,25 @@ message SchemaField {
   // not. Every unlisted occurrence, including recursion, is source-only.
   repeated FieldProjection projections = 7;
   string disposition = 8;
+  // A SKIP hint applied by the reported plan. False when no plan was requested.
   bool excluded_by_hint = 9;
+}
+
+// Inspect a valid descriptor graph without deriving or binding an index plan.
+message DescribeSchemaRequest {
+  // Complete serialized FileDescriptorSet, including imports.
+  bytes descriptor_set = 1;
+  // Fully qualified root message name, without a leading dot.
+  string message_type = 2;
+  // Same collection resolution and administration permission as PlanIndex.
+  string collection = 3;
+}
+
+message DescribeSchemaResponse {
+  // All fields are source-only: no indexing hints or projections are applied.
+  SchemaReport report = 1;
+  // Lowercase SHA-256 of the exact descriptor bytes, not a plan fingerprint.
+  string descriptor_sha256 = 2;
 }
 
 enum ProjectionUse {

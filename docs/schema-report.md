@@ -5,6 +5,34 @@ The report distinguishes original-byte preservation, mapped projection and the
 query representation. It is an explanation of the current plan, not a new
 indexing policy or a promise that every protobuf field type is queryable.
 
+`DescribeSchema` accepts a complete descriptor set and a root type without
+requiring a viable index plan. Its report inventories proto2/proto3 schemas,
+including empty messages, all scalar types, groups, MessageSet, extensions,
+recursive messages and well-known types. Every field is source-only, with empty
+projection lists. No indexing hints are applied, so `excluded_by_hint` is false;
+this does not override hints in a later `PlanIndex` call. MessageSet's wire-format
+option is explicit in the report even though mapped ingest cannot decode it.
+Malformed descriptors, missing imports, unknown roots and unsupported descriptor
+syntax are errors. Dynamic payloads inside `Any` remain bytes here; this RPC
+describes the declared graph, not types hidden in a document's payload.
+
+Planning and inspection validate syntax before entering reflection. The pinned
+descriptor library panics while constructing its unsupported-syntax error;
+explicit validation returns `INVALID_ARGUMENT` instead. Currently accepted
+syntax is absent (proto2), `proto2`, or `proto3`; editions are not supported by
+this reflection contract.
+
+The response includes the SHA-256 of the exact supplied descriptor bytes. This
+is a content address, not a semantic plan fingerprint. The RPC is read-only,
+needs no shard fanout and uses the same collection administration permission as
+`PlanIndex`. Embedded Rust's `describe_schema`, Android's `nativeDescribeSchema`
+and Swift's `describeSchema` provide the same report locally. The mobile calls
+take a serialized `DescribeSchemaRequest` and return `DescribeSchemaResponse`
+inside the usual `MobileResponse` envelope; call them off the UI thread.
+Android's `nativePlanIndex` and Swift's `planIndex` also expose the existing
+planner through `PlanIndexRequest`/`PlanIndexResponse`. A phone can derive and
+review its plan locally, then pass the returned fingerprint to mapped ingest.
+
 The schema is a finite graph. Each reachable message appears once with every
 ordinary field and registered extension, including fields hidden by SKIP hints,
 repeated-message boundaries or recursion in the projection walk. Field type
@@ -31,21 +59,29 @@ materialization and authorization are separate contracts. The report grants no
 access and adds no source-fetch route.
 
 Preservation means exact bytes in the retained original protobuf. Unknown fields
-share that rule. The report explicitly states the current limitation that node
-source retention requires at least one mapped row. A zero-chunk source still
-needs the logical document catalog described in [Search foundations](search-foundations.md).
+share that rule. `PlanIndex` reports that legacy mapped ingest requires at least
+one row for source retention. `DescribeSchema` reports the logical catalog's
+row-independent preservation contract, with
+`requires_index_rows_for_preservation=false`. Describing does not configure a
+catalog, accept a document, validate document payloads or acknowledge durability.
+Source acceptance still uses the [document catalog](document-writes.md), including
+for empty and zero-chunk sources.
 
 The report is derived and excluded from the v3 projection fingerprint. Valid
 existing mappings keep their identities; incompatible projection/wire changes
 still require their existing migration checks. Planning also validates the
 extractor for each proposed value path, so a column family that cannot decode
 its declared protobuf type refuses during planning rather than failing only at
-bind. Rejected plans still return a status, so independently describing schemas
-that the current planner cannot bind remains future work.
+bind. Rejected plans still return a status; clients can independently call
+`DescribeSchema` to inspect their source graph. Configurable projections and
+query implementations for currently source-only shapes remain unfinished.
 
 `tests/schema_report.rs` uses protoc-generated schemas and the existing Google
 protobuf semantics fixture. It checks fields hidden by projection boundaries,
 recursive and map graphs, extensions, oneofs, defaults, enum openness, exact
 projected occurrences, constraints and descriptor-file reorderings without
-losing custom options. Existing fingerprint and mapped-ingest tests pin binding
-and extraction behavior.
+losing custom options. A second fixture covers all 18 protobuf field types,
+empty messages, MessageSet and recursive extensions without search roles. RPC,
+authorization and mobile bridge tests cover transport, administration grants,
+revocation and local inspection without source or index rows. Existing
+fingerprint and mapped-ingest tests pin binding and extraction behavior.

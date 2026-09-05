@@ -4,7 +4,7 @@ package ai.pipestream.search.mobile;
  * Byte-oriented Android entry point for the embedded Protomolt Search engine.
  *
  * <p>Every byte array is an encoded protobuf message. Every result is an
- * {@code ai.pipestream.search.mobile.v1.MobileResponse}. Search behavior and
+ * {@code ai.protomolt.search.mobile.v1.MobileResponse}. Search behavior and
  * lifecycle state live in the packaged Rust library; this class contains no
  * ranking, schema, persistence, or networking implementation.</p>
  */
@@ -23,6 +23,12 @@ public final class ProtomoltSearch {
 
     /** AcceptDocumentRequest -> DocumentWriteReceipt. Call off the UI thread. */
     public static native byte[] nativeAcceptDocument(long handle, byte[] request);
+
+    /** DescribeSchemaRequest -> DescribeSchemaResponse. Call off the UI thread. */
+    public static native byte[] nativeDescribeSchema(long handle, byte[] request);
+
+    /** PlanIndexRequest -> PlanIndexResponse. Call off the UI thread. */
+    public static native byte[] nativePlanIndex(long handle, byte[] request);
 
     /** Reads original source history locally. Call off the UI thread. */
     public static native byte[] nativeReadAcceptedDocuments(long handle, byte[] request);

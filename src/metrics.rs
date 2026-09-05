@@ -82,6 +82,7 @@ pub enum Route {
     Query,
     QueryStream,
     PlanIndex,
+    DescribeSchema,
     RoutedIngestMapped,
     FreezeTopologyWrites,
     PublishTopology,
@@ -105,7 +106,7 @@ pub enum Route {
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 55] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 56] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -144,6 +145,7 @@ const REQUEST_ROUTES: [(Route, &str, bool); 55] = [
     (Route::Query, "query", false),
     (Route::QueryStream, "query_stream", true),
     (Route::PlanIndex, "plan_index", false),
+    (Route::DescribeSchema, "describe_schema", false),
     (Route::RoutedIngestMapped, "routed_ingest_mapped", false),
     (Route::FreezeTopologyWrites, "freeze_topology_writes", false),
     (Route::PublishTopology, "publish_topology", false),

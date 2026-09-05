@@ -96,6 +96,7 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
              (compile with --include_imports): {e}"
         ))
     })?;
+    validate_descriptor_syntax(&set).map_err(refuse)?;
     let index = TypeIndex::build(&set);
     check_extension_declarations(&set)?;
     let pool = DescriptorPool::decode(descriptor_set)
@@ -210,6 +211,55 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         .collect();
     plan.schema_report = Some(schema_report::build(&plan, &pool, &set, &skipped_fields)?);
     Ok(plan)
+}
+
+/// Describe source preservation without choosing an indexing projection.
+pub fn describe_schema(
+    descriptor_set: &[u8],
+    message_type: &str,
+) -> Result<pb::DescribeSchemaResponse, Status> {
+    if descriptor_set.is_empty() || message_type.is_empty() {
+        return Err(Status::invalid_argument(
+            "schema: descriptor_set and message_type are required",
+        ));
+    }
+    if message_type.starts_with('.') {
+        return Err(Status::invalid_argument(
+            "schema: message_type must not have a leading dot",
+        ));
+    }
+    let set = FileDescriptorSet::decode(descriptor_set).map_err(|error| {
+        Status::invalid_argument(format!("schema: invalid descriptor set: {error}"))
+    })?;
+    validate_descriptor_syntax(&set)
+        .map_err(|error| Status::invalid_argument(format!("schema: {error}")))?;
+    let pool = DescriptorPool::decode(descriptor_set).map_err(|error| {
+        Status::invalid_argument(format!("schema: invalid descriptors: {error}"))
+    })?;
+    if pool.get_message_by_name(message_type).is_none() {
+        return Err(Status::invalid_argument(format!(
+            "schema: message type {message_type:?} is absent from the descriptor set"
+        )));
+    }
+    Ok(pb::DescribeSchemaResponse {
+        report: Some(schema_report::describe(&pool, message_type)?),
+        descriptor_sha256: sha256::hex_digest(descriptor_set),
+    })
+}
+
+fn validate_descriptor_syntax(set: &FileDescriptorSet) -> Result<(), String> {
+    for file in &set.file {
+        match file.syntax.as_deref() {
+            None | Some("proto2" | "proto3") => {}
+            Some(syntax) => {
+                return Err(format!(
+                    "unsupported protobuf syntax {syntax:?} in file {:?}; expected proto2 or proto3",
+                    file.name()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

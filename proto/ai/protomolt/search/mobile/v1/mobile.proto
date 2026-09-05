@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package ai.pipestream.search.mobile.v1;
+package ai.protomolt.search.mobile.v1;
 
-import "ai/pipestream/search/v1/search.proto";
+import "ai/protomolt/search/v1/search.proto";
 
 // Configuration for one private shard in an embedded mobile runtime. The
 // bridge accepts no endpoint, hostname, sidecar, or embedding-provider field:
@@ -75,11 +75,11 @@ message MobileOpenResponse {
 // example a plan bind followed by document payloads.
 message MobileIngestMappedBatch {
   uint32 shard = 1;
-  repeated ai.pipestream.search.v1.IngestMappedRequest requests = 2;
+  repeated ai.protomolt.search.v1.IngestMappedRequest requests = 2;
 }
 
 message MobileFlushResponse {
-  repeated ai.pipestream.search.v1.FlushResponse shards = 1;
+  repeated ai.protomolt.search.v1.FlushResponse shards = 1;
 }
 
 message MobileCloseResponse {
@@ -93,7 +93,7 @@ message MobileQueryStreamOpenResponse {
 message MobileQueryStreamNextResponse {
   // Absent only when end is true. Every present response is the ordinary
   // public QueryStreamResponse, including its terminal certificate.
-  ai.pipestream.search.v1.QueryStreamResponse response = 1;
+  ai.protomolt.search.v1.QueryStreamResponse response = 1;
   bool end = 2;
 }
 
