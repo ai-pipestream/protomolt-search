@@ -116,3 +116,10 @@ Nested-relay tests replace leaf rows after readiness and verify that original
 identities and explicit legacy absence survive both relay levels. They also
 cover invalid selections, timeout and Stop. The relay conformance suite compares
 flat, one-level and two-level ranking bit for bit.
+
+The integration with relay and scan-budget main passed 420 library tests,
+497 integration tests across 83 targets (one existing sidecar test ignored),
+and 10 embedded tests on 2026-09-05. All five Android/iOS Rust target checks,
+examples/tests compilation, formatting, local documentation links and vendored
+protobuf byte-identity checks passed. This is local correctness and compilation
+evidence; the fleet benchmark matrix and deployment were not run.
