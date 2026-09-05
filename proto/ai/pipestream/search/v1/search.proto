@@ -754,6 +754,11 @@ message BrowseShardResponse {
   // without the column contributes nothing, exactly as its documents
   // hold no value). Parallel to the request's `sort`.
   repeated bool sort_columns_known = 8;
+  // Sealed segments in this shard's snapshot, and how many of them the
+  // request ruled out from their summaries without opening them
+  // (docs/segment-pruning.md). The answer is the same with pruning off.
+  uint32 segments_total = 9;
+  uint32 segments_skipped = 10;
 }
 
 message FilterBitmapRequest {
@@ -767,6 +772,11 @@ message FilterBitmapResponse {
   bytes bits = 3;
   repeated bool geo_columns_known = 4;
   repeated bool filter_columns_known = 5;
+  // Sealed segments in this shard's snapshot, and how many the filter
+  // ruled out from their summaries without opening them
+  // (docs/segment-pruning.md).
+  uint32 segments_total = 6;
+  uint32 segments_skipped = 7;
 }
 
 message LexicalBitmapRequest {
@@ -784,6 +794,11 @@ message MembershipBitmapResponse {
   // Lexical store epoch that produced the bitmap. Zero on the vector route.
   // Candidate rescoring can echo this through expected_stats_epoch.
   uint64 stats_epoch = 4;
+  // Sealed segments in this shard's snapshot, and how many of them the
+  // request ruled out from their summaries without opening them
+  // (docs/segment-pruning.md). The answer is the same with pruning off.
+  uint32 segments_total = 5;
+  uint32 segments_skipped = 6;
 }
 
 // One column's aggregate over a filtered match set (docs/facets.md).
@@ -1311,6 +1326,11 @@ message StreamSearchSummary {
   // Provider score-space identity for this exact generation. Every shard in
   // one successful stream must report the same non-empty fingerprint.
   string scoring_fingerprint = 7;
+  // Sealed segments in this shard's snapshot, and how many of them the
+  // request ruled out from their summaries without opening them
+  // (docs/segment-pruning.md). The answer is the same with pruning off.
+  uint32 segments_total = 8;
+  uint32 segments_skipped = 9;
 }
 
 enum VectorScoreDirection {
@@ -1632,6 +1652,11 @@ message SearchResponse {
   // layout-invariant: the same corpus in any shard layout yields the
   // same groups.
   float chunk_floor = 4;
+  // Sealed segments across the shards this request consulted, and how
+  // many were ruled out from their summaries without being opened
+  // (docs/segment-pruning.md); zero on shards without a segment catalog.
+  uint32 segments_total = 5;
+  uint32 segments_skipped = 6;
 }
 
 // One parent document's chunks in a document-mode search response.
@@ -2992,6 +3017,11 @@ message Bm25QueryResponse {
   // sent). A leaf no shard resolves is a typo'd column: the
   // coordinator refuses it by name rather than answering all-absent.
   repeated bool projection_leaves_known = 10;
+  // Sealed segments in this shard's snapshot, and how many of them the
+  // request ruled out from their summaries without opening them
+  // (docs/segment-pruning.md). The answer is the same with pruning off.
+  uint32 segments_total = 11;
+  uint32 segments_skipped = 12;
 }
 
 // One message on the client-to-shard leg of `Bm25QueryStream`.
@@ -3551,6 +3581,11 @@ message Bm25SearchResponse {
   // One entry per query term a synonym rule matched, per field
   // (docs/synonyms.md): the terms the rule added.
   repeated SynonymExpansion synonym_expansions = 9;
+  // Sealed segments across the shards this request consulted, and how
+  // many were ruled out from their summaries without being opened
+  // (docs/segment-pruning.md); zero on shards without a segment catalog.
+  uint32 segments_total = 10;
+  uint32 segments_skipped = 11;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.
@@ -6292,6 +6327,11 @@ message AggregateShardResponse {
   // One partial per compiled percentile expression, request order:
   // the phase-1 statistics the binary search starts from.
   repeated PercentilePartial percentile_partials = 10;
+  // Sealed segments in this shard's snapshot, and how many of them the
+  // request ruled out from their summaries without opening them
+  // (docs/segment-pruning.md). The answer is the same with pruning off.
+  uint32 segments_total = 11;
+  uint32 segments_skipped = 12;
 }
 
 // One shard's phase-1 percentile statistics.

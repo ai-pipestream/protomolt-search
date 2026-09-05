@@ -160,6 +160,10 @@ pub struct NodeConfig {
     /// disabled" baseline for A/B benchmarking. Results are identical
     /// either way; only the cost changes.
     pub block_max: bool,
+    /// Skip sealed segments a request's filter cannot match, from
+    /// their column summaries (`docs/segment-pruning.md`); `false` is the
+    /// A/B switch and changes no answer.
+    pub segment_pruning: bool,
     /// Minimum improvement over the last PUBLISHED floor before the next
     /// one goes on the wire. 0.0 publishes every raise (the historical
     /// behavior); a small positive delta trades a sliver of pruning
@@ -314,6 +318,7 @@ impl Default for NodeConfig {
             chunk_blocks: DEFAULT_CHUNK_BLOCKS,
             share_floors: true,
             block_max: true,
+            segment_pruning: true,
             floor_delta: 0.0,
             floor_warmup_chunks: 0,
             floor_min_interval_ms: 0,
@@ -1191,6 +1196,16 @@ impl Bm25Shard {
             Bm25Shard::Spilling(_) => None,
             Bm25Shard::Resident(r) => Some(Box::new(r.field(f))),
             Bm25Shard::Segmented(g) => Some(Box::new(g.field(f))),
+        }
+    }
+
+    /// [`Self::field_view`] over the sealed parts `mask` admits on a
+    /// segmented shard (`docs/segment-pruning.md`); the other layouts
+    /// have no parts to skip and serve the plain view.
+    fn field_view_masked(&self, f: usize, mask: &Arc<[bool]>) -> Option<Box<dyn Bm25Index + '_>> {
+        match self {
+            Bm25Shard::Segmented(g) => Some(Box::new(g.field_masked(f, Arc::clone(mask)))),
+            _ => self.field_view(f),
         }
     }
 
@@ -2547,6 +2562,110 @@ fn explain_stages(
     }
 }
 
+/// The sealed segments a resolved predicate rules out on one shard
+/// (`docs/segment-pruning.md`): their local slot ranges in catalog
+/// order, the counts, and the admitted-parts mask the postings walks
+/// take (`None` when no part was ruled out, so the unmasked reader
+/// serves and the path is the one it always was).
+#[derive(Debug, Default)]
+struct SegmentPrune {
+    /// `(base, rows)` of every pruned sealed segment, ascending.
+    ranges: Vec<(u32, u32)>,
+    stats: crate::segment_prune::PruneStats,
+    /// One flag per sealed part, `true` = walk it.
+    mask: Option<Arc<[bool]>>,
+}
+
+impl SegmentPrune {
+    /// Local slots outside every pruned range, ascending, over `0..n`.
+    fn admitted_slots(&self, n: u32) -> impl Iterator<Item = u32> + '_ {
+        self.admitted_slots_from(0, n)
+    }
+
+    /// Local slots outside every pruned range, ascending, over `start..n`.
+    fn admitted_slots_from(&self, start: u32, n: u32) -> impl Iterator<Item = u32> + '_ {
+        let mut ranges = self.ranges.iter().copied().peekable();
+        (start..n).filter(move |&slot| {
+            while let Some(&(base, rows)) = ranges.peek() {
+                if slot >= base.saturating_add(rows) {
+                    ranges.next();
+                    continue;
+                }
+                return slot < base;
+            }
+            true
+        })
+    }
+}
+
+/// Decide, from the segment summaries, which sealed segments of a
+/// segmented shard hold no row that can satisfy `pred`. A shard in any
+/// other layout, or a request without a predicate, prunes none; with
+/// `enabled == false` none is pruned either, and only the total is
+/// counted.
+fn prune_segments(
+    store: &Bm25Shard,
+    pred: Option<&crate::filter::ResolvedFilter>,
+    enabled: bool,
+) -> SegmentPrune {
+    let Bm25Shard::Segmented(shard) = store else {
+        return SegmentPrune::default();
+    };
+    let summaries = shard.part_summaries();
+    let (verdicts, stats) = crate::segment_prune::verdicts_over(pred, &summaries, shard, enabled);
+    let ranges: Vec<(u32, u32)> = shard
+        .sealed_ranges()
+        .into_iter()
+        .zip(&verdicts)
+        .filter(|(_, &pruned)| pruned)
+        .map(|(range, _)| range)
+        .collect();
+    let mask = (stats.segments_skipped > 0).then(|| {
+        verdicts
+            .iter()
+            .map(|&pruned| !pruned)
+            .collect::<Arc<[bool]>>()
+    });
+    SegmentPrune {
+        ranges,
+        stats,
+        mask,
+    }
+}
+
+/// Fill the slot allowlist for one shard: every slot of a pruned
+/// segment is `false` without a predicate evaluation; every other slot
+/// is the filter's verdict.
+fn fill_allowlist(n: u32, prune: &SegmentPrune, mut passes: impl FnMut(u32) -> bool) -> Vec<bool> {
+    let mut allow = vec![false; n as usize];
+    let mut slot = 0u32;
+    for &(base, rows) in &prune.ranges {
+        for s in slot..base.min(n) {
+            allow[s as usize] = passes(s);
+        }
+        slot = base.saturating_add(rows).min(n);
+    }
+    for s in slot..n {
+        allow[s as usize] = passes(s);
+    }
+    allow
+}
+
+/// Resolve a request's filters for one shard into the predicate the
+/// scorers gate with and the slot allowlist the vector kernel scans
+/// under. With `prune` set and a segmented shard, sealed segments the
+/// predicate cannot match are ruled out from their summaries first
+/// (`docs/segment-pruning.md`): their slots are `false` without a
+/// per-row evaluation, and the counts come back alongside.
+/// What [`resolve_shard_filters`] hands back: the predicate for the
+/// scorers' heap gate, the slot allowlist for the vector kernel, and
+/// the segment counts.
+type ResolvedShardFilters = (
+    Option<crate::filter::DocFilter<'static>>,
+    Option<Vec<bool>>,
+    crate::segment_prune::PruneStats,
+);
+
 fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,
     deleted: Option<Arc<Vec<u64>>>,
@@ -2554,9 +2673,17 @@ fn resolve_shard_filters(
     geo_filters: &[crate::pb::GeoFilter],
     geo_regions: &[crate::geo::GeoRegion],
     filter: Option<&crate::pb::FilterExpr>,
-) -> Result<(Option<crate::filter::DocFilter<'static>>, Option<Vec<bool>>), Status> {
+    prune: bool,
+) -> Result<ResolvedShardFilters, Status> {
+    let total = |bm25: Option<&Bm25Shard>| crate::segment_prune::PruneStats {
+        segments_total: match bm25 {
+            Some(Bm25Shard::Segmented(shard)) => shard.sealed_parts() as u32,
+            _ => 0,
+        },
+        segments_skipped: 0,
+    };
     if geo_filters.is_empty() && filter.is_none() && deleted.is_none() {
-        return Ok((None, None));
+        return Ok((None, None, total(bm25)));
     }
     let Some(store) = bm25 else {
         if geo_filters.is_empty() && filter.is_none() {
@@ -2569,9 +2696,9 @@ fn resolve_shard_filters(
                     })
                 })
                 .collect();
-            return Ok((None, Some(allow)));
+            return Ok((None, Some(allow), total(bm25)));
         }
-        return Ok((None, Some(vec![false; n])));
+        return Ok((None, Some(vec![false; n]), total(bm25)));
     };
     if store.as_index().is_none() {
         return Err(Status::failed_precondition(
@@ -2584,13 +2711,12 @@ fn resolve_shard_filters(
         pred: filter.map(|f| store.resolve_filter(f)).transpose()?,
         phrase: Vec::new(),
     };
+    let pruned = prune_segments(store, doc_filter.pred.as_ref(), prune);
     let allow = {
         let cols = ShardNumericRead(store);
-        (0..n as u32)
-            .map(|slot| doc_filter.passes(slot, &cols))
-            .collect()
+        fill_allowlist(n as u32, &pruned, |slot| doc_filter.passes(slot, &cols))
     };
-    Ok((Some(doc_filter), Some(allow)))
+    Ok((Some(doc_filter), Some(allow), pruned.stats))
 }
 
 /// The two known-column handshakes for one request, in the shape every
@@ -3699,6 +3825,7 @@ struct ScanJob {
 async fn scan_scheduler(
     state: Arc<std::sync::RwLock<ShardState>>,
     chunk_blocks: usize,
+    segment_pruning: bool,
     parallel: usize,
     mut jobs: mpsc::Receiver<ScanJob>,
 ) {
@@ -3726,14 +3853,19 @@ async fn scan_scheduler(
         let state = state.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = permit;
-            run_scan_batch(&state, chunk_blocks, batch);
+            run_scan_batch(&state, chunk_blocks, segment_pruning, batch);
         });
     }
 }
 
 /// Run one batched scan under the shard read lock and deliver every job's
 /// result. Blocking-pool context.
-fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, batch: Vec<ScanJob>) {
+fn run_scan_batch(
+    state: &std::sync::RwLock<ShardState>,
+    chunk_blocks: usize,
+    segment_pruning: bool,
+    batch: Vec<ScanJob>,
+) {
     let guard = state.read().expect("shard state lock poisoned");
     let index = match guard.index.as_ref() {
         Some(index) => index,
@@ -3753,6 +3885,7 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
     let slots = index.len();
     let mut specs: Vec<(Vec<f32>, usize, bool)> = Vec::with_capacity(batch.len());
     let mut allows: Vec<Option<Vec<bool>>> = Vec::with_capacity(batch.len());
+    let mut prunes: Vec<crate::segment_prune::PruneStats> = Vec::with_capacity(batch.len());
     let mut knowns: Vec<(Vec<bool>, Vec<bool>)> = Vec::with_capacity(batch.len());
     let mut externals: Vec<Box<dyn FnMut() -> Option<f32> + Send>> = Vec::new();
     let mut publishers: Vec<Box<dyn FnMut(f32) -> bool + Send>> = Vec::new();
@@ -3772,14 +3905,16 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
             &job.geo_filters,
             &job.geo_regions,
             job.filter.as_ref(),
+            segment_pruning,
         );
-        let allow = match resolved {
-            Ok((_, allow)) => allow,
+        let (allow, prune) = match resolved {
+            Ok((_, allow, prune)) => (allow, prune),
             Err(e) => {
                 let _ = job.done.send(Err(e));
                 continue;
             }
         };
+        prunes.push(prune);
         knowns.push(filter_known_flags(
             guard.bm25.as_ref(),
             &job.geo_filters,
@@ -3811,9 +3946,11 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
         &mut |qi| (externals[qi])(),
         &mut |qi, floor| (publishers[qi])(floor),
     );
-    for ((done, (hits, stats)), (geo_columns_known, filter_columns_known)) in
-        dones.into_iter().zip(results).zip(knowns)
+    for (((done, (hits, mut stats)), (geo_columns_known, filter_columns_known)), prune) in
+        dones.into_iter().zip(results).zip(knowns).zip(prunes)
     {
+        stats.segments_total = prune.segments_total;
+        stats.segments_skipped = prune.segments_skipped;
         crate::metrics::record_scan(&stats);
         let _ = done.send(Ok(ScanOutcome {
             hits,
@@ -4110,6 +4247,7 @@ impl NodeServiceImpl {
                 tokio::spawn(scan_scheduler(
                     self.state.clone(),
                     self.config.chunk_blocks,
+                    self.config.segment_pruning,
                     parallel,
                     rx,
                 ));
@@ -6175,6 +6313,7 @@ impl NodeServiceImpl {
             (None, Some(f)) => vec![false; crate::filter::leaf_count(f)],
             (_, None) => Vec::new(),
         };
+        let mut fused_prune = crate::segment_prune::PruneStats::default();
         let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
             // Facet counting enters the arm even at k == 0 (the flat
             // path counts regardless of k; the scorers return no hits
@@ -6222,6 +6361,30 @@ impl NodeServiceImpl {
                 // filters the ctx is None and every path below is
                 // bit-identical to its unfiltered form.
                 let numeric_read = ShardNumericRead(store);
+                let pred = req
+                    .filter
+                    .as_ref()
+                    .map(|f| store.resolve_filter(f))
+                    .transpose()?;
+                // Sealed segments the predicate rules out leave every
+                // leg's walk (docs/segment-pruning.md): the views the
+                // scorers, the facet counts, and the phrase gates take
+                // are rebuilt over the admitted parts.
+                let prune = prune_segments(store, pred.as_ref(), self.config.segment_pruning);
+                fused_prune = prune.stats;
+                if let Some(mask) = prune.mask.as_ref() {
+                    views = leg_of_view
+                        .iter()
+                        .map(|&li| {
+                            let fi = store
+                                .field_index(&req.fields[li].field)
+                                .expect("the field resolved above");
+                            store
+                                .field_view_masked(fi, mask)
+                                .expect("searchable, checked above")
+                        })
+                        .collect();
+                }
                 // Phrase gates (docs/phrase-proximity.md): a leg's
                 // ordered window, checked at the same heap gate as every
                 // other filter. The field must be on this shard and must
@@ -6270,11 +6433,7 @@ impl NodeServiceImpl {
                 let doc_filter = crate::filter::DocFilter {
                     deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                    pred: req
-                        .filter
-                        .as_ref()
-                        .map(|f| store.resolve_filter(f))
-                        .transpose()?,
+                    pred,
                     phrase: phrase_gates,
                 };
                 let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty()
@@ -6524,6 +6683,8 @@ impl NodeServiceImpl {
             0.0
         };
         Ok(Bm25QueryResponse {
+            segments_total: fused_prune.segments_total,
+            segments_skipped: fused_prune.segments_skipped,
             projection_leaves_known: Vec::new(),
             hits,
             kth_best,
@@ -6561,13 +6722,14 @@ impl NodeServiceImpl {
         let (geo_columns_known, filter_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), filters.geo, filters.tree);
         let slots = guard.index.as_ref().map_or(0, |index| index.len());
-        let (doc_filter, allow) = resolve_shard_filters(
+        let (doc_filter, allow, _prune) = resolve_shard_filters(
             guard.bm25.as_ref(),
             guard.live_docs.words(),
             slots,
             filters.geo,
             &filters.regions,
             filters.tree,
+            self.config.segment_pruning,
         )?;
 
         let mut vector_leg: Vec<(u64, f64)> = Vec::new();
@@ -9234,6 +9396,7 @@ impl NodeService for NodeServiceImpl {
                 });
 
                 let share = config.share_floors;
+                let segment_pruning = config.segment_pruning;
                 let floor_delta = config.floor_delta;
                 let chunk_blocks = config.chunk_blocks;
                 let slot_offset = config.slot_offset;
@@ -9335,20 +9498,21 @@ impl NodeService for NodeServiceImpl {
                         // filter is the collapse of the filtered corpus —
                         // still every floor a valid lower bound, still no new
                         // pruning math.
-                        let (_, allow) = resolve_shard_filters(
+                        let (_, allow, prune) = resolve_shard_filters(
                             guard.bm25.as_ref(),
                             guard.live_docs.words(),
                             index.len(),
                             &start.geo_filters,
                             &geo_regions,
                             start.filter.as_ref(),
+                            segment_pruning,
                         )?;
                         let known = filter_known_flags(
                             guard.bm25.as_ref(),
                             &start.geo_filters,
                             start.filter.as_ref(),
                         );
-                        let (hits, stats) = chunked_topk_collapsed(
+                        let (hits, mut stats) = chunked_topk_collapsed(
                             index,
                             &start.vector,
                             start.k as usize,
@@ -9358,6 +9522,8 @@ impl NodeService for NodeServiceImpl {
                             &mut publish_floor,
                             allow.as_deref(),
                         );
+                        stats.segments_total = prune.segments_total;
+                        stats.segments_skipped = prune.segments_skipped;
                         Ok((hits, stats, known))
                     });
                     let outcome = match scan.await {
@@ -9381,8 +9547,8 @@ impl NodeService for NodeServiceImpl {
                                     floors_published: stats.floors_published,
                                     floor_updates_applied: stats.floor_updates_applied,
                                     floors_offered: stats.floors_offered,
-                                    segments_total: 0,
-                                    segments_skipped: 0,
+                                    segments_total: stats.segments_total,
+                                    segments_skipped: stats.segments_skipped,
                                 }),
                                 geo_columns_known,
                                 filter_columns_known,
@@ -9461,20 +9627,21 @@ impl NodeService for NodeServiceImpl {
                                 )
                             })?;
                             Self::validate_start(index, &start)?;
-                            let (_, allow) = resolve_shard_filters(
+                            let (_, allow, prune) = resolve_shard_filters(
                                 guard.bm25.as_ref(),
                                 guard.live_docs.words(),
                                 index.len(),
                                 &start.geo_filters,
                                 &geo_regions,
                                 start.filter.as_ref(),
+                                segment_pruning,
                             )?;
                             let (geo_columns_known, filter_columns_known) = filter_known_flags(
                                 guard.bm25.as_ref(),
                                 &start.geo_filters,
                                 start.filter.as_ref(),
                             );
-                            let (hits, stats) = chunked_topk(
+                            let (hits, mut stats) = chunked_topk(
                                 index,
                                 &start.vector,
                                 start.k as usize,
@@ -9484,6 +9651,8 @@ impl NodeService for NodeServiceImpl {
                                 start.tie_complete,
                                 allow.as_deref(),
                             );
+                            stats.segments_total = prune.segments_total;
+                            stats.segments_skipped = prune.segments_skipped;
                             crate::metrics::record_scan(&stats);
                             Ok(ScanOutcome {
                                 hits,
@@ -9521,8 +9690,8 @@ impl NodeService for NodeServiceImpl {
                                 floors_published: stats.floors_published,
                                 floor_updates_applied: stats.floor_updates_applied,
                                 floors_offered: stats.floors_offered,
-                                segments_total: 0,
-                                segments_skipped: 0,
+                                segments_total: stats.segments_total,
+                                segments_skipped: stats.segments_skipped,
                             }),
                             geo_columns_known,
                             filter_columns_known,
@@ -9566,6 +9735,8 @@ impl NodeService for NodeServiceImpl {
                 // A document-less shard admits nothing; its all-false known
                 // flags feed the coordinator's typo rule like everywhere.
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     doc_ids: Vec::new(),
                     geo_columns_known,
                     filter_columns_known,
@@ -9628,6 +9799,8 @@ impl NodeService for NodeServiceImpl {
                 phrase: Vec::new(),
             };
             let cols = ShardNumericRead(store);
+            let prune =
+                prune_segments(store, doc_filter.pred.as_ref(), self.config.segment_pruning);
             if !req.sort.is_empty() {
                 // Column-ordered browse: walk the FULL admitted set with a
                 // k-bounded heap. Exhaustive by construction, so the
@@ -9667,6 +9840,8 @@ impl NodeService for NodeServiceImpl {
                     // key holds no value for it on any document, so it
                     // contributes no rows.
                     return Ok(Response::new(crate::pb::BrowseShardResponse {
+                        segments_total: prune.stats.segments_total,
+                        segments_skipped: prune.stats.segments_skipped,
                         doc_ids: Vec::new(),
                         geo_columns_known,
                         filter_columns_known,
@@ -9741,8 +9916,7 @@ impl NodeService for NodeServiceImpl {
                 }
                 let k = req.k as usize;
                 let mut kept: Vec<Row> = Vec::with_capacity(k + 1);
-                for local in 0..n {
-                    let doc = local as u32;
+                for doc in prune.admitted_slots(n as u32) {
                     if !in_lexical(doc) || !doc_filter.passes(doc, &cols) {
                         continue;
                     }
@@ -9751,7 +9925,7 @@ impl NodeService for NodeServiceImpl {
                     let Some((keys, values)) = keys_of(doc) else {
                         continue;
                     };
-                    let id = slot_offset + local;
+                    let id = slot_offset + u64::from(doc);
                     if let Some(b) = &boundary {
                         if cmp_candidate(&keys, id, b, req.after, &descending)
                             != std::cmp::Ordering::Greater
@@ -9791,6 +9965,8 @@ impl NodeService for NodeServiceImpl {
                     });
                 }
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    segments_total: prune.stats.segments_total,
+                    segments_skipped: prune.stats.segments_skipped,
                     doc_ids,
                     geo_columns_known,
                     filter_columns_known,
@@ -9799,15 +9975,17 @@ impl NodeService for NodeServiceImpl {
                 }));
             }
             let mut doc_ids = Vec::new();
-            for local in start..n {
-                if in_lexical(local as u32) && doc_filter.passes(local as u32, &cols) {
-                    doc_ids.push(slot_offset + local);
+            for local in prune.admitted_slots_from(start as u32, n as u32) {
+                if in_lexical(local) && doc_filter.passes(local, &cols) {
+                    doc_ids.push(slot_offset + u64::from(local));
                     if doc_ids.len() == req.k as usize {
                         break;
                     }
                 }
             }
             Ok(Response::new(crate::pb::BrowseShardResponse {
+                segments_total: prune.stats.segments_total,
+                segments_skipped: prune.stats.segments_skipped,
                 doc_ids,
                 geo_columns_known,
                 filter_columns_known,
@@ -9832,13 +10010,14 @@ impl NodeService for NodeServiceImpl {
                 .bm25
                 .as_ref()
                 .map_or(0, |store| store.next_doc_id() as usize);
-            let (_, allow) = resolve_shard_filters(
+            let (_, allow, prune) = resolve_shard_filters(
                 guard.bm25.as_ref(),
                 guard.live_docs.words(),
                 label_count,
                 &req.geo_filters,
                 &geo_regions,
                 req.filter.as_ref(),
+                self.config.segment_pruning,
             )?;
             let allow = allow.unwrap_or_else(|| vec![true; label_count]);
             let mut bits = vec![0u8; label_count.div_ceil(8)];
@@ -9853,6 +10032,8 @@ impl NodeService for NodeServiceImpl {
                 bits,
                 geo_columns_known,
                 filter_columns_known,
+                segments_total: prune.segments_total,
+                segments_skipped: prune.segments_skipped,
             }))
         })
         .await
@@ -9866,6 +10047,8 @@ impl NodeService for NodeServiceImpl {
         let guard = self.state.read().expect("shard state lock poisoned");
         let Some(shard) = guard.bm25.as_ref() else {
             return Ok(Response::new(MembershipBitmapResponse {
+                segments_total: 0,
+                segments_skipped: 0,
                 base_label: self.config.slot_offset,
                 label_count: 0,
                 bits: Vec::new(),
@@ -9877,6 +10060,33 @@ impl NodeService for NodeServiceImpl {
         })?;
         let label_count = usize::try_from(shard.next_doc_id())
             .map_err(|_| Status::resource_exhausted("lexical row count does not fit usize"))?;
+        // A sealed segment none of the terms occur in contributes no
+        // member: the walk skips it and the count says so
+        // (docs/segment-pruning.md). One dictionary lookup per term per
+        // part decides; with pruning off every part is walked.
+        let (masked, prune) = match shard {
+            Bm25Shard::Segmented(segmented) => {
+                let lacking = segmented.parts_lacking_terms(0, &req.terms);
+                let skipped = lacking.iter().filter(|&&lacks| lacks).count() as u32;
+                let stats = crate::segment_prune::PruneStats {
+                    segments_total: lacking.len() as u32,
+                    segments_skipped: if self.config.segment_pruning {
+                        skipped
+                    } else {
+                        0
+                    },
+                };
+                let masked = (self.config.segment_pruning && skipped > 0).then(|| {
+                    segmented.masked(lacking.iter().map(|&lacks| !lacks).collect::<Arc<[bool]>>())
+                });
+                (masked, stats)
+            }
+            _ => (None, crate::segment_prune::PruneStats::default()),
+        };
+        let index: &dyn Bm25Index = match masked.as_ref() {
+            Some(masked) => masked,
+            None => index,
+        };
         let mut bits = vec![0u8; label_count.div_ceil(8)];
         for term in req.terms {
             index.for_each_doc_tf(&term, &mut |doc_id, _tf| {
@@ -9891,6 +10101,8 @@ impl NodeService for NodeServiceImpl {
             label_count: label_count as u64,
             bits,
             stats_epoch: guard.stats_epoch,
+            segments_total: prune.segments_total,
+            segments_skipped: prune.segments_skipped,
         }))
     }
 
@@ -9913,6 +10125,8 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(MembershipBitmapResponse {
+            segments_total: 0,
+            segments_skipped: 0,
             base_label: self.config.slot_offset,
             label_count: label_count as u64,
             bits,
@@ -9958,6 +10172,8 @@ impl NodeService for NodeServiceImpl {
                 // all-absent partials and all-false flags feed the merge
                 // and the typo rule like everywhere.
                 return Ok(Response::new(crate::pb::AggregateShardResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     partials: req
                         .aggregations
                         .iter()
@@ -10122,6 +10338,8 @@ impl NodeService for NodeServiceImpl {
             };
             let cols = ShardNumericRead(store);
             let n = u64::from(store.next_doc_id());
+            let prune =
+                prune_segments(store, doc_filter.pred.as_ref(), self.config.segment_pruning);
             let id_allowlist = req.restrict_doc_ids.then(|| {
                 req.doc_ids
                     .iter()
@@ -10138,8 +10356,7 @@ impl NodeService for NodeServiceImpl {
             // One pass in doc order: the fold orders themselves are part
             // of the determinism contract (Neumaier and Welford both fold
             // exactly this sequence on every run).
-            for local in 0..n {
-                let doc = local as u32;
+            for doc in prune.admitted_slots(n as u32) {
                 if id_allowlist
                     .as_ref()
                     .is_some_and(|allowlist| !allowlist.contains(&doc))
@@ -10252,6 +10469,8 @@ impl NodeService for NodeServiceImpl {
                 })
                 .unwrap_or_default();
             Ok(Response::new(crate::pb::AggregateShardResponse {
+                segments_total: prune.stats.segments_total,
+                segments_skipped: prune.stats.segments_skipped,
                 partials: totals.iter().map(|acc| acc.partial(Some(store))).collect(),
                 matched,
                 geo_columns_known,
@@ -10332,6 +10551,8 @@ impl NodeService for NodeServiceImpl {
             };
             let cols = ShardNumericRead(store);
             let n = u64::from(store.next_doc_id());
+            let prune =
+                prune_segments(store, doc_filter.pred.as_ref(), self.config.segment_pruning);
             let id_allowlist = req.restrict_doc_ids.then(|| {
                 req.doc_ids
                     .iter()
@@ -10343,8 +10564,7 @@ impl NodeService for NodeServiceImpl {
             let mut bits_of = vec![None; exprs.len()];
             // One admitted-set pass per round: each expression evaluates
             // once per document, every target reads the cached bits.
-            for local in 0..n {
-                let doc = local as u32;
+            for doc in prune.admitted_slots(n as u32) {
                 if id_allowlist
                     .as_ref()
                     .is_some_and(|allowlist| !allowlist.contains(&doc))
@@ -10628,6 +10848,7 @@ impl NodeService for NodeServiceImpl {
             let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
             let state = self.state.clone();
             let slot_offset = self.config.slot_offset;
+            let segment_pruning = self.config.segment_pruning;
             let stream_signals = Arc::clone(&self.stream_signals);
 
             tokio::spawn(async move {
@@ -10772,13 +10993,14 @@ impl NodeService for NodeServiceImpl {
                         // "live" means "survived the filters", so the
                         // completion certificate covers the filtered corpus
                         // and means exactly what it meant before.
-                        let (_, allow) = resolve_shard_filters(
+                        let (_, allow, prune) = resolve_shard_filters(
                             guard.bm25.as_ref(),
                             guard.live_docs.words(),
                             index.len(),
                             &start.geo_filters,
                             &geo_regions,
                             start.filter.as_ref(),
+                            segment_pruning,
                         )?;
                         let (geo_columns_known, filter_columns_known) = filter_known_flags(
                             guard.bm25.as_ref(),
@@ -10868,6 +11090,8 @@ impl NodeService for NodeServiceImpl {
                             geo_columns_known,
                             filter_columns_known,
                             scoring_fingerprint,
+                            segments_total: prune.segments_total,
+                            segments_skipped: prune.segments_skipped,
                         })
                     });
                 let outcome = scan.await;
@@ -12656,6 +12880,24 @@ impl NodeServiceImpl {
             }
             _ => None,
         };
+        // Sealed segments the predicate rules out (docs/segment-pruning.md)
+        // leave the postings walks below: the scorers and the facet
+        // counts take the masked reader, whose per-document reads still
+        // cover the whole shard.
+        let prune = match guard.bm25.as_ref() {
+            Some(store) => prune_segments(
+                store,
+                doc_filter.as_ref().and_then(|f| f.pred.as_ref()),
+                self.config.segment_pruning,
+            ),
+            None => SegmentPrune::default(),
+        };
+        let masked_index = match (guard.bm25.as_ref(), prune.mask.as_ref()) {
+            (Some(Bm25Shard::Segmented(segmented)), Some(mask)) => {
+                Some(segmented.masked(Arc::clone(mask)))
+            }
+            _ => None,
+        };
         // Count-then-rank facets over the match set — term matches
         // that survive the filters — before any k/floor narrowing
         // (see count_facets). A shard with no lexical half has no
@@ -12669,9 +12911,12 @@ impl NodeServiceImpl {
                     || !req.stats_fields.is_empty()
                     || !req.cardinality_fields.is_empty() =>
             {
-                let index = store.as_index().ok_or_else(|| {
-                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                })?;
+                let index: &dyn Bm25Index = match masked_index.as_ref() {
+                    Some(masked) => masked,
+                    None => store.as_index().ok_or_else(|| {
+                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                    })?,
+                };
                 let numeric_read = ShardNumericRead(store);
                 let filter_ctx: bm25::FilterCtx = doc_filter
                     .as_ref()
@@ -12784,9 +13029,12 @@ impl NodeServiceImpl {
         };
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
-                let index = store.as_index().ok_or_else(|| {
-                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                })?;
+                let index: &dyn Bm25Index = match masked_index.as_ref() {
+                    Some(masked) => masked,
+                    None => store.as_index().ok_or_else(|| {
+                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                    })?,
+                };
                 // 0/absent means no supplied score floor (scores are positive).
                 let floor = if req.min_score == 0.0 {
                     f64::NEG_INFINITY
@@ -12959,6 +13207,8 @@ impl NodeServiceImpl {
             0.0
         };
         Ok(Bm25QueryResponse {
+            segments_total: prune.stats.segments_total,
+            segments_skipped: prune.stats.segments_skipped,
             projection_leaves_known,
             hits,
             kth_best,

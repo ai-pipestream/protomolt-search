@@ -168,7 +168,7 @@ pub fn cmp_f64_i64(x: f64, n: i64) -> Ordering {
 impl Edge {
     /// Whether column value `v` (non-NaN) sits at or above this edge
     /// as a LOWER bound.
-    fn admits_from_below(&self, v: f64) -> bool {
+    pub(crate) fn admits_from_below(&self, v: f64) -> bool {
         let v = if v == 0.0 { 0.0 } else { v };
         let ord = match self.value {
             NumBound::F(b) => v.total_cmp(&b),
@@ -183,7 +183,7 @@ impl Edge {
 
     /// Whether column value `v` (non-NaN) sits at or below this edge
     /// as an UPPER bound.
-    fn admits_from_above(&self, v: f64) -> bool {
+    pub(crate) fn admits_from_above(&self, v: f64) -> bool {
         let v = if v == 0.0 { 0.0 } else { v };
         let ord = match self.value {
             NumBound::F(b) => v.total_cmp(&b),

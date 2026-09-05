@@ -1222,6 +1222,24 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   through the ordinary online cutover. Details: [Immutable aligned
   segments](docs/immutable-segments.md), "Segment summaries" and
   "Partitioned layout".
+- **Landed 2026-09-05: segment pruning from summaries.** A sealed
+  segment's column summary rules it out of a request whose filter it
+  cannot match: the vector scan never opens the image, the postings walks
+  skip the part, the slot loops skip the rows, and the boolean planner
+  skips the segments a required keyword is absent from. Sound by
+  construction (`AND` prunes on any child, `OR` on all, `NOT` never;
+  facet, map, geo, and string leaves never), off with
+  `--segment-pruning=false`, and counted on every route and in
+  `QueryProfile`. Results are bitwise unchanged. Details:
+  [Segment pruning from summaries](docs/segment-pruning.md).
+- **Landed 2026-09-04 (evening): synonyms and did-you-mean.** Query-time
+  synonym rules (symmetric or one-way) on the coordinator's table
+  (`--synonyms=<toml>`) and on the request, analyzed under the field's spec
+  so a rule written as words matches stems; an expansion is an ordinary
+  query term with its own statistics, reported per matched term.
+  `SearchService.TermSuggest` proposes dictionary terms within an edit bound
+  of each analyzed term over the same bounded scan autocomplete uses.
+  Details: [Synonyms and did-you-mean](docs/synonyms.md).
 - **Landed 2026-09-05: the explain tree.** `QueryRequest.explain` hands
   each hit an `Explanation` tree whose root is the served score and whose
   nodes state their arithmetic: per-term BM25 inputs and contributions on
@@ -1231,14 +1249,6 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Assembled from numbers the engine already computed, so hits and order
   are bitwise unchanged with the flag on. Details:
   [The explain tree](docs/explain.md).
-- **Landed 2026-09-04 (evening): synonyms and did-you-mean.** Query-time
-  synonym rules (symmetric or one-way) on the coordinator's table
-  (`--synonyms=<toml>`) and on the request, analyzed under the field's spec
-  so a rule written as words matches stems; an expansion is an ordinary
-  query term with its own statistics, reported per matched term.
-  `SearchService.TermSuggest` proposes dictionary terms within an edit bound
-  of each analyzed term over the same bounded scan autocomplete uses.
-  Details: [Synonyms and did-you-mean](docs/synonyms.md).
 - **Landed 2026-09-05: aggregation over a query's pool, cardinality, and
   calendar histograms.** `QueryRequest.aggregate` folds the Aggregate
   route's exact folds over the candidate pool a page was drawn from, on

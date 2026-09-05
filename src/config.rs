@@ -210,6 +210,10 @@ pub struct Config {
     /// (v5 files). `false` forces the exhaustive scorer — the A/B
     /// baseline; results are identical either way.
     pub block_max: bool,
+    /// Skip sealed segments a request's filter cannot match, from
+    /// their column summaries (docs/segment-pruning.md). `false` keeps
+    /// every segment in the scan; the answer is the same either way.
+    pub segment_pruning: bool,
     /// Serve a shard whose BM25 bulk build was interrupted: a
     /// `.bm25.build` spill directory with no `.bm25` beside it.
     ///
@@ -496,6 +500,7 @@ struct FileConfig {
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
     block_max: Option<bool>,
+    segment_pruning: Option<bool>,
     allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
@@ -1083,6 +1088,10 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let block_max = match opt(args, "block-max", "TURBOVEC_BLOCK_MAX", None) {
         Some(s) => parse_env_bool(&s),
         None => file.block_max.unwrap_or(true),
+    };
+    let segment_pruning = match opt(args, "segment-pruning", "TURBOVEC_SEGMENT_PRUNING", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.segment_pruning.unwrap_or(true),
     };
     let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
         || match opt(
@@ -2218,6 +2227,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         chunk_blocks,
         share_floors,
         block_max,
+        segment_pruning,
         allow_missing_bm25,
         coalesce,
         scan_parallel,

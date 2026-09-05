@@ -69,6 +69,9 @@ struct PlannedBooleanNode {
     searches: Vec<PlannedSearchLeaf>,
     matchers: Vec<PlannedMatcher>,
     membership_wire_bytes: u64,
+    /// Sealed segments the shards consulted and ruled out while
+    /// resolving this node's membership (docs/segment-pruning.md).
+    prune: crate::segment_prune::PruneStats,
 }
 
 fn compile_boolean_filter(
@@ -178,6 +181,7 @@ fn plan_boolean_selection<'a>(
                         membership: ids,
                     }],
                     membership_wire_bytes: membership.wire_bytes,
+                    prune: membership.prune,
                 })
             }
             selection_query::Node::Filter(filter) => {
@@ -196,6 +200,7 @@ fn plan_boolean_selection<'a>(
                         membership: ids,
                     }],
                     membership_wire_bytes: membership.wire_bytes,
+                    prune: membership.prune,
                 })
             }
             selection_query::Node::Boolean(boolean) => {
@@ -300,6 +305,10 @@ fn plan_boolean_group<'a>(
                             Status::resource_exhausted("Boolean membership byte count overflow")
                         })
                 })?;
+        let mut prune = crate::segment_prune::PruneStats::default();
+        for node in must.iter().chain(&should).chain(&must_not) {
+            prune.add(node.prune);
+        }
         let mut searches = Vec::new();
         let mut matchers = Vec::new();
         for mut node in must.into_iter().chain(should) {
@@ -311,6 +320,7 @@ fn plan_boolean_group<'a>(
             searches,
             matchers,
             membership_wire_bytes,
+            prune,
         })
     })
 }
@@ -568,7 +578,7 @@ async fn execute_recursive_boolean(
     let boosts = parse_boolean_boosts(&req.boosts, scorer.is_some(), scored)?;
     let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
     let t_selection = std::time::Instant::now();
-    let evaluated = {
+    let (evaluated, plan_prune) = {
         let mut attempt = 0;
         loop {
             let plan = plan_boolean_group(coordinator, boolean, 1).await?;
@@ -584,7 +594,7 @@ async fn execute_recursive_boolean(
                     )));
                 }
                 Err(status) => return Err(status),
-                Ok(hits) => break hits,
+                Ok(hits) => break (hits, plan.prune),
             }
         }
     };
@@ -617,6 +627,8 @@ async fn execute_recursive_boolean(
     let mut profile: Option<crate::pb::QueryProfile> = req.profile.then(Default::default);
     if let Some(profile) = profile.as_mut() {
         profile.selection_ms = ms(t_selection);
+        profile.segments_total = plan_prune.segments_total;
+        profile.segments_skipped = plan_prune.segments_skipped;
     }
     apply_boosts(
         coordinator,
@@ -1301,6 +1313,8 @@ pub async fn execute(
                 .into_inner();
             if let Some(p) = prof.as_mut() {
                 p.selection_ms = ms(t_sel);
+                p.segments_total = response.segments_total;
+                p.segments_skipped = response.segments_skipped;
             }
             let synonym_expansions = response.synonym_expansions.clone();
             let mut hits: Vec<QueryHit> = response
@@ -1385,6 +1399,8 @@ pub async fn execute(
                 .into_inner();
             if let Some(p) = prof.as_mut() {
                 p.selection_ms = ms(t_sel);
+                p.segments_total = response.segments_total;
+                p.segments_skipped = response.segments_skipped;
             }
             let mut hits: Vec<QueryHit> = response
                 .hits
@@ -1930,6 +1946,8 @@ async fn execute_browse(
             .await?;
         if let Some(p) = prof.as_mut() {
             p.selection_ms = ms(t_sel);
+            p.segments_total = rows.prune.segments_total;
+            p.segments_skipped = rows.prune.segments_skipped;
         }
         let hits: Vec<QueryHit> = rows
             .ids
