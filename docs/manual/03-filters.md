@@ -124,6 +124,19 @@ values; see the partitioned layout in chapter 10.
 
 Reference: docs/segment-pruning.md
 
+## Whole shards are skipped from their placement leaf
+
+Under a placement tree (chapter 10, `docs/placement.md`) each shard serves one
+leaf, and the leaf's predicates bound what its rows can hold. Before the
+coordinator sends a filtered request anywhere, it drops the shards no row of
+which could pass: a range outside the leaf's interval, or a facet value the
+leaf never admits. The same sound rules apply as for segments, and a facet
+equality counts here because a leaf pins one value. A dropped shard is not
+asked, offers no floor, and contributes nothing; one shard is always asked.
+The answer is identical with pruning off (`--shard-pruning=false`, live as
+the `shard_pruning` knob); the profile reports `shards_total` and
+`shards_skipped`.
+
 ## What is rejected, and why
 
 Anything that does not compile to dictionary-resolved predicates plus boolean

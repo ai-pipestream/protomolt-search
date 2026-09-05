@@ -221,6 +221,18 @@ pub struct Config {
     /// their column summaries (docs/segment-pruning.md). `false` keeps
     /// every segment in the scan; the answer is the same either way.
     pub segment_pruning: bool,
+    /// Coordinator: skip shards a request's filter cannot match, from
+    /// the placement leaf each shard serves (docs/placement.md).
+    /// `false` consults every shard; the answer is the same either way.
+    pub shard_pruning: bool,
+    /// Node: the i64 column each row carries with its placement code
+    /// (`--placement-column`, docs/placement.md). Joins the integer
+    /// table.
+    pub placement_column: Option<String>,
+    /// Node: the placement code this shard serves
+    /// (`--placement-leaf`). Fills the placement column on a direct
+    /// ingest that lacks it and refuses another code.
+    pub placement_leaf: Option<i64>,
     /// Serve a shard whose BM25 bulk build was interrupted: a
     /// `.bm25.build` spill directory with no `.bm25` beside it.
     ///
@@ -508,6 +520,9 @@ struct FileConfig {
     floor_sharing: Option<bool>,
     block_max: Option<bool>,
     segment_pruning: Option<bool>,
+    shard_pruning: Option<bool>,
+    placement_column: Option<String>,
+    placement_leaf: Option<i64>,
     allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
@@ -1100,6 +1115,44 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         Some(s) => parse_env_bool(&s),
         None => file.segment_pruning.unwrap_or(true),
     };
+    let shard_pruning = match opt(args, "shard-pruning", "TURBOVEC_SHARD_PRUNING", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.shard_pruning.unwrap_or(true),
+    };
+    let placement_column = opt(
+        args,
+        "placement-column",
+        "TURBOVEC_PLACEMENT_COLUMN",
+        file.placement_column.as_deref(),
+    )
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+    let placement_leaf = opt(
+        args,
+        "placement-leaf",
+        "TURBOVEC_PLACEMENT_LEAF",
+        file.placement_leaf.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.trim()
+            .parse::<i64>()
+            .map_err(|e| format!("invalid placement leaf {s:?}: {e}"))
+            .and_then(|code| {
+                if code < 0 {
+                    Err(format!(
+                        "placement leaf {code} is negative; codes are non-negative path codes"
+                    ))
+                } else {
+                    Ok(code)
+                }
+            })
+    })
+    .transpose()?;
+    if placement_leaf.is_some() && placement_column.is_none() {
+        return Err(
+            "--placement-leaf needs --placement-column, the column that holds the code".to_string(),
+        );
+    }
     let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
         || match opt(
             args,
@@ -1727,14 +1780,22 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let geo_fields = parse_list("geo-fields", "TURBOVEC_GEO_FIELDS", &file.geo_fields);
     // One name space across all column kinds: the v7 column table
     // refuses duplicates, so the config does too, early and by name.
+    // The placement column is an integer column whether or not the
+    // integer list names it.
     {
         let mut all: Vec<&String> = Vec::new();
+        let placement_as_integer: Vec<String> = placement_column
+            .iter()
+            .filter(|column| !integer_fields.contains(column))
+            .cloned()
+            .collect();
         for name in facet_fields
             .iter()
             .chain(&numeric_fields)
             .chain(&map_facet_fields)
             .chain(&map_numeric_fields)
             .chain(&integer_fields)
+            .chain(&placement_as_integer)
             .chain(&geo_fields)
         {
             if all.contains(&name) {
@@ -2235,6 +2296,9 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         share_floors,
         block_max,
         segment_pruning,
+        shard_pruning,
+        placement_column,
+        placement_leaf,
         allow_missing_bm25,
         coalesce,
         scan_parallel,

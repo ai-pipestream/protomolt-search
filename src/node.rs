@@ -96,6 +96,17 @@ fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, St
         .transpose()
 }
 
+/// The placement column (`docs/placement.md`) is an integer column
+/// whether or not `--integer-fields` names it: every constructor runs
+/// this first so the column table and the catalog agree.
+fn declare_placement_column(config: &mut NodeConfig) {
+    if let Some(column) = config.placement_column.as_deref() {
+        if !config.integer_fields.iter().any(|name| name == column) {
+            config.integer_fields.push(column.to_string());
+        }
+    }
+}
+
 /// A node's runtime knobs from its config (docs/diagnostics.md): the
 /// live ones as atomics, the rest listed as read-at-startup.
 fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
@@ -177,6 +188,22 @@ fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
             kind: KnobKind::String,
             value: config.vector_backend.clone(),
             description: "The vector backend the shard was built with.",
+        },
+        FixedKnob {
+            name: "placement_column",
+            kind: KnobKind::String,
+            value: config.placement_column.clone().unwrap_or_default(),
+            description: "The i64 column that holds each row's placement code \
+                          (--placement-column, docs/placement.md).",
+        },
+        FixedKnob {
+            name: "placement_leaf",
+            kind: KnobKind::String,
+            value: config
+                .placement_leaf
+                .map(|code| code.to_string())
+                .unwrap_or_default(),
+            description: "The placement code this shard serves (--placement-leaf).",
         },
     ];
     Knobs::node(
@@ -322,6 +349,15 @@ pub struct NodeConfig {
     /// Same rules as `facet_fields`. Timestamp ingest lands in THESE
     /// columns as epoch micros — it is sugar, not a kind.
     pub integer_fields: Vec<String>,
+    /// The placement column (`docs/placement.md`): the i64 column every
+    /// row carries with its placement code. Declared here it joins the
+    /// integer table, and a direct ingest must carry a value for it or
+    /// have `placement_leaf` fill one in.
+    pub placement_column: Option<String>,
+    /// The placement code this shard serves. Fills the placement column
+    /// on a document that lacks it and rejects one that carries another
+    /// code. Needs `placement_column`.
+    pub placement_leaf: Option<i64>,
     /// The geo-point column table for NEW builders
     /// (`docs/geo-columns.md`). Same rules as `facet_fields`; the
     /// columns geo FILTERS and distance-decay stages read.
@@ -427,6 +463,8 @@ impl Default for NodeConfig {
             map_facet_fields: Vec::new(),
             map_numeric_fields: Vec::new(),
             integer_fields: Vec::new(),
+            placement_column: None,
+            placement_leaf: None,
             geo_fields: Vec::new(),
             position_fields: Vec::new(),
             sentence_fields: Vec::new(),
@@ -4130,10 +4168,11 @@ impl NodeServiceImpl {
     /// an unfinished BM25 spill is refused unless the caller explicitly
     /// allows a vector-only recovery.
     pub fn open(
-        config: NodeConfig,
+        mut config: NodeConfig,
         phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
         allow_missing_bm25: bool,
     ) -> Result<Self, String> {
+        declare_placement_column(&mut config);
         let generation = config.index_path.as_ref().and_then(|path| {
             recover_segments_swap(path);
             recover_generation(path)
@@ -4278,7 +4317,8 @@ impl NodeServiceImpl {
     }
 
     /// Wrap an optional preloaded index in a node service.
-    pub fn new(index: Option<VectorIndex>, config: NodeConfig) -> Self {
+    pub fn new(index: Option<VectorIndex>, mut config: NodeConfig) -> Self {
+        declare_placement_column(&mut config);
         let wal = open_wal(index.as_ref(), &config);
         let vocab = open_vocab(&config);
         let rerank_parallel = resolved_rerank_parallel(config.rerank_parallel);
@@ -4683,9 +4723,47 @@ impl NodeServiceImpl {
             scoring_fingerprint,
             segment_pruning: self.knobs.segment_pruning(),
             floor_sharing: self.knobs.share_floors(),
+            has_placement: self.config.placement_leaf.is_some(),
+            placement: self.config.placement_leaf.unwrap_or_default() as u64,
             ..Default::default()
         };
         if let Some(Bm25Shard::Segmented(segmented)) = guard.bm25.as_ref() {
+            // Mixed placement: a sealed segment whose placement column
+            // spans more than one code, two segments under different
+            // codes, or a segment under a code other than the pinned
+            // one. A pinned shard's tail cannot be mixed: ingest refuses
+            // another code before it is applied.
+            if let Some(column) = self.config.placement_column.as_deref() {
+                let set = segmented.snapshot();
+                let mut codes: Vec<i64> = Vec::new();
+                let mut mixed = false;
+                for i in 0..set.len() {
+                    let Some(summary) = set.metadata(i).summary.as_ref() else {
+                        continue;
+                    };
+                    let Some(range) = summary.int_columns.iter().find(|c| c.name == column) else {
+                        continue;
+                    };
+                    if range.present == 0 {
+                        continue;
+                    }
+                    if range.min != range.max {
+                        mixed = true;
+                    }
+                    if !codes.contains(&range.min) {
+                        codes.push(range.min);
+                    }
+                }
+                if codes.len() > 1 {
+                    mixed = true;
+                }
+                if let Some(pinned) = self.config.placement_leaf {
+                    if codes.iter().any(|code| *code != pinned) {
+                        mixed = true;
+                    }
+                }
+                out.placement_mixed = mixed;
+            }
             let set = segmented.snapshot();
             out.catalog_epoch = set.epoch();
             out.partition_key = set.manifest().partition_key.clone().unwrap_or_default();
@@ -8002,46 +8080,53 @@ impl NodeServiceImpl {
                 return Ok(compiled.columns.clone());
             }
         }
-        let mut names = std::collections::HashSet::new();
-        let mut columns = Vec::with_capacity(spec.columns.len());
-        for column in &spec.columns {
-            if column.name.is_empty() {
-                return Err(Status::invalid_argument(
-                    "materialize: a derived column needs a non-empty name",
-                ));
-            }
-            if !names.insert(column.name.as_str()) {
-                return Err(Status::invalid_argument(format!(
-                    "materialize: duplicate derived column {:?}",
-                    column.name
-                )));
-            }
-            let kind = match crate::pb::MaterializeKind::try_from(column.kind) {
-                Ok(crate::pb::MaterializeKind::F64) => crate::pb::MaterializeKind::F64,
-                Ok(crate::pb::MaterializeKind::I64) => crate::pb::MaterializeKind::I64,
-                _ => {
-                    return Err(Status::invalid_argument(format!(
-                        "materialize: column {:?} declares no target kind; kinds are \
-                         explicit (MATERIALIZE_KIND_F64 or MATERIALIZE_KIND_I64), \
-                         never inferred from data",
-                        column.name
-                    )))
-                }
-            };
-            let expr = crate::cel::compile_value(&column.expression).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "materialize: column {:?}: {}",
-                    column.name,
-                    e.message()
-                ))
-            })?;
-            columns.push((column.name.clone(), expr, kind));
-        }
+        let columns = compile_materialize_spec(spec)?;
         *cache = Some(CompiledMaterialize {
             spec: spec.clone(),
             columns: columns.clone(),
         });
         Ok(columns)
+    }
+
+    /// The placement rule (`docs/placement.md`) on a document about to
+    /// be applied. With a leaf pinned, a document without a value for
+    /// the placement column takes the shard's code and one with another
+    /// code is refused by name; with the column declared and no leaf, a
+    /// document must carry the value, which routed ingest guarantees
+    /// and a direct client must supply.
+    fn place_document(&self, mut doc: AddDocumentsRequest) -> Result<AddDocumentsRequest, Status> {
+        let Some(column) = self.config.placement_column.as_deref() else {
+            return Ok(doc);
+        };
+        let carried = doc
+            .integers
+            .iter()
+            .find(|value| value.field == column)
+            .map(|value| value.value);
+        match (self.config.placement_leaf, carried) {
+            (Some(code), None) => {
+                doc.integers.push(crate::pb::IntegerValue {
+                    field: column.to_string(),
+                    value: code,
+                });
+            }
+            (Some(code), Some(other)) if other != code => {
+                return Err(Status::invalid_argument(format!(
+                    "placement column {column:?} carries code {other}, but this shard serves \
+                     placement leaf {code} (--placement-leaf); route the document through the \
+                     coordinator or send it to the shard that serves {other}"
+                )));
+            }
+            (None, None) => {
+                return Err(Status::invalid_argument(format!(
+                    "placement column {column:?} has no value on this document and this shard \
+                     pins no leaf (--placement-leaf); route the document through the \
+                     coordinator, which evaluates the placement tree, or pin the leaf"
+                )));
+            }
+            _ => {}
+        }
+        Ok(doc)
     }
 
     /// Materialize derived columns (docs/cel-values.md): evaluate each
@@ -8065,6 +8150,64 @@ impl NodeServiceImpl {
             return Ok(doc);
         }
         let compiled = self.compiled_materialize(&spec)?;
+        apply_materialize(doc, &compiled)
+    }
+}
+
+/// Validate and compile one materialize spec (`docs/cel-values.md`):
+/// empty or duplicate names, an unset kind, or an expression that does
+/// not compile all refuse before any document is touched.
+pub(crate) fn compile_materialize_spec(
+    spec: &crate::pb::MaterializeSpec,
+) -> Result<Vec<(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)>, Status> {
+    let mut names = std::collections::HashSet::new();
+    let mut columns = Vec::with_capacity(spec.columns.len());
+    for column in &spec.columns {
+        if column.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "materialize: a derived column needs a non-empty name",
+            ));
+        }
+        if !names.insert(column.name.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "materialize: duplicate derived column {:?}",
+                column.name
+            )));
+        }
+        let kind = match crate::pb::MaterializeKind::try_from(column.kind) {
+            Ok(crate::pb::MaterializeKind::F64) => crate::pb::MaterializeKind::F64,
+            Ok(crate::pb::MaterializeKind::I64) => crate::pb::MaterializeKind::I64,
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "materialize: column {:?} declares no target kind; kinds are \
+                     explicit (MATERIALIZE_KIND_F64 or MATERIALIZE_KIND_I64), \
+                     never inferred from data",
+                    column.name
+                )))
+            }
+        };
+        let expr = crate::cel::compile_value(&column.expression).map_err(|e| {
+            Status::invalid_argument(format!(
+                "materialize: column {:?}: {}",
+                column.name,
+                e.message()
+            ))
+        })?;
+        columns.push((column.name.clone(), expr, kind));
+    }
+    Ok(columns)
+}
+
+/// Evaluate compiled materialized columns over one document's own
+/// values and push the results into its `numerics` / `integers`
+/// lists. Shared by node ingest and the coordinator's placement
+/// evaluation, so a placement predicate on a derived column sees the
+/// value the shard will store.
+pub(crate) fn apply_materialize(
+    mut doc: AddDocumentsRequest,
+    compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
+) -> Result<AddDocumentsRequest, Status> {
+    {
         let mut env = crate::values::IngestEnv::default();
         for nv in &doc.numerics {
             env.numerics.insert(nv.field.clone(), nv.value);
@@ -8076,7 +8219,7 @@ impl NodeServiceImpl {
             env.map_numerics
                 .insert((entry.field.clone(), entry.key.clone()), entry.value);
         }
-        for (name, expr, kind) in &compiled {
+        for (name, expr, kind) in compiled {
             let value = crate::values::eval_ingest(expr, &env).map_err(|e| {
                 Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
             })?;
@@ -8124,9 +8267,11 @@ impl NodeServiceImpl {
                 }
             }
         }
-        Ok(doc)
     }
+    Ok(doc)
+}
 
+impl NodeServiceImpl {
     /// Derive or validate phrase postings, materialize entity map entries on
     /// the first pass, and install the dedicated analyzed field. The returned
     /// request is the durable WAL form.
@@ -8486,6 +8631,7 @@ impl NodeServiceImpl {
         let doc = materialize_quality(doc, &analyzed)?;
         let doc = materialize_geography(doc, &analyzed)?;
         let doc = self.materialize_columns(doc)?;
+        let doc = self.place_document(doc)?;
         Ok((doc, analyzed))
     }
 

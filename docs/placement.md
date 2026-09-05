@@ -8,12 +8,9 @@ layout is a materialized projection of the document's columns, a
 proposed tree is the same projection unmaterialized, and a subtree is
 one integer range the segment pruner already reasons about.
 
-Status, 2026-09-05: the contract is reserved (proto messages, the
-`[placement]` table of the shard map, `src/placement.rs` with
-validation and the code arithmetic, `SearchService.PlanPlacement`
-refusing by name). Ingest evaluation, fan-out pruning, the dry run, and
-the leaf reshard follow on their own branches; each section below says
-which parts exist.
+Status, 2026-09-05: the contract, the tree, ingest evaluation, and
+fan-out pruning exist; the dry run and the leaf reshard follow on their
+own branch, and their sections below say so.
 
 ## The tree
 
@@ -83,28 +80,61 @@ with the path's predicates cannot match a row in the leaf. The "and not
 an earlier sibling" part of membership is realized by first match at
 ingest and is never needed for pruning.
 
-## Ingest (planned)
+## Ingest
 
-`RoutedIngestMapped` derives the materialized columns, evaluates the
-chain over the document's own columns, writes the code into the
-placement column, and hashes the stable key into that leaf's shard set.
-The log stores the value in place, so replay evaluates no CEL. A node
-with a placement column declared rejects a direct `AddDocuments` that
-carries no value, unless started with `--placement-leaf=<code>`, in
-which case it fills the value and rejects a document that evaluates to
-another leaf.
+`RoutedIngestMapped` under a placed topology evaluates the tree once
+per source document: the bind's plan extracts the columns, the value
+dialect derives the materialized columns, and the chain runs over the
+document's own values with the shard's three-valued rules
+(`placement::eval_document`). The stable key then hashes inside the
+leaf's shard set: under a tree the hash ranges tile the space per leaf
+(`route_stable_key_in`), and a plain `route_stable_key` on a placed
+topology is refused by name. The rows of one source document (one per
+chunk on a chunked plan) go to one shard, so they must agree on the
+leaf; a placement predicate reads parent-scope columns. Quality and
+geography columns are derived on the node after analysis, so a
+predicate on one is UNKNOWN at routing time and falls through.
 
-## Query (planned)
+The leaf's shards fill the column. A node started with
+`--placement-column=<name>` declares the column (it joins the integer
+table) and `--placement-leaf=<code>` pins the leaf: a document without
+a value takes the code, one with the same code passes, one with another
+code is refused naming both. A node with the column declared and no
+leaf pinned refuses a direct `AddDocuments` without the value, naming
+the column and the flag. The log stores the value in place, so replay
+evaluates no CEL and a reopened shard answers the same browse. Both
+flags read `TURBOVEC_PLACEMENT_COLUMN` and `TURBOVEC_PLACEMENT_LEAF`
+and the config-file keys of the same names; the layout diagnostics
+report the pinned code and whether the shard's segments carry more than
+one (`placement_mixed`).
 
-Every shard in the map carries one code, which is a shard-wide summary
-of `min = max = code`. Before fan-out the coordinator walks the tree
-top-down against the request filter with the segment pruner's rules,
-descending only into children that survive. A skipped shard offers no
-floor and contributes no candidate, as a shard with no matching row
-does today. A clause the path's predicates imply resolves no bitmap on
-that shard. `--shard-pruning` mirrors `--segment-pruning`; the profile
-reports `shards_total` and `shards_skipped` next to the segment
-counters. The answer is identical with pruning off.
+## Query
+
+Every shard in the map carries one code, and its leaf's own predicates
+(`Leaf::own`, plus the placement column pinned to the code) bound what
+its rows can hold. Before every filtered fan-out the coordinator tests
+the request filter against each shard's bounds
+(`placement::impossible_under`) and skips the shards where no row can
+pass: an AND with an impossible child, an OR whose branches are all
+impossible, a number range outside the leaf's interval, a facet
+equality, string range, or prefix no admitted value satisfies. `NOT`,
+map, geo, and presence predicates never skip on their own. Skipped
+shards are not sent the request on the vector fan-outs, the streaming
+scan, the BM25 legs, hybrid, browse, aggregation, percentiles, and
+boolean membership; a skipped shard contributes no candidate and no
+floor, as a shard with no matching row does. One shard is always
+consulted, so a filter that excludes every leaf still runs the known
+handshake and returns the shape a consulted fleet returns. The filter
+leaves that excluded a shard count as resolved for the typo rule,
+because the leaf predicate that excluded it named the same column.
+
+`--shard-pruning` (`TURBOVEC_SHARD_PRUNING`, default on) is the A/B
+switch, live afterwards as the coordinator's `shard_pruning` knob
+(`docs/diagnostics.md`). The profile reports `shards_total` and
+`shards_skipped` for the plan's filter next to the segment counters; a
+boolean root resolves each clause on its own shard set and reports no
+plan-level skip. The answer is identical with pruning off, and
+`tests/placement.rs` holds that on every shape.
 
 ## The dry run (planned)
 

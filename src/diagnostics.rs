@@ -95,6 +95,13 @@ const HEDGE_DELAY_MS: KnobSpec = KnobSpec {
     description: "Wait on a shard's primary before racing its replica; 0 disables hedging \
                   (--hedge-delay-ms).",
 };
+const SHARD_PRUNING: KnobSpec = KnobSpec {
+    name: "shard_pruning",
+    scope: KnobScope::Coordinator,
+    kind: KnobKind::Bool,
+    description: "Skip shards whose placement leaf rules out the request's filter before \
+                  fan-out (--shard-pruning, docs/placement.md).",
+};
 
 /// Live values of a node's knobs, taken once from its config.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,6 +119,7 @@ pub struct CoordinatorKnobValues {
     pub max_k: u32,
     /// 0 means no hedging.
     pub hedge_delay_ms: u64,
+    pub shard_pruning: bool,
 }
 
 enum Live {
@@ -126,6 +134,7 @@ enum Live {
     Coordinator {
         max_k: AtomicU32,
         hedge_delay_ms: AtomicU64,
+        shard_pruning: AtomicBool,
         startup: CoordinatorKnobValues,
     },
 }
@@ -200,6 +209,7 @@ impl Knobs {
             live: Live::Coordinator {
                 max_k: AtomicU32::new(values.max_k),
                 hedge_delay_ms: AtomicU64::new(values.hedge_delay_ms),
+                shard_pruning: AtomicBool::new(values.shard_pruning),
                 startup: values,
             },
             fixed: std::sync::RwLock::new(
@@ -241,6 +251,16 @@ impl Knobs {
                 segment_pruning, ..
             } => segment_pruning.load(Ordering::Relaxed),
             Live::Coordinator { .. } => true,
+        }
+    }
+
+    /// Coordinator: whether a filter skips shards from their placement
+    /// leaf (docs/placement.md). A node answers `true`; it holds no
+    /// topology.
+    pub fn shard_pruning(&self) -> bool {
+        match &self.live {
+            Live::Coordinator { shard_pruning, .. } => shard_pruning.load(Ordering::Relaxed),
+            Live::Node { .. } => true,
         }
     }
 
@@ -341,6 +361,11 @@ impl Knobs {
                         .to_string(),
                     startup.hedge_delay_ms.to_string(),
                 ),
+                entry(
+                    &SHARD_PRUNING,
+                    self.shard_pruning().to_string(),
+                    startup.shard_pruning.to_string(),
+                ),
             ],
         }
     }
@@ -432,6 +457,7 @@ impl Knobs {
             Live::Coordinator {
                 max_k,
                 hedge_delay_ms,
+                shard_pruning,
                 ..
             } => match name {
                 "max_k" => {
@@ -446,6 +472,10 @@ impl Knobs {
                 }
                 "hedge_delay_ms" => {
                     hedge_delay_ms.store(parse_u64(name, value)?, Ordering::Relaxed);
+                    Ok(())
+                }
+                "shard_pruning" => {
+                    shard_pruning.store(parse_bool(name, value)?, Ordering::Relaxed);
                     Ok(())
                 }
                 other => self.reject(other),
@@ -910,6 +940,7 @@ mod tests {
             CoordinatorKnobValues {
                 max_k: 100,
                 hedge_delay_ms: 0,
+                shard_pruning: true,
             },
             Vec::new(),
         );

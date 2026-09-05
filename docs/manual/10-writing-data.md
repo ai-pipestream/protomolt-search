@@ -64,6 +64,14 @@ hashes each document's stable key into one topology generation and forwards one
 ordinary stream per owning shard. The generation must be named explicitly; zero
 is rejected, so an automatic retry cannot cross a reshard cutover.
 
+- Under a placement tree (`docs/placement.md`) the coordinator first evaluates
+  the tree over the document's own columns, first match per level and the
+  level's default when no predicate is true, then hashes the key inside that
+  leaf's shards. The shard fills the placement column from the leaf it is
+  pinned to (`--placement-leaf`). A direct `AddDocuments` on a node with the
+  column declared must carry the value or arrive at a pinned node; anything
+  else is rejected naming the column and the flag.
+
 ## Deletes and replacements
 
 No value mutates in place. `NodeService.DeleteDocuments` records idempotent
