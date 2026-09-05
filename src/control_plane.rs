@@ -65,6 +65,9 @@ struct StoredCapacity {
     memory_bytes: u64,
     search_threads: u32,
     failure_domain: String,
+    /// Absent in state files written before the field existed.
+    #[serde(default)]
+    scan_bytes_per_second: u64,
 }
 
 impl From<NodeCapacity> for StoredCapacity {
@@ -75,6 +78,7 @@ impl From<NodeCapacity> for StoredCapacity {
             memory_bytes: value.memory_bytes,
             search_threads: value.search_threads,
             failure_domain: value.failure_domain,
+            scan_bytes_per_second: value.scan_bytes_per_second,
         }
     }
 }
@@ -87,6 +91,7 @@ impl From<&StoredCapacity> for NodeCapacity {
             memory_bytes: value.memory_bytes,
             search_threads: value.search_threads,
             failure_domain: value.failure_domain.clone(),
+            scan_bytes_per_second: value.scan_bytes_per_second,
         }
     }
 }
@@ -1827,6 +1832,25 @@ impl ClusterControl for ClusterControlService {
             self.membership(&_request)?;
             self.admit(&_request.get_ref().collection)?;
             self.plane.plan().map(Response::new)
+        })
+        .await
+    }
+
+    /// Balance dry run (`docs/bandwidth-budget.md`). Reserved: the
+    /// contract is in the proto; the measured scan rate on the lease and
+    /// the balancer are the next branch's work, and until then the call
+    /// refuses by name rather than answering with a plan it did not make.
+    async fn plan_balance(
+        &self,
+        request: Request<crate::pb::PlanBalanceRequest>,
+    ) -> Result<Response<crate::pb::PlanBalanceResponse>, Status> {
+        crate::metrics::timed(Route::PlanBalance, request, |request| async move {
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            Err(Status::unimplemented(
+                "plan_balance: the balance dry run is not implemented yet \
+                 (docs/bandwidth-budget.md)",
+            ))
         })
         .await
     }

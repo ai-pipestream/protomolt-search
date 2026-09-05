@@ -878,6 +878,12 @@ service ClusterControl {
   rpc ReconcileCluster(ReconcileClusterRequest) returns (ClusterPlan);
   rpc GetClusterPlan(GetClusterPlanRequest) returns (ClusterPlan);
   rpc RollbackCluster(RollbackClusterRequest) returns (ClusterPlan);
+
+  // Balance dry run (docs/bandwidth-budget.md): with each node's measured
+  // scan rate and the bytes of index it serves, the moves that would
+  // bring the slowest node's unfiltered scan time down, within each
+  // placement leaf's node set. Reads only; nothing moves.
+  rpc PlanBalance(PlanBalanceRequest) returns (PlanBalanceResponse);
 }
 
 // One shard's slice of a filter-only browse.
@@ -5891,6 +5897,11 @@ message NodeCapacity {
   uint64 memory_bytes = 3;
   uint32 search_threads = 4;
   string failure_domain = 5;
+  // Measured vector-scan throughput, bytes of index read per second,
+  // smoothed over recent scans and reported on every lease renewal
+  // (docs/bandwidth-budget.md). Zero means not yet measured. Never a
+  // declared figure: the balancer plans on what the node did.
+  uint64 scan_bytes_per_second = 6;
 }
 
 message RegisterNodeRequest {
@@ -5981,6 +5992,46 @@ message ReconcileClusterRequest {
 message GetClusterPlanRequest {
   // The collection whose plan to return (docs/collections.md).
   string collection = 1;
+}
+
+message PlanBalanceRequest {
+  // The collection this request addresses (docs/collections.md).
+  string collection = 1;
+  // Ignore moves saving less than this fraction of the slowest node's
+  // scan time (0 selects 0.10).
+  double min_gain = 2;
+}
+
+// One node's share of the scan work.
+message NodeLoad {
+  string node_id = 1;
+  // Bytes of vector index the node serves (sealed segments plus tail).
+  uint64 bytes = 2;
+  uint64 scan_bytes_per_second = 3;
+  // bytes / scan_bytes_per_second: the node's unfiltered scan time.
+  double seconds = 4;
+  repeated uint32 shards = 5;
+}
+
+// One proposed move of a shard's primary between nodes of one leaf.
+message BalanceMove {
+  uint32 shard = 1;
+  string from_node = 2;
+  string to_node = 3;
+  uint64 bytes = 4;
+  // The placement leaf whose node set bounds the move ("" without a tree).
+  string leaf = 5;
+}
+
+message PlanBalanceResponse {
+  uint64 topology_generation = 1;
+  repeated NodeLoad loads = 2;
+  repeated BalanceMove moves = 3;
+  // The slowest node's scan time before and after the moves.
+  double seconds_before = 4;
+  double seconds_after = 5;
+  // Nodes with no measured rate yet; the plan leaves them untouched.
+  repeated string unmeasured = 6;
 }
 
 message RollbackClusterRequest {

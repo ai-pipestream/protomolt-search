@@ -582,6 +582,9 @@ impl NodeAgent {
             memory_bytes: memory_bytes(),
             search_threads,
             failure_domain: self.inner.config.failure_domain.clone(),
+            // Measured by the budget branch (docs/bandwidth-budget.md);
+            // zero means not yet measured.
+            scan_bytes_per_second: 0,
         }
     }
 

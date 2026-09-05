@@ -45,12 +45,13 @@ use crate::pb::{
     CompletePlacementActionRequest, DescribeSchemaRequest, DescribeSchemaResponse,
     DrainNodeRequest, FreezeTopologyWritesRequest, FreezeTopologyWritesResponse,
     GetClusterPlanRequest, HybridSearchRequest, HybridSearchResponse, NodeLease,
-    PhraseSearchRequest, PlanIndexRequest, PlanIndexResponse, PlanPlacementRequest,
-    PlanPlacementResponse, PublishTopologyRequest, PublishTopologyResponse, QueryRequest,
-    QueryResponse, QueryStreamRequest, ReconcileClusterRequest, RegisterNodeRequest,
-    RenewNodeLeaseRequest, ReportShardRequest, RollbackClusterRequest, RoutedIngestMappedRequest,
-    RoutedIngestMappedResponse, SearchRequest, SearchResponse, SuggestRequest, SuggestResponse,
-    TermSuggestRequest, TermSuggestResponse, VariantSearchRequest, VariantSearchResponse,
+    PhraseSearchRequest, PlanBalanceRequest, PlanBalanceResponse, PlanIndexRequest,
+    PlanIndexResponse, PlanPlacementRequest, PlanPlacementResponse, PublishTopologyRequest,
+    PublishTopologyResponse, QueryRequest, QueryResponse, QueryStreamRequest,
+    ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest, ReportShardRequest,
+    RollbackClusterRequest, RoutedIngestMappedRequest, RoutedIngestMappedResponse, SearchRequest,
+    SearchResponse, SuggestRequest, SuggestResponse, TermSuggestRequest, TermSuggestResponse,
+    VariantSearchRequest, VariantSearchResponse,
 };
 use crate::security::{Guarded, MeteredIngest, Permit, Principal, Principals};
 
@@ -824,6 +825,7 @@ cluster_control_over_collections! {
     reconcile_cluster: ReconcileClusterRequest => ClusterPlan,
     get_cluster_plan: GetClusterPlanRequest => ClusterPlan,
     rollback_cluster: RollbackClusterRequest => ClusterPlan,
+    plan_balance: PlanBalanceRequest => PlanBalanceResponse,
 }
 
 #[cfg(test)]
