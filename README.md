@@ -1349,6 +1349,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   and remaining query-shape integration are still pending.
   [Dense identity](docs/dense-identity.md).
 
+- **Landed 2026-09-05: console panels for placement, relays, and the dry
+  runs.** The dashboard's shard map opens with the placement groups by
+  code and marks a relay; a placement dry run panel plans a tree written
+  in the shard map's shape through `PlanPlacement`; a balance dry run
+  panel renders `PlanBalance` loads, moves, and exclusions; scan bytes
+  per second and the kernel's active share join the tiles; the profile
+  line shows shards skipped. The facade exposes `ClusterControl` for
+  `PlanBalance` only, by a per-method allowlist.
+  [The console](docs/console-facade.md).
+
 - **Landed 2026-09-05: the restricted relay coordinator.** `--relay`
   serves the node-facing surface over a coordinator's shard set and
   presents itself to a parent as one shard: `StreamSearch` forwarded

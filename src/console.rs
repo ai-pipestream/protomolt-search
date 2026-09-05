@@ -6,10 +6,12 @@
 //! neither. Its one real job is transcoding: `POST /api/rpc/<Service>/
 //! <Method>` takes the request message as proto3 JSON, sends it over
 //! gRPC, and answers with the response as proto3 JSON, for every unary
-//! method of `SearchService` and `DiagnosticsService`; the
-//! server-streaming methods are exposed as server-sent events under
-//! `/api/stream/...`. The mapping is built from the compiled descriptor
-//! set at run time, so an RPC added to the proto needs no change here.
+//! method of `SearchService` and `DiagnosticsService`, plus the one
+//! `ClusterControl` method the dashboard needs (`PlanBalance`, a
+//! read-only dry run); the server-streaming methods are exposed as
+//! server-sent events under `/api/stream/...`. The mapping is built from
+//! the compiled descriptor set at run time, so an RPC added to an
+//! exposed service needs no change here.
 //!
 //! A few convenience routes exist for the UI: `/api/health`,
 //! `/api/config`, `/api/embed` (the analysis sidecar's embedding, when
@@ -48,10 +50,39 @@ use crate::security::{Bearer, PublicChannel, ToolClient};
 const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/search_descriptor.bin"));
 /// The proto package the exposed services live in.
 const PACKAGE: &str = "ai.protomolt.search.v1";
-/// The services a browser may reach through the facade. `NodeService`
-/// and `ClusterControl` are the cluster's internal surfaces and are not
-/// among them.
-const EXPOSED_SERVICES: &[&str] = &["SearchService", "DiagnosticsService"];
+/// What a browser may reach through the facade: a service with an empty
+/// method list is exposed whole (unary and server-streaming methods);
+/// a service with a list is exposed for those methods only.
+/// `NodeService` is the cluster's internal surface and is absent;
+/// `ClusterControl` is internal too, and only its read-only balance dry
+/// run is listed, for the dashboard. The wire still applies cluster
+/// trust to that call: the facade's own credentials must be a member's.
+const EXPOSED: &[(&str, &[&str])] = &[
+    ("SearchService", &[]),
+    ("DiagnosticsService", &[]),
+    ("ClusterControl", &["PlanBalance"]),
+];
+
+/// Whether `service.method` is reachable through the facade.
+fn is_exposed(service: &str, method: &str) -> bool {
+    EXPOSED
+        .iter()
+        .any(|(s, methods)| *s == service && (methods.is_empty() || methods.contains(&method)))
+}
+
+fn exposed_summary() -> String {
+    EXPOSED
+        .iter()
+        .map(|(s, methods)| {
+            if methods.is_empty() {
+                s.to_string()
+            } else {
+                format!("{s} ({} only)", methods.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 /// Request bodies are JSON; anything past this is a mistake.
 const MAX_BODY_BYTES: usize = 8 << 20;
 /// `ClusterHealth` is re-read at most this often for document routing.
@@ -286,12 +317,12 @@ pub fn descriptor_pool() -> &'static DescriptorPool {
 pub fn exposed_methods() -> Vec<(String, String, bool)> {
     let pool = descriptor_pool();
     let mut out = Vec::new();
-    for service in EXPOSED_SERVICES {
+    for (service, _) in EXPOSED {
         let Some(desc) = pool.get_service_by_name(&format!("{PACKAGE}.{service}")) else {
             continue;
         };
         for method in desc.methods() {
-            if method.is_client_streaming() {
+            if method.is_client_streaming() || !is_exposed(service, method.name()) {
                 continue;
             }
             out.push((
@@ -305,13 +336,13 @@ pub fn exposed_methods() -> Vec<(String, String, bool)> {
 }
 
 fn resolve_method(service: &str, method: &str) -> Result<MethodDescriptor, Reply> {
-    if !EXPOSED_SERVICES.contains(&service) {
+    if !is_exposed(service, method) {
         return Err(Reply::error(
             404,
             "NOT_FOUND",
             format!(
-                "service {service:?} is not exposed by the console; the services are {}",
-                EXPOSED_SERVICES.join(", ")
+                "{service}.{method} is not exposed by the console; the exposed surface is {}",
+                exposed_summary()
             ),
         ));
     }
@@ -1164,6 +1195,23 @@ mod tests {
         assert!(!methods
             .iter()
             .any(|(s, m, _)| s == "SearchService" && m == "RoutedIngestMapped"));
+        assert!(methods
+            .iter()
+            .any(|(s, m, streaming)| s == "SearchService" && m == "PlanPlacement" && !streaming));
+        // ClusterControl: the balance dry run and only that.
+        assert!(methods
+            .iter()
+            .any(|(s, m, streaming)| s == "ClusterControl" && m == "PlanBalance" && !streaming));
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|(s, _, _)| s == "ClusterControl")
+                .count(),
+            1
+        );
+        assert!(resolve_method("ClusterControl", "PlanBalance").is_ok());
+        assert!(resolve_method("ClusterControl", "GetClusterPlan").is_err());
+        assert!(resolve_method("ClusterControl", "ReconcileCluster").is_err());
         assert!(resolve_method("NodeService", "Health").is_err());
         assert!(resolve_method("SearchService", "Nope").is_err());
     }

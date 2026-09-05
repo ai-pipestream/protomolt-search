@@ -22,8 +22,36 @@
     <div class="panel"><h2>Runtime knobs</h2><div id="knobs" class="muted small">waiting for GetRuntimeKnobs</div></div>
   </div>
   <div class="two">
-    <div class="panel"><h2>Shard map</h2><div id="shards" class="muted small">waiting for GetShardDiagnostics</div><div id="seginfo" class="seginfo"></div></div>
+    <div class="panel"><h2>Shard map</h2><div id="placement" class="placement"></div><div id="shards" class="muted small">waiting for GetShardDiagnostics</div><div id="seginfo" class="seginfo"></div></div>
     <div class="panel"><h2>Recent queries</h2><div id="recent" class="muted small">waiting for RecentQueries</div></div>
+  </div>
+  <div class="two">
+    <div class="panel"><h2>Placement dry run</h2>
+      <div class="muted small">A proposed tree, in the shard map's <code>[placement]</code> shape or as <code>PlacementTree</code> JSON, evaluated over the stored columns of live documents by <code>SearchService.PlanPlacement</code>. Reads only.</div>
+      <textarea id="plan-tree" class="mono" rows="9" spellcheck="false">column = "placement"
+level_bits = 9
+
+[[placement.nodes]]
+name = "recent"
+cel = "year >= 2015"
+shards = 2
+
+[[placement.nodes]]
+name = "archive"
+shards = 6</textarea>
+      <div class="row"><label for="plan-filter" class="fixed">filter</label><input id="plan-filter" class="mono" placeholder="optional CEL over the documents considered"><button id="plan-run" class="primary fixed">plan</button></div>
+      <div id="plan-out" class="muted small"></div>
+    </div>
+    <div class="panel"><h2>Balance dry run</h2>
+      <div class="muted small">The moves <code>ClusterControl.PlanBalance</code> would make so the slowest node's unfiltered scan gets shorter, from each node's observed scan rate on its lease. Whole shards, inside a placement group's node set, device nodes excluded. Reads only.</div>
+      <div class="row">
+        <label for="bal-gain" class="fixed">min gain</label><input id="bal-gain" class="mono" value="0.10" size="6">
+        <label for="bal-moves" class="fixed">max moves</label><input id="bal-moves" class="mono" value="8" size="4">
+        <label for="bal-age" class="fixed">max rate age ms</label><input id="bal-age" class="mono" value="600000" size="9">
+        <button id="bal-run" class="primary fixed">plan</button>
+      </div>
+      <div id="bal-out" class="muted small"></div>
+    </div>
   </div>
   <div class="panel"><h2>Raw samples</h2><details><summary class="muted small">last snapshot</summary><pre class="raw" id="raw-snapshot"></pre></details></div>
 </div>

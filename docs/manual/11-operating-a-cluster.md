@@ -177,6 +177,20 @@ differ by at least 15 percentage points of disk use.
 Lease credentials are returned only to the node that registered; they are not
 part of a published plan.
 
+## The console
+
+The `console` binary is the operator's front end: a loopback HTTP
+server that transcodes proto3 JSON to the cluster's gRPC and serves a
+search page and a dashboard. It holds the TLS material and the bearer
+token, so a browser carries neither. The dashboard shows the live
+metrics stream, the runtime knobs, the shard map with each shard's
+placement group and any relay in it, the recent queries, and the two
+dry runs: a proposed placement tree evaluated over the live documents
+(`PlanPlacement`), and the balance plan from each node's observed scan
+rate (`PlanBalance`, the one cluster-control method the console
+exposes). Neither dry run moves anything. Reference:
+`docs/console-facade.md`.
+
 ## Metrics
 
 `--metrics-listen=host:port` exposes Prometheus text. It is off by default; the
