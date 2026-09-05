@@ -33,6 +33,8 @@ pub mod clustered_turbovec;
 pub mod collections;
 pub mod compaction;
 pub mod config;
+#[cfg(feature = "net")]
+pub mod console;
 pub mod control_plane;
 pub mod coordinator;
 pub mod demo;

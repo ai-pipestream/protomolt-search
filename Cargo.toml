@@ -55,6 +55,12 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 webpki-roots = { version = "1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
+# The console's JSON facade (docs/console-facade.md): proto3 JSON in and
+# out of dynamic messages built from the compiled descriptor set. No
+# default features: the text-format lexer and its regex-derived
+# dependencies stay out of the tree. `net` only; the embedded runtime
+# never links it.
+prost-reflect = { version = "0.14", default-features = false, features = ["serde"], optional = true }
 
 [features]
 # The network stack (docs/embedded-mobile.md): tonic's HTTP/2 transport,
@@ -78,6 +84,7 @@ net = [
     "dep:http-body-util",
     "dep:libc",
     "dep:turbovec-grpc",
+    "dep:prost-reflect",
 ]
 # TLS/mTLS on the gRPC listeners and the cluster-internal channels
 # (docs/security.md): rustls through tonic. On by default for the serving

@@ -87,6 +87,10 @@ The check happens in `CollectionSet`, the one place every public call
 passes through, before the collection is resolved: the principal is
 known before any shard is asked.
 
+The console (`docs/console-facade.md`) is the one client that holds the
+cluster credentials on a browser's behalf: it binds to loopback unless
+told otherwise, and whoever reaches it acts as its principal.
+
 ## Quotas, per principal
 
 | quota | rule | on exceed |

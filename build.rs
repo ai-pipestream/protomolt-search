@@ -10,10 +10,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The generated clients' `connect()` helpers name tonic's transport;
     // they exist only when the `net` feature builds it.
     let net = std::env::var_os("CARGO_FEATURE_NET").is_some();
+    // The console's JSON facade transcodes from this descriptor set at
+    // run time (src/console.rs), so a new RPC needs no facade change.
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
         .build_transport(net)
+        .file_descriptor_set_path(out_dir.join("search_descriptor.bin"))
         .compile_protos(
             &[
                 "proto/ai/pipestream/search/v1/search.proto",
