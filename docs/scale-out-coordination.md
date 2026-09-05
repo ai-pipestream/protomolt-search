@@ -13,6 +13,14 @@ branch `feat/scale-out-reservation-2026-09` so the review can change it
 before it reaches main. Two decisions are the operator's and are named at
 the end, with the questions a reviewer is asked to answer.
 
+Review: [changes requested, 2026-09-05](scale-out-coordination-review-2026-09-05.md).
+The review qualifies the composition, epoch, telemetry and standby claims
+below. It identifies a restricted query relay and scan instrumentation that
+can proceed independently; full relay compatibility, the final balance
+contract, automatic failover and segment movement are not cleared. Phone-owned
+shards remain on their originating device. Read the review before implementing
+this proposal.
+
 ## What exists, and what it costs at scale
 
 The coordinator holds the only top-k heap in a query. Nodes stream
