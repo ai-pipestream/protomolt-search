@@ -5016,10 +5016,10 @@ message MappedField {
   string search_analyzer = 8;
 
   // The column plane this field lands on. Absence semantics on every
-  // family are the engine's Kleene rule (docs/cel-filters.md): an unset
-  // proto3 scalar stores NOTHING, a comparison over the missing value is
-  // UNKNOWN, and negation cannot launder absence into a match — mapped
-  // fields never inherit proto3's default-value lie.
+  // family follow descriptor presence: absent explicit-presence fields
+  // are missing; present defaults are retained. Implicit-presence scalars
+  // project their protobuf defaults. Comparisons on missing values use
+  // the engine's Kleene rule (docs/cel-filters.md).
   ColumnFamily family = 9;
 }
 
@@ -5033,8 +5033,9 @@ message MappedPlan {
   repeated MappedField fields = 2;
 
   // Lowercase hex SHA-256 over the canonical encoding of this plan
-  // (fixed-layout bytes, never protobuf serialization). Two plans are
-  // the same plan exactly when these agree; a drift at restore time is
+  // and its reachable wire schema (fixed-layout bytes, never protobuf
+  // serialization). The v2 identity covers decoder semantics as well as
+  // projection policy. A drift at restore time is
   // an index compatibility event, not a warning.
   string fingerprint = 3;
 
@@ -5072,9 +5073,9 @@ message IngestMappedRequest {
     MappedBind bind = 1;
 
     // One serialized protobuf message of the bound type. Decoded by
-    // walking the wire bytes against the plan — unknown fields skip,
-    // repeated occurrences follow protobuf merge semantics, malformed
-    // bytes refuse by position.
+    // the validated descriptor before projection. Oneof selection and
+    // message merges resolve before column extraction; malformed bytes
+    // refuse by position. Original payload retention is a separate contract.
     bytes document = 2;
     // Routed form. The document bytes have identical mapping semantics; the
     // stable key is copied into the ordinary document/vector WAL records.

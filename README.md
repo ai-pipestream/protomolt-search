@@ -1212,6 +1212,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **In progress after PRE_ASTRA: search foundations.** Descriptor validation,
+  oneof and presence corrections, and a v2 mapping fingerprint covering wire
+  interpretation. Existing mapped indexes require a source rebuild before
+  writes under v2. The full protobuf-shape, authorization and durable-write
+  work is tracked in [Search foundations](docs/search-foundations.md).
+
 - **Landed 2026-09-04 (evening): the fleet's measurement pass.** The
   four-machine fleet (86,633,399 court chunks, 8 shards) rebuilt on the
   segment layout, compacted online on the Pi shards, and moved to mTLS with

@@ -40,6 +40,7 @@
 use std::collections::HashMap;
 
 use prost::Message as _;
+use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Value};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorSet};
 use tonic::Status;
 
@@ -62,11 +63,7 @@ const MAX_DEPTH: usize = 8;
 /// change to derivation semantics or to the canonical encoding: a
 /// changed fingerprint is how drift is caught, and a drift at restore
 /// time is an index compatibility event, not a warning.
-// Frozen persisted identity. Renaming this string would invalidate every
-// existing mapped generation even though the canonical plan bytes did not
-// change. The legacy product name is therefore a compatibility tag, not the
-// current API namespace.
-const FINGERPRINT_VERSION: &str = "turbovec-search.plan.v1";
+const FINGERPRINT_VERSION: &str = "pipestream-search.plan.v2";
 
 /// One refusal, uniformly shaped: every message begins `plan: `.
 fn refuse(msg: impl Into<String>) -> Status {
@@ -98,6 +95,8 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
     })?;
     let index = TypeIndex::build(&set);
     check_extension_declarations(&set)?;
+    DescriptorPool::decode(descriptor_set)
+        .map_err(|e| refuse(format!("invalid descriptor set: {e}")))?;
     let hint_map = extract_hints(descriptor_set)?;
     let root = index.messages.get(message_type).ok_or_else(|| {
         refuse(format!(
@@ -174,7 +173,7 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         chunk_id_path: chunk_id_path.unwrap_or_default(),
         descriptor_sha256: sha256::hex_digest(descriptor_set),
     };
-    plan.fingerprint = fingerprint(&plan);
+    plan.fingerprint = fingerprint(&plan, &set);
     Ok(plan)
 }
 
@@ -1165,11 +1164,12 @@ fn vector_shaped_name(name: &str) -> bool {
 /// encoding (never protobuf serialization, whose byte layout is not
 /// canonical) hashed with SHA-256, lowercase hex. The descriptor
 /// content address is deliberately NOT covered: two descriptor sets
-/// may derive the same plan, and the plan is what an index binds to.
-fn fingerprint(plan: &pb::MappedPlan) -> String {
+/// may derive the same plan. The reachable wire schema is covered separately.
+fn fingerprint(plan: &pb::MappedPlan, set: &FileDescriptorSet) -> String {
     let mut hasher = sha256::Sha256::new();
     write_str(&mut hasher, FINGERPRINT_VERSION);
     write_str(&mut hasher, &plan.message_type);
+    hash_wire_schema(&mut hasher, set, &plan.message_type);
     write_str(&mut hasher, &plan.vector_path);
     write_str(&mut hasher, &plan.doc_id_path);
     write_str(&mut hasher, &plan.chunks_path);
@@ -1190,6 +1190,74 @@ fn fingerprint(plan: &pb::MappedPlan) -> String {
     sha256::to_hex(&hasher.finalize())
 }
 
+/// Hash the reachable descriptor graph independently of file order and source comments.
+/// Projection policy is hashed separately above; this graph pins decoding meaning.
+fn hash_wire_schema(hasher: &mut sha256::Sha256, set: &FileDescriptorSet, root: &str) {
+    let index = TypeIndex::build(set);
+    let enums = collect_enum_descriptors(set);
+    let mut pending = vec![root.to_owned()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(entry) = index.messages.get(&name) {
+            for field in &entry.desc.field {
+                if !field.type_name().is_empty() {
+                    pending.push(field.type_name().trim_start_matches('.').to_owned());
+                }
+            }
+        }
+    }
+    hasher.update(&(seen.len() as u32).to_le_bytes());
+    for name in seen {
+        write_str(hasher, &name);
+        if let Some(entry) = index.messages.get(&name) {
+            let file = &set.file[entry.key.0];
+            write_str(hasher, file.syntax.as_deref().unwrap_or("proto2"));
+            hasher.update(&[u8::from(
+                entry.desc.options.as_ref().is_some_and(|o| o.map_entry()),
+            )]);
+            let mut fields: Vec<_> = entry.desc.field.iter().collect();
+            fields.sort_by_key(|f| f.number());
+            hasher.update(&(fields.len() as u32).to_le_bytes());
+            for field in fields {
+                write_str(hasher, field.name());
+                hasher.update(&field.number().to_le_bytes());
+                hasher.update(&field.r#type.unwrap_or_default().to_le_bytes());
+                hasher.update(&field.label.unwrap_or_default().to_le_bytes());
+                write_str(hasher, field.type_name());
+                hasher.update(&[u8::from(field.default_value.is_some())]);
+                write_str(hasher, field.default_value());
+                hasher.update(&[u8::from(field.proto3_optional())]);
+                // Membership, not the declaration's position or spelling, controls replacement.
+                let mut members: Vec<_> = entry
+                    .desc
+                    .field
+                    .iter()
+                    .filter(|other| {
+                        field.oneof_index.is_some() && other.oneof_index == field.oneof_index
+                    })
+                    .map(|other| other.number())
+                    .collect();
+                members.sort_unstable();
+                hasher.update(&(members.len() as u32).to_le_bytes());
+                for number in members {
+                    hasher.update(&number.to_le_bytes());
+                }
+            }
+        } else if let Some((file, descriptor)) = enums.get(&name) {
+            write_str(hasher, file.syntax.as_deref().unwrap_or("proto2"));
+            // Declaration order selects the first alias and the proto2 default.
+            hasher.update(&(descriptor.value.len() as u32).to_le_bytes());
+            for value in &descriptor.value {
+                hasher.update(&value.number().to_le_bytes());
+                write_str(hasher, value.name());
+            }
+        }
+    }
+}
+
 fn write_str(hasher: &mut sha256::Sha256, text: &str) {
     hasher.update(&(text.len() as u32).to_le_bytes());
     hasher.update(text.as_bytes());
@@ -1199,18 +1267,12 @@ fn write_str(hasher: &mut sha256::Sha256, text: &str) {
 // Protobuf-native extraction (increment 2)
 // ---------------------------------------------------------------------
 
-/// Compiled extractor for one bound plan: a trie over descriptor field
-/// NUMBERS from the message root to every landing leaf, built once at
-/// bind, walked per document. The same hand-rolled wire discipline as
-/// the hint pass above — unknown fields skip, repeated occurrences
-/// follow protobuf merge semantics (last wins for singular scalars,
-/// submessages merge field-wise, packed chunks concatenate), malformed
-/// bytes refuse by name. Nothing is transcoded through JSON or any
-/// intermediate document model: the wire bytes reduce directly to the
-/// ordinary `AddDocumentsRequest` value lists plus the vector.
+/// A validated protobuf decoder followed by a compiled column projection.
+/// Dynamic decoding resolves oneofs and message merges before any value is indexed.
 pub struct Extractor {
     plan: pb::MappedPlan,
     root: TrieNode,
+    descriptor: MessageDescriptor,
     leaves: Vec<Leaf>,
     /// Leaf index of the document BODY (a TEXT field).
     body: usize,
@@ -1256,7 +1318,7 @@ struct Leaf {
     land: Land,
 }
 
-/// How one leaf's wire value decodes and where it lands.
+/// How one decoded leaf lands in the index.
 enum Land {
     /// A TEXT field: the body, or a multi-field column.
     Text,
@@ -1269,38 +1331,16 @@ enum Land {
     /// drift, not a value.
     FacetEnum(HashMap<i64, String>),
     /// A KEYWORD-hinted integer facet: the decimal rendering.
-    FacetInt(IntWire),
+    FacetInt,
     /// An i64 column value.
-    Int(IntWire),
+    Int,
     /// A google.protobuf.Timestamp, landing as a TimestampValue so the
     /// ordinary epoch-micros conversion (and its refusals) applies.
     Date,
     /// An f64 column value.
-    Num(NumWire),
+    Num,
     /// The document's dense vector.
-    Vector(NumWire),
-}
-
-/// Integer wire encodings, per the descriptor's declared type.
-#[derive(Clone, Copy)]
-enum IntWire {
-    /// int32/int64: plain varint, negatives sign-extended to 64 bits.
-    Varint,
-    /// sint32/sint64: zigzag varint.
-    Zigzag,
-    /// uint32/uint64: plain varint; a value above i64::MAX refuses (the
-    /// i64 column cannot hold it).
-    Unsigned,
-    Fixed64,
-    Sfixed64,
-    Fixed32,
-    Sfixed32,
-}
-
-#[derive(Clone, Copy)]
-enum NumWire {
-    F32,
-    F64,
+    Vector,
 }
 
 /// One decoded document, ready for the ordinary ingest path.
@@ -1312,7 +1352,7 @@ pub struct ExtractedDoc {
     pub vector: Vec<f32>,
 }
 
-/// A value accumulating during one document's walk.
+/// A projected value for one document.
 #[derive(Clone)]
 enum Slot {
     Str(String),
@@ -1333,6 +1373,11 @@ impl Extractor {
         body_path: &str,
     ) -> Result<Extractor, Status> {
         let plan = derive_plan(descriptor_set, message_type)?;
+        let pool = DescriptorPool::decode(descriptor_set)
+            .map_err(|e| refuse(format!("invalid descriptor set: {e}")))?;
+        let descriptor = pool
+            .get_message_by_name(message_type)
+            .ok_or_else(|| refuse("message type is missing from validated descriptors"))?;
         // The searchable rows of a chunked plan are its CHUNKS, so the
         // body — the stored, highlighted text of a row — must live
         // inside the scope; parent TEXT fields denormalize as ordinary
@@ -1497,6 +1542,7 @@ impl Extractor {
         Ok(Extractor {
             plan,
             root,
+            descriptor,
             leaves,
             body: body.expect("body_path came from the plan's TEXT fields"),
             vector: vector.expect("derive_plan resolved the vector"),
@@ -1523,7 +1569,9 @@ impl Extractor {
     pub fn extract(&self, bytes: &[u8]) -> Result<Vec<ExtractedDoc>, Status> {
         let mut slots: Vec<Option<Slot>> = (0..self.leaves.len()).map(|_| None).collect();
         let mut chunks: Vec<Vec<Option<Slot>>> = Vec::new();
-        self.walk_bytes(bytes, &self.root, &mut slots, &mut chunks)?;
+        let message = DynamicMessage::decode(self.descriptor.clone(), bytes)
+            .map_err(|e| refuse(format!("malformed document: {e}")))?;
+        self.project_message(&message, &self.root, &mut slots, &mut chunks)?;
         if self.chunked.is_none() {
             return Ok(vec![self.assemble(&slots, None)?]);
         }
@@ -1564,14 +1612,7 @@ impl Extractor {
             } else {
                 parent[index].as_ref()
             };
-            // An empty wire string is proto3 absence, so both arms of
-            // this check speak the same rule: required leaves refuse,
-            // ordinary leaves simply do not land.
-            let present = match raw {
-                Some(Slot::Str(value)) if value.is_empty() => None,
-                other => other,
-            };
-            let Some(slot) = present else {
+            let Some(slot) = raw else {
                 if index == self.body {
                     return Err(refuse_at(&leaf.path, "the document has no body text"));
                 }
@@ -1662,59 +1703,42 @@ impl Extractor {
         Ok(ExtractedDoc { request, vector })
     }
 
-    fn walk_bytes(
+    fn project_message(
         &self,
-        bytes: &[u8],
+        message: &DynamicMessage,
         node: &TrieNode,
         slots: &mut [Option<Slot>],
         chunks: &mut Vec<Vec<Option<Slot>>>,
     ) -> Result<(), Status> {
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let tag = varint(bytes, &mut i)?;
-            let number = (tag >> 3) as i32;
-            let wire = tag & 7;
-            if number == 0 {
-                return Err(refuse("malformed document: field number 0"));
-            }
-            match node
-                .children
-                .iter()
-                .find(|(n, _)| *n == number)
-                .map(|(_, c)| c)
+        let descriptor = message.descriptor();
+        for (number, child) in &node.children {
+            let field = descriptor
+                .get_field(*number as u32)
+                .expect("compiled path belongs to the validated descriptor");
+            if !message.has_field(&field)
+                && (field.supports_presence() || field.is_list() || field.is_map())
             {
-                Some(Child::Descend(inner)) => {
-                    if wire != 2 {
-                        return Err(refuse(format!(
-                            "malformed document: message field {number} arrived with wire \
-                             type {wire}"
-                        )));
+                continue;
+            }
+            let value = message.get_field(&field);
+            match (child, value.as_ref()) {
+                (Child::Descend(inner), Value::Message(sub)) => {
+                    self.project_message(sub, inner, slots, chunks)?;
+                }
+                (Child::Chunks(inner), Value::List(values)) => {
+                    for value in values {
+                        let Value::Message(sub) = value else {
+                            unreachable!("validated chunk type")
+                        };
+                        let mut chunk_slots = vec![None; self.leaves.len()];
+                        self.project_message(sub, inner, &mut chunk_slots, &mut Vec::new())?;
+                        chunks.push(chunk_slots);
                     }
-                    let sub = read_len(bytes, &mut i)?;
-                    self.walk_bytes(sub, inner, slots, chunks)?;
                 }
-                Some(Child::Chunks(inner)) => {
-                    // Each occurrence of the container is ONE chunk,
-                    // walked into its own slot set.
-                    if wire != 2 {
-                        return Err(refuse(format!(
-                            "malformed document: the chunks container arrived with wire \
-                             type {wire}"
-                        )));
-                    }
-                    let sub = read_len(bytes, &mut i)?;
-                    let mut chunk_slots: Vec<Option<Slot>> =
-                        (0..self.leaves.len()).map(|_| None).collect();
-                    // The chunk trie holds no nested Chunks child by
-                    // construction, so this stays empty.
-                    let mut nested = Vec::new();
-                    self.walk_bytes(sub, inner, &mut chunk_slots, &mut nested)?;
-                    chunks.push(chunk_slots);
+                (Child::Leaf(slot), value) => {
+                    slots[*slot] = Some(project_leaf(&self.leaves[*slot], value)?);
                 }
-                Some(Child::Leaf(slot)) => {
-                    decode_leaf(&self.leaves[*slot], bytes, &mut i, wire, &mut slots[*slot])?;
-                }
-                None => skip_field(bytes, &mut i, wire)?,
+                _ => unreachable!("validated projection type"),
             }
         }
         Ok(())
@@ -1729,8 +1753,8 @@ impl Extractor {
 /// facet string but still reduces as the integer it is).
 fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
     match (land, slot) {
-        (Land::Int(_), Slot::Int(value)) => Ok(*value as u64),
-        (Land::FacetInt(_), Slot::Str(rendered)) => rendered
+        (Land::Int, Slot::Int(value)) => Ok(*value as u64),
+        (Land::FacetInt, Slot::Str(rendered)) => rendered
             .parse::<i64>()
             .map(|value| value as u64)
             .map_err(|_| {
@@ -1762,25 +1786,28 @@ fn land_for(
     use prost_types::field_descriptor_proto::Type;
     if is_vector {
         return match leaf.r#type() {
-            Type::Float => Ok(Land::Vector(NumWire::F32)),
-            Type::Double => Ok(Land::Vector(NumWire::F64)),
+            Type::Float => Ok(Land::Vector),
+            Type::Double => Ok(Land::Vector),
             other => Err(refuse_at(
                 &field.path,
                 format!("a VECTOR field must be repeated float or double, not {other:?}"),
             )),
         };
     }
-    let int_wire = |t: Type| -> Option<IntWire> {
-        match t {
-            Type::Int32 | Type::Int64 => Some(IntWire::Varint),
-            Type::Sint32 | Type::Sint64 => Some(IntWire::Zigzag),
-            Type::Uint32 | Type::Uint64 => Some(IntWire::Unsigned),
-            Type::Fixed64 => Some(IntWire::Fixed64),
-            Type::Sfixed64 => Some(IntWire::Sfixed64),
-            Type::Fixed32 => Some(IntWire::Fixed32),
-            Type::Sfixed32 => Some(IntWire::Sfixed32),
-            _ => None,
-        }
+    let is_integer = |t: Type| {
+        matches!(
+            t,
+            Type::Int32
+                | Type::Int64
+                | Type::Sint32
+                | Type::Sint64
+                | Type::Uint32
+                | Type::Uint64
+                | Type::Fixed64
+                | Type::Sfixed64
+                | Type::Fixed32
+                | Type::Sfixed32
+        )
     };
     let family = field.family;
     if family == pb::ColumnFamily::TextField as i32 {
@@ -1806,9 +1833,9 @@ fn land_for(
                 })?;
                 Ok(Land::FacetEnum(table.clone()))
             }
-            other => match int_wire(other) {
-                Some(wire) => Ok(Land::FacetInt(wire)),
-                None => Err(refuse_at(
+            other => match is_integer(other) {
+                true => Ok(Land::FacetInt),
+                false => Err(refuse_at(
                     &field.path,
                     format!("no facet rendering for descriptor type {other:?}"),
                 )),
@@ -1825,9 +1852,9 @@ fn land_for(
                 )),
             };
         }
-        return match int_wire(leaf.r#type()) {
-            Some(wire) => Ok(Land::Int(wire)),
-            None => Err(refuse_at(
+        return match is_integer(leaf.r#type()) {
+            true => Ok(Land::Int),
+            false => Err(refuse_at(
                 &field.path,
                 format!(
                     "an i64 column cannot decode descriptor type {:?}",
@@ -1838,8 +1865,8 @@ fn land_for(
     }
     if family == pb::ColumnFamily::F64 as i32 {
         return match leaf.r#type() {
-            Type::Float => Ok(Land::Num(NumWire::F32)),
-            Type::Double => Ok(Land::Num(NumWire::F64)),
+            Type::Float => Ok(Land::Num),
+            Type::Double => Ok(Land::Num),
             other => Err(refuse_at(
                 &field.path,
                 format!("an f64 column cannot decode descriptor type {other:?}"),
@@ -1899,260 +1926,121 @@ fn insert_path(
 
 /// Every enum in the set, by fully qualified name, as number -> value
 /// name — the exact identity a facet stores.
-fn collect_enum_values(set: &FileDescriptorSet) -> HashMap<String, HashMap<i64, String>> {
-    fn from_enum(e: &prost_types::EnumDescriptorProto) -> HashMap<i64, String> {
-        e.value
-            .iter()
-            .map(|v| (i64::from(v.number()), v.name().to_string()))
-            .collect()
-    }
-    fn walk_message(
-        message: &DescriptorProto,
+fn collect_enum_descriptors(
+    set: &FileDescriptorSet,
+) -> HashMap<
+    String,
+    (
+        &prost_types::FileDescriptorProto,
+        &prost_types::EnumDescriptorProto,
+    ),
+> {
+    fn walk<'a>(
+        file: &'a prost_types::FileDescriptorProto,
+        message: &'a DescriptorProto,
         full: &str,
-        out: &mut HashMap<String, HashMap<i64, String>>,
+        out: &mut HashMap<
+            String,
+            (
+                &'a prost_types::FileDescriptorProto,
+                &'a prost_types::EnumDescriptorProto,
+            ),
+        >,
     ) {
         for e in &message.enum_type {
-            out.insert(format!("{full}.{}", e.name()), from_enum(e));
+            out.insert(format!("{full}.{}", e.name()), (file, e));
         }
         for nested in &message.nested_type {
-            walk_message(nested, &format!("{full}.{}", nested.name()), out);
+            walk(file, nested, &format!("{full}.{}", nested.name()), out);
         }
     }
     let mut out = HashMap::new();
     for file in &set.file {
-        let package = file.package();
         for e in &file.enum_type {
-            out.insert(qualify(package, e.name()), from_enum(e));
+            out.insert(qualify(file.package(), e.name()), (file, e));
         }
         for message in &file.message_type {
-            walk_message(message, &qualify(package, message.name()), &mut out);
+            walk(
+                file,
+                message,
+                &qualify(file.package(), message.name()),
+                &mut out,
+            );
         }
     }
     out
 }
 
-/// Read one length-delimited payload.
-fn read_len<'a>(b: &'a [u8], i: &mut usize) -> Result<&'a [u8], Status> {
-    let len = varint(b, i)? as usize;
-    let end = i
-        .checked_add(len)
-        .filter(|end| *end <= b.len())
-        .ok_or_else(|| refuse("malformed document: length-delimited field overruns the buffer"))?;
-    let sub = &b[*i..end];
-    *i = end;
-    Ok(sub)
+fn collect_enum_values(set: &FileDescriptorSet) -> HashMap<String, HashMap<i64, String>> {
+    collect_enum_descriptors(set)
+        .into_iter()
+        .map(|(name, (_, e))| {
+            let mut values = HashMap::new();
+            for value in &e.value {
+                values
+                    .entry(i64::from(value.number()))
+                    .or_insert_with(|| value.name().to_string());
+            }
+            (name, values)
+        })
+        .collect()
 }
 
-fn read4(b: &[u8], i: &mut usize) -> Result<[u8; 4], Status> {
-    let end = i
-        .checked_add(4)
-        .filter(|end| *end <= b.len())
-        .ok_or_else(|| refuse("malformed document: truncated fixed32 value"))?;
-    let out = b[*i..end].try_into().expect("length just checked");
-    *i = end;
-    Ok(out)
-}
-
-fn read8(b: &[u8], i: &mut usize) -> Result<[u8; 8], Status> {
-    let end = i
-        .checked_add(8)
-        .filter(|end| *end <= b.len())
-        .ok_or_else(|| refuse("malformed document: truncated fixed64 value"))?;
-    let out = b[*i..end].try_into().expect("length just checked");
-    *i = end;
-    Ok(out)
-}
-
-fn wrong_wire(path: &str, wire: u64, want: &str) -> Status {
-    refuse_at(
-        path,
-        format!("the wire bytes carry wire type {wire} where {want} was expected"),
-    )
-}
-
-fn decode_int(
-    encoding: IntWire,
-    b: &[u8],
-    i: &mut usize,
-    wire: u64,
-    path: &str,
-) -> Result<i64, Status> {
-    match encoding {
-        IntWire::Varint => {
-            if wire != 0 {
-                return Err(wrong_wire(path, wire, "a varint"));
-            }
-            Ok(varint(b, i)? as i64)
-        }
-        IntWire::Zigzag => {
-            if wire != 0 {
-                return Err(wrong_wire(path, wire, "a varint"));
-            }
-            let v = varint(b, i)?;
-            Ok(((v >> 1) as i64) ^ -((v & 1) as i64))
-        }
-        IntWire::Unsigned => {
-            if wire != 0 {
-                return Err(wrong_wire(path, wire, "a varint"));
-            }
-            let v = varint(b, i)?;
-            i64::try_from(v).map_err(|_| {
-                refuse_at(path, format!("unsigned value {v} overflows the i64 column"))
-            })
-        }
-        IntWire::Fixed64 => {
-            if wire != 1 {
-                return Err(wrong_wire(path, wire, "a fixed 64-bit value"));
-            }
-            let v = u64::from_le_bytes(read8(b, i)?);
-            i64::try_from(v).map_err(|_| {
-                refuse_at(path, format!("unsigned value {v} overflows the i64 column"))
-            })
-        }
-        IntWire::Sfixed64 => {
-            if wire != 1 {
-                return Err(wrong_wire(path, wire, "a fixed 64-bit value"));
-            }
-            Ok(i64::from_le_bytes(read8(b, i)?))
-        }
-        IntWire::Fixed32 => {
-            if wire != 5 {
-                return Err(wrong_wire(path, wire, "a fixed 32-bit value"));
-            }
-            Ok(i64::from(u32::from_le_bytes(read4(b, i)?)))
-        }
-        IntWire::Sfixed32 => {
-            if wire != 5 {
-                return Err(wrong_wire(path, wire, "a fixed 32-bit value"));
-            }
-            Ok(i64::from(i32::from_le_bytes(read4(b, i)?)))
-        }
-    }
-}
-
-fn decode_leaf(
-    leaf: &Leaf,
-    b: &[u8],
-    i: &mut usize,
-    wire: u64,
-    slot: &mut Option<Slot>,
-) -> Result<(), Status> {
-    let path = &leaf.path;
-    match &leaf.land {
-        Land::Text | Land::FacetStr => {
-            if wire != 2 {
-                return Err(wrong_wire(path, wire, "a length-delimited string"));
-            }
-            let sub = read_len(b, i)?;
-            let text = std::str::from_utf8(sub)
-                .map_err(|_| refuse_at(path, "the value is not valid UTF-8"))?;
-            *slot = Some(Slot::Str(text.to_string()));
-        }
-        Land::FacetBool => {
-            if wire != 0 {
-                return Err(wrong_wire(path, wire, "a varint"));
-            }
-            let v = varint(b, i)?;
-            *slot = Some(Slot::Str(if v != 0 { "true" } else { "false" }.to_string()));
-        }
-        Land::FacetEnum(table) => {
-            if wire != 0 {
-                return Err(wrong_wire(path, wire, "a varint"));
-            }
-            let v = varint(b, i)? as i64;
-            let name = table.get(&v).ok_or_else(|| {
+fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
+    let integer = |value: &Value| -> Result<i64, Status> {
+        match value {
+            Value::I32(v) => Ok(i64::from(*v)),
+            Value::I64(v) => Ok(*v),
+            Value::U32(v) => Ok(i64::from(*v)),
+            Value::U64(v) => i64::try_from(*v).map_err(|_| {
                 refuse_at(
-                    path,
+                    &leaf.path,
+                    format!("unsigned value {v} overflows the i64 column"),
+                )
+            }),
+            _ => Err(refuse_at(&leaf.path, "expected an integer value")),
+        }
+    };
+    Ok(match (&leaf.land, value) {
+        (Land::Text | Land::FacetStr, Value::String(v)) => Slot::Str(v.clone()),
+        (Land::FacetBool, Value::Bool(v)) => Slot::Str(v.to_string()),
+        (Land::FacetEnum(table), Value::EnumNumber(v)) => {
+            Slot::Str(table.get(&i64::from(*v)).cloned().ok_or_else(|| {
+                refuse_at(
+                    &leaf.path,
                     format!("enum value {v} is not declared in the descriptor"),
                 )
-            })?;
-            *slot = Some(Slot::Str(name.clone()));
+            })?)
         }
-        Land::FacetInt(encoding) => {
-            let v = decode_int(*encoding, b, i, wire, path)?;
-            *slot = Some(Slot::Str(v.to_string()));
+        (Land::FacetInt, v) => Slot::Str(integer(v)?.to_string()),
+        (Land::Int, v) => Slot::Int(integer(v)?),
+        (Land::Num, Value::F32(v)) => Slot::Num(f64::from(*v)),
+        (Land::Num, Value::F64(v)) => Slot::Num(*v),
+        (Land::Date, Value::Message(v)) => Slot::Ts {
+            seconds: v
+                .get_field_by_name("seconds")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default(),
+            nanos: v
+                .get_field_by_name("nanos")
+                .and_then(|v| v.as_i32())
+                .unwrap_or_default(),
+        },
+        (Land::Vector, Value::List(values)) => Slot::Floats(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::F32(v) => *v,
+                    Value::F64(v) => *v as f32,
+                    _ => unreachable!("validated vector type"),
+                })
+                .collect(),
+        ),
+        _ => {
+            return Err(refuse_at(
+                &leaf.path,
+                "value does not match the planned projection",
+            ))
         }
-        Land::Int(encoding) => {
-            let v = decode_int(*encoding, b, i, wire, path)?;
-            *slot = Some(Slot::Int(v));
-        }
-        Land::Date => {
-            if wire != 2 {
-                return Err(wrong_wire(path, wire, "a Timestamp message"));
-            }
-            let sub = read_len(b, i)?;
-            // Occurrences merge field-wise, exactly protobuf's rule.
-            let (mut seconds, mut nanos) = match slot {
-                Some(Slot::Ts { seconds, nanos }) => (*seconds, *nanos),
-                _ => (0, 0),
-            };
-            let mut j = 0usize;
-            while j < sub.len() {
-                let tag = varint(sub, &mut j)?;
-                match (tag >> 3, tag & 7) {
-                    (1, 0) => seconds = varint(sub, &mut j)? as i64,
-                    (2, 0) => nanos = varint(sub, &mut j)? as i64 as i32,
-                    (_, w) => skip_field(sub, &mut j, w)?,
-                }
-            }
-            *slot = Some(Slot::Ts { seconds, nanos });
-        }
-        Land::Num(NumWire::F32) => {
-            if wire != 5 {
-                return Err(wrong_wire(path, wire, "a fixed 32-bit float"));
-            }
-            *slot = Some(Slot::Num(f64::from(f32::from_le_bytes(read4(b, i)?))));
-        }
-        Land::Num(NumWire::F64) => {
-            if wire != 1 {
-                return Err(wrong_wire(path, wire, "a fixed 64-bit double"));
-            }
-            *slot = Some(Slot::Num(f64::from_le_bytes(read8(b, i)?)));
-        }
-        Land::Vector(numeric) => {
-            let mut floats = match slot.take() {
-                Some(Slot::Floats(v)) => v,
-                _ => Vec::new(),
-            };
-            match (numeric, wire) {
-                (NumWire::F32, 2) => {
-                    let sub = read_len(b, i)?;
-                    if !sub.len().is_multiple_of(4) {
-                        return Err(refuse_at(
-                            path,
-                            "packed float payload is not a multiple of 4 bytes",
-                        ));
-                    }
-                    floats.extend(
-                        sub.as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|c| f32::from_le_bytes(*c)),
-                    );
-                }
-                (NumWire::F32, 5) => floats.push(f32::from_le_bytes(read4(b, i)?)),
-                // A double vector lands on the engine's f32 plane; the
-                // narrowing cast is the landing, stated in the docs.
-                (NumWire::F64, 2) => {
-                    let sub = read_len(b, i)?;
-                    if !sub.len().is_multiple_of(8) {
-                        return Err(refuse_at(
-                            path,
-                            "packed double payload is not a multiple of 8 bytes",
-                        ));
-                    }
-                    floats.extend(
-                        sub.as_chunks::<8>()
-                            .0
-                            .iter()
-                            .map(|c| f64::from_le_bytes(*c) as f32),
-                    );
-                }
-                (NumWire::F64, 1) => floats.push(f64::from_le_bytes(read8(b, i)?) as f32),
-                _ => return Err(wrong_wire(path, wire, "a packed or repeated float payload")),
-            }
-            *slot = Some(Slot::Floats(floats));
-        }
-    }
-    Ok(())
+    })
 }

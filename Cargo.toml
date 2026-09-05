@@ -17,6 +17,7 @@ turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", re
 # embedded runtime needs; the HTTP/2 transport rides the `net` feature.
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
 prost = "0.13"
+prost-reflect = "0.14.7"
 # google.protobuf.Timestamp on the ingest wire compiles to this crate's
 # type; tonic-build emits the reference, the runtime needs the crate.
 # Locked to prost's minor version: prost-types 0.14 implements prost

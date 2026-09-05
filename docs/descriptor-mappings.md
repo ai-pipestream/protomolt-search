@@ -1,5 +1,10 @@
 # Descriptor-derived mappings and the descriptor exchange contract
 
+The decoder and fingerprint were revised after `PRE_ASTRA`; see
+[Search foundations](search-foundations.md) for migration requirements and the
+remaining preservation, indexing and query contracts. In particular, the older
+reference description below is historical evidence, not complete shape support.
+
 Status: **increments 1 and 2 implemented** (2026-08-25) — dry-run
 derivation, and bind + protobuf-native ingest (section 4a).
 `SearchService.PlanIndex` derives the deterministic, fingerprinted plan
@@ -12,8 +17,8 @@ the CEL front-end), each field mapped onto the engine column family it
 would land on (`ColumnFamily` — repeated scalars and OBJECT/NESTED/
 BINARY fields visibly map to FAMILY_NONE, never silently dropped), and
 the whole plan identified by a lowercase-hex SHA-256 over a canonical
-fixed-layout encoding (frozen compatibility tag `turbovec-search.plan.v1`,
-retained so the product rename does not invalidate existing generations; hash from
+fixed-layout encoding (compatibility tag `pipestream-search.plan.v2`,
+including the reachable wire schema; hash from
 the hand-rolled `src/sha256.rs`, pinned to the NIST vectors). Every
 refusal in section 2 is implemented and pinned by tests: ambiguous or
 missing vector/doc-id candidates, contradictory hints, chunk-scope
@@ -126,13 +131,12 @@ deliberate:
   (`docs/cel-filters.md`). The port targets that compiler. The `cel`
   crate does not enter this repository's dependency tree; what does not
   compile does not run slowly, it does not run.
-- **Absence semantics.** The reference gave unset proto3 fields their
-  proto3 defaults (empty string, 0, the epoch). This engine uses the
-  documented Kleene three-valued rule: a comparison on a document that
-  lacks the value is UNKNOWN, and negation cannot launder absence into a
-  match (`src/filter.rs`). Mapped fields inherit the engine's rule, not
-  the reference's; over a corpus where absence is normal, proto-default
-  semantics lie.
+- **Presence semantics.** Explicit presence follows the descriptor: unset
+  optional fields and inactive oneof members remain missing, while explicitly
+  present defaults are projected. Proto3 implicit-presence scalars project their
+  defaults whether omitted or encoded. They cannot distinguish an unset value
+  from a deliberately assigned default. Missing values still use the engine's
+  Kleene three-valued comparisons (`src/filter.rs`).
 - **Storage target.** Mapped fields land on the existing typed column
   plane — facet, i64, f64, map, and geo families with their shard-local
   dictionaries — rather than a parallel per-document value store. Where
@@ -217,20 +221,16 @@ of the bound type. The contract, piece by piece:
   exactly when the plan has one), and the remaining TEXT fields index
   as ordinary multi-field columns. A chunked plan, a plan with no TEXT
   field, and a TEXT-kind document id all refuse at bind.
-- **Extraction is the same hand-rolled wire discipline as the hint
-  pass.** The bind compiles a trie over descriptor field NUMBERS; each
-  document's bytes walk it once — unknown fields skip, repeated
-  occurrences follow protobuf merge semantics, malformed bytes refuse
-  by position ("document 17: ..."). Values land by planned family:
-  strings, bools ("true"/"false"), enums (the value NAME from the
-  descriptor; an undeclared number refuses — schema drift, not a
-  value), integers (every proto encoding; a uint above i64::MAX
-  refuses), Timestamps (as `TimestampValue`, so the ordinary
-  epoch-micros conversion and its refusals apply), floats and doubles.
-  A double vector narrows to the engine's f32 plane — the one lossy
-  landing, stated here. An empty wire string is proto3 absence and
-  lands nothing; the body, the id, and the vector are required and
-  refuse when absent.
+- **Decode before projection.** `prost-reflect` validates the descriptor and
+  decodes the whole message before the compiled field-number projection reads
+  values. Oneof alternatives replace each other, repeated values concatenate,
+  and singular submessages merge before indexing. Invalid wire data, including
+  malformed unindexed known fields, refuses the document. Explicitly present
+  empty strings are retained. Enum names and signed columns retain their current
+  restrictions: unknown enum numbers and unsigned values above i64::MAX refuse.
+  Timestamp and vector projections retain their existing units and narrowing.
+  The decoder does not make source preservation or every shape queryable; see
+  the foundation completion requirements.
 - **The ordinary path does the rest.** Each decoded document becomes an
   ordinary `AddDocumentsRequest` — the bind's `analysis` and CEL
   `materialize` specs attached as session properties — and enters the
