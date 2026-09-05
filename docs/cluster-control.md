@@ -237,6 +237,35 @@ Placement prefers a different failure domain, then lower disk utilization.
 The reconciler fills replication deficits and can move one large primary when
 active-node disk utilization differs by at least 15 percentage points.
 
+## Balance dry run
+
+`PlanBalance` (`docs/bandwidth-budget.md`) answers with the whole-shard
+primary moves that would bring the slowest node's estimated unfiltered
+scan time down, and moves nothing. Its inputs are the durable state
+(nodes, leases, capacities, primary replicas and their rows), the
+provider's encoded row bytes read from the live shards' health through
+the coordinator (one geometry cluster-wide; a disagreement is refused by
+name, and a plane with no coordinator attached refuses), and each
+shard's placement leaf from the coordinator's live topology, whose node
+set bounds the move when the leaf names nodes.
+
+Per node the plan reports the bytes it serves (rows of its primaries
+times the row bytes), its observed rate, and `bytes / rate` as an
+estimate; a node with no estimate is listed in `excluded` with one
+reason: `unmeasured` (no rate, or too few samples), `stale` (observed
+longer ago than `max_rate_age_ms`, default ten minutes),
+`device` (a phone: never a source or a destination, before any capacity
+logic runs), `residency-unspecified`, `draining`, or `no-lease`. A
+destination in the failure domain of one of the shard's ready copies is
+skipped. The greedy step takes the slowest eligible node, tries each of
+its shards against each eligible node in the shard's pool, keeps the
+move that leaves the lowest maximum (ties by node id, then shard id), and
+stops when a move would lower the maximum by less than `min_gain` (in
+[0, 1], default 0.10) or when `max_moves` (default 8) is reached. The
+response carries the topology generation and control revision it was
+computed from and the thresholds it used. Cluster trust, like the other
+control routes; it is not a public route.
+
 ## Action protocol
 
 `GetClusterPlan` returns durable, idempotent actions (and, since

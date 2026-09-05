@@ -6,7 +6,10 @@ tree (`placement.md`) and the partitioned layout with segment pruning
 (`segment-pruning.md`, `benchmarks/partition-pruning-2026-09.md`), both
 on main.
 
-Status: proposal, 2026-09-05. Nothing here is implemented. The contract
+Status: proposal, 2026-09-05, reviewed. The restricted, read-only relay
+the review cleared exists (`relay-coordinators.md`: `StreamSearch`,
+`TermStats`, `Health`, a map interface with pinned revisions); the rest
+of item 2 and item 3 are not built. The contract
 it would need first (a scan-rate field on `NodeCapacity` and a
 `ClusterControl.PlanBalance` dry run, both refusing by name) sits on the
 branch `feat/scale-out-reservation-2026-09` so the review can change it
@@ -49,6 +52,9 @@ node set with one code range, so it is the natural unit for an intermediate
 coordinator to own.
 
 ## Item 2: a tree of coordinators
+
+Built so far: the restricted relay of `relay-coordinators.md`. What
+follows is the design it grows toward; the review names the gates.
 
 ### The relay coordinator
 
@@ -131,6 +137,10 @@ with `openraft` unless the user prefers to own the implementation. Option
 2 is not recommended.
 
 ## Item 3: bandwidth as the budget
+
+Status, 2026-09-05: the measurement and the balance dry run exist
+(`bandwidth-budget.md`); execution of a move and segment-subset
+ownership do not.
 
 An unfiltered vector query reads every 4-bit vector of every shard it
 touches. There is no per-chunk upper bound to stop early on, so the cost

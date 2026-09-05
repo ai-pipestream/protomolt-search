@@ -185,6 +185,8 @@ Folded in once per completed scan on every route through the scheduler
     turbovec_scan_floors_offered_total       floors the scan offered
     turbovec_scan_floors_published_total     floors actually on the wire
     turbovec_scan_floor_updates_applied_total  chunks run under a pushed floor
+    turbovec_scan_bytes_total                encoded index bytes the kernel streamed
+    turbovec_scan_active_nanoseconds_total   wall time inside the kernel calls
     turbovec_scan_batches_total              batched kernel passes
     turbovec_scan_batched_jobs_total         jobs that rode a batch
 
@@ -192,6 +194,16 @@ The offered/published split exists because they were once one counter
 and a knob that suppressed nine tenths of the broadcasts read as having
 done nothing (`docs/optimizations.md`); `candidates_total` is where
 floor sharing's savings show.
+
+`scan_bytes_total` and `scan_active_nanoseconds_total` are counted once
+per kernel call, however many queries shared it: the bytes are the rows
+the call streamed (a whole chunk unfiltered; the blocks the allowlist
+left non-empty when filtered) times the image's row bytes (the packed
+codes plus the 4-byte scale; ids, headers, calibration tables and the
+FP32 sidecar are not read by the scan and not counted), and the time is
+the wall time inside the call. Their ratio is the process's scan rate,
+which the node's lease renewal reports in a bounded window
+(`docs/bandwidth-budget.md`).
 
 ### Ingest
 

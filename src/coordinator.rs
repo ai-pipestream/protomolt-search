@@ -431,6 +431,10 @@ pub struct CoordinatorServiceImpl {
     /// recurse into a frozen clone with this field cleared, so no request can
     /// observe half of two generations.
     live_topology: Option<Arc<RwLock<Arc<CoordinatorTopology>>>>,
+    /// The generation the live topology currently serves, as a watch so a
+    /// relay (`docs/relay-coordinators.md`, "Map interface") wakes when the
+    /// map moves under it. Replaced on every publication.
+    topology_watch: Arc<watch::Sender<u64>>,
     /// Routed writes take a read guard. A cutover holds the owned write guard
     /// while the final WAL tail is verified and the new map is published;
     /// queries do not use this gate.
@@ -1855,6 +1859,7 @@ impl CoordinatorServiceImpl {
             placement_codes: Vec::new(),
             placement: None,
             live_topology: None,
+            topology_watch: Arc::new(watch::channel(0).0),
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
             cutover_guard: Arc::new(Mutex::new(None)),
             cutover_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1961,6 +1966,7 @@ impl CoordinatorServiceImpl {
         self.placement_codes = codes;
         self.placement = topology.placement.clone();
         self.live_topology = Some(Arc::new(RwLock::new(Arc::new(topology))));
+        self.topology_watch.send_replace(self.topology_generation);
         Ok(self)
     }
 
@@ -2001,7 +2007,38 @@ impl CoordinatorServiceImpl {
             ));
         }
         *current = replacement;
+        drop(current);
+        self.topology_watch.send_replace(generation);
         Ok(())
+    }
+
+    /// A receiver that changes whenever a new topology generation is
+    /// published on this coordinator; its value is that generation.
+    pub fn topology_changes(&self) -> watch::Receiver<u64> {
+        self.topology_watch.subscribe()
+    }
+
+    /// A frozen clone of this coordinator over exactly `routes`: the
+    /// links, keys, limits, and TLS of this one, the shard set of the
+    /// caller's map snapshot, no live topology. A relay fans out through
+    /// this so the children it talks to are the children its pinned map
+    /// revision names, whatever source that map came from.
+    pub(crate) fn frozen_over(
+        &self,
+        generation: u64,
+        routes: &[TopologyRoute],
+        placement: Option<Arc<crate::placement::Placement>>,
+    ) -> Self {
+        let mut frozen = self.clone();
+        frozen.node_addrs = routes.iter().map(|route| route.addr.clone()).collect();
+        frozen.replica_addrs = routes.iter().map(|route| route.replica.clone()).collect();
+        frozen.hash_ranges = routes.iter().map(|route| route.hash_range).collect();
+        frozen.placement_codes = routes.iter().map(|route| route.placement).collect();
+        frozen.topology_generation = generation;
+        frozen.placement = placement;
+        frozen.stats_cache = Arc::new(crate::stats_cache::StatsCache::new(routes.len()));
+        frozen.live_topology = None;
+        frozen
     }
 
     pub fn current_topology_generation(&self) -> u64 {
@@ -2165,7 +2202,7 @@ impl CoordinatorServiceImpl {
         known
     }
 
-    fn request_snapshot(&self) -> Option<Self> {
+    pub(crate) fn request_snapshot(&self) -> Option<Self> {
         let authority = self.live_topology.as_ref()?;
         let topology = authority
             .read()
@@ -2746,6 +2783,13 @@ impl CoordinatorServiceImpl {
     pub fn with_udp_hmac_key(mut self, key: crate::security::UdpKey) -> Self {
         self.udp_hmac_key = Some(key);
         self
+    }
+
+    /// The key that signs this coordinator's UDP datagrams, when one is
+    /// configured (`docs/security.md`); a relay signs its own parent-facing
+    /// lane with the same key.
+    pub(crate) fn udp_key(&self) -> Option<&crate::security::UdpKey> {
+        self.udp_hmac_key.as_ref()
     }
 
     /// The shard addresses this coordinator fans out to, in shard order.
@@ -3373,7 +3417,7 @@ impl CoordinatorServiceImpl {
 
     /// The link to a node: the cached one (a local node, or a channel
     /// dialed before), else a new channel when the network is allowed.
-    fn node_client(&self, addr: &str) -> Result<crate::link::NodeLink, Status> {
+    pub(crate) fn node_client(&self, addr: &str) -> Result<crate::link::NodeLink, Status> {
         #[cfg_attr(not(feature = "net"), allow(unused_mut))]
         let mut cache = self.links.lock().expect("node link cache mutex poisoned");
         if let Some(link) = cache.get(addr) {
@@ -6732,7 +6776,7 @@ impl CoordinatorServiceImpl {
     /// sender that later carries floor raises or an authoritative Stop. Each
     /// stream also gets a UDP token so both signals reach the shard first on
     /// the fast lossy lane and then on the gRPC stream.
-    fn open_stream_fanout(
+    pub(crate) fn open_stream_fanout(
         &self,
         request_id: &str,
         vector: &[f32],
@@ -6820,7 +6864,7 @@ impl CoordinatorServiceImpl {
     /// monotone max-folds shard-side, so double delivery and loss are
     /// equally free; a full stream channel just means the next raise
     /// supersedes this one.
-    fn push_stream_floor(&self, fanout: &StreamFanout, floor: f32) {
+    pub(crate) fn push_stream_floor(&self, fanout: &StreamFanout, floor: f32) {
         let update = StreamSearchRequest {
             payload: Some(stream_search_request::Payload::FloorUpdate(FloorUpdate {
                 floor,
@@ -9635,7 +9679,7 @@ fn decomposed_floor(s_lb: f64, wb_b1: f64, w_v: f64) -> f32 {
 /// Shared by every streaming consumer — plain top-k, document mode,
 /// and the decomposed hybrid — which differ only in what they do with
 /// the batches and which floor they derive.
-struct StreamFanout {
+pub(crate) struct StreamFanout {
     merged_rx: mpsc::Receiver<(usize, Result<Option<StreamSearchResponse>, Status>)>,
     floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>>,
     udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>>,
@@ -9688,7 +9732,7 @@ impl StreamFanout {
     /// matching gRPC Stop is then awaited on every open request stream and is
     /// the authoritative signal. A stopped node can only return
     /// `completed = false`.
-    async fn cancel(&mut self) {
+    pub(crate) async fn cancel(&mut self) {
         self.send_udp_cancel();
         let senders: Vec<mpsc::Sender<StreamSearchRequest>> =
             self.floor_txs.iter_mut().filter_map(Option::take).collect();
@@ -9701,12 +9745,12 @@ impl StreamFanout {
         }
     }
 
-    async fn cancel_with<T>(&mut self, status: Status) -> Result<T, Status> {
+    pub(crate) async fn cancel_with<T>(&mut self, status: Status) -> Result<T, Status> {
         self.cancel().await;
         Err(status)
     }
 
-    fn mark_completed(&mut self, shard: usize) {
+    pub(crate) fn mark_completed(&mut self, shard: usize) {
         self.floor_txs[shard] = None;
         self.udp_lanes[shard] = None;
     }
@@ -9717,7 +9761,7 @@ impl StreamFanout {
     /// summary (a protocol break — the summary is the exactness
     /// certificate, so a stream that vanishes without one aborts the
     /// query).
-    async fn next_message(
+    pub(crate) async fn next_message(
         &mut self,
         summaries: &[Option<StreamSearchSummary>],
     ) -> Result<Option<(usize, StreamSearchResponse)>, Status> {

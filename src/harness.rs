@@ -277,6 +277,44 @@ pub async fn serve_node(node: NodeServiceImpl) -> (String, JoinHandle<Result<(),
     (format!("http://{addr}"), handle)
 }
 
+/// Start a relay coordinator (`docs/relay-coordinators.md`) over
+/// `children` on 127.0.0.1:0, its parent-facing UDP lane on the same
+/// port, and return the relay handle beside the address so a test can
+/// read its token registry. The children are not checked here: a test
+/// that wants the startup refusal calls `check_children` itself.
+pub async fn start_relay(
+    children: Vec<String>,
+) -> (
+    String,
+    crate::relay::RelayService,
+    JoinHandle<Result<(), TransportError>>,
+) {
+    start_relay_over(CoordinatorServiceImpl::new(children)).await
+}
+
+/// [`start_relay`] over a coordinator the caller built, for a hot
+/// topology the test then republishes.
+pub async fn start_relay_over(
+    coordinator: CoordinatorServiceImpl,
+) -> (
+    String,
+    crate::relay::RelayService,
+    JoinHandle<Result<(), TransportError>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let relay = crate::relay::RelayService::new(std::sync::Arc::new(coordinator));
+    relay.spawn_floor_listener(addr);
+    let handle = tokio::spawn(
+        Server::builder()
+            .initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .initial_connection_window_size(crate::H2_CONN_WINDOW)
+            .add_service(relay.clone().into_server(MAX_MESSAGE_BYTES))
+            .serve_with_incoming(nodelay_incoming(listener)),
+    );
+    (format!("http://{addr}"), relay, handle)
+}
+
 /// Start a coordinator server on 127.0.0.1:0.
 pub async fn start_coordinator(
     node_addrs: Vec<String>,
