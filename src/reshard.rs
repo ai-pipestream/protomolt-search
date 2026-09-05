@@ -717,6 +717,20 @@ fn build_child(
                 t
             }
         };
+        let unsigned_integer_table: Vec<String> = match columns {
+            Some(columns) => columns.unsigned_integers.clone(),
+            None => {
+                let mut names = Vec::new();
+                for (_, doc) in &mapped {
+                    for value in &doc.unsigned_integers {
+                        if !names.contains(&value.field) {
+                            names.push(value.field.clone());
+                        }
+                    }
+                }
+                names
+            }
+        };
         // Geo columns come from one list, so the derivation is the
         // plain first-seen union (docs/geo-columns.md).
         let geo_table: Vec<String> = match columns {
@@ -745,6 +759,8 @@ fn build_child(
         let map_facet_names: Vec<&str> = map_facet_table.iter().map(String::as_str).collect();
         let map_numeric_names: Vec<&str> = map_numeric_table.iter().map(String::as_str).collect();
         let integer_names: Vec<&str> = integer_table.iter().map(String::as_str).collect();
+        let unsigned_integer_names: Vec<&str> =
+            unsigned_integer_table.iter().map(String::as_str).collect();
         let geo_names: Vec<&str> = geo_table.iter().map(String::as_str).collect();
         // The child's positional fields (docs/phrase-proximity.md) come
         // from the records' proximity record, which every record of one
@@ -791,6 +807,7 @@ fn build_child(
             .with_map_facet_fields(&map_facet_names)
             .with_map_numeric_fields(&map_numeric_names)
             .with_integer_fields(&integer_names)
+            .with_unsigned_integer_fields(&unsigned_integer_names)
             .with_geo_fields(&geo_names)
             .with_position_fields(&position_names)
             .with_sentence_fields(&sentence_names);
@@ -1113,6 +1130,25 @@ fn build_child(
                         .position(|n| n == &e.field)
                         .expect("integer table was derived from these records");
                     builder.set_integer(ii, *local, e.value);
+                }
+                let mut unsigned_seen = std::collections::HashSet::new();
+                for value in &doc.unsigned_integers {
+                    if !unsigned_seen.insert(&value.field) {
+                        return Err(format!(
+                            "record at child slot {local}: unsigned field {:?} repeats",
+                            value.field
+                        ));
+                    }
+                    let column = unsigned_integer_table
+                        .iter()
+                        .position(|name| name == &value.field)
+                        .ok_or_else(|| {
+                            format!(
+                                "record at child slot {local}: undeclared unsigned field {:?}",
+                                value.field
+                            )
+                        })?;
+                    builder.set_unsigned_integer(column, *local, value.value);
                 }
                 // Timestamps re-run the node's conversion, from the
                 // instant the WAL kept: the child gets the same epoch
@@ -2429,6 +2465,7 @@ pub struct ColumnTables {
     pub map_facets: Vec<String>,
     pub map_numerics: Vec<String>,
     pub integers: Vec<String>,
+    pub unsigned_integers: Vec<String>,
     pub geo: Vec<String>,
 }
 

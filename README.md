@@ -1222,12 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
-- **Unsigned numeric storage foundation (2026-09-05, feature branch).** A
-  distinct u64 column kind preserves the entire unsigned domain and explicit
-  presence through heap/spill writes, mapped reads, segment sealing and reopen.
-  Segment summaries retain unsigned bounds; replacement tails must preserve
-  the ordered schema. Public unsigned mapping and query support remain in
-  progress. See [integer storage](docs/range-facets.md) and the
+- **Unsigned numeric storage and ingest (2026-09-05, feature branch).** A
+  distinct u64 column kind and protobuf ingest entries preserve the entire
+  unsigned domain with explicit presence. Server, Rust and mobile configuration
+  declare the same columns. WAL replay and compaction retain exact values;
+  both compaction layouts preserve entirely absent column declarations.
+  Unsigned mapping and query support remain in progress. See [integer storage](docs/range-facets.md) and the
   [foundation status](docs/search-foundations.md).
 
 - **Full-domain signed numeric columns (2026-09-05).** Integer presence now

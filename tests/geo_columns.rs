@@ -78,6 +78,7 @@ async fn add_documents_geo(
     let (tx, rx) = mpsc::channel(64);
     for (text, points) in docs {
         tx.send(AddDocumentsRequest {
+            unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,

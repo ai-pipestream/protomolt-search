@@ -60,6 +60,7 @@ async fn add_documents_faceted(
     let (tx, rx) = mpsc::channel(8);
     for (text, facets) in docs {
         tx.send(AddDocumentsRequest {
+            unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,

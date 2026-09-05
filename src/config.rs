@@ -379,6 +379,8 @@ pub struct Config {
     /// exact integers past 2^53, and where Timestamp ingest lands as
     /// epoch micros. Same rules; one name space across all kinds.
     pub integer_fields: Vec<String>,
+    /// Exact u64 columns (--unsigned-integer-fields), with explicit presence.
+    pub unsigned_integer_fields: Vec<String>,
     /// The geo-point column table for NEW shard builders
     /// (`--geo-fields=courthouse`, docs/geo-columns.md): the columns
     /// bbox/radius filters and distance-decay stages read. Same rules;
@@ -567,6 +569,7 @@ struct FileConfig {
     sentence_fields: Option<Vec<String>>,
     map_numeric_fields: Option<Vec<String>>,
     integer_fields: Option<Vec<String>>,
+    unsigned_integer_fields: Option<Vec<String>>,
     geo_fields: Option<Vec<String>>,
     wal: Option<bool>,
     wal_buckets: Option<u32>,
@@ -1806,6 +1809,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         "TURBOVEC_INTEGER_FIELDS",
         &file.integer_fields,
     );
+    let unsigned_integer_fields = parse_list(
+        "unsigned-integer-fields",
+        "PIPESTREAM_SEARCH_UNSIGNED_INTEGER_FIELDS",
+        &file.unsigned_integer_fields,
+    );
     let geo_fields = parse_list("geo-fields", "TURBOVEC_GEO_FIELDS", &file.geo_fields);
     // One name space across all column kinds: the v7 column table
     // refuses duplicates, so the config does too, early and by name.
@@ -1824,6 +1832,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .chain(&map_facet_fields)
             .chain(&map_numeric_fields)
             .chain(&integer_fields)
+            .chain(&unsigned_integer_fields)
             .chain(&placement_as_integer)
             .chain(&geo_fields)
         {
@@ -2368,6 +2377,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         sentence_fields,
         map_numeric_fields,
         integer_fields,
+        unsigned_integer_fields,
         geo_fields,
         shard_map,
         shard_map_path,
@@ -2418,6 +2428,38 @@ mod tests {
 
     fn args_raw(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unsigned_columns_keep_their_own_configured_type() {
+        let config = parse(&args(&[
+            "--role=node",
+            "--index=/tmp/unsigned.tv",
+            "--unsigned-integer-fields=count,maximum",
+            "--integer-fields=signed",
+        ]))
+        .unwrap();
+        assert_eq!(config.unsigned_integer_fields, ["count", "maximum"]);
+        assert_eq!(config.integer_fields, ["signed"]);
+        for conflict in [
+            "--integer-fields=count",
+            "--numeric-fields=count",
+            "--facet-fields=count",
+            "--placement-column=count",
+        ] {
+            assert!(parse(&args(&[
+                "--role=node",
+                "--index=/tmp/unsigned.tv",
+                "--unsigned-integer-fields=count",
+                conflict
+            ]))
+            .unwrap_err()
+            .contains("more than one column kind"));
+        }
+        let file: FileConfig = toml::from_str("unsigned_integer_fields = ['counter']").unwrap();
+        assert_eq!(file.unsigned_integer_fields, Some(vec!["counter".into()]));
+        let old: FileConfig = toml::from_str("").unwrap();
+        assert!(old.unsigned_integer_fields.is_none());
     }
 
     #[test]

@@ -106,6 +106,29 @@ fn declare_placement_column(config: &mut NodeConfig) {
     }
 }
 
+// Rust and embedded callers bypass the CLI parser. Enforce the same column
+// namespace before they create or open storage, and before a fresh ingest.
+fn validate_column_tables(config: &NodeConfig) -> Result<(), String> {
+    let mut names = std::collections::HashSet::new();
+    for name in config
+        .facet_fields
+        .iter()
+        .chain(&config.numeric_fields)
+        .chain(&config.map_facet_fields)
+        .chain(&config.map_numeric_fields)
+        .chain(&config.integer_fields)
+        .chain(&config.unsigned_integer_fields)
+        .chain(&config.geo_fields)
+    {
+        if !names.insert(name) {
+            return Err(format!(
+                "column {name:?} is declared more than once; each name has one column kind"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A node's runtime knobs from its config (docs/diagnostics.md): the
 /// live ones as atomics, the rest listed as read-at-startup.
 fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
@@ -348,6 +371,8 @@ pub struct NodeConfig {
     /// Same rules as `facet_fields`. Timestamp ingest lands in THESE
     /// columns as epoch micros — it is sugar, not a kind.
     pub integer_fields: Vec<String>,
+    /// Full-domain unsigned numeric columns, distinct from signed columns.
+    pub unsigned_integer_fields: Vec<String>,
     /// The placement column (`docs/placement.md`): the i64 column every
     /// row carries with its placement code. Declared here it joins the
     /// integer table, and a direct ingest must carry a value for it or
@@ -462,6 +487,7 @@ impl Default for NodeConfig {
             map_facet_fields: Vec::new(),
             map_numeric_fields: Vec::new(),
             integer_fields: Vec::new(),
+            unsigned_integer_fields: Vec::new(),
             placement_column: None,
             placement_leaf: None,
             geo_fields: Vec::new(),
@@ -768,6 +794,15 @@ impl Bm25Shard {
             Bm25Shard::Spilling(s) => s.integer_index(name),
             Bm25Shard::Resident(r) => r.integer_index(name),
             Bm25Shard::Segmented(g) => g.integer_index(name),
+        }
+    }
+
+    pub(crate) fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.unsigned_integer_index(name),
+            Bm25Shard::Spilling(s) => s.unsigned_integer_index(name),
+            Bm25Shard::Resident(r) => r.unsigned_integer_index(name),
+            Bm25Shard::Segmented(g) => g.unsigned_integer_index(name),
         }
     }
 
@@ -3194,6 +3229,7 @@ pub fn segments_root(index_path: &std::path::Path) -> PathBuf {
 /// The heap store a node's configuration declares: the tail of a
 /// segmented shard, or the whole store of an in-memory one.
 pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
+    validate_column_tables(config)?;
     let names: Vec<&str> = config.bm25_fields.iter().map(String::as_str).collect();
     for name in config.position_fields.iter().chain(&config.sentence_fields) {
         if !names.contains(&name.as_str()) {
@@ -3211,6 +3247,11 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
         .map(String::as_str)
         .collect();
     let integers: Vec<&str> = config.integer_fields.iter().map(String::as_str).collect();
+    let unsigned_integers: Vec<&str> = config
+        .unsigned_integer_fields
+        .iter()
+        .map(String::as_str)
+        .collect();
     let geos: Vec<&str> = config.geo_fields.iter().map(String::as_str).collect();
     let positions: Vec<&str> = config.position_fields.iter().map(String::as_str).collect();
     let sentences: Vec<&str> = config.sentence_fields.iter().map(String::as_str).collect();
@@ -3220,6 +3261,7 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
         .with_map_facets(&map_facets)
         .with_map_numerics(&map_numerics)
         .with_integers(&integers)
+        .with_unsigned_integers(&unsigned_integers)
         .with_geos(&geos)
         .with_positions(&positions)
         .with_sentences(&sentences))
@@ -4347,6 +4389,7 @@ impl NodeServiceImpl {
         allow_missing_bm25: bool,
     ) -> Result<Self, String> {
         declare_placement_column(&mut config);
+        validate_column_tables(&config)?;
         let generation = config.index_path.as_ref().and_then(|path| {
             recover_segments_swap(path);
             recover_generation(path)
@@ -4631,6 +4674,7 @@ impl NodeServiceImpl {
     /// through the disk spiller (bounded heap, not searchable until
     /// Flush); path-less demo shards build in heap.
     fn new_builder(&self, generation: Option<&PathBuf>) -> Result<Bm25Shard, Status> {
+        validate_column_tables(&self.config).map_err(Status::failed_precondition)?;
         let names: Vec<&str> = self.config.bm25_fields.iter().map(String::as_str).collect();
         let facets: Vec<&str> = self
             .config
@@ -4659,6 +4703,12 @@ impl NodeServiceImpl {
         let integers: Vec<&str> = self
             .config
             .integer_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let unsigned_integers: Vec<&str> = self
+            .config
+            .unsigned_integer_fields
             .iter()
             .map(String::as_str)
             .collect();
@@ -4712,6 +4762,7 @@ impl NodeServiceImpl {
                                 .with_map_facet_fields(&map_facets)
                                 .with_map_numeric_fields(&map_numerics)
                                 .with_integer_fields(&integers)
+                                .with_unsigned_integer_fields(&unsigned_integers)
                                 .with_geo_fields(&geos)
                                 .with_position_fields(&positions)
                                 .with_sentence_fields(&sentences),
@@ -4726,6 +4777,7 @@ impl NodeServiceImpl {
                     .with_map_facets(&map_facets)
                     .with_map_numerics(&map_numerics)
                     .with_integers(&integers)
+                    .with_unsigned_integers(&unsigned_integers)
                     .with_geos(&geos)
                     .with_positions(&positions)
                     .with_sentences(&sentences),
@@ -4752,6 +4804,7 @@ impl NodeServiceImpl {
                 "ingest is fenced on this shard: {reason}"
             )));
         }
+        validate_column_tables(&self.config).map_err(Status::failed_precondition)?;
         if self
             .ingest_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -9343,6 +9396,27 @@ impl NodeServiceImpl {
             }
             slots
         };
+        let unsigned_integer_slots: Vec<(usize, u64)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen = std::collections::HashSet::new();
+            let mut slots = Vec::with_capacity(doc.unsigned_integers.len());
+            for value in &doc.unsigned_integers {
+                if !seen.insert(&value.field) {
+                    return Err(Status::invalid_argument(format!(
+                        "unsigned integer field {:?} repeats in one document",
+                        value.field
+                    )));
+                }
+                let column = shard.unsigned_integer_index(&value.field).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "unknown unsigned integer field {:?}; declare it in --unsigned-integer-fields",
+                        value.field
+                    ))
+                })?;
+                slots.push((column, value.value));
+            }
+            slots
+        };
         // Geo points (docs/geo-columns.md). Same refuse-before-mutating
         // shape as the others: every entry resolves and validates before
         // a single value is written, so a document that names one bad
@@ -9416,6 +9490,9 @@ impl NodeServiceImpl {
                 for &(ii, value) in &integer_slots {
                     store.set_integer(ii, local, value);
                 }
+                for &(ii, value) in &unsigned_integer_slots {
+                    store.set_unsigned_integer(ii, local, value);
+                }
                 for &(gi, lat, lon) in &geo_slots {
                     store.set_geo(gi, local, lat, lon);
                 }
@@ -9448,6 +9525,9 @@ impl NodeServiceImpl {
                 }
                 for &(ii, value) in &integer_slots {
                     store.set_integer(ii, doc_id, value);
+                }
+                for &(ii, value) in &unsigned_integer_slots {
+                    store.set_unsigned_integer(ii, doc_id, value);
                 }
                 for &(gi, lat, lon) in &geo_slots {
                     store.set_geo(gi, doc_id, lat, lon);
@@ -9482,6 +9562,9 @@ impl NodeServiceImpl {
                 }
                 for &(ii, value) in &integer_slots {
                     builder.set_integer(ii, doc_id, value);
+                }
+                for &(ii, value) in &unsigned_integer_slots {
+                    builder.set_unsigned_integer(ii, doc_id, value);
                 }
                 for &(gi, lat, lon) in &geo_slots {
                     builder.set_geo(gi, doc_id, lat, lon);

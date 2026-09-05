@@ -151,6 +151,7 @@ async fn ingest(
     tokio::spawn(async move {
         for i in 0..docs {
             tx.send(AddDocumentsRequest {
+                unsigned_integers: Vec::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,
@@ -1144,6 +1145,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     tokio::spawn(async move {
         for (i, name) in names_feed.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                unsigned_integers: Vec::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,

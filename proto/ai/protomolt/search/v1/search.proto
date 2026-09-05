@@ -2073,6 +2073,16 @@ message IntegerValue {
   sint64 value = 2;
 }
 
+// One unsigned integer value in a declared u64 column. The complete domain,
+// including zero and UINT64_MAX, is preserved with separate presence bits.
+message UnsignedIntegerValue {
+  // Name in the node's --unsigned-integer-fields table. Unknown names and
+  // repeated entries for the same field are INVALID_ARGUMENT.
+  string field = 1;
+  // Omit the entire entry for an absent value. Zero is a present value.
+  uint64 value = 2;
+}
+
 // One timestamp value of a document. Pure ingest sugar over
 // IntegerValue: the NODE converts the instant to EPOCH MICROSECONDS
 // and stores it in the named i64 column, so range facets and score
@@ -2298,6 +2308,9 @@ message AddDocumentsRequest {
   // route does not itself enforce version preconditions or persistent retries.
   // Requires original_source and the same chunk ordinal as above.
   DocumentIdentity identity = 25;
+  // Exact unsigned values, one entry per declared u64 column. The WAL retains
+  // these typed values for replay; they never pass through i64 or double.
+  repeated UnsignedIntegerValue unsigned_integers = 26;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share

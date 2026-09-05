@@ -63,10 +63,31 @@ Segmented reads retain unsigned values through the writable tail, frozen
 seal, publication and reopen. Tail replacement and segment opening require
 identical ordered field and column tables. Sealed summaries carry a separate
 `uint_columns` list with unsigned bounds and present counts; old summaries
-omit that list and provide no unsigned pruning information. These are storage
-primitives only: protobuf numeric mapping, ingest, query expressions and
-unsigned pruning are not yet connected to them. The schema report continues
-to describe the currently supported signed numeric range.
+omit that list and provide no unsigned pruning information.
+
+On the unsigned-numeric feature branch, `AddDocumentsRequest.unsigned_integers`
+carries `UnsignedIntegerValue { field, value }` entries. Declare the columns
+with `--unsigned-integer-fields`, `PIPESTREAM_SEARCH_UNSIGNED_INTEGER_FIELDS`,
+or `unsigned_integer_fields` in TOML. Rust uses
+`NodeConfig.unsigned_integer_fields`; the mobile protobuf bridge exposes the
+same list in `MobileShardConfig.unsigned_integer_fields`. Omit the entry for
+absence; an entry containing zero is present. Duplicate entries and unknown
+or signed-only column names refuse before applying the row. Column-name
+collisions refuse for CLI, Rust and embedded configurations.
+
+The WAL carries the u64 values directly. Flush/reopen, online compaction and
+offline WAL splitting preserve their bits. Online compaction now retains the
+live column tables on both layouts, including columns without any surviving
+value. Offline splitting without supplied column tables still derives its
+schema from the records present; it cannot reconstruct an entirely absent
+column declaration from those records. Flush remains the ordinary shard's
+durability boundary; this does not strengthen AddDocuments receipts.
+
+Protobuf numeric mapping, query expressions and unsigned pruning are not yet
+connected to the u64 family. The schema report continues to describe the
+currently supported signed numeric mapping range. Use matching server and
+client builds for this feature: older protobuf readers can ignore the new
+request field, and older storage readers refuse kind 11.
 
 Score stages read i64 columns transparently: `ScoreStage.column` with
 no `key` resolves against the f64 table first and the i64 table second

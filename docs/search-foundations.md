@@ -129,9 +129,28 @@ ingest and reopen; segment summaries keep unsigned ranges in `uint_columns`.
 Schema checks reject a tail or segment with different ordered columns before
 it can change the meaning of a column ordinal. Existing signed storage bytes
 and protobuf contracts are unchanged. This foundation does not yet enable
-mapped unsigned numerics: the ingest, WAL configuration, query/projection and
-pruning paths still need their own unsigned types before support is advertised.
+mapped unsigned numerics: mapping, query/projection and pruning still need
+their own unsigned types before support is advertised.
 See `tests/unsigned_columns.rs` and `docs/range-facets.md`.
+
+The next increment connects `UnsignedIntegerValue` to ordinary protobuf ingest,
+server/Rust/mobile configuration, all three write implementations and WAL
+replay. Duplicate or incompatible column names refuse before ingest, including
+for Rust callers that bypass the CLI. `tests/unsigned_ingest.rs` exercises zero,
+absent values, values above 2^53 and i64::MAX, and u64::MAX over gRPC, flush,
+reopen, repeated compaction and a two-child WAL split. It reproduced a
+single-image compaction bug that dropped entirely absent column declarations;
+both layouts now retain the live column tables. Offline splitting still needs
+a durable declaration contract to retain columns absent from all input records.
+
+Validation of the ingest increment on 2026-09-05: 421 library tests, 517
+integration tests across 87 targets and 11 embedded tests passed, with one
+existing sidecar test ignored. All five Android/iOS Rust target checks,
+tests/examples compilation, formatting and vendored-proto checks passed.
+The descriptor comparison against `ee2abb1` confirms that the only wire
+changes are the unsigned value message, ingest field 26 and mobile config
+field 28; existing declarations are unchanged. This branch includes the
+relay-BM25 main checkpoint `4dedddb`. No fleet rebuild or deployment ran.
 
 The unsigned storage foundation passed 420 library tests and 510 integration
 tests across 86 targets on the `0effb06` base, with one existing sidecar test

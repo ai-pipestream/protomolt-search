@@ -33,6 +33,7 @@ async fn add_documents(addr: &str, texts: &[&str]) {
     let (tx, rx) = mpsc::channel(8);
     for text in texts {
         tx.send(AddDocumentsRequest {
+            unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,
@@ -337,6 +338,7 @@ async fn fused_repeated_query_reuses_cached_stats() {
         let (tx, rx) = mpsc::channel(8);
         for (body, name) in *docs {
             tx.send(AddDocumentsRequest {
+                unsigned_integers: Vec::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,

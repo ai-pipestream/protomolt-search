@@ -1376,6 +1376,7 @@ mod tests {
                 lineage: None,
                 fields: Vec::new(),
                 integers: Vec::new(),
+                unsigned_integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
                 quality: None,

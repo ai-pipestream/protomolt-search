@@ -39,6 +39,8 @@ message MobileShardConfig {
   optional bool coalesce = 25;
   optional uint32 scan_parallel = 26;
   optional uint32 rerank_parallel = 27;
+  // Full-domain u64 columns, with the same local storage semantics as servers.
+  repeated string unsigned_integer_fields = 28;
 }
 
 // The complete create/open request. Optional scalars preserve the Rust

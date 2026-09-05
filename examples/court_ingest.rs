@@ -548,6 +548,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (facets, integers, timestamps) =
                         cluster_columns(&cluster_meta, chunk.cluster_id);
                     tx.send(AddDocumentsRequest {
+                        unsigned_integers: Vec::new(),
                         original_source: None,
                         source_chunk_ordinal: None,
                         identity: None,
@@ -1036,6 +1037,7 @@ async fn run_remote(
                     let (facets, integers, timestamps) =
                         cluster_columns(&cluster_meta2, chunk.cluster_id);
                     docs.push(AddDocumentsRequest {
+                        unsigned_integers: Vec::new(),
                         original_source: None,
                         source_chunk_ordinal: None,
                         identity: None,

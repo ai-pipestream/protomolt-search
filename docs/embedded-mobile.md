@@ -54,8 +54,11 @@ It also provides the local lifecycle needed to own a private index:
 - a generated in-memory `NodeServiceClient` for the remaining admin routes,
   including snapshot and encoded-row operations.
 
-`NodeConfig` owns the same BM25 field, facet, numeric, map, integer, and geo
-tables on server and device. `PlanIndex` runs the same deterministic mapping
+`NodeConfig` owns the same BM25 field, facet, numeric, map, signed integer,
+unsigned integer and geo tables on server and device. On the unsigned-numeric
+feature branch, `MobileShardConfig.unsigned_integer_fields` declares u64
+columns for ordinary protobuf ingest. Unsigned mapped ingest and query
+expressions remain in progress. `PlanIndex` runs the same deterministic mapping
 derivation, and mapped ingest binds the reviewed plan fingerprint before it
 accepts a document. Global BM25 statistics, vector score identity, hybrid
 fusion, tie order, live-document admission, CEL, facets, and query-stream

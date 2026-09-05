@@ -218,6 +218,7 @@ fn node_config(config: MobileShardConfig) -> Result<EmbeddedShardConfig, BridgeE
     node.map_facet_fields = config.map_facet_fields;
     node.map_numeric_fields = config.map_numeric_fields;
     node.integer_fields = config.integer_fields;
+    node.unsigned_integer_fields = config.unsigned_integer_fields;
     node.geo_fields = config.geo_fields;
     if let Some(value) = config.wal {
         node.wal = value;
@@ -862,6 +863,26 @@ mod tests {
             .expect("response envelope")
             .outcome
             .expect("response outcome")
+    }
+
+    #[test]
+    fn mobile_unsigned_column_declarations_survive_the_wire_bridge() {
+        let request = MobileShardConfig {
+            in_memory: true,
+            integer_fields: vec!["signed".into()],
+            unsigned_integer_fields: vec!["counter".into()],
+            ..Default::default()
+        };
+        let decoded = MobileShardConfig::decode(request.encode_to_vec().as_slice()).unwrap();
+        let configured = node_config(decoded).unwrap();
+        assert_eq!(configured.node.integer_fields, ["signed"]);
+        assert_eq!(configured.node.unsigned_integer_fields, ["counter"]);
+        let old = MobileShardConfig::decode([0x10u8, 0x01].as_slice()).unwrap();
+        assert!(node_config(old)
+            .unwrap()
+            .node
+            .unsigned_integer_fields
+            .is_empty());
     }
 
     #[test]

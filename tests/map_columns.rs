@@ -62,6 +62,7 @@ async fn add_documents_mapped(
     let (tx, rx) = mpsc::channel(8);
     for (text, strs, nums) in docs {
         tx.send(AddDocumentsRequest {
+            unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,
@@ -594,6 +595,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // Ingest refusals: empty key, repeated (column, key), unknown
     // column, empty string value, non-finite numeric value.
     let bad_facet = |field: &str, key: &str, value: &str| AddDocumentsRequest {
+        unsigned_integers: Vec::new(),
         original_source: None,
         source_chunk_ordinal: None,
         identity: None,

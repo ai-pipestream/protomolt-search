@@ -596,31 +596,42 @@ impl NodeServiceImpl {
             }
             Some(column.to_string())
         };
-        // The live column tables, for every segmented build: a bucket or
-        // a partition with no record of a declared column still declares
-        // it, or the output would not open under this configuration.
+        // Retain every declared column, including columns with no surviving
+        // values. Both storage layouts must reopen with the same schema.
+        macro_rules! column_tables {
+            ($store:expr) => {{
+                let s = $store;
+                crate::reshard::ColumnTables {
+                    facets: (0..s.facet_count())
+                        .map(|i| s.facet_name(i).to_string())
+                        .collect(),
+                    numerics: (0..s.numeric_count())
+                        .map(|i| s.numeric_name(i).to_string())
+                        .collect(),
+                    map_facets: (0..s.map_facet_count())
+                        .map(|i| s.map_facet_name(i).to_string())
+                        .collect(),
+                    map_numerics: (0..s.map_numeric_count())
+                        .map(|i| s.map_numeric_name(i).to_string())
+                        .collect(),
+                    integers: (0..s.integer_count())
+                        .map(|i| s.integer_name(i).to_string())
+                        .collect(),
+                    unsigned_integers: (0..s.unsigned_integer_count())
+                        .map(|i| s.unsigned_integer_name(i).to_string())
+                        .collect(),
+                    geo: (0..s.geo_count())
+                        .map(|i| s.geo_name(i).to_string())
+                        .collect(),
+                }
+            }};
+        }
         let columns = match guard.bm25.as_ref() {
-            Some(Bm25Shard::Segmented(s)) => Some(crate::reshard::ColumnTables {
-                facets: (0..s.facet_count())
-                    .map(|i| s.facet_name(i).to_string())
-                    .collect(),
-                numerics: (0..s.numeric_count())
-                    .map(|i| s.numeric_name(i).to_string())
-                    .collect(),
-                map_facets: (0..s.map_facet_count())
-                    .map(|i| s.map_facet_name(i).to_string())
-                    .collect(),
-                map_numerics: (0..s.map_numeric_count())
-                    .map(|i| s.map_numeric_name(i).to_string())
-                    .collect(),
-                integers: (0..s.integer_count())
-                    .map(|i| s.integer_name(i).to_string())
-                    .collect(),
-                geo: (0..s.geo_count())
-                    .map(|i| s.geo_name(i).to_string())
-                    .collect(),
-            }),
-            _ => None,
+            Some(Bm25Shard::Building(s)) => Some(column_tables!(s)),
+            Some(Bm25Shard::Resident(s)) => Some(column_tables!(s)),
+            Some(Bm25Shard::Segmented(s)) => Some(column_tables!(s)),
+            Some(Bm25Shard::Spilling(_)) => unreachable!("bulk build refused above"),
+            None => None,
         };
         if fields.is_some() && self.config.analysis_addr.is_none() {
             return Err(Status::unavailable(
