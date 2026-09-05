@@ -578,11 +578,13 @@ service SearchService {
   // Did-you-mean over one field's dictionary (docs/synonyms.md,
   // "Did you mean"): analyzes the text under the field's spec and, for
   // each term the dictionary lacks (or every term, under mode ALWAYS),
-  // proposes dictionary terms within `max_edits` Damerau-Levenshtein
-  // edits that share the term's first `prefix_length` characters,
-  // ranked by distance then df summed over the shards. The scan is the
-  // same bounded prefix scan Suggest runs (`max_scan`), so the cost is
-  // named and never a quieter answer. A stemmed field proposes stems.
+  // proposes dictionary terms within `max_edits` optimal string
+  // alignment edits (insert, delete, substitute, or transpose two
+  // adjacent characters) that share the term's first `prefix_length`
+  // characters, ranked by distance then df summed over the shards.
+  // The scan is the same bounded prefix scan Suggest runs (`max_scan`), so
+  // the cost is named and never a quieter answer. A stemmed field
+  // proposes stems.
   rpc TermSuggest(TermSuggestRequest) returns (TermSuggestResponse);
 }
 
