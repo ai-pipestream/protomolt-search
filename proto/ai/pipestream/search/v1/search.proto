@@ -4404,6 +4404,28 @@ message QueryRequest {
   // fewer than k groups. A browse refuses: it has no order to pick a
   // representative by.
   CollapseSpec collapse = 14;
+  // When true, every hit carries an `explain` tree: the arithmetic that
+  // produced its score, leaf by leaf and term by term (docs/explain.md).
+  // Results are unchanged; the response is larger.
+  bool explain = 15;
+  // Optional exact aggregation over the selection's candidate pool for
+  // non-boolean roots (a single leaf, a composite, a scorer, or a boost
+  // pool): the fold runs over exactly the pool the page was drawn from,
+  // and the response says how large that pool was. A boolean root
+  // carries its aggregation on BooleanQuery.aggregate instead, over the
+  // full match set; setting both refuses by name (docs/aggregations.md
+  // "Aggregating a query's pool").
+  AggregateRequest aggregate = 16;
+}
+
+// One node of a score explanation (docs/explain.md): the value this
+// node contributed, what it is in words, and the nodes it was computed
+// from. A leaf has no details. The tree is exact: a parent's value is
+// the stated function of its children's values.
+message Explanation {
+  double value = 1;
+  string description = 2;
+  repeated Explanation details = 3;
 }
 
 // One sort key (docs/query-api.md "Sorting").
@@ -5027,6 +5049,9 @@ message QueryHit {
   // to the request's `sort`; `sort_key` keeps the first key's numeric
   // value (0 for a text key).
   repeated SortValue sort_values = 10;
+  // The score explanation tree; present only when the request set
+  // `explain` (docs/explain.md).
+  Explanation explain = 11;
 }
 
 // One named raw relevance signal.
@@ -5850,6 +5875,25 @@ message HistogramSpec {
   // Cap on distinct buckets, 0 = 1024. Exceeding it REFUSES loudly:
   // the honest fixes are a coarser interval or a tighter filter.
   uint32 max_buckets = 4;
+  // Calendar bucketing for timestamp expressions (docs/aggregations.md
+  // "Date histograms"); when set, `interval` must be zero and buckets
+  // are calendar units in the given offset from UTC.
+  CalendarInterval calendar = 5;
+  // Fixed offset from UTC, in minutes, for calendar bucketing. Zero is
+  // UTC.
+  sint32 utc_offset_minutes = 6;
+}
+
+// Calendar units for date histograms (docs/aggregations.md).
+enum CalendarInterval {
+  CALENDAR_INTERVAL_UNSPECIFIED = 0;
+  CALENDAR_INTERVAL_MINUTE = 1;
+  CALENDAR_INTERVAL_HOUR = 2;
+  CALENDAR_INTERVAL_DAY = 3;
+  CALENDAR_INTERVAL_WEEK = 4;
+  CALENDAR_INTERVAL_MONTH = 5;
+  CALENDAR_INTERVAL_QUARTER = 6;
+  CALENDAR_INTERVAL_YEAR = 7;
 }
 
 // One requested aggregate.
@@ -5894,6 +5938,9 @@ enum AggregateOp {
   AGGREGATE_OP_VARIANCE = 6;
   // Population standard deviation, sqrt of the variance.
   AGGREGATE_OP_STDDEV = 7;
+  // Exact distinct count of the expression's values over the match set
+  // (docs/aggregations.md "Cardinality"). Never a sketch.
+  AGGREGATE_OP_CARDINALITY = 8;
 }
 
 message AggregateResponse {
@@ -5986,6 +6033,10 @@ message HistogramResult {
 
 // One occupied bucket.
 message HistogramBucket {
+  // Calendar histograms only: the bucket's lower bound as an exact epoch
+  // instant in the expression's unit (docs/aggregations.md "Date
+  // histograms"); `lower` then carries the same value as a double.
+  sint64 lower_int = 3;
   // Inclusive lower bound: index * interval.
   double lower = 1;
 

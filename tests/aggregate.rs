@@ -116,6 +116,8 @@ fn hist(name: &str, expression: &str, interval: f64, max_buckets: u32) -> Histog
         expression: expression.into(),
         interval,
         max_buckets,
+        calendar: 0,
+        utc_offset_minutes: 0,
     }
 }
 

@@ -2268,6 +2268,7 @@ pub(crate) fn agg_op_name(op: crate::pb::AggregateOp) -> &'static str {
         O::Mean => "mean",
         O::Variance => "variance",
         O::Stddev => "stddev",
+        O::Cardinality => "cardinality",
     }
 }
 

@@ -601,6 +601,7 @@ async fn execute_recursive_boolean(
             sort_key: 0.0,
             sort_values: Vec::new(),
             dimensions: Vec::new(),
+            explain: None,
         })
         .collect();
     hits.sort_by(|a, b| {
@@ -1247,6 +1248,7 @@ pub async fn execute(
                     sort_key: 0.0,
                     sort_values: Vec::new(),
                     dimensions: Vec::new(),
+                    explain: None,
                 })
                 .collect();
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
@@ -1313,6 +1315,7 @@ pub async fn execute(
                     sort_key: 0.0,
                     sort_values: Vec::new(),
                     dimensions: Vec::new(),
+                    explain: None,
                 })
                 .collect();
             let route = if fp32_rerank {
@@ -1484,6 +1487,7 @@ pub async fn execute(
                             sort_key: 0.0,
                             sort_values: Vec::new(),
                             dimensions: Vec::new(),
+                            explain: None,
                         }
                     })
                     .collect()
@@ -1532,6 +1536,7 @@ pub async fn execute(
                             sort_key: 0.0,
                             sort_values: Vec::new(),
                             dimensions: Vec::new(),
+                            explain: None,
                         }
                     })
                     .collect()
@@ -1782,6 +1787,7 @@ async fn execute_browse(
                     .map(|v| v.iter().map(crate::sortkeys::Value::to_pb).collect())
                     .unwrap_or_default(),
                 dimensions: Vec::new(),
+                explain: None,
             })
             .collect();
         let next = if req.k != 0 && hits.len() == req.k as usize {

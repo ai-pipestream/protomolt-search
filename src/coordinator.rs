@@ -748,6 +748,12 @@ pub(crate) fn compile_aggregations(
                 h.name
             )));
         }
+        if h.calendar != 0 || h.utc_offset_minutes != 0 {
+            return Err(Status::unimplemented(format!(
+                "histogram {:?}: calendar intervals are reserved and not served yet",
+                h.name
+            )));
+        }
         if !(h.interval > 0.0 && h.interval.is_finite()) {
             return Err(Status::invalid_argument(format!(
                 "histogram {:?}: the interval must be positive and finite, got {}",
@@ -1030,6 +1036,11 @@ impl AggMerge {
             O::Mean => Some(W::DoubleValue(self.mean)),
             O::Variance => Some(W::DoubleValue(self.m2 / self.present as f64)),
             O::Stddev => Some(W::DoubleValue((self.m2 / self.present as f64).sqrt())),
+            O::Cardinality => {
+                return Err(Status::unimplemented(format!(
+                    "aggregation {name:?}: cardinality is reserved and not served yet"
+                )));
+            }
             O::Unspecified => unreachable!("compile refused the unspecified op"),
         };
         Ok(crate::pb::AggregateResult {
@@ -8482,6 +8493,7 @@ impl CoordinatorServiceImpl {
                     .map(|(&idx, &count)| crate::pb::HistogramBucket {
                         lower: idx as f64 * spec.interval,
                         count,
+                        lower_int: 0,
                     })
                     .collect(),
                 present: hist_present[i],
