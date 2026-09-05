@@ -22,6 +22,7 @@ package ai.pipestream.search.v1;
 
 import "google/protobuf/timestamp.proto";
 import "ai/pipestream/search/v1/source.proto";
+import "ai/pipestream/search/v1/schema_report.proto";
 
 // NodeService is the internal shard-owner API. Exactly one node owns a given
 // shard; the coordinator is the only intended client.
@@ -5070,6 +5071,10 @@ message MappedPlan {
   // different descriptor sets may derive the same plan, and the plan is
   // what an index is bound to.
   string descriptor_sha256 = 9;
+
+  // Exhaustive reachable schema graph and exact mapped projection paths.
+  // This derived explanation does not change the projection fingerprint.
+  SchemaReport schema_report = 10;
 }
 
 // One message on the IngestMapped stream: the bind first, then

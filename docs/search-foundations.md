@@ -9,7 +9,7 @@ establish completion of the three workstreams.
 | Requirement | Required evidence | Current state |
 |---|---|---|
 | Faithful protobuf decoding and compatible index binding | Generated-runtime differential fixtures for presence, oneofs, merges, scalar encodings, unknown values and schema evolution | Oneof, presence, merged messages, int32, enum openness, required fields and groups corrected; v3 includes reachable extensions; coverage expanding |
-| Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Not implemented |
+| Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Accepted mapped plans return an exhaustive reachable schema graph and exact projection/query dispositions; standalone reporting of unbindable schemas and configurable index definitions remain |
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing mapped sources retained byte-for-byte through images, WAL, replicas, snapshots, compaction and resharding; zero-row logical documents remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public routes enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
@@ -71,8 +71,8 @@ rewrite stored fingerprints or replay reduced columns as proof of corrected
 extraction. Unmapped generations do not acquire a new mapping or require a
 rebuild from this change alone.
 
-Remaining protobuf work includes zero-row original retention, complete shape
-reporting, unsigned columns, repeated/nested correlation, extension indexing,
+Remaining protobuf work includes zero-row original retention, standalone shape
+reporting for unbindable schemas, unsigned columns, repeated/nested correlation, extension indexing,
 well-known types and Editions. Reachable MessageSet types are explicitly refused.
 The decoder dependency does not itself prove those contracts. Its behavior must
 be covered or adapted by the conformance suite before support is claimed.
@@ -122,3 +122,12 @@ Descriptors and source payloads are interned within each image and WAL
 generation; spill builders put payloads on disk. This does not yet establish
 logical identity, complete shape support, source disclosure permissions or
 transactional durability.
+
+## Schema report increment
+
+[Schema and projection report](schema-report.md) describes every reachable field
+and registered extension for accepted plans, including skipped and recursive
+shapes. Exact projection paths distinguish source-only occurrences, traversed
+containers and query values; constraints expose current value-domain losses.
+This does not supply the remaining scalar/nested/extension query implementations
+or an independently configurable index definition.

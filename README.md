@@ -1212,6 +1212,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Schema report (2026-09-05, `feat/search-foundations`).** Successful
+  `PlanIndex` responses enumerate the reachable protobuf graph, including
+  skipped fields, recursive/map types and registered extensions. Exact paths
+  distinguish preserved originals, projected values and query representations,
+  with current value-domain restrictions. Valid v3 fingerprints are unchanged.
+  See [schema reports](docs/schema-report.md).
+
 - **ProtoMolt namespace alignment (2026-09-05).** Vendored descriptor
   exchange, validation and indexing hints now use `ai.protomolt.proto.*`,
   matching their owner. Pipestream Search retains `ai.pipestream.search.*`.

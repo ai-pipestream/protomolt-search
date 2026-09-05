@@ -1,0 +1,88 @@
+syntax = "proto3";
+package ai.pipestream.search.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// A finite graph of every message, enum, ordinary field and registered
+// extension reachable from the root. Message type names are graph edges;
+// recursive, repeated and map edges are never dropped or expanded forever.
+// This describes mapped projection, before bind-time materialization or policy.
+// It is not a replacement for the original FileDescriptorSet: unknown custom
+// option bytes belong to source preservation, not these decoded descriptors.
+message SchemaReport {
+  uint32 report_version = 1;
+  string root_message = 2;
+  repeated SchemaMessage messages = 3;
+  repeated SchemaEnum enums = 4;
+  SourcePreservation unknown_fields = 5;
+  // Source retention currently requires at least one mapped row. A parent
+  // without chunks is not retained by the node, even though the archive can
+  // represent it. This report does not promise source-only document ingest.
+  bool requires_index_rows_for_preservation = 6;
+}
+
+enum SourcePreservation {
+  SOURCE_PRESERVATION_UNSPECIFIED = 0;
+  // Exact producer bytes within the retained original message, not a
+  // reserialization of projected values. No source-fetch RPC is implied.
+  SOURCE_PRESERVATION_ORIGINAL_BYTES = 1;
+}
+
+message SchemaMessage {
+  string full_name = 1;
+  string syntax = 2;
+  bool map_entry = 3;
+  repeated SchemaField fields = 4;
+  repeated google.protobuf.OneofDescriptorProto oneofs = 5;
+}
+
+message SchemaEnum {
+  string full_name = 1;
+  // Openness follows the file defining the enum. It determines whether
+  // unknown numeric values enter projection; original bytes are retained.
+  bool open = 2;
+  google.protobuf.EnumDescriptorProto descriptor = 3;
+}
+
+message SchemaField {
+  string full_name = 1;
+  google.protobuf.FieldDescriptorProto descriptor = 2;
+  bool extension = 3;
+  bool supports_presence = 4;
+  bool map = 5;
+  SourcePreservation preservation = 6;
+  // Exact root-relative paths and their dispositions. Only VALUE and
+  // CONTAINER paths participate in mapped projection; SOURCE_ONLY paths do
+  // not. Every unlisted occurrence, including recursion, is source-only.
+  repeated FieldProjection projections = 7;
+  string disposition = 8;
+  bool excluded_by_hint = 9;
+}
+
+enum ProjectionUse {
+  PROJECTION_USE_UNSPECIFIED = 0;
+  PROJECTION_USE_SOURCE_ONLY = 1;
+  // A traversed message or chunk scope, not an independently queryable value.
+  PROJECTION_USE_CONTAINER = 2;
+  PROJECTION_USE_VALUE = 3;
+}
+
+enum MappedQueryRepresentation {
+  MAPPED_QUERY_REPRESENTATION_NONE = 0;
+  MAPPED_QUERY_REPRESENTATION_ANALYZED_TEXT = 1;
+  MAPPED_QUERY_REPRESENTATION_STRING_FACET = 2;
+  MAPPED_QUERY_REPRESENTATION_SIGNED_INTEGER = 3;
+  MAPPED_QUERY_REPRESENTATION_FLOATING_POINT = 4;
+  MAPPED_QUERY_REPRESENTATION_DENSE_VECTOR = 5;
+}
+
+message FieldProjection {
+  string path = 1;
+  repeated uint32 field_numbers = 2;
+  string column_name = 3;
+  ProjectionUse use = 4;
+  MappedQueryRepresentation query_representation = 5;
+  // Domain restrictions and conversions imposed by the current extractor,
+  // separate from the producer's protobuf field type and original bytes.
+  repeated string constraints = 6;
+}

@@ -47,6 +47,9 @@ use tonic::Status;
 use crate::pb::{self, hints};
 use crate::sha256;
 
+#[path = "schema_report.rs"]
+mod schema_report;
+
 /// Full name of the field-option extension carrying indexing hints,
 /// owned by ProtoMolt and vendored under `proto/ai/protomolt/`.
 const HINT_EXTENSION_NAME: &str = "ai.protomolt.proto.index.hints.v1.index";
@@ -185,8 +188,27 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         chunks_path: chunks_path.unwrap_or_default(),
         chunk_id_path: chunk_id_path.unwrap_or_default(),
         descriptor_sha256: sha256::hex_digest(descriptor_set),
+        schema_report: None,
     };
     plan.fingerprint = fingerprint(&plan, &set, &pool);
+    let skipped_fields = index
+        .messages
+        .values()
+        .flat_map(|entry| {
+            entry
+                .desc
+                .field
+                .iter()
+                .enumerate()
+                .filter_map(|(i, field)| {
+                    hint_map
+                        .get(&(entry.key.clone(), i))
+                        .filter(|hint| hint.r#type == hints::IndexFieldType::Skip as i32)
+                        .map(|_| format!("{}.{}", entry.full, field.name()))
+                })
+        })
+        .collect();
+    plan.schema_report = Some(schema_report::build(&plan, &pool, &set, &skipped_fields)?);
     Ok(plan)
 }
 
@@ -775,6 +797,14 @@ fn validate_hint(
     path: &str,
 ) -> Result<(), Status> {
     use prost_types::field_descriptor_proto::Type;
+    if hint.kind == pb::MappedKind::Date
+        && !matches!(shape, Shape::Message { full, map: false, .. } if full == "google.protobuf.Timestamp")
+    {
+        return Err(refuse_at(
+            path,
+            "a DATE hint requires a google.protobuf.Timestamp field",
+        ));
+    }
     if hint.kind == pb::MappedKind::Vector {
         let element_ok = matches!(shape, Shape::Scalar(Type::Float | Type::Double));
         if !is_repeated(field) || !element_ok {

@@ -1,0 +1,44 @@
+syntax = "proto3";
+package report_fixture;
+import "ai/protomolt/proto/index/hints/v1/indexing_hints.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/timestamp.proto";
+
+message Record {
+  string id = 1;
+  repeated float embedding = 2;
+  string body = 3;
+  optional uint64 counter = 4;
+  bytes secret = 5 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_SKIP];
+  Node head = 6;
+  repeated Node other_nodes = 7;
+  map<string, Node> nodes_by_key = 8;
+  google.protobuf.Any dynamic = 9;
+  google.protobuf.Struct properties = 10;
+  google.protobuf.Int64Value wrapped = 11;
+  google.protobuf.Timestamp created = 14;
+  oneof selected {
+    string label = 12;
+    int32 code = 13;
+  }
+}
+message Node {
+  string caption = 1;
+  Node next = 2;
+  repeated int32 values = 3;
+  Hidden hidden = 4 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_SKIP];
+}
+message Hidden { string leaf = 1; }
+
+message InvalidText {
+  string id = 1;
+  repeated float embedding = 2;
+  int64 body = 3 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_TEXT];
+}
+message InvalidDate {
+  string id = 1;
+  repeated float embedding = 2;
+  Node date = 3 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_DATE];
+}
