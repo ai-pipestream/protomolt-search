@@ -74,6 +74,19 @@ proves this process owns the freeze. If publication fails after the map is
 durable, writes stay frozen: restart from the durable map or retry publication
 and do not reopen the old generation and losing a tail.
 
+## Relay coordinators
+
+`--relay` on a coordinator makes it serve the node-facing surface over
+its shard set and present itself to a parent coordinator as one shard,
+which is how a root stands over thousands of shards with a level in
+between. A relay serves `StreamSearch`, `TermStats`, and `Health` and
+refuses every other node route by name; it takes one unnamed collection
+on a dedicated endpoint, needs children with contiguous slot ranges, and
+under a placement tree serves one leaf. Its statistics epoch is a token
+bound to its children's epochs and to the map revision it was issued
+under; a parent that holds an older token is refused and refetches.
+Reference: `docs/relay-coordinators.md`.
+
 ## Splits, merges, and resharding
 
 Records are routed to write-ahead-log bucket files by the same partition

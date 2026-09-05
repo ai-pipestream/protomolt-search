@@ -71,6 +71,7 @@ pub mod proximity;
 pub mod quality;
 pub mod query;
 pub mod rankdiff;
+pub mod relay;
 #[cfg(feature = "net")]
 pub mod replication;
 pub mod reshard;

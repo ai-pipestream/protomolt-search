@@ -183,6 +183,15 @@ whether every shard completed and carries the observed score-space
 fingerprints. Facets, categories, and broader aggregation vocabulary can grow
 without weakening that completion rule.
 
+A relay coordinator (`docs/relay-coordinators.md`) puts a level between
+the root and thousands of shards without a new protocol: it serves the
+node-facing surface over its children and presents itself to its parent
+as one shard. Candidates go up untouched, floors and cancellation go down
+on the relay's own signed lane, the relay's completion frame follows the
+last child's, and the exactness argument composes because a floor is only
+ever a lower bound on the final cutoff. Its scope today is `StreamSearch`,
+`TermStats`, and `Health`; every other route refuses by name.
+
 ## 5. Search nodes
 
 A node serves one or more shards, and a persisted shard can contain four

@@ -1322,6 +1322,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Landed 2026-09-05: the restricted relay coordinator.** `--relay`
+  serves the node-facing surface over a coordinator's shard set and
+  presents itself to a parent as one shard: `StreamSearch` forwarded
+  untouched with floors and cancellation relayed on its own signed lane,
+  `TermStats` summed with checked arithmetic under a token bound to the
+  children's epochs, `Health` over contiguous children, every other route
+  refused by name. The map arrives through a revision-carrying interface
+  and every decision pins its revision. Flat, one-level, and two-level
+  execution agree bit for bit (`tests/relay.rs`).
+  [Relay coordinators](docs/relay-coordinators.md).
+
 - **Proposed 2026-09-05: replicated control authority.** The foundations
   work owns OpenRaft state, storage, transport and recovery; Fable owns relay
   consumers of the complete revisioned map. The design covers deterministic
