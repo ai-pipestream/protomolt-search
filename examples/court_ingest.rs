@@ -8,6 +8,12 @@
 //! ranges), preserving per-opinion locality within a shard where the
 //! file order allows.
 //!
+//! Columns (`--cluster-meta=<tsv>`, lines of `cluster_id\tYYYY-MM-DD\tcourt`):
+//! a chunk whose cluster is listed carries the facet `court`, the integer
+//! `year`, and the timestamp `decided` (the filing date at midnight UTC),
+//! so filters, partitioned compaction, and a placement tree have a key.
+//! Nodes must then run with `--facet-fields=court --integer-fields=year,decided`.
+//!
 //! ```text
 //! court_ingest --shards=4 --out-dir=/work/court-corpus/shards
 //! ```
@@ -23,7 +29,8 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastVectorBackendRequest,
-    DocLineage, DocumentField, FlushRequest, GetDocumentsRequest, HealthRequest,
+    DocLineage, DocumentField, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest,
+    IntegerValue, TimestampValue,
 };
 use pipestream_search::security::ToolClient;
 use tokio::sync::mpsc;
@@ -144,6 +151,98 @@ fn parse_body_columns(spec: &str) -> Result<Vec<BodyColumn>, String> {
 /// The extra-field entries for one chunk: every A/B body column over the
 /// chunk's own text, then a case_name DocumentField when the cluster map
 /// knows the chunk's cluster.
+/// One cluster's filing date and court from `--cluster-meta`.
+#[derive(Clone, Debug)]
+struct ClusterMeta {
+    year: i64,
+    /// The filing date at midnight UTC.
+    decided: prost_types::Timestamp,
+    court: String,
+}
+
+/// `cluster_id\tYYYY-MM-DD\tcourt` per line; an empty date or court
+/// leaves that value absent for the cluster.
+fn load_cluster_meta(path: &str) -> Result<HashMap<u64, ClusterMeta>, String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let mut map = HashMap::new();
+    for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("{path}:{}: {e}", i + 1))?;
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let id: u64 = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .map_err(|e| format!("{path}:{}: cluster id: {e}", i + 1))?;
+        let date = parts.next().unwrap_or("").trim();
+        let court = parts.next().unwrap_or("").trim();
+        if date.is_empty() || court.is_empty() {
+            continue;
+        }
+        let (year, seconds) = parse_civil_date(date)
+            .ok_or_else(|| format!("{path}:{}: date {date:?} is not YYYY-MM-DD", i + 1))?;
+        map.insert(
+            id,
+            ClusterMeta {
+                year,
+                decided: prost_types::Timestamp { seconds, nanos: 0 },
+                court: court.to_string(),
+            },
+        );
+    }
+    Ok(map)
+}
+
+/// `YYYY-MM-DD` to (year, seconds since the Unix epoch at midnight UTC),
+/// by the proleptic Gregorian day count. No calendar crate: the input is
+/// one fixed shape and the arithmetic is a dozen lines.
+fn parse_civil_date(text: &str) -> Option<(i64, i64)> {
+    let mut it = text.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Howard Hinnant's days_from_civil.
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((y, days * 86_400))
+}
+
+/// The typed column values of one chunk from its cluster's metadata.
+fn cluster_columns(
+    meta: &Option<std::sync::Arc<HashMap<u64, ClusterMeta>>>,
+    cluster_id: u64,
+) -> (Vec<FacetValue>, Vec<IntegerValue>, Vec<TimestampValue>) {
+    let Some(m) = meta.as_ref().and_then(|m| m.get(&cluster_id)) else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    (
+        vec![FacetValue {
+            field: "court".to_string(),
+            value: m.court.clone(),
+        }],
+        vec![IntegerValue {
+            field: "year".to_string(),
+            value: m.year,
+        }],
+        vec![TimestampValue {
+            field: "decided".to_string(),
+            value: Some(m.decided.clone()),
+        }],
+    )
+}
+
 fn chunk_fields(
     case_names: &Option<std::sync::Arc<std::collections::HashMap<u64, String>>>,
     cluster_id: u64,
@@ -313,6 +412,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "" => None,
             path => Some(std::sync::Arc::new(load_case_names(path)?)),
         };
+    let cluster_meta: Option<std::sync::Arc<HashMap<u64, ClusterMeta>>> =
+        match arg("cluster-meta", "").as_str() {
+            "" => None,
+            path => Some(std::sync::Arc::new(load_cluster_meta(path)?)),
+        };
     let body_columns = std::sync::Arc::new(parse_body_columns(&arg("body-columns", ""))?);
 
     // --- Load and join chunks x embeddings -------------------------------
@@ -428,6 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = addr.clone();
         let spec = spec.clone();
         let case_names = case_names.clone();
+        let cluster_meta = cluster_meta.clone();
         let body_columns = body_columns.clone();
         let security = security.clone();
         ingest_tasks.push(tokio::spawn(async move {
@@ -440,6 +545,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if i > 0 && i.is_multiple_of(20_000) {
                         eprintln!("  shard {shard}: {i}/{n} documents analyzed");
                     }
+                    let (facets, integers, timestamps) =
+                        cluster_columns(&cluster_meta, chunk.cluster_id);
                     tx.send(AddDocumentsRequest {
                         original_source: None,
                         source_chunk_ordinal: None,
@@ -451,7 +558,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         map_numerics: Vec::new(),
                         map_facets: Vec::new(),
                         numerics: Vec::new(),
-                        facets: Vec::new(),
+                        facets,
                         text: chunk.text.clone(),
                         analysis: Some(spec.clone()),
                         lineage: Some(DocLineage {
@@ -466,8 +573,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &body_columns,
                             &chunk.text,
                         ),
-                        integers: Vec::new(),
-                        timestamps: Vec::new(),
+                        integers,
+                        timestamps,
                         geo_points: Vec::new(),
                         quality: None,
                         geography: None,
@@ -635,6 +742,11 @@ async fn run_remote(
         match arg("case-names", "").as_str() {
             "" => None,
             path => Some(std::sync::Arc::new(load_case_names(path)?)),
+        };
+    let cluster_meta: Option<std::sync::Arc<HashMap<u64, ClusterMeta>>> =
+        match arg("cluster-meta", "").as_str() {
+            "" => None,
+            path => Some(std::sync::Arc::new(load_cluster_meta(path)?)),
         };
     // Extra A/B columns over the same body text (--body-columns). Nodes
     // must carry these names in --bm25-fields, in this order, after body.
@@ -886,6 +998,7 @@ async fn run_remote(
             let (btx, mut brx) = mpsc::channel::<(Vec<AddDocumentsRequest>, Vec<f32>)>(2);
             let spec2 = spec.clone();
             let case_names2 = case_names.clone();
+            let cluster_meta2 = cluster_meta.clone();
             let body_columns2 = body_columns.clone();
             let cp = chunks_path.clone();
             let ep = embeddings_path.clone();
@@ -920,6 +1033,8 @@ async fn run_remote(
                     // them before the body text moves into the request.
                     let fields =
                         chunk_fields(&case_names2, chunk.cluster_id, &body_columns2, &chunk.text);
+                    let (facets, integers, timestamps) =
+                        cluster_columns(&cluster_meta2, chunk.cluster_id);
                     docs.push(AddDocumentsRequest {
                         original_source: None,
                         source_chunk_ordinal: None,
@@ -931,7 +1046,7 @@ async fn run_remote(
                         map_numerics: Vec::new(),
                         map_facets: Vec::new(),
                         numerics: Vec::new(),
-                        facets: Vec::new(),
+                        facets,
                         text: chunk.text,
                         analysis: Some(spec2.clone()),
                         lineage: Some(DocLineage {
@@ -941,8 +1056,8 @@ async fn run_remote(
                             span_end: chunk.span_end,
                         }),
                         fields,
-                        integers: Vec::new(),
-                        timestamps: Vec::new(),
+                        integers,
+                        timestamps,
                         geo_points: Vec::new(),
                         quality: None,
                         geography: None,
