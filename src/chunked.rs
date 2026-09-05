@@ -62,6 +62,62 @@ pub struct ScanStats {
     /// the kernel does not know about segments.
     pub segments_total: u32,
     pub segments_skipped: u32,
+    /// Encoded index bytes the kernel streamed for this query: the rows
+    /// of every chunk it scanned (whole chunk unfiltered; the blocks the
+    /// allowlist left non-empty when filtered) times [`encoded_row_bytes`].
+    /// A batched query is charged the pass it rode, so summing this over
+    /// the queries of one batch counts the pass once per query; the
+    /// process-wide counters take the pass once through the observer
+    /// (`docs/bandwidth-budget.md`).
+    pub bytes_scanned: u64,
+    /// Wall time inside the kernel calls this query rode, in nanoseconds.
+    pub scan_nanos: u64,
+}
+
+/// One kernel call's cost: encoded bytes streamed and wall time inside
+/// the call. Reported once per call, however many queries rode it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanPass {
+    pub bytes: u64,
+    pub nanos: u64,
+}
+
+/// Bytes of the image the kernel reads per row: the packed codes
+/// (`dim / (8 / bits)` bytes, the format's own integer geometry) plus the
+/// row's 4-byte scale. The id column is not read by the scan and is not
+/// counted; neither are calibration tables, headers, or the FP32 sidecar.
+/// Zero for a lazy index whose geometry is not committed yet, which
+/// counts nothing rather than a guess.
+pub fn encoded_row_bytes(dim: usize, bits_per_dimension: usize) -> u64 {
+    if dim == 0 || bits_per_dimension == 0 || bits_per_dimension > 8 {
+        return 0;
+    }
+    let codes_per_byte = 8 / bits_per_dimension;
+    (dim / codes_per_byte) as u64 + 4
+}
+
+/// [`encoded_row_bytes`] of an index from its own geometry.
+pub fn index_row_bytes(index: &VectorIndex) -> u64 {
+    match (index.dim_opt(), index.bits_per_dimension()) {
+        (Some(dim), Some(bits)) => encoded_row_bytes(dim, bits),
+        _ => 0,
+    }
+}
+
+/// Rows a masked chunk streams: the kernel skips a block whose 32 slots
+/// are all masked out, so the count is the rows of the blocks that keep
+/// at least one allowed slot, clipped to the chunk.
+fn masked_rows(allow: &[bool], start: usize, end: usize) -> usize {
+    let mut rows = 0;
+    let mut block_start = start;
+    while block_start < end {
+        let block_end = (block_start + BLOCK_VECTORS).min(end);
+        if allow[block_start..block_end].iter().any(|&ok| ok) {
+            rows += block_end - block_start;
+        }
+        block_start = block_end;
+    }
+    rows
 }
 
 /// `true` when `a` ranks ahead of `b` in top-k order: score descending,
@@ -248,7 +304,31 @@ pub fn chunked_topk_batch(
     external_floor: &mut dyn FnMut(usize) -> Option<f32>,
     publish_floor: &mut dyn FnMut(usize, f32) -> bool,
 ) -> Vec<(Vec<ChunkHit>, ScanStats)> {
+    chunked_topk_batch_observed(
+        index,
+        queries,
+        chunk_blocks,
+        external_floor,
+        publish_floor,
+        &mut |_| {},
+    )
+}
+
+/// [`chunked_topk_batch`] with an observer that sees every kernel call
+/// once, with the bytes it streamed and its wall time, whatever the
+/// batch's size. The node's scan-rate window and the process counters
+/// take their samples here so a shared pass is counted once
+/// (`docs/bandwidth-budget.md`).
+pub fn chunked_topk_batch_observed(
+    index: &VectorIndex,
+    queries: &[BatchQuery<'_>],
+    chunk_blocks: usize,
+    external_floor: &mut dyn FnMut(usize) -> Option<f32>,
+    publish_floor: &mut dyn FnMut(usize, f32) -> bool,
+    observe: &mut dyn FnMut(ScanPass),
+) -> Vec<(Vec<ChunkHit>, ScanStats)> {
     let n = index.len();
+    let row_bytes = index_row_bytes(index);
     let nq = queries.len();
     let mut out: Vec<(Vec<ChunkHit>, ScanStats)> = queries
         .iter()
@@ -332,11 +412,12 @@ pub fn chunked_topk_batch(
             let chunk_k = if any_ties { usize::MAX } else { group_k };
 
             let allow = queries[group[0]].allow;
-            match allow {
+            let rows_streamed = match allow {
                 None => {
                     for slot in mask.iter_mut().take(end).skip(start) {
                         *slot = true;
                     }
+                    end - start
                 }
                 // A chunk in which the filters allow nothing is skipped
                 // outright: no kernel call, no candidates, and nothing to
@@ -344,8 +425,12 @@ pub fn chunked_topk_batch(
                 // itself, above the kernel's own all-masked block
                 // short-circuit.
                 Some(a) if !a[start..end].iter().any(|&ok| ok) => continue,
-                Some(a) => mask[start..end].copy_from_slice(&a[start..end]),
-            }
+                Some(a) => {
+                    mask[start..end].copy_from_slice(&a[start..end]);
+                    masked_rows(a, start, end)
+                }
+            };
+            let started = std::time::Instant::now();
             let results = index.search_with_options(
                 flat,
                 chunk_k,
@@ -353,6 +438,11 @@ pub fn chunked_topk_batch(
                     .with_mask(&mask)
                     .with_initial_threshold(kernel_floor),
             );
+            let pass = ScanPass {
+                bytes: rows_streamed as u64 * row_bytes,
+                nanos: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            };
+            observe(pass);
             for slot in mask.iter_mut().take(end).skip(start) {
                 *slot = false;
             }
@@ -360,6 +450,8 @@ pub fn chunked_topk_batch(
             for (local, &qi) in group.iter().enumerate() {
                 let q = &queries[qi];
                 out[qi].1.chunk_calls += 1;
+                out[qi].1.bytes_scanned += pass.bytes;
+                out[qi].1.scan_nanos += pass.nanos;
                 if q.k == 0 {
                     continue;
                 }
@@ -472,6 +564,7 @@ pub fn chunked_topk_collapsed(
 ) -> (Vec<CollapsedHit>, ScanStats) {
     let n = index.len();
     assert_eq!(parents.len(), n, "parents must map every slot of the index");
+    let row_bytes = index_row_bytes(index);
     if let Some(a) = allow {
         assert_eq!(
             a.len(),
@@ -514,6 +607,10 @@ pub fn chunked_topk_collapsed(
             }
             Some(a) => mask[start..end].copy_from_slice(&a[start..end]),
         }
+        let rows_streamed = match allow {
+            None => end - start,
+            Some(a) => masked_rows(a, start, end),
+        };
         // Escalate until the kernel provably returned everything at or
         // above the floor in this chunk (an unsaturated call). The
         // saturation test compares against the chunk's slot span, which
@@ -523,6 +620,7 @@ pub fn chunked_topk_collapsed(
         let mut chunk_k = k.max(1);
         let hits: Vec<ChunkHit> = loop {
             stats.chunk_calls += 1;
+            let started = std::time::Instant::now();
             let results = index.search_with_options(
                 query,
                 chunk_k.min(end - start),
@@ -530,6 +628,8 @@ pub fn chunked_topk_collapsed(
                     .with_mask(&mask)
                     .with_initial_threshold(floor),
             );
+            stats.bytes_scanned += rows_streamed as u64 * row_bytes;
+            stats.scan_nanos += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let mut hits = Vec::new();
             for (&score, &slot) in results
                 .scores_for_query(0)
@@ -628,6 +728,112 @@ mod tests {
         let mut idx = VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, dim, 4).unwrap();
         idx.add(&unit_vectors(n, dim, 0xC40C_0001), dim).unwrap();
         idx
+    }
+
+    /// The bytes a scan charges are the rows it streamed times the
+    /// image's row bytes, and a batched pass is observed once however
+    /// many queries rode it (`docs/bandwidth-budget.md`).
+    #[test]
+    fn scan_bytes_follow_the_geometry_and_a_shared_pass_counts_once() {
+        let (n, dim) = (5_000, 64);
+        let index = build(n, dim);
+        let row_bytes = index_row_bytes(&index);
+        assert_eq!(row_bytes, encoded_row_bytes(dim, 4));
+        assert_eq!(
+            row_bytes,
+            (64 / 2 + 4) as u64,
+            "4 bits: two codes a byte, plus the scale"
+        );
+        assert_eq!(encoded_row_bytes(0, 4), 0, "a lazy index counts nothing");
+        assert_eq!(encoded_row_bytes(64, 0), 0);
+
+        // One query, unfiltered: every row streamed exactly once.
+        let query = unit_vectors(1, dim, 0x0E50_0002);
+        let (_, stats) = chunked_topk(
+            &index,
+            &query,
+            10,
+            4,
+            &mut || None,
+            &mut |_| false,
+            false,
+            None,
+        );
+        assert_eq!(stats.bytes_scanned, n as u64 * row_bytes);
+        assert!(stats.scan_nanos > 0, "active time is observed");
+
+        // Four unfiltered queries in one batch: one pass, observed once
+        // per kernel call, and each query charged the pass it rode.
+        let vectors = unit_vectors(4, dim, 0x0E50_0003);
+        let queries: Vec<BatchQuery<'_>> = vectors
+            .chunks(dim)
+            .map(|v| BatchQuery {
+                vector: v,
+                k: 10,
+                keep_ties: false,
+                allow: None,
+            })
+            .collect();
+        let mut observed_bytes = 0u64;
+        let mut observed_calls = 0u32;
+        let results = chunked_topk_batch_observed(
+            &index,
+            &queries,
+            4,
+            &mut |_| None,
+            &mut |_, _| false,
+            &mut |pass| {
+                observed_bytes += pass.bytes;
+                observed_calls += 1;
+            },
+        );
+        assert_eq!(
+            observed_bytes,
+            n as u64 * row_bytes,
+            "the pass is counted once"
+        );
+        assert_eq!(
+            observed_calls, results[0].1.chunk_calls,
+            "one observation per kernel call"
+        );
+        for (_, stats) in &results {
+            assert_eq!(stats.bytes_scanned, n as u64 * row_bytes);
+        }
+
+        // A filter that empties whole chunks and whole blocks: only the
+        // blocks with an allowed slot are streamed.
+        let mut allow = vec![false; n];
+        allow[0] = true; // block 0 of chunk 0
+        allow[4 * BLOCK_VECTORS + 3] = true; // block 0 of chunk 1 (chunk = 4 blocks)
+        let (_, stats) = chunked_topk(
+            &index,
+            &query,
+            10,
+            4,
+            &mut || None,
+            &mut |_| false,
+            false,
+            Some(&allow),
+        );
+        assert_eq!(
+            stats.bytes_scanned,
+            2 * BLOCK_VECTORS as u64 * row_bytes,
+            "two blocks kept a slot; the other chunks streamed nothing"
+        );
+        assert_eq!(stats.chunk_calls, 2);
+        let empty = vec![false; n];
+        let (_, stats) = chunked_topk(
+            &index,
+            &query,
+            10,
+            4,
+            &mut || None,
+            &mut |_| false,
+            false,
+            Some(&empty),
+        );
+        assert_eq!(stats.bytes_scanned, 0);
+        assert_eq!(stats.scan_nanos, 0);
     }
 
     /// Plain scan (no external floors) must reproduce the index's own

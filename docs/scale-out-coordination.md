@@ -132,6 +132,10 @@ with `openraft` unless the user prefers to own the implementation. Option
 
 ## Item 3: bandwidth as the budget
 
+Status, 2026-09-05: the measurement and the balance dry run exist
+(`bandwidth-budget.md`); execution of a move and segment-subset
+ownership do not.
+
 An unfiltered vector query reads every 4-bit vector of every shard it
 touches. There is no per-chunk upper bound to stop early on, so the cost
 is bytes read divided by the node's scan rate, and the slowest node sets

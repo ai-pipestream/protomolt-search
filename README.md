@@ -1334,6 +1334,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   instrumentation that can proceed. Transparent route composition, automatic
   standby promotion and segment movement are not cleared; phone shards stay
   on their originating devices.
+- **Landed 2026-09-05: the observed scan rate and the balance dry run.**
+  Every kernel call counts the encoded bytes it streamed and its wall
+  time, once however many queries shared it (`turbovec_scan_bytes_total`,
+  `turbovec_scan_active_nanoseconds_total`); the node keeps a bounded
+  window and its lease renewal reports the rate with its freshness and
+  the node's residency. `ClusterControl.PlanBalance` plans whole-shard
+  moves within a placement leaf's node set from those rates, excludes a
+  device node by declaration, and moves nothing.
+  [Bandwidth as the budget](docs/bandwidth-budget.md).
+
 - **Landed 2026-09-05: placement ingest and shard pruning.** Under a
   placement tree the coordinator evaluates the tree per routed document
   and hashes inside the leaf; a node declares the column
