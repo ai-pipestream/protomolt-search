@@ -1,12 +1,32 @@
 # Placement trees
 
-CEL as the partition function. An ordered chain of predicates at each
-level assigns every document to a leaf; a leaf is a shard group with
-its own shard count and node set. The choice is stored on the row as an
-`i64` column holding the root-to-leaf path as a prefix code, so the
-layout is a materialized projection of the document's columns, a
-proposed tree is the same projection unmaterialized, and a subtree is
-one integer range the segment pruner already reasons about.
+Predicate partitioning with constraint exclusion. An ordered chain of
+predicates at each level assigns every document to a leaf; a leaf is a
+shard group with its own shard count and node set. The choice is stored
+on the row as an `i64` column holding the root-to-leaf path as a prefix
+code, so the layout is a materialized projection of the document's
+columns, a proposed tree is the same projection unmaterialized, and a
+subtree is one integer range the segment pruner already reasons about.
+
+## Terms
+
+The names here are the database ones, so the reader carries the proof
+with the word:
+
+- **Predicate partitioning** (also expression partitioning): the
+  partition function is a predicate over the row's columns, written in
+  the filter dialect. A multi-level tree is subpartitioning.
+- **Constraint exclusion** (also partition pruning): the planner skips a
+  partition whose predicate cannot hold together with the query filter.
+  The coordinator applies it to shards and the shard applies it to
+  segments, with the same sound rules.
+- **Logical partition**: a node of the tree that changes no file; its
+  predicate is resolved at query time as a bitmap, like a view.
+- **Materialized partition**: a node cut into its own segments by a
+  partitioned compaction on the placement column, like a materialized
+  view. Compaction materializes; a merge makes it logical again.
+- **Shard** keeps its meaning: the unit of the stable-key hash split. A
+  leaf is a set of shards; a partition is a predicate.
 
 Status, 2026-09-05: the contract, the tree, ingest evaluation, fan-out
 pruning, the dry run, and the offline placement split exist. The
@@ -186,15 +206,16 @@ publish) still partitions by the stable-key hash; keying its catch-up
 by the placement value is the next step, on the same
 `LiveReshardState` the hash flow uses.
 
-## Segments as leaves
+## Segments as leaves: logical and materialized partitions
 
 A segment sealed under one code has a summary of `min = max = code`, so
 its tree position is its summary and one walk serves coordinator,
-shard, and segment. A node in the tree is logical by default: a
-predicate costs a bitmap and changes no file. It becomes physical, a
-real segment cut by a partitioned compaction on the column, when it is
-a sharding boundary or when the recent-query ring and route counters
-show a cut would pay. Physical to logical is a merge.
+shard, and segment. A node in the tree is a logical partition by
+default: a predicate costs a bitmap and changes no file. It becomes a
+materialized partition, a real segment cut by a partitioned compaction
+on the column, when it is a sharding boundary or when the recent-query
+ring and route counters show a cut would pay. A merge makes it logical
+again.
 
 Design note with the full argument: sea-of-slop
 `design-notes/placement-trees-2026-09-05.md`.
