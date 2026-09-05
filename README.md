@@ -1222,6 +1222,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Open: a pinned shard does not check a direct row against its leaf's
+  predicates (2026-09-05).** `--placement-leaf` fills the placement code on a
+  document that arrives without one, and the node knows only the code, not
+  the tree. A direct `AddDocuments` row outside the leaf's predicates is
+  accepted, and shard pruning and implied-clause dropping both trust the
+  leaf's bounds. Routed ingest cannot produce such a row. The fix is for the
+  node to learn its leaf's predicates from the published topology and refuse
+  the row by name. See [placement](docs/placement.md).
+
 - **Full-domain signed numeric columns (2026-09-05).** Integer presence now
   has its own bitmap, so `i64::MIN` survives ingest, materialization, querying,
   reopen and compaction. New files use kind 10; older readers refuse it.
