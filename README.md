@@ -1336,7 +1336,9 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   observed on each node and carried on its lease, and a balance dry run
   within a placement leaf's node set. Nothing built; the reserved contract
   is on `feat/scale-out-reservation-2026-09` awaiting contract revisions.
-  [Scale-out coordination](docs/scale-out-coordination.md).
+  [Scale-out coordination](docs/scale-out-coordination.md). The replicated control
+  authority design is reviewed in
+  [raft-control-review-2026-09-05.md](docs/raft-control-review-2026-09-05.md).
   The [2026-09-05 review](docs/scale-out-coordination-review-2026-09-05.md)
   requests contract changes and defines the restricted query relay and scan
   instrumentation that can proceed. Transparent route composition, automatic
