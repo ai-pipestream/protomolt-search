@@ -1220,6 +1220,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Landed 2026-09-05: the diagnostics service.** `DiagnosticsService`
+  on every node and coordinator listener: runtime knobs that flip live
+  (`floor_sharing`, `segment_pruning`, the floor parameters, `max_k`,
+  the hedge delay) beside the startup-only settings, the metrics
+  registry as a snapshot and as a stream, per-shard layout diagnostics
+  with segment summaries and partition ranges, and the coordinator's
+  ring of recent requests; guarded by `admin = true` principals. Details:
+  [The diagnostics service](docs/diagnostics.md).
 - **Landed 2026-09-05: partitioned compaction and segment summaries.**
   Every sealed segment records, per integer and double column, its value
   range and how many rows carry one; `CompactShardRequest.partition_column`

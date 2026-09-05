@@ -62,6 +62,12 @@ pays the same plus one bool check per polled message.
 
 ## What is exported
 
+The same registry is also served as values by
+`DiagnosticsService.GetMetricsSnapshot` and streamed by
+`StreamMetrics` (`docs/diagnostics.md`); a test holds the snapshot and
+this page equal.
+
+
 ### Requests, by route
 
 Counted at ARRIVAL (a shard erroring under load shows as traffic, not

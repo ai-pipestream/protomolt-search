@@ -68,7 +68,13 @@ token = "…at least 16 bytes…"
 max_k = 200              # 0: the coordinator's max_k
 concurrency = 8          # 0: unlimited
 ingest_docs_per_sec = 500  # 0: unlimited
+admin = false            # true: may call the diagnostics service
 ```
+
+`admin = true` admits the principal to `DiagnosticsService`
+(`docs/diagnostics.md`): reading and setting runtime knobs, metrics
+snapshots, shard layouts, and recent queries. Any other principal gets
+`PERMISSION_DENIED` there. It grants no other quota or route.
 
 With principals configured every `SearchService` call — search, query,
 streaming query, aggregate, plan, routed ingest, topology, broadcast,
