@@ -3201,6 +3201,9 @@ struct SealPlan {
 pub struct NodeServiceImpl {
     /// Locked shard state; see [`ShardState`].
     pub(crate) state: Arc<RwLock<ShardState>>,
+    /// Commits share a permit; compaction reserves the final tail while
+    /// analysis runs. Waiting writers yield without blocking shard reads.
+    pub(crate) mutation_gate: Arc<tokio::sync::RwLock<()>>,
     /// Single-writer gate for ingest streams. Two concurrent AddDocuments
     /// (or AddVectors) streams would interleave positional ids into one
     /// shard — every doc logged, none attributable — so the second stream
@@ -3743,6 +3746,7 @@ impl NodeServiceImpl {
                 pending_compaction: None,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             seal_lock: Arc::new(std::sync::Mutex::new(())),
             compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -7766,7 +7770,7 @@ impl NodeServiceImpl {
     /// Apply one analyzed document: id assignment, store insert, WAL
     /// append. Must be called in arrival order — both transports
     /// guarantee it.
-    fn apply_analyzed_document(
+    async fn apply_analyzed_document(
         &self,
         doc: AddDocumentsRequest,
         analyzed: crate::postings::AnalyzedDoc,
@@ -7783,6 +7787,7 @@ impl NodeServiceImpl {
         // makes replay exact — the logged request carries the values, so
         // replay never calls the sidecar and never derives twice.
         let (doc, analyzed) = self.materialize_document(doc, analyzed)?;
+        let _mutation = self.mutation_gate.read().await;
         let mut guard = self.state.write().expect("shard state lock poisoned");
         self.apply_document_locked(
             &mut guard,
@@ -8744,7 +8749,8 @@ impl NodeServiceImpl {
         let mut next_apply = 0u64;
         let mut inbound_open = true;
         loop {
-            self.advance_apply(&mut pending, &mut results, &mut next_apply, added, first_id)?;
+            self.advance_apply(&mut pending, &mut results, &mut next_apply, added, first_id)
+                .await?;
             // A full tail seals here, between documents, so one long
             // stream never grows a segment past --seal-tail-docs.
             if self.seal_if_due().await? {
@@ -8817,7 +8823,8 @@ impl NodeServiceImpl {
                             &mut next_apply,
                             added,
                             first_id,
-                        )?;
+                        )
+                        .await?;
                         session = crate::analyzer::AnalyzeStream::open_with_vocab(
                             addr,
                             doc.analysis.as_ref(),
@@ -8872,7 +8879,7 @@ impl NodeServiceImpl {
     /// Advance the apply wavefront over every consecutive sequence whose
     /// body AND every extra field have landed, keeping application in
     /// arrival order.
-    fn advance_apply(
+    async fn advance_apply(
         &self,
         pending: &mut std::collections::BTreeMap<u64, PendingDoc>,
         results: &mut std::collections::HashMap<u64, crate::postings::AnalyzedDoc>,
@@ -8897,7 +8904,8 @@ impl NodeServiceImpl {
                 held.stable_routing_key,
                 added,
                 first_id,
-            )?;
+            )
+            .await?;
             *next_apply += 1;
         }
     }
@@ -10082,6 +10090,7 @@ impl NodeService for NodeServiceImpl {
             body_path: req.body_path,
             materialize_sha: req.materialize_sha,
         };
+        let _mutation = self.mutation_gate.read().await;
         let mut guard = self.state.write().expect("shard state lock poisoned");
         let already_bound = Self::apply_binding_locked(&mut guard, incoming)?;
         Ok(Response::new(crate::pb::ApplyWalBindingResponse {
@@ -10496,6 +10505,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<ConfigureVectorBackendRequest>,
     ) -> Result<Response<ConfigureVectorBackendResponse>, Status> {
+        let _mutation = self.mutation_gate.read().await;
         let already_configured = self.apply_backend_config(request.into_inner())?;
         Ok(Response::new(ConfigureVectorBackendResponse {
             already_configured,
@@ -10533,6 +10543,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<SetCalibrationRequest>,
     ) -> Result<Response<SetCalibrationResponse>, Status> {
+        let _mutation = self.mutation_gate.read().await;
         let already_seeded = self.apply_calibration(&request.into_inner())?;
         Ok(Response::new(SetCalibrationResponse { already_seeded }))
     }
@@ -10557,10 +10568,13 @@ impl NodeService for NodeServiceImpl {
                 }
                 let service = self.clone();
                 let key = stable_routing_key.clone();
-                let (batch_added, batch_first_id) =
-                    tokio::task::spawn_blocking(move || service.apply_batch(batch, key))
-                        .await
-                        .map_err(|e| Status::internal(format!("add task failed: {e}")))??;
+                let mutation = self.mutation_gate.clone().read_owned().await;
+                let (batch_added, batch_first_id) = tokio::task::spawn_blocking(move || {
+                    let _mutation = mutation;
+                    service.apply_batch(batch, key)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("add task failed: {e}")))??;
                 if added == 0 && batch_added > 0 {
                     first_id = batch_first_id;
                 }
@@ -10590,10 +10604,14 @@ impl NodeService for NodeServiceImpl {
         _request: Request<FlushRequest>,
     ) -> Result<Response<FlushResponse>, Status> {
         let service = self.clone();
-        tokio::task::spawn_blocking(move || service.flush_index())
-            .await
-            .map_err(|e| Status::internal(format!("flush task failed: {e}")))?
-            .map(Response::new)
+        let mutation = self.mutation_gate.clone().read_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _mutation = mutation;
+            service.flush_index()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("flush task failed: {e}")))?
+        .map(Response::new)
     }
 
     async fn install_snapshot(
@@ -10865,6 +10883,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<DeleteDocumentsResponse>, Status> {
         crate::metrics::timed(Route::DeleteDocuments, request, |request| async move {
             let req = request.into_inner();
+            let _mutation = self.mutation_gate.read().await;
             let mut guard = self.state.write().expect("shard state lock poisoned");
             self.delete_documents_locked(&mut guard, &req.doc_ids, req.expected_wal_generation)
                 .map(Response::new)
@@ -10878,6 +10897,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<CommitReplacementsResponse>, Status> {
         crate::metrics::timed(Route::CommitReplacements, request, |request| async move {
             let req = request.into_inner();
+            let _mutation = self.mutation_gate.read().await;
             let mut guard = self.state.write().expect("shard state lock poisoned");
             self.commit_replacements_locked(
                 &mut guard,
@@ -10913,7 +10933,10 @@ impl NodeService for NodeServiceImpl {
                 }
             };
             self.admit_collection(&bind.collection)?;
-            let extractor = self.bind_mapped(&bind)?;
+            let extractor = {
+                let _mutation = self.mutation_gate.read().await;
+                self.bind_mapped(&bind)?
+            };
             let fingerprint = extractor.plan().fingerprint.clone();
             let mut added = 0u64;
             let mut first_id = 0u64;

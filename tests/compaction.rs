@@ -700,7 +700,7 @@ async fn run_online_compaction(layout: Layout) {
         first.tail_records_applied > 0,
         "the tail applied nothing although writes ran"
     );
-    assert!(first.locked_tail_records <= 256);
+    assert_eq!(first.locked_tail_records, 0);
     assert!(
         first.write_lock_ms < 500,
         "write lock held {} ms",

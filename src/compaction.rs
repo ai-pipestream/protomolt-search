@@ -13,9 +13,10 @@
 //!    generation, and tail the live log into it through the same apply
 //!    functions ingest uses, no lock held, until fewer than `tail_bound`
 //!    records remain.
-//! 4. Under the shard's write lock: apply the last records, write a
-//!    commit marker, move the new generation into place, and swap the
-//!    state. Queries that snapshotted the old state finish on it.
+//! 4. Prepare the final tail without the shard's write lock. Under the
+//!    lock, verify the WAL has not advanced; otherwise release and retry.
+//!    Once caught up, write a commit marker, move the new generation into
+//!    place, and swap the state. Existing query snapshots finish on it.
 //! 5. The next flush (this call makes one at once) writes the new
 //!    generation's images, removes the marker, and retires the old
 //!    files. A marker found at open means the closing flush never ran:
@@ -47,15 +48,14 @@ use crate::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest, Segme
 use crate::vector::VectorIndex;
 use crate::wal::{self, ClockedTail, WalWriter};
 
-/// Records the tail loop leaves for the write-locked apply when the
-/// request does not say.
+/// Tail-pass size below which cutover preparation starts by default.
 const DEFAULT_TAIL_BOUND: u32 = 256;
 /// Unlocked tail passes before compaction gives up on a log that grows
 /// faster than the shadow applies it.
 const MAX_TAIL_PASSES: u64 = 10_000;
-/// Times the cutover releases the lock and applies an over-bound tail
-/// unlocked before refusing.
-const LOCKED_PASS_RETRIES: usize = 16;
+/// Cutover attempts before refusing writes that keep advancing the WAL
+/// during preparation.
+const CUTOVER_RETRIES: usize = 16;
 /// Concurrent analysis streams the build and tail open per spec.
 const ANALYSIS_STREAMS: usize = 2;
 /// The commit marker's format, for a reader that finds a newer one.
@@ -419,7 +419,8 @@ impl NodeServiceImpl {
         })?;
         probe_same_filesystem(&preflight.work_dir, &wal::wal_dir(&preflight.index_path))?;
 
-        let outcome = self.build_and_cut_over(&preflight, tail_bound, handle);
+        let mut analyze = self.analyzer(&handle);
+        let outcome = self.build_and_cut_over(&preflight, tail_bound, &mut analyze);
         match outcome {
             Ok(response) => {
                 // Everything the work directory held was moved or copied
@@ -620,7 +621,7 @@ impl NodeServiceImpl {
         &self,
         pre: &Preflight,
         tail_bound: usize,
-        handle: tokio::runtime::Handle,
+        analyze: &mut Analyze<'_>,
     ) -> Result<CompactShardResponse, Status> {
         let slot_offset = self.config.slot_offset;
         // The rewritten generation: the source manifest one generation
@@ -633,7 +634,6 @@ impl NodeServiceImpl {
         let mut new_wal = WalWriter::create(&wal_stage, new_manifest)
             .map_err(|e| Status::internal(format!("create the rewritten WAL generation: {e}")))?;
         let build_dir = pre.work_dir.join("build");
-        let mut analyze = self.analyzer(&handle);
         // The binding goes first in the rewritten log (a replica applies
         // it to an empty shard only), so it is read and logged before any
         // row is emitted.
@@ -688,7 +688,7 @@ impl NodeServiceImpl {
                 pre.segmented,
                 names.as_deref(),
                 pins.as_deref(),
-                &mut analyze,
+                analyze,
                 &mut sink,
             )
             .map_err(|e| Status::failed_precondition(format!("compaction build: {e}")))?
@@ -710,7 +710,7 @@ impl NodeServiceImpl {
         };
         shadow.id_map = build.id_map;
         let dense_rows = build.rows_before - build.tombstones;
-        let outcome = self.tail_and_cut_over(pre, &mut shadow, tail_bound, &mut analyze);
+        let outcome = self.tail_and_cut_over(pre, &mut shadow, tail_bound, analyze);
         match outcome {
             Ok((locked_records, write_lock_ms, tail_passes)) => {
                 let closing = Instant::now();
@@ -1413,32 +1413,34 @@ impl NodeServiceImpl {
             }
         }
 
-        // Cutover. A seal in flight finishes on the old state first; the
-        // seal lock is what a seal holds from freeze to republish.
+        // Reserve commits before taking the seal lock, matching Flush's
+        // order. Writers wait asynchronously while analysis and reads can
+        // still run. The state lock is held only for the final fence/swap.
+        let _mutation = self.mutation_gate.blocking_write();
         let _seal = self.seal_lock.lock().expect("seal lock poisoned");
         let mut attempt = 0usize;
         loop {
             attempt += 1;
-            let started = Instant::now();
-            let mut guard = self.state.write().expect("shard state lock poisoned");
-            let watermark = Self::flush_live_wal_locked(&mut guard, pre)?;
+            let watermark = self.flush_live_wal(pre)?;
             let records = tail
                 .read_through(watermark)
                 .map_err(|e| Status::failed_precondition(format!("tail the live WAL: {e}")))?;
-            if records.len() > tail_bound {
-                if attempt >= LOCKED_PASS_RETRIES {
+            // Analysis may use asynchronous I/O. A live-state lock here
+            // can block the runtime workers needed to complete that I/O.
+            self.apply_pass(shadow, records, analyze)?;
+            passes += 1;
+            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let started = Instant::now();
+            if Self::flush_live_wal_locked(&mut guard, pre)? != watermark {
+                drop(guard);
+                if attempt >= CUTOVER_RETRIES {
                     return Err(Status::resource_exhausted(format!(
-                        "writes outpace compaction: {} records arrived during the last pass, \
-                         above tail_bound {tail_bound}, {LOCKED_PASS_RETRIES} times in a row",
-                        records.len()
+                        "writes outpace compaction: the live WAL advanced during all \
+                         {CUTOVER_RETRIES} cutover preparations"
                     )));
                 }
-                drop(guard);
-                self.apply_pass(shadow, records, analyze)?;
                 continue;
             }
-            let locked_records = records.len() as u64;
-            self.apply_pass(shadow, records, analyze)?;
             shadow
                 .state
                 .wal
@@ -1453,7 +1455,7 @@ impl NodeServiceImpl {
             let held = started.elapsed().as_millis() as u64;
             drop(guard);
             drop(previous);
-            return Ok((locked_records, held, passes));
+            return Ok((0, held, passes));
         }
     }
 
@@ -1605,4 +1607,174 @@ fn probe_same_filesystem(work_dir: &Path, wal_dir: &Path) -> Result<(), Status> 
             wal_dir.display()
         ))
     })
+}
+
+#[cfg(all(test, feature = "net"))]
+mod tests {
+    use super::*;
+    use crate::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
+    use crate::node::NodeConfig;
+    use crate::vector::EMBEDDED_TURBOVEC;
+
+    #[tokio::test]
+    async fn a_reserved_cutover_yields_writers_without_blocking_reads() {
+        use crate::pb::node_service_server::NodeService;
+        let node = NodeServiceImpl::new(None, NodeConfig::default());
+        let reservation = node.mutation_gate.clone().write_owned().await;
+        let writer_node = node.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            started.send(()).unwrap();
+            writer_node
+                .delete_documents(tonic::Request::new(
+                    crate::pb::DeleteDocumentsRequest::default(),
+                ))
+                .await
+        });
+        entered.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !writer.is_finished(),
+            "write bypassed the cutover reservation"
+        );
+        node.health(tonic::Request::new(crate::pb::HealthRequest {}))
+            .await
+            .unwrap();
+        drop(reservation);
+        let deleted = writer.await.unwrap().unwrap().into_inner();
+        assert_eq!(deleted.deleted, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cutover_analysis_allows_reads_and_includes_writes_during_preparation() {
+        cutover_with_writes_during_analysis(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cutover_refuses_persistent_writes_without_replacing_the_live_generation() {
+        cutover_with_writes_during_analysis(true).await;
+    }
+
+    async fn cutover_with_writes_during_analysis(always_advance: bool) {
+        tokio::task::spawn_blocking(move || {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("psearch-cutover-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let sample = crate::harness::unit_vectors(32, 64, 19);
+            let config =
+                VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, 64, 4, &sample).unwrap();
+            let index = VectorIndex::from_backend_config(64, &config).unwrap();
+            let node = NodeServiceImpl::new(
+                Some(index),
+                NodeConfig {
+                    index_path: Some(dir.join("shard.vector")),
+                    analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+                    wal: true,
+                    ..Default::default()
+                },
+            );
+            let handle = tokio::runtime::Handle::current();
+            let spec = body_spec();
+            let texts = ["seed", "first tail", "second tail", "late tail"];
+            let analyzed = texts
+                .iter()
+                .map(|text| {
+                    handle
+                        .block_on(crate::analyzer::analyze_document(
+                            NATIVE_ANALYSIS_BACKEND,
+                            text,
+                            Some(&spec),
+                        ))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let append = |i: usize| {
+                let mut guard = node.state.write().unwrap();
+                node.apply_document_locked(
+                    &mut guard,
+                    AddDocumentsRequest {
+                        text: texts[i].into(),
+                        analysis: Some(spec.clone()),
+                        ..Default::default()
+                    },
+                    analyzed[i].clone(),
+                    Some(sample[..64].to_vec()),
+                    None,
+                    &mut 0,
+                    &mut 0,
+                )
+                .unwrap();
+            };
+            append(0);
+            node.flush_index().unwrap();
+            let pre = node
+                .preflight_at_row_boundary(&CompactShardRequest::default())
+                .unwrap();
+            std::fs::create_dir_all(&pre.work_dir).unwrap();
+            let mut calls = 0;
+            let mut analyze = |docs: &[(
+                &str,
+                Option<&crate::pb::AnalysisSpec>,
+                crate::analyzer::SessionLayers,
+            )]| {
+                assert!(
+                    node.state.try_read().is_ok(),
+                    "analysis ran while the live shard was write-locked"
+                );
+                calls += 1;
+                // Build, catch-up, and the first cutover preparation each
+                // receive another committed row. The final fence must retry.
+                if always_advance || calls <= 3 {
+                    append(calls.min(3));
+                }
+                handle
+                    .block_on(crate::analyzer::analyze_batch_streams(
+                        NATIVE_ANALYSIS_BACKEND,
+                        docs,
+                        2,
+                    ))
+                    .map_err(|error| error.to_string())
+            };
+            let result = node.build_and_cut_over(&pre, 256, &mut analyze);
+            let expected = if always_advance {
+                let error = result.unwrap_err();
+                assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+                assert!(error.message().contains("writes outpace compaction"));
+                assert_eq!(calls, 2 + CUTOVER_RETRIES);
+                let live = node.state.read().unwrap();
+                assert_eq!(live.wal.as_ref().unwrap().generation(), 0);
+                assert!(!marker_path(&pre.index_path).exists());
+                (0..=calls).map(|i| texts[i.min(3)]).collect::<Vec<_>>()
+            } else {
+                let response = result.unwrap();
+                assert_eq!(calls, 4);
+                assert_eq!(response.rows_after, 4);
+                assert_eq!(response.locked_tail_records, 0);
+                texts.to_vec()
+            };
+            let fetched = handle
+                .block_on(crate::pb::node_service_server::NodeService::get_documents(
+                    &node,
+                    tonic::Request::new(crate::pb::GetDocumentsRequest {
+                        doc_ids: (0..expected.len() as u64).collect(),
+                    }),
+                ))
+                .unwrap()
+                .into_inner();
+            let actual = fetched
+                .documents
+                .into_iter()
+                .map(|doc| doc.text)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            drop(node);
+            std::fs::remove_dir_all(dir).unwrap();
+        })
+        .await
+        .unwrap();
+    }
 }

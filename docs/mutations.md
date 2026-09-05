@@ -87,16 +87,22 @@ The shape is the live reshard's, in one process:
    ids and extend the id map; deletes and replacements map through it, and an
    id the map does not know is an error, never a skip; documents are analyzed
    through the node's own analysis backend in one batch per pass. The loop
-   repeats until fewer than `tail_bound` records (default 256) remain.
-5. **Cutover.** Under the write lock (after any seal in flight has
-   finished): fsync, apply the remaining records, fsync the shadow's
-   generation, write the commit marker, move the rewritten generation into
-   `<index>.wal/`, swap the files (the single-image layout takes the same
+   repeats until a pass consumes fewer than `tail_bound` records (default 256).
+5. **Cutover.** Reserve the commit gate, then wait for any seal in flight
+   to finish. Ingest commits, deletes, replacements, binding changes and
+   public flushes await shared permits asynchronously. Reads and analysis
+   can continue. Prepare the remaining tail without the live shard's write lock.
+   Acquire the write lock, fsync the live WAL, and verify its generation and
+   high watermark still match the prepared tail. If writes advanced the WAL,
+   release the lock and prepare the new records before retrying (16 attempts,
+   then refuse with "writes outpace compaction"). A generation change aborts.
+   Once caught up, fsync the shadow, write the commit marker, move the rewritten
+   generation into `<index>.wal/`, swap the files (the single-image layout takes
+   the same
    rename dance a snapshot install takes, `adopt_generation`; the segment
    layout swaps `segments.json`), swap the state, bump the stats epoch, and
-   release. If more than `tail_bound` records arrived since the last pass,
-   the lock is released, they apply unlocked, and the cutover retries (16
-   times, then it refuses: "writes outpace compaction"). Queries that
+   release both locks and the reservation. Analysis never runs under the live
+   shard's write lock. Queries that
    snapshotted the old state finish on it.
 6. **Closing flush.** The call then runs `Flush`, which writes the new
    generation's images, removes the marker, and retires the replaced files:
@@ -165,11 +171,12 @@ for inspection after a rollback and refused by name until removed.
   until cutover, and the old image, catalog entries, and WAL generation stay
   until the closing flush retires them (the WAL generation stays until
   archived).
-- The write-lock window is the final tail apply (at most `tail_bound`
-  records, analysis included), the marker, three or four renames, and the
-  state swap. On the test fixture (1,200 rows plus a writer appending,
-  deleting, and replacing throughout) it measured 13–39 ms with 18–90 records
-  applied under the lock; the test refuses above 500 ms.
+- The write-lock window includes the live WAL fence, the shadow WAL fsync,
+  the marker, three or four renames, and the state swap. No records or analysis run under that
+  lock, so `locked_tail_records` is zero. Earlier measurements of 13–39 ms
+  with 18–90 records applied under the lock describe the retired algorithm;
+  it could stall when analysis and a blocked ingest shared a runtime.
+  The concurrent-write fixture still refuses lock holds above 500 ms.
 - The closing flush costs what any flush on the layout costs: a segmented
   flush seals the tail rows into one small segment and rewrites the
   whole-shard FP32 sidecar; a single-image flush rewrites the image. It is
@@ -194,3 +201,13 @@ generation replaying to the same shard, the cursor and stale-generation
 refusals, distributed equal to monolithic beside an untouched shard, the
 refusal table, the snapshot-during-compaction abort, the dry run, and the
 rollback of an interrupted cutover.
+
+The unit regression `cutover_analysis_allows_reads_and_includes_writes_during_preparation`
+injects a committed write during final analysis, requires the live state to
+remain readable during every analysis call, and verifies the cutover includes
+the late write after retrying its watermark fence.
+The persistent-write regression forces every attempt to receive another write
+and verifies refusal leaves the live generation and every committed row intact.
+Those writes deliberately bypass the commit gate to exercise the WAL fence.
+A single-thread runtime test verifies a reserved cutover yields a public writer,
+allows health reads, and resumes the writer after the reservation is released.
