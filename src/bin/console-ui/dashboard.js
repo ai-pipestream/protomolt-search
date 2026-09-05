@@ -2,7 +2,7 @@
 // the runtime knobs, the shard map, and the recent-queries ring. Every
 // diagnostics call that the cluster does not serve yet renders as a
 // plain "not served" state and is polled slowly.
-import { api, el, clear, fmtMs, fmtNum, loadConfig, mountHeader, errorText, isUnimplemented, refreshStatus } from '/common.js';
+import { api, el, clear, fmtMs, fmtNum, fmtBytes, loadConfig, mountHeader, errorText, isUnimplemented, refreshStatus } from '/common.js';
 import { Sparkline, histogramQuantile, histogramDelta } from '/sparkline.js';
 
 const $ = (id) => document.getElementById(id);
@@ -28,6 +28,8 @@ async function init() {
   target.addEventListener('change', () => { state.target = target.value; restart(); });
   $('interval').addEventListener('change', () => restart());
   buildTiles();
+  $('plan-run').addEventListener('click', runPlacementPlan);
+  $('bal-run').addEventListener('click', runBalancePlan);
   restart();
 }
 
@@ -94,6 +96,8 @@ const TILES = [
   ['err_rate', 'errors / s', 'by status code'],
   ['cand_rate', 'candidates / s', 'vector scan'],
   ['floor_rate', 'floors published / s', 'shared cutoffs on the wire'],
+  ['scan_rate', 'scan bytes / s', 'encoded index bytes the kernel processed'],
+  ['scan_busy', 'scan active', 'kernel seconds per wall second'],
   ['shards_up', 'shards reachable', 'from ClusterHealth'],
   ['live_docs', 'live documents', 'from ClusterHealth'],
 ];
@@ -220,6 +224,22 @@ function ingest(raw) {
   setTile('cand_rate', fmtNum(Math.round(candRate))); state.tiles.get('cand_rate').push(candRate);
   setTile('floor_rate', floorRate.toFixed(1)); state.tiles.get('floor_rate').push(floorRate);
   setTile('in_flight', String(inFlight)); state.tiles.get('in_flight').push(inFlight);
+  // The scan budget's counters (docs/bandwidth-budget.md): bytes the
+  // provider scan processed and the kernel's active time, per second of
+  // wall time. Their ratio is this process's observed scan rate.
+  const bytesRate = rate('turbovec_scan_bytes_total');
+  const activeRate = rate('turbovec_scan_active_nanoseconds_total') / 1e9;
+  const hasScan = [...snap.counters.values()].some((c) => c.name === 'turbovec_scan_bytes_total');
+  if (hasScan) {
+    const observed = activeRate > 0 ? bytesRate / activeRate : 0;
+    setTile('scan_rate', `${fmtBytes(bytesRate)}/s`, observed > 0 ? `${fmtBytes(observed)}/s while scanning` : 'encoded index bytes the kernel processed');
+    setTile('scan_busy', activeRate.toFixed(3), 'kernel seconds per wall second');
+    state.tiles.get('scan_rate').push(bytesRate);
+    state.tiles.get('scan_busy').push(activeRate);
+  } else {
+    setTile('scan_rate', '–', 'no scan counters in this snapshot');
+    setTile('scan_busy', '–', 'no scan counters in this snapshot');
+  }
 
   // Overall p99 over the window: merge every request-duration histogram
   // without a phase label (phased ones count a request twice).
@@ -316,19 +336,73 @@ function renderKnobs(r, err) {
 // Shard map
 // ---------------------------------------------------------------------------
 
+// A shard whose layout diagnostics came back as a relay's refusal is a
+// relay: the relay coordinator serves the node-facing surface only and
+// names itself in the refusal (docs/relay-coordinators.md). The children
+// behind it are its own shard map, which the coordinator's diagnostics
+// do not see.
+function isRelay(s) {
+  return /relay/i.test(s.layout || '') && !(s.segments || []).length;
+}
+
+// The placement code as its path: one index per level, root first, in
+// the tree's fixed field width (docs/placement.md "The code"). The width
+// is the default unless the map says otherwise; the raw code is shown
+// beside it so nothing is lost when the width differs.
+function codePath(code, levelBits = 9n) {
+  const c = BigInt(code);
+  const path = [];
+  const levels = 63n / levelBits;
+  for (let level = 0n; level < levels; level++) {
+    const shift = 63n - levelBits * (level + 1n);
+    path.push(Number((c >> shift) & ((1n << levelBits) - 1n)));
+  }
+  while (path.length > 1 && path[path.length - 1] === 0) path.pop();
+  return path.join('.');
+}
+
+function renderPlacement(r) {
+  const box = clear($('placement'));
+  const shards = (r.shards || []).filter((s) => s.hasPlacement);
+  if (!shards.length) { box.append(el('div', { class: 'muted small', text: 'no placement tree: shards are hashed by stable key only' })); return; }
+  const groups = new Map();
+  for (const s of shards) {
+    const code = String(s.placement ?? '0');
+    if (!groups.has(code)) groups.set(code, []);
+    groups.get(code).push(s);
+  }
+  box.append(el('div', { class: 'muted small', text: `placement tree: ${groups.size} group(s) served, by code` }));
+  for (const [code, members] of [...groups.entries()].sort((a, b) => (BigInt(a[0]) < BigInt(b[0]) ? -1 : 1))) {
+    const rows = members.reduce((a, s) => a + Number(s.rows || 0), 0);
+    const mixed = members.filter((s) => s.placementMixed).length;
+    box.append(el('div', { class: 'group' }, [
+      el('strong', { text: `path ${codePath(code)}` }), el('span', { class: 'code', text: `code ${code}` }),
+      el('span', { text: `${members.length} shard(s): ${members.map((s) => (isRelay(s) ? `relay ${s.shard}` : s.shard)).join(', ')}` }),
+      el('span', { class: 'muted', text: `${fmtNum(rows)} rows` }),
+      mixed ? el('span', { class: 'pill warn', text: `${mixed} mid-migration` }) : null,
+    ]));
+  }
+}
+
 function renderShards(r, err) {
   const box = clear($('shards'));
-  if (!r) { box.textContent = isUnimplemented(err) ? 'not served by this cluster' : errorText(err); return; }
+  if (!r) { clear($('placement')); box.textContent = isUnimplemented(err) ? 'not served by this cluster' : errorText(err); return; }
   box.classList.remove('muted');
+  renderPlacement(r);
   box.append(el('div', { class: 'muted small', text: `process ${r.process || ''}, topology ${r.topologyGeneration || 0}` }));
   for (const s of r.shards || []) {
     const shard = el('div', { class: 'shard' });
+    const relay = isRelay(s);
     shard.append(el('div', { class: 'head' }, [
-      el('strong', { text: `shard ${s.shard}` }), el('span', { class: 'muted', text: s.address || '' }), el('span', { text: s.layout || '' }),
-      el('span', { text: `${fmtNum(s.liveRows)} live / ${fmtNum(s.rows)} rows, ${fmtNum(s.tombstones)} tombstones, tail ${fmtNum(s.tailRows)}` }),
+      el('strong', { text: `shard ${s.shard}` }), el('span', { class: 'muted', text: s.address || '' }),
+      relay ? el('span', { class: 'pill relay', text: 'relay' }) : el('span', { text: s.layout || '' }),
+      relay ? el('span', { class: 'muted', text: 'a relay coordinator: candidates and cutoffs forwarded from its children; layout is theirs' }) : el('span', { text: `${fmtNum(s.liveRows)} live / ${fmtNum(s.rows)} rows, ${fmtNum(s.tombstones)} tombstones, tail ${fmtNum(s.tailRows)}` }),
+      s.hasPlacement ? el('span', { class: 'team-a', text: `placement ${codePath(s.placement)}` }) : null,
+      s.placementMixed ? el('span', { class: 'pill warn', text: 'mixed codes: mid-migration' }) : null,
       s.partitionKey ? el('span', { class: 'team-a', text: `partitioned by ${s.partitionKey}` }) : null,
-      el('span', { class: 'muted', text: `pruning ${s.segmentPruning ? 'on' : 'off'}, floors ${s.floorSharing ? 'on' : 'off'}` }),
+      relay ? null : el('span', { class: 'muted', text: `pruning ${s.segmentPruning ? 'on' : 'off'}, floors ${s.floorSharing ? 'on' : 'off'}` }),
     ]));
+    if (relay) { box.append(shard); continue; }
     const segments = s.segments || [];
     if (segments.length) {
       const total = segments.reduce((a, g) => a + Number(g.rows), 0) || 1;
@@ -384,4 +458,142 @@ function renderRecent(r, err) {
   }
   table.append(tbody);
   box.append(table);
+}
+
+// ---------------------------------------------------------------------------
+// The placement dry run
+// ---------------------------------------------------------------------------
+
+// The shard map's `[placement]` shape (docs/placement.md) as PlacementTree
+// JSON. A `[[placement.nodes]]` header opens a root node, each further
+// `.children` opens a child of the last node one level up; a node with no
+// `cel` is its level's default. JSON input is passed through.
+export function parseTree(text) {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{')) return JSON.parse(trimmed);
+  const tree = { column: 'placement', level_bits: 0, nodes: [] };
+  let stack = []; // the open node per depth
+  let current = null; // the table the next key = value belongs to
+  const unquote = (v) => {
+    v = v.trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) return v.slice(1, -1);
+    return v;
+  };
+  const list = (v) => {
+    v = v.trim();
+    if (!v.startsWith('[')) throw new Error(`expected a list: ${v}`);
+    return v.slice(1, -1).split(',').map((x) => unquote(x)).filter((x) => x.length);
+  };
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (!line) continue;
+    if (line.startsWith('[[')) {
+      const header = line.replace(/^\[\[/, '').replace(/\]\]$/, '').trim();
+      const parts = header.split('.');
+      if (parts[0] !== 'placement' || parts[1] !== 'nodes') throw new Error(`unknown table ${header}`);
+      const depth = parts.slice(2).filter((x) => x === 'children').length;
+      if (parts.length !== 2 + depth) throw new Error(`unknown table ${header}`);
+      if (depth > stack.length) throw new Error(`${header} has no parent node`);
+      const node = { name: '', cel: '', shards: 0, nodes: [], children: [] };
+      stack = stack.slice(0, depth);
+      (depth === 0 ? tree.nodes : stack[depth - 1].children).push(node);
+      stack.push(node);
+      current = node;
+      continue;
+    }
+    if (line.startsWith('[')) {
+      if (line !== '[placement]') throw new Error(`unknown table ${line}`);
+      current = tree;
+      stack = [];
+      continue;
+    }
+    const eq = line.indexOf('=');
+    if (eq < 0) throw new Error(`not a key = value line: ${line}`);
+    const key = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1);
+    const target = current || tree;
+    if (target === tree) {
+      if (key === 'column') tree.column = unquote(value);
+      else if (key === 'level_bits') tree.level_bits = Number(value);
+      else throw new Error(`unknown placement key ${key}`);
+    } else if (key === 'name') target.name = unquote(value);
+    else if (key === 'cel') target.cel = unquote(value);
+    else if (key === 'shards') target.shards = Number(value);
+    else if (key === 'nodes') target.nodes = list(value);
+    else throw new Error(`unknown node key ${key}`);
+  }
+  return tree;
+}
+
+async function runPlacementPlan() {
+  const out = clear($('plan-out'));
+  out.classList.add('plan');
+  let proposed;
+  try { proposed = parseTree($('plan-tree').value); } catch (e) { out.append(el('div', { class: 'error', text: `tree: ${e.message}` })); return; }
+  const request = { proposed, filter: $('plan-filter').value.trim() };
+  out.textContent = 'planning…';
+  let r;
+  try { r = await api.rpc('SearchService', 'PlanPlacement', request); } catch (e) { clear(out).append(el('div', { class: 'error', text: errorText(e) })); return; }
+  clear(out);
+  out.classList.remove('muted');
+  const cells = (r.cells || []).slice().sort((a, b) => Number(a.shard) - Number(b.shard) || (BigInt(a.code) < BigInt(b.code) ? -1 : 1));
+  const table = el('table', {}, [el('thead', {}, [el('tr', {}, ['shard', 'leaf', 'code', 'rows', 'moving'].map((h) => el('th', { class: h === 'rows' || h === 'moving' ? 'num' : '', text: h })))])]);
+  const tbody = el('tbody');
+  for (const c of cells) {
+    tbody.append(el('tr', {}, [
+      el('td', { class: 'mono', text: c.shard }), el('td', { class: 'mono', text: c.leaf || '' }), el('td', { class: 'mono', text: `${codePath(c.code)} (${c.code})` }),
+      el('td', { class: 'num', text: fmtNum(c.rows) }), el('td', { class: `num ${Number(c.movingRows) ? 'team-b' : ''}`, text: fmtNum(c.movingRows) }),
+    ]));
+  }
+  table.append(tbody);
+  out.append(table);
+  out.append(el('div', { class: 'totals', text: `${fmtNum(r.rows)} rows, ${fmtNum(r.movingRows)} would move, ${fmtNum(r.defaultedRows)} take a default, topology ${r.topologyGeneration || 0}` }));
+  out.append(el('details', {}, [el('summary', { class: 'muted small', text: 'request as sent' }), el('pre', { class: 'raw', text: JSON.stringify(request, null, 1) })]));
+}
+
+// ---------------------------------------------------------------------------
+// The balance dry run
+// ---------------------------------------------------------------------------
+
+async function runBalancePlan() {
+  const out = clear($('bal-out'));
+  out.classList.add('plan');
+  const request = {
+    min_gain: Number($('bal-gain').value) || 0,
+    max_moves: Number($('bal-moves').value) || 0,
+    max_rate_age_ms: Number($('bal-age').value) || 0,
+  };
+  out.textContent = 'planning…';
+  let r;
+  try { r = await api.rpc('ClusterControl', 'PlanBalance', request); } catch (e) { clear(out).append(el('div', { class: 'error', text: errorText(e) })); return; }
+  clear(out);
+  out.classList.remove('muted');
+  const secs = (v) => (v == null || Number(v) === 0 ? '–' : `${Number(v).toFixed(2)} s`);
+  out.append(el('div', { class: 'totals', text: `slowest node ${secs(r.secondsBefore)} before, ${secs(r.secondsAfter)} after ${(r.moves || []).length} move(s); min gain ${r.minGain}, max moves ${r.maxMoves}; topology ${r.topologyGeneration || 0}, control revision ${r.controlRevision || 0}` }));
+  const loads = el('table', {}, [el('thead', {}, [el('tr', {}, ['node', 'residency', 'bytes', 'rate', 'seconds', 'shards'].map((h) => el('th', { class: ['bytes', 'rate', 'seconds'].includes(h) ? 'num' : '', text: h })))])]);
+  const lb = el('tbody');
+  for (const l of r.loads || []) {
+    lb.append(el('tr', {}, [
+      el('td', { class: 'mono', text: l.nodeId }), el('td', { text: (l.residency || '').replace('NODE_RESIDENCY_', '').toLowerCase() }),
+      el('td', { class: 'num', text: fmtBytes(l.bytes) }), el('td', { class: 'num', text: Number(l.scanBytesPerSecond) ? `${fmtBytes(l.scanBytesPerSecond)}/s` : 'unknown' }),
+      el('td', { class: 'num', text: secs(l.seconds) }), el('td', { class: 'mono', text: (l.shards || []).join(', ') }),
+    ]));
+  }
+  loads.append(lb);
+  out.append(el('h3', { text: 'Loads' }), loads);
+  const moves = el('table', {}, [el('thead', {}, [el('tr', {}, ['shard', 'from', 'to', 'bytes', 'group', 'seconds after'].map((h) => el('th', { class: h === 'bytes' || h === 'seconds after' ? 'num' : '', text: h })))])]);
+  const mb = el('tbody');
+  for (const m of r.moves || []) {
+    mb.append(el('tr', {}, [
+      el('td', { class: 'mono', text: m.shard }), el('td', { class: 'mono', text: m.fromNode }), el('td', { class: 'mono', text: m.toNode }),
+      el('td', { class: 'num', text: fmtBytes(m.bytes) }), el('td', { class: 'mono', text: m.leaf || '' }), el('td', { class: 'num', text: secs(m.secondsAfter) }),
+    ]));
+  }
+  moves.append(mb);
+  out.append(el('h3', { text: (r.moves || []).length ? 'Moves' : 'No move clears the gain threshold' }), moves);
+  if ((r.excluded || []).length) {
+    out.append(el('h3', { text: 'Excluded' }));
+    for (const x of r.excluded) out.append(el('div', { class: 'small mono', text: `${x.nodeId}: ${x.reason}` }));
+  }
+  out.append(el('details', {}, [el('summary', { class: 'muted small', text: 'response' }), el('pre', { class: 'raw', text: JSON.stringify(r, null, 1) })]));
 }

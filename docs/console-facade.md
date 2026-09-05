@@ -16,9 +16,14 @@ every field rendered, defaults included (what `grpcurl -emit-defaults`
 prints), so a document id of 0 is a value and not an omission. Every
 unary method of `SearchService` and `DiagnosticsService` is reachable
 this way; the mapping is built from the compiled descriptor set at run
-time, so an RPC added to the proto needs no facade change. `NodeService`
-and `ClusterControl` are the cluster's internal surfaces and are not
-exposed. A gRPC status becomes an HTTP status (`INVALID_ARGUMENT` 400,
+time, so an RPC added to an exposed service needs no facade change.
+`NodeService` is the cluster's internal surface and is not exposed.
+`ClusterControl` is internal too, and the facade lists one of its
+methods by name: `PlanBalance`, the read-only balance dry run the
+dashboard renders (`docs/bandwidth-budget.md`). The wire still applies
+cluster trust to that call, so the facade's own credentials must be a
+member's; the other control methods answer 404 from the facade, naming
+the exposed surface. A gRPC status becomes an HTTP status (`INVALID_ARGUMENT` 400,
 `UNAUTHENTICATED` 401, `PERMISSION_DENIED` 403, `NOT_FOUND` 404,
 `RESOURCE_EXHAUSTED` 429, `UNIMPLEMENTED` 501, anything else 502) with
 the status message in a JSON `error` field and its name in `code`,
@@ -66,8 +71,8 @@ collapse with inner hits, highlight snippets, an aggregation rail
 (group-by, folds, a fixed or calendar histogram, percentiles), the
 explain and profile flags, and cursor paging. Hits show scores, signals,
 scorer dimensions, matched clauses, snippets or the stored text, and a
-foldable explain tree; the profile line shows phase timings and the
-segments skipped. Typeahead comes from `Suggest` on the last word,
+foldable explain tree; the profile line shows phase timings, the shards
+the coordinator skipped from their placement, and the segments skipped. Typeahead comes from `Suggest` on the last word,
 did-you-mean from `TermSuggest` after each query. The Stream button
 runs the same request through `QueryStream` and logs each revision. The
 A/B panel runs `VariantSearch` with two configurations and shows both
@@ -79,16 +84,30 @@ pasted vector otherwise.
 
 **Dashboard** (`/dashboard`) streams `StreamMetrics` from the chosen
 process into tiles with sparklines (requests per second, windowed p99,
-in flight, errors, scan candidates, floors published) and a per-route
-table with p50 and p99 from the latency histograms over the stream's
-window; a knobs panel from `GetRuntimeKnobs` with inputs that call
-`SetRuntimeKnob` and show the startup value; a shard map from
-`GetShardDiagnostics` drawing each shard's sealed segments as bars, in
-green when a partitioned compaction gave them a range, with the summary
-on hover; and a recent-queries table from `RecentQueries` with a
-drill-down. Cluster health tiles come from `/api/health`. A diagnostics
-call the cluster does not serve renders as "not served by this cluster"
-and is retried every 30 seconds.
+in flight, errors, scan candidates, floors published, scan bytes per
+second with the rate while scanning, and the kernel's active share) and
+a per-route table with p50 and p99 from the latency histograms over the
+stream's window; the table's rows are the snapshot's route labels, so a
+new route appears on its own. A knobs panel from `GetRuntimeKnobs` has
+inputs that call `SetRuntimeKnob` and show the startup value. The shard
+map from `GetShardDiagnostics` opens with the placement groups (one line
+per code served, the path it decodes to, the shards in it, a warning
+when a shard's rows carry more than one code) and draws each shard's
+sealed segments as bars, in green when a partitioned compaction gave
+them a range, with the summary on hover; a shard whose layout came back
+as a relay's refusal is marked as a relay, since a relay serves the
+node-facing surface only and its children are its own map
+(`docs/relay-coordinators.md`). The placement dry run panel takes a tree
+in the shard map's `[placement]` shape (or as `PlacementTree` JSON) and
+an optional filter, calls `SearchService.PlanPlacement`, and lists rows
+and moving rows per shard and leaf with the totals; the balance dry run
+panel calls `ClusterControl.PlanBalance` with the gain threshold, the
+move budget, and the rate age, and lists the loads, the moves with the
+estimate after each, and the exclusions with their reasons. A
+recent-queries table from `RecentQueries` has a drill-down. Cluster
+health tiles come from `/api/health`. A diagnostics call the cluster
+does not serve renders as "not served by this cluster" and is retried
+every 30 seconds.
 
 ## Configuration
 
@@ -109,7 +128,10 @@ rendering of the typed client's response bytes; a boolean `Query` with a
 filter, explain, and an aggregation; the 400 mapping with the gRPC
 message and the facade's own 400 for malformed JSON; 501 for the unserved
 diagnostics on the coordinator and on a node, and 400 for a node index
-out of range; 404 for internal services and unknown methods; document
+out of range; the placement dry run (a tree with no default refused by
+name, a planned tree's rows per leaf) and the balance dry run against an
+in-memory control plane, with the other control methods answering 404;
+404 for internal services and unknown methods; document
 text routed by slot range; the 501 embedding route; the UI assets with
 their content types; the suggesters; the server-sent event stream for
 `QueryStream` with its end frame and the query-parameter form; and the

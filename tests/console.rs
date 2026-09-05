@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use pipestream_search::console::{Console, ConsoleConfig};
+use pipestream_search::control_plane::{ClusterControlService, ControlPolicy, DurableControlPlane};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::diagnostics::{CoordinatorDiagnostics, RecentRing};
 use pipestream_search::node::NodeConfig;
@@ -109,16 +110,32 @@ async fn start() -> Cluster {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let coordinator_addr = format!("http://{}", listener.local_addr().unwrap());
-    let coordinator =
-        CoordinatorServiceImpl::new(nodes.clone()).with_bm25(Some(analysis), Default::default());
-    // The coordinator listener serves diagnostics next to search, as the
-    // product's does (src/main.rs): one unnamed member, no principals.
+    let half = u64::MAX / 2;
+    let coordinator = CoordinatorServiceImpl::new(nodes.clone())
+        .with_bm25(Some(analysis), Default::default())
+        .with_topology_generation(1)
+        .with_hot_topology(vec![Some((0, half)), Some((half + 1, u64::MAX))])
+        .unwrap();
+    // The coordinator listener serves diagnostics and cluster control
+    // next to search, as the product's does (src/main.rs): one unnamed
+    // member, no principals, an in-memory control plane bootstrapped from
+    // the live topology.
     let diagnostics = CoordinatorDiagnostics::new(
         vec![(String::new(), coordinator.clone())],
         None,
         Arc::new(RecentRing::default()),
     )
     .into_server(MAX_MESSAGE_BYTES);
+    let plane = DurableControlPlane::in_memory(ControlPolicy {
+        replication_factor: 1,
+        ..Default::default()
+    });
+    plane
+        .bootstrap_topology(1, &coordinator.current_topology_routes())
+        .unwrap();
+    let control = ClusterControlService::new(plane)
+        .with_coordinator(coordinator.clone())
+        .into_server(MAX_MESSAGE_BYTES);
     handles.push(tokio::spawn(
         Server::builder()
             .add_service(CoordinatorServiceImpl::into_server(
@@ -126,6 +143,7 @@ async fn start() -> Cluster {
                 MAX_MESSAGE_BYTES,
             ))
             .add_service(diagnostics)
+            .add_service(control)
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     ));
     let console = Console::bind(ConsoleConfig {
@@ -369,6 +387,74 @@ async fn the_facade_transcodes_search_and_diagnostics_and_serves_the_ui() {
     .await;
     assert_eq!(r.status, 400, "{}", r.body);
     assert!(r.body.contains("out of range"), "{}", r.body);
+
+    // The placement dry run rides the same route: a tree with no default
+    // is refused by name, a tree over a column the shards hold is planned
+    // over every live document (no placement column: every row moves).
+    let (status, body) = rpc(
+        c,
+        "SearchService",
+        "PlanPlacement",
+        json!({ "proposed": { "column": "placement", "nodes": [ { "name": "recent", "cel": "year >= 2004" } ] } }),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("no default"),
+        "{body}"
+    );
+    let (status, body) = rpc(
+        c,
+        "SearchService",
+        "PlanPlacement",
+        json!({ "proposed": { "column": "placement", "nodes": [
+            { "name": "recent", "cel": "year >= 2004", "shards": 1 },
+            { "name": "archive", "shards": 1 }
+        ] } }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"], "12", "{body}");
+    assert_eq!(
+        body["movingRows"], "12",
+        "no placement column: every row moves: {body}"
+    );
+    let cells = body["cells"].as_array().unwrap();
+    let recent: u64 = cells
+        .iter()
+        .filter(|cell| cell["leaf"] == "recent")
+        .map(|cell| cell["rows"].as_str().unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(recent, 8, "years 2004..=2011: {body}");
+
+    // Cluster control: the balance dry run is the one exposed method.
+    let (status, body) = rpc(
+        c,
+        "ClusterControl",
+        "PlanBalance",
+        json!({ "min_gain": 0.1, "max_moves": 4 }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["loads"].is_array(), "{body}");
+    assert!(body["controlRevision"].is_string(), "{body}");
+    assert_eq!(body["maxMoves"], 4, "{body}");
+    let (status, body) = rpc(c, "ClusterControl", "GetClusterPlan", json!({})).await;
+    assert_eq!(status, 404, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("PlanBalance only"),
+        "{body}"
+    );
+    let (status, _) = rpc(c, "ClusterControl", "ReconcileCluster", json!({})).await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|m| m["service"] == "ClusterControl")
+            .count(),
+        1,
+        "the config lists the one control method"
+    );
 
     // Internal services and unknown methods are not exposed.
     let (status, _) = rpc(c, "NodeService", "Health", json!({})).await;

@@ -397,6 +397,7 @@ function renderProfile(response) {
   const phases = [['selection', p.selectionMs], ['boost', p.boostMs], ['values', p.valuesMs], ['scorer', p.scorerMs], ['projection', p.projectionMs], ['rerank', p.rerankMs], ['collapse', p.collapseMs]];
   for (const [name, ms] of phases) if (ms) line.append(el('span', { text: `${name} ${fmtMs(ms)}` }));
   line.append(el('span', { text: `total ${fmtMs(p.totalMs)}` }));
+  if (p.shardsTotal) line.append(el('span', { text: `shards ${p.shardsSkipped ?? 0}/${p.shardsTotal} skipped` }));
   if (p.segmentsTotal) line.append(el('span', { text: `segments ${p.segmentsSkipped ?? 0}/${p.segmentsTotal} skipped` }));
   if (p.rerankRows) line.append(el('span', { text: `rerank ${fmtNum(p.rerankRows)} rows, ${fmtNum(p.rerankPages)} pages` }));
   if (response.servedTopologyGeneration) line.append(el('span', { text: `topology ${response.servedTopologyGeneration}` }));

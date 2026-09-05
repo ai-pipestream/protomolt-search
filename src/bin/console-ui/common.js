@@ -153,6 +153,15 @@ export function fmtNum(v) {
   return n.toPrecision(5);
 }
 
+export function fmtBytes(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '';
+  const units = ['B', 'kB', 'MB', 'GB', 'TB'];
+  let i = 0, x = n;
+  while (x >= 1000 && i < units.length - 1) { x /= 1000; i++; }
+  return `${i === 0 ? x.toFixed(0) : x.toFixed(x >= 100 ? 0 : x >= 10 ? 1 : 2)} ${units[i]}`;
+}
+
 export function debounce(fn, ms) {
   let t;
   return (...args) => {
