@@ -19,6 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/ai/pipestream/search/v1/search.proto",
                 "proto/ai/pipestream/search/v1/authorization.proto",
                 "proto/ai/pipestream/search/v1/source.proto",
+                "proto/ai/pipestream/search/v1/document_write.proto",
+                "proto/ai/pipestream/search/storage/v1/document_catalog.proto",
                 "proto/ai/pipestream/search/v1/schema_report.proto",
                 "proto/ai/pipestream/search/storage/v1/source_archive.proto",
                 "proto/ai/pipestream/search/mobile/v1/mobile.proto",

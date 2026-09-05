@@ -25,7 +25,7 @@ android {
 
     sourceSets.getByName("main").proto {
         srcDir(checkout.resolve("proto"))
-        include("ai/pipestream/search/v1/search.proto")
+        include("ai/pipestream/search/v1/*.proto")
         include("ai/pipestream/search/mobile/v1/mobile.proto")
     }
 

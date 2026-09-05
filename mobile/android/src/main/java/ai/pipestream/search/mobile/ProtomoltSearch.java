@@ -21,6 +21,9 @@ public final class ProtomoltSearch {
     /** Accepts MobileIngestMappedBatch. */
     public static native byte[] nativeIngestMapped(long handle, byte[] request);
 
+    /** AcceptDocumentRequest -> DocumentWriteReceipt. Call off the UI thread. */
+    public static native byte[] nativeAcceptDocument(long handle, byte[] request);
+
     /** Accepts the public QueryRequest. */
     public static native byte[] nativeQuery(long handle, byte[] request);
 

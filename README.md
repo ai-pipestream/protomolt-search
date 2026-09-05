@@ -1212,6 +1212,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Logical source authority (2026-09-05, `feat/search-foundations`).**
+  Embedded and mobile document acceptance now uses one collection-wide local
+  transaction store for exact keys, conditional versions, original sources and
+  persistent retry decisions. It retains zero-row sources and distinguishes
+  durable from volatile acceptance. Search projection publication and server
+  integration remain unfinished. See [document writes](docs/document-writes.md).
+
 - **Schema report (2026-09-05, `feat/search-foundations`).** Successful
   `PlanIndex` responses enumerate the reachable protobuf graph, including
   skipped fields, recursive/map types and registered extensions. Exact paths

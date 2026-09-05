@@ -29,6 +29,11 @@ public enum ProtomoltSearchMobile {
         call(request) { protomolt_search_ingest_mapped(handle, $0, $1) }
     }
 
+    /// AcceptDocumentRequest -> DocumentWriteReceipt. Call off the UI thread.
+    public static func acceptDocument(handle: UInt64, request: Data) -> Data {
+        call(request) { protomolt_search_accept_document(handle, $0, $1) }
+    }
+
     public static func query(handle: UInt64, request: Data) -> Data {
         call(request) { protomolt_search_query(handle, $0, $1) }
     }

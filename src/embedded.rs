@@ -20,6 +20,7 @@ use crate::bm25::Bm25Params;
 use crate::coordinator::{
     CoordinatorServiceImpl, FanoutLimits, DEFAULT_MAX_K, DEFAULT_MAX_RERANK_BYTES,
 };
+use crate::document_catalog::DocumentCatalog;
 use crate::link::NodeLink;
 use crate::node::{
     bm25_sidecar_path, exact_vector_sidecar_path, generation_dir, live_docs_sidecar_path,
@@ -79,6 +80,9 @@ impl EmbeddedShardConfig {
 #[derive(Clone, Debug)]
 pub struct EmbeddedSearchConfig {
     pub shards: Vec<EmbeddedShardConfig>,
+    /// One collection-wide authority, independent of the physical shard paths.
+    /// Absent disables logical document acceptance.
+    pub document_catalog: Option<EmbeddedDocumentCatalogConfig>,
     pub bm25_params: Bm25Params,
     pub stream_search: bool,
     pub bm25_stream: bool,
@@ -94,6 +98,7 @@ impl EmbeddedSearchConfig {
     pub fn new(shards: Vec<EmbeddedShardConfig>) -> Self {
         Self {
             shards,
+            document_catalog: None,
             bm25_params: Bm25Params::default(),
             stream_search: true,
             bm25_stream: true,
@@ -109,6 +114,15 @@ impl EmbeddedSearchConfig {
     pub fn single(shard: EmbeddedShardConfig) -> Self {
         Self::new(vec![shard])
     }
+}
+
+/// Local source/version storage. A persistent path must have an existing parent
+/// directory and must remain stable when shard layouts or index generations change.
+#[derive(Clone, Debug)]
+pub struct EmbeddedDocumentCatalogConfig {
+    pub collection: String,
+    /// None explicitly selects volatile storage; receipts report durable=false.
+    pub path: Option<PathBuf>,
 }
 
 /// Startup/configuration failures are separate from RPC failures so a host
@@ -161,12 +175,22 @@ pub struct EmbeddedSearch {
     /// The shards, reached in-process through [`NodeLink::Local`]: the
     /// same handlers the network serves, with no HTTP/2 between.
     nodes: Vec<Arc<NodeServiceImpl>>,
+    document_catalog: Option<DocumentCatalog>,
 }
 
 impl EmbeddedSearch {
     /// Create a new local cluster, refusing any configured path that already
     /// has provider, sidecar, snapshot, or WAL data.
     pub async fn create(config: EmbeddedSearchConfig) -> Result<Self, EmbeddedError> {
+        if let Some(path) = config
+            .document_catalog
+            .as_ref()
+            .and_then(|c| c.path.as_ref())
+        {
+            if path.exists() {
+                return Err(EmbeddedError::ExistingData(path.clone()));
+            }
+        }
         for shard in &config.shards {
             if let Some(path) = shard.node.index_path.as_deref() {
                 if let Some(existing) = first_existing_artifact(path) {
@@ -174,13 +198,30 @@ impl EmbeddedSearch {
                 }
             }
         }
-        Self::open(config).await
+        Self::open_inner(config, true).await
     }
 
     /// Open existing private shards, or start empty shards when their paths do
     /// not exist. All analysis and shard transport is forced in-process.
-    pub async fn open(mut config: EmbeddedSearchConfig) -> Result<Self, EmbeddedError> {
+    pub async fn open(config: EmbeddedSearchConfig) -> Result<Self, EmbeddedError> {
+        Self::open_inner(config, false).await
+    }
+
+    async fn open_inner(
+        mut config: EmbeddedSearchConfig,
+        create: bool,
+    ) -> Result<Self, EmbeddedError> {
         validate_config(&mut config)?;
+
+        let document_catalog = config
+            .document_catalog
+            .as_ref()
+            .map(|catalog| match &catalog.path {
+                Some(path) if create => DocumentCatalog::create(path, &catalog.collection),
+                Some(path) => DocumentCatalog::open(path, &catalog.collection),
+                None => DocumentCatalog::in_memory(&catalog.collection),
+            })
+            .transpose()?;
 
         let mut nodes = Vec::with_capacity(config.shards.len());
         for (shard, shard_config) in config.shards.iter().enumerate() {
@@ -209,7 +250,37 @@ impl EmbeddedSearch {
             coordinator = coordinator.with_dense_quality_profile(profile);
         }
 
-        Ok(Self { coordinator, nodes })
+        Ok(Self {
+            coordinator,
+            nodes,
+            document_catalog,
+        })
+    }
+
+    /// Persist the source/version and retry decision for this runtime's collection.
+    /// This blocking local transaction does not yet publish an index projection.
+    pub fn accept_document(
+        &self,
+        request: &AcceptDocumentRequest,
+    ) -> Result<DocumentWriteReceipt, Status> {
+        self.document_catalog()?.accept(request)
+    }
+
+    /// Trusted application-local lookup of an accepted source, including history.
+    pub fn accepted_document(
+        &self,
+        key: &[u8],
+        version: Option<u64>,
+    ) -> Result<Option<(storage::DocumentVersion, Option<ProtobufSource>)>, Status> {
+        self.document_catalog()?.get(key, version)
+    }
+
+    fn document_catalog(&self) -> Result<&DocumentCatalog, Status> {
+        self.document_catalog.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "configure a collection-wide document catalog before accepting documents",
+            )
+        })
     }
 
     pub fn shard_count(&self) -> usize {
@@ -477,8 +548,37 @@ fn validate_config(config: &mut EmbeddedSearchConfig) -> Result<(), EmbeddedErro
         ));
     }
 
+    let catalog_path = config
+        .document_catalog
+        .as_ref()
+        .and_then(|c| c.path.as_ref())
+        .map(|path| canonical_storage_path(path))
+        .transpose()?;
     let mut paths = HashSet::new();
     for (shard, shard_config) in config.shards.iter_mut().enumerate() {
+        if let Some(catalog) = &config.document_catalog {
+            if shard_config.node.collection != catalog.collection {
+                return Err(EmbeddedError::InvalidConfig(format!(
+                    "embedded shard {shard} collection differs from the document catalog"
+                )));
+            }
+            if let (Some(path), Some(index)) = (&catalog_path, &shard_config.node.index_path) {
+                for artifact in [
+                    index.clone(),
+                    bm25_sidecar_path(index),
+                    exact_vector_sidecar_path(index),
+                    live_docs_sidecar_path(index),
+                    generation_dir(index),
+                    crate::wal::wal_dir(index),
+                ] {
+                    if path.starts_with(canonical_storage_path(&artifact)?) {
+                        return Err(EmbeddedError::InvalidConfig(
+                            "document catalog path overlaps shard storage".into(),
+                        ));
+                    }
+                }
+            }
+        }
         match shard_config.node.analysis_addr.as_deref() {
             None | Some("native") | Some("native://") => {
                 shard_config.node.analysis_addr = Some(NATIVE_ANALYSIS_BACKEND.to_string());
@@ -504,6 +604,26 @@ fn validate_config(config: &mut EmbeddedSearchConfig) -> Result<(), EmbeddedErro
         }
     }
     Ok(())
+}
+
+fn canonical_storage_path(path: &Path) -> Result<PathBuf, EmbeddedError> {
+    let result = if path.exists() {
+        path.canonicalize()
+    } else {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        parent
+            .canonicalize()
+            .map(|parent| parent.join(path.file_name().unwrap_or_default()))
+    };
+    result.map_err(|error| {
+        EmbeddedError::InvalidConfig(format!(
+            "resolve storage path {} (parent must exist): {error}",
+            path.display()
+        ))
+    })
 }
 
 fn first_existing_artifact(index_path: &Path) -> Option<PathBuf> {

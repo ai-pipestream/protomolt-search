@@ -10,14 +10,17 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use pipestream_search::embedded::{
-    EmbeddedError, EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig,
+    EmbeddedDocumentCatalogConfig, EmbeddedError, EmbeddedSearch, EmbeddedSearchConfig,
+    EmbeddedShardConfig,
 };
 use pipestream_search::pb::mobile::{
     mobile_response, MobileCloseResponse, MobileError, MobileErrorCode, MobileFlushResponse,
     MobileIngestMappedBatch, MobileOpenRequest, MobileOpenResponse, MobileQueryStreamNextResponse,
     MobileQueryStreamOpenResponse, MobileResponse, MobileShardConfig,
 };
-use pipestream_search::pb::{QueryRequest, QueryResponse, QueryStreamRequest, QueryStreamResponse};
+use pipestream_search::pb::{
+    AcceptDocumentRequest, QueryRequest, QueryResponse, QueryStreamRequest, QueryStreamResponse,
+};
 
 type QueryReceiver =
     pipestream_search::metrics::Timed<ReceiverStream<Result<QueryStreamResponse, tonic::Status>>>;
@@ -115,6 +118,7 @@ fn mobile_code(code: tonic::Code) -> MobileErrorCode {
         tonic::Code::AlreadyExists => MobileErrorCode::AlreadyExists,
         tonic::Code::FailedPrecondition => MobileErrorCode::FailedPrecondition,
         tonic::Code::Cancelled => MobileErrorCode::Cancelled,
+        tonic::Code::Aborted => MobileErrorCode::Aborted,
         _ => MobileErrorCode::Internal,
     }
 }
@@ -269,6 +273,20 @@ fn embedded_config(request: MobileOpenRequest) -> Result<EmbeddedSearchConfig, B
         .map(node_config)
         .collect::<Result<Vec<_>, _>>()?;
     let mut config = EmbeddedSearchConfig::new(shards);
+    if let Some(catalog) = request.document_catalog {
+        if catalog.in_memory != catalog.path.is_empty() {
+            return Err(BridgeError::invalid(
+                "document catalog path must be empty exactly when in_memory is true",
+            ));
+        }
+        for shard in &mut config.shards {
+            shard.node.collection = catalog.collection.clone();
+        }
+        config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
+            collection: catalog.collection,
+            path: (!catalog.in_memory).then(|| PathBuf::from(catalog.path)),
+        });
+    }
     if let Some(value) = request.bm25_k1 {
         config.bm25_params.k1 = value;
     }
@@ -332,6 +350,14 @@ fn ingest_mapped_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
         let search = search(handle)?;
         let result =
             runtime()?.block_on(search.ingest_mapped(batch.shard as usize, batch.requests))?;
+        Ok(success(&result))
+    })
+}
+
+fn accept_document_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
+    response(|| {
+        let request = decode::<AcceptDocumentRequest>(input, "AcceptDocumentRequest")?;
+        let result = search(handle)?.accept_document(&request)?;
         Ok(success(&result))
     })
 }
@@ -518,6 +544,17 @@ pub extern "C" fn protomolt_search_ingest_mapped(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn protomolt_search_accept_document(
+    handle: u64,
+    request: *const u8,
+    request_len: usize,
+) -> MobileBuffer {
+    ffi_input(request, request_len, |bytes| {
+        accept_document_bytes(handle, bytes)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn protomolt_search_query(
     handle: u64,
     request: *const u8,
@@ -625,6 +662,20 @@ mod android {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "system" fn Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeAcceptDocument<
+        'caller,
+    >(
+        env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        handle: jlong,
+        request: JByteArray<'caller>,
+    ) -> JByteArray<'caller> {
+        with_input(env, request, |bytes| {
+            accept_document_bytes(handle as u64, bytes)
+        })
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "system" fn Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeQuery<'caller>(
         env: EnvUnowned<'caller>,
         _class: JClass<'caller>,
@@ -708,6 +759,61 @@ mod tests {
             .expect("response envelope")
             .outcome
             .expect("response outcome")
+    }
+
+    #[test]
+    fn mobile_document_acceptance_preserves_retry_and_conflict_codes() {
+        use pipestream_search::pb::mobile::MobileDocumentCatalogConfig;
+        use pipestream_search::pb::{
+            accept_document_request::Mutation, DocumentWriteReceipt, ProtobufSource,
+        };
+        let opened: MobileOpenResponse = payload(&open_bytes(
+            &MobileOpenRequest {
+                shards: vec![MobileShardConfig {
+                    in_memory: true,
+                    ..Default::default()
+                }],
+                document_catalog: Some(MobileDocumentCatalogConfig {
+                    collection: "private".into(),
+                    in_memory: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            true,
+        ));
+        let mut request = AcceptDocumentRequest {
+            contract_version: 1,
+            document_key: b"source".to_vec(),
+            operation_id: b"create".to_vec(),
+            expected_version: Some(0),
+            mutation: Some(Mutation::Source(ProtobufSource {
+                descriptor_set: record_descriptor(),
+                message_type: "private.v1.Record".into(),
+                payload: vec![],
+            })),
+        };
+        let bytes = request.encode_to_vec();
+        let buffer = protomolt_search_accept_document(opened.handle, bytes.as_ptr(), bytes.len());
+        let receipt: DocumentWriteReceipt =
+            payload(unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) });
+        // The buffer was returned by the C ABI above and is freed exactly once.
+        unsafe { protomolt_search_buffer_free(buffer) };
+        assert!(receipt.accepted && !receipt.durable && !receipt.searchable && !receipt.replayed);
+        let retry: DocumentWriteReceipt = payload(&accept_document_bytes(opened.handle, &bytes));
+        assert!(retry.replayed);
+        assert_eq!(retry.version, receipt.version);
+        request.operation_id = b"stale".to_vec();
+        let mobile_response::Outcome::Error(error) = outcome(&accept_document_bytes(
+            opened.handle,
+            &request.encode_to_vec(),
+        )) else {
+            panic!("stale version must fail");
+        };
+        assert_eq!(error.code(), MobileErrorCode::Aborted);
+        let closed: MobileCloseResponse = payload(&close_bytes(opened.handle));
+        assert!(closed.closed);
     }
 
     fn payload<M: Message + Default>(bytes: &[u8]) -> M {

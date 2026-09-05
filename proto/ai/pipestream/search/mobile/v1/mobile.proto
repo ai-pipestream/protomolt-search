@@ -53,6 +53,16 @@ message MobileOpenRequest {
   optional uint32 max_k = 6;
   optional uint64 max_rerank_bytes = 7;
   uint64 topology_generation = 8;
+  // Optional collection-wide source/version authority. Its path is independent
+  // of shard layout and must stay in the application's private container.
+  MobileDocumentCatalogConfig document_catalog = 9;
+}
+
+message MobileDocumentCatalogConfig {
+  string collection = 1;
+  // Parent directory must exist. Empty exactly when in_memory is true.
+  string path = 2;
+  bool in_memory = 3;
 }
 
 message MobileOpenResponse {
@@ -95,6 +105,7 @@ enum MobileErrorCode {
   MOBILE_ERROR_CODE_FAILED_PRECONDITION = 4;
   MOBILE_ERROR_CODE_CANCELLED = 5;
   MOBILE_ERROR_CODE_INTERNAL = 6;
+  MOBILE_ERROR_CODE_ABORTED = 7;
 }
 
 message MobileError {

@@ -138,6 +138,14 @@ like an ordinary node.
 
 ## Android and iOS packages
 
+The optional [logical document catalog](document-writes.md) adds source/version
+acceptance and persistent retry decisions to the local runtime and both mobile
+bridges. Configure its collection-wide path independently of shard images.
+Its receipts distinguish local source durability from search visibility;
+projection publication is still pending.
+The Android package includes all public `search/v1` contracts, including source,
+schema-report and document-write imports, alongside `mobile.proto`.
+
 The product-named crate is a small facade over the shared implementation and
 emits all three forms needed by its consumers: `rlib` for Rust applications,
 `cdylib` for Android, and `staticlib` for Apple:

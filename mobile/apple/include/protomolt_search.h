@@ -24,6 +24,12 @@ ProtomoltSearchBuffer protomolt_search_ingest_mapped(
     uint64_t handle,
     const uint8_t *request,
     size_t request_len);
+// AcceptDocumentRequest -> DocumentWriteReceipt inside MobileResponse.
+// Blocks through the local source/history commit; does not publish search rows.
+ProtomoltSearchBuffer protomolt_search_accept_document(
+    uint64_t handle,
+    const uint8_t *request,
+    size_t request_len);
 ProtomoltSearchBuffer protomolt_search_query(
     uint64_t handle,
     const uint8_t *request,

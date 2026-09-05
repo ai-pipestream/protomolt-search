@@ -1,0 +1,34 @@
+syntax = "proto3";
+package ai.pipestream.search.v1;
+import "ai/pipestream/search/v1/source.proto";
+
+// Acceptance of a logical document, independent of physical index rows.
+// Version 1 persists source and retry history. It does not publish a search
+// projection; successful receipts explicitly report searchable=false.
+message AcceptDocumentRequest {
+  uint32 contract_version = 1;
+  // Exact collection-local identity, never a hash or physical row number.
+  bytes document_key = 2;
+  // Exact collection-local retry key. Reuse for any different request fails.
+  bytes operation_id = 3;
+  // Absent allows an unconditional write. Zero requires no prior version;
+  // positive values require exactly that version, including a tombstone.
+  optional uint64 expected_version = 4;
+  oneof mutation {
+    ProtobufSource source = 5;
+    // Must be true. Deletion creates a new version and preserves retry history.
+    bool delete = 6;
+  }
+}
+
+message DocumentWriteReceipt {
+  bytes document_key = 1;
+  uint64 version = 2;
+  uint64 accepted_sequence = 3;
+  bool accepted = 4;
+  bool searchable = 5;
+  // True only for a synced local source/history transaction. This does not
+  // promise an index-image checkpoint or a replica on another device.
+  bool durable = 6;
+  bool replayed = 7;
+}

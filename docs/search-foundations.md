@@ -15,8 +15,8 @@ establish completion of the three workstreams.
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public routes enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
 | Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Not implemented |
 | Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Not implemented; public row IDs remain positional |
-| Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Not implemented |
-| Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Not implemented |
+| Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
+| Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Local source acceptance has durable/volatile receipts and abrupt-process-exit coverage; searchable publication remains |
 
 ## Design constraints
 
@@ -131,3 +131,12 @@ shapes. Exact projection paths distinguish source-only occurrences, traversed
 containers and query values; constraints expose current value-domain losses.
 This does not supply the remaining scalar/nested/extension query implementations
 or an independently configurable index definition.
+
+## Logical source authority increment
+
+[Document writes](document-writes.md) records the collection-wide catalog,
+conditional versions and persistent retry decisions. Embedded Rust and mobile
+calls retain originals without requiring any index rows. Its path is independent
+of shard geometry, and source acceptance never claims search visibility.
+Legacy ingest, public result identity, atomic projection replacement, catalog
+backup/migration, workspace binding and document/field grants remain unfinished.

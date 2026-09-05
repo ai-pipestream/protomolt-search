@@ -84,8 +84,8 @@ cp "$repo_dir/mobile/android/proguard.txt" "$stage/proguard.txt"
 cp "$repo_dir/mobile/android/R.txt" "$stage/R.txt"
 cp "$repo_dir/proto/ai/pipestream/search/mobile/v1/mobile.proto" \
   "$stage/assets/ai/pipestream/search/mobile/v1/mobile.proto"
-cp "$repo_dir/proto/ai/pipestream/search/v1/search.proto" \
-  "$stage/assets/ai/pipestream/search/v1/search.proto"
+cp "$repo_dir/proto/ai/pipestream/search/v1/"*.proto \
+  "$stage/assets/ai/pipestream/search/v1/"
 
 if [[ -e "$output" ]]; then
   echo "refusing to overwrite existing AAR: $output" >&2
