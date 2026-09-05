@@ -1473,12 +1473,13 @@ enum Land {
     FacetStr,
     /// A bool facet: "true" / "false".
     FacetBool,
-    /// An enum facet: the value NAME from the descriptor, exact. An
-    /// enum number the descriptor does not declare refuses — schema
-    /// drift, not a value.
+    /// An enum facet: first declared alias, or an unknown open-enum number
+    /// rendered as decimal. The decoder excludes unknown closed-enum values.
     FacetEnum(HashMap<i64, String>),
-    /// A KEYWORD-hinted integer facet: the decimal rendering.
+    /// A KEYWORD-hinted signed integer facet: the decimal rendering.
     FacetInt,
+    /// A KEYWORD-hinted unsigned integer facet, preserving the full u64 range.
+    FacetUint,
     /// An i64 column value.
     Int,
     /// A google.protobuf.Timestamp, landing as a TimestampValue so the
@@ -1901,14 +1902,18 @@ impl Extractor {
 fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
     match (land, slot) {
         (Land::Int, Slot::Int(value)) => Ok(*value as u64),
-        (Land::FacetInt, Slot::Str(rendered)) => rendered
-            .parse::<i64>()
-            .map(|value| value as u64)
-            .map_err(|_| {
+        (Land::FacetInt | Land::FacetUint, Slot::Str(rendered)) => {
+            let parsed = if matches!(land, Land::FacetUint) {
+                rendered.parse::<u64>()
+            } else {
+                rendered.parse::<i64>().map(|value| value as u64)
+            };
+            parsed.map_err(|_| {
                 Status::internal(format!(
                     "plan: doc id {path}: non-decimal own rendering {rendered:?}"
                 ))
-            }),
+            })
+        }
         (_, Slot::Str(value)) => Ok(u64::from_be_bytes(
             sha256::digest(value.as_bytes())[..8]
                 .try_into()
@@ -1980,6 +1985,7 @@ fn land_for(
                 })?;
                 Ok(Land::FacetEnum(table.clone()))
             }
+            Type::Uint32 | Type::Uint64 | Type::Fixed32 | Type::Fixed64 => Ok(Land::FacetUint),
             other => match is_integer(other) {
                 true => Ok(Land::FacetInt),
                 false => Err(refuse_at(
@@ -2158,6 +2164,8 @@ fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
                 .unwrap_or_else(|| v.to_string()),
         ),
         (Land::FacetInt, v) => Slot::Str(integer(v)?.to_string()),
+        (Land::FacetUint, Value::U32(v)) => Slot::Str(v.to_string()),
+        (Land::FacetUint, Value::U64(v)) => Slot::Str(v.to_string()),
         (Land::Int, v) => Slot::Int(integer(v)?),
         (Land::Num, Value::F32(v)) => Slot::Num(f64::from(*v)),
         (Land::Num, Value::F64(v)) => Slot::Num(*v),

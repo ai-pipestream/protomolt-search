@@ -219,7 +219,9 @@ fn projection(
             constraints
                 .push("i64::MIN is reserved for absence and is refused as a column value.".into());
         }
-        if matches!(descriptor.r#type(), Type::Uint64 | Type::Fixed64) {
+        if representation == Query::SignedInteger
+            && matches!(descriptor.r#type(), Type::Uint64 | Type::Fixed64)
+        {
             constraints.push("Values above i64::MAX are refused by the current extractor.".into());
         }
         if representation == Query::DenseVector {

@@ -1222,10 +1222,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Full-range integer keywords (2026-09-05).** Explicit keyword mappings
+  preserve exact decimal strings for every protobuf integer encoding, including
+  `uint64` and `fixed64` above `i64::MAX`. Parent IDs preserve their integer
+  bits. These remain string facets; full-width unsigned numeric columns are
+  unfinished. See [schema reports](docs/schema-report.md).
+
 - **Immutable identity metadata (2026-09-05, `feat/identity-snapshots-2026-09`).**
   Heap, spill, mapped and segmented stores can retain row bindings across
   appends, sealing and replacement without retaining original payloads or
-  mapped files. Public dense identity propagation remains unfinished. See
+  mapped files. Plain dense results now carry those identities through nested
+  relays; see [dense identity](docs/dense-identity.md) for remaining routes. See
   [source storage](docs/protobuf-source-storage.md#immutable-identity-views).
 
 - **Foundations checkpoint on main (2026-09-05).** The ProtoMolt Search

@@ -79,6 +79,24 @@ MessageSet types; source-only inspection can describe them.
 The decoder dependency does not itself prove those contracts. Its behavior must
 be covered or adapted by the conformance suite before support is claimed.
 
+Integer keyword extraction now distinguishes signed and unsigned descriptor
+types. All ten protobuf integer encodings render exact decimal facets over their
+full domain, including optional zero, `i64::MIN` and `u64::MAX`. Keyword parent
+IDs retain their integer bit pattern instead of acquiring string hashes. This
+removes an erroneous i64 coercion from keyword ingest and its schema report;
+numeric u64 columns remain unfinished. Existing accepted values and v3 plan
+fingerprints are unchanged. `tests/integer_keywords.rs` reproduces the previous
+refusal and covers extraction, ID reduction, CEL string selection, projections
+and persisted source/column bytes.
+
+Validation on 2026-09-05: 420 library tests, 500 integration tests across 84
+targets and 10 embedded tests passed, with one existing sidecar test ignored.
+The first integration pass had a transport-readiness failure during fixture
+ingest in `ltr::lexical_boost_on_a_dense_leaf_carries_its_own_analysis`; the
+entire 16-test LTR target passed on retry. The cause was not established.
+All five Android/iOS Rust target checks passed with the three existing relay
+dead-code warnings. These are local checks, not fleet deployment evidence.
+
 `tests/protobuf_semantics.rs` uses generated prost messages as differential
 oracles and adversarial wire encodings. `tests/descriptor_mappings.rs` pins the
 new fingerprint. `tests/mapped_ingest.rs` exercises binding, column landing,

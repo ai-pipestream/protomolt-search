@@ -1,0 +1,38 @@
+syntax = "proto3";
+package integer_keywords;
+
+import "ai/protomolt/proto/index/hints/v1/indexing_hints.proto";
+
+message Record {
+  uint64 id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional uint64 unsigned_value = 2 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional fixed64 unsigned_fixed = 3 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional uint32 unsigned_small = 4 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional fixed32 unsigned_small_fixed = 5 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional int64 signed_value = 6 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional sint64 signed_zigzag = 7 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional sfixed64 signed_fixed = 8 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional int32 signed_small = 9 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional sint32 signed_small_zigzag = 10 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  string body = 11;
+  repeated float embedding = 12;
+  optional sfixed32 signed_small_fixed = 13 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  optional uint64 numeric_value = 14;
+}
+
+message Chunk {
+  fixed64 id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD,
+    (ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNK_ID];
+  string body = 2;
+  repeated float embedding = 3;
+}
+
+message UnsignedParent {
+  fixed64 id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  repeated Chunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}
+
+message SignedParent {
+  int64 id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  repeated Chunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}

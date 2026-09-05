@@ -53,10 +53,17 @@ because one occurrence is indexed.
 The query representation distinguishes analyzed text, string facets, signed
 integers, floating-point numbers and dense vectors. Constraints describe current
 conversions and value-domain restrictions: finite numerics, f32 vectors, the
-unsigned-to-i64 limit, the signed absence sentinel, string-rendered enums and
+unsigned-to-i64 limit on signed numeric columns, the signed absence sentinel,
+string-rendered enums and
 epoch-microsecond timestamp storage. Bind-time analyzer configuration,
 materialization and authorization are separate contracts. The report grants no
 access and adds no source-fetch route.
+
+Explicit integer keywords use exact decimal strings across their full declared
+signed or unsigned domain. In particular, `uint64` and `fixed64` keywords accept
+values through `18446744073709551615`; they do not inherit the numeric i64 limit.
+Their query representation remains `STRING_FACET`, so equality and sorting use
+string semantics. This does not provide full-width unsigned numeric columns.
 
 Preservation means exact bytes in the retained original protobuf. Unknown fields
 share that rule. `PlanIndex` reports that legacy mapped ingest requires at least
