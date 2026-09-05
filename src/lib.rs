@@ -38,6 +38,7 @@ pub mod demo;
 pub mod dense_policy;
 pub mod embedded;
 pub mod exact_vectors;
+pub mod explain;
 pub mod filter;
 pub mod fusion;
 pub mod geo;
