@@ -42,12 +42,12 @@ use crate::pb::{
     ClusterHealthRequest, ClusterHealthResponse, ClusterPlan, CollectionHealth,
     CompletePlacementActionRequest, DrainNodeRequest, FreezeTopologyWritesRequest,
     FreezeTopologyWritesResponse, GetClusterPlanRequest, HybridSearchRequest, HybridSearchResponse,
-    NodeLease, PhraseSearchRequest, PlanIndexRequest, PlanIndexResponse, PublishTopologyRequest,
-    PublishTopologyResponse, QueryRequest, QueryResponse, QueryStreamRequest,
-    ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest, ReportShardRequest,
-    RollbackClusterRequest, RoutedIngestMappedRequest, RoutedIngestMappedResponse, SearchRequest,
-    SearchResponse, SuggestRequest, SuggestResponse, TermSuggestRequest, TermSuggestResponse,
-    VariantSearchRequest, VariantSearchResponse,
+    NodeLease, PhraseSearchRequest, PlanIndexRequest, PlanIndexResponse, PlanPlacementRequest,
+    PlanPlacementResponse, PublishTopologyRequest, PublishTopologyResponse, QueryRequest,
+    QueryResponse, QueryStreamRequest, ReconcileClusterRequest, RegisterNodeRequest,
+    RenewNodeLeaseRequest, ReportShardRequest, RollbackClusterRequest, RoutedIngestMappedRequest,
+    RoutedIngestMappedResponse, SearchRequest, SearchResponse, SuggestRequest, SuggestResponse,
+    TermSuggestRequest, TermSuggestResponse, VariantSearchRequest, VariantSearchResponse,
 };
 use crate::security::{Guarded, MeteredIngest, Permit, Principal, Principals};
 
@@ -277,6 +277,15 @@ impl RecentFields for AggregateResponse {
     }
 }
 
+impl RecentFields for PlanPlacementResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: u32::try_from(self.rows).unwrap_or(u32::MAX),
+            ..Default::default()
+        }
+    }
+}
+
 impl RecentFields for SuggestResponse {
     fn figures(&self) -> crate::diagnostics::RecentFigures {
         crate::diagnostics::RecentFigures {
@@ -304,6 +313,7 @@ impl RecentFields for AbortTopologyCutoverResponse {}
 
 impl RequestK for PhraseSearchRequest {}
 impl RequestK for AggregateRequest {}
+impl RequestK for PlanPlacementRequest {}
 impl RequestK for PlanIndexRequest {}
 impl RequestK for BroadcastVectorBackendRequest {}
 impl RequestK for BroadcastCalibrationRequest {}
@@ -669,6 +679,7 @@ search_service_over_collections! {
     publish_topology: PublishTopologyRequest => PublishTopologyResponse,
     abort_topology_cutover: AbortTopologyCutoverRequest => AbortTopologyCutoverResponse,
     aggregate: AggregateRequest => AggregateResponse,
+    plan_placement: PlanPlacementRequest => PlanPlacementResponse,
     suggest: SuggestRequest => SuggestResponse,
     term_suggest: TermSuggestRequest => TermSuggestResponse,
 }

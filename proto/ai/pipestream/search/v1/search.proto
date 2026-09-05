@@ -562,6 +562,12 @@ service SearchService {
   // absent is skipped and counted nowhere — never a fabricated zero.
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
 
+  // Placement dry run (docs/placement.md): evaluate a proposed tree
+  // over every shard's stored columns and report, per shard and per
+  // leaf, how many rows would land there and how many would move from
+  // the leaf they carry now. Reads only; no row moves.
+  rpc PlanPlacement(PlanPlacementRequest) returns (PlanPlacementResponse);
+
   // Autocomplete (docs/suggest.md): the terms of one indexed BM25 field
   // that start with `prefix`, ranked by document frequency summed over
   // the collection's shards (ties in term byte order), the best `limit`
@@ -807,6 +813,12 @@ message ShardLayoutDiagnostics {
   repeated SegmentDiagnostics segments = 11;
   bool segment_pruning = 12;
   bool floor_sharing = 13;
+  // The placement code this shard serves (docs/placement.md), and
+  // whether the topology assigns one. A shard whose rows carry other
+  // codes is mid-migration and says so in `placement_mixed`.
+  bool has_placement = 14;
+  uint64 placement = 15;
+  bool placement_mixed = 16;
 }
 
 message ShardDiagnostics {
@@ -5364,6 +5376,11 @@ message QueryProfile {
   // were ruled out from their summaries without being opened.
   uint32 segments_total = 13;
   uint32 segments_skipped = 14;
+  // Shards in the topology and shards the coordinator ruled out from
+  // their placement leaf before fan-out (docs/placement.md). Zero
+  // skipped on a topology with no placement tree.
+  uint32 shards_total = 15;
+  uint32 shards_skipped = 16;
 }
 
 // One public hit with score provenance.
@@ -5776,6 +5793,9 @@ message PublishedTopologyShard {
   string replica = 2;
   uint64 hash_lo = 3;
   uint64 hash_hi = 4;
+  // The placement code this shard serves, when the map has a tree.
+  bool has_placement = 5;
+  uint64 placement = 6;
 }
 
 message PublishTopologyRequest {
@@ -5787,6 +5807,10 @@ message PublishTopologyRequest {
   // default; an unknown name, or no name where named collections exist
   // and no default is configured, refuses by name.
   string collection = 4;
+  // The placement tree of the published generation (docs/placement.md).
+  // Absent keeps the generation without a tree; a tree requires every
+  // shard to carry a code that names one of its leaves.
+  PlacementTree placement = 5;
 }
 
 message PublishTopologyResponse {
@@ -6147,6 +6171,57 @@ message ValueFunc {
 // Aggregations (docs/aggregations.md): exact folds of value
 // expressions over the filtered corpus.
 // ---------------------------------------------------------------------
+
+// One node of a placement tree (docs/placement.md): an ordered chain
+// of predicates at each level. `cel` is in the FILTER dialect
+// (docs/cel-filters.md), validated at the coordinator; a node with an
+// empty `cel` is its level's default and must be last. A node with
+// children must end with a default child. `shards` and `nodes` size
+// and place the leaf; a node with children carries neither.
+message PlacementNode {
+  string name = 1;
+  string cel = 2;
+  uint32 shards = 3;
+  repeated string nodes = 4;
+  repeated PlacementNode children = 5;
+}
+
+// The tree: `column` is the i64 column every row carries with its
+// path code; `level_bits` is the fixed field width per level (0
+// selects 9: 512 children per level, seven levels in 63 bits). The
+// root's chain must end with a default node.
+message PlacementTree {
+  string column = 1;
+  uint32 level_bits = 2;
+  repeated PlacementNode nodes = 3;
+}
+
+message PlanPlacementRequest {
+  PlacementTree proposed = 1;
+  // The collection this request addresses (docs/collections.md).
+  string collection = 2;
+  // A filter over the rows considered; empty considers every live row.
+  string filter = 3;
+}
+
+// Rows of one shard that a proposed tree assigns to one leaf.
+message PlacementCell {
+  uint32 shard = 1;
+  uint64 code = 2;
+  string leaf = 3;
+  uint64 rows = 4;
+  // Rows whose current code differs from `code` (they would move).
+  uint64 moving_rows = 5;
+}
+
+message PlanPlacementResponse {
+  uint64 topology_generation = 1;
+  repeated PlacementCell cells = 2;
+  uint64 rows = 3;
+  uint64 moving_rows = 4;
+  // Rows no leaf matched: they take the default of their level.
+  uint64 defaulted_rows = 5;
+}
 
 message AggregateRequest {
   // CEL filter (docs/cel-filters.md). Empty or whitespace = every

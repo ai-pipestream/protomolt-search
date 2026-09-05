@@ -10939,6 +10939,29 @@ impl SearchService for CoordinatorServiceImpl {
         .await
     }
 
+    /// Placement dry run (`docs/placement.md`). Reserved: the contract is
+    /// in the proto; the evaluation over every shard's stored columns is
+    /// the next branch's work, and until then the call refuses by name
+    /// rather than answering with counts it did not compute.
+    async fn plan_placement(
+        &self,
+        request: Request<crate::pb::PlanPlacementRequest>,
+    ) -> Result<Response<crate::pb::PlanPlacementResponse>, Status> {
+        crate::metrics::timed(Route::PlanPlacement, request, |request| async move {
+            self.admit(&request.get_ref().collection)?;
+            let proposed = request.get_ref().proposed.as_ref().ok_or_else(|| {
+                Status::invalid_argument("plan_placement: proposed tree is absent")
+            })?;
+            let config = crate::placement::PlacementTreeConfig::from_proto(proposed);
+            crate::placement::Placement::validate(&config).map_err(Status::invalid_argument)?;
+            Err(Status::unimplemented(
+                "plan_placement: the dry run is not implemented yet (docs/placement.md); the \
+                 proposed tree validated",
+            ))
+        })
+        .await
+    }
+
     /// Autocomplete over one field's dictionary (`docs/suggest.md`):
     /// normalize the prefix as a prefix term is normalized (the field's
     /// char filters, never its stemmer), ask every shard for the terms
@@ -11684,6 +11707,7 @@ mod stream_cancel_tests {
             &coordinator,
             Request::new(PublishTopologyRequest {
                 collection: String::new(),
+                placement: None,
                 cutover_token: frozen.cutover_token,
                 generation: 5,
                 shards: vec![
@@ -11692,12 +11716,16 @@ mod stream_cancel_tests {
                         replica: String::new(),
                         hash_lo: 0,
                         hash_hi: split,
+                        has_placement: false,
+                        placement: 0,
                     },
                     crate::pb::PublishedTopologyShard {
                         addr: "b:50051".into(),
                         replica: String::new(),
                         hash_lo: split + 1,
                         hash_hi: u64::MAX,
+                        has_placement: false,
+                        placement: 0,
                     },
                 ],
             }),

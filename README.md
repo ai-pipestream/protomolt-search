@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Reserved 2026-09-05: placement trees.** `PlacementTree` and
+  `PlacementNode` in the proto, the `[placement]` table of the shard map,
+  `src/placement.rs` (validation, the prefix code), and
+  `SearchService.PlanPlacement` refusing by name until the dry run
+  exists. Ingest evaluation, fan-out pruning, the dry run, and the leaf
+  reshard follow on their own branches. [Placement trees](docs/placement.md).
 - **Landed 2026-09-05: the diagnostics service.** `DiagnosticsService`
   on every node and coordinator listener: runtime knobs that flip live
   (`floor_sharing`, `segment_pruning`, the floor parameters, `max_k`,

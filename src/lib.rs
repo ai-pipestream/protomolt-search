@@ -61,6 +61,7 @@ pub mod node;
 pub mod node_agent;
 pub mod pb;
 pub mod phrases;
+pub mod placement;
 pub mod postings;
 pub mod proximity;
 pub mod quality;

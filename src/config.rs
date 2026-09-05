@@ -137,6 +137,9 @@ pub struct ShardMapShard {
     /// Inclusive hash-range bounds (`fnv1a64(vector_id)` space).
     pub hash_lo: Option<u64>,
     pub hash_hi: Option<u64>,
+    /// The placement code this shard serves (`docs/placement.md`), when
+    /// the map has a `[placement]` tree. Required on every shard then.
+    pub placement: Option<u64>,
 }
 
 /// The id-to-shard authority for one cluster generation
@@ -149,6 +152,10 @@ pub struct ShardMap {
     pub generation: u64,
     /// One entry per shard, in fan-out order (= merge tie-break order).
     pub shards: Vec<ShardMapShard>,
+    /// The placement tree (`docs/placement.md`): which leaf each shard
+    /// serves and the predicates that route a document there.
+    #[serde(default)]
+    pub placement: Option<crate::placement::PlacementTreeConfig>,
 }
 
 /// Read one complete shard-map candidate. Callers validate its routing

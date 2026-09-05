@@ -108,12 +108,14 @@ pub enum Route {
     StreamMetrics,
     GetShardDiagnostics,
     RecentQueries,
+    /// `SearchService.PlanPlacement` (docs/placement.md).
+    PlanPlacement,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 62] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 63] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -184,6 +186,7 @@ const REQUEST_ROUTES: [(Route, &str, bool); 62] = [
     (Route::StreamMetrics, "stream_metrics", true),
     (Route::GetShardDiagnostics, "get_shard_diagnostics", false),
     (Route::RecentQueries, "recent_queries", false),
+    (Route::PlanPlacement, "plan_placement", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();

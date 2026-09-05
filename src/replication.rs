@@ -808,8 +808,10 @@ pub async fn atomic_live_cutover(
                     slot_offset: child.slot_offset,
                     hash_lo: Some(child.hash_lo),
                     hash_hi: Some(child.hash_hi),
+                    placement: None,
                 })
                 .collect(),
+            placement: None,
         };
         write_toml_atomic(shard_map_path, &map, "shard map")?;
         durable_map_published = true;
@@ -826,8 +828,11 @@ pub async fn atomic_live_cutover(
                         replica: shard.replica.clone().unwrap_or_default(),
                         hash_lo: shard.hash_lo.unwrap_or_default(),
                         hash_hi: shard.hash_hi.unwrap_or_default(),
+                        has_placement: shard.placement.is_some(),
+                        placement: shard.placement.unwrap_or_default(),
                     })
                     .collect(),
+                placement: map.placement.as_ref().map(|tree| tree.to_proto()),
             })
             .await
             .map_err(|error| format!("publish topology: {error}"))?
