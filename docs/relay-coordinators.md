@@ -78,10 +78,44 @@ are contiguous, and refuses by name, naming the gap or overlap, when they
 are not. A relay has no WAL and no live revision; it reports zeros and
 `wal_clocked = false` and never invents a watermark for a subtree.
 
+The keyword leg. `Bm25Query`, `Bm25PhraseQuery`, `Bm25QueryStream`,
+`Bm25Rescore`, and `ShardLegs` (the raw per-leg lists behind global-rank
+and score-blend fusion) forward to every child with the root's global
+statistics, field order, and score stages unchanged and the parent's
+epoch claim translated into each child's (below). Candidate batches and
+the children's cutoff raises go up untouched, monotone; the parent's
+raises and its stop go down; the relay's completion certificate follows
+the last child's, with the children's counts summed and one fingerprint
+required of all. Each child's terminal response merges by value into the
+one the parent reads as a shard's: the local top-k lists concatenated
+(the parent's global merge picks from the union), facet counts summed by
+value and range buckets by position, column-known flags ORed so the
+root's typo rule sees the subtree, segment counts added with a check. A
+facet no child knows stays unknown rather than refused, because the root
+decides over shards this relay does not see. Hits pass through whole,
+explain and identity included; a rescore routes each candidate id to the
+child whose slot range holds it and refuses an id in none.
+
+Two request shapes are refused by name on these routes: `stats_fields`
+(a column statistic folds floating-point partials in the root's shard
+order, and a relay would change it) and `cardinality_fields` (an exact
+cardinality is a union of values, not a sum). A phrase through a relay
+whose children disagree on positions is refused when the root fetches
+statistics, as any mixed capability is.
+
+One ordering note. The flat unary fan-out orders equal scores by shard
+index and then id; a relay's children share one shard index at the
+parent, so equal scores across those children order by id, as a
+monolith orders them. The streaming route and the fused routes order by
+id and by competition rank in both shapes, and the exactness gate covers
+them bit for bit.
+
 Every other `NodeService` route refuses UNIMPLEMENTED naming the route
 and the relay: no ingest, no administration, no snapshots, no
-aggregation, no follow-up fetches, no BM25 scoring through this level
-yet.
+aggregation, no dictionary routes, no follow-up fetches by id, and no
+per-shard fusion (`HybridShard`) or unary vector search (`SearchShard`)
+through this level. The cascade's vector gate takes `SearchShard`, so a
+cascade does not run through a relay yet; its rescoring half does.
 
 ## The epoch token
 
@@ -93,7 +127,13 @@ to the tuple (collection, map revision, children in shard order, each
 child's epoch). The same tuple gets the same token, so a parent's stats
 cache keeps hitting while nothing moves; a moved child is a new token.
 The relay translates a token back into one claim per child
-(`RelayService::translate_epoch`), and the child enforces its own claim.
+(`RelayService::translate_epoch`), and the child enforces its own claim:
+every keyword-leg request the parent sends with the token as its
+`expected_stats_epoch` reaches each child with that child's recorded
+epoch instead, and a child whose postings moved since refuses with the
+`stale stats epoch` prefix, which the relay keeps at the front of the
+error so the parent's retry rule (invalidate, refetch, repeat once
+unclaimed) fires as it does for a node.
 
 Tokens are `incarnation << 32 | counter`: the incarnation is taken at
 process start, so a token from before a restart is unknown afterwards
@@ -137,13 +177,18 @@ relay without touching relay code.
 ## What is not composed yet
 
 The review names what a general relay needs beyond this scope and why:
-BM25 scoring routes with the root's global statistics and the per-child
-epoch claim, follow-up fetches routed by original id, bitmap routes over
-sparse ranges, aggregation with the root's fold order preserved, bounded
-dictionaries, recursive ingest, and a wider statistics contract past
-`u32`. Each is a separate gate with its own equivalence test.
+follow-up fetches routed by original id, the unary vector search the
+cascade gates on, per-shard fusion, bitmap routes over sparse ranges,
+aggregation with the root's fold order preserved (column statistics and
+cardinalities included), bounded dictionaries, recursive ingest, and a
+wider statistics contract past `u32`. Each is a separate gate with its
+own equivalence test.
 
 Reference: `tests/relay.rs` (flat, one-level, and two-level execution
 bit for bit, ties across relays, an initial floor, the token and the
 child's enforcement, a map move, a child error, a parent's stop, the
-refusals, and the contiguity rule).
+refusals, the contiguity rule; and for the keyword leg: lexical queries
+on the unary and streaming routes with explain and facets, global-rank
+and score-blend hybrids, the stale-epoch refusal end to end and the
+refetch that restores it, a phrase under mixed positions, a stop
+mid-stream, and a rescore routed by id).

@@ -1349,6 +1349,19 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   and remaining query-shape integration are still pending.
   [Dense identity](docs/dense-identity.md).
 
+- **Landed 2026-09-05: the keyword leg through a relay.** `Bm25Query`,
+  `Bm25PhraseQuery`, `Bm25QueryStream`, `Bm25Rescore`, and `ShardLegs`
+  forward through a relay coordinator: the root's global statistics and
+  score stages reach each child unchanged, the relay token translates
+  into each child's epoch claim and a moved child's stale-epoch refusal
+  keeps its prefix, candidates and cutoffs pass untouched, terminal
+  responses merge by value with checked arithmetic, and a rescore routes
+  each id to the child that holds it. Column statistics and
+  cardinalities refuse by name. Lexical and global-rank and score-blend
+  hybrid queries agree with the flat fan-out through one and two relay
+  levels (`tests/relay.rs`).
+  [Relay coordinators](docs/relay-coordinators.md).
+
 - **Landed 2026-09-05: the restricted relay coordinator.** `--relay`
   serves the node-facing surface over a coordinator's shard set and
   presents itself to a parent as one shard: `StreamSearch` forwarded

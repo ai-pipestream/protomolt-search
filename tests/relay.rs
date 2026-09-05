@@ -13,16 +13,23 @@
 mod common;
 
 use common::mock::start_mock_analysis;
-use common::{monolithic_topk, start_empty_node, start_node, unit_vectors, BIT_WIDTH, DIM};
-use pipestream_search::coordinator::{CoordinatorServiceImpl, TopologyRoute};
+use common::{
+    fit_calibration, monolithic_topk, start_empty_node, start_node, unit_vectors, BIT_WIDTH, DIM,
+};
+use pipestream_search::coordinator::{CoordinatorServiceImpl, HybridLegs, TopologyRoute};
+use pipestream_search::fusion::{Combination, Normalization};
 use pipestream_search::harness::{start_relay, start_relay_over};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::search_service_server::SearchService as _;
 use pipestream_search::pb::{
-    stream_search_request, stream_search_response, AddDocumentsRequest, Bm25QueryRequest,
-    FieldTerms, HealthRequest, ScoredHit, StartStreamSearch, StopStreamSearch, StreamSearchRequest,
-    TermStatsRequest, TermStatsResponse,
+    bm25_query_stream_request, bm25_query_stream_response, stream_search_request,
+    stream_search_response, AddDocumentsRequest, AddVectorsRequest, Bm25QueryRequest,
+    Bm25QueryStreamRequest, Bm25SearchRequest, FacetValue, FieldTerms, FusionMode, HealthRequest,
+    PhraseMatch, ScoredHit, SetCalibrationRequest, StartStreamSearch, StopBm25Query,
+    StopStreamSearch, StreamSearchRequest, TermStatsRequest, TermStatsResponse,
 };
+use pipestream_search::pb::{Bm25Hit, HybridHit};
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -566,12 +573,29 @@ async fn unsupported_routes_refuse_by_name() {
     let relay_addr = relay_over(&[&leaves.addrs[0]]).await;
     let mut client = NodeServiceClient::connect(relay_addr).await.unwrap();
     let err = client
-        .bm25_query(Bm25QueryRequest::default())
+        .get_documents(pipestream_search::pb::GetDocumentsRequest::default())
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unimplemented);
     assert!(
-        err.message().contains("relay") && err.message().contains("Bm25Query"),
+        err.message().contains("relay") && err.message().contains("GetDocuments"),
+        "{}",
+        err.message()
+    );
+    // Aggregates the relay cannot merge without changing bits refuse by
+    // name on the routes it does serve.
+    let err = client
+        .bm25_query(Bm25QueryRequest {
+            terms: vec!["court".into()],
+            k: 3,
+            stats_fields: vec!["score".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unimplemented);
+    assert!(
+        err.message().contains("stats_fields") && err.message().contains("relay"),
         "{}",
         err.message()
     );
@@ -635,4 +659,544 @@ async fn health_merges_contiguous_children_and_refuses_a_gap() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("contiguous"), "{}", err.message());
+}
+
+// --- The keyword leg ------------------------------------------------------
+
+const LEX_LEAVES: usize = 4;
+const LEX_ROWS: usize = 8;
+const LEX_K: u32 = 6;
+
+/// One leaf's texts. Each leaf pads its documents by a different amount,
+/// so a document with the same words in another leaf scores differently:
+/// the flat unary fan-out orders equal scores by shard index and a relay
+/// by id, and only equal scores could tell the two apart.
+fn lexical_texts(leaf: usize) -> Vec<String> {
+    let base = [
+        "the court held",
+        "an opinion of the court",
+        "zebra crossing ahead",
+        "the court opinion on the zebra",
+        "a lone court",
+        "no match in here",
+        "opinion opinion",
+        "zebra zebra court",
+    ];
+    base.iter()
+        .map(|words| format!("{words}{}", " pad".repeat(leaf + 1)))
+        .collect()
+}
+
+struct LexicalLeaves {
+    addrs: Vec<String>,
+    analysis: String,
+    corpus: Vec<f32>,
+    _mock: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+async fn set_calibration(addr: &str, shift: &[f32], scale: &[f32]) {
+    NodeServiceClient::connect(addr.to_string())
+        .await
+        .unwrap()
+        .set_calibration(SetCalibrationRequest {
+            dim: DIM as u32,
+            bit_width: BIT_WIDTH as u32,
+            shift: shift.to_vec(),
+            scale: scale.to_vec(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn add_faceted_documents(addr: &str, texts: &[String]) {
+    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
+    let (tx, rx) = mpsc::channel(4);
+    let texts = texts.to_vec();
+    let feeder = tokio::spawn(async move {
+        for (i, text) in texts.into_iter().enumerate() {
+            tx.send(AddDocumentsRequest {
+                text,
+                facets: vec![FacetValue {
+                    field: "court".into(),
+                    value: if i % 2 == 0 {
+                        "scotus".into()
+                    } else {
+                        "ca9".into()
+                    },
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+    });
+    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+    feeder.await.unwrap();
+}
+
+async fn add_vectors(addr: &str, vectors: Vec<f32>) {
+    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(AddVectorsRequest {
+        vectors,
+        dim: DIM as u32,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
+}
+
+/// Four leaves with documents, a facet, and vectors aligned by id, on
+/// contiguous slot ranges; `positions[leaf]` gives the leaf positions on
+/// the body field.
+async fn lexical_leaves(positions: &[bool; LEX_LEAVES]) -> LexicalLeaves {
+    let (analysis, mock) = start_mock_analysis().await;
+    let corpus = unit_vectors(LEX_LEAVES * LEX_ROWS, DIM, 0x1E7A_2E1A);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
+    let mut addrs = Vec::new();
+    for leaf in 0..LEX_LEAVES {
+        let (addr, _handle) = start_empty_node(NodeConfig {
+            slot_offset: (leaf * LEX_ROWS) as u64,
+            analysis_addr: Some(analysis.clone()),
+            facet_fields: vec!["court".into()],
+            position_fields: if positions[leaf] {
+                vec!["body".into()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        })
+        .await;
+        set_calibration(&addr, &shift, &scale).await;
+        add_faceted_documents(&addr, &lexical_texts(leaf)).await;
+        add_vectors(
+            &addr,
+            corpus[leaf * LEX_ROWS * DIM..(leaf + 1) * LEX_ROWS * DIM].to_vec(),
+        )
+        .await;
+        addrs.push(addr);
+    }
+    LexicalLeaves {
+        addrs,
+        analysis,
+        corpus,
+        _mock: mock,
+    }
+}
+
+fn lexical_request(text: &str) -> Bm25SearchRequest {
+    Bm25SearchRequest {
+        text: text.into(),
+        k: LEX_K,
+        facet_fields: vec!["court".into()],
+        explain: true,
+        ..Default::default()
+    }
+}
+
+fn rrf_legs() -> HybridLegs {
+    HybridLegs {
+        leg_k: 12,
+        vector_weight: 1.0,
+        bm25_weight: 1.0,
+        rrf_k: 60.0,
+        fusion_mode: FusionMode::GlobalRank,
+        normalization: Normalization::MinMax,
+        combination: Combination::Arithmetic,
+        min_vector_score: 0.0,
+    }
+}
+
+/// A weighted, normalized sum of the two legs. (The decomposed mode
+/// rescores vector candidates by id through `VectorRescore`, a
+/// vector-side follow-up that is outside the relay's scope.)
+fn weighted_legs() -> HybridLegs {
+    HybridLegs {
+        vector_weight: 0.7,
+        bm25_weight: 0.3,
+        fusion_mode: FusionMode::ScoreBlend,
+        ..rrf_legs()
+    }
+}
+
+/// (doc id, fused score bits, vector rank, vector score bits, bm25 rank,
+/// bm25 score bits).
+type HybridBits = (u64, u32, Option<u32>, u32, Option<u32>, u32);
+
+/// A hybrid hit without the shard index the parent names, which is the
+/// relay's index through a relay and the leaf's on the flat path.
+fn hybrid_bits(hits: &[HybridHit]) -> Vec<HybridBits> {
+    hits.iter()
+        .map(|h| {
+            (
+                h.doc_id,
+                h.fused_score.to_bits(),
+                h.vector_rank,
+                h.vector_score.to_bits(),
+                h.bm25_rank,
+                h.bm25_score.to_bits(),
+            )
+        })
+        .collect()
+}
+
+async fn lexical(
+    coordinator: &CoordinatorServiceImpl,
+    text: &str,
+) -> (
+    Vec<Bm25Hit>,
+    Vec<pipestream_search::pb::FacetFieldCounts>,
+    u32,
+) {
+    let response = coordinator
+        .bm25_search(tonic::Request::new(lexical_request(text)))
+        .await
+        .expect("lexical search")
+        .into_inner();
+    (response.hits, response.facets, response.segments_total)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lexical_and_hybrid_queries_through_relays_equal_the_flat_fanout() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    // Stream search on: a relay serves the streaming vector route, and
+    // the cascade's gate takes the unary one otherwise.
+    let with_bm25 = |addrs: Vec<String>, stream: bool| {
+        CoordinatorServiceImpl::new(addrs)
+            .with_bm25(Some(leaves.analysis.clone()), Default::default())
+            .with_bm25_stream(stream)
+            .with_stream_search(true)
+    };
+    let a = relay_over(&[&l[0], &l[1]]).await;
+    let b = relay_over(&[&l[2], &l[3]]).await;
+    let p = relay_over(&[&l[3], &l[1]]).await;
+    let q = relay_over(&[&l[2], &l[0]]).await;
+    let top = relay_over(&[&a, &b]).await;
+    let trees: Vec<(&str, Vec<String>)> = vec![
+        ("one level", vec![a.clone(), b.clone()]),
+        ("permuted", vec![q, p]),
+        ("two levels", vec![top]),
+    ];
+    let queries = ["court", "zebra court", "opinion", "held"];
+    for stream in [false, true] {
+        let flat = with_bm25(l.clone(), stream);
+        for (name, roots) in &trees {
+            let relayed = with_bm25(roots.clone(), stream);
+            for text in queries {
+                let (want_hits, want_facets, want_segments) = lexical(&flat, text).await;
+                let (hits, facets, segments) = lexical(&relayed, text).await;
+                assert!(!want_hits.is_empty(), "{text}: the flat query matched");
+                assert_eq!(
+                    hits, want_hits,
+                    "{name} stream={stream} {text:?}: lexical hits"
+                );
+                assert!(
+                    hits.iter().all(|h| h.explain.is_some()),
+                    "{name} stream={stream} {text:?}: explain carried through"
+                );
+                assert_eq!(
+                    facets, want_facets,
+                    "{name} stream={stream} {text:?}: facets"
+                );
+                assert_eq!(
+                    segments, want_segments,
+                    "{name} stream={stream} {text:?}: segment count"
+                );
+            }
+        }
+    }
+    // Hybrid: the fusions whose answer does not depend on how shards are
+    // grouped (global ranks, a normalized weighted sum). The cascade's
+    // vector gate takes `SearchShard`, a vector route this relay does not
+    // serve; its rescoring half is exercised on its own below.
+    let flat = with_bm25(l.clone(), true);
+    for (qi, text) in ["court", "zebra court"].into_iter().enumerate() {
+        let query = leaves.corpus[qi * DIM..(qi + 1) * DIM].to_vec();
+        let filters = Default::default();
+        let (want_rrf, _) = flat
+            .fanout_hybrid("h", text, &query, LEX_K, None, rrf_legs(), false, &filters)
+            .await
+            .expect("flat rrf");
+        let (want_weighted, _) = flat
+            .fanout_hybrid(
+                "w",
+                text,
+                &query,
+                LEX_K,
+                None,
+                weighted_legs(),
+                false,
+                &filters,
+            )
+            .await
+            .expect("flat weighted");
+        assert!(!want_rrf.is_empty(), "{text}: hybrid matched");
+        for (name, roots) in &trees {
+            let relayed = with_bm25(roots.clone(), true);
+            let (rrf, _) = relayed
+                .fanout_hybrid("h", text, &query, LEX_K, None, rrf_legs(), false, &filters)
+                .await
+                .expect("relayed rrf");
+            assert_eq!(
+                hybrid_bits(&rrf),
+                hybrid_bits(&want_rrf),
+                "{name} {text:?}: rrf"
+            );
+            let (weighted, _) = relayed
+                .fanout_hybrid(
+                    "w",
+                    text,
+                    &query,
+                    LEX_K,
+                    None,
+                    weighted_legs(),
+                    false,
+                    &filters,
+                )
+                .await
+                .expect("relayed weighted");
+            assert_eq!(
+                hybrid_bits(&weighted),
+                hybrid_bits(&want_weighted),
+                "{name} {text:?}: weighted sum"
+            );
+        }
+    }
+}
+
+fn scoring_request(stats: &TermStatsResponse, token: u64) -> Bm25QueryRequest {
+    Bm25QueryRequest {
+        terms: vec!["court".into()],
+        k: 5,
+        global_doc_count: stats.doc_count,
+        global_total_doc_length: stats.total_doc_length,
+        global_doc_frequencies: stats.doc_frequencies.clone(),
+        k1: 1.2,
+        b: 0.75,
+        expected_stats_epoch: token,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moved_child_refuses_the_relayed_claim_and_a_refetch_restores_it() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let relay_addr = relay_over(&[&l[0], &l[1]]).await;
+    let root = CoordinatorServiceImpl::new(vec![relay_addr.clone()])
+        .with_bm25(Some(leaves.analysis.clone()), Default::default());
+    let (before, _, _) = lexical(&root, "court").await;
+    assert!(!before.is_empty());
+
+    let mut relay = NodeServiceClient::connect(relay_addr.clone())
+        .await
+        .unwrap();
+    let request = TermStatsRequest {
+        terms: vec!["court".into()],
+        fields: Vec::new(),
+    };
+    let stats = relay
+        .term_stats(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let token = stats.stats_epoch;
+    assert_ne!(token, 0);
+    let scored = relay
+        .bm25_query(scoring_request(&stats, token))
+        .await
+        .expect("the claim translates to each child")
+        .into_inner();
+    assert!(!scored.hits.is_empty());
+
+    // Child 0 moves: the token's claim on it is stale, and the child says
+    // so through the relay with the prefix the root's retry rule reads.
+    add_faceted_documents(&l[0], &["a new court opinion".to_string()]).await;
+    let err = relay
+        .bm25_query(scoring_request(&stats, token))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().starts_with("stale stats epoch"),
+        "{}",
+        err.message()
+    );
+    assert!(err.message().contains("relay child 0"), "{}", err.message());
+
+    // The root refetches on its own and answers with the new document.
+    let (after, _, _) = lexical(&root, "court").await;
+    assert_eq!(after.len(), before.len().max(1));
+    assert!(
+        after
+            .iter()
+            .any(|h| !before.iter().any(|b| b.doc_id == h.doc_id))
+            || after.len() > before.len()
+            || after != before,
+        "the moved child's document reached the root's answer"
+    );
+
+    let fresh = relay.term_stats(request).await.unwrap().into_inner();
+    assert_ne!(fresh.stats_epoch, token, "a moved child is a new token");
+    let scored = relay
+        .bm25_query(scoring_request(&fresh, fresh.stats_epoch))
+        .await
+        .expect("the fresh claim translates")
+        .into_inner();
+    assert!(!scored.hits.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phrase_refuses_under_mixed_position_capabilities() {
+    let leaves = lexical_leaves(&[true, false, true, true]).await;
+    let l = &leaves.addrs;
+    let mixed = relay_over(&[&l[0], &l[1]]).await;
+    let uniform = relay_over(&[&l[2], &l[3]]).await;
+    let root = CoordinatorServiceImpl::new(vec![mixed, uniform])
+        .with_bm25(Some(leaves.analysis.clone()), Default::default());
+    let err = root
+        .bm25_search(tonic::Request::new(Bm25SearchRequest {
+            text: "court opinion".into(),
+            k: 4,
+            phrase: Some(PhraseMatch { slop: 0 }),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a phrase over a relay whose children disagree on positions is refused");
+    assert!(
+        err.message().contains("positions") && err.message().contains("relay"),
+        "{}",
+        err.message()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parent_stop_mid_stream_yields_an_incomplete_bm25_certificate() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let holding = holding_child().await;
+    let relay_addr = relay_over(&[&leaves.addrs[0], &holding]).await;
+    let stats = NodeServiceClient::connect(leaves.addrs[0].clone())
+        .await
+        .unwrap()
+        .term_stats(TermStatsRequest {
+            terms: vec!["court".into()],
+            fields: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut relay = NodeServiceClient::connect(relay_addr).await.unwrap();
+    let (tx, rx) = mpsc::channel::<Bm25QueryStreamRequest>(4);
+    tx.send(Bm25QueryStreamRequest {
+        payload: Some(bm25_query_stream_request::Payload::Start(scoring_request(
+            &stats, 0,
+        ))),
+    })
+    .await
+    .unwrap();
+    let mut inbound = relay
+        .bm25_query_stream(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    tx.send(Bm25QueryStreamRequest {
+        payload: Some(bm25_query_stream_request::Payload::Stop(StopBm25Query {})),
+    })
+    .await
+    .unwrap();
+    let completion = loop {
+        match inbound
+            .message()
+            .await
+            .expect("the relay answers, not errors")
+        {
+            Some(pipestream_search::pb::Bm25QueryStreamResponse {
+                payload: Some(bm25_query_stream_response::Payload::Completion(c)),
+            }) => break c,
+            Some(_) => continue,
+            None => panic!("the stream closed without a completion"),
+        }
+    };
+    assert!(
+        !completion.completed,
+        "a stopped scan is not certified complete"
+    );
+    assert!(completion.response.is_none());
+    drop(tx);
+}
+
+/// The cascade's rescoring half: candidate ids routed to the child whose
+/// slot range holds them, each child under its own translated claim,
+/// the hits the same as the children's own answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rescore_through_a_relay_routes_each_id_to_its_child() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let relay_addr = relay_over(&[&l[0], &l[1]]).await;
+    let mut relay = NodeServiceClient::connect(relay_addr).await.unwrap();
+    let stats = relay
+        .term_stats(TermStatsRequest {
+            terms: vec!["court".into()],
+            fields: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let claims = stats.stats_epoch;
+    // Ids from both children, out of order.
+    let ids: Vec<u64> = vec![LEX_ROWS as u64 + 3, 0, 4, LEX_ROWS as u64, 5];
+    let rescore = |ids: Vec<u64>, claim: u64| pipestream_search::pb::Bm25RescoreRequest {
+        terms: vec!["court".into()],
+        global_doc_count: stats.doc_count,
+        global_total_doc_length: stats.total_doc_length,
+        global_doc_frequencies: stats.doc_frequencies.clone(),
+        candidate_ids: ids,
+        k1: 1.2,
+        b: 0.75,
+        expected_stats_epoch: claim,
+        score_stages: Vec::new(),
+    };
+    let through = relay
+        .bm25_rescore(rescore(ids.clone(), claims))
+        .await
+        .expect("routed rescore")
+        .into_inner();
+    let mut want = Vec::new();
+    for (child, addr) in l.iter().take(2).enumerate() {
+        let mine: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|&id| (id as usize) / LEX_ROWS == child)
+            .collect();
+        let direct = NodeServiceClient::connect(addr.clone())
+            .await
+            .unwrap()
+            .bm25_rescore(rescore(mine, 0))
+            .await
+            .unwrap()
+            .into_inner();
+        want.extend(direct.hits);
+    }
+    let key = |h: &Bm25Hit| (h.doc_id, h.score.to_bits());
+    let mut got: Vec<_> = through.hits.iter().map(key).collect();
+    let mut expected: Vec<_> = want.iter().map(key).collect();
+    got.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "the routed rescore equals the children's own answers"
+    );
+    assert!(!got.is_empty());
+    let err = relay
+        .bm25_rescore(rescore(vec![(LEX_LEAVES * LEX_ROWS + 10) as u64], claims))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("no child's slot range"),
+        "{}",
+        err.message()
+    );
 }

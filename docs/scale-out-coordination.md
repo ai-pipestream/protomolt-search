@@ -8,8 +8,11 @@ on main.
 
 Status: proposal, 2026-09-05, reviewed. The restricted, read-only relay
 the review cleared exists (`relay-coordinators.md`: `StreamSearch`,
-`TermStats`, `Health`, a map interface with pinned revisions); the rest
-of item 2 and item 3 are not built. The contract
+`TermStats`, `Health`, a map interface with pinned revisions), and the
+keyword leg now runs through it (`Bm25Query`, `Bm25PhraseQuery`,
+`Bm25QueryStream`, `Bm25Rescore`, `ShardLegs`, with the root's
+statistics forwarded unchanged and the epoch token translated per
+child); the rest of item 2 and item 3 are not built. The contract
 it would need first (a scan-rate field on `NodeCapacity` and a
 `ClusterControl.PlanBalance` dry run, both refusing by name) sits on the
 branch `feat/scale-out-reservation-2026-09` so the review can change it
@@ -53,8 +56,9 @@ coordinator to own.
 
 ## Item 2: a tree of coordinators
 
-Built so far: the restricted relay of `relay-coordinators.md`. What
-follows is the design it grows toward; the review names the gates.
+Built so far: the restricted relay of `relay-coordinators.md`, with the
+vector stream and the keyword leg through it. What follows is the
+design it grows toward; the review names the gates.
 
 ### The relay coordinator
 
