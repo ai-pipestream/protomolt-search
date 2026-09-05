@@ -573,6 +573,71 @@ service SearchService {
   // never a quieter match set. df is posting df: a tombstoned row still
   // counts until compaction, and the response says when that applies.
   rpc Suggest(SuggestRequest) returns (SuggestResponse);
+
+  // Did-you-mean over one field's dictionary (docs/synonyms.md,
+  // "Did you mean"): analyzes the text under the field's spec and, for
+  // each term the dictionary lacks (or every term, under mode ALWAYS),
+  // proposes dictionary terms within `max_edits` Damerau-Levenshtein
+  // edits that share the term's first `prefix_length` characters,
+  // ranked by distance then df summed over the shards. The scan is the
+  // same bounded prefix scan Suggest runs (`max_scan`), so the cost is
+  // named and never a quieter answer. A stemmed field proposes stems.
+  rpc TermSuggest(TermSuggestRequest) returns (TermSuggestResponse);
+}
+
+message TermSuggestRequest {
+  string collection = 1;
+  // The indexed BM25 field whose dictionary is consulted.
+  string field = 2;
+  // The query text, analyzed under `analysis`.
+  string text = 3;
+  // The field's analysis spec. Required, as for Suggest.
+  AnalysisSpec analysis = 4;
+  // Edits a candidate may be away from the term: 0 selects 1, above
+  // 2 refuses.
+  uint32 max_edits = 5;
+  // Leading characters a candidate must share with the term: the
+  // scan's lever. 0 selects 1; must be at most the term's length, else
+  // the term gets no candidates.
+  uint32 prefix_length = 6;
+  // Candidates per term. 0 selects 5; above 100 refuses.
+  uint32 limit = 7;
+  // Dictionary terms the scan may read under a term's prefix, per
+  // shard and fleet-wide (as Suggest). 0 selects 100,000.
+  uint64 max_scan = 8;
+  TermSuggestMode mode = 9;
+}
+
+enum TermSuggestMode {
+  // Terms the dictionary lacks (df 0 on every shard) get candidates.
+  TERM_SUGGEST_MODE_MISSING = 0;
+  // Every term gets candidates, its own entry excluded.
+  TERM_SUGGEST_MODE_ALWAYS = 1;
+}
+
+message TermSuggestResponse {
+  // One entry per distinct analyzed query term, in first-occurrence
+  // order.
+  repeated TermSuggestion terms = 1;
+  bool df_includes_tombstoned_rows = 2;
+}
+
+message TermSuggestion {
+  string term = 1;
+  // The term's own df summed over the shards (0: not in any dictionary).
+  uint64 df = 2;
+  // Under MISSING, empty for a term the dictionary has.
+  repeated TermCandidate candidates = 3;
+  // Dictionary terms under the term's prefix, fleet-wide, whether or
+  // not they were within the edit bound.
+  uint64 dictionary_terms_scanned = 4;
+}
+
+message TermCandidate {
+  string term = 1;
+  uint64 df = 2;
+  uint32 distance = 3;
+  uint32 shards = 4;
 }
 
 // Durable cluster membership and placement authority. Query data never flows
@@ -609,23 +674,54 @@ message BrowseShardRequest {
   // Compiled filter IR (the coordinator compiles CEL once), resolved
   // against this shard's dictionaries. Absent = no tree filter.
   FilterExpr filter = 5;
-  // Order by a column instead of by id (docs/query-api.md). The shard
-  // walks its full admitted set with a column-keyed heap — exhaustive
-  // traversal, so the exactness certificate is trivial rather than
-  // inherited from pruning bounds it would otherwise invalidate. A
-  // document WITHOUT a value in the sort column is excluded: absence
-  // has no honest position in a column order (the same stance the
-  // filter rules take — absence is not a value).
-  BrowseSort sort = 6;
-  // Sorted resume only: the boundary's order-preserving key bits (see
-  // BrowseShardResponse.sort_key_bits); pairs with `after` (the
-  // boundary doc id) when `first_page` is false and `sort` is set.
-  uint64 after_key_bits = 7;
+  // Order by columns instead of by id (docs/query-api.md "Sorting"),
+  // most significant key first. The shard walks its full admitted set
+  // with a key-ordered heap — exhaustive traversal, so the exactness
+  // certificate is trivial rather than inherited from pruning bounds
+  // it would otherwise invalidate. A document WITHOUT a value in any
+  // sort key is excluded: absence has no honest position in a column
+  // order (the same stance the filter rules take — absence is not a
+  // value). Empty = id order.
+  repeated BrowseSort sort = 6;
+  reserved 7;
+  // Sorted resume only: the boundary's keys, parallel to `sort`, with
+  // `after` as the boundary doc id. Absent on the first page.
+  repeated SortKey after_keys = 8;
+  // A lexical membership predicate: the coordinator-analyzed terms of
+  // one lexical leaf; a document is admitted when at least one term
+  // has a posting (the BM25 positive-score set, exactly the
+  // ResolveLexicalBitmap rule). Empty = no lexical predicate.
+  repeated string lexical_terms = 9;
 }
 
-// One browse sort order: an i64 or f64 column, ascending or
-// descending. Other families refuse by name (facet/string order needs
-// the sorted term dictionary that does not exist yet).
+// One key of a sorted row on the wire, in the form the merge compares:
+// an order-preserving u64 for i64/f64/id keys (already complemented for
+// a descending order), or the term text of a facet key (compared as
+// bytes; the merge reverses the comparison for a descending order).
+message SortKey {
+  oneof key {
+    uint64 bits = 1;
+    string text = 2;
+  }
+}
+
+// One sorted row's keys and reported values, parallel to `sort`.
+message SortKeyRow {
+  repeated SortKey keys = 1;
+  repeated SortValue values = 2;
+}
+
+// A sort key's value as the public response reports it.
+message SortValue {
+  oneof value {
+    double number = 1;
+    sint64 integer = 2;
+    string text = 3;
+  }
+}
+
+// One sort key: an i64, f64, or facet column, or one of the lineage
+// keys `parent_id` / `group_id`, ascending or descending.
 message BrowseSort {
   string column = 1;
   bool descending = 2;
@@ -640,22 +736,20 @@ message BrowseShardResponse {
   // coordinator.
   repeated bool geo_columns_known = 2;
   repeated bool filter_columns_known = 3;
-  // Sorted only, parallel to doc_ids: ORDER-PRESERVING u64 key bits.
-  // i64 values map through offset-binary (x XOR i64::MIN); f64 values
-  // through the sign-flip trick (negative: all bits flipped; positive:
-  // sign bit set); a DESCENDING sort then complements the result — so
-  // the merged order, the heap order, and the cursor boundary are all
-  // one ascending u64 comparison regardless of kind or direction.
-  repeated uint64 sort_key_bits = 4;
-  // Sorted only, parallel to doc_ids: the actual column values for
-  // reporting (i64 values pass through the same monotone cast the
-  // column metadata uses).
-  repeated double sort_keys = 5;
-  // Whether this shard resolves the sort column (typo rule: refused at
-  // the coordinator only when NO shard does; a shard without the
-  // column contributes nothing, exactly as its documents hold no
-  // value).
-  bool sort_column_known = 6;
+  reserved 4, 5, 6;
+  // Sorted only, parallel to doc_ids: each row's keys in merge form
+  // and its reported values. i64 values map through offset-binary
+  // (x XOR i64::MIN); f64 values through the sign-flip trick
+  // (negative: all bits flipped; positive: sign bit set); a DESCENDING
+  // sort complements the result — so the heap order, the merged order,
+  // and the cursor boundary are one ascending comparison per key.
+  // Facet keys travel as their term text.
+  repeated SortKeyRow sort_rows = 7;
+  // Per sort key, whether this shard resolves the column (typo rule:
+  // refused at the coordinator only when NO shard does; a shard
+  // without the column contributes nothing, exactly as its documents
+  // hold no value). Parallel to the request's `sort`.
+  repeated bool sort_columns_known = 8;
 }
 
 message FilterBitmapRequest {
@@ -2925,6 +3019,8 @@ message ResolveParentsRequest {
 message ResolvedParent {
   uint64 doc_id = 1;
   uint64 parent_id = 2;
+  // The lineage group key (DocLineage.group_id); 0 without lineage.
+  uint64 group_id = 3;
 }
 
 message ResolveParentsResponse {
@@ -3043,6 +3139,13 @@ message Bm25SearchRequest {
   // default; an unknown name, or no name where named collections exist
   // and no default is configured, refuses by name.
   string collection = 18;
+  // Query-time synonym rules for this request (docs/synonyms.md), on
+  // top of the coordinator's table unless `synonyms_off`. Flat route
+  // only; on the fused route each QueryField carries its own.
+  repeated SynonymRule synonyms = 19;
+  // Skip the coordinator's synonym table for this request (the
+  // request's own rules still apply).
+  bool synonyms_off = 20;
 }
 
 // A prefix over a field's term dictionary (docs/prefix-terms.md): every
@@ -3272,6 +3375,33 @@ message QueryField {
   // Term prefixes expanded in this field's dictionary and added to
   // its query terms (docs/prefix-terms.md).
   repeated TermPrefix prefixes = 7;
+  // Query-time synonym rules for this field (docs/synonyms.md), on top
+  // of the coordinator's table unless `synonyms_off`.
+  repeated SynonymRule synonyms = 8;
+  bool synonyms_off = 9;
+}
+
+// One synonym rule (docs/synonyms.md): the words on one line of a
+// synonym file. With `to` empty the rule is symmetric — every entry
+// expands to every other; with `to` set it is one-way — each `terms`
+// entry expands to the `to` entries and never back. Entries are
+// surface words or phrases; the coordinator analyzes them under the
+// field's analysis spec, so a rule written as words matches the stems
+// the dictionary holds.
+message SynonymRule {
+  repeated string terms = 1;
+  repeated string to = 2;
+}
+
+// What one query term expanded to under the synonym rules, per field,
+// in the order the terms were matched.
+message SynonymExpansion {
+  string field = 1;
+  // The analyzed query term the rule matched.
+  string term = 2;
+  // The analyzed terms added to the query, each scored as an ordinary
+  // term (docs/synonyms.md).
+  repeated string terms = 3;
 }
 
 // Client-facing distributed BM25 response.
@@ -3314,6 +3444,9 @@ message Bm25SearchResponse {
   // One entry per TermPrefix the request carried, in request order:
   // the terms it expanded to and was scored over.
   repeated PrefixExpansion prefix_expansions = 8;
+  // One entry per query term a synonym rule matched, per field
+  // (docs/synonyms.md): the terms the rule added.
+  repeated SynonymExpansion synonym_expansions = 9;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.
@@ -4232,14 +4365,17 @@ message QueryRequest {
   // never silently deepened; an exhausted pool refuses and names
   // selection_k as the knob.
   string cursor = 8;
-  // Order the result by a column instead of by relevance
-  // (docs/query-api.md). Increment 1: browse selections only — a
-  // column order over a SCORED selection must re-argue the pruning
-  // certificate (block-max bounds the score, not the column) and is
-  // refused by name until that path exists. The column must be an i64
-  // or f64 column; documents without a value are excluded, because
-  // absence has no honest position in a column order.
-  QuerySort sort = 9;
+  // Order the result by columns instead of by relevance
+  // (docs/query-api.md "Sorting"): most significant key first, ties by
+  // the next key, then by doc id. Served on a browse and on a single
+  // lexical leaf, whose exact term membership (the BM25 positive-score
+  // set) is walked without scores — a column order needs no pruning
+  // certificate because nothing is pruned. A dense or composite
+  // selection has no membership to order and refuses by name. A key
+  // names an i64, f64, or facet column, or a lineage key (`parent_id`,
+  // `group_id`); a document without a value for any key is excluded,
+  // because absence has no honest position in a column order.
+  repeated QuerySort sort = 9;
 
   // Query-time projections (docs/cel-values.md), by name per hit. Routes
   // without inline projection support use candidate-scoped FetchValues.
@@ -4258,12 +4394,36 @@ message QueryRequest {
   // default; an unknown name, or no name where named collections exist
   // and no default is configured, refuses by name.
   string collection = 13;
+  // Collapse the result to one representative per key value
+  // (docs/query-api.md "Collapse"): k means k groups, each represented
+  // by its best hit in the selection's order, with the group's top
+  // inner hits alongside. Served on scored selections over their
+  // candidate pool: a single leaf deepens the pool until k groups are
+  // found (or the corpus or max_k is exhausted); a composite, scorer,
+  // or boost pool is fixed at selection_k and refuses when it holds
+  // fewer than k groups. A browse refuses: it has no order to pick a
+  // representative by.
+  CollapseSpec collapse = 14;
 }
 
-// A column sort order for browse.
+// One sort key (docs/query-api.md "Sorting").
 message QuerySort {
+  // An i64, f64, or facet column, or `parent_id` / `group_id`.
   string column = 1;
   bool descending = 2;
+}
+
+// A collapse (docs/query-api.md "Collapse").
+message CollapseSpec {
+  // The key: an i64 or facet column, or the lineage keys `parent_id` /
+  // `group_id`. A document without a value forms no group and is
+  // dropped from a collapsed result, as the sort rule drops it.
+  string column = 1;
+  // Hits listed per group, the representative first; 0 lists the
+  // representative alone. Each group reports whether its list is
+  // complete (no hit outside the served candidate pool can belong in
+  // it).
+  uint32 inner_hits = 2;
 }
 
 // One node of the selection tree.
@@ -4326,6 +4486,10 @@ message LexicalQuery {
   // Term prefixes expanded in the field's dictionary
   // (docs/prefix-terms.md); served on the single lexical leaf.
   repeated TermPrefix prefixes = 5;
+  // Query-time synonym rules for the leaf (docs/synonyms.md), on top
+  // of the coordinator's table unless `synonyms_off`.
+  repeated SynonymRule synonyms = 6;
+  bool synonyms_off = 7;
 }
 
 // Dense vector relevance (the Search leg).
@@ -4653,6 +4817,27 @@ message QueryResponse {
   // Present when the root BooleanQuery requested an exact aggregation over
   // its full match set (not merely the returned page).
   AggregateResponse aggregate = 9;
+  // Collapsed queries only: one group per hit, parallel to `hits`
+  // (hits[i] is groups[i]'s representative).
+  repeated QueryGroup groups = 10;
+  // The synonym expansions of a lexical leaf (docs/synonyms.md).
+  repeated SynonymExpansion synonym_expansions = 11;
+}
+
+// One collapse group (QueryRequest.collapse).
+message QueryGroup {
+  // The key value the group shares.
+  SortValue key = 1;
+  // The group's hits in the selection's order, at most inner_hits
+  // (at least the representative), ranks counting within the group.
+  repeated QueryHit hits = 2;
+  // Whether `hits` provably lists the group's best inner_hits: true
+  // when the group holds at least inner_hits hits in the candidate
+  // pool, or when the pool reached the end of the selection; false
+  // when a full pool was cut before the group could show more.
+  bool complete = 3;
+  // The group's hits in the candidate pool.
+  uint32 pool_hits = 4;
 }
 
 message DenseQualityOutcome {
@@ -4804,6 +4989,8 @@ message QueryProfile {
   uint64 rerank_logical_bytes = 9;
   uint64 rerank_pages = 10;
   uint32 rerank_tasks = 11;
+  // Collapse: key resolution and grouping over the candidate pool.
+  float collapse_ms = 12;
 }
 
 // One public hit with score provenance.
@@ -4836,6 +5023,10 @@ message QueryHit {
   repeated DimensionScore dimensions = 8;
   // Snippets when the request carried a HighlightSpec.
   repeated Snippet snippets = 9;
+  // Sorted queries only: this hit's value for each sort key, parallel
+  // to the request's `sort`; `sort_key` keeps the first key's numeric
+  // value (0 for a text key).
+  repeated SortValue sort_values = 10;
 }
 
 // One named raw relevance signal.

@@ -336,6 +336,9 @@ pub struct CoordinatorServiceImpl {
     clustered_vectors: Option<ClusteredTurboVecBackend>,
     /// Optional measured candidate-depth contract for FP32 reranking.
     dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
+    /// The coordinator's synonym table (`docs/synonyms.md`), applied to
+    /// every lexical query unless the request turns it off.
+    synonyms: Option<Arc<crate::synonyms::SynonymTable>>,
     /// The generation-bound policy AUTO consults on a non-exhaustive
     /// provider (`docs/dense-execution-policy.md`).
     dense_execution_policy: Option<Arc<crate::dense_policy::DenseExecutionPolicy>>,
@@ -1446,10 +1449,12 @@ pub struct DenseRequestKey<'a> {
 
 /// A browse resume boundary: the last returned id, plus its adjusted
 /// sort-key bits when the browse is column-ordered.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BrowseAfter {
     pub id: u64,
-    pub key_bits: u64,
+    /// The boundary's sort keys, parallel to the request's sort list
+    /// (empty for an id-ordered browse).
+    pub keys: Vec<crate::sortkeys::Key>,
 }
 
 /// One merged browse page.
@@ -1457,11 +1462,11 @@ pub struct BrowseAfter {
 pub struct BrowseRows {
     /// Global doc ids in final order.
     pub ids: Vec<u64>,
-    /// Adjusted order-preserving key bits, parallel to `ids` (the ids
-    /// themselves unsorted).
-    pub key_bits: Vec<u64>,
-    /// Reported sort-column values, parallel (0.0 unsorted).
-    pub keys: Vec<f64>,
+    /// Each row's sort keys in merge form, parallel to `ids` (empty
+    /// rows unsorted).
+    pub keys: Vec<Vec<crate::sortkeys::Key>>,
+    /// Each row's reported sort values, parallel to `ids`.
+    pub values: Vec<Vec<crate::sortkeys::Value>>,
     /// Whether a column order was applied.
     pub sorted: bool,
 }
@@ -1557,6 +1562,10 @@ pub const MAX_PREFIX_EXPANSIONS: usize = 1024;
 
 /// Suggestions a `Suggest` request returns when `limit` is unset
 /// (`docs/suggest.md`).
+/// Candidates per term a did-you-mean request returns by default.
+pub const DEFAULT_TERM_SUGGEST_LIMIT: usize = 5;
+/// The largest edit bound a did-you-mean request may name.
+pub const MAX_TERM_SUGGEST_EDITS: u32 = 2;
 pub const DEFAULT_SUGGEST_LIMIT: usize = 10;
 /// The most suggestions one request may ask for.
 pub const MAX_SUGGEST_LIMIT: usize = 100;
@@ -1627,6 +1636,7 @@ impl CoordinatorServiceImpl {
             #[cfg(feature = "net")]
             clustered_vectors: None,
             dense_quality_profile: None,
+            synonyms: None,
             dense_execution_policy: None,
             topology_generation: 0,
             hash_ranges: Vec::new(),
@@ -2018,6 +2028,55 @@ impl CoordinatorServiceImpl {
     pub fn with_clustered_turbovec(mut self, backend: ClusteredTurboVecBackend) -> Self {
         self.clustered_vectors = Some(backend);
         self
+    }
+
+    /// Install the synonym table (`docs/synonyms.md`).
+    pub fn with_synonyms(mut self, table: crate::synonyms::SynonymTable) -> Self {
+        self.synonyms = Some(Arc::new(table));
+        self
+    }
+
+    /// Expand one field's analyzed query terms under the table (unless
+    /// `off`) and the request's rules, through the coordinator's
+    /// analysis backend; the added terms are appended to `terms`.
+    async fn expand_synonyms(
+        &self,
+        field: &str,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        rules: &[crate::pb::SynonymRule],
+        off: bool,
+        terms: &mut Vec<String>,
+    ) -> Result<Vec<crate::pb::SynonymExpansion>, Status> {
+        if rules.is_empty() && (off || self.synonyms.as_ref().is_none_or(|t| t.is_empty())) {
+            return Ok(Vec::new());
+        }
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
+        })?;
+        let analyze = move |text: String, spec: Option<crate::pb::AnalysisSpec>| {
+            let addr = addr.clone();
+            async move {
+                let analyzed =
+                    crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await?;
+                let mut out: Vec<String> = Vec::new();
+                for (term, _, _) in analyzed.into_body().terms {
+                    if !out.contains(&term) {
+                        out.push(term);
+                    }
+                }
+                Ok(out)
+            }
+        };
+        crate::synonyms::expand(
+            self.synonyms.as_deref(),
+            off,
+            rules,
+            field,
+            spec,
+            terms,
+            analyze,
+        )
+        .await
     }
 
     pub fn with_dense_quality_profile(
@@ -2885,6 +2944,9 @@ impl CoordinatorServiceImpl {
             &[],
             &mut Vec::new(),
             None,
+            &[],
+            false,
+            &mut Vec::new(),
         )
         .await
         .map(|r| (r.0, r.1, r.2))
@@ -2913,6 +2975,9 @@ impl CoordinatorServiceImpl {
         prefixes: &[crate::pb::TermPrefix],
         expansions: &mut Vec<crate::pb::PrefixExpansion>,
         highlight: Option<&crate::pb::HighlightSpec>,
+        synonyms: &[crate::pb::SynonymRule],
+        synonyms_off: bool,
+        synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
     ) -> Result<AggregatedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -2944,6 +3009,11 @@ impl CoordinatorServiceImpl {
         // Term prefixes join the analyzed terms (docs/prefix-terms.md).
         expansions.extend(
             self.expand_prefixes("body", spec, prefixes, &mut terms)
+                .await?,
+        );
+        // Synonym rules join them the same way (docs/synonyms.md).
+        synonym_expansions.extend(
+            self.expand_synonyms("body", spec, synonyms, synonyms_off, &mut terms)
                 .await?,
         );
         if terms.is_empty() || k == 0 {
@@ -3386,6 +3456,7 @@ impl CoordinatorServiceImpl {
             filter,
             &mut Vec::new(),
             None,
+            &mut Vec::new(),
         )
         .await
         .map(|(hits, _)| hits)
@@ -3416,6 +3487,7 @@ impl CoordinatorServiceImpl {
         filter: Option<&crate::pb::FilterExpr>,
         expansions: &mut Vec<crate::pb::PrefixExpansion>,
         highlight: Option<&crate::pb::HighlightSpec>,
+        synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
     ) -> Result<(FacetedHits, Vec<crate::pb::PhraseRouting>), Status> {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
@@ -3508,6 +3580,16 @@ impl CoordinatorServiceImpl {
             expansions.extend(
                 self.expand_prefixes(&f.field, f.analysis.as_ref(), &f.prefixes, &mut terms)
                     .await?,
+            );
+            synonym_expansions.extend(
+                self.expand_synonyms(
+                    &f.field,
+                    f.analysis.as_ref(),
+                    &f.synonyms,
+                    f.synonyms_off,
+                    &mut terms,
+                )
+                .await?,
             );
             field_terms.push(terms);
             phrase_requests.push(phrase);
@@ -3721,6 +3803,8 @@ impl CoordinatorServiceImpl {
                 b: 0.0,
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }]
         } else {
             if base.analysis.is_some() {
@@ -3791,6 +3875,8 @@ impl CoordinatorServiceImpl {
             b: 0.0,
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         });
         field_terms.push(phrase_terms);
         if k == 0 || field_terms.iter().all(Vec::is_empty) {
@@ -7293,9 +7379,11 @@ impl CoordinatorServiceImpl {
         &self,
         k: u32,
         after: Option<BrowseAfter>,
-        sort: Option<&crate::pb::BrowseSort>,
+        sort: &[crate::pb::BrowseSort],
+        lexical_terms: &[String],
         filters: &RequestFilters,
     ) -> Result<BrowseRows, Status> {
+        use crate::sortkeys::{cmp_rows, Key, Value};
         let k = self.resolve_k(k)?;
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
@@ -7305,8 +7393,12 @@ impl CoordinatorServiceImpl {
                 first_page: after.is_none(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
-                sort: sort.cloned(),
-                after_key_bits: after.as_ref().map_or(0, |a| a.key_bits),
+                sort: sort.to_vec(),
+                after_keys: after
+                    .as_ref()
+                    .map(|a| a.keys.iter().map(Key::to_pb).collect())
+                    .unwrap_or_default(),
+                lexical_terms: lexical_terms.to_vec(),
             };
             let client = self.node_client(node);
             tasks.push(tokio::spawn(async move {
@@ -7314,53 +7406,106 @@ impl CoordinatorServiceImpl {
             }));
         }
         let mut known = FilterKnown::new(filters);
-        let mut sort_known = sort.is_none();
-        // (merge key, id, reported value): key = adjusted key bits
-        // sorted, or the id itself unsorted — one ascending comparison
-        // either way.
-        let mut rows: Vec<(u64, u64, f64)> = Vec::new();
+        let mut sort_known = vec![false; sort.len()];
+        struct Row {
+            keys: Vec<Key>,
+            values: Vec<Value>,
+            id: u64,
+        }
+        let mut rows: Vec<Row> = Vec::new();
         for task in tasks {
             let response = task
                 .await
                 .map_err(|e| Status::internal(format!("browse task failed: {e}")))??;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
-            sort_known |= response.sort_column_known;
-            if sort.is_some() {
-                if response.sort_key_bits.len() != response.doc_ids.len()
-                    || response.sort_keys.len() != response.doc_ids.len()
-                {
-                    return Err(Status::internal(
-                        "shard answered a sorted browse with mismatched key columns",
-                    ));
-                }
-                for ((&id, &bits), &value) in response
-                    .doc_ids
+            for (known, shard) in sort_known.iter_mut().zip(&response.sort_columns_known) {
+                *known |= shard;
+            }
+            if sort.is_empty() {
+                rows.extend(response.doc_ids.iter().map(|&id| Row {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                    id,
+                }));
+                continue;
+            }
+            if response.sort_rows.len() != response.doc_ids.len() {
+                return Err(Status::internal(
+                    "shard answered a sorted browse with mismatched key rows",
+                ));
+            }
+            for (&id, row) in response.doc_ids.iter().zip(&response.sort_rows) {
+                let keys: Option<Vec<Key>> = row.keys.iter().map(Key::from_pb).collect();
+                let values: Option<Vec<Value>> = row
+                    .values
                     .iter()
-                    .zip(&response.sort_key_bits)
-                    .zip(&response.sort_keys)
-                {
-                    rows.push((bits, id, value));
+                    .map(crate::sortkeys::value_from_pb)
+                    .collect();
+                let (Some(keys), Some(values)) = (keys, values) else {
+                    return Err(Status::internal(
+                        "shard answered a sorted browse with an empty key",
+                    ));
+                };
+                if keys.len() != sort.len() || values.len() != sort.len() {
+                    return Err(Status::internal(format!(
+                        "shard answered a sorted browse with {} keys for {} sort columns",
+                        keys.len(),
+                        sort.len()
+                    )));
                 }
-            } else {
-                rows.extend(response.doc_ids.iter().map(|&id| (id, id, 0.0)));
+                rows.push(Row { keys, values, id });
             }
         }
         known.refuse_unknown(filters)?;
-        if !sort_known {
-            let column = sort.map(|s| s.column.as_str()).unwrap_or_default();
-            return Err(Status::invalid_argument(format!(
-                "sort column {column:?} is not declared on any shard's numeric or integer \
-                 table (--numeric-fields / --integer-fields)"
-            )));
+        for (sort, known) in sort.iter().zip(&sort_known) {
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "sort column {:?} is not declared on any shard's numeric, integer, or \
+                     facet table (--numeric-fields / --integer-fields / --facet-fields), \
+                     and is not a lineage key (parent_id, group_id)",
+                    sort.column
+                )));
+            }
         }
-        rows.sort_unstable_by_key(|r| (r.0, r.1));
+        let descending: Vec<bool> = sort.iter().map(|s| s.descending).collect();
+        rows.sort_by(|a, b| cmp_rows(&a.keys, a.id, &b.keys, b.id, &descending));
         rows.truncate(k as usize);
         Ok(BrowseRows {
-            ids: rows.iter().map(|r| r.1).collect(),
-            key_bits: rows.iter().map(|r| r.0).collect(),
-            keys: rows.iter().map(|r| r.2).collect(),
-            sorted: sort.is_some(),
+            ids: rows.iter().map(|r| r.id).collect(),
+            keys: rows.iter().map(|r| r.keys.clone()).collect(),
+            values: rows.iter().map(|r| r.values.clone()).collect(),
+            sorted: !sort.is_empty(),
         })
+    }
+
+    /// The lineage keys of every requested document across the shards:
+    /// doc id to (parent_id, group_id). A document without lineage
+    /// parents itself in the high-bit-tagged domain and has group 0. A
+    /// deleted or unknown id is absent.
+    pub async fn lineage_keys(&self, ids: &[u64]) -> Result<HashMap<u64, (u64, u64)>, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::ResolveParentsRequest {
+                doc_ids: ids.to_vec(),
+            };
+            let mut client = self.node_client(node)?;
+            tasks.push(tokio::spawn(async move {
+                client
+                    .resolve_parents(request)
+                    .await
+                    .map(|r| r.into_inner())
+            }));
+        }
+        let mut out = HashMap::with_capacity(ids.len());
+        for task in tasks {
+            let response = task
+                .await
+                .map_err(|e| Status::internal(format!("lineage task failed: {e}")))??;
+            for resolved in response.parents {
+                out.insert(resolved.doc_id, (resolved.parent_id, resolved.group_id));
+            }
+        }
+        Ok(out)
     }
 
     fn merge_membership_bitmap(
@@ -7473,13 +7618,13 @@ impl CoordinatorServiceImpl {
         Ok(merged)
     }
 
-    /// Analyze one lexical clause and resolve its exact positive-score
-    /// membership. No score bytes cross this phase.
-    pub async fn lexical_membership(
+    /// The distinct body terms of one lexical clause under `spec`, in
+    /// first-occurrence order: the membership vocabulary of the clause.
+    pub async fn analyze_terms(
         &self,
         text: &str,
         spec: Option<&crate::pb::AnalysisSpec>,
-    ) -> Result<MembershipSet, Status> {
+    ) -> Result<Vec<String>, Status> {
         if text.is_empty() {
             return Err(Status::invalid_argument("lexical clause text is empty"));
         }
@@ -7493,6 +7638,17 @@ impl CoordinatorServiceImpl {
                 terms.push(term);
             }
         }
+        Ok(terms)
+    }
+
+    /// Analyze one lexical clause and resolve its exact positive-score
+    /// membership. No score bytes cross this phase.
+    pub async fn lexical_membership(
+        &self,
+        text: &str,
+        spec: Option<&crate::pb::AnalysisSpec>,
+    ) -> Result<MembershipSet, Status> {
+        let terms = self.analyze_terms(text, spec).await?;
         if terms.is_empty() {
             return Ok(MembershipSet {
                 epochs: vec![0; self.node_addrs.len()],
@@ -9490,6 +9646,7 @@ impl SearchService for CoordinatorServiceImpl {
             let projections = compile_projections(&req.projections)?;
             let mut phrase_routing = Vec::new();
             let mut prefix_expansions = Vec::new();
+            let mut synonym_expansions = Vec::new();
             let (hits, facets, range_facets, stats, cardinality) =
                 if req.fields.is_empty() && req.phrase.is_some() {
                     // A phrase on the flat route is the body field's phrase on
@@ -9521,6 +9678,8 @@ impl SearchService for CoordinatorServiceImpl {
                         b: 0.0,
                         phrase: req.phrase,
                         prefixes: req.prefixes.clone(),
+                        synonyms: req.synonyms.clone(),
+                        synonyms_off: req.synonyms_off,
                     }];
                     let ((hits, facets, ranges), routing) = self
                         .fanout_bm25_fused_routed(
@@ -9535,6 +9694,7 @@ impl SearchService for CoordinatorServiceImpl {
                             filter.as_ref(),
                             &mut prefix_expansions,
                             req.highlight.as_ref(),
+                            &mut synonym_expansions,
                         )
                         .await?;
                     phrase_routing = routing;
@@ -9557,6 +9717,9 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.prefixes,
                         &mut prefix_expansions,
                         req.highlight.as_ref(),
+                        &req.synonyms,
+                        req.synonyms_off,
+                        &mut synonym_expansions,
                     )
                     .await?
                 } else {
@@ -9618,6 +9781,7 @@ impl SearchService for CoordinatorServiceImpl {
                             filter.as_ref(),
                             &mut prefix_expansions,
                             req.highlight.as_ref(),
+                            &mut synonym_expansions,
                         )
                         .await?;
                     phrase_routing = routing;
@@ -9642,6 +9806,7 @@ impl SearchService for CoordinatorServiceImpl {
                 cardinality,
                 phrase_routing,
                 prefix_expansions,
+                synonym_expansions,
             }))
         })
         .await
@@ -9706,6 +9871,7 @@ impl SearchService for CoordinatorServiceImpl {
             cardinality: Vec::new(),
             phrase_routing: Vec::new(),
             prefix_expansions: Vec::new(),
+            synonym_expansions: Vec::new(),
         }))
         })
         .await
@@ -10484,6 +10650,171 @@ impl SearchService for CoordinatorServiceImpl {
                     .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
                     .collect(),
                 dictionary_terms_with_prefix,
+                df_includes_tombstoned_rows: tombstoned,
+            }))
+        })
+        .await
+    }
+
+    async fn term_suggest(
+        &self,
+        request: Request<crate::pb::TermSuggestRequest>,
+    ) -> Result<Response<crate::pb::TermSuggestResponse>, Status> {
+        crate::metrics::timed(Route::TermSuggest, request, |request| async move {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
+                return Box::pin(SearchService::term_suggest(&snapshot, request)).await;
+            }
+            let req = request.into_inner();
+            let max_edits = match req.max_edits {
+                0 => 1usize,
+                n if n > MAX_TERM_SUGGEST_EDITS => {
+                    return Err(Status::invalid_argument(format!(
+                        "max_edits {n} exceeds the maximum {MAX_TERM_SUGGEST_EDITS}"
+                    )))
+                }
+                n => n as usize,
+            };
+            let prefix_length = match req.prefix_length {
+                0 => 1usize,
+                n => n as usize,
+            };
+            let limit = match req.limit as usize {
+                0 => DEFAULT_TERM_SUGGEST_LIMIT,
+                n if n > MAX_SUGGEST_LIMIT => {
+                    return Err(Status::invalid_argument(format!(
+                        "limit {n} exceeds the maximum {MAX_SUGGEST_LIMIT}"
+                    )))
+                }
+                n => n,
+            };
+            let max_scan = match req.max_scan {
+                0 => DEFAULT_SUGGEST_SCAN,
+                n if n > MAX_SUGGEST_SCAN as u64 => {
+                    return Err(Status::invalid_argument(format!(
+                        "max_scan {n} exceeds the maximum {MAX_SUGGEST_SCAN}"
+                    )))
+                }
+                n => n as usize,
+            };
+            if req.field.is_empty() {
+                return Err(Status::invalid_argument(
+                    "term suggestions need a field: name the indexed BM25 field whose \
+                     dictionary to consult (\"body\" for the body)",
+                ));
+            }
+            if req.analysis.is_none() {
+                return Err(Status::invalid_argument(
+                    "term suggestions need the field's analysis spec: the text is analyzed \
+                     under it, and the sidecar's default chain is not known here",
+                ));
+            }
+            if req.text.trim().is_empty() {
+                return Err(Status::invalid_argument("term suggestions need text"));
+            }
+            let always = req.mode == crate::pb::TermSuggestMode::Always as i32;
+            let field = req.field.clone();
+            let addr = self.analysis_addr.clone().ok_or_else(|| {
+                Status::unavailable(
+                    "no analysis backend configured on the coordinator (analysis_addr)",
+                )
+            })?;
+            let analyzed =
+                crate::analyzer::analyze_document(&addr, &req.text, req.analysis.as_ref())
+                    .await?
+                    .into_body();
+            let mut terms: Vec<String> = Vec::new();
+            for (term, _, _) in analyzed.terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+            // One bounded prefix scan per term per shard; a term shorter
+            // than the prefix length is looked up whole (its own df) and
+            // gets no candidates.
+            let mut tasks = Vec::with_capacity(terms.len() * self.node_addrs.len());
+            for (ti, term) in terms.iter().enumerate() {
+                let prefix: String = term.chars().take(prefix_length).collect();
+                let scan = if term.chars().count() >= prefix_length {
+                    prefix
+                } else {
+                    term.clone()
+                };
+                for (shard, node) in self.node_addrs.iter().enumerate() {
+                    let mut client = self.node_client(node)?;
+                    let request = crate::pb::SuggestTermsRequest {
+                        field: field.clone(),
+                        prefix: scan.clone(),
+                        max_scan: max_scan as u64,
+                    };
+                    tasks.push((
+                        ti,
+                        shard,
+                        scan.clone(),
+                        tokio::spawn(async move {
+                            client.suggest_terms(request).await.map(|r| r.into_inner())
+                        }),
+                    ));
+                }
+            }
+            let mut unions: Vec<std::collections::BTreeMap<String, (u64, u32)>> =
+                terms.iter().map(|_| Default::default()).collect();
+            let mut known = false;
+            let mut tombstoned = false;
+            for (ti, shard, scan, task) in tasks {
+                let resp = task
+                    .await
+                    .map_err(|e| Status::internal(format!("term suggest task failed: {e}")))??;
+                tombstoned |= resp.tombstoned_rows > 0;
+                if !resp.known {
+                    continue;
+                }
+                known = true;
+                if resp.count as usize > max_scan {
+                    return Err(Status::invalid_argument(format!(
+                        "prefix {scan:?} of term {:?} on field {field:?} matches {} dictionary \
+                         terms on shard {shard}; the scan bound is {max_scan} (raise max_scan \
+                         up to {MAX_SUGGEST_SCAN}, or raise prefix_length)",
+                        terms[ti], resp.count
+                    )));
+                }
+                for entry in resp.entries {
+                    let slot = unions[ti].entry(entry.term).or_insert((0, 0));
+                    slot.0 += entry.df;
+                    slot.1 += 1;
+                }
+            }
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "no shard indexes field {field:?}; there is no dictionary to suggest from"
+                )));
+            }
+            let mut out = Vec::with_capacity(terms.len());
+            for (ti, term) in terms.iter().enumerate() {
+                let union = &unions[ti];
+                if union.len() > max_scan {
+                    return Err(Status::invalid_argument(format!(
+                        "the prefix of term {term:?} on field {field:?} matches {} dictionary \
+                         terms across the fleet; the scan bound is {max_scan} (raise max_scan \
+                         up to {MAX_SUGGEST_SCAN}, or raise prefix_length)",
+                        union.len()
+                    )));
+                }
+                let df = union.get(term).map_or(0, |(df, _)| *df);
+                let candidates = if term.chars().count() < prefix_length || (df > 0 && !always) {
+                    Vec::new()
+                } else {
+                    crate::synonyms::rank_candidates(term, union, max_edits, limit)
+                };
+                out.push(crate::pb::TermSuggestion {
+                    term: term.clone(),
+                    df,
+                    candidates,
+                    dictionary_terms_scanned: union.len() as u64,
+                });
+            }
+            Ok(Response::new(crate::pb::TermSuggestResponse {
+                terms: out,
                 df_includes_tombstoned_rows: tombstoned,
             }))
         })

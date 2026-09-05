@@ -265,6 +265,8 @@ async fn fields_without_a_payload_refuse_by_name() {
                 b: 0.0,
                 phrase: Some(PhraseMatch { slop: 0 }),
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }],
             ..Default::default()
         }),
@@ -297,6 +299,8 @@ async fn fields_without_a_payload_refuse_by_name() {
                 b: 0.0,
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }],
             ..Default::default()
         },
@@ -327,6 +331,8 @@ async fn fields_without_a_payload_refuse_by_name() {
         b: 0.0,
         phrase: None,
         prefixes: Vec::new(),
+        synonyms: Vec::new(),
+        synonyms_off: false,
     }];
     let error = SearchService::bm25_search(&fleet.coordinator, Request::new(fused))
         .await
@@ -439,6 +445,8 @@ async fn the_query_adapter_serves_the_single_lexical_leaf_and_refuses_the_rest()
         score_stages: Vec::new(),
         phrase: Some(PhraseMatch { slop }),
         prefixes: Vec::new(),
+        synonyms: Vec::new(),
+        synonyms_off: false,
     };
     let leaf = |slop: u32| SelectionQuery {
         node: Some(selection_query::Node::Search(SearchQuery {

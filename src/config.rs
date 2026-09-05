@@ -269,6 +269,8 @@ pub struct Config {
     pub max_rerank_bytes: u64,
     /// Optional generation-bound measured candidate-depth profile.
     pub dense_quality_profile: Option<PathBuf>,
+    /// Optional synonym table (`docs/synonyms.md`), a TOML file.
+    pub synonyms: Option<PathBuf>,
     /// Optional generation-bound dense execution policy for AUTO
     /// (`docs/dense-execution-policy.md`).
     pub dense_execution_policy: Option<PathBuf>,
@@ -439,6 +441,7 @@ pub struct CollectionConfig {
     pub bm25_k1: f32,
     pub bm25_b: f32,
     pub dense_quality_profile: Option<PathBuf>,
+    pub synonyms: Option<PathBuf>,
     pub dense_execution_policy: Option<PathBuf>,
     pub replica_state_path: Option<PathBuf>,
     pub control_state_path: Option<PathBuf>,
@@ -454,6 +457,7 @@ struct FileCollection {
     bm25_k1: Option<f32>,
     bm25_b: Option<f32>,
     dense_quality_profile: Option<String>,
+    synonyms: Option<String>,
     dense_execution_policy: Option<String>,
     replica_state: Option<String>,
     control_state: Option<String>,
@@ -508,6 +512,7 @@ struct FileConfig {
     max_k: Option<u32>,
     max_rerank_mib: Option<u64>,
     dense_quality_profile: Option<String>,
+    synonyms: Option<String>,
     dense_execution_policy: Option<String>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
@@ -1565,6 +1570,14 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     )
     .filter(|path| !path.trim().is_empty())
     .map(PathBuf::from);
+    let synonyms = opt(
+        args,
+        "synonyms",
+        "PIPESTREAM_SEARCH_SYNONYMS",
+        file.synonyms.as_deref(),
+    )
+    .filter(|path| !path.trim().is_empty())
+    .map(PathBuf::from);
     let dense_execution_policy = opt(
         args,
         "dense-execution-policy",
@@ -1991,6 +2004,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     .as_ref()
                     .map(PathBuf::from)
                     .or_else(|| dense_quality_profile.clone()),
+                synonyms: c
+                    .synonyms
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or_else(|| synonyms.clone()),
                 dense_execution_policy: c
                     .dense_execution_policy
                     .as_ref()
@@ -2217,6 +2235,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         max_k,
         max_rerank_bytes,
         dense_quality_profile,
+        synonyms,
         dense_execution_policy,
         query_dim,
         bit_width,

@@ -3185,6 +3185,13 @@ pub struct NodeServiceImpl {
     /// shard — every doc logged, none attributable — so the second stream
     /// is refused outright rather than merged.
     ingest_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// A fence on ingest (`docs/cluster-control.md`, "Shard split"): set
+    /// by the node agent when the shard's rows are moving to its split
+    /// children, so no append can land between the children's final
+    /// catch-up and the topology cutover. The reason names the
+    /// children; a fenced shard refuses every ingest stream by name and
+    /// keeps serving queries.
+    ingest_fence: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) config: NodeConfig,
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
@@ -3722,6 +3729,7 @@ impl NodeServiceImpl {
                 pending_compaction: None,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ingest_fence: Arc::new(std::sync::Mutex::new(None)),
             seal_lock: Arc::new(std::sync::Mutex::new(())),
             compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -3940,9 +3948,25 @@ impl NodeServiceImpl {
         }
     }
 
+    /// Fence ingest on this shard: every later ingest stream is refused
+    /// naming `reason`; queries are unaffected. Idempotent.
+    pub fn fence_ingest(&self, reason: String) {
+        *self.ingest_fence.lock().expect("ingest fence lock") = Some(reason);
+    }
+
+    /// The fence reason, when the shard is fenced.
+    pub fn ingest_fence(&self) -> Option<String> {
+        self.ingest_fence.lock().expect("ingest fence lock").clone()
+    }
+
     /// Claim the single-writer ingest gate, or refuse the stream.
     fn claim_ingest(&self) -> Result<IngestGuard, Status> {
         use std::sync::atomic::Ordering;
+        if let Some(reason) = self.ingest_fence() {
+            return Err(Status::failed_precondition(format!(
+                "ingest is fenced on this shard: {reason}"
+            )));
+        }
         if self
             .ingest_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -9235,9 +9259,8 @@ impl NodeService for NodeServiceImpl {
                     doc_ids: Vec::new(),
                     geo_columns_known,
                     filter_columns_known,
-                    sort_key_bits: Vec::new(),
-                    sort_keys: Vec::new(),
-                    sort_column_known: false,
+                    sort_rows: Vec::new(),
+                    sort_columns_known: vec![false; req.sort.len()],
                 }));
             };
             if store.as_index().is_none() {
@@ -9246,6 +9269,36 @@ impl NodeService for NodeServiceImpl {
                 ));
             }
             let n = u64::from(store.next_doc_id());
+            // The lexical membership predicate (the terms of one lexical
+            // leaf, OR): the same bitmap ResolveLexicalBitmap answers,
+            // built here so the walk reads it in place.
+            let lexical: Option<Vec<u8>> = if req.lexical_terms.is_empty() {
+                None
+            } else {
+                let index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                let count = n as usize;
+                let mut bits = vec![0u8; count.div_ceil(8)];
+                for term in &req.lexical_terms {
+                    index.for_each_doc_tf(term, &mut |doc_id, _tf| {
+                        let position = doc_id as usize;
+                        if position < count {
+                            bits[position / 8] |= 1 << (position % 8);
+                        }
+                    });
+                }
+                Some(bits)
+            };
+            let in_lexical = |local: u32| -> bool {
+                match &lexical {
+                    None => true,
+                    Some(bits) => {
+                        let p = local as usize;
+                        bits.get(p / 8).is_some_and(|b| b & (1 << (p % 8)) != 0)
+                    }
+                }
+            };
             // The exclusive floor in local id space. The first page carries
             // no floor at all (proto3 cannot distinguish after = 0 from
             // unset, so the request says which it is).
@@ -9265,83 +9318,179 @@ impl NodeService for NodeServiceImpl {
                 phrase: Vec::new(),
             };
             let cols = ShardNumericRead(store);
-            if let Some(sort) = &req.sort {
+            if !req.sort.is_empty() {
                 // Column-ordered browse: walk the FULL admitted set with a
                 // k-bounded heap. Exhaustive by construction, so the
                 // exactness certificate is trivial; per-shard exact top-k
                 // by key means the coordinator's merged union contains the
                 // global top-k (local rank <= global rank).
-                let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> =
-                    if let Some(ni) = store.numeric_index(&sort.column) {
-                        Box::new(move |doc| {
-                            store.numeric_value(ni, doc).map(|v| (f64_order_bits(v), v))
-                        })
+                use crate::sortkeys::{cmp_candidate, Key, KeyRef, Value};
+                enum Column {
+                    Numeric(usize),
+                    Integer(usize),
+                    Facet(usize),
+                    Parent,
+                    Group,
+                }
+                let mut columns = Vec::with_capacity(req.sort.len());
+                let mut known = Vec::with_capacity(req.sort.len());
+                for sort in &req.sort {
+                    let column = if let Some(ni) = store.numeric_index(&sort.column) {
+                        Some(Column::Numeric(ni))
                     } else if let Some(ii) = store.integer_index(&sort.column) {
-                        Box::new(move |doc| {
-                            store
-                                .integer_value(ii, doc)
-                                .map(|v| (i64_order_bits(v), v as f64))
-                        })
+                        Some(Column::Integer(ii))
+                    } else if let Some(fi) = store.facet_index(&sort.column) {
+                        Some(Column::Facet(fi))
+                    } else if sort.column == "parent_id" {
+                        Some(Column::Parent)
+                    } else if sort.column == "group_id" {
+                        Some(Column::Group)
                     } else {
-                        // Unknown here; the coordinator's typo rule refuses
-                        // only when NO shard knows it.
-                        return Ok(Response::new(crate::pb::BrowseShardResponse {
-                            doc_ids: Vec::new(),
-                            geo_columns_known,
-                            filter_columns_known,
-                            sort_key_bits: Vec::new(),
-                            sort_keys: Vec::new(),
-                            sort_column_known: false,
-                        }));
+                        None
                     };
-                let boundary = (!req.first_page).then_some((req.after_key_bits, req.after));
-                // Max-heap keeping the k SMALLEST (adjusted-bits, id) pairs.
-                let mut heap: std::collections::BinaryHeap<(u64, u64, u64)> =
-                    std::collections::BinaryHeap::with_capacity(req.k as usize + 1);
+                    known.push(column.is_some());
+                    columns.push(column);
+                }
+                if columns.iter().any(Option::is_none) {
+                    // Unknown here; the coordinator's typo rule refuses only
+                    // when NO shard knows a column. A shard that lacks any
+                    // key holds no value for it on any document, so it
+                    // contributes no rows.
+                    return Ok(Response::new(crate::pb::BrowseShardResponse {
+                        doc_ids: Vec::new(),
+                        geo_columns_known,
+                        filter_columns_known,
+                        sort_rows: Vec::new(),
+                        sort_columns_known: known,
+                    }));
+                }
+                let columns: Vec<Column> = columns.into_iter().flatten().collect();
+                let descending: Vec<bool> = req.sort.iter().map(|s| s.descending).collect();
+                let index = store.as_index();
+                // A candidate's keys, borrowed where the column lets them
+                // be, and its reported values; None when any key is absent.
+                let keys_of = |doc: u32| -> Option<(Vec<KeyRef<'_>>, Vec<Value>)> {
+                    let mut keys = Vec::with_capacity(columns.len());
+                    let mut values = Vec::with_capacity(columns.len());
+                    for (column, desc) in columns.iter().zip(&descending) {
+                        let adjust = |bits: u64| if *desc { !bits } else { bits };
+                        match column {
+                            Column::Numeric(ni) => {
+                                let v = store.numeric_value(*ni, doc)?;
+                                keys.push(KeyRef::Bits(adjust(f64_order_bits(v))));
+                                values.push(Value::Number(v));
+                            }
+                            Column::Integer(ii) => {
+                                let v = store.integer_value(*ii, doc)?;
+                                keys.push(KeyRef::Bits(adjust(i64_order_bits(v))));
+                                values.push(Value::Integer(v));
+                            }
+                            Column::Facet(fi) => {
+                                let ord = store.facet_ord(*fi, doc)?;
+                                let text = store.facet_value(*fi, ord);
+                                keys.push(KeyRef::Text(text));
+                                values.push(Value::Text(text.to_string()));
+                            }
+                            Column::Parent | Column::Group => {
+                                let lineage = index.and_then(|index| index.lineage(doc))?;
+                                let v = if matches!(column, Column::Parent) {
+                                    lineage.parent_id
+                                } else {
+                                    lineage.group_id
+                                };
+                                keys.push(KeyRef::Bits(adjust(v)));
+                                values.push(Value::Integer(v as i64));
+                            }
+                        }
+                    }
+                    Some((keys, values))
+                };
+                let boundary: Option<Vec<Key>> = if req.first_page {
+                    None
+                } else {
+                    let keys: Option<Vec<Key>> = req.after_keys.iter().map(Key::from_pb).collect();
+                    let keys = keys.ok_or_else(|| {
+                        Status::invalid_argument("sorted browse boundary carries an empty key")
+                    })?;
+                    if keys.len() != req.sort.len() {
+                        return Err(Status::invalid_argument(format!(
+                            "sorted browse boundary has {} keys for {} sort columns",
+                            keys.len(),
+                            req.sort.len()
+                        )));
+                    }
+                    Some(keys)
+                };
+                // The k best rows so far, worst last (a small k: the heap's
+                // work is the comparison against the worst kept row, and
+                // an insertion is a shift of at most k entries).
+                struct Row {
+                    keys: Vec<Key>,
+                    values: Vec<Value>,
+                    id: u64,
+                }
+                let k = req.k as usize;
+                let mut kept: Vec<Row> = Vec::with_capacity(k + 1);
                 for local in 0..n {
                     let doc = local as u32;
-                    if !doc_filter.passes(doc, &cols) {
+                    if !in_lexical(doc) || !doc_filter.passes(doc, &cols) {
                         continue;
                     }
                     // A document without a value has no honest position in
                     // a column order: excluded, same stance as the filters.
-                    let Some((bits, value)) = key_of(doc) else {
+                    let Some((keys, values)) = keys_of(doc) else {
                         continue;
                     };
-                    let adjusted = if sort.descending { !bits } else { bits };
                     let id = slot_offset + local;
-                    if let Some(b) = boundary {
-                        if (adjusted, id) <= b {
+                    if let Some(b) = &boundary {
+                        if cmp_candidate(&keys, id, b, req.after, &descending)
+                            != std::cmp::Ordering::Greater
+                        {
                             continue;
                         }
                     }
-                    heap.push((adjusted, id, value.to_bits()));
-                    if heap.len() > req.k as usize {
-                        heap.pop();
+                    if kept.len() == k {
+                        let worst = &kept[k - 1];
+                        if cmp_candidate(&keys, id, &worst.keys, worst.id, &descending)
+                            != std::cmp::Ordering::Less
+                        {
+                            continue;
+                        }
+                    }
+                    let row = Row {
+                        keys: keys.into_iter().map(KeyRef::to_owned).collect(),
+                        values,
+                        id,
+                    };
+                    let at = kept.partition_point(|r| {
+                        crate::sortkeys::cmp_rows(&r.keys, r.id, &row.keys, row.id, &descending)
+                            == std::cmp::Ordering::Less
+                    });
+                    kept.insert(at, row);
+                    if kept.len() > k {
+                        kept.pop();
                     }
                 }
-                let mut rows = heap.into_vec();
-                rows.sort_unstable();
-                let mut doc_ids = Vec::with_capacity(rows.len());
-                let mut sort_key_bits = Vec::with_capacity(rows.len());
-                let mut sort_keys = Vec::with_capacity(rows.len());
-                for (adjusted, id, value_bits) in rows {
-                    doc_ids.push(id);
-                    sort_key_bits.push(adjusted);
-                    sort_keys.push(f64::from_bits(value_bits));
+                let mut doc_ids = Vec::with_capacity(kept.len());
+                let mut sort_rows = Vec::with_capacity(kept.len());
+                for row in kept {
+                    doc_ids.push(row.id);
+                    sort_rows.push(crate::pb::SortKeyRow {
+                        keys: row.keys.iter().map(Key::to_pb).collect(),
+                        values: row.values.iter().map(Value::to_pb).collect(),
+                    });
                 }
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
                     doc_ids,
                     geo_columns_known,
                     filter_columns_known,
-                    sort_key_bits,
-                    sort_keys,
-                    sort_column_known: true,
+                    sort_rows,
+                    sort_columns_known: known,
                 }));
             }
             let mut doc_ids = Vec::new();
             for local in start..n {
-                if doc_filter.passes(local as u32, &cols) {
+                if in_lexical(local as u32) && doc_filter.passes(local as u32, &cols) {
                     doc_ids.push(slot_offset + local);
                     if doc_ids.len() == req.k as usize {
                         break;
@@ -9352,9 +9501,8 @@ impl NodeService for NodeServiceImpl {
                 doc_ids,
                 geo_columns_known,
                 filter_columns_known,
-                sort_key_bits: Vec::new(),
-                sort_keys: Vec::new(),
-                sort_column_known: req.sort.is_none(),
+                sort_rows: Vec::new(),
+                sort_columns_known: Vec::new(),
             }))
         })
         .await
@@ -11696,11 +11844,16 @@ impl NodeService for NodeServiceImpl {
                 if guard.live_docs.is_deleted(local as usize) {
                     continue;
                 }
-                let parent_id = u32::try_from(local)
+                let lineage = u32::try_from(local)
                     .ok()
-                    .and_then(|local| store.and_then(|store| store.lineage(local)))
-                    .map_or(SELF_PARENT_TAG | doc_id, |lineage| lineage.parent_id);
-                parents.push(ResolvedParent { doc_id, parent_id });
+                    .and_then(|local| store.and_then(|store| store.lineage(local)));
+                let (parent_id, group_id) =
+                    lineage.map_or((SELF_PARENT_TAG | doc_id, 0), |l| (l.parent_id, l.group_id));
+                parents.push(ResolvedParent {
+                    doc_id,
+                    parent_id,
+                    group_id,
+                });
             }
             Ok(Response::new(ResolveParentsResponse { parents }))
         })

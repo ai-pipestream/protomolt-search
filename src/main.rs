@@ -609,6 +609,7 @@ struct CorpusSpec<'a> {
     bm25_k1: f32,
     bm25_b: f32,
     dense_quality_profile: Option<&'a Path>,
+    synonyms: Option<&'a Path>,
     dense_execution_policy: Option<&'a Path>,
     replica_state_path: Option<&'a Path>,
     control_state_path: Option<&'a Path>,
@@ -662,6 +663,11 @@ async fn build_corpus(
             profile.measured_queries()
         );
         coordinator = coordinator.with_dense_quality_profile(profile);
+    }
+    if let Some(path) = dataset.synonyms {
+        let table = pipestream_search::synonyms::SynonymTable::load(path)?;
+        eprintln!("synonyms: {} ({} rules)", path.display(), table.len());
+        coordinator = coordinator.with_synonyms(table);
     }
     if let Some(path) = dataset.dense_execution_policy {
         let policy = pipestream_search::dense_policy::DenseExecutionPolicy::load(path)?;
@@ -895,6 +901,7 @@ async fn build_collections(
                 bm25_k1: cfg.bm25_k1,
                 bm25_b: cfg.bm25_b,
                 dense_quality_profile: cfg.dense_quality_profile.as_deref(),
+                synonyms: cfg.synonyms.as_deref(),
                 dense_execution_policy: cfg.dense_execution_policy.as_deref(),
                 replica_state_path: cfg.replica_state_path.as_deref(),
                 control_state_path: cfg.control_state_path.as_deref(),
@@ -931,6 +938,7 @@ async fn build_collections(
                     bm25_k1: c.bm25_k1,
                     bm25_b: c.bm25_b,
                     dense_quality_profile: c.dense_quality_profile.as_deref(),
+                    synonyms: c.synonyms.as_deref(),
                     dense_execution_policy: c.dense_execution_policy.as_deref(),
                     replica_state_path: c.replica_state_path.as_deref(),
                     control_state_path: c.control_state_path.as_deref(),

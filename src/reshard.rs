@@ -1664,6 +1664,142 @@ pub fn split_stable_logs(
     })
 }
 
+/// Repartition full-history, generation-clocked WALs by their stable
+/// product keys into children covering the given hash ranges
+/// (`docs/cluster-control.md`, "Shard split"): child `i` receives the
+/// rows whose key hash falls in `ranges[i]` and takes `slot_offsets[i]`.
+/// The ranges must tile the source's range without a gap; a live row
+/// whose hash falls outside every range refuses by name, since the
+/// children would not conserve the source. Legacy rows without a stable
+/// key refuse as [`split_stable_logs`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn split_stable_logs_ranged(
+    gens: &[PathBuf],
+    ranges: &[(u64, u64)],
+    out_dir: &Path,
+    slot_offsets: &[u64],
+    vectors_only: bool,
+    bm25_fields: Option<&[String]>,
+    analyze: &mut Analyzer,
+) -> Result<StableReshardOutput, String> {
+    if ranges.len() < 2 {
+        return Err("a ranged split needs at least two child ranges".to_string());
+    }
+    if slot_offsets.len() != ranges.len() {
+        return Err(format!(
+            "a ranged split needs one slot offset per child: {} offsets for {} ranges",
+            slot_offsets.len(),
+            ranges.len()
+        ));
+    }
+    for window in ranges.windows(2) {
+        let (_, hi) = window[0];
+        let (lo, _) = window[1];
+        if hi.checked_add(1) != Some(lo) {
+            return Err(format!(
+                "child ranges must be adjacent and ascending: ..={hi} is followed by {lo}.."
+            ));
+        }
+    }
+    if ranges.iter().any(|(lo, hi)| lo > hi) {
+        return Err("a child range is inverted".to_string());
+    }
+    let Some(first_gen) = gens.first() else {
+        return Err("a ranged split requires at least one input generation".to_string());
+    };
+    let manifest = read_gen_manifest(first_gen)?;
+    let mut top_generation = manifest.generation;
+    let mut cutoffs = Vec::with_capacity(gens.len());
+    let mut replay = Replay::default();
+    for gen in gens {
+        let current = read_gen_manifest(gen)?;
+        require_backend_config(&current, gen)?;
+        require_complete_history(&current, gen)?;
+        if !same_backend_config(&manifest, &current) {
+            return Err(format!(
+                "{}: vector backend configuration differs from the first input",
+                gen.display()
+            ));
+        }
+        let clocked = wal::read_clocked_records(gen, 0)
+            .map_err(|error| format!("clocked replay {}: {error}", gen.display()))?;
+        cutoffs.push(WalCutoff {
+            generation: current.generation,
+            high_watermark: clocked.last().map_or(0, |record| record.clock),
+        });
+        replay_buckets(
+            gen,
+            0..current.bucket_count,
+            current.bucket_count as usize,
+            current.dim as usize,
+            vectors_only,
+            &mut replay,
+        )?;
+        top_generation = top_generation.max(current.generation);
+    }
+    replay.compact();
+    for id in replay.vectors.keys().chain(replay.documents.keys()) {
+        if replay.stable_keys.get(id).is_none_or(|key| key.is_empty()) {
+            return Err(format!(
+                "stable split requires a routed stable key for live source id {id}; rebuild \
+                 legacy explicitly addressed rows before a live split"
+            ));
+        }
+    }
+    let binding = read_gens_binding(gens)?;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| format!("mkdir {}: {error}", out_dir.display()))?;
+    let child_of = |key: &[u8]| -> Result<usize, String> {
+        let hash = crate::coordinator::stable_routing_hash(key);
+        ranges
+            .iter()
+            .position(|(lo, hi)| hash >= *lo && hash <= *hi)
+            .ok_or_else(|| {
+                format!(
+                    "a live row's key hashes to {hash}, outside every child range of this \
+                     split; the source holds rows the split's range does not cover"
+                )
+            })
+    };
+    let mut buckets: Vec<Replay> = ranges.iter().map(|_| Replay::default()).collect();
+    let keys = replay.stable_keys;
+    for (id, vector) in replay.vectors {
+        let key = keys.get(&id).expect("validated above");
+        let shard = child_of(key)?;
+        buckets[shard].vectors.insert(id, vector);
+        buckets[shard].stable_keys.insert(id, key.clone());
+    }
+    for (id, document) in replay.documents {
+        let key = keys.get(&id).expect("validated above");
+        let shard = child_of(key)?;
+        buckets[shard].documents.insert(id, document);
+        buckets[shard].stable_keys.insert(id, key.clone());
+    }
+    let mut children = Vec::with_capacity(ranges.len());
+    for (shard, replay) in buckets.into_iter().enumerate() {
+        let (hash_lo, hash_hi) = ranges[shard];
+        children.push(finish_child(
+            &manifest,
+            replay,
+            shard,
+            out_dir,
+            slot_offsets[shard],
+            hash_lo,
+            hash_hi,
+            bm25_fields,
+            binding.as_ref(),
+            analyze,
+        )?);
+    }
+    Ok(StableReshardOutput {
+        images: ReshardOutput {
+            generation: top_generation + 1,
+            children,
+        },
+        source_cutoffs: cutoffs,
+    })
+}
+
 /// One live row of a compaction's dense image, in the order the sink
 /// receives them: new local slot order, which is also the order the
 /// rewritten log records them in.

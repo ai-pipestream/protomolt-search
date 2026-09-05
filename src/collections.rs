@@ -46,7 +46,8 @@ use crate::pb::{
     PublishTopologyResponse, QueryRequest, QueryResponse, QueryStreamRequest,
     ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest, ReportShardRequest,
     RollbackClusterRequest, RoutedIngestMappedRequest, RoutedIngestMappedResponse, SearchRequest,
-    SearchResponse, SuggestRequest, SuggestResponse, VariantSearchRequest, VariantSearchResponse,
+    SearchResponse, SuggestRequest, SuggestResponse, TermSuggestRequest, TermSuggestResponse,
+    VariantSearchRequest, VariantSearchResponse,
 };
 use crate::security::{Guarded, MeteredIngest, Permit, Principal, Principals};
 
@@ -203,6 +204,8 @@ impl RequestK for ClusterHealthRequest {}
 // `limit` is not a `k`: it is capped absolutely at MAX_SUGGEST_LIMIT
 // (`docs/suggest.md`), so only the concurrency quota applies.
 impl RequestK for SuggestRequest {}
+// `limit` is per term and capped absolutely too (docs/synonyms.md).
+impl RequestK for TermSuggestRequest {}
 impl RequestK for Streaming<RoutedIngestMappedRequest> {}
 
 /// The public search surface over one or more collections.
@@ -459,6 +462,7 @@ search_service_over_collections! {
     abort_topology_cutover: AbortTopologyCutoverRequest => AbortTopologyCutoverResponse,
     aggregate: AggregateRequest => AggregateResponse,
     suggest: SuggestRequest => SuggestResponse,
+    term_suggest: TermSuggestRequest => TermSuggestResponse,
 }
 
 /// The cluster-control surface over one durable plane per collection.

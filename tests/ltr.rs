@@ -546,14 +546,14 @@ async fn scorer_interplays_refuse_by_name() {
             QueryRequest {
                 k: 5,
                 selection: Some(lexical_leaf("lex", "zebra")),
-                sort: Some(QuerySort {
+                sort: vec![QuerySort {
                     column: "year".into(),
                     descending: true,
-                }),
+                }],
                 scorer: base(),
                 ..Default::default()
             },
-            "browse selections only",
+            "silent no-op",
         ),
         (
             // A dimension may not source a filter.
