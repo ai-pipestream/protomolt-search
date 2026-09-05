@@ -348,6 +348,12 @@ cargo run --release --example sweep -- \
 prints ready-to-paste `[[shards]]` config entries — this is how the indexes
 for a real deployment are produced (shared calibration baked in).
 
+`partition_bench` is the layout counterpart: one segment-layout shard with a
+`year` column, the same cases on the bucket layout and after a partitioned
+`CompactShard`, each with segment pruning on and off, asserting identical
+answers throughout. Numbers and the command line:
+[docs/benchmarks/partition-pruning-2026-09.md](docs/benchmarks/partition-pruning-2026-09.md).
+
 ## BM25 lexical search (hybrid half)
 
 Each shard also carries a **BM25 postings index** next to its vector index:
