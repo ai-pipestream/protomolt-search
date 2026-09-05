@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Unsigned numeric storage foundation (2026-09-05, feature branch).** A
+  distinct u64 column kind preserves the entire unsigned domain and explicit
+  presence through heap/spill writes, mapped reads, segment sealing and reopen.
+  Segment summaries retain unsigned bounds; replacement tails must preserve
+  the ordered schema. Public unsigned mapping and query support remain in
+  progress. See [integer storage](docs/range-facets.md) and the
+  [foundation status](docs/search-foundations.md).
+
 - **Full-domain signed numeric columns (2026-09-05).** Integer presence now
   has its own bitmap, so `i64::MIN` survives ingest, materialization, querying,
   reopen and compaction. New files use kind 10; older readers refuse it.

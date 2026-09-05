@@ -91,6 +91,8 @@ const COLUMN_KIND_I64: u8 = 4;
 /// Full-domain i64: fixed-width values followed by an LSB-first presence bitmap.
 /// Same table payload as kind 4; absent slots have canonical zero value bytes.
 const COLUMN_KIND_I64_PRESENT: u8 = 10;
+/// Full-domain unsigned integer values with an explicit presence bitmap.
+const COLUMN_KIND_U64: u8 = 11;
 /// v7 column-table kind: geo-point column (`docs/geo-columns.md`), a
 /// per-slot (lat, lon) f64 pair at a fixed 16 B stride. BOTH halves NaN
 /// means absent; a half-NaN pair is refused at open as corruption,
@@ -428,9 +430,9 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:pairs"), u64_at(base + 20)));
                     cursor = base + 28;
                 }
-                COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
+                COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT | COLUMN_KIND_U64 => {
                     starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
-                    if kind == COLUMN_KIND_I64_PRESENT {
+                    if kind != COLUMN_KIND_I64 {
                         starts.push((
                             format!("column:{name}:presence"),
                             u64_at(base + 16) + 8 * u64::from(u32_at(12)),
@@ -1113,11 +1115,33 @@ impl NumericStore {
     }
 }
 
+trait ColumnInteger: Copy + Ord + Default {
+    const MIN: Self;
+    const MAX: Self;
+    fn bits(self) -> u64;
+}
+impl ColumnInteger for i64 {
+    const MIN: Self = i64::MIN;
+    const MAX: Self = i64::MAX;
+    fn bits(self) -> u64 {
+        self as u64
+    }
+}
+impl ColumnInteger for u64 {
+    const MIN: Self = u64::MIN;
+    const MAX: Self = u64::MAX;
+    fn bits(self) -> u64 {
+        self
+    }
+}
+type IntStore = IntegerStore<i64>;
+type UintStore = IntegerStore<u64>;
+
 /// One full-domain integer column. Presence never consumes a numeric value.
 #[derive(Debug)]
-struct IntStore {
+struct IntegerStore<T> {
     name: String,
-    vals: Vec<i64>,
+    vals: Vec<T>,
     present: Vec<u8>,
 }
 
@@ -1127,7 +1151,7 @@ fn integer_present(bitmap: &[u8], slot: usize) -> bool {
         .is_some_and(|byte| byte & (1 << (slot % 8)) != 0)
 }
 
-impl IntStore {
+impl<T: ColumnInteger> IntegerStore<T> {
     fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -1136,12 +1160,12 @@ impl IntStore {
         }
     }
 
-    fn value(&self, slot: usize) -> Option<i64> {
+    fn value(&self, slot: usize) -> Option<T> {
         integer_present(&self.present, slot).then(|| self.vals[slot])
     }
 
     /// One value per document and field; a second write is a caller error.
-    fn set(&mut self, doc_id: u32, value: i64) {
+    fn set(&mut self, doc_id: u32, value: T) {
         let slot = doc_id as usize;
         assert!(
             !integer_present(&self.present, slot),
@@ -1149,7 +1173,7 @@ impl IntStore {
             self.name
         );
         if self.vals.len() <= slot {
-            self.vals.resize(slot + 1, 0);
+            self.vals.resize(slot + 1, T::default());
             self.present.resize((slot + 1).div_ceil(8), 0);
         }
         self.vals[slot] = value;
@@ -1157,19 +1181,19 @@ impl IntStore {
     }
 
     /// The inverted range (MAX, MIN) means no values; a real MIN is present.
-    fn min_max(&self) -> (i64, i64) {
+    fn min_max(&self) -> (T, T) {
         self.vals
             .iter()
             .enumerate()
             .filter(|(slot, _)| integer_present(&self.present, *slot))
-            .fold((i64::MAX, i64::MIN), |(min, max), (_, &v)| {
+            .fold((T::MAX, T::MIN), |(min, max), (_, &v)| {
                 (min.min(v), max.max(v))
             })
     }
 
     fn write(&self, w: &mut impl Write, n_slots: usize) -> io::Result<()> {
         for slot in 0..n_slots {
-            write_u64(w, self.value(slot).unwrap_or(0) as u64)?;
+            write_u64(w, self.value(slot).unwrap_or_default().bits())?;
         }
         let bytes = n_slots.div_ceil(8);
         let held = self.present.len().min(bytes);
@@ -1675,6 +1699,7 @@ pub struct Bm25Store {
     map_numerics: Vec<MapNumericStore>,
     /// i64 columns in integer-id order.
     integers: Vec<IntStore>,
+    unsigned_integers: Vec<UintStore>,
     /// Geo-point columns in geo-id order (`docs/geo-columns.md`). A
     /// store with no columns of any kind persists as v6.
     geos: Vec<GeoStore>,
@@ -1695,6 +1720,7 @@ impl Default for Bm25Store {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
             sources: Default::default(),
@@ -1762,6 +1788,7 @@ impl Bm25Store {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
             sources: Default::default(),
@@ -2027,6 +2054,51 @@ impl Bm25Store {
     /// [`IntStore::set`] for the contract.
     pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
         self.integers[ii].set(doc_id, value);
+    }
+
+    /// Declare the unsigned column table before adding documents. The v8
+    /// writer records kind 11 columns with explicit presence.
+    pub fn with_unsigned_integers(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "integer fields must be declared before documents are added"
+        );
+        validate_facet_names(names);
+        self.unsigned_integers = names.iter().map(|n| UintStore::new(n)).collect();
+        self
+    }
+
+    /// Number of u64 fields in the integer table.
+    pub fn unsigned_integer_count(&self) -> usize {
+        self.unsigned_integers.len()
+    }
+
+    /// The name of integer field `ii`. Panics when out of range.
+    pub fn unsigned_integer_name(&self, ii: usize) -> &str {
+        &self.unsigned_integers[ii].name
+    }
+
+    /// The index of the integer field named `name`, if the table has it.
+    pub fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.unsigned_integers.iter().position(|n| n.name == name)
+    }
+
+    /// `doc_id`'s value for integer field `ii`, `None` when absent.
+    pub fn unsigned_integer_value(&self, ii: usize, doc_id: u32) -> Option<u64> {
+        self.unsigned_integers[ii].value(doc_id as usize)
+    }
+
+    /// (min, max) of integer field `ii` over present values; the empty
+    /// range `(u64::MAX, u64::MIN)` when no document has one (see
+    /// [`UintStore::min_max`]).
+    pub fn unsigned_integer_min_max(&self, ii: usize) -> (u64, u64) {
+        self.unsigned_integers[ii].min_max()
+    }
+
+    /// Record `doc_id`'s value for integer field `ii`; see
+    /// [`UintStore::set`] for the contract.
+    pub fn set_unsigned_integer(&mut self, ii: usize, doc_id: u32, value: u64) {
+        self.unsigned_integers[ii].set(doc_id, value);
     }
 
     /// Declare the geo-point column table, in geo-id order (builder
@@ -2644,6 +2716,12 @@ impl Bm25Store {
     ///   u32 blob_off, u16 term_len), then the term blob)
     /// ```
     fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        if !self.unsigned_integers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy format cannot preserve unsigned integer columns",
+            ));
+        }
         if !self.sources.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2753,6 +2831,7 @@ impl Bm25Store {
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
             || !self.integers.is_empty()
+            || !self.unsigned_integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
             || !self.sources.is_empty()
@@ -2782,6 +2861,11 @@ impl Bm25Store {
                     .sum::<u64>()
                 + self
                     .integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .unsigned_integers
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
                     .sum::<u64>()
@@ -2930,6 +3014,11 @@ impl Bm25Store {
             cursor += sentences_section_size(n_slots, total);
         }
 
+        let mut unsigned_offs = Vec::with_capacity(self.unsigned_integers.len());
+        for _ in &self.unsigned_integers {
+            unsigned_offs.push(cursor);
+            cursor += 8 * n_slots + n_slots.div_ceil(8);
+        }
         let source_section = if self.sources.is_empty() {
             None
         } else {
@@ -2959,6 +3048,7 @@ impl Bm25Store {
                     + self.map_facets.len()
                     + self.map_numerics.len()
                     + self.integers.len()
+                    + self.unsigned_integers.len()
                     + self.geos.len()
                     + positions_offs.len()
                     + sentences_offs.len()
@@ -3041,6 +3131,15 @@ impl Bm25Store {
                 w.write_all(&[COLUMN_KIND_SENTENCES])?;
                 write_u64(w, off)?;
                 write_u64(w, total)?;
+            }
+            for (column, &off) in self.unsigned_integers.iter().zip(&unsigned_offs) {
+                let (min, max) = column.min_max();
+                write_u16(w, column.name.len() as u16)?;
+                w.write_all(column.name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_U64])?;
+                write_u64(w, min)?;
+                write_u64(w, max)?;
+                write_u64(w, off)?;
             }
             write_binding_entry(w, self.binding.as_ref())?;
             write_source_entry(w, source_section)?;
@@ -3128,6 +3227,9 @@ impl Bm25Store {
                 }
             }
         }
+        for column in &self.unsigned_integers {
+            column.write(w, n_slots as usize)?;
+        }
         if source_section.is_some() {
             self.sources.write(w, n_slots as u32)?;
         }
@@ -3156,6 +3258,12 @@ impl Bm25Store {
     ///   term blob) — binary-searchable by term
     /// ```
     fn write_v4_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        if !self.unsigned_integers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy format cannot preserve unsigned integer columns",
+            ));
+        }
         if !self.sources.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -3280,6 +3388,7 @@ impl Bm25Store {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
             sources: Default::default(),
@@ -4130,6 +4239,7 @@ impl Bm25Store {
         // (name, n_keys, keys, offsets, pairs)
         let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
         let mut integer_metas: Vec<(String, u64, bool)> = Vec::new();
+        let mut unsigned_metas: Vec<(String, u64)> = Vec::new();
         let mut geo_metas: Vec<(String, u64)> = Vec::new();
         // (field name, section_off) per kind-7 entry.
         let mut positions_metas: Vec<(String, u64)> = Vec::new();
@@ -4187,6 +4297,10 @@ impl Bm25Store {
                             u64_at(base + 16)?,
                             kind == COLUMN_KIND_I64_PRESENT,
                         ));
+                        cursor = base + 24;
+                    }
+                    COLUMN_KIND_U64 => {
+                        unsigned_metas.push((name, u64_at(base + 16)?));
                         cursor = base + 24;
                     }
                     COLUMN_KIND_GEO => {
@@ -4463,6 +4577,17 @@ impl Bm25Store {
             }
             integers.push(column);
         }
+        let mut unsigned_integers = Vec::with_capacity(unsigned_metas.len());
+        for (name, vals_off) in unsigned_metas {
+            let mut column = UintStore::new(&name);
+            let bitmap = at(vals_off + 8 * n_slots as u64, (n_slots as u64).div_ceil(8))?;
+            for slot in 0..n_slots {
+                if integer_present(bitmap, slot) {
+                    column.set(slot as u32, u64_at(vals_off + 8 * slot as u64)?);
+                }
+            }
+            unsigned_integers.push(column);
+        }
         // Geo columns (v7 only): n_slots x (f64 lat, f64 lon) at a
         // 16 B stride, (NaN, NaN) = absent. Validation already refused a
         // half-NaN pair, so the loader takes the bytes as they are.
@@ -4486,6 +4611,7 @@ impl Bm25Store {
             map_facets,
             map_numerics,
             integers,
+            unsigned_integers,
             geos,
             binding: binding_meta,
             sources: match sources_meta {
@@ -4607,6 +4733,7 @@ pub struct SpillBuilder {
     /// i64 columns (8 B per slot in heap, same argument as `numerics`).
     /// Non-empty makes `finish` write v7.
     integers: Vec<IntStore>,
+    unsigned_integers: Vec<UintStore>,
     /// Geo-point columns (16 B per slot in heap). Non-empty makes
     /// `finish` write v7.
     geos: Vec<GeoStore>,
@@ -4689,6 +4816,7 @@ impl SpillBuilder {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
             sources: crate::source_archive::SourceArchive::spilling(&dir.join("sources.spill"))?,
@@ -4849,6 +4977,41 @@ impl SpillBuilder {
     /// [`IntStore::set`] for the contract.
     pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
         self.integers[ii].set(doc_id, value);
+    }
+
+    /// Declare the u64 field table; same contract as
+    /// [`Bm25Store::with_unsigned_integers`]. Must be called before any
+    /// document is added; `finish` writes kind 11 columns in the v8 container.
+    pub fn with_unsigned_integer_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "integer fields must be declared before documents are added"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.unsigned_integers = names.iter().map(|n| UintStore::new(n)).collect();
+        self
+    }
+
+    /// Number of u64 fields in the integer table.
+    pub fn unsigned_integer_count(&self) -> usize {
+        self.unsigned_integers.len()
+    }
+
+    /// The name of integer field `ii`. Panics when out of range.
+    pub fn unsigned_integer_name(&self, ii: usize) -> &str {
+        &self.unsigned_integers[ii].name
+    }
+
+    /// The index of the integer field named `name`, if the table has it.
+    pub fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.unsigned_integers.iter().position(|n| n.name == name)
+    }
+
+    /// Record `doc_id`'s value for integer field `ii`; see
+    /// [`UintStore::set`] for the contract.
+    pub fn set_unsigned_integer(&mut self, ii: usize, doc_id: u32, value: u64) {
+        self.unsigned_integers[ii].set(doc_id, value);
     }
 
     /// Declare the geo-point column table; same contract as
@@ -5355,6 +5518,7 @@ impl SpillBuilder {
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
             || !self.integers.is_empty()
+            || !self.unsigned_integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
             || !self.sources.is_empty()
@@ -5384,6 +5548,11 @@ impl SpillBuilder {
                     .sum::<u64>()
                 + self
                     .integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .unsigned_integers
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 8 * 3)
                     .sum::<u64>()
@@ -5520,6 +5689,11 @@ impl SpillBuilder {
             cursor += sentences_section_size(n_slots_u64, total);
         }
 
+        let mut unsigned_offs = Vec::with_capacity(self.unsigned_integers.len());
+        for _ in &self.unsigned_integers {
+            unsigned_offs.push(cursor);
+            cursor += 8 * n_slots + n_slots.div_ceil(8);
+        }
         let source_section = if self.sources.is_empty() {
             None
         } else {
@@ -5551,6 +5725,7 @@ impl SpillBuilder {
                         + self.map_facets.len()
                         + self.map_numerics.len()
                         + self.integers.len()
+                        + self.unsigned_integers.len()
                         + self.geos.len()
                         + positions_offs.len()
                         + sentences_offs.len()
@@ -5633,6 +5808,15 @@ impl SpillBuilder {
                     w.write_all(&[COLUMN_KIND_SENTENCES])?;
                     write_u64(&mut w, off)?;
                     write_u64(&mut w, total)?;
+                }
+                for (column, &off) in self.unsigned_integers.iter().zip(&unsigned_offs) {
+                    let (min, max) = column.min_max();
+                    write_u16(&mut w, column.name.len() as u16)?;
+                    w.write_all(column.name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_U64])?;
+                    write_u64(&mut w, min)?;
+                    write_u64(&mut w, max)?;
+                    write_u64(&mut w, off)?;
                 }
                 write_binding_entry(&mut w, self.binding.as_ref())?;
                 write_source_entry(&mut w, source_section)?;
@@ -5758,6 +5942,9 @@ impl SpillBuilder {
                         }
                     }
                 }
+            }
+            for column in &self.unsigned_integers {
+                column.write(&mut w, n_slots as usize)?;
             }
             if source_section.is_some() {
                 self.sources.write(&mut w, n_slots as u32)?;
@@ -6616,6 +6803,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let mut map_numerics: Vec<(u32, u64, u64, u64)> = Vec::new();
     // (min_bits, max_bits, vals)
     let mut integers: Vec<(u64, u64, u64, bool)> = Vec::new();
+    let mut unsigned_integers: Vec<(u64, u64, u64)> = Vec::new();
     // (min_lat, max_lat, min_lon, max_lon bits, vals)
     let mut geos: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
     // (field name, section_off, total occurrences) per kind-7 entry.
@@ -6681,6 +6869,10 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                         u64_at(base + 16)?,
                         kind == COLUMN_KIND_I64_PRESENT,
                     ));
+                    cursor = base + 24;
+                }
+                COLUMN_KIND_U64 => {
+                    unsigned_integers.push((u64_at(base)?, u64_at(base + 8)?, u64_at(base + 16)?));
                     cursor = base + 24;
                 }
                 COLUMN_KIND_GEO => {
@@ -6783,7 +6975,10 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             }
         }
     }
-    let columns_end = source_section.map_or(file_len, |(off, _)| off);
+    let unsigned_end = source_section.map_or(file_len, |(off, _)| off);
+    let columns_end = unsigned_integers
+        .first()
+        .map_or(unsigned_end, |entry| entry.2);
     let header_end = cursor;
     // Shared sections: contiguous from the header end, in order.
     if texts_off != header_end || texts_off > file_len {
@@ -7353,6 +7548,42 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         }
         expected_start = group_end;
     }
+    for (i, &(stored_min, stored_max, off)) in unsigned_integers.iter().enumerate() {
+        let bitmap_off = off + 8 * n_slots;
+        let end = bitmap_off + n_slots.div_ceil(8);
+        let expected_end = unsigned_integers
+            .get(i + 1)
+            .map_or(unsigned_end, |entry| entry.2);
+        if off != expected_start || end != expected_end {
+            return Err(invalid(format!(
+                "unsigned integer field {i}: sections do not tile the file"
+            )));
+        }
+        let bitmap = bytes_at(bitmap_off, n_slots.div_ceil(8))?;
+        if n_slots % 8 != 0 && bitmap.last().is_some_and(|b| b >> (n_slots % 8) != 0) {
+            return Err(invalid(format!(
+                "unsigned integer field {i}: nonzero presence padding"
+            )));
+        }
+        let (mut min, mut max) = (u64::MAX, u64::MIN);
+        for slot in 0..n_slots {
+            let value = u64_at(off + 8 * slot)?;
+            if integer_present(bitmap, slot as usize) {
+                min = min.min(value);
+                max = max.max(value);
+            } else if value != 0 {
+                return Err(invalid(format!(
+                    "unsigned integer field {i}: nonzero absent value"
+                )));
+            }
+        }
+        if (min, max) != (stored_min, stored_max) {
+            return Err(invalid(format!(
+                "unsigned integer field {i}: min/max metadata disagrees with values"
+            )));
+        }
+        expected_start = end;
+    }
     if let Some((off, len)) = source_section {
         if off != expected_start || off.checked_add(len) != Some(file_len) {
             return Err(invalid("source section does not tile the file".into()));
@@ -7478,6 +7709,13 @@ struct IntegerSlice {
     presence_off: Option<u64>,
 }
 
+struct UnsignedSlice {
+    name: String,
+    min: u64,
+    max: u64,
+    vals_off: u64,
+}
+
 /// Per-geo-column read state of one open v7 file: the bounding-box
 /// metadata from the column table plus the map offset of the
 /// fixed-stride vals section, which stays on disk.
@@ -7508,6 +7746,7 @@ pub struct Bm25Reader {
     /// Per-integer-column state, integer-id order (v7 files; empty
     /// otherwise).
     integers: Vec<IntegerSlice>,
+    unsigned_integers: Vec<UnsignedSlice>,
     /// Per-geo-column state, geo-id order (v7 files; empty otherwise).
     geos: Vec<GeoSlice>,
     /// Documents with postings in any field — the corpus-wide N (a
@@ -7827,6 +8066,43 @@ impl Bm25Reader {
         present.then_some(v)
     }
 
+    /// Number of full-domain unsigned integer columns.
+    pub fn unsigned_integer_count(&self) -> usize {
+        self.unsigned_integers.len()
+    }
+    /// The name of one unsigned column.
+    pub fn unsigned_integer_name(&self, column: usize) -> &str {
+        &self.unsigned_integers[column].name
+    }
+    /// Resolve an unsigned column by name.
+    pub fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.unsigned_integers
+            .iter()
+            .position(|column| column.name == name)
+    }
+    /// Bounds over present values. (MAX, 0) denotes an empty column.
+    pub fn unsigned_integer_min_max(&self, column: usize) -> (u64, u64) {
+        let column = &self.unsigned_integers[column];
+        (column.min, column.max)
+    }
+    /// Read exact unsigned bits only when the row is present.
+    pub fn unsigned_integer_value(&self, column: usize, row: u32) -> Option<u64> {
+        let slot = row as usize;
+        if slot >= self.n_slots() {
+            return None;
+        }
+        let off = self.unsigned_integers[column].vals_off as usize;
+        let bitmap = off + 8 * self.n_slots();
+        if !integer_present(&self.map[bitmap..bitmap + self.n_slots().div_ceil(8)], slot) {
+            return None;
+        }
+        Some(u64::from_le_bytes(
+            self.map[off + 8 * slot..off + 8 * slot + 8]
+                .try_into()
+                .expect("8 bytes"),
+        ))
+    }
+
     /// Number of geo fields in the geo table (0 pre-v7).
     pub fn geo_count(&self) -> usize {
         self.geos.len()
@@ -8140,6 +8416,7 @@ impl Bm25Reader {
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
             integers: Vec::new(),
+            unsigned_integers: Vec::new(),
             geos: Vec::new(),
             doc_count,
             lineages_off,
@@ -8217,6 +8494,7 @@ impl Bm25Reader {
         let mut map_facets = Vec::new();
         let mut map_numerics = Vec::new();
         let mut integers = Vec::new();
+        let mut unsigned_integers = Vec::new();
         let mut geos = Vec::new();
         let mut binding = None;
         let mut source_section = None;
@@ -8331,6 +8609,15 @@ impl Bm25Reader {
                         });
                         cursor = base + 24;
                     }
+                    COLUMN_KIND_U64 => {
+                        unsigned_integers.push(UnsignedSlice {
+                            name,
+                            min: u64_at(base),
+                            max: u64_at(base + 8),
+                            vals_off: u64_at(base + 16),
+                        });
+                        cursor = base + 24;
+                    }
                     COLUMN_KIND_GEO => {
                         geos.push(GeoSlice {
                             name,
@@ -8412,6 +8699,7 @@ impl Bm25Reader {
             map_facets,
             map_numerics,
             integers,
+            unsigned_integers,
             geos,
             doc_count,
             lineages_off,

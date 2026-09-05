@@ -269,6 +269,7 @@ mod tests {
                 max: 0.75,
                 present: 3,
             }],
+            uint_columns: Vec::new(),
             partition: None,
         }
     }

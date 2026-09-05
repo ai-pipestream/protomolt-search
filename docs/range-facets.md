@@ -6,7 +6,7 @@ kind that can hold an integer without rounding it.
 
 ## Why i64 is a kind and not an f64 with a note
 
-An f64 holds every integer up to 2^53 exactly and none above it:
+An f64 holds every integer up to 2^53 exactly, but not every integer above it:
 `2^53 + 1` rounds to `2^53`, silently. That is a small number by the
 standards of the things a metadata plane holds — opinion ids, docket
 numbers, epoch microseconds, anything minted by a counter — and this
@@ -50,6 +50,23 @@ materialization hashes keep their existing semantics and remain unchanged.
 Presence costs one bit per row per integer column. It preserves the full
 protobuf signed domain without making a valid numeric value disappear. The
 separate unsigned column/query representation remains under development.
+
+The unsigned storage layer uses kind 11, with the same table and section
+widths as kind 10 but unsigned min/max and little-endian u64 values. Its empty
+range is `(u64::MAX, 0)`; zero and `u64::MAX` are ordinary present values.
+Unsigned payloads follow the existing column and positional sections and
+precede the source archive. Both writers and both readers preserve their
+bits, validate presence and bounds, and keep signed and unsigned column
+ordinals separate. Legacy v4/v5 serializers refuse unsigned columns.
+
+Segmented reads retain unsigned values through the writable tail, frozen
+seal, publication and reopen. Tail replacement and segment opening require
+identical ordered field and column tables. Sealed summaries carry a separate
+`uint_columns` list with unsigned bounds and present counts; old summaries
+omit that list and provide no unsigned pruning information. These are storage
+primitives only: protobuf numeric mapping, ingest, query expressions and
+unsigned pruning are not yet connected to them. The schema report continues
+to describe the currently supported signed numeric range.
 
 Score stages read i64 columns transparently: `ScoreStage.column` with
 no `key` resolves against the f64 table first and the i64 table second

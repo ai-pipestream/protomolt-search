@@ -28,6 +28,39 @@ use crate::postings::{
 };
 use crate::segments::{OpenedSegmentSet, SegmentCatalog, SegmentSummary};
 
+// Heap tails and mapped segments expose the same ordered schema tables.
+// Compare them before changing which part supplies a column ordinal.
+macro_rules! same_tables {
+    ($other:expr, $tail:expr) => {{
+        let other = $other;
+        let tail = $tail;
+        let same_fields = other.field_count() == tail.field_count()
+            && (0..tail.field_count()).all(|f| {
+                other.field_name(f) == tail.field_name(f)
+                    && other.field_has_positions(f) == tail.field_has_positions(f)
+                    && other.field_has_sentences(f) == tail.field_has_sentences(f)
+            });
+        let same_columns = other.facet_count() == tail.facet_count()
+            && (0..tail.facet_count()).all(|i| other.facet_name(i) == tail.facet_name(i))
+            && other.numeric_count() == tail.numeric_count()
+            && (0..tail.numeric_count()).all(|i| other.numeric_name(i) == tail.numeric_name(i))
+            && other.integer_count() == tail.integer_count()
+            && (0..tail.integer_count()).all(|i| other.integer_name(i) == tail.integer_name(i))
+            && other.unsigned_integer_count() == tail.unsigned_integer_count()
+            && (0..tail.unsigned_integer_count())
+                .all(|i| other.unsigned_integer_name(i) == tail.unsigned_integer_name(i))
+            && other.geo_count() == tail.geo_count()
+            && (0..tail.geo_count()).all(|i| other.geo_name(i) == tail.geo_name(i))
+            && other.map_facet_count() == tail.map_facet_count()
+            && (0..tail.map_facet_count())
+                .all(|i| other.map_facet_name(i) == tail.map_facet_name(i))
+            && other.map_numeric_count() == tail.map_numeric_count()
+            && (0..tail.map_numeric_count())
+                .all(|i| other.map_numeric_name(i) == tail.map_numeric_name(i));
+        same_fields && same_columns
+    }};
+}
+
 /// One column's global dictionary over the sealed parts and the tail.
 #[derive(Debug, Default)]
 struct UnionDict {
@@ -415,28 +448,7 @@ impl SegmentedShard {
 
     /// Refuse a sealed segment whose tables differ from the tail's.
     fn check_tables(&self, reader: &crate::postings::Bm25Reader, id: &str) -> Result<(), String> {
-        let tail = &self.tail;
-        let same_fields = reader.field_count() == tail.field_count()
-            && (0..tail.field_count()).all(|f| {
-                reader.field_name(f) == tail.field_name(f)
-                    && reader.field_has_positions(f) == tail.field_has_positions(f)
-                    && reader.field_has_sentences(f) == tail.field_has_sentences(f)
-            });
-        let same_columns = reader.facet_count() == tail.facet_count()
-            && (0..tail.facet_count()).all(|i| reader.facet_name(i) == tail.facet_name(i))
-            && reader.numeric_count() == tail.numeric_count()
-            && (0..tail.numeric_count()).all(|i| reader.numeric_name(i) == tail.numeric_name(i))
-            && reader.integer_count() == tail.integer_count()
-            && (0..tail.integer_count()).all(|i| reader.integer_name(i) == tail.integer_name(i))
-            && reader.geo_count() == tail.geo_count()
-            && (0..tail.geo_count()).all(|i| reader.geo_name(i) == tail.geo_name(i))
-            && reader.map_facet_count() == tail.map_facet_count()
-            && (0..tail.map_facet_count())
-                .all(|i| reader.map_facet_name(i) == tail.map_facet_name(i))
-            && reader.map_numeric_count() == tail.map_numeric_count()
-            && (0..tail.map_numeric_count())
-                .all(|i| reader.map_numeric_name(i) == tail.map_numeric_name(i));
-        if !(same_fields && same_columns) {
+        if !same_tables!(reader, &self.tail) {
             return Err(format!(
                 "segment {id:?} declares a field or column table this shard does not; the \
                  catalog and the node configuration must agree"
@@ -483,6 +495,9 @@ impl SegmentedShard {
                 "a seal of {rows} rows cannot cover the tail's {} documents",
                 self.tail.next_doc_id()
             ));
+        }
+        if !same_tables!(&fresh, &self.tail) {
+            return Err("a fresh tail must preserve the shard's field and column tables".into());
         }
         let store = Arc::new(std::mem::replace(&mut self.tail, fresh));
         self.frozen = Some(Frozen {
@@ -858,6 +873,45 @@ impl SegmentedShard {
         }
         for (_, heap) in self.heaps() {
             fold(&mut acc, heap.integer_min_max(ii));
+        }
+        acc
+    }
+
+    pub fn unsigned_integer_count(&self) -> usize {
+        self.tail.unsigned_integer_count()
+    }
+
+    pub fn unsigned_integer_name(&self, ii: usize) -> &str {
+        self.tail.unsigned_integer_name(ii)
+    }
+
+    pub fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.tail.unsigned_integer_index(name)
+    }
+
+    pub fn unsigned_integer_value(&self, ii: usize, doc: u32) -> Option<u64> {
+        match self.place(doc) {
+            Placement::Sealed { part, local } => {
+                self.reader(part).unsigned_integer_value(ii, local)
+            }
+            Placement::Frozen { local } => self.frozen_store().unsigned_integer_value(ii, local),
+            Placement::Tail { local } => self.tail.unsigned_integer_value(ii, local),
+        }
+    }
+
+    pub fn unsigned_integer_min_max(&self, ii: usize) -> (u64, u64) {
+        let mut acc = (u64::MAX, 0);
+        let fold = |acc: &mut (u64, u64), (lo, hi): (u64, u64)| {
+            if lo <= hi {
+                acc.0 = acc.0.min(lo);
+                acc.1 = acc.1.max(hi);
+            }
+        };
+        for i in 0..self.parts.len() {
+            fold(&mut acc, self.reader(i).unsigned_integer_min_max(ii));
+        }
+        for (_, heap) in self.heaps() {
+            fold(&mut acc, heap.unsigned_integer_min_max(ii));
         }
         acc
     }

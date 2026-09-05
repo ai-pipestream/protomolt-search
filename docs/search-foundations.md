@@ -122,6 +122,25 @@ compilation, formatting, fixture regeneration and vendored-proto checks passed;
 the public search descriptor remains byte-identical when source comments are
 excluded. No fleet benchmark, rebuild or cutover was performed.
 
+The unsigned-numeric branch adds a physical u64 family (storage kind 11),
+explicit presence, exact unsigned bounds, and heap/spill/mapped access. Segment
+reads preserve those values across a frozen seal, publication, continued tail
+ingest and reopen; segment summaries keep unsigned ranges in `uint_columns`.
+Schema checks reject a tail or segment with different ordered columns before
+it can change the meaning of a column ordinal. Existing signed storage bytes
+and protobuf contracts are unchanged. This foundation does not yet enable
+mapped unsigned numerics: the ingest, WAL configuration, query/projection and
+pruning paths still need their own unsigned types before support is advertised.
+See `tests/unsigned_columns.rs` and `docs/range-facets.md`.
+
+The unsigned storage foundation passed 420 library tests and 510 integration
+tests across 86 targets on the `0effb06` base, with one existing sidecar test
+ignored and no failures. After incorporating main's console changes through
+`8275e56`, all three console tests, five unsigned storage tests, and ten
+embedded tests passed. All five Android/iOS Rust target checks passed with
+the three existing relay dead-code warnings. This is local validation of the
+storage foundation, not evidence of public unsigned search or fleet cutover.
+
 `tests/protobuf_semantics.rs` uses generated prost messages as differential
 oracles and adversarial wire encodings. `tests/descriptor_mappings.rs` pins the
 new fingerprint. `tests/mapped_ingest.rs` exercises binding, column landing,

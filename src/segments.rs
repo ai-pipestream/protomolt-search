@@ -45,6 +45,15 @@ pub struct IntColumnSummary {
     pub present: u64,
 }
 
+/// [`IntColumnSummary`] for an unsigned column, including values above `i64::MAX`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UintColumnSummary {
+    pub name: String,
+    pub min: u64,
+    pub max: u64,
+    pub present: u64,
+}
+
 /// [`IntColumnSummary`] for a double column.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NumericColumnSummary {
@@ -76,6 +85,8 @@ pub struct PartitionRange {
 pub struct SegmentSummary {
     #[serde(default)]
     pub int_columns: Vec<IntColumnSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uint_columns: Vec<UintColumnSummary>,
     #[serde(default)]
     pub numeric_columns: Vec<NumericColumnSummary>,
     #[serde(default)]
@@ -1457,6 +1468,26 @@ pub(crate) fn summarize_columns(bm25: &Bm25Reader, rows: u32) -> SegmentSummary 
             }
         })
         .collect();
+    let uint_columns = (0..bm25.unsigned_integer_count())
+        .map(|ii| {
+            let mut present = 0u64;
+            let mut min = u64::MAX;
+            let mut max = 0;
+            for doc in 0..rows {
+                if let Some(value) = bm25.unsigned_integer_value(ii, doc) {
+                    present += 1;
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+            }
+            UintColumnSummary {
+                name: bm25.unsigned_integer_name(ii).to_string(),
+                min,
+                max,
+                present,
+            }
+        })
+        .collect();
     let numeric_columns = (0..bm25.numeric_count())
         .map(|ni| {
             let mut present = 0u64;
@@ -1483,6 +1514,7 @@ pub(crate) fn summarize_columns(bm25: &Bm25Reader, rows: u32) -> SegmentSummary 
         .collect();
     SegmentSummary {
         int_columns,
+        uint_columns,
         numeric_columns,
         partition: None,
     }
