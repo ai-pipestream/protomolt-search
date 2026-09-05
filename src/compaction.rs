@@ -51,11 +51,18 @@ use crate::wal::{self, ClockedTail, WalWriter};
 /// Tail-pass size below which cutover preparation starts by default.
 const DEFAULT_TAIL_BOUND: u32 = 256;
 /// Unlocked tail passes before compaction gives up on a log that grows
-/// faster than the shadow applies it.
+/// faster than the shadow applies it. A backstop only: the stall rule
+/// below is what fires in practice.
 const MAX_TAIL_PASSES: u64 = 10_000;
 /// Cutover attempts before refusing writes that keep advancing the WAL
 /// during preparation.
 const CUTOVER_RETRIES: usize = 16;
+/// Consecutive unlocked passes that fail to read fewer records than the
+/// smallest pass so far. Each pass pays an fsync the writer does not, so
+/// once a pass is slow enough for the writer to refill the tail the loop
+/// makes no progress and no later pass will: the refusal names it at
+/// once instead of after the pass cap.
+const STALLED_TAIL_PASSES: u64 = 8;
 /// Concurrent analysis streams the build and tail open per spec.
 const ANALYSIS_STREAMS: usize = 2;
 /// The commit marker's format, for a reader that finds a newer one.
@@ -324,6 +331,13 @@ struct Preflight {
     backend_kind: String,
     scoring_fingerprint: String,
     stats_epoch: u64,
+    /// The integer column the outputs are ordered by
+    /// (docs/immutable-segments.md "Partitioned layout"); `None` keeps
+    /// the bucket layout.
+    partition: Option<String>,
+    /// The live shard's column tables on the segment layout, given to
+    /// the build so every output declares them.
+    columns: Option<crate::reshard::ColumnTables>,
 }
 
 /// A segment-layout tail caught between the two calls of a legacy append:
@@ -402,13 +416,14 @@ impl NodeServiceImpl {
                 layout: layout_name(preflight.segmented).to_string(),
                 dry_run: true,
                 stats_epoch: preflight.stats_epoch,
+                partition_column: preflight.partition.clone().unwrap_or_default(),
                 ..Default::default()
             });
         }
         // The prefix through the cutoff goes to disk before the replay
         // reads it; writes keep landing on the live shard meanwhile.
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = crate::node::write_shard(&self.state);
             if let Some(wal) = guard.wal.as_mut() {
                 wal.flush()
                     .map_err(|e| Status::internal(format!("wal fsync before compaction: {e}")))?;
@@ -480,7 +495,7 @@ impl NodeServiceImpl {
                  to compact",
             )
         })?;
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = crate::node::read_shard(&self.state);
         if guard.pending_compaction.is_some() {
             return Err(Status::failed_precondition(
                 "a compaction cutover is pending its closing flush on this shard; call Flush",
@@ -524,6 +539,89 @@ impl NodeServiceImpl {
                 })
                 .unzip()
         });
+        let partition = if request.partition_column.is_empty() {
+            None
+        } else {
+            let column = request.partition_column.as_str();
+            if !segmented {
+                return Err(Status::failed_precondition(format!(
+                    "partition_column {column:?} needs the segment layout; this shard is a \
+                     single image"
+                )));
+            }
+            let Some(shard) = guard.bm25.as_ref() else {
+                return Err(Status::failed_precondition(format!(
+                    "partition_column {column:?}: this shard holds no documents, so no column \
+                     can order it"
+                )));
+            };
+            let Some(ii) = shard.integer_index(column) else {
+                let kind = if shard.numeric_index(column).is_some() {
+                    "a double column"
+                } else if shard.facet_index(column).is_some() {
+                    "a facet column"
+                } else {
+                    "not a column of this shard"
+                };
+                return Err(Status::invalid_argument(format!(
+                    "partition_column {column:?} is {kind}; a partitioned compaction orders \
+                     by an integer column (--integer-fields, timestamps included)"
+                )));
+            };
+            let Bm25Shard::Segmented(segmented) = shard else {
+                return Err(Status::internal(
+                    "the segment layout serves a segmented shard",
+                ));
+            };
+            // Before any work: a column no document of the shard carries
+            // cannot order it. The sealed summaries count the segments'
+            // rows; the tail is scanned.
+            let sealed: u64 = segmented
+                .snapshot()
+                .manifest()
+                .segments
+                .iter()
+                .filter_map(|segment| segment.summary.as_ref())
+                .flat_map(|summary| summary.int_columns.iter())
+                .filter(|c| c.name == column)
+                .map(|c| c.present)
+                .sum();
+            let tail = segmented.tail();
+            let in_tail = (0..tail.next_doc_id()).any(|doc| tail.integer_value(ii, doc).is_some());
+            if sealed == 0 && !in_tail {
+                return Err(Status::failed_precondition(format!(
+                    "partition_column {column:?}: no document of this shard carries it, so it \
+                     cannot order the rows"
+                )));
+            }
+            Some(column.to_string())
+        };
+        // The live column tables, for every segmented build: a bucket or
+        // a partition with no record of a declared column still declares
+        // it, or the output would not open under this configuration.
+        let columns = match guard.bm25.as_ref() {
+            Some(Bm25Shard::Segmented(s)) => Some(crate::reshard::ColumnTables {
+                facets: (0..s.facet_count())
+                    .map(|i| s.facet_name(i).to_string())
+                    .collect(),
+                numerics: (0..s.numeric_count())
+                    .map(|i| s.numeric_name(i).to_string())
+                    .collect(),
+                map_facets: (0..s.map_facet_count())
+                    .map(|i| s.map_facet_name(i).to_string())
+                    .collect(),
+                map_numerics: (0..s.map_numeric_count())
+                    .map(|i| s.map_numeric_name(i).to_string())
+                    .collect(),
+                integers: (0..s.integer_count())
+                    .map(|i| s.integer_name(i).to_string())
+                    .collect(),
+                geo: (0..s.geo_count())
+                    .map(|i| s.geo_name(i).to_string())
+                    .collect(),
+            }),
+            _ => None,
+        };
         if fields.is_some() && self.config.analysis_addr.is_none() {
             return Err(Status::unavailable(
                 "no analysis backend configured for this shard (analysis_addr); compaction \
@@ -596,6 +694,8 @@ impl NodeServiceImpl {
             backend_kind,
             scoring_fingerprint,
             stats_epoch: guard.stats_epoch,
+            partition,
+            columns,
         }))
     }
 
@@ -681,16 +781,33 @@ impl NodeServiceImpl {
                 }
                 Ok(())
             };
-            crate::reshard::compact_log(
-                &pre.gen_dir,
-                pre.cutoff_clock,
-                &build_dir,
-                pre.segmented,
-                names.as_deref(),
-                pins.as_deref(),
-                analyze,
-                &mut sink,
-            )
+            match pre.partition.as_deref() {
+                Some(column) => crate::reshard::compact_log_partitioned(
+                    &pre.gen_dir,
+                    pre.cutoff_clock,
+                    &build_dir,
+                    crate::reshard::PartitionSpec {
+                        column,
+                        bound: tail_bound,
+                    },
+                    names.as_deref(),
+                    pins.as_deref(),
+                    pre.columns.as_ref(),
+                    analyze,
+                    &mut sink,
+                ),
+                None => crate::reshard::compact_log(
+                    &pre.gen_dir,
+                    pre.cutoff_clock,
+                    &build_dir,
+                    pre.segmented,
+                    names.as_deref(),
+                    pins.as_deref(),
+                    pre.columns.as_ref(),
+                    analyze,
+                    &mut sink,
+                ),
+            }
             .map_err(|e| Status::failed_precondition(format!("compaction build: {e}")))?
         };
         if build.binding != bound_first {
@@ -717,7 +834,7 @@ impl NodeServiceImpl {
                 self.closing_flush()?;
                 let closing_flush_ms = closing.elapsed().as_millis() as u64;
                 let (rows_after, stats_epoch) = {
-                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let guard = crate::node::read_shard(&self.state);
                     (crate::node::physical_rows(&guard), guard.stats_epoch)
                 };
                 Ok(CompactShardResponse {
@@ -734,6 +851,7 @@ impl NodeServiceImpl {
                     closing_flush_ms,
                     tail_passes,
                     stats_epoch,
+                    partition_column: pre.partition.clone().unwrap_or_default(),
                 })
             }
             Err(status) => {
@@ -931,7 +1049,7 @@ impl NodeServiceImpl {
             .map(|s| s.segment_id.clone())
             .collect();
         let epoch_at_open = {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = crate::node::read_shard(&self.state);
             match guard.bm25.as_ref() {
                 Some(Bm25Shard::Segmented(shard)) => shard.snapshot().epoch(),
                 _ => live_manifest.epoch,
@@ -979,6 +1097,7 @@ impl NodeServiceImpl {
                     .then_some(image.exact_vector_path.as_path()),
                 bm25_path: image.bm25_path.as_deref().expect("checked above"),
                 live_docs_path: live,
+                partition_column: pre.partition.as_deref(),
             })
             .collect();
         let staged = crate::segments::stage_segments(&root, sources)
@@ -991,6 +1110,7 @@ impl NodeServiceImpl {
             let manifest = SegmentSetManifest {
                 epoch: epoch_at_open,
                 segments: staged.clone(),
+                partition_key: pre.partition.clone(),
                 ..Default::default()
             };
             let catalog = SegmentCatalog::open_staged(&root, manifest, self.config.vector_load())
@@ -1359,7 +1479,7 @@ impl NodeServiceImpl {
     /// Fsync the live log and return its high watermark: the bound of
     /// one tail pass. Brief, under the write lock.
     fn flush_live_wal(&self, pre: &Preflight) -> Result<u64, Status> {
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = crate::node::write_shard(&self.state);
         Self::flush_live_wal_locked(&mut guard, pre)
     }
 
@@ -1394,6 +1514,8 @@ impl NodeServiceImpl {
     ) -> Result<(u64, u64, u64), Status> {
         let mut tail = ClockedTail::start(&pre.gen_dir, pre.cutoff_clock);
         let mut passes = 0u64;
+        let mut smallest = usize::MAX;
+        let mut stalled = 0u64;
         loop {
             passes += 1;
             if passes > MAX_TAIL_PASSES {
@@ -1410,6 +1532,20 @@ impl NodeServiceImpl {
             self.apply_pass(shadow, records, analyze)?;
             if count < tail_bound {
                 break;
+            }
+            if count < smallest {
+                smallest = count;
+                stalled = 0;
+            } else {
+                stalled += 1;
+                if stalled >= STALLED_TAIL_PASSES {
+                    return Err(Status::resource_exhausted(format!(
+                        "writes outpace compaction: {STALLED_TAIL_PASSES} consecutive tail \
+                         passes read no fewer than {smallest} records (last {count}, \
+                         tail_bound {tail_bound}) after {passes} passes; pause writes or \
+                         raise tail_bound"
+                    )));
+                }
             }
         }
 
@@ -1429,7 +1565,7 @@ impl NodeServiceImpl {
             // can block the runtime workers needed to complete that I/O.
             self.apply_pass(shadow, records, analyze)?;
             passes += 1;
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = crate::node::write_shard(&self.state);
             let started = Instant::now();
             if Self::flush_live_wal_locked(&mut guard, pre)? != watermark {
                 drop(guard);

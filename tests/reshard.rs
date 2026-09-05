@@ -893,6 +893,7 @@ async fn one_child_reshard_compacts_generation_tombstones() {
             )),
             bm25_path: &pipestream_search::node::bm25_sidecar_path(&index_path),
             live_docs_path: &pipestream_search::node::live_docs_sidecar_path(&index_path),
+            partition_column: None,
         })
         .unwrap();
     let published = catalog
@@ -903,6 +904,7 @@ async fn one_child_reshard_compacts_generation_tombstones() {
             EMBEDDED_TURBOVEC,
             0,
             1_000,
+            None,
             None,
             &mut replay_analyzer(&analysis_addr),
         )

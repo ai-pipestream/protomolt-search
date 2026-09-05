@@ -34,9 +34,10 @@ new server without regeneration.
 - `GetCalibration`, `SetCalibration`, and `BroadcastCalibration` remain as
   compatibility adapters. New clients should use `GetVectorBackend`,
   `ConfigureVectorBackend`, and `BroadcastVectorBackend`.
-- The persisted mapping fingerprint tag remains `turbovec-search.plan.v1`.
-  It is a frozen format identifier, not current branding, and retaining it
-  avoids invalidating mapped generations whose canonical plan did not change.
+- The current mapping fingerprint tag is `pipestream-search.plan.v3`.
+  The foundations decoder changes require a source rebuild before binding
+  v1/v2 mapped generations for new writes; the namespace reconciliation
+  itself does not change the v3 algorithm. See [search foundations](search-foundations.md).
 
 ## Protocol namespace break
 
@@ -52,6 +53,12 @@ Do not rewrite persisted user descriptor sets or retained original protobuf
 sources to make this rename appear backward-compatible. They remain opaque
 producer data. Review a generation's stored descriptors and Any payloads when
 planning a cutover, and migrate only through a verified reader/rebuild path.
+
+The main reconciliation also assigns `Bm25Hit.identity` field 7 and
+`QueryHit.identity` field 12. Main retains `Bm25Hit.explain` at 6 and
+`QueryHit.sort_values`/`explain` at 10/11. Clients generated from the earlier
+foundations branch must regenerate too: their identity fields were 6 and 10.
+Main's multi-key sort and cursor contracts replace the older single-key shapes.
 
 ## Operational consequence
 

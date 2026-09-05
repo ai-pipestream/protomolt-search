@@ -431,6 +431,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     let resp = SearchService::bm25_search(
         &distributed,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -449,6 +450,8 @@ async fn distributed_chain_matches_monolith_and_reorders() {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         }),
     )
     .await
@@ -540,6 +543,7 @@ async fn stage_and_ingest_refusals_are_loud() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -557,6 +561,8 @@ async fn stage_and_ingest_refusals_are_loud() {
                 b: 0.0,
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }],
             facet_fields: Vec::new(),
             score_stages: vec![decay_stage(300.0, 100.0)],
@@ -566,6 +572,8 @@ async fn stage_and_ingest_refusals_are_loud() {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         }),
     )
     .await

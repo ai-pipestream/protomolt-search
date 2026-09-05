@@ -140,6 +140,82 @@ impl PlacedShard {
 }
 
 /// One shard this node serves and reports.
+/// One child of a split, as chosen when the split started.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitChild {
+    pub shard_id: String,
+    pub hash_lo: u64,
+    pub hash_hi: u64,
+    pub slot_offset: u64,
+}
+
+/// Durable progress of one `SPLIT_SHARD` action
+/// (`<data-dir>/<shard_id>.split/split.toml`): the children and their
+/// ranges are fixed when the split starts, so a retry after a crash
+/// resumes the same split rather than starting another.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitState {
+    pub action_id: u64,
+    pub shard_id: String,
+    pub source_generation: u64,
+    pub target_generation: u64,
+    pub children: Vec<SplitChild>,
+    /// The baseline images are built and the children placed.
+    pub built: bool,
+    /// The live tail cursor into the children.
+    pub live: Option<crate::replication::LiveReshardState>,
+    /// The source's ingest is fenced (re-applied after a restart).
+    pub fenced: bool,
+    pub completed: bool,
+}
+
+impl SplitState {
+    pub fn path(dir: &Path) -> PathBuf {
+        dir.join("split.toml")
+    }
+
+    pub fn load(dir: &Path) -> Result<Option<Self>, String> {
+        let path = Self::path(dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        toml::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+
+    pub fn write(&self, dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let text = toml::to_string(self).map_err(|e| format!("encode split state: {e}"))?;
+        let tmp = dir.join("split.toml.tmp");
+        std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        let path = Self::path(dir);
+        std::fs::rename(&tmp, &path).map_err(|e| format!("publish {}: {e}", path.display()))?;
+        crate::postings::fsync_parent(&path).map_err(|e| format!("fsync {}: {e}", path.display()))
+    }
+}
+
+/// The marker a split leaves for a configured source it retired.
+fn retired_marker(data_dir: &Path, shard_id: &str) -> PathBuf {
+    data_dir.join("retired").join(shard_id)
+}
+
+/// Move one built image file into a placed shard's directory: a rename
+/// on the same filesystem, a copy across.
+fn move_image_file(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)
+        .map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))?;
+    std::fs::remove_file(from).map_err(|e| format!("remove {}: {e}", from.display()))
+}
+
 pub struct ServedShard {
     pub shard_id: String,
     pub node: NodeServiceImpl,
@@ -188,6 +264,8 @@ pub struct AgentStats {
     /// differed from what the copy had; retried on a later tick.
     pub completion_refusals: AtomicU64,
     pub drops_completed: AtomicU64,
+    /// Splits this worker built, caught up, fenced, and completed.
+    pub splits_completed: AtomicU64,
     pub unhandled_actions: AtomicU64,
 }
 
@@ -228,6 +306,23 @@ impl NodeAgent {
         let flush_notify = Arc::new(Notify::new());
         let shards = shards
             .into_iter()
+            .filter(|shard| {
+                // A configured shard a split retired stays retired across
+                // a restart: its rows live in its children now, and a
+                // report of it would re-register a range the children
+                // already tile.
+                let retired = retired_marker(&config.data_dir, &shard.shard_id).exists();
+                if retired {
+                    eprintln!(
+                        "node {:?}: shard {:?} was retired by a split; not served or reported \
+                         (remove it from the configuration and {} to forget it)",
+                        config.node_id,
+                        shard.shard_id,
+                        retired_marker(&config.data_dir, &shard.shard_id).display()
+                    );
+                }
+                !retired
+            })
             .map(|shard| (shard.shard_id.clone(), shard))
             .collect();
         NodeAgent {
@@ -735,6 +830,7 @@ impl NodeAgent {
             let result = match PlacementActionKind::try_from(action.kind) {
                 Ok(PlacementActionKind::CopyReplica) => self.execute_copy(action, &plan).await,
                 Ok(PlacementActionKind::DropReplica) => self.execute_drop(action, &plan).await,
+                Ok(PlacementActionKind::SplitShard) => self.execute_split(action, &plan).await,
                 other => {
                     if self
                         .inner
@@ -1063,6 +1159,473 @@ impl NodeAgent {
     /// `DROP_REPLICA`: remove this node's retired copy. A copy the plane
     /// still lists as primary, or a shard from the configuration, is
     /// refused and the action stays pending.
+    /// `SPLIT_SHARD` (`docs/cluster-control.md`, "Shard split"): build
+    /// two children covering the source range from the source's own
+    /// WAL, place them here on fresh listeners, tail the source's log
+    /// into them by stable key until they are within the lag bound,
+    /// fence ingest on the source, drain the last records, verify the
+    /// children conserve the source's live rows, complete the action
+    /// with the children as primaries, and retire the source. Every
+    /// step is durable in `split.toml`, so a crash resumes where it
+    /// stopped; a completion the plane refuses is retried next tick
+    /// with the source still fenced.
+    pub async fn execute_split(
+        &self,
+        action: &PlacementAction,
+        plan: &ClusterPlan,
+    ) -> Result<(), String> {
+        let node_id = self.inner.config.node_id.clone();
+        let source_record = plan
+            .replicas
+            .iter()
+            .find(|record| {
+                record.shard_id == action.shard_id
+                    && record.node_id == node_id
+                    && record.role == ShardReplicaRole::Primary as i32
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the plan has no primary record of shard {:?} on this node",
+                    action.shard_id
+                )
+            })?;
+        if source_record.generation != action.source_generation {
+            return Err(format!(
+                "action {} was planned from generation {} but the source is at {}; waiting for \
+                 the plane to replan",
+                action.action_id, action.source_generation, source_record.generation
+            ));
+        }
+        if action.hash_lo >= action.hash_hi {
+            return Err(format!(
+                "shard {:?} covers the single hash value {}; nothing to split",
+                action.shard_id, action.hash_lo
+            ));
+        }
+        let (source_node, source_addr, source_index) = {
+            let shards = self.inner.shards.lock().expect("shards lock");
+            let shard = shards
+                .get(&action.shard_id)
+                .ok_or_else(|| format!("shard {:?} is not served on this node", action.shard_id))?;
+            let index = shard
+                .node
+                .config()
+                .index_path
+                .clone()
+                .ok_or_else(|| format!("shard {:?} has no index path", action.shard_id))?;
+            (shard.node.clone(), shard.addr.clone(), index)
+        };
+        let split_dir = self.split_dir(&action.shard_id);
+        let mut state = match SplitState::load(&split_dir)? {
+            Some(state) if state.action_id == action.action_id => state,
+            Some(state) => {
+                return Err(format!(
+                    "shard {:?} has split state for action {} on disk; action {} cannot start \
+                     until it is resolved ({})",
+                    action.shard_id,
+                    state.action_id,
+                    action.action_id,
+                    split_dir.display()
+                ));
+            }
+            None => {
+                let source_health = node_health(&source_addr).await?;
+                if source_health.deleted_docs != 0 {
+                    return Err(format!(
+                        "shard {:?} has {} tombstones; the live split moves appends only, so \
+                         compact it first",
+                        action.shard_id, source_health.deleted_docs
+                    ));
+                }
+                let rows = rows_of(&source_health);
+                // Fresh, non-overlapping slot ranges above every range the
+                // plan and this node know, spaced by the source's row count
+                // rounded up to a mebi: a child's ids never reuse another
+                // shard's.
+                let span = rows.saturating_add(1).div_ceil(1 << 20).max(1) << 20;
+                let known_top = plan
+                    .replicas
+                    .iter()
+                    .map(|record| record.slot_offset.saturating_add(record.rows))
+                    .chain(
+                        self.inner
+                            .shards
+                            .lock()
+                            .expect("shards lock")
+                            .values()
+                            .map(|shard| shard.node.config().slot_offset)
+                            .map(|offset| offset.saturating_add(rows)),
+                    )
+                    .max()
+                    .unwrap_or(0);
+                let base = known_top.div_ceil(span).saturating_mul(span);
+                let mid = action.hash_lo + (action.hash_hi - action.hash_lo) / 2;
+                let children = vec![
+                    SplitChild {
+                        shard_id: format!("{}-0", action.shard_id),
+                        hash_lo: action.hash_lo,
+                        hash_hi: mid,
+                        slot_offset: base,
+                    },
+                    SplitChild {
+                        shard_id: format!("{}-1", action.shard_id),
+                        hash_lo: mid + 1,
+                        hash_hi: action.hash_hi,
+                        slot_offset: base.saturating_add(span),
+                    },
+                ];
+                for child in &children {
+                    if self
+                        .inner
+                        .shards
+                        .lock()
+                        .expect("shards lock")
+                        .contains_key(&child.shard_id)
+                        || plan.replicas.iter().any(|r| r.shard_id == child.shard_id)
+                    {
+                        return Err(format!(
+                            "split child shard id {:?} already exists",
+                            child.shard_id
+                        ));
+                    }
+                }
+                let state = SplitState {
+                    action_id: action.action_id,
+                    shard_id: action.shard_id.clone(),
+                    source_generation: action.source_generation,
+                    target_generation: action.target_generation,
+                    children,
+                    built: false,
+                    live: None,
+                    fenced: false,
+                    completed: false,
+                };
+                state.write(&split_dir)?;
+                state
+            }
+        };
+
+        // 1. Build the baseline children from the source's WAL and place
+        //    them on fresh listeners.
+        if !state.built {
+            let ranges: Vec<(u64, u64)> = state
+                .children
+                .iter()
+                .map(|child| (child.hash_lo, child.hash_hi))
+                .collect();
+            let offsets: Vec<u64> = state
+                .children
+                .iter()
+                .map(|child| child.slot_offset)
+                .collect();
+            let work = split_dir.join("build");
+            let _ = std::fs::remove_dir_all(&work);
+            let generation = crate::reshard::resolve_gen(&crate::wal::wal_dir(&source_index))?;
+            let analysis_addr = self
+                .inner
+                .config
+                .template
+                .analysis_addr
+                .clone()
+                .ok_or_else(|| {
+                    "the node has no analysis backend; a split rebuilds the children's postings"
+                        .to_string()
+                })?;
+            let bm25_fields = self.inner.config.template.bm25_fields.clone();
+            let handle = tokio::runtime::Handle::current();
+            let build_dir = work.clone();
+            let built = tokio::task::spawn_blocking(move || {
+                let mut analyze = move |docs: &[(
+                    &str,
+                    Option<&crate::pb::AnalysisSpec>,
+                    crate::analyzer::SessionLayers,
+                )]| {
+                    handle
+                        .block_on(crate::analyzer::analyze_batch_streams(
+                            &analysis_addr,
+                            docs,
+                            1,
+                        ))
+                        .map_err(|error| error.to_string())
+                };
+                crate::reshard::split_stable_logs_ranged(
+                    &[generation],
+                    &ranges,
+                    &build_dir,
+                    &offsets,
+                    false,
+                    (!bm25_fields.is_empty()).then_some(bm25_fields.as_slice()),
+                    &mut analyze,
+                )
+            })
+            .await
+            .map_err(|e| format!("split build task: {e}"))??;
+            let cutoff = *built
+                .source_cutoffs
+                .first()
+                .ok_or_else(|| "the split reported no source cutoff".to_string())?;
+            let mut live_children = Vec::with_capacity(state.children.len());
+            for (child, image) in state.children.iter().zip(&built.images.children) {
+                let dir = self.shard_dir(&child.shard_id);
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("create {}: {e}", dir.display()))?;
+                let target = dir.join("shard");
+                move_image_file(&image.vector_path, &target)?;
+                move_image_file(
+                    &image.exact_vector_path,
+                    &crate::node::exact_vector_sidecar_path(&target),
+                )?;
+                if let Some(bm25) = &image.bm25_path {
+                    move_image_file(bm25, &crate::node::bm25_sidecar_path(&target))?;
+                }
+                let placed = PlacedShard {
+                    shard_id: child.shard_id.clone(),
+                    collection: self.inner.config.collection.clone(),
+                    slot_offset: child.slot_offset,
+                    hash_lo: child.hash_lo,
+                    hash_hi: child.hash_hi,
+                    source_generation: action.target_generation,
+                    installed: true,
+                    ..Default::default()
+                };
+                let addr = self.serve_placed(placed).await?;
+                live_children.push(crate::replication::LiveChild {
+                    addr,
+                    replica: None,
+                    hash_lo: child.hash_lo,
+                    hash_hi: child.hash_hi,
+                    slot_offset: child.slot_offset,
+                    base_vectors: image.num_vectors,
+                    base_document_slots: image.num_documents,
+                    applied_vectors: 0,
+                    applied_documents: 0,
+                });
+            }
+            let _ = std::fs::remove_dir_all(&work);
+            state.live = Some(crate::replication::LiveReshardState {
+                source: source_addr.clone(),
+                source_wal_generation: cutoff.generation,
+                source_clock: cutoff.high_watermark,
+                old_topology_generation: plan.topology_generation,
+                new_topology_generation: plan.topology_generation.saturating_add(1),
+                children: live_children,
+            });
+            state.built = true;
+            state.write(&split_dir)?;
+            self.inner.stats.installs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // A restart re-serves the children through open_placed; make
+            // sure they are up before tailing into them.
+            for child in &state.children {
+                if self.shard_addr(&child.shard_id).is_none() {
+                    return Err(format!(
+                        "split child {:?} is not served; open the placed shards first",
+                        child.shard_id
+                    ));
+                }
+            }
+        }
+        let mut live = state
+            .live
+            .clone()
+            .ok_or_else(|| "split state has no live cursor".to_string())?;
+
+        // 2. Tail the source into the children until within the lag bound.
+        let mut lag = u64::MAX;
+        for _ in 0..CATCH_UP_ROUNDS {
+            live = crate::replication::catch_up_children_once(&live).await?;
+            state.live = Some(live.clone());
+            state.write(&split_dir)?;
+            let source = node_health(&source_addr).await?;
+            lag = source.wal_high_watermark.saturating_sub(live.source_clock);
+            if lag <= self.inner.config.lag_bound {
+                break;
+            }
+        }
+        if lag > self.inner.config.lag_bound {
+            return Err(format!(
+                "split children of {:?} are still {lag} clocks behind after \
+                 {CATCH_UP_ROUNDS} rounds; continuing next tick",
+                action.shard_id
+            ));
+        }
+
+        // 3. Fence the source and drain the last records: with no append
+        //    able to land, the children's rows are the source's rows.
+        source_node.fence_ingest(format!(
+            "shard {:?} is splitting into {} (action {}); retry against the new topology",
+            action.shard_id,
+            state
+                .children
+                .iter()
+                .map(|child| child.shard_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            action.action_id
+        ));
+        if !state.fenced {
+            state.fenced = true;
+            state.write(&split_dir)?;
+        }
+        live = crate::replication::catch_up_children_once(&live).await?;
+        state.live = Some(live.clone());
+        state.write(&split_dir)?;
+        let source = node_health(&source_addr).await?;
+        if source.wal_high_watermark != live.source_clock {
+            return Err(format!(
+                "fenced source {:?} still moved: watermark {} past the children's clock {}",
+                action.shard_id, source.wal_high_watermark, live.source_clock
+            ));
+        }
+        let mut child_rows = 0u64;
+        let mut outputs = Vec::with_capacity(state.children.len());
+        for child in &state.children {
+            let served = {
+                let shards = self.inner.shards.lock().expect("shards lock");
+                shards.get(&child.shard_id).map(|shard| ServedShard {
+                    shard_id: shard.shard_id.clone(),
+                    node: shard.node.clone(),
+                    addr: shard.addr.clone(),
+                    hash_range: shard.hash_range,
+                    placed: shard.placed.clone(),
+                    server: None,
+                })
+            }
+            .ok_or_else(|| format!("split child {:?} vanished", child.shard_id))?;
+            let health = NodeService::health(&served.node, Request::new(HealthRequest {}))
+                .await
+                .map_err(|e| format!("health of child {:?}: {e}", child.shard_id))?
+                .into_inner();
+            child_rows = child_rows.saturating_add(rows_of(&health));
+            let Some(mut output) = self.replica_state(&served, plan).await? else {
+                return Err(format!(
+                    "split child {:?} has no hash range",
+                    child.shard_id
+                ));
+            };
+            output.role = ShardReplicaRole::Primary as i32;
+            output.ready = true;
+            output.generation = action.target_generation;
+            outputs.push(output);
+        }
+        // The fenced source's counts are final: report them so the plane's
+        // record of the source is the one the children are checked against.
+        self.report_shard_with(&action.shard_id, plan).await?;
+        let source_live = rows_of(&source).saturating_sub(source.deleted_docs);
+        if child_rows != source_live {
+            return Err(format!(
+                "split children of {:?} hold {child_rows} rows, the fenced source {source_live}; \
+                 the split does not conserve the source and is not completed",
+                action.shard_id
+            ));
+        }
+
+        // 4. Complete with the children as primaries; the plane replaces
+        //    the source's record and publishes the topology.
+        let hook = self
+            .inner
+            .before_complete
+            .lock()
+            .expect("hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+        let token = self.lease_token().await?;
+        let mut control = self.control().await?;
+        match control
+            .complete_placement_action(CompletePlacementActionRequest {
+                node_id: node_id.clone(),
+                lease_token: token,
+                action_id: action.action_id,
+                outputs,
+                collection: self.inner.config.collection.clone(),
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(status) if status.code() == Code::FailedPrecondition => {
+                // The plane's record of the source is behind the fenced
+                // source; report it (its counts no longer move) and let
+                // the next tick complete.
+                self.inner
+                    .stats
+                    .completion_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                self.report_shard_with(&action.shard_id, plan).await?;
+                return Err(format!(
+                    "split of {:?} refused by the plane: {}; the source is fenced and reported, \
+                     retrying next tick",
+                    action.shard_id,
+                    status.message()
+                ));
+            }
+            Err(status) => {
+                return Err(format!(
+                    "complete split action {}: {status}",
+                    action.action_id
+                ))
+            }
+        }
+        for child in &state.children {
+            self.update_placed(&child.shard_id, |placed| {
+                placed.ready = true;
+                placed.completed_action = action.action_id;
+            })?;
+        }
+        // 5. Retire the source: it is no longer reported or served; a
+        //    configured source keeps its files and a marker, a placed one
+        //    is removed like a dropped copy.
+        let retired = self
+            .inner
+            .shards
+            .lock()
+            .expect("shards lock")
+            .remove(&action.shard_id);
+        if let Some(shard) = retired {
+            if shard.placed.is_some() {
+                if let Some(server) = shard.server {
+                    server.abort();
+                }
+                drop(shard.node);
+                let dir = self.shard_dir(&action.shard_id);
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| format!("remove {}: {e}", dir.display()))?;
+            } else {
+                let marker = retired_marker(&self.inner.config.data_dir, &action.shard_id);
+                if let Some(parent) = marker.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create {}: {e}", parent.display()))?;
+                }
+                std::fs::write(&marker, format!("split by action {}\n", action.action_id))
+                    .map_err(|e| format!("write {}: {e}", marker.display()))?;
+            }
+        }
+        state.completed = true;
+        state.write(&split_dir)?;
+        self.inner
+            .stats
+            .splits_completed
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "node {:?}: shard {:?} split into {} (action {}), source retired",
+            node_id,
+            action.shard_id,
+            state
+                .children
+                .iter()
+                .map(|child| child.shard_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            action.action_id
+        );
+        Ok(())
+    }
+
+    fn split_dir(&self, shard_id: &str) -> PathBuf {
+        self.inner.config.data_dir.join(format!("{shard_id}.split"))
+    }
+
     pub async fn execute_drop(
         &self,
         action: &PlacementAction,

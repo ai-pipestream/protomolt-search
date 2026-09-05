@@ -68,6 +68,7 @@ token = "…at least 16 bytes…"
 max_k = 200              # 0: the coordinator's max_k
 concurrency = 8          # 0: unlimited
 ingest_docs_per_sec = 500  # 0: unlimited
+admin = false            # true: may call the diagnostics service
 
 [policy]
 format_version = 1
@@ -81,6 +82,11 @@ workspace = "legal"
 collection = "opinions"
 actions = ["search"]
 ```
+
+`admin = true` admits the principal to `DiagnosticsService`
+(`docs/diagnostics.md`): reading and setting runtime knobs, metrics
+snapshots, shard layouts, and recent queries. Any other principal gets
+`PERMISSION_DENIED` there. It grants no other quota or route.
 
 With principals configured every `SearchService` call — search, query,
 streaming query, aggregate, plan, routed ingest, topology, broadcast,
@@ -109,9 +115,9 @@ Every public route in `CollectionSet` declares one capability:
 
 | Capability | Routes |
 |---|---|
-| `search` | Search, Bm25Search, PhraseSearch, HybridSearch, VariantSearch, Query, QueryStream, Aggregate, Suggest |
+| `search` | Search, Bm25Search, PhraseSearch, HybridSearch, VariantSearch, Query, QueryStream, Aggregate, Suggest, TermSuggest |
 | `ingest` | RoutedIngestMapped |
-| `admin` | PlanIndex, DescribeSchema, BroadcastVectorBackend, BroadcastCalibration, FreezeTopologyWrites, PublishTopology, AbortTopologyCutover, ClusterHealth |
+| `admin` | PlanIndex, DescribeSchema, PlanPlacement, BroadcastVectorBackend, BroadcastCalibration, FreezeTopologyWrites, PublishTopology, AbortTopologyCutover, ClusterHealth |
 
 No capability implies another. An administrator who also needs to search or
 write needs those grants explicitly. Names are exact; there are no implicit
@@ -149,6 +155,9 @@ fleet tools' unnamed dataset when creating a new file; it does not overwrite an
 existing file. This increment does not alter the separate node mTLS or cluster
 control membership rules. It does not establish document/field authorization or
 secure a direct node call by applying the public collection policy.
+The console (`docs/console-facade.md`) is the one client that holds the
+cluster credentials on a browser's behalf: it binds to loopback unless
+told otherwise, and whoever reaches it acts as its principal.
 
 ## Quotas, per principal
 

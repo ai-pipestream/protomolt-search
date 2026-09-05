@@ -107,6 +107,7 @@ fn agg(name: &str, expression: &str, op: AggregateOp) -> Aggregation {
         name: name.into(),
         expression: expression.into(),
         op: op as i32,
+        max_distinct: 0,
     }
 }
 
@@ -116,6 +117,8 @@ fn hist(name: &str, expression: &str, interval: f64, max_buckets: u32) -> Histog
         expression: expression.into(),
         interval,
         max_buckets,
+        calendar: 0,
+        utc_offset_minutes: 0,
     }
 }
 
@@ -872,6 +875,565 @@ async fn percentile_refusals_name_the_spec() {
         .await
         .unwrap_err();
     assert!(status.message().contains("duplicate"));
+    for h in handles {
+        h.abort();
+    }
+}
+
+// ---------------------------------------------------------------------
+// Cardinality: the exact distinct count (docs/aggregations.md).
+// ---------------------------------------------------------------------
+
+fn card(name: &str, expression: &str, max_distinct: u32) -> Aggregation {
+    Aggregation {
+        name: name.into(),
+        expression: expression.into(),
+        op: AggregateOp::Cardinality as i32,
+        max_distinct,
+    }
+}
+
+fn int_of(response: &AggregateResponse, name: &str) -> i64 {
+    let r = response
+        .results
+        .iter()
+        .find(|r| r.name == name)
+        .unwrap_or_else(|| panic!("{name} answered"));
+    match r.value {
+        Some(W::IntValue(v)) => v,
+        other => panic!("{name}: expected an int, got {other:?}"),
+    }
+}
+
+/// Distinct counts over every type, exact across the shard boundary,
+/// with doubles canonical (one zero, one NaN) and absence excluded.
+#[tokio::test]
+async fn cardinality_counts_distinct_values_exactly() {
+    let (coordinator, handles) = start_cluster().await;
+    let response = run(
+        &coordinator,
+        "",
+        vec![
+            card("courts", "court", 0),
+            card("years", "year", 0),
+            card("prices", "price", 0),
+            // -0.0 on the early years, 0.0 on the late ones: one value.
+            card(
+                "zeros",
+                "year > 1993 ? (price - price) : (0.0 - (price - price))",
+                0,
+            ),
+            card("nans", "(price - price) / (price - price)", 0),
+            card("late", "year > 1993", 0),
+            agg("n", "year", AggregateOp::Count),
+        ],
+    )
+    .await
+    .unwrap();
+    let courts: std::collections::BTreeSet<&str> = (0..N_DOCS).filter_map(court_of).collect();
+    assert_eq!(int_of(&response, "courts"), courts.len() as i64);
+    assert_eq!(int_of(&response, "years"), 7, "seven documents hold a year");
+    assert_eq!(int_of(&response, "prices"), 7);
+    assert_eq!(int_of(&response, "zeros"), 1, "-0.0 and 0.0 are one value");
+    assert_eq!(int_of(&response, "nans"), 1, "every NaN is one value");
+    assert_eq!(int_of(&response, "late"), 2, "true and false both occur");
+    assert_eq!(int_of(&response, "n"), 7);
+    let present = |name: &str| {
+        response
+            .results
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap()
+            .present
+    };
+    assert_eq!(present("courts"), 7);
+    assert_eq!(
+        present("zeros"),
+        6,
+        "the row without a price or a year is absent"
+    );
+    // Bitwise determinism: the same request answers the same bytes.
+    let again = run(
+        &coordinator,
+        "",
+        vec![card("courts", "court", 0), card("years", "year", 0)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.results[0], response.results[0]);
+    assert_eq!(again.results[1], response.results[1]);
+    // The filter scopes the distinct set: late years sit in one court.
+    let late = run(
+        &coordinator,
+        "year >= 1994",
+        vec![card("courts", "court", 0), card("years", "year", 0)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(late.matched, 3);
+    assert_eq!(int_of(&late, "courts"), 1);
+    assert_eq!(int_of(&late, "years"), 3);
+    // An empty selection has no distinct values, and says so with a
+    // zero, like COUNT.
+    let none = run(
+        &coordinator,
+        "year > 3000",
+        vec![card("courts", "court", 0)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(int_of(&none, "courts"), 0);
+    for h in handles {
+        h.abort();
+    }
+}
+
+/// Cardinality inside a group-by, and the caps: a shard's own distinct
+/// count and the fleet-wide union both refuse by name; the cap on any
+/// other op refuses at compile time.
+#[tokio::test]
+async fn cardinality_groups_and_caps_loudly() {
+    let (coordinator, handles) = start_cluster().await;
+    let response = coordinator
+        .aggregate(Request::new(AggregateRequest {
+            aggregations: vec![card("years", "year", 0)],
+            group_by: "court".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut expected: std::collections::BTreeMap<&str, std::collections::BTreeSet<i64>> =
+        Default::default();
+    for id in 0..N_DOCS {
+        if let (Some(court), Some(year)) = (court_of(id), year_of(id)) {
+            expected.entry(court).or_default().insert(year);
+        }
+    }
+    let got: Vec<(&str, i64)> = response
+        .groups
+        .iter()
+        .map(|g| (g.value.as_str(), int_of_group(g, "years")))
+        .collect();
+    let want: Vec<(&str, i64)> = expected
+        .iter()
+        .map(|(court, years)| (*court, years.len() as i64))
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(int_of(&response, "years"), 7, "the total is the union");
+
+    // Shard 0 alone holds four years: a cap of 2 refuses on the shard.
+    let status = run(&coordinator, "", vec![card("years", "year", 2)])
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(
+        status.message().contains("\"years\"") && status.message().contains("on one shard"),
+        "{status}"
+    );
+    // Each shard holds at most four, the union seven: a cap of 4
+    // refuses at the merge.
+    let status = run(&coordinator, "", vec![card("years", "year", 4)])
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(
+        status.message().contains("\"years\"") && status.message().contains("across the fleet"),
+        "{status}"
+    );
+    // A cap of 7 admits the seven.
+    let ok = run(&coordinator, "", vec![card("years", "year", 7)])
+        .await
+        .unwrap();
+    assert_eq!(int_of(&ok, "years"), 7);
+    // The cap belongs to CARDINALITY.
+    let status = run(
+        &coordinator,
+        "",
+        vec![Aggregation {
+            name: "n".into(),
+            expression: "year".into(),
+            op: AggregateOp::Count as i32,
+            max_distinct: 5,
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+    assert!(
+        status
+            .message()
+            .contains("max_distinct applies to CARDINALITY, not count"),
+        "{status}"
+    );
+    for h in handles {
+        h.abort();
+    }
+}
+
+fn int_of_group(group: &pipestream_search::pb::AggregateGroup, name: &str) -> i64 {
+    match group.results.iter().find(|r| r.name == name).unwrap().value {
+        Some(W::IntValue(v)) => v,
+        other => panic!("{name}: expected an int, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Calendar date histograms over the timestamp column (epoch micros).
+// ---------------------------------------------------------------------
+
+/// Days since 1970-01-01, by walking the calendar: independent of the
+/// engine's arithmetic on purpose.
+fn test_days(y: i64, m: u32, d: u32) -> i64 {
+    fn leap(y: i64) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+    let month_days = |y: i64, m: u32| -> i64 {
+        match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if leap(y) {
+                    29
+                } else {
+                    28
+                }
+            }
+        }
+    };
+    let mut days = 0i64;
+    if y >= 1970 {
+        for year in 1970..y {
+            days += if leap(year) { 366 } else { 365 };
+        }
+    } else {
+        for year in y..1970 {
+            days -= if leap(year) { 366 } else { 365 };
+        }
+    }
+    for month in 1..m {
+        days += month_days(y, month);
+    }
+    days + i64::from(d) - 1
+}
+
+fn micros_at(y: i64, m: u32, d: u32, hh: i64, mm: i64, ss: i64) -> i64 {
+    (test_days(y, m, d) * 86_400 + hh * 3600 + mm * 60 + ss) * 1_000_000
+}
+
+/// The instants, spread over both shards: a leap day, a month
+/// boundary in a western zone, a year boundary inside one ISO week,
+/// and one instant before 1970.
+fn filed_instants() -> Vec<i64> {
+    vec![
+        micros_at(2024, 2, 29, 23, 30, 0),
+        micros_at(2024, 3, 1, 2, 30, 0),
+        micros_at(2024, 3, 1, 12, 0, 0),
+        micros_at(2024, 1, 15, 0, 0, 0),
+        micros_at(2023, 12, 31, 23, 59, 59),
+        micros_at(2024, 12, 30, 0, 0, 0),
+        micros_at(2025, 1, 1, 0, 0, 0),
+        micros_at(1969, 12, 31, 23, 0, 0),
+    ]
+}
+
+async fn start_dated_cluster() -> (
+    CoordinatorServiceImpl,
+    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
+) {
+    let (analysis, mock) = start_mock_analysis().await;
+    let mut handles = vec![mock];
+    let mut addrs = Vec::new();
+    let instants = filed_instants();
+    for shard in 0..2usize {
+        let (addr, handle) = start_empty_node(NodeConfig {
+            slot_offset: (shard * SHARD_DOCS) as u64,
+            analysis_addr: Some(analysis.clone()),
+            integer_fields: vec!["filed".into()],
+            ..Default::default()
+        })
+        .await;
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        for i in 0..SHARD_DOCS {
+            let id = shard * SHARD_DOCS + i;
+            let micros = instants[id];
+            tx.send(AddDocumentsRequest {
+                text: format!("filing {id}"),
+                timestamps: vec![pipestream_search::pb::TimestampValue {
+                    field: "filed".into(),
+                    value: Some(prost_types::Timestamp {
+                        seconds: micros.div_euclid(1_000_000),
+                        nanos: (micros.rem_euclid(1_000_000) * 1000) as i32,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
+    (coordinator, handles)
+}
+
+fn calendar_hist(
+    name: &str,
+    unit: pipestream_search::pb::CalendarInterval,
+    utc_offset_minutes: i32,
+) -> HistogramSpec {
+    HistogramSpec {
+        name: name.into(),
+        expression: "filed".into(),
+        interval: 0.0,
+        max_buckets: 0,
+        calendar: unit as i32,
+        utc_offset_minutes,
+    }
+}
+
+/// Every unit buckets at its calendar boundary, the key is the bucket's
+/// start instant, and a zone offset moves the boundary.
+#[tokio::test]
+async fn calendar_histograms_bucket_at_civil_boundaries() {
+    use pipestream_search::pb::CalendarInterval as C;
+    let (coordinator, handles) = start_dated_cluster().await;
+    let response = coordinator
+        .aggregate(Request::new(AggregateRequest {
+            histograms: vec![
+                calendar_hist("day", C::Day, 0),
+                calendar_hist("day_eastern", C::Day, -300),
+                calendar_hist("week", C::Week, 0),
+                calendar_hist("month", C::Month, 0),
+                calendar_hist("quarter", C::Quarter, 0),
+                calendar_hist("year", C::Year, 0),
+                calendar_hist("hour_india", C::Hour, 330),
+                calendar_hist("minute", C::Minute, 0),
+            ],
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let at = |y, m, d, hh, mm| micros_at(y, m, d, hh, mm, 0);
+    let expectations: Vec<(&str, Vec<(i64, u64)>)> = vec![
+        (
+            "day",
+            vec![
+                (at(1969, 12, 31, 0, 0), 1),
+                (at(2023, 12, 31, 0, 0), 1),
+                (at(2024, 1, 15, 0, 0), 1),
+                (at(2024, 2, 29, 0, 0), 1),
+                (at(2024, 3, 1, 0, 0), 2),
+                (at(2024, 12, 30, 0, 0), 1),
+                (at(2025, 1, 1, 0, 0), 1),
+            ],
+        ),
+        // UTC-5: local midnight is 05:00Z; 02:30Z on March 1st is
+        // still February 29th, a UTC midnight is the evening before,
+        // and 23:00Z on 1969-12-31 is the 31st.
+        (
+            "day_eastern",
+            vec![
+                (at(1969, 12, 31, 5, 0), 1),
+                (at(2023, 12, 31, 5, 0), 1),
+                (at(2024, 1, 14, 5, 0), 1),
+                (at(2024, 2, 29, 5, 0), 2),
+                (at(2024, 3, 1, 5, 0), 1),
+                (at(2024, 12, 29, 5, 0), 1),
+                (at(2024, 12, 31, 5, 0), 1),
+            ],
+        ),
+        // ISO weeks begin on Monday.
+        (
+            "week",
+            vec![
+                (at(1969, 12, 29, 0, 0), 1),
+                (at(2023, 12, 25, 0, 0), 1),
+                (at(2024, 1, 15, 0, 0), 1),
+                (at(2024, 2, 26, 0, 0), 3),
+                (at(2024, 12, 30, 0, 0), 2),
+            ],
+        ),
+        (
+            "month",
+            vec![
+                (at(1969, 12, 1, 0, 0), 1),
+                (at(2023, 12, 1, 0, 0), 1),
+                (at(2024, 1, 1, 0, 0), 1),
+                (at(2024, 2, 1, 0, 0), 1),
+                (at(2024, 3, 1, 0, 0), 2),
+                (at(2024, 12, 1, 0, 0), 1),
+                (at(2025, 1, 1, 0, 0), 1),
+            ],
+        ),
+        (
+            "quarter",
+            vec![
+                (at(1969, 10, 1, 0, 0), 1),
+                (at(2023, 10, 1, 0, 0), 1),
+                (at(2024, 1, 1, 0, 0), 4),
+                (at(2024, 10, 1, 0, 0), 1),
+                (at(2025, 1, 1, 0, 0), 1),
+            ],
+        ),
+        (
+            "year",
+            vec![
+                (at(1969, 1, 1, 0, 0), 1),
+                (at(2023, 1, 1, 0, 0), 1),
+                (at(2024, 1, 1, 0, 0), 5),
+                (at(2025, 1, 1, 0, 0), 1),
+            ],
+        ),
+        // UTC+5:30: the local hour begins on the UTC half hour.
+        (
+            "hour_india",
+            vec![
+                (at(1969, 12, 31, 22, 30), 1),
+                (at(2023, 12, 31, 23, 30), 1),
+                (at(2024, 1, 14, 23, 30), 1),
+                (at(2024, 2, 29, 23, 30), 1),
+                (at(2024, 3, 1, 2, 30), 1),
+                (at(2024, 3, 1, 11, 30), 1),
+                (at(2024, 12, 29, 23, 30), 1),
+                (at(2024, 12, 31, 23, 30), 1),
+            ],
+        ),
+        (
+            "minute",
+            vec![
+                (at(1969, 12, 31, 23, 0), 1),
+                (at(2023, 12, 31, 23, 59), 1),
+                (at(2024, 1, 15, 0, 0), 1),
+                (at(2024, 2, 29, 23, 30), 1),
+                (at(2024, 3, 1, 2, 30), 1),
+                (at(2024, 3, 1, 12, 0), 1),
+                (at(2024, 12, 30, 0, 0), 1),
+                (at(2025, 1, 1, 0, 0), 1),
+            ],
+        ),
+    ];
+    assert_eq!(response.histograms.len(), expectations.len());
+    for (result, (name, want)) in response.histograms.iter().zip(&expectations) {
+        assert_eq!(&result.name, name);
+        let got: Vec<(i64, u64)> = result
+            .buckets
+            .iter()
+            .map(|b| (b.lower_int, b.count))
+            .collect();
+        assert_eq!(&got, want, "{name}");
+        for b in &result.buckets {
+            assert_eq!(
+                b.lower, b.lower_int as f64,
+                "{name}: lower mirrors lower_int"
+            );
+        }
+        assert_eq!(result.present, N_DOCS as u64, "{name}");
+        assert_eq!(result.unbucketable, 0, "{name}");
+    }
+    // The same request twice: the same bytes.
+    let again = coordinator
+        .aggregate(Request::new(AggregateRequest {
+            histograms: vec![calendar_hist("week", C::Week, 0)],
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.histograms[0].buckets, response.histograms[2].buckets);
+    for h in handles {
+        h.abort();
+    }
+}
+
+/// The calendar shape's refusals name the histogram and the fix.
+#[tokio::test]
+async fn calendar_histogram_refusals_name_the_spec() {
+    use pipestream_search::pb::CalendarInterval as C;
+    let (coordinator, handles) = start_dated_cluster().await;
+    let run_hist = |spec: HistogramSpec| {
+        coordinator.aggregate(Request::new(AggregateRequest {
+            histograms: vec![spec],
+            ..Default::default()
+        }))
+    };
+    let cases: Vec<(&str, HistogramSpec, &str)> = vec![
+        (
+            "interval with calendar",
+            HistogramSpec {
+                interval: 2.0,
+                ..calendar_hist("h", C::Day, 0)
+            },
+            "fixed interval must be zero",
+        ),
+        (
+            "offset out of range",
+            calendar_hist("h", C::Day, 2000),
+            "outside +-1080",
+        ),
+        (
+            "offset without calendar",
+            HistogramSpec {
+                name: "h".into(),
+                expression: "double(filed)".into(),
+                interval: 1.0,
+                max_buckets: 0,
+                calendar: 0,
+                utc_offset_minutes: 60,
+            },
+            "utc_offset_minutes applies to a calendar histogram",
+        ),
+        (
+            "unknown unit",
+            HistogramSpec {
+                calendar: 99,
+                ..calendar_hist("h", C::Day, 0)
+            },
+            "unknown calendar interval 99",
+        ),
+        (
+            "double expression",
+            HistogramSpec {
+                expression: "double(filed)".into(),
+                ..calendar_hist("h", C::Day, 0)
+            },
+            "epoch micros",
+        ),
+    ];
+    for (label, spec, needle) in cases {
+        let status = run_hist(spec)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{label}: refused"));
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "{label}: {status}"
+        );
+        assert!(
+            status.message().contains("\"h\"") && status.message().contains(needle),
+            "{label}: {} lacks {needle:?}",
+            status.message()
+        );
+    }
+    // The bucket cap applies to calendar buckets as to fixed ones.
+    let status = run_hist(HistogramSpec {
+        max_buckets: 2,
+        ..calendar_hist("h", C::Day, 0)
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(
+        status.message().contains("\"h\" exceeds 2 buckets"),
+        "{status}"
+    );
     for h in handles {
         h.abort();
     }

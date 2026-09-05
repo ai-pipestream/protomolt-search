@@ -5,7 +5,9 @@ VARIANCE / STDDEV of CEL value expressions over the filter-admitted
 document set, per-shard partials merged exactly; group-by-facet
 (every aggregation folded per facet value); fixed-interval
 histograms; and EXACT percentiles (nearest-rank order statistics via
-count-below binary search, never a sketch).
+count-below binary search, never a sketch). Extended 2026-09-05 with
+the same folds over a query's candidate pool (§8), an exact
+CARDINALITY (§9), and calendar date histograms (§10).
 
 `SearchService.Aggregate` is the analytics half of the value layer:
 the same compiled expression language that filters
@@ -155,8 +157,95 @@ namespace with everything else.
 ## 7. What this is not (yet)
 
 No per-group histograms or per-group percentiles, no nested
-grouping. No text-scoped aggregation: the scope is the FILTER's
-admitted set, not a BM25 result set (facet counts already serve the
-search routes). And deliberately no approximate anything: when an
-exact answer needs a different request shape, the refusal says
-which.
+grouping. No aggregation over a sorted lexical leaf's membership
+(§8 names the shapes that do fold). And deliberately no approximate
+anything: when an exact answer needs a different request shape, the
+refusal says which.
+
+## 8. Aggregating a query's pool
+
+`QueryRequest.aggregate` carries the same `AggregateRequest` the
+Aggregate route takes and folds it over the candidate pool the page
+was drawn from, on the public Query route (`docs/query-api.md`). The
+scope is the pool, exactly:
+
+- **A single lexical or dense leaf, a composite (RRF, blend,
+  decomposed, cascade), a scorer pool, a boost pool.** The fold runs
+  over the `selection_k` candidates, the set the page is the top `k`
+  of. Naming an aggregation makes the request a POOLED one: the depth
+  is fixed at `selection_k` (default `k`), paging moves inside it, and
+  a cursor past it refuses with the fix, the same rule a composite or
+  a boost already follows. A hybrid result page therefore shows the
+  facet counts of the candidates it ranked, and page two shows the
+  same counts, bitwise.
+- **Under a collapse** the fold covers the pool before grouping (the
+  documents, not the groups); a collapse over a single leaf that
+  deepens its pool folds over the pool it settled on.
+- **A browse** (a filter-only root, sorted or not) has no pool: its
+  membership is the filter's exact match set, and the fold runs over
+  that set on the shards directly, whatever page was asked for.
+- **A boolean root** aggregates on `BooleanQuery.aggregate` over its
+  exact match set (`docs/query-api.md`); setting
+  `QueryRequest.aggregate` there refuses by name.
+- **A sorted lexical leaf** refuses: its term membership is walked
+  page by page and never held as a set.
+
+`AggregateResponse.matched` is the pool's size (the match set's, for
+a browse). The request's own `filter` and `geo_filters` must be
+empty, because the selection owns membership. Group-by, histograms,
+percentiles, and CARDINALITY all fold over the pool. The fan-out is
+the explicit-id allowlist the boolean root uses, so a pool fold and
+a filter fold over the same documents answer the same bits. The page
+itself is unchanged by the aggregation: same hits, same scores, same
+`executed`. The streaming Query serves the same request through the
+same planner, so its completion carries the aggregate too.
+
+## 9. Cardinality
+
+`AGGREGATE_OP_CARDINALITY` answers the EXACT number of distinct
+values an expression takes over the admitted set, never a HyperLogLog.
+Each shard folds the distinct values it saw and ships them in its
+partial; the coordinator unions them in a deterministic order. The
+cost is the distinct set's size, which is why the op carries a loud
+cap: `Aggregation.max_distinct` (default 100000) refuses on the shard
+that alone exceeds it and again at the merge when the union does,
+naming the aggregation and the fixes (raise the cap, tighten the
+filter). A nonzero `max_distinct` on any other op refuses.
+
+Typing: CARDINALITY admits every type, booleans included (an
+expression like `year > 1993` has at most two values). Strings union
+by dictionary term, so shards with different dictionaries agree.
+Doubles are compared by canonical bits: `-0.0` and `0.0` are one
+value and every NaN payload is one value. Absent rows are not values.
+The count is an int result; an empty selection answers zero, like
+COUNT. CARDINALITY folds per group under `group_by`, each group's
+distinct set unioned across shards on its own.
+
+## 10. Date histograms
+
+`HistogramSpec.calendar` names a calendar unit (MINUTE, HOUR, DAY,
+WEEK, MONTH, QUARTER, YEAR) and buckets an int expression in epoch
+MICROSECONDS, the unit the timestamp column stores
+(`TimestampValue`), at civil boundaries: the first microsecond of the
+minute, hour, day, ISO week (Monday), month, quarter (January, April,
+July, October), or year that holds the value, in the fixed zone
+`utc_offset_minutes` names (zero is UTC; the bound is +-1080). The
+calendar is proleptic Gregorian, computed with exact integer
+arithmetic (`src/calendar.rs`, no calendar dependency); leap years
+and month lengths are what the civil calendar says, before 1970
+included.
+
+A bucket's key IS its start instant: `HistogramBucket.lower_int`
+carries it in micros and `lower` carries the same number as a double.
+Shards fold sparse `(start, count)` maps and the coordinator sums
+counts by start, the merge fixed-interval histograms already use, so
+the answer is bitwise deterministic in shard order. Only occupied
+buckets return, ascending; `max_buckets` caps them loudly as before.
+A value whose bucket start leaves i64 (an instant within hours of the
+representable range's ends) is `unbucketable`, reported, never
+dropped.
+
+Shapes that refuse by name: a calendar with a nonzero `interval`, an
+offset outside the bound, an offset without a calendar, an unknown
+unit, and a double or string expression (convert nothing; name the
+timestamp column).

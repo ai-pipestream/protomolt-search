@@ -314,6 +314,12 @@ Built and tested:
   stable-key routed mapped ingest.
 - Automatic primary-to-replica WAL catch-up with durable per-pair cursors and
   idempotent crash-window reconciliation.
+- Control-plane `SPLIT_SHARD` executed by the node worker
+  (`docs/cluster-control.md`, "Shard split"): the ranged stable split of
+  the source's own WAL, placed children, the live tail, an ingest fence for
+  the final drain, completion with the children as primaries, and the
+  source's retirement — the hitless split runbook above as one durable
+  action rather than three tool invocations.
 
 Deliberately deferred:
 

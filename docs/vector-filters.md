@@ -121,6 +121,13 @@ When the saving needs a number, turbovec's `mask-skip-counter` feature
 exposes `blocks_skipped_by_mask()`; it is feature-gated because the
 per-skip atomic sits in the masked hot loop.
 
+On a segmented shard a third saving comes first: a sealed segment whose
+column summary cannot meet the filter's range predicates is ruled out
+before the allowlist is built, its slots are `false` without a per-row
+evaluation, and its vector image is never opened
+(`docs/segment-pruning.md`). `ShardScanStats.segments_total` and
+`segments_skipped` report it per shard.
+
 ## Routes
 
 | Route | Filters |

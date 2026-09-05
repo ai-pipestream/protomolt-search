@@ -150,6 +150,7 @@ fn principals() -> Arc<Principals> {
                 max_k: 5,
                 concurrency: 1,
                 ingest_docs_per_sec: 2,
+                admin: false,
             },
             PrincipalConfig {
                 name: "batch".into(),

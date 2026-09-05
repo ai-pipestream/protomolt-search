@@ -39,7 +39,9 @@ The cap is the contract: `max_expansions` (default 128, at most 1024). A
 prefix that expands past it on any shard, or in the union, is
 `INVALID_ARGUMENT` naming the count. The engine never truncates a prefix
 to a quieter match set, and it never linear-scans a dictionary to serve
-one. Wildcard and fuzzy matching remain deliberately absent.
+one. Wildcard matching remains deliberately absent; fuzzy matching is
+served as did-you-mean over the same bounded scan (`docs/synonyms.md`),
+never as a query term.
 
 Prefixes on a composite strategy, a boolean clause, a boost, or a
 `PhraseSearch` field refuse by name, as does a top-level prefix list on a

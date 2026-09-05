@@ -32,7 +32,57 @@ pub struct SegmentArtifact {
     pub sha256: String,
 }
 
+/// One column's range over a sealed segment: the least and greatest
+/// stored value and how many rows carry one. A segment whose range
+/// cannot intersect a request's predicate holds no row that passes it,
+/// so a planner may leave the segment unopened without changing the
+/// answer (docs/immutable-segments.md "Segment summaries").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntColumnSummary {
+    pub name: String,
+    pub min: i64,
+    pub max: i64,
+    pub present: u64,
+}
+
+/// [`IntColumnSummary`] for a double column.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NumericColumnSummary {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+    pub present: u64,
+}
+
+/// The value range a partitioned compaction gave this segment
+/// (docs/immutable-segments.md "Partitioned layout"): every row that
+/// carries `column` has a value in `lo..=hi`, and the segments of one
+/// set cover disjoint ascending ranges. Absent on a bucket-layout
+/// segment and on the unkeyed segment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartitionRange {
+    pub column: String,
+    pub lo: i64,
+    pub hi: i64,
+}
+
+/// Per-segment column ranges, written at seal time from the sealed
+/// BM25 image. Columns with no stored value in the segment are listed
+/// with `present == 0` and a `min > max` placeholder range: the full
+/// integer range inverted, and for doubles `f64::MAX` over `f64::MIN`
+/// (JSON has no infinities, so those are the placeholders that read
+/// back).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SegmentSummary {
+    #[serde(default)]
+    pub int_columns: Vec<IntColumnSummary>,
+    #[serde(default)]
+    pub numeric_columns: Vec<NumericColumnSummary>,
+    #[serde(default)]
+    pub partition: Option<PartitionRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentMetadata {
     pub segment_id: String,
     pub generation: u64,
@@ -48,6 +98,10 @@ pub struct SegmentMetadata {
     pub exact_vectors: SegmentArtifact,
     pub bm25: SegmentArtifact,
     pub live_docs: SegmentArtifact,
+    /// Absent on segments sealed before summaries existed; such a
+    /// segment is never pruned.
+    #[serde(default)]
+    pub summary: Option<SegmentSummary>,
 }
 
 impl SegmentMetadata {
@@ -58,11 +112,18 @@ impl SegmentMetadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentSetManifest {
     pub format: u32,
     pub epoch: u64,
     pub segments: Vec<SegmentMetadata>,
+    /// The integer column a partitioned compaction ordered this set by
+    /// (docs/immutable-segments.md "Partitioned layout"); absent for the
+    /// bucket layout. A later seal appends an unordered tail segment
+    /// and leaves the key in place: the ordered segments keep their
+    /// ranges, and the next partitioned compaction folds the tail in.
+    #[serde(default)]
+    pub partition_key: Option<String>,
 }
 
 impl Default for SegmentSetManifest {
@@ -71,6 +132,7 @@ impl Default for SegmentSetManifest {
             format: SET_FORMAT,
             epoch: 0,
             segments: Vec::new(),
+            partition_key: None,
         }
     }
 }
@@ -86,6 +148,11 @@ pub struct SegmentSource<'a> {
     pub exact_vector_path: Option<&'a Path>,
     pub bm25_path: &'a Path,
     pub live_docs_path: &'a Path,
+    /// The integer column a partitioned compaction ordered this segment
+    /// by (docs/immutable-segments.md "Partitioned layout"): the sealed
+    /// summary then records the segment's value range as its partition.
+    /// `None` for a tail seal and for the bucket layout.
+    pub partition_column: Option<&'a str>,
 }
 
 /// The artifact record of an artifact a segment does not have.
@@ -744,7 +811,7 @@ impl SegmentCatalog {
         input_ids: &[String],
         source: SegmentSource<'_>,
     ) -> Result<Arc<OpenedSegmentSet>, String> {
-        self.replace_many_for_compaction(input_ids, vec![source])
+        self.replace_many_for_compaction(input_ids, vec![source], None)
     }
 
     /// Atomically replace compacted inputs with one or more dense immutable
@@ -756,6 +823,7 @@ impl SegmentCatalog {
         &self,
         input_ids: &[String],
         sources: Vec<SegmentSource<'_>>,
+        partition_key: Option<String>,
     ) -> Result<Arc<OpenedSegmentSet>, String> {
         let _guard = self
             .update
@@ -845,6 +913,7 @@ impl SegmentCatalog {
             .retain(|segment| !wanted.contains(segment.segment_id.as_str()));
         manifest.segments.extend(outputs.iter().cloned());
         manifest.segments.sort_by_key(|segment| segment.base_label);
+        manifest.partition_key = partition_key;
         let published = self.publish(manifest);
         if published.is_err() {
             cleanup_staged(&self.root, &outputs);
@@ -866,6 +935,7 @@ impl SegmentCatalog {
         slot_base: u64,
         slot_capacity: u64,
         bm25_fields: Option<&[String]>,
+        partition: Option<crate::reshard::PartitionSpec<'_>>,
         analyze: &mut crate::reshard::Analyzer,
     ) -> Result<WalCompactionResult, String> {
         if work_dir.exists()
@@ -881,16 +951,47 @@ impl SegmentCatalog {
                 work_dir.display()
             ));
         }
-        let output = crate::reshard::split_logs_segmented(
-            generations,
-            1,
-            work_dir,
-            slot_base,
-            slot_capacity,
-            false,
-            bm25_fields,
-            analyze,
-        )?;
+        let output = match partition {
+            None => crate::reshard::split_logs_segmented(
+                generations,
+                1,
+                work_dir,
+                slot_base,
+                slot_capacity,
+                false,
+                bm25_fields,
+                analyze,
+            )?,
+            Some(spec) => {
+                let [gen] = generations else {
+                    return Err(format!(
+                        "a partitioned compaction takes one WAL generation, not {}",
+                        generations.len()
+                    ));
+                };
+                let mut sink = |_row: crate::reshard::CompactedRow<'_>| Ok(());
+                let build = crate::reshard::compact_log_partitioned(
+                    gen,
+                    u64::MAX,
+                    work_dir,
+                    spec,
+                    bm25_fields,
+                    None,
+                    None,
+                    analyze,
+                    &mut sink,
+                )?;
+                let images: Vec<crate::reshard::ChildImage> = build
+                    .images
+                    .into_iter()
+                    .map(|mut image| {
+                        image.slot_offset += slot_base;
+                        image
+                    })
+                    .collect();
+                crate::reshard::SegmentedReshardOutput::from_images(build.generation, images)
+            }
+        };
         if output.segments.is_empty() {
             return Err("compaction produced no live segments".into());
         }
@@ -942,9 +1043,14 @@ impl SegmentCatalog {
                 exact_vector_path: Some(&segment.image.exact_vector_path),
                 bm25_path: segment.image.bm25_path.as_deref().expect("validated above"),
                 live_docs_path,
+                partition_column: partition.map(|spec| spec.column),
             })
             .collect();
-        let snapshot = self.replace_many_for_compaction(input_ids, sources)?;
+        let snapshot = self.replace_many_for_compaction(
+            input_ids,
+            sources,
+            partition.map(|spec| spec.column.to_string()),
+        )?;
         Ok(WalCompactionResult { snapshot, output })
     }
 
@@ -1250,6 +1356,21 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
             exact_vectors: exact_artifact,
             bm25: bm25_artifact,
             live_docs: live_artifact,
+            summary: Some({
+                let mut summary = summarize_columns(&bm25, rows as u32);
+                summary.partition = source.partition_column.and_then(|column| {
+                    summary
+                        .int_columns
+                        .iter()
+                        .find(|c| c.name == column && c.present > 0)
+                        .map(|c| PartitionRange {
+                            column: column.to_string(),
+                            lo: c.min,
+                            hi: c.max,
+                        })
+                });
+                summary
+            }),
         };
         write_json_atomic(&temp_dir.join(SEGMENT_META_FILE), &metadata)?;
         std::fs::File::open(&temp_dir)
@@ -1310,6 +1431,61 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> 
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync {}: {error}", parent.display()))
+}
+
+/// The column ranges of a sealed BM25 image, over every stored row
+/// (deleted rows included: a range over a superset is still sound for
+/// pruning, and the live bitmap keeps changing after the seal).
+pub(crate) fn summarize_columns(bm25: &Bm25Reader, rows: u32) -> SegmentSummary {
+    let int_columns = (0..bm25.integer_count())
+        .map(|ii| {
+            let mut present = 0u64;
+            let mut min = i64::MAX;
+            let mut max = i64::MIN;
+            for doc in 0..rows {
+                if let Some(value) = bm25.integer_value(ii, doc) {
+                    present += 1;
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+            }
+            IntColumnSummary {
+                name: bm25.integer_name(ii).to_string(),
+                min,
+                max,
+                present,
+            }
+        })
+        .collect();
+    let numeric_columns = (0..bm25.numeric_count())
+        .map(|ni| {
+            let mut present = 0u64;
+            let mut min = f64::MAX;
+            let mut max = f64::MIN;
+            for doc in 0..rows {
+                if let Some(value) = bm25.numeric_value(ni, doc) {
+                    present += 1;
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+            }
+            if present == 0 {
+                min = f64::MAX;
+                max = f64::MIN;
+            }
+            NumericColumnSummary {
+                name: bm25.numeric_name(ni).to_string(),
+                min,
+                max,
+                present,
+            }
+        })
+        .collect();
+    SegmentSummary {
+        int_columns,
+        numeric_columns,
+        partition: None,
+    }
 }
 
 #[cfg(test)]
@@ -1401,6 +1577,7 @@ mod tests {
             exact_vector_path: Some(&fixture.exact),
             bm25_path: &fixture.bm25,
             live_docs_path: &fixture.live_docs,
+            partition_column: None,
         }
     }
 
@@ -1511,6 +1688,7 @@ mod tests {
                     source_generation(&output_a, "out-a", 100, 2),
                     source_generation(&output_b, "out-b", 102, 2),
                 ],
+                None,
             )
             .unwrap();
         assert_eq!(before.manifest().segments.len(), 2);

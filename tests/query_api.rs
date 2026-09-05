@@ -13,13 +13,14 @@ use pipestream_search::pb::{
     aggregate_result, query_stream_response, search_query, selection_query,
     selection_score_strategy, AddDocumentsRequest, AddVectorsRequest, AggregateOp,
     AggregateRequest, Aggregation, Bm25SearchRequest, BooleanQuery, BoostQuery, BoostRescore,
-    CascadeScore, CompositeScorer, CompositeSearchStrategy, DecomposedScore,
+    CascadeScore, CollapseSpec, CompositeScorer, CompositeSearchStrategy, DecomposedScore,
     DeleteDocumentsRequest, DenseExecutionMode, DenseQualityPolicy, DenseQuery, DenseScoreMode,
-    FilterQuery, FlushRequest, FusionMode, HealthRequest, HybridLegOptions, HybridSearchRequest,
-    IntegerValue, LexicalQuery, QueryRequest, QueryResponse, QuerySort, QueryStreamCompletion,
-    QueryStreamPhase, QueryStreamRequest, QueryStreamResponse, QueryStreamRevision, RrfScore,
-    ScoreOp, ScoreStage, SearchQuery, SearchRequest, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, SetCalibrationRequest, VectorQualityContract,
+    DocLineage, FacetValue, FilterQuery, FlushRequest, FusionMode, HealthRequest, HybridLegOptions,
+    HybridSearchRequest, IntegerValue, LexicalQuery, QueryRequest, QueryResponse, QuerySort,
+    QueryStreamCompletion, QueryStreamPhase, QueryStreamRequest, QueryStreamResponse,
+    QueryStreamRevision, RrfScore, ScoreOp, ScoreStage, SearchQuery, SearchRequest,
+    SelectionOperator, SelectionQuery, SelectionScoreStrategy, SetCalibrationRequest,
+    VectorQualityContract,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,6 +33,7 @@ use prost::Message;
 const DIM: usize = 64;
 const SHARD_DOCS: usize = 4;
 const N_DOCS: usize = 2 * SHARD_DOCS;
+const COURTS: [&str; 3] = ["ca9", "ca2", "scotus"];
 
 /// Corpus: doc i's text mentions "zebra" for even i, and every doc
 /// carries `year = i` for filters. Vectors are the seeded unit corpus;
@@ -83,6 +85,7 @@ async fn start_cluster_with_identities(
             slot_offset: (shard * SHARD_DOCS) as u64,
             analysis_addr: Some(analysis.clone()),
             integer_fields: vec!["year".into()],
+            facet_fields: vec!["court".into()],
             ..Default::default()
         })
         .await;
@@ -118,6 +121,19 @@ async fn start_cluster_with_identities(
                     field: "year".into(),
                     value: id as i64,
                 }],
+                // A facet column and lineage for the sort and collapse
+                // tests: three courts round-robin, parents in pairs,
+                // groups in fours.
+                facets: vec![FacetValue {
+                    field: "court".into(),
+                    value: COURTS[id % 3].into(),
+                }],
+                lineage: Some(DocLineage {
+                    parent_id: (id / 2) as u64,
+                    group_id: (id / 4) as u64,
+                    span_start: 0,
+                    span_end: 0,
+                }),
                 ..Default::default()
             })
             .await
@@ -147,6 +163,7 @@ async fn start_cluster_with_identities(
 async fn lexical_results_preserve_imported_identity_through_public_and_streamed_queries() {
     let ((coordinator, _, handles), addrs) = start_cluster_with_identities(true).await;
     let request = QueryRequest {
+        explain: true,
         k: N_DOCS as u32,
         selection: Some(lexical_leaf("lex", "document")),
         ..Default::default()
@@ -156,6 +173,7 @@ async fn lexical_results_preserve_imported_identity_through_public_and_streamed_
         for fused in [false, true] {
             let lexical = coordinator
                 .bm25_search(Request::new(Bm25SearchRequest {
+                    explain: true,
                     text: "document".into(),
                     k: N_DOCS as u32,
                     fields: if fused {
@@ -174,20 +192,32 @@ async fn lexical_results_preserve_imported_identity_through_public_and_streamed_
             assert_eq!(lexical.hits.len(), N_DOCS);
             for hit in &lexical.hits {
                 assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+                assert!(hit.explain.is_some());
             }
         }
         let response = query(&coordinator, request.clone()).await.unwrap();
         assert_eq!(response.hits.len(), N_DOCS);
         for hit in &response.hits {
             assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+            assert!(hit.explain.is_some());
         }
     }
-    let events = streamed_query(&coordinator, Some(request), 0).await;
+    // Explain remains unary-only; the stream still carries terminal identity.
+    let events = streamed_query(
+        &coordinator,
+        Some(QueryRequest {
+            explain: false,
+            ..request
+        }),
+        0,
+    )
+    .await;
     let (_, completion) = stream_parts(&events);
     let response = completion.response.as_ref().unwrap();
     assert_eq!(response.hits.len(), N_DOCS);
     for hit in &response.hits {
         assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+        assert!(hit.explain.is_none());
     }
     for addr in addrs {
         let rescored = NodeServiceClient::connect(addr)
@@ -1124,6 +1154,7 @@ async fn recursive_boolean_is_exact_across_hybrid_signals_filters_aggregation_an
                     name: "year_sum".into(),
                     expression: "year".into(),
                     op: AggregateOp::Sum as i32,
+                    max_distinct: 0,
                 }],
                 ..Default::default()
             }),
@@ -1323,6 +1354,7 @@ async fn an_empty_boolean_match_set_has_an_empty_aggregate() {
                         name: "count".into(),
                         expression: "year".into(),
                         op: AggregateOp::Count as i32,
+                        max_distinct: 0,
                     }],
                     ..Default::default()
                 }),
@@ -1620,11 +1652,9 @@ async fn browse_refuses_an_unknown_column_by_name() {
 async fn sorted_browse_orders_by_column_and_pages() {
     let (coordinator, _qvec, _handles) = start_cluster().await;
     let selection = || cel_filter("f", "year >= 1");
-    let sort = || {
-        Some(QuerySort {
-            column: "year".into(),
-            descending: true,
-        })
+    let by = |column: &str, descending: bool| QuerySort {
+        column: column.into(),
+        descending,
     };
 
     let full = query(
@@ -1632,7 +1662,7 @@ async fn sorted_browse_orders_by_column_and_pages() {
         QueryRequest {
             k: 10,
             selection: Some(selection()),
-            sort: sort(),
+            sort: vec![by("year", true)],
             ..Default::default()
         },
     )
@@ -1647,6 +1677,13 @@ async fn sorted_browse_orders_by_column_and_pages() {
             .collect::<Vec<_>>(),
         "newest first, and the sort key is reported"
     );
+    assert_eq!(
+        full.hits[0].sort_values,
+        vec![pipestream_search::pb::SortValue {
+            value: Some(pipestream_search::pb::sort_value::Value::Integer(7))
+        }],
+        "the typed value rides alongside"
+    );
 
     // Ascending, paged: stitches into the ascending order.
     let mut stitched = Vec::new();
@@ -1657,10 +1694,7 @@ async fn sorted_browse_orders_by_column_and_pages() {
             QueryRequest {
                 k: 3,
                 selection: Some(selection()),
-                sort: Some(QuerySort {
-                    column: "year".into(),
-                    descending: false,
-                }),
+                sort: vec![by("year", false)],
                 cursor: cursor.clone(),
                 ..Default::default()
             },
@@ -1671,7 +1705,7 @@ async fn sorted_browse_orders_by_column_and_pages() {
         if resp.next_cursor.is_empty() {
             break;
         }
-        assert!(resp.next_cursor.starts_with("tvqs1:"), "sorted token");
+        assert!(resp.next_cursor.starts_with("tvqs2:"), "sorted token");
         cursor = resp.next_cursor;
     }
     assert_eq!(
@@ -1680,16 +1714,13 @@ async fn sorted_browse_orders_by_column_and_pages() {
         "sorted pages stitch with continuing ranks"
     );
 
-    // Refusals: unknown sort column by name; sort on a scored shape.
+    // Refusals: unknown sort column by name; sort on a dense shape.
     let err = query(
         &coordinator,
         QueryRequest {
             k: 5,
             selection: Some(selection()),
-            sort: Some(QuerySort {
-                column: "yaer".into(),
-                descending: false,
-            }),
+            sort: vec![by("yaer", false)],
             ..Default::default()
         },
     )
@@ -1700,15 +1731,498 @@ async fn sorted_browse_orders_by_column_and_pages() {
         &coordinator,
         QueryRequest {
             k: 5,
-            selection: Some(lexical_leaf("lex", "zebra")),
-            sort: sort(),
+            selection: Some(dense_leaf("d", &_qvec)),
+            sort: vec![by("year", true)],
             ..Default::default()
         },
     )
     .await
     .unwrap_err();
     assert!(
-        err.message().contains("pruning certificate"),
+        err.message().contains("no membership to order"),
+        "{}",
+        err.message()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_key_sort_orders_text_then_number_and_pages() {
+    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let by = |column: &str, descending: bool| QuerySort {
+        column: column.into(),
+        descending,
+    };
+    // court ascending (ca2 < ca9 < scotus), then year descending.
+    let expected: Vec<(u64, &str)> = vec![
+        (7, "ca2"),
+        (4, "ca2"),
+        (1, "ca2"),
+        (6, "ca9"),
+        (3, "ca9"),
+        (0, "ca9"),
+        (5, "scotus"),
+        (2, "scotus"),
+    ];
+    let full = query(
+        &coordinator,
+        QueryRequest {
+            k: 10,
+            selection: Some(cel_filter("f", "year >= 0")),
+            sort: vec![by("court", false), by("year", true)],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let got: Vec<(u64, String)> = full
+        .hits
+        .iter()
+        .map(|h| {
+            let text = match h.sort_values[0].value.as_ref().unwrap() {
+                pipestream_search::pb::sort_value::Value::Text(t) => t.clone(),
+                other => panic!("{other:?}"),
+            };
+            (h.doc_id, text)
+        })
+        .collect();
+    assert_eq!(
+        got,
+        expected
+            .iter()
+            .map(|(id, c)| (*id, c.to_string()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        full.hits[0].sort_key, 0.0,
+        "a text first key has no numeric view"
+    );
+
+    // Text descending reverses the court order and keeps the year order.
+    let reversed = query(
+        &coordinator,
+        QueryRequest {
+            k: 10,
+            selection: Some(cel_filter("f", "year >= 0")),
+            sort: vec![by("court", true), by("year", true)],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ids: Vec<u64> = reversed.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(ids, vec![5, 2, 6, 3, 0, 7, 4, 1]);
+
+    // Paged by 3 with a text boundary in the cursor: stitches exactly.
+    let mut stitched = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let resp = query(
+            &coordinator,
+            QueryRequest {
+                k: 3,
+                selection: Some(cel_filter("f", "year >= 0")),
+                sort: vec![by("court", false), by("year", true)],
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        stitched.extend(resp.hits.iter().map(|h| h.doc_id));
+        if resp.next_cursor.is_empty() {
+            break;
+        }
+        cursor = resp.next_cursor;
+    }
+    assert_eq!(
+        stitched,
+        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+
+    // A lineage key sorts too: parent_id descending, then id.
+    let parents = query(
+        &coordinator,
+        QueryRequest {
+            k: 10,
+            selection: Some(cel_filter("f", "year >= 0")),
+            sort: vec![by("parent_id", true)],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ids: Vec<u64> = parents.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(ids, vec![6, 7, 4, 5, 2, 3, 0, 1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lexical_leaf_sorts_its_exact_membership_without_scores() {
+    let (coordinator, _qvec, _handles) = start_cluster().await;
+    // "zebra" matches the even ids; year descending orders them 6,4,2,0.
+    let resp = query(
+        &coordinator,
+        QueryRequest {
+            k: 10,
+            selection: Some(lexical_leaf("lex", "zebra")),
+            sort: vec![QuerySort {
+                column: "year".into(),
+                descending: true,
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ids: Vec<u64> = resp.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(ids, vec![6, 4, 2, 0]);
+    assert!(
+        resp.hits.iter().all(|h| h.score == 0.0),
+        "no relevance is computed"
+    );
+    assert_eq!(resp.hits[0].matched, vec!["lex".to_string()]);
+    assert_eq!(resp.executed, "browse_shard:lexical");
+
+    // With a filter: the membership is the AND of the leaf and the filter.
+    let resp = query(
+        &coordinator,
+        QueryRequest {
+            k: 10,
+            selection: Some(composite(
+                SelectionOperator::And,
+                vec![lexical_leaf("lex", "zebra"), cel_filter("f", "year >= 3")],
+                None,
+            )),
+            sort: vec![QuerySort {
+                column: "year".into(),
+                descending: false,
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ids: Vec<u64> = resp.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(ids, vec![4, 6]);
+    assert_eq!(
+        resp.hits[0].matched,
+        vec!["lex".to_string(), "f".to_string()]
+    );
+
+    // Paged by 1, stitching through the sorted lexical membership.
+    let mut stitched = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let resp = query(
+            &coordinator,
+            QueryRequest {
+                k: 1,
+                selection: Some(lexical_leaf("lex", "zebra")),
+                sort: vec![QuerySort {
+                    column: "year".into(),
+                    descending: true,
+                }],
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        stitched.extend(resp.hits.iter().map(|h| (h.doc_id, h.rank)));
+        if resp.next_cursor.is_empty() {
+            break;
+        }
+        cursor = resp.next_cursor;
+    }
+    assert_eq!(stitched, vec![(6, 1), (4, 2), (2, 3), (0, 4)]);
+
+    // A relevance shape on the sorted leaf refuses by name.
+    let mut phrase = lexical_leaf("lex", "zebra document");
+    if let Some(selection_query::Node::Search(SearchQuery {
+        query: Some(search_query::Query::Lexical(q)),
+        ..
+    })) = phrase.node.as_mut()
+    {
+        q.phrase = Some(pipestream_search::pb::PhraseMatch::default());
+    }
+    let err = query(
+        &coordinator,
+        QueryRequest {
+            k: 5,
+            selection: Some(phrase),
+            sort: vec![QuerySort {
+                column: "year".into(),
+                descending: true,
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.message().contains("a phrase"), "{}", err.message());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collapse_groups_the_pool_by_key_with_inner_hits_and_pages() {
+    let (coordinator, qvec, _handles) = start_cluster().await;
+    let collapse = |column: &str, inner_hits: u32| {
+        Some(CollapseSpec {
+            column: column.into(),
+            inner_hits,
+        })
+    };
+    // The uncollapsed dense order over the whole corpus is the oracle:
+    // groups appear in the order of their best hit.
+    let full = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection: Some(dense_leaf("d", &qvec)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(full.hits.len(), 8);
+    let mut expected_groups: Vec<(u64, Vec<u64>)> = Vec::new();
+    for h in &full.hits {
+        let parent = h.doc_id / 2;
+        match expected_groups.iter_mut().find(|(p, _)| *p == parent) {
+            Some((_, members)) => members.push(h.doc_id),
+            None => expected_groups.push((parent, vec![h.doc_id])),
+        }
+    }
+    assert_eq!(expected_groups.len(), 4);
+
+    // k = 2 groups by parent over a single dense leaf: the pool deepens
+    // from k until two parents show, and the representatives are the
+    // groups' best hits in relevance order.
+    let resp = query(
+        &coordinator,
+        QueryRequest {
+            k: 2,
+            selection: Some(dense_leaf("d", &qvec)),
+            collapse: collapse("parent_id", 2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.executed, "search+collapse");
+    let reps: Vec<u64> = resp.hits.iter().map(|h| h.doc_id).collect();
+    assert_eq!(
+        reps,
+        expected_groups
+            .iter()
+            .take(2)
+            .map(|(_, m)| m[0])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(resp.groups.len(), 2);
+    for (i, (group, (parent, _))) in resp.groups.iter().zip(&expected_groups).enumerate() {
+        assert_eq!(
+            group.key,
+            Some(pipestream_search::pb::SortValue {
+                value: Some(pipestream_search::pb::sort_value::Value::Integer(
+                    *parent as i64
+                ))
+            })
+        );
+        assert!(group.hits.len() <= 2 && !group.hits.is_empty());
+        assert_eq!(
+            group.hits[0].doc_id, reps[i],
+            "the representative leads its group"
+        );
+        assert_eq!(group.hits[0].rank, 1, "ranks count within the group");
+        assert!(group.hits.iter().all(|h| h.doc_id / 2 == *parent));
+    }
+
+    // A pool deeper than the corpus comes back short, which is the proof
+    // that every group is complete; a pool exactly the corpus's size
+    // cannot tell the end from a cut and reports incomplete groups.
+    let resp = query(
+        &coordinator,
+        QueryRequest {
+            k: 4,
+            selection_k: 8,
+            selection: Some(dense_leaf("d", &qvec)),
+            collapse: collapse("parent_id", 3),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        resp.groups.iter().all(|g| !g.complete),
+        "a full pool proves nothing about what follows"
+    );
+    let resp = query(
+        &coordinator,
+        QueryRequest {
+            k: 4,
+            selection_k: 16,
+            selection: Some(dense_leaf("d", &qvec)),
+            collapse: collapse("parent_id", 3),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.hits.len(), 4);
+    for (group, (parent, members)) in resp.groups.iter().zip(&expected_groups) {
+        let listed: Vec<u64> = group.hits.iter().map(|h| h.doc_id).collect();
+        assert_eq!(&listed, members, "parent {parent}");
+        assert_eq!(group.pool_hits, 2);
+        assert!(group.complete, "the pool reached the end of the corpus");
+    }
+
+    // Paging by one group stitches into the full group order.
+    let mut stitched = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let resp = query(
+            &coordinator,
+            QueryRequest {
+                k: 1,
+                selection: Some(dense_leaf("d", &qvec)),
+                collapse: collapse("parent_id", 0),
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        stitched.extend(resp.hits.iter().map(|h| (h.doc_id, h.rank)));
+        assert!(resp.groups.iter().all(|g| g.hits.len() == 1));
+        if resp.next_cursor.is_empty() {
+            break;
+        }
+        cursor = resp.next_cursor;
+    }
+    assert_eq!(
+        stitched,
+        expected_groups
+            .iter()
+            .enumerate()
+            .map(|(i, (_, m))| (m[0], (i + 1) as u32))
+            .collect::<Vec<_>>()
+    );
+
+    // A facet key on a lexical leaf: "document" matches everything, so
+    // the groups are the three courts in the order of their best hit.
+    let lexical_full = query(
+        &coordinator,
+        QueryRequest {
+            k: 8,
+            selection: Some(lexical_leaf("lex", "document")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut courts_in_order: Vec<&str> = Vec::new();
+    for h in &lexical_full.hits {
+        let court = COURTS[h.doc_id as usize % 3];
+        if !courts_in_order.contains(&court) {
+            courts_in_order.push(court);
+        }
+    }
+    let resp = query(
+        &coordinator,
+        QueryRequest {
+            k: 3,
+            selection: Some(lexical_leaf("lex", "document")),
+            collapse: collapse("court", 1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let keys: Vec<String> = resp
+        .groups
+        .iter()
+        .map(|g| match g.key.as_ref().unwrap().value.as_ref().unwrap() {
+            pipestream_search::pb::sort_value::Value::Text(t) => t.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(keys, courts_in_order);
+    assert_eq!(resp.executed, "bm25_search+collapse");
+
+    // A composite is a fixed pool: selection_k = 8 holds every parent;
+    // a filtered pool of four hits that all share one lineage group
+    // cannot show two groups and refuses naming selection_k.
+    let composite_of = |selection_k: u32, k: u32, column: &str, filter: Option<SelectionQuery>| {
+        let fused = composite(
+            SelectionOperator::Or,
+            vec![dense_leaf("d", &qvec), lexical_leaf("lex", "document")],
+            Some(selection_score_strategy::Strategy::Rrf(RrfScore::default())),
+        );
+        QueryRequest {
+            k,
+            selection_k,
+            selection: Some(match filter {
+                Some(f) => composite(SelectionOperator::And, vec![fused, f], None),
+                None => fused,
+            }),
+            collapse: collapse(column, 2),
+            ..Default::default()
+        }
+    };
+    let resp = query(&coordinator, composite_of(8, 4, "parent_id", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.hits.len(), 4);
+    assert_eq!(resp.groups.len(), 4);
+    assert_eq!(resp.executed, "hybrid_search:global_rank+collapse");
+    let err = query(
+        &coordinator,
+        composite_of(4, 2, "group_id", Some(cel_filter("f", "year < 4"))),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "{}",
+        err.message()
+    );
+    assert!(err.message().contains("selection_k"), "{}", err.message());
+
+    // Refusals by name: a browse has no order to collapse by; collapse
+    // and sort do not combine.
+    let err = query(
+        &coordinator,
+        QueryRequest {
+            k: 3,
+            selection: Some(cel_filter("f", "year >= 0")),
+            collapse: collapse("court", 1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.message().contains("SCORED selection"),
+        "{}",
+        err.message()
+    );
+    let err = query(
+        &coordinator,
+        QueryRequest {
+            k: 3,
+            selection: Some(lexical_leaf("lex", "document")),
+            collapse: collapse("court", 1),
+            sort: vec![QuerySort {
+                column: "year".into(),
+                descending: true,
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.message().contains("do not combine"),
         "{}",
         err.message()
     );

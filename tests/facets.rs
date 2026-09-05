@@ -326,6 +326,8 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
         b: 0.0,
         phrase: None,
         prefixes: Vec::new(),
+        synonyms: Vec::new(),
+        synonyms_off: false,
     }];
     let (fused_hits, fused_facets, _) = coordinator
         .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[], &[], &[], None)
@@ -352,6 +354,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -370,6 +373,8 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         }),
     )
     .await
@@ -383,6 +388,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -401,6 +407,8 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             cardinality_fields: Vec::new(),
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         }),
     )
     .await
@@ -497,6 +505,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     // come from the mmapped ords column.
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            explain: false,
             highlight: None,
             projections: Vec::new(),
             filter: None,

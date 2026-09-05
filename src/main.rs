@@ -229,6 +229,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 chunk_blocks: cfg.chunk_blocks,
                 share_floors: cfg.share_floors,
                 block_max: cfg.block_max,
+                segment_pruning: cfg.segment_pruning,
                 coalesce: cfg.coalesce,
                 scan_parallel: cfg.scan_parallel,
                 rerank_parallel: cfg.rerank_parallel,
@@ -285,11 +286,13 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             let max = cfg.max_message_bytes;
             let mut shutdown = shutdown_rx.clone();
+            let diagnostics = node.diagnostics_server(max);
             handles.push(tokio::spawn(
                 secured_server(cfg.tls.as_ref(), true)?
                     .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                     .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                     .add_service(NodeServiceImpl::into_server(node, max))
+                    .add_service(diagnostics)
                     .serve_with_incoming_shutdown(
                         harness::nodelay_incoming(listener),
                         async move {
@@ -318,6 +321,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             chunk_blocks: cfg.chunk_blocks,
             share_floors: cfg.share_floors,
             block_max: cfg.block_max,
+            segment_pruning: cfg.segment_pruning,
             coalesce: cfg.coalesce,
             scan_parallel: cfg.scan_parallel,
             rerank_parallel: cfg.rerank_parallel,
@@ -434,12 +438,21 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             build_collections(&cfg, &phrase_index, &shutdown_rx, &mut handles, addr).await?;
         let max = cfg.max_message_bytes;
         let mut shutdown = shutdown_rx.clone();
+        let gauges: Vec<pipestream_search::metrics::GaugeProvider> = node_services
+            .iter()
+            .map(|node| node.metrics_provider())
+            .collect();
+        let diagnostics = search_set
+            .diagnostics()
+            .with_gauges(gauges)
+            .into_server(max);
         handles.push(tokio::spawn(
             secured_server(cfg.tls.as_ref(), false)?
                 .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                 .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                 .add_optional_service(control_set.map(|set| set.into_server(max)))
                 .add_service(search_set.into_server(max))
+                .add_service(diagnostics)
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;
                 }),
@@ -609,6 +622,7 @@ struct CorpusSpec<'a> {
     bm25_k1: f32,
     bm25_b: f32,
     dense_quality_profile: Option<&'a Path>,
+    synonyms: Option<&'a Path>,
     dense_execution_policy: Option<&'a Path>,
     replica_state_path: Option<&'a Path>,
     control_state_path: Option<&'a Path>,
@@ -662,6 +676,11 @@ async fn build_corpus(
             profile.measured_queries()
         );
         coordinator = coordinator.with_dense_quality_profile(profile);
+    }
+    if let Some(path) = dataset.synonyms {
+        let table = pipestream_search::synonyms::SynonymTable::load(path)?;
+        eprintln!("synonyms: {} ({} rules)", path.display(), table.len());
+        coordinator = coordinator.with_synonyms(table);
     }
     if let Some(path) = dataset.dense_execution_policy {
         let policy = pipestream_search::dense_policy::DenseExecutionPolicy::load(path)?;
@@ -895,6 +914,7 @@ async fn build_collections(
                 bm25_k1: cfg.bm25_k1,
                 bm25_b: cfg.bm25_b,
                 dense_quality_profile: cfg.dense_quality_profile.as_deref(),
+                synonyms: cfg.synonyms.as_deref(),
                 dense_execution_policy: cfg.dense_execution_policy.as_deref(),
                 replica_state_path: cfg.replica_state_path.as_deref(),
                 control_state_path: cfg.control_state_path.as_deref(),
@@ -931,6 +951,7 @@ async fn build_collections(
                     bm25_k1: c.bm25_k1,
                     bm25_b: c.bm25_b,
                     dense_quality_profile: c.dense_quality_profile.as_deref(),
+                    synonyms: c.synonyms.as_deref(),
                     dense_execution_policy: c.dense_execution_policy.as_deref(),
                     replica_state_path: c.replica_state_path.as_deref(),
                     control_state_path: c.control_state_path.as_deref(),

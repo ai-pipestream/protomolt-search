@@ -163,6 +163,7 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         .unwrap()
         .into_inner();
     let request = |claim: u64| Bm25QueryRequest {
+        explain: false,
         highlight: None,
         projections: Vec::new(),
         filter: None,
@@ -385,6 +386,8 @@ async fn fused_repeated_query_reuses_cached_stats() {
             b: 0.0,
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         },
         QueryField {
             field: "case_name".to_string(),
@@ -394,6 +397,8 @@ async fn fused_repeated_query_reuses_cached_stats() {
             b: 0.0,
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         },
     ];
 

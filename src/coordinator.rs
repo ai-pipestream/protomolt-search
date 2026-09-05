@@ -311,7 +311,9 @@ pub struct CoordinatorServiceImpl {
     /// refused (never clamped), and a request that omits `k` (proto3 0)
     /// runs at exactly this depth. This bounds the coordinator's heap; it is
     /// not a node quota or scan-completion signal.
-    max_k: u32,
+    /// Runtime knobs (`max_k`, the hedge delay) read at request time
+    /// (docs/diagnostics.md); shared by every clone of this coordinator.
+    knobs: Arc<crate::diagnostics::Knobs>,
     /// Hard request-wide logical FP32 row-byte bound for reranking.
     max_rerank_bytes: u64,
     /// One reusable channel per address, created on first use.
@@ -336,6 +338,9 @@ pub struct CoordinatorServiceImpl {
     clustered_vectors: Option<ClusteredTurboVecBackend>,
     /// Optional measured candidate-depth contract for FP32 reranking.
     dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
+    /// The coordinator's synonym table (`docs/synonyms.md`), applied to
+    /// every lexical query unless the request turns it off.
+    synonyms: Option<Arc<crate::synonyms::SynonymTable>>,
     /// The generation-bound policy AUTO consults on a non-exhaustive
     /// provider (`docs/dense-execution-policy.md`).
     dense_execution_policy: Option<Arc<crate::dense_policy::DenseExecutionPolicy>>,
@@ -617,6 +622,7 @@ type AggregatedHits = (
     Vec<crate::pb::RangeFacetCounts>,
     Vec<crate::pb::ColumnStats>,
     Vec<crate::pb::FacetCardinality>,
+    crate::segment_prune::PruneStats,
 );
 
 /// Merge per-shard column stats: counts and sums add, mins and maxes
@@ -666,6 +672,10 @@ pub(crate) fn compile_projections(
 
 /// The compiled aggregate request: everything the fan-out sends and
 /// the merge needs.
+/// The distinct-value cap a CARDINALITY aggregation gets when the
+/// request names none (docs/aggregations.md "Cardinality").
+pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;
+
 pub(crate) struct CompiledAggregate {
     aggregations: Vec<crate::pb::CompiledAggregation>,
     histograms: Vec<crate::pb::CompiledHistogram>,
@@ -720,9 +730,17 @@ pub(crate) fn compile_aggregations(
                 a.name
             )));
         }
-        crate::node::agg_op_of(a.op).map_err(|e| {
+        let op = crate::node::agg_op_of(a.op).map_err(|e| {
             Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message()))
         })?;
+        let cardinality = op == crate::pb::AggregateOp::Cardinality;
+        if a.max_distinct != 0 && !cardinality {
+            return Err(Status::invalid_argument(format!(
+                "aggregation {:?}: max_distinct applies to CARDINALITY, not {}",
+                a.name,
+                crate::node::agg_op_name(op)
+            )));
+        }
         let expr = crate::cel::compile_value(&a.expression).map_err(|e| {
             Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message()))
         })?;
@@ -730,6 +748,11 @@ pub(crate) fn compile_aggregations(
             expr: Some(expr),
             op: a.op,
             name: a.name.clone(),
+            max_distinct: match (cardinality, a.max_distinct) {
+                (false, _) => 0,
+                (true, 0) => DEFAULT_MAX_DISTINCT,
+                (true, cap) => cap,
+            },
         });
     }
     let mut compiled_hists = Vec::with_capacity(histograms.len());
@@ -745,12 +768,47 @@ pub(crate) fn compile_aggregations(
                 h.name
             )));
         }
-        if !(h.interval > 0.0 && h.interval.is_finite()) {
-            return Err(Status::invalid_argument(format!(
-                "histogram {:?}: the interval must be positive and finite, got {}",
-                h.name, h.interval
-            )));
-        }
+        let calendar = if h.calendar != 0 {
+            let unit = crate::calendar::interval_of(h.calendar).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "histogram {:?}: unknown calendar interval {}",
+                    h.name, h.calendar
+                ))
+            })?;
+            if h.interval != 0.0 {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: a calendar histogram buckets by {}; its fixed \
+                     interval must be zero, got {}",
+                    h.name,
+                    crate::calendar::interval_name(unit),
+                    h.interval
+                )));
+            }
+            if h.utc_offset_minutes.abs() > crate::calendar::MAX_UTC_OFFSET_MINUTES {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: utc_offset_minutes {} is outside +-{}",
+                    h.name,
+                    h.utc_offset_minutes,
+                    crate::calendar::MAX_UTC_OFFSET_MINUTES
+                )));
+            }
+            Some(unit)
+        } else {
+            if h.utc_offset_minutes != 0 {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: utc_offset_minutes applies to a calendar histogram; \
+                     name a calendar interval",
+                    h.name
+                )));
+            }
+            if !(h.interval > 0.0 && h.interval.is_finite()) {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: the interval must be positive and finite, got {}",
+                    h.name, h.interval
+                )));
+            }
+            None
+        };
         let expr = crate::cel::compile_value(&h.expression).map_err(|e| {
             Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
         })?;
@@ -763,6 +821,8 @@ pub(crate) fn compile_aggregations(
                 h.max_buckets
             },
             name: h.name.clone(),
+            calendar: calendar.map_or(0, |unit| unit as i32),
+            utc_offset_minutes: h.utc_offset_minutes,
         });
     }
     let mut compiled_pcts = Vec::with_capacity(percentiles.len());
@@ -884,6 +944,10 @@ impl PctMerge {
 struct AggMerge {
     vt: Option<crate::pb::AggregateValueType>,
     present: u64,
+    /// CARDINALITY: the fleet-wide union of the shards' distinct
+    /// values, typed by the vote. A BTreeSet so the union is
+    /// deterministic whatever the shard order.
+    distinct: Distinct,
     int_sum: i128,
     int_min: i64,
     int_max: i64,
@@ -895,11 +959,28 @@ struct AggMerge {
     m2: f64,
 }
 
+/// The exact distinct-value union behind CARDINALITY, one set per
+/// type; doubles by canonical bits, strings by dictionary term.
+#[derive(Default)]
+struct Distinct {
+    ints: std::collections::BTreeSet<i64>,
+    doubles: std::collections::BTreeSet<u64>,
+    strings: std::collections::BTreeSet<String>,
+    bools: std::collections::BTreeSet<bool>,
+}
+
+impl Distinct {
+    fn len(&self) -> usize {
+        self.ints.len() + self.doubles.len() + self.strings.len() + self.bools.len()
+    }
+}
+
 impl AggMerge {
     fn new() -> Self {
         Self {
             vt: None,
             present: 0,
+            distinct: Distinct::default(),
             int_sum: 0,
             int_min: 0,
             int_max: 0,
@@ -925,8 +1006,13 @@ impl AggMerge {
 
     /// Fold one shard's partial in. Shard order is the caller's
     /// contract; every fold here is deterministic given that order.
-    fn fold(&mut self, p: &crate::pb::AggregatePartial, name: &str) -> Result<(), Status> {
+    fn fold(
+        &mut self,
+        p: &crate::pb::AggregatePartial,
+        agg: &crate::pb::CompiledAggregation,
+    ) -> Result<(), Status> {
         use crate::pb::AggregateValueType as T;
+        let name = agg.name.as_str();
         let vt = match T::try_from(p.vtype) {
             Ok(T::Absent) => return Ok(()),
             Ok(T::Unspecified) | Err(_) => {
@@ -989,10 +1075,27 @@ impl AggMerge {
                     self.m2 += p.m2 + delta * delta * (na as f64 * nb as f64 / n);
                 }
             }
-            T::String => {}
+            T::String | T::Bool => {}
             T::Absent | T::Unspecified => unreachable!("handled above"),
         }
         self.present += p.present;
+        if agg.op == crate::pb::AggregateOp::Cardinality as i32 {
+            self.distinct.ints.extend(p.distinct_ints.iter().copied());
+            self.distinct
+                .doubles
+                .extend(p.distinct_double_bits.iter().copied());
+            self.distinct
+                .strings
+                .extend(p.distinct_strings.iter().cloned());
+            self.distinct.bools.extend(p.distinct_bools.iter().copied());
+            if self.distinct.len() > agg.max_distinct as usize {
+                return Err(Status::failed_precondition(format!(
+                    "aggregation {name:?}: more than {} distinct values across the \
+                     fleet; raise max_distinct or tighten the filter",
+                    agg.max_distinct
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1008,6 +1111,7 @@ impl AggMerge {
         let int_typed = self.vt == Some(T::Int);
         let value = match op {
             O::Count => Some(W::IntValue(self.present as i64)),
+            O::Cardinality => Some(W::IntValue(self.distinct.len() as i64)),
             _ if self.present == 0 => None,
             O::Sum if int_typed => match i64::try_from(self.int_sum) {
                 Ok(v) => Some(W::IntValue(v)),
@@ -1044,6 +1148,7 @@ fn agg_vt_name(vt: crate::pb::AggregateValueType) -> &'static str {
         T::Int => "int",
         T::Double => "double",
         T::String => "string",
+        T::Bool => "bool",
         T::Absent | T::Unspecified => "absent",
     }
 }
@@ -1446,22 +1551,27 @@ pub struct DenseRequestKey<'a> {
 
 /// A browse resume boundary: the last returned id, plus its adjusted
 /// sort-key bits when the browse is column-ordered.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BrowseAfter {
     pub id: u64,
-    pub key_bits: u64,
+    /// The boundary's sort keys, parallel to the request's sort list
+    /// (empty for an id-ordered browse).
+    pub keys: Vec<crate::sortkeys::Key>,
 }
 
 /// One merged browse page.
 #[derive(Debug, Clone)]
 pub struct BrowseRows {
+    /// Sealed segments the shards consulted and ruled out
+    /// (docs/segment-pruning.md).
+    pub prune: crate::segment_prune::PruneStats,
     /// Global doc ids in final order.
     pub ids: Vec<u64>,
-    /// Adjusted order-preserving key bits, parallel to `ids` (the ids
-    /// themselves unsorted).
-    pub key_bits: Vec<u64>,
-    /// Reported sort-column values, parallel (0.0 unsorted).
-    pub keys: Vec<f64>,
+    /// Each row's sort keys in merge form, parallel to `ids` (empty
+    /// rows unsorted).
+    pub keys: Vec<Vec<crate::sortkeys::Key>>,
+    /// Each row's reported sort values, parallel to `ids`.
+    pub values: Vec<Vec<crate::sortkeys::Value>>,
     /// Whether a column order was applied.
     pub sorted: bool,
 }
@@ -1476,6 +1586,9 @@ pub struct MembershipSet {
     pub epochs: Vec<u64>,
     pub wire_bytes: u64,
     pub terms: Vec<String>,
+    /// Sealed segments the shards consulted and ruled out while
+    /// resolving this set (docs/segment-pruning.md).
+    pub prune: crate::segment_prune::PruneStats,
     pub(crate) ranges: Vec<(u64, u64)>,
 }
 
@@ -1557,6 +1670,10 @@ pub const MAX_PREFIX_EXPANSIONS: usize = 1024;
 
 /// Suggestions a `Suggest` request returns when `limit` is unset
 /// (`docs/suggest.md`).
+/// Candidates per term a did-you-mean request returns by default.
+pub const DEFAULT_TERM_SUGGEST_LIMIT: usize = 5;
+/// The largest edit bound a did-you-mean request may name.
+pub const MAX_TERM_SUGGEST_EDITS: u32 = 2;
 pub const DEFAULT_SUGGEST_LIMIT: usize = 10;
 /// The most suggestions one request may ask for.
 pub const MAX_SUGGEST_LIMIT: usize = 100;
@@ -1617,7 +1734,14 @@ impl CoordinatorServiceImpl {
             limits: FanoutLimits::default(),
             stream_search: false,
             bm25_stream: false,
-            max_k: DEFAULT_MAX_K,
+            knobs: Arc::new(crate::diagnostics::Knobs::coordinator(
+                "coordinator",
+                crate::diagnostics::CoordinatorKnobValues {
+                    max_k: DEFAULT_MAX_K,
+                    hedge_delay_ms: 0,
+                },
+                Vec::new(),
+            )),
             max_rerank_bytes: DEFAULT_MAX_RERANK_BYTES,
             links: Arc::new(Mutex::new(HashMap::new())),
             allow_network: true,
@@ -1627,6 +1751,7 @@ impl CoordinatorServiceImpl {
             #[cfg(feature = "net")]
             clustered_vectors: None,
             dense_quality_profile: None,
+            synonyms: None,
             dense_execution_policy: None,
             topology_generation: 0,
             hash_ranges: Vec::new(),
@@ -1679,7 +1804,7 @@ impl CoordinatorServiceImpl {
     }
 
     pub fn max_k(&self) -> u32 {
-        self.max_k
+        self.knobs.max_k()
     }
 
     /// The term-stats cache, exposed for tests (`fetch_count` is how a
@@ -1954,8 +2079,174 @@ impl CoordinatorServiceImpl {
     /// omitting `k` runs at). Zero is rejected at config parse time, so
     /// this takes the already-validated value.
     pub fn with_max_k(mut self, max_k: u32) -> Self {
-        self.max_k = max_k;
+        self.rebuild_knobs(max_k, self.knobs.hedge_delay());
+        self.refresh_fixed_knobs();
         self
+    }
+
+    /// Builders run before the coordinator is shared, so a knob change
+    /// at build time replaces the set; the live values carry over.
+    fn rebuild_knobs(&mut self, max_k: u32, hedge_delay: Option<Duration>) {
+        self.knobs = Arc::new(crate::diagnostics::Knobs::coordinator(
+            self.knobs.process().to_string(),
+            crate::diagnostics::CoordinatorKnobValues {
+                max_k,
+                hedge_delay_ms: hedge_delay.map_or(0, |d| d.as_millis() as u64),
+            },
+            Vec::new(),
+        ));
+    }
+
+    /// The read-at-startup settings listed beside the live knobs.
+    fn refresh_fixed_knobs(&self) {
+        use crate::diagnostics::FixedKnob;
+        use crate::pb::KnobKind;
+        self.knobs.set_fixed(vec![
+            FixedKnob {
+                name: "collection",
+                kind: KnobKind::String,
+                value: self.collection.clone(),
+                description: "The collection this coordinator serves.",
+            },
+            FixedKnob {
+                name: "nodes",
+                kind: KnobKind::Int,
+                value: self.node_addrs.len().to_string(),
+                description: "Shard nodes in the construction-time shard map.",
+            },
+            FixedKnob {
+                name: "replicas",
+                kind: KnobKind::Int,
+                value: self
+                    .replica_addrs
+                    .iter()
+                    .filter(|r| r.is_some())
+                    .count()
+                    .to_string(),
+                description: "Shards with a replica configured.",
+            },
+            FixedKnob {
+                name: "stream_search",
+                kind: KnobKind::Bool,
+                value: self.stream_search.to_string(),
+                description: "Vector legs over the streaming shard search (--stream-search).",
+            },
+            FixedKnob {
+                name: "bm25_stream",
+                kind: KnobKind::Bool,
+                value: self.bm25_stream.to_string(),
+                description: "Lexical legs over the streaming BM25 query (--bm25-stream).",
+            },
+            FixedKnob {
+                name: "max_rerank_bytes",
+                kind: KnobKind::Int,
+                value: self.max_rerank_bytes.to_string(),
+                description: "Largest exact-rerank pool in FP32 bytes (--max-rerank-bytes).",
+            },
+            FixedKnob {
+                name: "shard_deadline_ms",
+                kind: KnobKind::Int,
+                value: self
+                    .limits
+                    .shard_deadline
+                    .map_or(0, |d| d.as_millis() as u64)
+                    .to_string(),
+                description: "Bound on one shard's attempt; 0 is none (--shard-deadline-ms).",
+            },
+            FixedKnob {
+                name: "dense_execution_policy",
+                kind: KnobKind::Bool,
+                value: self.dense_execution_policy.is_some().to_string(),
+                description: "A dense execution policy is installed (--dense-execution-policy).",
+            },
+        ]);
+    }
+
+    /// The knobs this coordinator reads at request time.
+    pub fn knobs(&self) -> &Arc<crate::diagnostics::Knobs> {
+        &self.knobs
+    }
+
+    /// Fan-out limits with the live hedge delay.
+    fn limits(&self) -> FanoutLimits {
+        FanoutLimits {
+            shard_deadline: self.limits.shard_deadline,
+            hedge_delay: self.knobs.hedge_delay(),
+        }
+    }
+
+    /// Layouts of this coordinator's shard nodes (docs/diagnostics.md):
+    /// in-process nodes answer directly, remote ones through their own
+    /// diagnostics service; a node without it is listed with the status
+    /// it returned in `layout`.
+    pub async fn shard_diagnostics(
+        &self,
+        only: Option<u32>,
+    ) -> Vec<crate::pb::ShardLayoutDiagnostics> {
+        let mut out = Vec::new();
+        for (shard, addr) in self.node_addrs.iter().enumerate() {
+            let shard = shard as u32;
+            if only.is_some_and(|s| s != shard) {
+                continue;
+            }
+            let layout = match self.node_client(addr) {
+                Ok(crate::link::NodeLink::Local(node)) => {
+                    node.shard_diagnostics(shard, addr.clone())
+                }
+                #[cfg(feature = "net")]
+                Ok(crate::link::NodeLink::Remote(_)) => match self.connect(addr) {
+                    Ok(channel) => {
+                        let mut client =
+                            crate::pb::diagnostics_service_client::DiagnosticsServiceClient::new(
+                                channel,
+                            );
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            client.get_shard_diagnostics(crate::pb::ShardDiagnosticsRequest {
+                                shard: None,
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(Ok(reply)) => match reply.into_inner().shards.into_iter().next() {
+                                Some(mut layout) => {
+                                    layout.shard = shard;
+                                    layout.address = addr.clone();
+                                    layout
+                                }
+                                None => crate::diagnostics::unserved_layout(
+                                    shard,
+                                    addr.clone(),
+                                    "EMPTY: the node reported no shard",
+                                ),
+                            },
+                            Ok(Err(status)) => crate::diagnostics::unserved_layout(
+                                shard,
+                                addr.clone(),
+                                &format!("{:?}: {}", status.code(), status.message()),
+                            ),
+                            Err(_) => crate::diagnostics::unserved_layout(
+                                shard,
+                                addr.clone(),
+                                "DEADLINE_EXCEEDED: diagnostics probe timed out",
+                            ),
+                        }
+                    }
+                    Err(status) => crate::diagnostics::unserved_layout(
+                        shard,
+                        addr.clone(),
+                        &format!("{:?}: {}", status.code(), status.message()),
+                    ),
+                },
+                Err(status) => crate::diagnostics::unserved_layout(
+                    shard,
+                    addr.clone(),
+                    &format!("{:?}: {}", status.code(), status.message()),
+                ),
+            };
+            out.push(layout);
+        }
+        out
     }
 
     pub fn with_max_rerank_bytes(mut self, bytes: u64) -> Self {
@@ -1969,13 +2260,13 @@ impl CoordinatorServiceImpl {
     /// both numbers named rather than silently clamped.
     fn resolve_k(&self, requested: u32) -> Result<u32, Status> {
         if requested == 0 {
-            return Ok(self.max_k);
+            return Ok(self.knobs.max_k());
         }
-        if requested > self.max_k {
+        if requested > self.knobs.max_k() {
             return Err(Status::invalid_argument(format!(
                 "k={requested} exceeds this coordinator's max_k={}; \
                  lower k or raise --max-k",
-                self.max_k
+                self.knobs.max_k()
             )));
         }
         Ok(requested)
@@ -2001,6 +2292,8 @@ impl CoordinatorServiceImpl {
     /// Configure per-shard deadlines and hedging.
     pub fn with_limits(mut self, limits: FanoutLimits) -> Self {
         self.limits = limits;
+        self.rebuild_knobs(self.knobs.max_k(), limits.hedge_delay);
+        self.refresh_fixed_knobs();
         self
     }
 
@@ -2018,6 +2311,55 @@ impl CoordinatorServiceImpl {
     pub fn with_clustered_turbovec(mut self, backend: ClusteredTurboVecBackend) -> Self {
         self.clustered_vectors = Some(backend);
         self
+    }
+
+    /// Install the synonym table (`docs/synonyms.md`).
+    pub fn with_synonyms(mut self, table: crate::synonyms::SynonymTable) -> Self {
+        self.synonyms = Some(Arc::new(table));
+        self
+    }
+
+    /// Expand one field's analyzed query terms under the table (unless
+    /// `off`) and the request's rules, through the coordinator's
+    /// analysis backend; the added terms are appended to `terms`.
+    async fn expand_synonyms(
+        &self,
+        field: &str,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        rules: &[crate::pb::SynonymRule],
+        off: bool,
+        terms: &mut Vec<String>,
+    ) -> Result<Vec<crate::pb::SynonymExpansion>, Status> {
+        if rules.is_empty() && (off || self.synonyms.as_ref().is_none_or(|t| t.is_empty())) {
+            return Ok(Vec::new());
+        }
+        let addr = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
+        })?;
+        let analyze = move |text: String, spec: Option<crate::pb::AnalysisSpec>| {
+            let addr = addr.clone();
+            async move {
+                let analyzed =
+                    crate::analyzer::analyze_document(&addr, &text, spec.as_ref()).await?;
+                let mut out: Vec<String> = Vec::new();
+                for (term, _, _) in analyzed.into_body().terms {
+                    if !out.contains(&term) {
+                        out.push(term);
+                    }
+                }
+                Ok(out)
+            }
+        };
+        crate::synonyms::expand(
+            self.synonyms.as_deref(),
+            off,
+            rules,
+            field,
+            spec,
+            terms,
+            analyze,
+        )
+        .await
     }
 
     pub fn with_dense_quality_profile(
@@ -2591,10 +2933,10 @@ impl CoordinatorServiceImpl {
                 policy.max_candidates,
             )
             .map_err(Status::invalid_argument)?;
-        if resolution.selection_k > self.max_k {
+        if resolution.selection_k > self.knobs.max_k() {
             return Err(Status::failed_precondition(format!(
                 "quality profile resolves selection_k={} above coordinator max_k={}; raise --max-k or measure a bounded policy",
-                resolution.selection_k, self.max_k
+                resolution.selection_k, self.knobs.max_k()
             )));
         }
         if resolution.dimensions as usize != query_dim {
@@ -2885,6 +3227,10 @@ impl CoordinatorServiceImpl {
             &[],
             &mut Vec::new(),
             None,
+            &[],
+            false,
+            &mut Vec::new(),
+            false,
         )
         .await
         .map(|r| (r.0, r.1, r.2))
@@ -2913,6 +3259,10 @@ impl CoordinatorServiceImpl {
         prefixes: &[crate::pb::TermPrefix],
         expansions: &mut Vec<crate::pb::PrefixExpansion>,
         highlight: Option<&crate::pb::HighlightSpec>,
+        synonyms: &[crate::pb::SynonymRule],
+        synonyms_off: bool,
+        synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
+        explain: bool,
     ) -> Result<AggregatedHits, Status> {
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -2946,8 +3296,20 @@ impl CoordinatorServiceImpl {
             self.expand_prefixes("body", spec, prefixes, &mut terms)
                 .await?,
         );
+        // Synonym rules join them the same way (docs/synonyms.md).
+        synonym_expansions.extend(
+            self.expand_synonyms("body", spec, synonyms, synonyms_off, &mut terms)
+                .await?,
+        );
         if terms.is_empty() || k == 0 {
-            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            return Ok((
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                crate::segment_prune::PruneStats::default(),
+            ));
         }
 
         // (b) each shard's share of the corpus stats, cached per node;
@@ -2974,6 +3336,7 @@ impl CoordinatorServiceImpl {
                     cardinality_fields,
                     projections,
                     highlight,
+                    explain,
                 )
                 .await
             {
@@ -3010,6 +3373,7 @@ impl CoordinatorServiceImpl {
         cardinality_fields: &[String],
         projections: &[crate::pb::CompiledProjection],
         highlight: Option<&crate::pb::HighlightSpec>,
+        explain: bool,
     ) -> Result<AggregatedHits, Status> {
         if self.node_addrs.is_empty() {
             return Err(Status::failed_precondition("no shard nodes configured"));
@@ -3054,6 +3418,7 @@ impl CoordinatorServiceImpl {
                 stats_fields: stats_fields.to_vec(),
                 cardinality_fields: cardinality_fields.to_vec(),
                 phrase: None,
+                explain,
             };
             let mut client = self.node_client(node)?;
             if let Some((floor_tx, floor_rx)) = relay.clone() {
@@ -3091,6 +3456,7 @@ impl CoordinatorServiceImpl {
                             response.stats,
                             response.distinct,
                             response.projection_leaves_known,
+                            (response.segments_total, response.segments_skipped),
                             Some(r.scoring_fingerprint),
                         )
                     })
@@ -3111,12 +3477,14 @@ impl CoordinatorServiceImpl {
                         r.stats,
                         r.distinct,
                         r.projection_leaves_known,
+                        (r.segments_total, r.segments_skipped),
                         None,
                     )
                 })
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut prune = crate::segment_prune::PruneStats::default();
         let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut stage_known = vec![false; score_stages.len()];
@@ -3150,6 +3518,7 @@ impl CoordinatorServiceImpl {
                 sstats,
                 sdistinct,
                 pknown,
+                sprune,
                 fingerprint,
             ) = task
                 .await
@@ -3180,6 +3549,10 @@ impl CoordinatorServiceImpl {
             shard_ranges.push(ranges);
             shard_stats.push(sstats);
             shard_distinct.push(sdistinct);
+            prune.add(crate::segment_prune::PruneStats {
+                segments_total: sprune.0,
+                segments_skipped: sprune.1,
+            });
             if geo.len() != geo_filters.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} geo-column flags for {} filters",
@@ -3337,6 +3710,7 @@ impl CoordinatorServiceImpl {
             ranges,
             stats,
             cardinality,
+            prune,
         ))
     }
 
@@ -3386,9 +3760,11 @@ impl CoordinatorServiceImpl {
             filter,
             &mut Vec::new(),
             None,
+            &mut Vec::new(),
+            false,
         )
         .await
-        .map(|(hits, _)| hits)
+        .map(|((hits, _), _)| hits)
     }
 
     /// [`Self::fanout_bm25_fused_faceted`] that also reports which
@@ -3416,7 +3792,15 @@ impl CoordinatorServiceImpl {
         filter: Option<&crate::pb::FilterExpr>,
         expansions: &mut Vec<crate::pb::PrefixExpansion>,
         highlight: Option<&crate::pb::HighlightSpec>,
-    ) -> Result<(FacetedHits, Vec<crate::pb::PhraseRouting>), Status> {
+        synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
+        explain: bool,
+    ) -> Result<
+        (
+            (FacetedHits, crate::segment_prune::PruneStats),
+            Vec<crate::pb::PhraseRouting>,
+        ),
+        Status,
+    > {
         // Same rule as fanout_bm25_faceted: edge-list validation needs
         // no shard, so it runs before the all-legs-empty early return.
         crate::node::validate_range_facet_fields(range_facet_fields)?;
@@ -3509,12 +3893,28 @@ impl CoordinatorServiceImpl {
                 self.expand_prefixes(&f.field, f.analysis.as_ref(), &f.prefixes, &mut terms)
                     .await?,
             );
+            synonym_expansions.extend(
+                self.expand_synonyms(
+                    &f.field,
+                    f.analysis.as_ref(),
+                    &f.synonyms,
+                    f.synonyms_off,
+                    &mut terms,
+                )
+                .await?,
+            );
             field_terms.push(terms);
             phrase_requests.push(phrase);
         }
         let t_analyzed = t0.elapsed();
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
-            return Ok(((Vec::new(), Vec::new(), Vec::new()), Vec::new()));
+            return Ok((
+                (
+                    (Vec::new(), Vec::new(), Vec::new()),
+                    crate::segment_prune::PruneStats::default(),
+                ),
+                Vec::new(),
+            ));
         }
         // (b) every field's stats, served from the per-node cache, plus
         // one PROBE per two-term exact phrase for its bigram column: the
@@ -3671,6 +4071,7 @@ impl CoordinatorServiceImpl {
                     t0,
                     t_analyzed,
                     t_stats,
+                    explain,
                 )
                 .await
             {
@@ -3721,6 +4122,8 @@ impl CoordinatorServiceImpl {
                 b: 0.0,
                 phrase: None,
                 prefixes: Vec::new(),
+                synonyms: Vec::new(),
+                synonyms_off: false,
             }]
         } else {
             if base.analysis.is_some() {
@@ -3791,6 +4194,8 @@ impl CoordinatorServiceImpl {
             b: 0.0,
             phrase: None,
             prefixes: Vec::new(),
+            synonyms: Vec::new(),
+            synonyms_off: false,
         });
         field_terms.push(phrase_terms);
         if k == 0 || field_terms.iter().all(Vec::is_empty) {
@@ -3855,6 +4260,7 @@ impl CoordinatorServiceImpl {
                     t0,
                     t_analyzed,
                     t_stats,
+                    base.explain,
                 )
                 .await;
             match round {
@@ -3862,7 +4268,7 @@ impl CoordinatorServiceImpl {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
-                other => return other,
+                other => return other.map(|(hits, _)| hits),
             }
         }
     }
@@ -4137,7 +4543,8 @@ impl CoordinatorServiceImpl {
         t0: std::time::Instant,
         t_analyzed: std::time::Duration,
         t_stats: std::time::Duration,
-    ) -> Result<FacetedHits, Status> {
+        explain: bool,
+    ) -> Result<(FacetedHits, crate::segment_prune::PruneStats), Status> {
         let doc_count = globals.doc_count;
         let totals = &globals.totals;
         let dfs = &globals.dfs;
@@ -4226,6 +4633,7 @@ impl CoordinatorServiceImpl {
                 stats_fields: Vec::new(),
                 cardinality_fields: Vec::new(),
                 phrase: None,
+                explain,
             };
             let mut client = self.node_client(node)?;
             let phrase_request =
@@ -4267,6 +4675,7 @@ impl CoordinatorServiceImpl {
                         response.range_facets,
                         response.geo_columns_known,
                         response.filter_columns_known,
+                        (response.segments_total, response.segments_skipped),
                         started.elapsed().as_secs_f64() * 1000.0,
                         Some(result.scoring_fingerprint),
                     ))
@@ -4288,6 +4697,7 @@ impl CoordinatorServiceImpl {
                         r.range_facets,
                         r.geo_columns_known,
                         r.filter_columns_known,
+                        (r.segments_total, r.segments_skipped),
                         started.elapsed().as_secs_f64() * 1000.0,
                         None,
                     )
@@ -4295,6 +4705,7 @@ impl CoordinatorServiceImpl {
             }));
         }
         let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
+        let mut prune = crate::segment_prune::PruneStats::default();
         let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
         let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
         let mut per_shard: Vec<(u32, f64)> = Vec::new();
@@ -4303,9 +4714,13 @@ impl CoordinatorServiceImpl {
         let mut filter_known = vec![false; filter_leaves];
         let mut scoring_fingerprint: Option<String> = None;
         for task in query_tasks {
-            let (shard, hits, facets, ranges, geo, fknown, ms, fingerprint) = task
-                .await
-                .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            let (shard, hits, facets, ranges, geo, fknown, sprune, ms, fingerprint) =
+                task.await
+                    .map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??;
+            prune.add(crate::segment_prune::PruneStats {
+                segments_total: sprune.0,
+                segments_skipped: sprune.1,
+            });
             if let Some(fingerprint) = fingerprint {
                 match scoring_fingerprint.as_ref() {
                     Some(expected) if expected != &fingerprint => {
@@ -4427,7 +4842,10 @@ impl CoordinatorServiceImpl {
                 field_terms.iter().map(Vec::len).sum::<usize>(),
             );
         }
-        Ok((all.into_iter().map(|(_, h)| h).collect(), facets, ranges))
+        Ok((
+            (all.into_iter().map(|(_, h)| h).collect(), facets, ranges),
+            prune,
+        ))
     }
 
     /// Hybrid vector + BM25 search:
@@ -4730,6 +5148,8 @@ impl CoordinatorServiceImpl {
                 bm25_rank: hit.leg_ranks[1],
                 bm25_score: hit.leg_scores[1].unwrap_or(0.0) as f32,
                 boost_score: 0.0,
+                vector_normalized: hit.leg_norms.first().copied().flatten(),
+                bm25_normalized: hit.leg_norms.get(1).copied().flatten(),
             })
             .collect();
         let debug = debug.then(|| {
@@ -4926,6 +5346,8 @@ impl CoordinatorServiceImpl {
                 bm25_rank: f.leg_ranks[1],
                 bm25_score: f.leg_scores[1].unwrap_or(0.0) as f32,
                 boost_score: 0.0,
+                vector_normalized: f.leg_norms.first().copied().flatten(),
+                bm25_normalized: f.leg_norms.get(1).copied().flatten(),
             })
             .collect();
         let dbg = debug.then(|| {
@@ -5085,6 +5507,8 @@ impl CoordinatorServiceImpl {
                     bm25_rank: source.bm25_rank,
                     bm25_score: source.bm25_score,
                     boost_score: 0.0,
+                    vector_normalized: None,
+                    bm25_normalized: None,
                 }
             })
             .collect();
@@ -5233,6 +5657,8 @@ impl CoordinatorServiceImpl {
                     bm25_rank: source.bm25_rank,
                     bm25_score: source.bm25_score,
                     boost_score: 0.0,
+                    vector_normalized: None,
+                    bm25_normalized: None,
                 }
             })
             .collect();
@@ -5349,6 +5775,7 @@ impl CoordinatorServiceImpl {
                     stats_fields: Vec::new(),
                     cardinality_fields: Vec::new(),
                     phrase: None,
+                    explain: false,
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -5656,6 +6083,8 @@ impl CoordinatorServiceImpl {
                 bm25_rank: bm25_rank.get(&doc).copied(),
                 bm25_score: b,
                 boost_score: 0.0,
+                vector_normalized: None,
+                bm25_normalized: None,
             })
             .collect();
         let dbg = debug.then(|| {
@@ -5939,7 +6368,7 @@ impl CoordinatorServiceImpl {
                 None => None,
             };
             let ctx = ctx.clone();
-            let limits = self.limits;
+            let limits = self.limits();
             let done_tx = done_tx.clone();
             tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
@@ -6520,7 +6949,7 @@ impl CoordinatorServiceImpl {
                 None => None,
             };
             let ctx = ctx.clone();
-            let limits = self.limits;
+            let limits = self.limits();
             let done_tx = done_tx.clone();
             tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
@@ -7293,9 +7722,11 @@ impl CoordinatorServiceImpl {
         &self,
         k: u32,
         after: Option<BrowseAfter>,
-        sort: Option<&crate::pb::BrowseSort>,
+        sort: &[crate::pb::BrowseSort],
+        lexical_terms: &[String],
         filters: &RequestFilters,
     ) -> Result<BrowseRows, Status> {
+        use crate::sortkeys::{cmp_rows, Key, Value};
         let k = self.resolve_k(k)?;
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
@@ -7305,8 +7736,12 @@ impl CoordinatorServiceImpl {
                 first_page: after.is_none(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
-                sort: sort.cloned(),
-                after_key_bits: after.as_ref().map_or(0, |a| a.key_bits),
+                sort: sort.to_vec(),
+                after_keys: after
+                    .as_ref()
+                    .map(|a| a.keys.iter().map(Key::to_pb).collect())
+                    .unwrap_or_default(),
+                lexical_terms: lexical_terms.to_vec(),
             };
             let client = self.node_client(node);
             tasks.push(tokio::spawn(async move {
@@ -7314,53 +7749,112 @@ impl CoordinatorServiceImpl {
             }));
         }
         let mut known = FilterKnown::new(filters);
-        let mut sort_known = sort.is_none();
-        // (merge key, id, reported value): key = adjusted key bits
-        // sorted, or the id itself unsorted — one ascending comparison
-        // either way.
-        let mut rows: Vec<(u64, u64, f64)> = Vec::new();
+        let mut sort_known = vec![false; sort.len()];
+        struct Row {
+            keys: Vec<Key>,
+            values: Vec<Value>,
+            id: u64,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        let mut prune = crate::segment_prune::PruneStats::default();
         for task in tasks {
             let response = task
                 .await
                 .map_err(|e| Status::internal(format!("browse task failed: {e}")))??;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
-            sort_known |= response.sort_column_known;
-            if sort.is_some() {
-                if response.sort_key_bits.len() != response.doc_ids.len()
-                    || response.sort_keys.len() != response.doc_ids.len()
-                {
-                    return Err(Status::internal(
-                        "shard answered a sorted browse with mismatched key columns",
-                    ));
-                }
-                for ((&id, &bits), &value) in response
-                    .doc_ids
+            prune.add(crate::segment_prune::PruneStats {
+                segments_total: response.segments_total,
+                segments_skipped: response.segments_skipped,
+            });
+            for (known, shard) in sort_known.iter_mut().zip(&response.sort_columns_known) {
+                *known |= shard;
+            }
+            if sort.is_empty() {
+                rows.extend(response.doc_ids.iter().map(|&id| Row {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                    id,
+                }));
+                continue;
+            }
+            if response.sort_rows.len() != response.doc_ids.len() {
+                return Err(Status::internal(
+                    "shard answered a sorted browse with mismatched key rows",
+                ));
+            }
+            for (&id, row) in response.doc_ids.iter().zip(&response.sort_rows) {
+                let keys: Option<Vec<Key>> = row.keys.iter().map(Key::from_pb).collect();
+                let values: Option<Vec<Value>> = row
+                    .values
                     .iter()
-                    .zip(&response.sort_key_bits)
-                    .zip(&response.sort_keys)
-                {
-                    rows.push((bits, id, value));
+                    .map(crate::sortkeys::value_from_pb)
+                    .collect();
+                let (Some(keys), Some(values)) = (keys, values) else {
+                    return Err(Status::internal(
+                        "shard answered a sorted browse with an empty key",
+                    ));
+                };
+                if keys.len() != sort.len() || values.len() != sort.len() {
+                    return Err(Status::internal(format!(
+                        "shard answered a sorted browse with {} keys for {} sort columns",
+                        keys.len(),
+                        sort.len()
+                    )));
                 }
-            } else {
-                rows.extend(response.doc_ids.iter().map(|&id| (id, id, 0.0)));
+                rows.push(Row { keys, values, id });
             }
         }
         known.refuse_unknown(filters)?;
-        if !sort_known {
-            let column = sort.map(|s| s.column.as_str()).unwrap_or_default();
-            return Err(Status::invalid_argument(format!(
-                "sort column {column:?} is not declared on any shard's numeric or integer \
-                 table (--numeric-fields / --integer-fields)"
-            )));
+        for (sort, known) in sort.iter().zip(&sort_known) {
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "sort column {:?} is not declared on any shard's numeric, integer, or \
+                     facet table (--numeric-fields / --integer-fields / --facet-fields), \
+                     and is not a lineage key (parent_id, group_id)",
+                    sort.column
+                )));
+            }
         }
-        rows.sort_unstable_by_key(|r| (r.0, r.1));
+        let descending: Vec<bool> = sort.iter().map(|s| s.descending).collect();
+        rows.sort_by(|a, b| cmp_rows(&a.keys, a.id, &b.keys, b.id, &descending));
         rows.truncate(k as usize);
         Ok(BrowseRows {
-            ids: rows.iter().map(|r| r.1).collect(),
-            key_bits: rows.iter().map(|r| r.0).collect(),
-            keys: rows.iter().map(|r| r.2).collect(),
-            sorted: sort.is_some(),
+            prune,
+            ids: rows.iter().map(|r| r.id).collect(),
+            keys: rows.iter().map(|r| r.keys.clone()).collect(),
+            values: rows.iter().map(|r| r.values.clone()).collect(),
+            sorted: !sort.is_empty(),
         })
+    }
+
+    /// The lineage keys of every requested document across the shards:
+    /// doc id to (parent_id, group_id). A document without lineage
+    /// parents itself in the high-bit-tagged domain and has group 0. A
+    /// deleted or unknown id is absent.
+    pub async fn lineage_keys(&self, ids: &[u64]) -> Result<HashMap<u64, (u64, u64)>, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for node in &self.node_addrs {
+            let request = crate::pb::ResolveParentsRequest {
+                doc_ids: ids.to_vec(),
+            };
+            let mut client = self.node_client(node)?;
+            tasks.push(tokio::spawn(async move {
+                client
+                    .resolve_parents(request)
+                    .await
+                    .map(|r| r.into_inner())
+            }));
+        }
+        let mut out = HashMap::with_capacity(ids.len());
+        for task in tasks {
+            let response = task
+                .await
+                .map_err(|e| Status::internal(format!("lineage task failed: {e}")))??;
+            for resolved in response.parents {
+                out.insert(resolved.doc_id, (resolved.parent_id, resolved.group_id));
+            }
+        }
+        Ok(out)
     }
 
     fn merge_membership_bitmap(
@@ -7459,9 +7953,15 @@ impl CoordinatorServiceImpl {
                 Status::internal(format!("filter membership task failed: {error}"))
             })??;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            merged.prune.add(crate::segment_prune::PruneStats {
+                segments_total: response.segments_total,
+                segments_skipped: response.segments_skipped,
+            });
             Self::merge_membership_bitmap(
                 &mut merged,
                 &crate::pb::MembershipBitmapResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     base_label: response.base_label,
                     label_count: response.label_count,
                     bits: response.bits,
@@ -7473,13 +7973,13 @@ impl CoordinatorServiceImpl {
         Ok(merged)
     }
 
-    /// Analyze one lexical clause and resolve its exact positive-score
-    /// membership. No score bytes cross this phase.
-    pub async fn lexical_membership(
+    /// The distinct body terms of one lexical clause under `spec`, in
+    /// first-occurrence order: the membership vocabulary of the clause.
+    pub async fn analyze_terms(
         &self,
         text: &str,
         spec: Option<&crate::pb::AnalysisSpec>,
-    ) -> Result<MembershipSet, Status> {
+    ) -> Result<Vec<String>, Status> {
         if text.is_empty() {
             return Err(Status::invalid_argument("lexical clause text is empty"));
         }
@@ -7493,6 +7993,17 @@ impl CoordinatorServiceImpl {
                 terms.push(term);
             }
         }
+        Ok(terms)
+    }
+
+    /// Analyze one lexical clause and resolve its exact positive-score
+    /// membership. No score bytes cross this phase.
+    pub async fn lexical_membership(
+        &self,
+        text: &str,
+        spec: Option<&crate::pb::AnalysisSpec>,
+    ) -> Result<MembershipSet, Status> {
+        let terms = self.analyze_terms(text, spec).await?;
         if terms.is_empty() {
             return Ok(MembershipSet {
                 epochs: vec![0; self.node_addrs.len()],
@@ -7518,6 +8029,10 @@ impl CoordinatorServiceImpl {
                 Status::internal(format!("lexical membership task failed: {error}"))
             })??;
             merged.epochs.push(response.stats_epoch);
+            merged.prune.add(crate::segment_prune::PruneStats {
+                segments_total: response.segments_total,
+                segments_skipped: response.segments_skipped,
+            });
             Self::merge_membership_bitmap(&mut merged, &response)?;
         }
         merged.terms = terms;
@@ -8218,7 +8733,7 @@ impl CoordinatorServiceImpl {
                 .iter_mut()
                 .zip(response.partials.iter().zip(aggregations))
             {
-                m.fold(p, &agg.name)?;
+                m.fold(p, agg)?;
             }
             for shard_group in &response.groups {
                 if shard_group.partials.len() != aggregations.len() {
@@ -8237,7 +8752,7 @@ impl CoordinatorServiceImpl {
                     .iter_mut()
                     .zip(shard_group.partials.iter().zip(aggregations))
                 {
-                    m.fold(p, &agg.name)?;
+                    m.fold(p, agg)?;
                 }
                 if groups.len() > group_cap {
                     return Err(Status::failed_precondition(format!(
@@ -8323,9 +8838,22 @@ impl CoordinatorServiceImpl {
                 name: spec.name.clone(),
                 buckets: hist_buckets[i]
                     .iter()
-                    .map(|(&idx, &count)| crate::pb::HistogramBucket {
-                        lower: idx as f64 * spec.interval,
-                        count,
+                    .map(|(&idx, &count)| {
+                        if spec.calendar != 0 {
+                            // A calendar bucket's key IS its start
+                            // instant, in the expression's micros.
+                            crate::pb::HistogramBucket {
+                                lower: idx as f64,
+                                lower_int: idx,
+                                count,
+                            }
+                        } else {
+                            crate::pb::HistogramBucket {
+                                lower: idx as f64 * spec.interval,
+                                lower_int: 0,
+                                count,
+                            }
+                        }
                     })
                     .collect(),
                 present: hist_present[i],
@@ -9386,6 +9914,8 @@ impl SearchService for CoordinatorServiceImpl {
                         .clustered_parent_collapse(&request_id, &req.vector, k, &filters)
                         .await?;
                     return Ok(Response::new(SearchResponse {
+                        segments_total: 0,
+                        segments_skipped: 0,
                         request_id,
                         hits: collapsed.hits,
                         groups: collapsed.groups,
@@ -9405,6 +9935,8 @@ impl SearchService for CoordinatorServiceImpl {
                     })
                     .collect();
                 return Ok(Response::new(SearchResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     request_id,
                     hits,
                     groups: Vec::new(),
@@ -9423,6 +9955,8 @@ impl SearchService for CoordinatorServiceImpl {
                         .fanout_stream_search_collapse(&request_id, &req.vector, k, &filters)
                         .await?;
                     return Ok(Response::new(SearchResponse {
+                        segments_total: 0,
+                        segments_skipped: 0,
                         request_id,
                         hits: doc.hits,
                         groups: doc.groups,
@@ -9436,6 +9970,8 @@ impl SearchService for CoordinatorServiceImpl {
                     .fanout_stream_search(&request_id, &req.vector, k, None, &filters)
                     .await?;
                 return Ok(Response::new(SearchResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     request_id,
                     hits: streamed.hits,
                     groups: Vec::new(),
@@ -9445,7 +9981,18 @@ impl SearchService for CoordinatorServiceImpl {
                 self.fanout_search(&request_id, &req.vector, k, false, &filters)
                     .await?
             };
+            let (segments_total, segments_skipped) = result.shard_stats.iter().flatten().fold(
+                (0u32, 0u32),
+                |(total, skipped), stats| {
+                    (
+                        total.saturating_add(stats.segments_total),
+                        skipped.saturating_add(stats.segments_skipped),
+                    )
+                },
+            );
             Ok(Response::new(SearchResponse {
+                segments_total,
+                segments_skipped,
                 request_id,
                 hits: result.hits,
                 groups: Vec::new(),
@@ -9490,7 +10037,8 @@ impl SearchService for CoordinatorServiceImpl {
             let projections = compile_projections(&req.projections)?;
             let mut phrase_routing = Vec::new();
             let mut prefix_expansions = Vec::new();
-            let (hits, facets, range_facets, stats, cardinality) =
+            let mut synonym_expansions = Vec::new();
+            let (hits, facets, range_facets, stats, cardinality, prune) =
                 if req.fields.is_empty() && req.phrase.is_some() {
                     // A phrase on the flat route is the body field's phrase on
                     // the fused route (docs/phrase-proximity.md); the fused
@@ -9521,8 +10069,10 @@ impl SearchService for CoordinatorServiceImpl {
                         b: 0.0,
                         phrase: req.phrase,
                         prefixes: req.prefixes.clone(),
+                        synonyms: req.synonyms.clone(),
+                        synonyms_off: req.synonyms_off,
                     }];
-                    let ((hits, facets, ranges), routing) = self
+                    let (((hits, facets, ranges), fused_prune), routing) = self
                         .fanout_bm25_fused_routed(
                             &req.text,
                             k,
@@ -9535,10 +10085,12 @@ impl SearchService for CoordinatorServiceImpl {
                             filter.as_ref(),
                             &mut prefix_expansions,
                             req.highlight.as_ref(),
+                            &mut synonym_expansions,
+                            req.explain,
                         )
                         .await?;
                     phrase_routing = routing;
-                    (hits, facets, ranges, Vec::new(), Vec::new())
+                    (hits, facets, ranges, Vec::new(), Vec::new(), fused_prune)
                 } else if req.fields.is_empty() {
                     self.fanout_bm25_aggregated(
                         &req.text,
@@ -9557,6 +10109,10 @@ impl SearchService for CoordinatorServiceImpl {
                         &req.prefixes,
                         &mut prefix_expansions,
                         req.highlight.as_ref(),
+                        &req.synonyms,
+                        req.synonyms_off,
+                        &mut synonym_expansions,
+                        req.explain,
                     )
                     .await?
                 } else {
@@ -9605,7 +10161,7 @@ impl SearchService for CoordinatorServiceImpl {
                          the prefixes on the QueryField whose dictionary they expand in",
                     ));
                     }
-                    let ((hits, facets, ranges), routing) = self
+                    let (((hits, facets, ranges), fused_prune), routing) = self
                         .fanout_bm25_fused_routed(
                             &req.text,
                             k,
@@ -9618,10 +10174,12 @@ impl SearchService for CoordinatorServiceImpl {
                             filter.as_ref(),
                             &mut prefix_expansions,
                             req.highlight.as_ref(),
+                            &mut synonym_expansions,
+                            req.explain,
                         )
                         .await?;
                     phrase_routing = routing;
-                    (hits, facets, ranges, Vec::new(), Vec::new())
+                    (hits, facets, ranges, Vec::new(), Vec::new(), fused_prune)
                 };
             // The merged k-th best: one f32 ULP below the last hit's score
             // when k hits were returned (see `bm25::floor_seed` — a later
@@ -9634,6 +10192,8 @@ impl SearchService for CoordinatorServiceImpl {
                 0.0
             };
             Ok(Response::new(Bm25SearchResponse {
+                segments_total: prune.segments_total,
+                segments_skipped: prune.segments_skipped,
                 hits,
                 kth_best,
                 facets,
@@ -9642,6 +10202,7 @@ impl SearchService for CoordinatorServiceImpl {
                 cardinality,
                 phrase_routing,
                 prefix_expansions,
+                synonym_expansions,
             }))
         })
         .await
@@ -9698,6 +10259,8 @@ impl SearchService for CoordinatorServiceImpl {
             0.0
         };
         Ok(Response::new(Bm25SearchResponse {
+            segments_total: 0,
+            segments_skipped: 0,
             hits,
             kth_best,
             facets,
@@ -9706,6 +10269,7 @@ impl SearchService for CoordinatorServiceImpl {
             cardinality: Vec::new(),
             phrase_routing: Vec::new(),
             prefix_expansions: Vec::new(),
+            synonym_expansions: Vec::new(),
         }))
         })
         .await
@@ -9921,6 +10485,11 @@ impl SearchService for CoordinatorServiceImpl {
         let request = request.into_inner();
         if let Some(query) = request.query.as_ref() {
             self.require_topology_generation(query.required_topology_generation)?;
+            if query.explain {
+                return Err(Status::invalid_argument(
+                    "explain is served on the unary Query route: a stream's revisions carry                      candidate hits without their trees, and a tree over a revision that a                      later one replaces would explain a score that was never served",
+                ));
+            }
         }
         let (tx, rx) = mpsc::channel::<Result<crate::pb::QueryStreamResponse, Status>>(8);
         let service = self.clone();
@@ -10390,6 +10959,29 @@ impl SearchService for CoordinatorServiceImpl {
         .await
     }
 
+    /// Placement dry run (`docs/placement.md`). Reserved: the contract is
+    /// in the proto; the evaluation over every shard's stored columns is
+    /// the next branch's work, and until then the call refuses by name
+    /// rather than answering with counts it did not compute.
+    async fn plan_placement(
+        &self,
+        request: Request<crate::pb::PlanPlacementRequest>,
+    ) -> Result<Response<crate::pb::PlanPlacementResponse>, Status> {
+        crate::metrics::timed(Route::PlanPlacement, request, |request| async move {
+            self.admit(&request.get_ref().collection)?;
+            let proposed = request.get_ref().proposed.as_ref().ok_or_else(|| {
+                Status::invalid_argument("plan_placement: proposed tree is absent")
+            })?;
+            let config = crate::placement::PlacementTreeConfig::from_proto(proposed);
+            crate::placement::Placement::validate(&config).map_err(Status::invalid_argument)?;
+            Err(Status::unimplemented(
+                "plan_placement: the dry run is not implemented yet (docs/placement.md); the \
+                 proposed tree validated",
+            ))
+        })
+        .await
+    }
+
     /// Autocomplete over one field's dictionary (`docs/suggest.md`):
     /// normalize the prefix as a prefix term is normalized (the field's
     /// char filters, never its stemmer), ask every shard for the terms
@@ -10504,6 +11096,171 @@ impl SearchService for CoordinatorServiceImpl {
                     .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
                     .collect(),
                 dictionary_terms_with_prefix,
+                df_includes_tombstoned_rows: tombstoned,
+            }))
+        })
+        .await
+    }
+
+    async fn term_suggest(
+        &self,
+        request: Request<crate::pb::TermSuggestRequest>,
+    ) -> Result<Response<crate::pb::TermSuggestResponse>, Status> {
+        crate::metrics::timed(Route::TermSuggest, request, |request| async move {
+            self.admit(&request.get_ref().collection)?;
+            if let Some(snapshot) = self.request_snapshot() {
+                return Box::pin(SearchService::term_suggest(&snapshot, request)).await;
+            }
+            let req = request.into_inner();
+            let max_edits = match req.max_edits {
+                0 => 1usize,
+                n if n > MAX_TERM_SUGGEST_EDITS => {
+                    return Err(Status::invalid_argument(format!(
+                        "max_edits {n} exceeds the maximum {MAX_TERM_SUGGEST_EDITS}"
+                    )))
+                }
+                n => n as usize,
+            };
+            let prefix_length = match req.prefix_length {
+                0 => 1usize,
+                n => n as usize,
+            };
+            let limit = match req.limit as usize {
+                0 => DEFAULT_TERM_SUGGEST_LIMIT,
+                n if n > MAX_SUGGEST_LIMIT => {
+                    return Err(Status::invalid_argument(format!(
+                        "limit {n} exceeds the maximum {MAX_SUGGEST_LIMIT}"
+                    )))
+                }
+                n => n,
+            };
+            let max_scan = match req.max_scan {
+                0 => DEFAULT_SUGGEST_SCAN,
+                n if n > MAX_SUGGEST_SCAN as u64 => {
+                    return Err(Status::invalid_argument(format!(
+                        "max_scan {n} exceeds the maximum {MAX_SUGGEST_SCAN}"
+                    )))
+                }
+                n => n as usize,
+            };
+            if req.field.is_empty() {
+                return Err(Status::invalid_argument(
+                    "term suggestions need a field: name the indexed BM25 field whose \
+                     dictionary to consult (\"body\" for the body)",
+                ));
+            }
+            if req.analysis.is_none() {
+                return Err(Status::invalid_argument(
+                    "term suggestions need the field's analysis spec: the text is analyzed \
+                     under it, and the sidecar's default chain is not known here",
+                ));
+            }
+            if req.text.trim().is_empty() {
+                return Err(Status::invalid_argument("term suggestions need text"));
+            }
+            let always = req.mode == crate::pb::TermSuggestMode::Always as i32;
+            let field = req.field.clone();
+            let addr = self.analysis_addr.clone().ok_or_else(|| {
+                Status::unavailable(
+                    "no analysis backend configured on the coordinator (analysis_addr)",
+                )
+            })?;
+            let analyzed =
+                crate::analyzer::analyze_document(&addr, &req.text, req.analysis.as_ref())
+                    .await?
+                    .into_body();
+            let mut terms: Vec<String> = Vec::new();
+            for (term, _, _) in analyzed.terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+            // One bounded prefix scan per term per shard; a term shorter
+            // than the prefix length is looked up whole (its own df) and
+            // gets no candidates.
+            let mut tasks = Vec::with_capacity(terms.len() * self.node_addrs.len());
+            for (ti, term) in terms.iter().enumerate() {
+                let prefix: String = term.chars().take(prefix_length).collect();
+                let scan = if term.chars().count() >= prefix_length {
+                    prefix
+                } else {
+                    term.clone()
+                };
+                for (shard, node) in self.node_addrs.iter().enumerate() {
+                    let mut client = self.node_client(node)?;
+                    let request = crate::pb::SuggestTermsRequest {
+                        field: field.clone(),
+                        prefix: scan.clone(),
+                        max_scan: max_scan as u64,
+                    };
+                    tasks.push((
+                        ti,
+                        shard,
+                        scan.clone(),
+                        tokio::spawn(async move {
+                            client.suggest_terms(request).await.map(|r| r.into_inner())
+                        }),
+                    ));
+                }
+            }
+            let mut unions: Vec<std::collections::BTreeMap<String, (u64, u32)>> =
+                terms.iter().map(|_| Default::default()).collect();
+            let mut known = false;
+            let mut tombstoned = false;
+            for (ti, shard, scan, task) in tasks {
+                let resp = task
+                    .await
+                    .map_err(|e| Status::internal(format!("term suggest task failed: {e}")))??;
+                tombstoned |= resp.tombstoned_rows > 0;
+                if !resp.known {
+                    continue;
+                }
+                known = true;
+                if resp.count as usize > max_scan {
+                    return Err(Status::invalid_argument(format!(
+                        "prefix {scan:?} of term {:?} on field {field:?} matches {} dictionary \
+                         terms on shard {shard}; the scan bound is {max_scan} (raise max_scan \
+                         up to {MAX_SUGGEST_SCAN}, or raise prefix_length)",
+                        terms[ti], resp.count
+                    )));
+                }
+                for entry in resp.entries {
+                    let slot = unions[ti].entry(entry.term).or_insert((0, 0));
+                    slot.0 += entry.df;
+                    slot.1 += 1;
+                }
+            }
+            if !known {
+                return Err(Status::invalid_argument(format!(
+                    "no shard indexes field {field:?}; there is no dictionary to suggest from"
+                )));
+            }
+            let mut out = Vec::with_capacity(terms.len());
+            for (ti, term) in terms.iter().enumerate() {
+                let union = &unions[ti];
+                if union.len() > max_scan {
+                    return Err(Status::invalid_argument(format!(
+                        "the prefix of term {term:?} on field {field:?} matches {} dictionary \
+                         terms across the fleet; the scan bound is {max_scan} (raise max_scan \
+                         up to {MAX_SUGGEST_SCAN}, or raise prefix_length)",
+                        union.len()
+                    )));
+                }
+                let df = union.get(term).map_or(0, |(df, _)| *df);
+                let candidates = if term.chars().count() < prefix_length || (df > 0 && !always) {
+                    Vec::new()
+                } else {
+                    crate::synonyms::rank_candidates(term, union, max_edits, limit)
+                };
+                out.push(crate::pb::TermSuggestion {
+                    term: term.clone(),
+                    df,
+                    candidates,
+                    dictionary_terms_scanned: union.len() as u64,
+                });
+            }
+            Ok(Response::new(crate::pb::TermSuggestResponse {
+                terms: out,
                 df_includes_tombstoned_rows: tombstoned,
             }))
         })
@@ -10970,6 +11727,7 @@ mod stream_cancel_tests {
             &coordinator,
             Request::new(PublishTopologyRequest {
                 collection: String::new(),
+                placement: None,
                 cutover_token: frozen.cutover_token,
                 generation: 5,
                 shards: vec![
@@ -10978,12 +11736,16 @@ mod stream_cancel_tests {
                         replica: String::new(),
                         hash_lo: 0,
                         hash_hi: split,
+                        has_placement: false,
+                        placement: 0,
                     },
                     crate::pb::PublishedTopologyShard {
                         addr: "b:50051".into(),
                         replica: String::new(),
                         hash_lo: split + 1,
                         hash_hi: u64::MAX,
+                        has_placement: false,
+                        placement: 0,
                     },
                 ],
             }),

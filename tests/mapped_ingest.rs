@@ -606,6 +606,7 @@ async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
         &coordinator,
         Request::new(PublishTopologyRequest {
             collection: String::new(),
+            placement: None,
             cutover_token: frozen.cutover_token,
             generation: 11,
             shards: vec![
@@ -614,12 +615,16 @@ async fn routed_mapped_ingest_uses_stable_keys_and_requires_one_generation() {
                     replica: String::new(),
                     hash_lo: 0,
                     hash_hi: split,
+                    has_placement: false,
+                    placement: 0,
                 },
                 PublishedTopologyShard {
                     addr: nodes[1].clone(),
                     replica: String::new(),
                     hash_lo: split + 1,
                     hash_hi: u64::MAX,
+                    has_placement: false,
+                    placement: 0,
                 },
             ],
         }),

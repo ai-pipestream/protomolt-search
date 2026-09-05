@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipestream Search dashboard</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top"></header>
+<div class="dashboard">
+  <div class="toolbar">
+    <label for="target">Process</label><select id="target"><option value="coordinator">coordinator</option></select>
+    <label for="interval">Interval</label><select id="interval"><option value="1000">1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select>
+    <span id="stream-state" class="pill">connecting</span>
+    <span class="spacer"></span>
+    <span id="diag-note" class="muted small"></span>
+  </div>
+  <div id="tiles" class="grid"></div>
+  <div class="two">
+    <div class="panel"><h2>Routes</h2><div class="muted small">Per route: requests per second and p50 / p99 from the latency histogram, over the stream's window.</div><table id="routes"><thead><tr><th>route</th><th class="num">req/s</th><th class="num">p50</th><th class="num">p99</th><th class="num">errors</th><th>rate</th></tr></thead><tbody></tbody></table></div>
+    <div class="panel"><h2>Runtime knobs</h2><div id="knobs" class="muted small">waiting for GetRuntimeKnobs</div></div>
+  </div>
+  <div class="two">
+    <div class="panel"><h2>Shard map</h2><div id="shards" class="muted small">waiting for GetShardDiagnostics</div><div id="seginfo" class="seginfo"></div></div>
+    <div class="panel"><h2>Recent queries</h2><div id="recent" class="muted small">waiting for RecentQueries</div></div>
+  </div>
+  <div class="panel"><h2>Raw samples</h2><details><summary class="muted small">last snapshot</summary><pre class="raw" id="raw-snapshot"></pre></details></div>
+</div>
+<script type="module" src="/dashboard.js"></script>
+</body>
+</html>

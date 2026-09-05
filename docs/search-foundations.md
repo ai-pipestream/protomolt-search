@@ -71,9 +71,11 @@ rewrite stored fingerprints or replay reduced columns as proof of corrected
 extraction. Unmapped generations do not acquire a new mapping or require a
 rebuild from this change alone.
 
-Remaining protobuf work includes zero-row original retention, standalone shape
-reporting for unbindable schemas, unsigned columns, repeated/nested correlation, extension indexing,
-well-known types and Editions. Reachable MessageSet types are explicitly refused.
+The local catalog now retains zero-row originals, and standalone schema
+inspection reports graphs that cannot form an index plan. Remaining protobuf
+work includes unsigned columns, repeated/nested correlation, extension indexing,
+well-known-type projection and Editions. Index planning refuses reachable
+MessageSet types; source-only inspection can describe them.
 The decoder dependency does not itself prove those contracts. Its behavior must
 be covered or adapted by the conformance suite before support is claimed.
 

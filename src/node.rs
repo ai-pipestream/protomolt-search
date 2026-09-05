@@ -96,6 +96,102 @@ fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, St
         .transpose()
 }
 
+/// A node's runtime knobs from its config (docs/diagnostics.md): the
+/// live ones as atomics, the rest listed as read-at-startup.
+fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
+    use crate::diagnostics::{FixedKnob, Knobs, NodeKnobValues};
+    use crate::pb::KnobKind;
+    let process = format!("node:{}", config.slot_offset);
+    let fixed = vec![
+        FixedKnob {
+            name: "chunk_blocks",
+            kind: KnobKind::Int,
+            value: config.chunk_blocks.to_string(),
+            description: "SIMD blocks per scan chunk (--chunk-blocks).",
+        },
+        FixedKnob {
+            name: "block_max",
+            kind: KnobKind::Bool,
+            value: config.block_max.to_string(),
+            description: "Block-max pruning on the lexical leg (--block-max).",
+        },
+        FixedKnob {
+            name: "coalesce",
+            kind: KnobKind::Bool,
+            value: config.coalesce.to_string(),
+            description: "Coalesce concurrent scans into one pass (--coalesce).",
+        },
+        FixedKnob {
+            name: "scan_parallel",
+            kind: KnobKind::Int,
+            value: config.scan_parallel.to_string(),
+            description: "Scan slots (--scan-parallel).",
+        },
+        FixedKnob {
+            name: "rerank_parallel",
+            kind: KnobKind::Int,
+            value: config.rerank_parallel.to_string(),
+            description: "Exact rerank slots (--rerank-parallel).",
+        },
+        FixedKnob {
+            name: "layout",
+            kind: KnobKind::String,
+            value: match config.layout {
+                Layout::Segments => "segments".to_string(),
+                Layout::SingleImage => "single-image".to_string(),
+            },
+            description: "On-disk layout of a new persisted shard (--layout).",
+        },
+        FixedKnob {
+            name: "vector_mmap",
+            kind: KnobKind::Bool,
+            value: config.vector_mmap.to_string(),
+            description: "Serve sealed vector images through a memory map (--vector-mmap).",
+        },
+        FixedKnob {
+            name: "seal_tail_docs",
+            kind: KnobKind::Int,
+            value: config.seal_tail_docs.to_string(),
+            description: "Rows that seal the tail into a segment (--seal-tail-docs).",
+        },
+        FixedKnob {
+            name: "bit_width",
+            kind: KnobKind::Int,
+            value: config.bit_width.to_string(),
+            description: "Quantized bits per dimension (--bit-width).",
+        },
+        FixedKnob {
+            name: "slot_offset",
+            kind: KnobKind::Int,
+            value: config.slot_offset.to_string(),
+            description: "First global id of this shard.",
+        },
+        FixedKnob {
+            name: "collection",
+            kind: KnobKind::String,
+            value: config.collection.clone(),
+            description: "The collection this shard belongs to.",
+        },
+        FixedKnob {
+            name: "vector_backend",
+            kind: KnobKind::String,
+            value: config.vector_backend.clone(),
+            description: "The vector backend the shard was built with.",
+        },
+    ];
+    Knobs::node(
+        process,
+        NodeKnobValues {
+            share_floors: config.share_floors,
+            segment_pruning: config.segment_pruning,
+            floor_delta: config.floor_delta,
+            floor_warmup_chunks: config.floor_warmup_chunks,
+            floor_min_interval_ms: config.floor_min_interval_ms,
+        },
+        fixed,
+    )
+}
+
 fn resolved_rerank_parallel(configured: usize) -> usize {
     if configured == 0 {
         std::thread::available_parallelism()
@@ -160,6 +256,10 @@ pub struct NodeConfig {
     /// disabled" baseline for A/B benchmarking. Results are identical
     /// either way; only the cost changes.
     pub block_max: bool,
+    /// Skip sealed segments a request's filter cannot match, from
+    /// their column summaries (`docs/segment-pruning.md`); `false` is the
+    /// A/B switch and changes no answer.
+    pub segment_pruning: bool,
     /// Minimum improvement over the last PUBLISHED floor before the next
     /// one goes on the wire. 0.0 publishes every raise (the historical
     /// behavior); a small positive delta trades a sliver of pruning
@@ -314,6 +414,7 @@ impl Default for NodeConfig {
             chunk_blocks: DEFAULT_CHUNK_BLOCKS,
             share_floors: true,
             block_max: true,
+            segment_pruning: true,
             floor_delta: 0.0,
             floor_warmup_chunks: 0,
             floor_min_interval_ms: 0,
@@ -528,7 +629,7 @@ impl Bm25Shard {
 
     /// The facet-table index of the facet field named `name`, if the
     /// active table has it.
-    fn facet_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn facet_index(&self, name: &str) -> Option<usize> {
         match self {
             Bm25Shard::Building(s) => s.facet_index(name),
             Bm25Shard::Spilling(s) => s.facet_index(name),
@@ -582,7 +683,7 @@ impl Bm25Shard {
 
     /// The numeric-table index of the numeric field named `name`, if
     /// the active table has it.
-    fn numeric_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn numeric_index(&self, name: &str) -> Option<usize> {
         match self {
             Bm25Shard::Building(s) => s.numeric_index(name),
             Bm25Shard::Spilling(s) => s.numeric_index(name),
@@ -614,7 +715,7 @@ impl Bm25Shard {
 
     /// The integer-table index of the i64 field named `name`, if the
     /// active table has it.
-    fn integer_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn integer_index(&self, name: &str) -> Option<usize> {
         match self {
             Bm25Shard::Building(s) => s.integer_index(name),
             Bm25Shard::Spilling(s) => s.integer_index(name),
@@ -1212,6 +1313,16 @@ impl Bm25Shard {
             Bm25Shard::Spilling(_) => None,
             Bm25Shard::Resident(r) => Some(Box::new(r.field(f))),
             Bm25Shard::Segmented(g) => Some(Box::new(g.field(f))),
+        }
+    }
+
+    /// [`Self::field_view`] over the sealed parts `mask` admits on a
+    /// segmented shard (`docs/segment-pruning.md`); the other layouts
+    /// have no parts to skip and serve the plain view.
+    fn field_view_masked(&self, f: usize, mask: &Arc<[bool]>) -> Option<Box<dyn Bm25Index + '_>> {
+        match self {
+            Bm25Shard::Segmented(g) => Some(Box::new(g.field_masked(f, Arc::clone(mask)))),
+            _ => self.field_view(f),
         }
     }
 
@@ -1973,6 +2084,8 @@ enum AggAcc {
         sum: i128,
         min: i64,
         max: i64,
+        /// CARDINALITY: the distinct values seen.
+        distinct: Option<std::collections::HashSet<i64>>,
     },
     Double {
         present: u64,
@@ -1985,10 +2098,35 @@ enum AggAcc {
         /// Welford.
         mean: f64,
         m2: f64,
+        /// CARDINALITY: the distinct canonical bit patterns seen.
+        distinct: Option<std::collections::HashSet<u64>>,
     },
     Str {
         present: u64,
+        /// CARDINALITY: the distinct (map, column, ordinal) reads seen;
+        /// rendered against the dictionary on the way out.
+        distinct: Option<std::collections::HashSet<(bool, usize, u32)>>,
     },
+    /// CARDINALITY over a boolean expression: which of the values
+    /// occurred.
+    Bool {
+        present: u64,
+        seen_true: bool,
+        seen_false: bool,
+    },
+}
+
+/// One bit pattern per double value for the distinct count: a single
+/// NaN and a single zero, so `-0.0` and `0.0` are one value and every
+/// NaN payload is one value. Everything else is its own bits.
+fn canonical_double_bits(x: f64) -> u64 {
+    if x.is_nan() {
+        f64::NAN.to_bits()
+    } else if x == 0.0 {
+        0
+    } else {
+        x.to_bits()
+    }
 }
 
 impl AggAcc {
@@ -2001,6 +2139,7 @@ impl AggAcc {
                     sum,
                     min,
                     max,
+                    distinct,
                 },
                 crate::values::Val::Int(x),
             ) => {
@@ -2013,6 +2152,9 @@ impl AggAcc {
                 }
                 *present += 1;
                 *sum += i128::from(x);
+                if let Some(set) = distinct {
+                    set.insert(x);
+                }
             }
             (
                 AggAcc::Double {
@@ -2023,9 +2165,13 @@ impl AggAcc {
                     max,
                     mean,
                     m2,
+                    distinct,
                 },
                 crate::values::Val::Double(x),
             ) => {
+                if let Some(set) = distinct {
+                    set.insert(canonical_double_bits(x));
+                }
                 if *present == 0 {
                     *min = x;
                     *max = x;
@@ -2052,15 +2198,60 @@ impl AggAcc {
                 *mean += delta / n;
                 *m2 += delta * (x - *mean);
             }
-            (AggAcc::Str { present }, crate::values::Val::FacetOrd { .. })
-            | (AggAcc::Str { present }, crate::values::Val::MapFacetOrd { .. }) => {
+            (AggAcc::Str { present, distinct }, crate::values::Val::FacetOrd { column, ord }) => {
                 *present += 1;
+                if let Some(set) = distinct {
+                    set.insert((false, column, ord));
+                }
+            }
+            (
+                AggAcc::Str { present, distinct },
+                crate::values::Val::MapFacetOrd { column, ord },
+            ) => {
+                *present += 1;
+                if let Some(set) = distinct {
+                    set.insert((true, column, ord));
+                }
+            }
+            (
+                AggAcc::Bool {
+                    present,
+                    seen_true,
+                    seen_false,
+                },
+                crate::values::Val::Bool(b),
+            ) => {
+                *present += 1;
+                if b {
+                    *seen_true = true;
+                } else {
+                    *seen_false = true;
+                }
             }
             _ => unreachable!("resolution typed the accumulator"),
         }
     }
 
-    fn partial(&self) -> crate::pb::AggregatePartial {
+    /// This shard's distinct-value count, when CARDINALITY asked for
+    /// one.
+    fn distinct_len(&self) -> Option<usize> {
+        match self {
+            AggAcc::Absent => None,
+            AggAcc::Int { distinct, .. } => distinct.as_ref().map(|s| s.len()),
+            AggAcc::Double { distinct, .. } => distinct.as_ref().map(|s| s.len()),
+            AggAcc::Str { distinct, .. } => distinct.as_ref().map(|s| s.len()),
+            AggAcc::Bool {
+                seen_true,
+                seen_false,
+                ..
+            } => Some(usize::from(*seen_true) + usize::from(*seen_false)),
+        }
+    }
+
+    /// The wire partial. `store` renders string ordinals; only a
+    /// document-less shard, whose accumulators are all absent, has
+    /// none to offer.
+    fn partial(&self, store: Option<&Bm25Shard>) -> crate::pb::AggregatePartial {
         use crate::pb::AggregateValueType as T;
         let mut p = crate::pb::AggregatePartial {
             vtype: T::Absent as i32,
@@ -2073,6 +2264,7 @@ impl AggAcc {
                 sum,
                 min,
                 max,
+                distinct,
             } => {
                 p.vtype = T::Int as i32;
                 p.present = *present;
@@ -2080,6 +2272,11 @@ impl AggAcc {
                 p.int_sum_lo = *sum as u64;
                 p.int_min = *min;
                 p.int_max = *max;
+                if let Some(set) = distinct {
+                    let mut values: Vec<i64> = set.iter().copied().collect();
+                    values.sort_unstable();
+                    p.distinct_ints = values;
+                }
             }
             AggAcc::Double {
                 present,
@@ -2089,6 +2286,7 @@ impl AggAcc {
                 max,
                 mean,
                 m2,
+                distinct,
             } => {
                 p.vtype = T::Double as i32;
                 p.present = *present;
@@ -2098,18 +2296,53 @@ impl AggAcc {
                 p.double_max = *max;
                 p.mean = *mean;
                 p.m2 = *m2;
+                if let Some(set) = distinct {
+                    let mut values: Vec<u64> = set.iter().copied().collect();
+                    values.sort_unstable();
+                    p.distinct_double_bits = values;
+                }
             }
-            AggAcc::Str { present } => {
+            AggAcc::Str { present, distinct } => {
                 p.vtype = T::String as i32;
                 p.present = *present;
+                if let (Some(set), Some(store)) = (distinct, store) {
+                    let mut values: Vec<String> = set
+                        .iter()
+                        .map(|&(map, column, ord)| {
+                            if map {
+                                store.map_facet_value(column, ord).to_string()
+                            } else {
+                                store.facet_value(column, ord).to_string()
+                            }
+                        })
+                        .collect();
+                    values.sort_unstable();
+                    values.dedup();
+                    p.distinct_strings = values;
+                }
+            }
+            AggAcc::Bool {
+                present,
+                seen_true,
+                seen_false,
+            } => {
+                p.vtype = T::Bool as i32;
+                p.present = *present;
+                if *seen_false {
+                    p.distinct_bools.push(false);
+                }
+                if *seen_true {
+                    p.distinct_bools.push(true);
+                }
             }
         }
         p
     }
 }
 
-/// A fresh accumulator for one resolved type.
-fn acc_of(vt: crate::values::ValueType) -> AggAcc {
+/// A fresh accumulator for one resolved type; `cardinality` adds the
+/// distinct set the op counts.
+fn acc_of(vt: crate::values::ValueType, cardinality: bool) -> AggAcc {
     match vt {
         crate::values::ValueType::Unknown => AggAcc::Absent,
         crate::values::ValueType::Int => AggAcc::Int {
@@ -2117,6 +2350,7 @@ fn acc_of(vt: crate::values::ValueType) -> AggAcc {
             sum: 0,
             min: 0,
             max: 0,
+            distinct: cardinality.then(Default::default),
         },
         crate::values::ValueType::Double => AggAcc::Double {
             present: 0,
@@ -2126,10 +2360,35 @@ fn acc_of(vt: crate::values::ValueType) -> AggAcc {
             max: 0.0,
             mean: 0.0,
             m2: 0.0,
+            distinct: cardinality.then(Default::default),
         },
-        crate::values::ValueType::Str => AggAcc::Str { present: 0 },
-        crate::values::ValueType::Bool => unreachable!("check_agg_type refused booleans"),
+        crate::values::ValueType::Str => AggAcc::Str {
+            present: 0,
+            distinct: cardinality.then(Default::default),
+        },
+        crate::values::ValueType::Bool => {
+            debug_assert!(
+                cardinality,
+                "check_agg_type admits booleans under CARDINALITY only"
+            );
+            AggAcc::Bool {
+                present: 0,
+                seen_true: false,
+                seen_false: false,
+            }
+        }
     }
+}
+
+/// How one histogram buckets: a fixed width over doubles, or a
+/// calendar unit over epoch-micros ints (docs/aggregations.md).
+#[derive(Clone, Copy)]
+enum Bucketing {
+    Fixed(f64),
+    Calendar {
+        unit: crate::pb::CalendarInterval,
+        utc_offset_minutes: i32,
+    },
 }
 
 /// One shard's sparse histogram fold.
@@ -2154,8 +2413,31 @@ impl HistAcc {
             self.unbucketable += 1;
             return Ok(());
         }
+        self.count(idx_f as i64, cap, name)
+    }
+
+    /// Fold one present epoch-micros value into its calendar bucket,
+    /// keyed by the bucket's start instant. `Err` = this shard alone
+    /// exceeds the bucket cap.
+    fn push_calendar(
+        &mut self,
+        micros: i64,
+        unit: crate::pb::CalendarInterval,
+        utc_offset_minutes: i32,
+        cap: usize,
+        name: &str,
+    ) -> Result<(), Status> {
+        self.present += 1;
+        let Some(start) = crate::calendar::bucket_start(micros, unit, utc_offset_minutes) else {
+            self.unbucketable += 1;
+            return Ok(());
+        };
+        self.count(start, cap, name)
+    }
+
+    fn count(&mut self, key: i64, cap: usize, name: &str) -> Result<(), Status> {
         let n = self.buckets.len();
-        let slot = self.buckets.entry(idx_f as i64).or_insert(0);
+        let slot = self.buckets.entry(key).or_insert(0);
         *slot += 1;
         if *slot == 1 && n == cap {
             return Err(Status::failed_precondition(format!(
@@ -2259,6 +2541,10 @@ fn check_agg_type(
 ) -> Result<(), Status> {
     use crate::pb::AggregateOp as O;
     use crate::values::ValueType as V;
+    if op == O::Cardinality {
+        // Distinct values exist for every type, booleans included.
+        return Ok(());
+    }
     match vt {
         V::Bool => Err(Status::invalid_argument(format!(
             "aggregation {name:?}: a boolean aggregates nowhere; filter on the \
@@ -2289,8 +2575,213 @@ pub(crate) fn agg_op_name(op: crate::pb::AggregateOp) -> &'static str {
         O::Mean => "mean",
         O::Variance => "variance",
         O::Stddev => "stddev",
+        O::Cardinality => "cardinality",
     }
 }
+
+/// The explain breakdown of one scored document (docs/explain.md):
+/// each present (field, term) pair's inputs and contribution, computed
+/// with the scorers' own `idf` and `tf_norm` in the scorers' own
+/// operand order, and the pre-stage sum recomposed from them in
+/// accumulation order. `names[fi]` is the field name reported for
+/// `fields[fi]`; `phrase` is the phrase leg's view index and parallel
+/// term weights when the phrase scorer ran.
+fn explain_terms(
+    fields: &[bm25::FieldQuery<'_>],
+    names: &[&str],
+    presence: &[bm25::TermPresence],
+    phrase: Option<(usize, &[f64])>,
+) -> crate::pb::Bm25Explain {
+    let mut base = 0.0f64;
+    let mut phrase_max = 0.0f64;
+    let mut terms = Vec::with_capacity(presence.len());
+    for hit in presence {
+        let fq = &fields[hit.field];
+        let avgdl = fq.stats.avgdl();
+        let idf = bm25::idf(fq.stats.doc_count, fq.stats.dfs[hit.term]);
+        let tf_norm = bm25::tf_norm(fq.params, hit.tf, hit.doc_len, avgdl);
+        let mut contribution = fq.weight * idf * tf_norm;
+        let mut phrase_group = false;
+        let mut phrase_weight = 1.0;
+        match phrase {
+            Some((view, weights)) if view == hit.field => {
+                phrase_group = true;
+                phrase_weight = weights[hit.term];
+                contribution *= phrase_weight;
+                phrase_max = phrase_max.max(contribution);
+            }
+            _ => base += contribution,
+        }
+        terms.push(crate::pb::Bm25TermExplain {
+            field: names[hit.field].to_string(),
+            term: fq.terms[hit.term].clone(),
+            tf: hit.tf,
+            doc_length: hit.doc_len,
+            avgdl,
+            k1: fq.params.k1,
+            b: fq.params.b,
+            tf_norm,
+            doc_count: fq.stats.doc_count,
+            df: fq.stats.dfs[hit.term],
+            idf,
+            weight: fq.weight,
+            contribution,
+            phrase_group,
+            phrase_weight,
+        });
+    }
+    crate::pb::Bm25Explain {
+        terms,
+        bm25: base + phrase_max,
+        stages: Vec::new(),
+        phrase: phrase.is_some(),
+        phrase_max,
+    }
+}
+
+/// The score-stage rows of an explain breakdown: the chain replayed
+/// stage by stage from the pre-stage sum with the same reads and the
+/// same float expressions `ScoreChain::eval` uses.
+fn explain_stages(
+    explain: &mut crate::pb::Bm25Explain,
+    chain: &crate::scorefn::ScoreChain,
+    specs: &[crate::pb::ScoreStage],
+    doc_id: u32,
+    columns: &dyn crate::scorefn::NumericRead,
+) {
+    let mut score = explain.bm25;
+    for (i, stage) in chain.stages.iter().enumerate() {
+        let spec = &specs[i];
+        let mut row = crate::pb::ScoreStageExplain {
+            stage: i as u32,
+            column: spec.column.clone(),
+            key: spec.key.clone(),
+            present: false,
+            input: 0.0,
+            contribution: 0.0,
+            output: score,
+        };
+        if let (Some(input), Some(contribution)) = (
+            stage.input(doc_id, columns),
+            stage.contribution(doc_id, columns),
+        ) {
+            score = if stage.is_additive() {
+                score + contribution
+            } else {
+                score * contribution
+            };
+            row.present = true;
+            row.input = input;
+            row.contribution = contribution;
+            row.output = score;
+        }
+        explain.stages.push(row);
+    }
+}
+
+/// The sealed segments a resolved predicate rules out on one shard
+/// (`docs/segment-pruning.md`): their local slot ranges in catalog
+/// order, the counts, and the admitted-parts mask the postings walks
+/// take (`None` when no part was ruled out, so the unmasked reader
+/// serves and the path is the one it always was).
+#[derive(Debug, Default)]
+struct SegmentPrune {
+    /// `(base, rows)` of every pruned sealed segment, ascending.
+    ranges: Vec<(u32, u32)>,
+    stats: crate::segment_prune::PruneStats,
+    /// One flag per sealed part, `true` = walk it.
+    mask: Option<Arc<[bool]>>,
+}
+
+impl SegmentPrune {
+    /// Local slots outside every pruned range, ascending, over `0..n`.
+    fn admitted_slots(&self, n: u32) -> impl Iterator<Item = u32> + '_ {
+        self.admitted_slots_from(0, n)
+    }
+
+    /// Local slots outside every pruned range, ascending, over `start..n`.
+    fn admitted_slots_from(&self, start: u32, n: u32) -> impl Iterator<Item = u32> + '_ {
+        let mut ranges = self.ranges.iter().copied().peekable();
+        (start..n).filter(move |&slot| {
+            while let Some(&(base, rows)) = ranges.peek() {
+                if slot >= base.saturating_add(rows) {
+                    ranges.next();
+                    continue;
+                }
+                return slot < base;
+            }
+            true
+        })
+    }
+}
+
+/// Decide, from the segment summaries, which sealed segments of a
+/// segmented shard hold no row that can satisfy `pred`. A shard in any
+/// other layout, or a request without a predicate, prunes none; with
+/// `enabled == false` none is pruned either, and only the total is
+/// counted.
+fn prune_segments(
+    store: &Bm25Shard,
+    pred: Option<&crate::filter::ResolvedFilter>,
+    enabled: bool,
+) -> SegmentPrune {
+    let Bm25Shard::Segmented(shard) = store else {
+        return SegmentPrune::default();
+    };
+    let summaries = shard.part_summaries();
+    let (verdicts, stats) = crate::segment_prune::verdicts_over(pred, &summaries, shard, enabled);
+    let ranges: Vec<(u32, u32)> = shard
+        .sealed_ranges()
+        .into_iter()
+        .zip(&verdicts)
+        .filter(|(_, &pruned)| pruned)
+        .map(|(range, _)| range)
+        .collect();
+    let mask = (stats.segments_skipped > 0).then(|| {
+        verdicts
+            .iter()
+            .map(|&pruned| !pruned)
+            .collect::<Arc<[bool]>>()
+    });
+    SegmentPrune {
+        ranges,
+        stats,
+        mask,
+    }
+}
+
+/// Fill the slot allowlist for one shard: every slot of a pruned
+/// segment is `false` without a predicate evaluation; every other slot
+/// is the filter's verdict.
+fn fill_allowlist(n: u32, prune: &SegmentPrune, mut passes: impl FnMut(u32) -> bool) -> Vec<bool> {
+    let mut allow = vec![false; n as usize];
+    let mut slot = 0u32;
+    for &(base, rows) in &prune.ranges {
+        for s in slot..base.min(n) {
+            allow[s as usize] = passes(s);
+        }
+        slot = base.saturating_add(rows).min(n);
+    }
+    for s in slot..n {
+        allow[s as usize] = passes(s);
+    }
+    allow
+}
+
+/// Resolve a request's filters for one shard into the predicate the
+/// scorers gate with and the slot allowlist the vector kernel scans
+/// under. With `prune` set and a segmented shard, sealed segments the
+/// predicate cannot match are ruled out from their summaries first
+/// (`docs/segment-pruning.md`): their slots are `false` without a
+/// per-row evaluation, and the counts come back alongside.
+/// What [`resolve_shard_filters`] hands back: the predicate for the
+/// scorers' heap gate, the slot allowlist for the vector kernel, and
+/// the segment counts.
+type ResolvedShardFilters = (
+    Option<crate::filter::DocFilter<'static>>,
+    Option<Vec<bool>>,
+    crate::segment_prune::PruneStats,
+);
 
 fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,
@@ -2299,9 +2790,17 @@ fn resolve_shard_filters(
     geo_filters: &[crate::pb::GeoFilter],
     geo_regions: &[crate::geo::GeoRegion],
     filter: Option<&crate::pb::FilterExpr>,
-) -> Result<(Option<crate::filter::DocFilter<'static>>, Option<Vec<bool>>), Status> {
+    prune: bool,
+) -> Result<ResolvedShardFilters, Status> {
+    let total = |bm25: Option<&Bm25Shard>| crate::segment_prune::PruneStats {
+        segments_total: match bm25 {
+            Some(Bm25Shard::Segmented(shard)) => shard.sealed_parts() as u32,
+            _ => 0,
+        },
+        segments_skipped: 0,
+    };
     if geo_filters.is_empty() && filter.is_none() && deleted.is_none() {
-        return Ok((None, None));
+        return Ok((None, None, total(bm25)));
     }
     let Some(store) = bm25 else {
         if geo_filters.is_empty() && filter.is_none() {
@@ -2314,9 +2813,9 @@ fn resolve_shard_filters(
                     })
                 })
                 .collect();
-            return Ok((None, Some(allow)));
+            return Ok((None, Some(allow), total(bm25)));
         }
-        return Ok((None, Some(vec![false; n])));
+        return Ok((None, Some(vec![false; n]), total(bm25)));
     };
     if store.as_index().is_none() {
         return Err(Status::failed_precondition(
@@ -2329,13 +2828,12 @@ fn resolve_shard_filters(
         pred: filter.map(|f| store.resolve_filter(f)).transpose()?,
         phrase: Vec::new(),
     };
+    let pruned = prune_segments(store, doc_filter.pred.as_ref(), prune);
     let allow = {
         let cols = ShardNumericRead(store);
-        (0..n as u32)
-            .map(|slot| doc_filter.passes(slot, &cols))
-            .collect()
+        fill_allowlist(n as u32, &pruned, |slot| doc_filter.passes(slot, &cols))
     };
-    Ok((Some(doc_filter), Some(allow)))
+    Ok((Some(doc_filter), Some(allow), pruned.stats))
 }
 
 /// The two known-column handshakes for one request, in the shape every
@@ -3209,7 +3707,16 @@ pub struct NodeServiceImpl {
     /// shard — every doc logged, none attributable — so the second stream
     /// is refused outright rather than merged.
     ingest_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// A fence on ingest (`docs/cluster-control.md`, "Shard split"): set
+    /// by the node agent when the shard's rows are moving to its split
+    /// children, so no append can land between the children's final
+    /// catch-up and the topology cutover. The reason names the
+    /// children; a fenced shard refuses every ingest stream by name and
+    /// keeps serving queries.
+    ingest_fence: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) config: NodeConfig,
+    /// Runtime knobs read at request time (docs/diagnostics.md).
+    knobs: Arc<crate::diagnostics::Knobs>,
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
     scan_jobs: Arc<std::sync::OnceLock<mpsc::Sender<ScanJob>>>,
@@ -3440,6 +3947,7 @@ struct ScanJob {
 async fn scan_scheduler(
     state: Arc<std::sync::RwLock<ShardState>>,
     chunk_blocks: usize,
+    knobs: Arc<crate::diagnostics::Knobs>,
     parallel: usize,
     mut jobs: mpsc::Receiver<ScanJob>,
 ) {
@@ -3465,17 +3973,23 @@ async fn scan_scheduler(
         SCAN_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SCAN_BATCHED_JOBS.fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let state = state.clone();
+        let segment_pruning = knobs.segment_pruning();
         tokio::task::spawn_blocking(move || {
             let _slot = permit;
-            run_scan_batch(&state, chunk_blocks, batch);
+            run_scan_batch(&state, chunk_blocks, segment_pruning, batch);
         });
     }
 }
 
 /// Run one batched scan under the shard read lock and deliver every job's
 /// result. Blocking-pool context.
-fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, batch: Vec<ScanJob>) {
-    let guard = state.read().expect("shard state lock poisoned");
+fn run_scan_batch(
+    state: &std::sync::RwLock<ShardState>,
+    chunk_blocks: usize,
+    segment_pruning: bool,
+    batch: Vec<ScanJob>,
+) {
+    let guard = read_shard(state);
     let index = match guard.index.as_ref() {
         Some(index) => index,
         None => {
@@ -3494,6 +4008,7 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
     let slots = index.len();
     let mut specs: Vec<(Vec<f32>, usize, bool)> = Vec::with_capacity(batch.len());
     let mut allows: Vec<Option<Vec<bool>>> = Vec::with_capacity(batch.len());
+    let mut prunes: Vec<crate::segment_prune::PruneStats> = Vec::with_capacity(batch.len());
     let mut knowns: Vec<(Vec<bool>, Vec<bool>)> = Vec::with_capacity(batch.len());
     let mut externals: Vec<Box<dyn FnMut() -> Option<f32> + Send>> = Vec::new();
     let mut publishers: Vec<Box<dyn FnMut(f32) -> bool + Send>> = Vec::new();
@@ -3513,14 +4028,16 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
             &job.geo_filters,
             &job.geo_regions,
             job.filter.as_ref(),
+            segment_pruning,
         );
-        let allow = match resolved {
-            Ok((_, allow)) => allow,
+        let (allow, prune) = match resolved {
+            Ok((_, allow, prune)) => (allow, prune),
             Err(e) => {
                 let _ = job.done.send(Err(e));
                 continue;
             }
         };
+        prunes.push(prune);
         knowns.push(filter_known_flags(
             guard.bm25.as_ref(),
             &job.geo_filters,
@@ -3552,9 +4069,11 @@ fn run_scan_batch(state: &std::sync::RwLock<ShardState>, chunk_blocks: usize, ba
         &mut |qi| (externals[qi])(),
         &mut |qi, floor| (publishers[qi])(floor),
     );
-    for ((done, (hits, stats)), (geo_columns_known, filter_columns_known)) in
-        dones.into_iter().zip(results).zip(knowns)
+    for (((done, (hits, mut stats)), (geo_columns_known, filter_columns_known)), prune) in
+        dones.into_iter().zip(results).zip(knowns).zip(prunes)
     {
+        stats.segments_total = prune.segments_total;
+        stats.segments_skipped = prune.segments_skipped;
         crate::metrics::record_scan(&stats);
         let _ = done.send(Ok(ScanOutcome {
             hits,
@@ -3571,6 +4090,61 @@ struct IngestGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for IngestGuard {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Wait for a shard lock without holding a runtime worker hostage.
+///
+/// `ShardState` sits behind a std `RwLock`, and most acquisitions are
+/// uncontended and short, so they happen inline. A contended one is a
+/// different matter on a tokio worker: a compaction cutover holds the
+/// write lock while it analyzes its last records over the network, and
+/// that stream is served by the same runtime. A worker that parks in the
+/// futex under those conditions takes the tasks in its slot with it, and
+/// the cutover then waits for a stream the parked worker was about to
+/// drive: both sides wait forever. Measured on 2026-09-05 with a stack
+/// dump of the hung test process, not inferred.
+///
+/// So a contended wait on a multi-thread runtime goes through
+/// `block_in_place`, which hands the worker's queue to another thread
+/// before this one parks. Off the runtime, or on a current-thread
+/// runtime (where `block_in_place` is not allowed and the wait is the
+/// caller's own), the wait happens inline.
+fn wait_off_runtime<T>(wait: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
+/// The shard read lock; see [`wait_off_runtime`].
+pub(crate) fn read_shard(state: &RwLock<ShardState>) -> std::sync::RwLockReadGuard<'_, ShardState> {
+    match state.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("shard state lock poisoned: {poisoned}")
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            wait_off_runtime(|| state.read().expect("shard state lock poisoned"))
+        }
+    }
+}
+
+/// The shard write lock; see [`wait_off_runtime`].
+pub(crate) fn write_shard(
+    state: &RwLock<ShardState>,
+) -> std::sync::RwLockWriteGuard<'_, ShardState> {
+    match state.try_write() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("shard state lock poisoned: {poisoned}")
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            wait_off_runtime(|| state.write().expect("shard state lock poisoned"))
+        }
     }
 }
 
@@ -3732,7 +4306,9 @@ impl NodeServiceImpl {
         let wal = open_wal(index.as_ref(), &config);
         let vocab = open_vocab(&config);
         let rerank_parallel = resolved_rerank_parallel(config.rerank_parallel);
+        let knobs = Arc::new(node_knobs(&config));
         Self {
+            knobs,
             state: Arc::new(RwLock::new(ShardState {
                 index,
                 exact_vectors: None,
@@ -3747,6 +4323,7 @@ impl NodeServiceImpl {
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
+            ingest_fence: Arc::new(std::sync::Mutex::new(None)),
             seal_lock: Arc::new(std::sync::Mutex::new(())),
             compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -3851,6 +4428,7 @@ impl NodeServiceImpl {
                 tokio::spawn(scan_scheduler(
                     self.state.clone(),
                     self.config.chunk_blocks,
+                    Arc::clone(&self.knobs),
                     parallel,
                     rx,
                 ));
@@ -3965,9 +4543,25 @@ impl NodeServiceImpl {
         }
     }
 
+    /// Fence ingest on this shard: every later ingest stream is refused
+    /// naming `reason`; queries are unaffected. Idempotent.
+    pub fn fence_ingest(&self, reason: String) {
+        *self.ingest_fence.lock().expect("ingest fence lock") = Some(reason);
+    }
+
+    /// The fence reason, when the shard is fenced.
+    pub fn ingest_fence(&self) -> Option<String> {
+        self.ingest_fence.lock().expect("ingest fence lock").clone()
+    }
+
     /// Claim the single-writer ingest gate, or refuse the stream.
     fn claim_ingest(&self) -> Result<IngestGuard, Status> {
         use std::sync::atomic::Ordering;
+        if let Some(reason) = self.ingest_fence() {
+            return Err(Status::failed_precondition(format!(
+                "ingest is fenced on this shard: {reason}"
+            )));
+        }
         if self
             .ingest_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -3986,7 +4580,7 @@ impl NodeServiceImpl {
     /// under.
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             guard.mapped_binding = store.as_ref().and_then(|s| s.binding().cloned());
             guard.bm25 = store;
             guard.stats_epoch += 1;
@@ -3998,7 +4592,7 @@ impl NodeServiceImpl {
     /// must describe exactly the provider slots in this shard generation.
     pub fn with_exact_vectors(self, store: Option<ExactVectorStore>) -> Result<Self, String> {
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             if let Some(exact) = store.as_ref() {
                 if let Some(index) = guard.index.as_ref() {
                     if exact.len() != index.len() || exact.dim() != index.dim_opt() {
@@ -4029,7 +4623,7 @@ impl NodeServiceImpl {
     /// Attach the persisted generation overlay loaded at startup.
     pub fn with_live_docs(self, live_docs: LiveDocs) -> Result<Self, String> {
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             let rows = physical_rows(&guard);
             if live_docs.persisted_rows() > rows {
                 return Err(format!(
@@ -4062,11 +4656,122 @@ impl NodeServiceImpl {
     /// A metrics gauge sampler over this shard's live state
     /// (`docs/metrics.md`): called at scrape time, reads under the
     /// state lock, and so can never go stale.
+    /// The knobs this node reads at request time (docs/diagnostics.md).
+    pub fn knobs(&self) -> &Arc<crate::diagnostics::Knobs> {
+        &self.knobs
+    }
+
+    /// The diagnostics service over this node, for the same listener
+    /// as its `NodeService`.
+    pub fn diagnostics_server(
+        &self,
+        max_message_bytes: usize,
+    ) -> crate::pb::diagnostics_service_server::DiagnosticsServiceServer<
+        crate::diagnostics::NodeDiagnostics,
+    > {
+        crate::diagnostics::NodeDiagnostics::new(self.clone()).into_server(max_message_bytes)
+    }
+
+    /// This shard's layout for `GetShardDiagnostics`
+    /// (docs/diagnostics.md): the catalog's sealed segments with their
+    /// summaries, the tail, rows, tombstones, and the live knob values.
+    pub fn shard_diagnostics(
+        &self,
+        shard: u32,
+        address: String,
+    ) -> crate::pb::ShardLayoutDiagnostics {
+        use crate::pb::{SegmentColumnRange, SegmentDiagnostics, ShardLayoutDiagnostics};
+        let guard = read_shard(&self.state);
+        let vector_rows = guard.index.as_ref().map_or(0, |i| i.len() as u64);
+        let doc_rows = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
+        let rows = vector_rows.max(doc_rows);
+        let tombstones = guard.live_docs.deleted_count();
+        let scoring_fingerprint = guard
+            .index
+            .as_ref()
+            .map(|i| i.descriptor().scoring_fingerprint)
+            .unwrap_or_default();
+        let mut out = ShardLayoutDiagnostics {
+            shard,
+            address,
+            layout: match guard.bm25.as_ref() {
+                Some(Bm25Shard::Segmented(_)) => "segments".to_string(),
+                Some(_) => "single-image".to_string(),
+                None => match self.config.layout {
+                    Layout::Segments => "segments".to_string(),
+                    Layout::SingleImage => "single-image".to_string(),
+                },
+            },
+            rows,
+            live_rows: rows.saturating_sub(tombstones),
+            tombstones,
+            scoring_fingerprint,
+            segment_pruning: self.knobs.segment_pruning(),
+            floor_sharing: self.knobs.share_floors(),
+            ..Default::default()
+        };
+        if let Some(Bm25Shard::Segmented(segmented)) = guard.bm25.as_ref() {
+            let set = segmented.snapshot();
+            out.catalog_epoch = set.epoch();
+            out.partition_key = set.manifest().partition_key.clone().unwrap_or_default();
+            out.tail_rows = u64::from(
+                segmented
+                    .next_doc_id()
+                    .saturating_sub(segmented.tail_base()),
+            );
+            for i in 0..set.len() {
+                let meta = set.metadata(i);
+                let mut columns = Vec::new();
+                let mut partition = None;
+                if let Some(summary) = meta.summary.as_ref() {
+                    for c in &summary.int_columns {
+                        columns.push(SegmentColumnRange {
+                            column: c.name.clone(),
+                            lo: c.min,
+                            hi: c.max,
+                            present: c.present,
+                            ..Default::default()
+                        });
+                    }
+                    for c in &summary.numeric_columns {
+                        columns.push(SegmentColumnRange {
+                            column: c.name.clone(),
+                            lo_f: c.min,
+                            hi_f: c.max,
+                            present: c.present,
+                            floating: true,
+                            ..Default::default()
+                        });
+                    }
+                    partition = summary.partition.as_ref().map(|p| SegmentColumnRange {
+                        column: p.column.clone(),
+                        lo: p.lo,
+                        hi: p.hi,
+                        present: meta.live_rows,
+                        ..Default::default()
+                    });
+                }
+                out.segments.push(SegmentDiagnostics {
+                    segment_id: meta.segment_id.clone(),
+                    generation: meta.generation,
+                    base: meta.base_label,
+                    rows: meta.rows,
+                    live_rows: meta.live_rows,
+                    has_summary: meta.summary.is_some(),
+                    columns,
+                    partition,
+                    mapped: set.vector(i).is_some_and(|v| v.is_mapped()),
+                });
+            }
+        }
+        out
+    }
+
     pub fn metrics_provider(&self) -> crate::metrics::GaugeProvider {
         let state = Arc::clone(&self.state);
         let slot_offset = self.config.slot_offset;
         Box::new(move || {
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&state);
             crate::metrics::ShardGauges {
                 slot_offset,
                 vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
@@ -4098,7 +4803,7 @@ impl NodeServiceImpl {
     ) -> Arc<Vec<u64>> {
         const SELF_PARENT_TAG: u64 = 1 << 63;
         {
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(state);
             if let Some(p) = guard.parents.as_ref() {
                 if p.len() == n {
                     return Arc::clone(p);
@@ -4106,7 +4811,7 @@ impl NodeServiceImpl {
             }
         }
         let built = {
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(state);
             let store = guard.bm25.as_ref().and_then(|b| b.as_index());
             let mut parents = Vec::with_capacity(n);
             for slot in 0..n {
@@ -4118,7 +4823,7 @@ impl NodeServiceImpl {
             }
             Arc::new(parents)
         };
-        state.write().expect("shard state lock poisoned").parents = Some(Arc::clone(&built));
+        write_shard(state).parents = Some(Arc::clone(&built));
         built
     }
 
@@ -4212,7 +4917,7 @@ impl NodeServiceImpl {
         let outcome = self.write_segment(&plan);
         let _ = std::fs::remove_dir_all(&plan.stage);
         let published = outcome?;
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_mut() else {
             return Err(Status::internal(
                 "the segmented shard changed layout while a seal was in flight",
@@ -4248,7 +4953,7 @@ impl NodeServiceImpl {
     /// pick up the frozen part a failed seal left) and gather what the
     /// writer needs. `None` when there is nothing to seal.
     fn freeze_tail(&self) -> Result<Option<SealPlan>, Status> {
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let ShardState {
             bm25,
             index,
@@ -4361,7 +5066,7 @@ impl NodeServiceImpl {
                     .write(&vector_path)
                     .map_err(|e| Status::internal(format!("seal vectors: {e}")))?;
                 let (dim, values) = {
-                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let guard = read_shard(&self.state);
                     let exact = guard.exact_vectors.as_ref().ok_or_else(|| {
                         Status::failed_precondition(
                             "sealing a segment with vectors needs the exact-vector sidecar for \
@@ -4398,6 +5103,7 @@ impl NodeServiceImpl {
             exact_vector_path: exact_path.as_deref(),
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
+            partition_column: None,
         };
         plan.catalog
             .append(source)
@@ -4411,7 +5117,7 @@ impl NodeServiceImpl {
             return false;
         }
         let bound = self.config.seal_tail_docs as usize;
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
             return false;
         };
@@ -4464,7 +5170,7 @@ impl NodeServiceImpl {
 
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let Some(config_path) = self.config.index_path.clone() else {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             return Ok(FlushResponse {
                 path: String::new(),
                 num_vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
@@ -4478,7 +5184,7 @@ impl NodeServiceImpl {
         // whose records the log lost would silently drop those records
         // from every future replay (reshard, recovery).
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             if let Some(wal) = guard.wal.as_mut() {
                 wal.flush().map_err(|e| {
                     Status::internal(format!("wal fsync {}: {e}", wal.dir().display()))
@@ -4488,7 +5194,7 @@ impl NodeServiceImpl {
         // A segmented shard seals its tail with the lock free (see
         // `seal_tail`); the single-image writes below hold it.
         let sealed = self.seal_tail()?;
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
         let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let (vector_path, exact_path, bm25_path) =
@@ -4789,7 +5495,7 @@ impl NodeServiceImpl {
         // score one shard in another space (docs/mmap-vectors.md).
         {
             let incoming = loaded.descriptor();
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let serving_kind = guard
                 .index
                 .as_ref()
@@ -4868,7 +5574,7 @@ impl NodeServiceImpl {
             ));
         }
 
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         // Scoring comparability: a shard with a locked backend configuration
         // only accepts an image with the identical scoring fingerprint.
         if let Some(index) = guard.index.as_ref() {
@@ -5000,7 +5706,7 @@ impl NodeServiceImpl {
     /// Per-field analysis fingerprints of the BM25 store, in field-table
     /// order (empty without a store).
     pub fn analysis_fingerprints(&self) -> Vec<u64> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         Self::analysis_fingerprints_of(&guard)
     }
 
@@ -5016,7 +5722,7 @@ impl NodeServiceImpl {
     /// the segment layout, one for a disk-resident single image, zero
     /// for a heap builder or an empty shard.
     pub fn immutable_segments(&self) -> u32 {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         match guard.bm25.as_ref() {
             Some(Bm25Shard::Segmented(shard)) => shard.sealed_parts() as u32,
             Some(Bm25Shard::Resident(_)) => 1,
@@ -5063,7 +5769,7 @@ impl NodeServiceImpl {
         let mut attempts = 0u32;
         let (manifest, bytes) = loop {
             attempts += 1;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             match guard.wal.as_ref() {
                 Some(wal) if wal.is_dirty() => {
                     drop(guard);
@@ -5079,7 +5785,7 @@ impl NodeServiceImpl {
                 Some(_) => break self.export_locked(&guard, &index_path, directory)?,
                 None => {
                     drop(guard);
-                    let guard = self.state.write().expect("shard state lock poisoned");
+                    let guard = write_shard(&self.state);
                     break self.export_locked(&guard, &index_path, directory)?;
                 }
             }
@@ -5272,7 +5978,7 @@ impl NodeServiceImpl {
             ));
         }
         {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             if Self::served_layout(&guard) == LAYOUT_SEGMENTS && physical_rows(&guard) > 0 {
                 return Err(Status::failed_precondition(format!(
                     "this shard serves a segment catalog with {} rows; a single-image snapshot \
@@ -5317,7 +6023,7 @@ impl NodeServiceImpl {
             ));
         }
         {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             if guard.generation.is_some() {
                 return Err(Status::failed_precondition(
                     "this shard serves an installed single-image generation; a segment-catalog \
@@ -5358,7 +6064,7 @@ impl NodeServiceImpl {
         };
         let incoming = incoming.or_else(|| plain_image.as_ref().map(|i| i.descriptor()));
         {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let serving_kind = guard
                 .index
                 .as_ref()
@@ -5430,7 +6136,7 @@ impl NodeServiceImpl {
         drop(staged);
         drop(plain_image);
 
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         if let (Some(index), Some(incoming)) = (guard.index.as_ref(), incoming.as_ref()) {
             let current = index.descriptor();
             if current.backend_kind != incoming.backend_kind
@@ -5597,7 +6303,7 @@ impl NodeServiceImpl {
             VectorIndex::from_backend_config(dim, &config)
                 .map_err(|e| Status::invalid_argument(format!("invalid backend config: {e}")))
         };
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let result = match guard.index.as_ref() {
             Some(index) if !index.is_empty() => Err(Status::failed_precondition(format!(
                 "shard holds {} vectors; vector backend configuration is locked for the generation",
@@ -5664,7 +6370,7 @@ impl NodeServiceImpl {
         batch: AddVectorsRequest,
         stable_routing_key: Option<Vec<u8>>,
     ) -> Result<(u64, u64), Status> {
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         self.apply_batch_locked(&mut guard, batch, stable_routing_key)
     }
 
@@ -5881,7 +6587,7 @@ impl NodeServiceImpl {
         if let Some(f) = req.filter.as_ref() {
             crate::filter::validate_filter(f)?;
         }
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         // Filled inside the scoring arm (the facet walk reuses the
         // resolved field views); a shard with no lexical half answers
@@ -5899,6 +6605,7 @@ impl NodeServiceImpl {
             (None, Some(f)) => vec![false; crate::filter::leaf_count(f)],
             (_, None) => Vec::new(),
         };
+        let mut fused_prune = crate::segment_prune::PruneStats::default();
         let hits: Vec<Bm25Hit> = match guard.bm25.as_ref() {
             // Facet counting enters the arm even at k == 0 (the flat
             // path counts regardless of k; the scorers return no hits
@@ -5946,6 +6653,30 @@ impl NodeServiceImpl {
                 // filters the ctx is None and every path below is
                 // bit-identical to its unfiltered form.
                 let numeric_read = ShardNumericRead(store);
+                let pred = req
+                    .filter
+                    .as_ref()
+                    .map(|f| store.resolve_filter(f))
+                    .transpose()?;
+                // Sealed segments the predicate rules out leave every
+                // leg's walk (docs/segment-pruning.md): the views the
+                // scorers, the facet counts, and the phrase gates take
+                // are rebuilt over the admitted parts.
+                let prune = prune_segments(store, pred.as_ref(), self.knobs.segment_pruning());
+                fused_prune = prune.stats;
+                if let Some(mask) = prune.mask.as_ref() {
+                    views = leg_of_view
+                        .iter()
+                        .map(|&li| {
+                            let fi = store
+                                .field_index(&req.fields[li].field)
+                                .expect("the field resolved above");
+                            store
+                                .field_view_masked(fi, mask)
+                                .expect("searchable, checked above")
+                        })
+                        .collect();
+                }
                 // Phrase gates (docs/phrase-proximity.md): a leg's
                 // ordered window, checked at the same heap gate as every
                 // other filter. The field must be on this shard and must
@@ -5994,11 +6725,7 @@ impl NodeServiceImpl {
                 let doc_filter = crate::filter::DocFilter {
                     deleted: guard.live_docs.words(),
                     geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                    pred: req
-                        .filter
-                        .as_ref()
-                        .map(|f| store.resolve_filter(f))
-                        .transpose()?,
+                    pred,
                     phrase: phrase_gates,
                 };
                 let filter_ctx: bm25::FilterCtx = if req.geo_filters.is_empty()
@@ -6144,8 +6871,36 @@ impl NodeServiceImpl {
                 let text_index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
+                // The explain breakdown, only for the hits that survived
+                // the top-k (docs/explain.md).
+                let presence = req.explain.then(|| {
+                    let ids: Vec<u32> = docs.iter().map(|doc| doc.doc_id).collect();
+                    bm25::breakdown(&queries, &ids)
+                });
+                let leg_names: Vec<&str> = leg_of_view
+                    .iter()
+                    .map(|&li| req.fields[li].field.as_str())
+                    .collect();
+                let phrase_weights: Option<(usize, Vec<f64>)> =
+                    phrase_view.map(|(view, weights)| {
+                        (
+                            view,
+                            weights.iter().map(|&value| f64::from(value)).collect(),
+                        )
+                    });
                 docs.into_iter()
-                    .map(|doc| -> Result<Bm25Hit, Status> {
+                    .enumerate()
+                    .map(|(hit_index, doc)| -> Result<Bm25Hit, Status> {
+                        let explain = presence.as_ref().map(|presence| {
+                            explain_terms(
+                                &queries,
+                                &leg_names,
+                                &presence[hit_index],
+                                phrase_weights
+                                    .as_ref()
+                                    .map(|(view, weights)| (*view, weights.as_slice())),
+                            )
+                        });
                         let snippets = match highlight.as_ref() {
                             Some(plan) => {
                                 // Body occurrences only (the stored text
@@ -6166,6 +6921,7 @@ impl NodeServiceImpl {
                         };
                         Ok(Bm25Hit {
                             identity: store.document_identity(doc.doc_id),
+                            explain,
                             snippets,
                             projected: Vec::new(),
                             doc_id: self.config.slot_offset + u64::from(doc.doc_id),
@@ -6220,6 +6976,8 @@ impl NodeServiceImpl {
             0.0
         };
         Ok(Bm25QueryResponse {
+            segments_total: fused_prune.segments_total,
+            segments_skipped: fused_prune.segments_skipped,
             projection_leaves_known: Vec::new(),
             hits,
             kth_best,
@@ -6248,7 +7006,7 @@ impl NodeServiceImpl {
         expected_stats_epoch: u64,
         filters: &LegFilters<'_>,
     ) -> Result<LegResults, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(expected_stats_epoch)?;
         // One resolution for both legs (docs/vector-filters.md): the
         // allowlist the vector kernel scans under and the predicate the
@@ -6257,13 +7015,14 @@ impl NodeServiceImpl {
         let (geo_columns_known, filter_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), filters.geo, filters.tree);
         let slots = guard.index.as_ref().map_or(0, |index| index.len());
-        let (doc_filter, allow) = resolve_shard_filters(
+        let (doc_filter, allow, _prune) = resolve_shard_filters(
             guard.bm25.as_ref(),
             guard.live_docs.words(),
             slots,
             filters.geo,
             &filters.regions,
             filters.tree,
+            self.knobs.segment_pruning(),
         )?;
 
         let mut vector_leg: Vec<(u64, f64)> = Vec::new();
@@ -7789,7 +8548,7 @@ impl NodeServiceImpl {
         // replay never calls the sidecar and never derives twice.
         let (doc, analyzed) = self.materialize_document(doc, analyzed)?;
         let _mutation = self.mutation_gate.read().await;
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         self.apply_document_locked(
             &mut guard,
             doc,
@@ -8592,7 +9351,7 @@ impl NodeServiceImpl {
             body_path: extractor.body_path().to_string(),
             materialize_sha: materialize_sha(bind.materialize.as_ref()),
         };
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         match &guard.mapped_binding {
             Some(bound) if *bound != incoming => {
                 let mut differs = Vec::new();
@@ -8933,6 +9692,7 @@ impl NodeService for NodeServiceImpl {
             let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
             let state = self.state.clone();
             let config = self.config.clone();
+            let knobs = Arc::clone(&self.knobs);
             let scan_queue = config.coalesce.then(|| self.scan_queue());
 
             tokio::spawn(async move {
@@ -9001,8 +9761,9 @@ impl NodeService for NodeServiceImpl {
                     }
                 });
 
-                let share = config.share_floors;
-                let floor_delta = config.floor_delta;
+                let share = knobs.share_floors();
+                let segment_pruning = knobs.segment_pruning();
+                let floor_delta = knobs.floor_delta();
                 let chunk_blocks = config.chunk_blocks;
                 let slot_offset = config.slot_offset;
                 let scan_tx = tx.clone();
@@ -9011,9 +9772,10 @@ impl NodeService for NodeServiceImpl {
                 // disposable (they are monotone, so the next chunk's publish
                 // supersedes any dropped one). The terminal Done is sent
                 // with `.await` below and cannot be dropped.
-                let warmup = config.floor_warmup_chunks;
-                let min_interval = (config.floor_min_interval_ms > 0)
-                    .then(|| std::time::Duration::from_millis(config.floor_min_interval_ms));
+                let warmup = knobs.floor_warmup_chunks();
+                let floor_min_interval_ms = knobs.floor_min_interval_ms();
+                let min_interval = (floor_min_interval_ms > 0)
+                    .then(|| std::time::Duration::from_millis(floor_min_interval_ms));
                 let mut last_published = f32::NEG_INFINITY;
                 let mut offers = 0u32;
                 let mut last_at: Option<std::time::Instant> = None;
@@ -9077,7 +9839,7 @@ impl NodeService for NodeServiceImpl {
                     let geo_regions = geo_regions.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         let n = {
-                            let guard = state.read().expect("shard state lock poisoned");
+                            let guard = read_shard(&state);
                             let index = guard.index.as_ref().ok_or_else(|| {
                                 Status::failed_precondition(
                                     "shard has no index yet (set calibration or add vectors)",
@@ -9089,7 +9851,7 @@ impl NodeService for NodeServiceImpl {
                         // parent_map takes its own locks (read to build, write
                         // to cache), so the validation guard is dropped first.
                         let parents = Self::parent_map(&state, slot_offset, n);
-                        let guard = state.read().expect("shard state lock poisoned");
+                        let guard = read_shard(&state);
                         let index = guard.index.as_ref().ok_or_else(|| {
                             Status::failed_precondition("shard index disappeared mid-setup")
                         })?;
@@ -9103,20 +9865,21 @@ impl NodeService for NodeServiceImpl {
                         // filter is the collapse of the filtered corpus —
                         // still every floor a valid lower bound, still no new
                         // pruning math.
-                        let (_, allow) = resolve_shard_filters(
+                        let (_, allow, prune) = resolve_shard_filters(
                             guard.bm25.as_ref(),
                             guard.live_docs.words(),
                             index.len(),
                             &start.geo_filters,
                             &geo_regions,
                             start.filter.as_ref(),
+                            segment_pruning,
                         )?;
                         let known = filter_known_flags(
                             guard.bm25.as_ref(),
                             &start.geo_filters,
                             start.filter.as_ref(),
                         );
-                        let (hits, stats) = chunked_topk_collapsed(
+                        let (hits, mut stats) = chunked_topk_collapsed(
                             index,
                             &start.vector,
                             start.k as usize,
@@ -9126,6 +9889,8 @@ impl NodeService for NodeServiceImpl {
                             &mut publish_floor,
                             allow.as_deref(),
                         );
+                        stats.segments_total = prune.segments_total;
+                        stats.segments_skipped = prune.segments_skipped;
                         Ok((hits, stats, known))
                     });
                     let outcome = match scan.await {
@@ -9149,6 +9914,8 @@ impl NodeService for NodeServiceImpl {
                                     floors_published: stats.floors_published,
                                     floor_updates_applied: stats.floor_updates_applied,
                                     floors_offered: stats.floors_offered,
+                                    segments_total: stats.segments_total,
+                                    segments_skipped: stats.segments_skipped,
                                 }),
                                 geo_columns_known,
                                 filter_columns_known,
@@ -9173,7 +9940,7 @@ impl NodeService for NodeServiceImpl {
                         // batch runner holds the read lock for the scan, the
                         // same consistency the solo path gets.
                         let validated = {
-                            let guard = state.read().expect("shard state lock poisoned");
+                            let guard = read_shard(&state);
                             match guard.index.as_ref() {
                                 Some(index) => Self::validate_start(index, &start),
                                 None => Err(Status::failed_precondition(
@@ -9220,27 +9987,28 @@ impl NodeService for NodeServiceImpl {
                             // scan: adds (write lock) never interleave with a
                             // scan, so a search sees one consistent index
                             // snapshot.
-                            let guard = state.read().expect("shard state lock poisoned");
+                            let guard = read_shard(&state);
                             let index = guard.index.as_ref().ok_or_else(|| {
                                 Status::failed_precondition(
                                     "shard has no index yet (set calibration or add vectors)",
                                 )
                             })?;
                             Self::validate_start(index, &start)?;
-                            let (_, allow) = resolve_shard_filters(
+                            let (_, allow, prune) = resolve_shard_filters(
                                 guard.bm25.as_ref(),
                                 guard.live_docs.words(),
                                 index.len(),
                                 &start.geo_filters,
                                 &geo_regions,
                                 start.filter.as_ref(),
+                                segment_pruning,
                             )?;
                             let (geo_columns_known, filter_columns_known) = filter_known_flags(
                                 guard.bm25.as_ref(),
                                 &start.geo_filters,
                                 start.filter.as_ref(),
                             );
-                            let (hits, stats) = chunked_topk(
+                            let (hits, mut stats) = chunked_topk(
                                 index,
                                 &start.vector,
                                 start.k as usize,
@@ -9250,6 +10018,8 @@ impl NodeService for NodeServiceImpl {
                                 start.tie_complete,
                                 allow.as_deref(),
                             );
+                            stats.segments_total = prune.segments_total;
+                            stats.segments_skipped = prune.segments_skipped;
                             crate::metrics::record_scan(&stats);
                             Ok(ScanOutcome {
                                 hits,
@@ -9287,6 +10057,8 @@ impl NodeService for NodeServiceImpl {
                                 floors_published: stats.floors_published,
                                 floor_updates_applied: stats.floor_updates_applied,
                                 floors_offered: stats.floors_offered,
+                                segments_total: stats.segments_total,
+                                segments_skipped: stats.segments_skipped,
                             }),
                             geo_columns_known,
                             filter_columns_known,
@@ -9322,7 +10094,7 @@ impl NodeService for NodeServiceImpl {
                 return Err(Status::invalid_argument("browse requires k > 0"));
             }
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             let slot_offset = self.config.slot_offset;
@@ -9330,12 +10102,13 @@ impl NodeService for NodeServiceImpl {
                 // A document-less shard admits nothing; its all-false known
                 // flags feed the coordinator's typo rule like everywhere.
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     doc_ids: Vec::new(),
                     geo_columns_known,
                     filter_columns_known,
-                    sort_key_bits: Vec::new(),
-                    sort_keys: Vec::new(),
-                    sort_column_known: false,
+                    sort_rows: Vec::new(),
+                    sort_columns_known: vec![false; req.sort.len()],
                 }));
             };
             if store.as_index().is_none() {
@@ -9344,6 +10117,36 @@ impl NodeService for NodeServiceImpl {
                 ));
             }
             let n = u64::from(store.next_doc_id());
+            // The lexical membership predicate (the terms of one lexical
+            // leaf, OR): the same bitmap ResolveLexicalBitmap answers,
+            // built here so the walk reads it in place.
+            let lexical: Option<Vec<u8>> = if req.lexical_terms.is_empty() {
+                None
+            } else {
+                let index = store.as_index().ok_or_else(|| {
+                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                })?;
+                let count = n as usize;
+                let mut bits = vec![0u8; count.div_ceil(8)];
+                for term in &req.lexical_terms {
+                    index.for_each_doc_tf(term, &mut |doc_id, _tf| {
+                        let position = doc_id as usize;
+                        if position < count {
+                            bits[position / 8] |= 1 << (position % 8);
+                        }
+                    });
+                }
+                Some(bits)
+            };
+            let in_lexical = |local: u32| -> bool {
+                match &lexical {
+                    None => true,
+                    Some(bits) => {
+                        let p = local as usize;
+                        bits.get(p / 8).is_some_and(|b| b & (1 << (p % 8)) != 0)
+                    }
+                }
+            };
             // The exclusive floor in local id space. The first page carries
             // no floor at all (proto3 cannot distinguish after = 0 from
             // unset, so the request says which it is).
@@ -9363,96 +10166,201 @@ impl NodeService for NodeServiceImpl {
                 phrase: Vec::new(),
             };
             let cols = ShardNumericRead(store);
-            if let Some(sort) = &req.sort {
+            let prune = prune_segments(
+                store,
+                doc_filter.pred.as_ref(),
+                self.knobs.segment_pruning(),
+            );
+            if !req.sort.is_empty() {
                 // Column-ordered browse: walk the FULL admitted set with a
                 // k-bounded heap. Exhaustive by construction, so the
                 // exactness certificate is trivial; per-shard exact top-k
                 // by key means the coordinator's merged union contains the
                 // global top-k (local rank <= global rank).
-                let key_of: Box<dyn Fn(u32) -> Option<(u64, f64)>> =
-                    if let Some(ni) = store.numeric_index(&sort.column) {
-                        Box::new(move |doc| {
-                            store.numeric_value(ni, doc).map(|v| (f64_order_bits(v), v))
-                        })
+                use crate::sortkeys::{cmp_candidate, Key, KeyRef, Value};
+                enum Column {
+                    Numeric(usize),
+                    Integer(usize),
+                    Facet(usize),
+                    Parent,
+                    Group,
+                }
+                let mut columns = Vec::with_capacity(req.sort.len());
+                let mut known = Vec::with_capacity(req.sort.len());
+                for sort in &req.sort {
+                    let column = if let Some(ni) = store.numeric_index(&sort.column) {
+                        Some(Column::Numeric(ni))
                     } else if let Some(ii) = store.integer_index(&sort.column) {
-                        Box::new(move |doc| {
-                            store
-                                .integer_value(ii, doc)
-                                .map(|v| (i64_order_bits(v), v as f64))
-                        })
+                        Some(Column::Integer(ii))
+                    } else if let Some(fi) = store.facet_index(&sort.column) {
+                        Some(Column::Facet(fi))
+                    } else if sort.column == "parent_id" {
+                        Some(Column::Parent)
+                    } else if sort.column == "group_id" {
+                        Some(Column::Group)
                     } else {
-                        // Unknown here; the coordinator's typo rule refuses
-                        // only when NO shard knows it.
-                        return Ok(Response::new(crate::pb::BrowseShardResponse {
-                            doc_ids: Vec::new(),
-                            geo_columns_known,
-                            filter_columns_known,
-                            sort_key_bits: Vec::new(),
-                            sort_keys: Vec::new(),
-                            sort_column_known: false,
-                        }));
+                        None
                     };
-                let boundary = (!req.first_page).then_some((req.after_key_bits, req.after));
-                // Max-heap keeping the k SMALLEST (adjusted-bits, id) pairs.
-                let mut heap: std::collections::BinaryHeap<(u64, u64, u64)> =
-                    std::collections::BinaryHeap::with_capacity(req.k as usize + 1);
-                for local in 0..n {
-                    let doc = local as u32;
-                    if !doc_filter.passes(doc, &cols) {
+                    known.push(column.is_some());
+                    columns.push(column);
+                }
+                if columns.iter().any(Option::is_none) {
+                    // Unknown here; the coordinator's typo rule refuses only
+                    // when NO shard knows a column. A shard that lacks any
+                    // key holds no value for it on any document, so it
+                    // contributes no rows.
+                    return Ok(Response::new(crate::pb::BrowseShardResponse {
+                        segments_total: prune.stats.segments_total,
+                        segments_skipped: prune.stats.segments_skipped,
+                        doc_ids: Vec::new(),
+                        geo_columns_known,
+                        filter_columns_known,
+                        sort_rows: Vec::new(),
+                        sort_columns_known: known,
+                    }));
+                }
+                let columns: Vec<Column> = columns.into_iter().flatten().collect();
+                let descending: Vec<bool> = req.sort.iter().map(|s| s.descending).collect();
+                let index = store.as_index();
+                // A candidate's keys, borrowed where the column lets them
+                // be, and its reported values; None when any key is absent.
+                let keys_of = |doc: u32| -> Option<(Vec<KeyRef<'_>>, Vec<Value>)> {
+                    let mut keys = Vec::with_capacity(columns.len());
+                    let mut values = Vec::with_capacity(columns.len());
+                    for (column, desc) in columns.iter().zip(&descending) {
+                        let adjust = |bits: u64| if *desc { !bits } else { bits };
+                        match column {
+                            Column::Numeric(ni) => {
+                                let v = store.numeric_value(*ni, doc)?;
+                                keys.push(KeyRef::Bits(adjust(f64_order_bits(v))));
+                                values.push(Value::Number(v));
+                            }
+                            Column::Integer(ii) => {
+                                let v = store.integer_value(*ii, doc)?;
+                                keys.push(KeyRef::Bits(adjust(i64_order_bits(v))));
+                                values.push(Value::Integer(v));
+                            }
+                            Column::Facet(fi) => {
+                                let ord = store.facet_ord(*fi, doc)?;
+                                let text = store.facet_value(*fi, ord);
+                                keys.push(KeyRef::Text(text));
+                                values.push(Value::Text(text.to_string()));
+                            }
+                            Column::Parent | Column::Group => {
+                                let lineage = index.and_then(|index| index.lineage(doc))?;
+                                let v = if matches!(column, Column::Parent) {
+                                    lineage.parent_id
+                                } else {
+                                    lineage.group_id
+                                };
+                                keys.push(KeyRef::Bits(adjust(v)));
+                                values.push(Value::Integer(v as i64));
+                            }
+                        }
+                    }
+                    Some((keys, values))
+                };
+                let boundary: Option<Vec<Key>> = if req.first_page {
+                    None
+                } else {
+                    let keys: Option<Vec<Key>> = req.after_keys.iter().map(Key::from_pb).collect();
+                    let keys = keys.ok_or_else(|| {
+                        Status::invalid_argument("sorted browse boundary carries an empty key")
+                    })?;
+                    if keys.len() != req.sort.len() {
+                        return Err(Status::invalid_argument(format!(
+                            "sorted browse boundary has {} keys for {} sort columns",
+                            keys.len(),
+                            req.sort.len()
+                        )));
+                    }
+                    Some(keys)
+                };
+                // The k best rows so far, worst last (a small k: the heap's
+                // work is the comparison against the worst kept row, and
+                // an insertion is a shift of at most k entries).
+                struct Row {
+                    keys: Vec<Key>,
+                    values: Vec<Value>,
+                    id: u64,
+                }
+                let k = req.k as usize;
+                let mut kept: Vec<Row> = Vec::with_capacity(k + 1);
+                for doc in prune.admitted_slots(n as u32) {
+                    if !in_lexical(doc) || !doc_filter.passes(doc, &cols) {
                         continue;
                     }
                     // A document without a value has no honest position in
                     // a column order: excluded, same stance as the filters.
-                    let Some((bits, value)) = key_of(doc) else {
+                    let Some((keys, values)) = keys_of(doc) else {
                         continue;
                     };
-                    let adjusted = if sort.descending { !bits } else { bits };
-                    let id = slot_offset + local;
-                    if let Some(b) = boundary {
-                        if (adjusted, id) <= b {
+                    let id = slot_offset + u64::from(doc);
+                    if let Some(b) = &boundary {
+                        if cmp_candidate(&keys, id, b, req.after, &descending)
+                            != std::cmp::Ordering::Greater
+                        {
                             continue;
                         }
                     }
-                    heap.push((adjusted, id, value.to_bits()));
-                    if heap.len() > req.k as usize {
-                        heap.pop();
+                    if kept.len() == k {
+                        let worst = &kept[k - 1];
+                        if cmp_candidate(&keys, id, &worst.keys, worst.id, &descending)
+                            != std::cmp::Ordering::Less
+                        {
+                            continue;
+                        }
+                    }
+                    let row = Row {
+                        keys: keys.into_iter().map(KeyRef::to_owned).collect(),
+                        values,
+                        id,
+                    };
+                    let at = kept.partition_point(|r| {
+                        crate::sortkeys::cmp_rows(&r.keys, r.id, &row.keys, row.id, &descending)
+                            == std::cmp::Ordering::Less
+                    });
+                    kept.insert(at, row);
+                    if kept.len() > k {
+                        kept.pop();
                     }
                 }
-                let mut rows = heap.into_vec();
-                rows.sort_unstable();
-                let mut doc_ids = Vec::with_capacity(rows.len());
-                let mut sort_key_bits = Vec::with_capacity(rows.len());
-                let mut sort_keys = Vec::with_capacity(rows.len());
-                for (adjusted, id, value_bits) in rows {
-                    doc_ids.push(id);
-                    sort_key_bits.push(adjusted);
-                    sort_keys.push(f64::from_bits(value_bits));
+                let mut doc_ids = Vec::with_capacity(kept.len());
+                let mut sort_rows = Vec::with_capacity(kept.len());
+                for row in kept {
+                    doc_ids.push(row.id);
+                    sort_rows.push(crate::pb::SortKeyRow {
+                        keys: row.keys.iter().map(Key::to_pb).collect(),
+                        values: row.values.iter().map(Value::to_pb).collect(),
+                    });
                 }
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    segments_total: prune.stats.segments_total,
+                    segments_skipped: prune.stats.segments_skipped,
                     doc_ids,
                     geo_columns_known,
                     filter_columns_known,
-                    sort_key_bits,
-                    sort_keys,
-                    sort_column_known: true,
+                    sort_rows,
+                    sort_columns_known: known,
                 }));
             }
             let mut doc_ids = Vec::new();
-            for local in start..n {
-                if doc_filter.passes(local as u32, &cols) {
-                    doc_ids.push(slot_offset + local);
+            for local in prune.admitted_slots_from(start as u32, n as u32) {
+                if in_lexical(local) && doc_filter.passes(local, &cols) {
+                    doc_ids.push(slot_offset + u64::from(local));
                     if doc_ids.len() == req.k as usize {
                         break;
                     }
                 }
             }
             Ok(Response::new(crate::pb::BrowseShardResponse {
+                segments_total: prune.stats.segments_total,
+                segments_skipped: prune.stats.segments_skipped,
                 doc_ids,
                 geo_columns_known,
                 filter_columns_known,
-                sort_key_bits: Vec::new(),
-                sort_keys: Vec::new(),
-                sort_column_known: req.sort.is_none(),
+                sort_rows: Vec::new(),
+                sort_columns_known: Vec::new(),
             }))
         })
         .await
@@ -9465,20 +10373,21 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::ResolveFilterBitmap, request, |request| async move {
             let req = request.into_inner();
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             let label_count = guard
                 .bm25
                 .as_ref()
                 .map_or(0, |store| store.next_doc_id() as usize);
-            let (_, allow) = resolve_shard_filters(
+            let (_, allow, prune) = resolve_shard_filters(
                 guard.bm25.as_ref(),
                 guard.live_docs.words(),
                 label_count,
                 &req.geo_filters,
                 &geo_regions,
                 req.filter.as_ref(),
+                self.knobs.segment_pruning(),
             )?;
             let allow = allow.unwrap_or_else(|| vec![true; label_count]);
             let mut bits = vec![0u8; label_count.div_ceil(8)];
@@ -9493,6 +10402,8 @@ impl NodeService for NodeServiceImpl {
                 bits,
                 geo_columns_known,
                 filter_columns_known,
+                segments_total: prune.segments_total,
+                segments_skipped: prune.segments_skipped,
             }))
         })
         .await
@@ -9503,9 +10414,11 @@ impl NodeService for NodeServiceImpl {
         request: Request<LexicalBitmapRequest>,
     ) -> Result<Response<MembershipBitmapResponse>, Status> {
         let req = request.into_inner();
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let Some(shard) = guard.bm25.as_ref() else {
             return Ok(Response::new(MembershipBitmapResponse {
+                segments_total: 0,
+                segments_skipped: 0,
                 base_label: self.config.slot_offset,
                 label_count: 0,
                 bits: Vec::new(),
@@ -9517,6 +10430,33 @@ impl NodeService for NodeServiceImpl {
         })?;
         let label_count = usize::try_from(shard.next_doc_id())
             .map_err(|_| Status::resource_exhausted("lexical row count does not fit usize"))?;
+        // A sealed segment none of the terms occur in contributes no
+        // member: the walk skips it and the count says so
+        // (docs/segment-pruning.md). One dictionary lookup per term per
+        // part decides; with pruning off every part is walked.
+        let (masked, prune) = match shard {
+            Bm25Shard::Segmented(segmented) => {
+                let lacking = segmented.parts_lacking_terms(0, &req.terms);
+                let skipped = lacking.iter().filter(|&&lacks| lacks).count() as u32;
+                let stats = crate::segment_prune::PruneStats {
+                    segments_total: lacking.len() as u32,
+                    segments_skipped: if self.knobs.segment_pruning() {
+                        skipped
+                    } else {
+                        0
+                    },
+                };
+                let masked = (self.knobs.segment_pruning() && skipped > 0).then(|| {
+                    segmented.masked(lacking.iter().map(|&lacks| !lacks).collect::<Arc<[bool]>>())
+                });
+                (masked, stats)
+            }
+            _ => (None, crate::segment_prune::PruneStats::default()),
+        };
+        let index: &dyn Bm25Index = match masked.as_ref() {
+            Some(masked) => masked,
+            None => index,
+        };
         let mut bits = vec![0u8; label_count.div_ceil(8)];
         for term in req.terms {
             index.for_each_doc_tf(&term, &mut |doc_id, _tf| {
@@ -9531,6 +10471,8 @@ impl NodeService for NodeServiceImpl {
             label_count: label_count as u64,
             bits,
             stats_epoch: guard.stats_epoch,
+            segments_total: prune.segments_total,
+            segments_skipped: prune.segments_skipped,
         }))
     }
 
@@ -9538,7 +10480,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<VectorBitmapRequest>,
     ) -> Result<Response<MembershipBitmapResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let label_count = guard.index.as_ref().map_or(0, VectorIndex::len);
         let mut bits = vec![0xffu8; label_count.div_ceil(8)];
         if let Some(last) = bits.last_mut() {
@@ -9553,6 +10495,8 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(MembershipBitmapResponse {
+            segments_total: 0,
+            segments_skipped: 0,
             base_label: self.config.slot_offset,
             label_count: label_count as u64,
             bits,
@@ -9577,7 +10521,7 @@ impl NodeService for NodeServiceImpl {
             let grouping = !req.group_by.is_empty();
             let group_cap = req.max_groups as usize;
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             // Expression column leaves: aggregations first, then
@@ -9598,10 +10542,12 @@ impl NodeService for NodeServiceImpl {
                 // all-absent partials and all-false flags feed the merge
                 // and the typo rule like everywhere.
                 return Ok(Response::new(crate::pb::AggregateShardResponse {
+                    segments_total: 0,
+                    segments_skipped: 0,
                     partials: req
                         .aggregations
                         .iter()
-                        .map(|_| AggAcc::Absent.partial())
+                        .map(|_| AggAcc::Absent.partial(None))
                         .collect(),
                     matched: 0,
                     geo_columns_known,
@@ -9639,11 +10585,18 @@ impl NodeService for NodeServiceImpl {
             // Resolve every expression and admit its op against the
             // resolved type BEFORE touching any document: a type conflict
             // refuses the request, it never mis-aggregates.
-            let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType)> =
+            let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType, bool)> =
                 Vec::with_capacity(req.aggregations.len());
             let mut totals: Vec<AggAcc> = Vec::with_capacity(req.aggregations.len());
             for agg in &req.aggregations {
                 let op = agg_op_of(agg.op)?;
+                let cardinality = op == crate::pb::AggregateOp::Cardinality;
+                if cardinality && agg.max_distinct == 0 {
+                    return Err(Status::internal(format!(
+                        "aggregation {:?} arrived without a distinct cap",
+                        agg.name
+                    )));
+                }
                 let expr = agg.expr.as_ref().ok_or_else(|| {
                     Status::invalid_argument(format!(
                         "aggregation {:?} without an expression",
@@ -9654,23 +10607,37 @@ impl NodeService for NodeServiceImpl {
                     Status::invalid_argument(format!("aggregation {:?}: {}", agg.name, e.message()))
                 })?;
                 check_agg_type(&agg.name, op, vt)?;
-                totals.push(acc_of(vt));
-                exprs.push((rv, vt));
+                totals.push(acc_of(vt, cardinality));
+                exprs.push((rv, vt, cardinality));
             }
             let mut hists: Vec<(
                 Option<crate::values::ResolvedValue>,
-                f64,
+                Bucketing,
                 usize,
                 String,
                 HistAcc,
             )> = Vec::with_capacity(req.histograms.len());
             for h in &req.histograms {
-                if !(h.interval > 0.0 && h.interval.is_finite()) {
-                    return Err(Status::internal(format!(
-                        "histogram {:?} arrived with an unvalidated interval",
-                        h.name
-                    )));
-                }
+                let bucketing = if h.calendar != 0 {
+                    let unit = crate::calendar::interval_of(h.calendar).ok_or_else(|| {
+                        Status::internal(format!(
+                            "histogram {:?} arrived with an unvalidated calendar unit",
+                            h.name
+                        ))
+                    })?;
+                    Bucketing::Calendar {
+                        unit,
+                        utc_offset_minutes: h.utc_offset_minutes,
+                    }
+                } else {
+                    if !(h.interval > 0.0 && h.interval.is_finite()) {
+                        return Err(Status::internal(format!(
+                            "histogram {:?} arrived with an unvalidated interval",
+                            h.name
+                        )));
+                    }
+                    Bucketing::Fixed(h.interval)
+                };
                 let expr = h.expr.as_ref().ok_or_else(|| {
                     Status::invalid_argument(format!(
                         "histogram {:?} without an expression",
@@ -9680,30 +10647,43 @@ impl NodeService for NodeServiceImpl {
                 let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
                     Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
                 })?;
-                let rv = match vt {
-                    crate::values::ValueType::Double => Some(rv),
-                    crate::values::ValueType::Unknown => None,
-                    crate::values::ValueType::Int => {
+                let type_name = |vt: crate::values::ValueType| match vt {
+                    crate::values::ValueType::Str => "string",
+                    crate::values::ValueType::Bool => "boolean",
+                    crate::values::ValueType::Int => "int",
+                    crate::values::ValueType::Double => "double",
+                    crate::values::ValueType::Unknown => "unknown",
+                };
+                let rv = match (bucketing, vt) {
+                    (_, crate::values::ValueType::Unknown) => None,
+                    (Bucketing::Fixed(_), crate::values::ValueType::Double) => Some(rv),
+                    (Bucketing::Fixed(_), crate::values::ValueType::Int) => {
                         return Err(Status::invalid_argument(format!(
                             "histogram {:?} takes a double expression; convert explicitly \
                          with double()",
                             h.name
                         )));
                     }
-                    other => {
+                    (Bucketing::Fixed(_), other) => {
                         return Err(Status::invalid_argument(format!(
                             "histogram {:?} takes a double expression, not a {}",
                             h.name,
-                            match other {
-                                crate::values::ValueType::Str => "string",
-                                _ => "boolean",
-                            }
+                            type_name(other)
+                        )));
+                    }
+                    (Bucketing::Calendar { .. }, crate::values::ValueType::Int) => Some(rv),
+                    (Bucketing::Calendar { .. }, other) => {
+                        return Err(Status::invalid_argument(format!(
+                            "histogram {:?} buckets by calendar over an int expression in \
+                             epoch micros (a timestamp column), not a {}",
+                            h.name,
+                            type_name(other)
                         )));
                     }
                 };
                 hists.push((
                     rv,
-                    h.interval,
+                    bucketing,
                     h.max_buckets as usize,
                     h.name.clone(),
                     HistAcc::default(),
@@ -9728,6 +10708,11 @@ impl NodeService for NodeServiceImpl {
             };
             let cols = ShardNumericRead(store);
             let n = u64::from(store.next_doc_id());
+            let prune = prune_segments(
+                store,
+                doc_filter.pred.as_ref(),
+                self.knobs.segment_pruning(),
+            );
             let id_allowlist = req.restrict_doc_ids.then(|| {
                 req.doc_ids
                     .iter()
@@ -9744,8 +10729,7 @@ impl NodeService for NodeServiceImpl {
             // One pass in doc order: the fold orders themselves are part
             // of the determinism contract (Neumaier and Welford both fold
             // exactly this sequence on every run).
-            for local in 0..n {
-                let doc = local as u32;
+            for doc in prune.admitted_slots(n as u32) {
                 if id_allowlist
                     .as_ref()
                     .is_some_and(|allowlist| !allowlist.contains(&doc))
@@ -9761,7 +10745,13 @@ impl NodeService for NodeServiceImpl {
                         Some(ord) => {
                             let n_groups = groups.len();
                             let entry = groups.entry(ord).or_insert_with(|| {
-                                (0, exprs.iter().map(|(_, vt)| acc_of(*vt)).collect())
+                                (
+                                    0,
+                                    exprs
+                                        .iter()
+                                        .map(|(_, vt, cardinality)| acc_of(*vt, *cardinality))
+                                        .collect(),
+                                )
                             });
                             if entry.0 == 0 && n_groups == group_cap {
                                 return Err(Status::failed_precondition(format!(
@@ -9782,7 +10772,7 @@ impl NodeService for NodeServiceImpl {
                     None
                 };
                 let mut group_accs = group.map(|g| &mut g.1);
-                for (i, (rv, _)) in exprs.iter().enumerate() {
+                for (i, (rv, _, _)) in exprs.iter().enumerate() {
                     // Absent-typed totals imply an absent-typed group
                     // accumulator: the type is the expression's, not the
                     // group's.
@@ -9796,11 +10786,22 @@ impl NodeService for NodeServiceImpl {
                         }
                     }
                 }
-                for (rv, interval, cap, name, acc) in hists.iter_mut() {
+                for (rv, bucketing, cap, name, acc) in hists.iter_mut() {
                     let Some(rv) = rv else { continue };
-                    if let Some(crate::values::Val::Double(x)) = crate::values::eval(rv, doc, &cols)
-                    {
-                        acc.push(x, *interval, *cap, name)?;
+                    match (*bucketing, crate::values::eval(rv, doc, &cols)) {
+                        (Bucketing::Fixed(interval), Some(crate::values::Val::Double(x))) => {
+                            acc.push(x, interval, *cap, name)?;
+                        }
+                        (
+                            Bucketing::Calendar {
+                                unit,
+                                utc_offset_minutes,
+                            },
+                            Some(crate::values::Val::Int(micros)),
+                        ) => {
+                            acc.push_calendar(micros, unit, utc_offset_minutes, *cap, name)?;
+                        }
+                        _ => {}
                     }
                 }
                 for (resolved, acc) in pcts.iter_mut() {
@@ -9809,6 +10810,17 @@ impl NodeService for NodeServiceImpl {
                     };
                     if let Some(v) = crate::values::eval(rv, doc, &cols) {
                         acc.push(rankable_bits(v, *int_typed));
+                    }
+                }
+            }
+            for (agg, acc) in req.aggregations.iter().zip(&totals) {
+                if let Some(n) = acc.distinct_len() {
+                    if n > agg.max_distinct as usize {
+                        return Err(Status::failed_precondition(format!(
+                            "aggregation {:?}: more than {} distinct values on one shard; \
+                             raise max_distinct or tighten the filter",
+                            agg.name, agg.max_distinct
+                        )));
                     }
                 }
             }
@@ -9824,13 +10836,15 @@ impl NodeService for NodeServiceImpl {
                         .map(|(ord, m, accs)| crate::pb::AggregateShardGroup {
                             value: store.facet_value(fi, *ord).to_string(),
                             matched: *m,
-                            partials: accs.iter().map(AggAcc::partial).collect(),
+                            partials: accs.iter().map(|acc| acc.partial(Some(store))).collect(),
                         })
                         .collect()
                 })
                 .unwrap_or_default();
             Ok(Response::new(crate::pb::AggregateShardResponse {
-                partials: totals.iter().map(AggAcc::partial).collect(),
+                segments_total: prune.stats.segments_total,
+                segments_skipped: prune.stats.segments_skipped,
+                partials: totals.iter().map(|acc| acc.partial(Some(store))).collect(),
                 matched,
                 geo_columns_known,
                 filter_columns_known,
@@ -9871,7 +10885,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::QuantileCounts, request, |request| async move {
             let req = request.into_inner();
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let Some(store) = guard.bm25.as_ref() else {
                 return Ok(Response::new(crate::pb::QuantileCountsResponse {
                     counts: vec![0; req.targets.len()],
@@ -9910,6 +10924,11 @@ impl NodeService for NodeServiceImpl {
             };
             let cols = ShardNumericRead(store);
             let n = u64::from(store.next_doc_id());
+            let prune = prune_segments(
+                store,
+                doc_filter.pred.as_ref(),
+                self.knobs.segment_pruning(),
+            );
             let id_allowlist = req.restrict_doc_ids.then(|| {
                 req.doc_ids
                     .iter()
@@ -9921,8 +10940,7 @@ impl NodeService for NodeServiceImpl {
             let mut bits_of = vec![None; exprs.len()];
             // One admitted-set pass per round: each expression evaluates
             // once per document, every target reads the cached bits.
-            for local in 0..n {
-                let doc = local as u32;
+            for doc in prune.admitted_slots(n as u32) {
                 if id_allowlist
                     .as_ref()
                     .is_some_and(|allowlist| !allowlist.contains(&doc))
@@ -9975,7 +10993,7 @@ impl NodeService for NodeServiceImpl {
                         })??;
                 }
                 let snapshot = {
-                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let guard = read_shard(&self.state);
                     let wal = guard.wal.as_ref().ok_or_else(|| {
                         Status::failed_precondition(
                             "this shard has no WAL; live catch-up is unavailable",
@@ -10092,7 +11110,7 @@ impl NodeService for NodeServiceImpl {
             materialize_sha: req.materialize_sha,
         };
         let _mutation = self.mutation_gate.read().await;
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let already_bound = Self::apply_binding_locked(&mut guard, incoming)?;
         Ok(Response::new(crate::pb::ApplyWalBindingResponse {
             already_bound,
@@ -10118,7 +11136,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let (num_vectors, dim, bit_width, vector_backend, scoring_fingerprint, quality_contract) =
             match guard.index.as_ref() {
                 Some(index) => {
@@ -10207,6 +11225,7 @@ impl NodeService for NodeServiceImpl {
             let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
             let state = self.state.clone();
             let slot_offset = self.config.slot_offset;
+            let segment_pruning = self.knobs.segment_pruning();
             let stream_signals = Arc::clone(&self.stream_signals);
 
             tokio::spawn(async move {
@@ -10301,14 +11320,14 @@ impl NodeService for NodeServiceImpl {
                         // path.
                         let parents = if start.collapse_parents {
                             let n = {
-                                let guard = state.read().expect("shard state lock poisoned");
+                                let guard = read_shard(&state);
                                 guard.index.as_ref().map_or(0, |index| index.len())
                             };
                             Some(Self::parent_map(&state, slot_offset, n))
                         } else {
                             None
                         };
-                        let guard = state.read().expect("shard state lock poisoned");
+                        let guard = read_shard(&state);
                         let index = guard.index.as_ref().ok_or_else(|| {
                             Status::failed_precondition(
                                 "shard has no index yet (set calibration or add vectors)",
@@ -10351,13 +11370,14 @@ impl NodeService for NodeServiceImpl {
                         // "live" means "survived the filters", so the
                         // completion certificate covers the filtered corpus
                         // and means exactly what it meant before.
-                        let (_, allow) = resolve_shard_filters(
+                        let (_, allow, prune) = resolve_shard_filters(
                             guard.bm25.as_ref(),
                             guard.live_docs.words(),
                             index.len(),
                             &start.geo_filters,
                             &geo_regions,
                             start.filter.as_ref(),
+                            segment_pruning,
                         )?;
                         let (geo_columns_known, filter_columns_known) = filter_known_flags(
                             guard.bm25.as_ref(),
@@ -10447,6 +11467,8 @@ impl NodeService for NodeServiceImpl {
                             geo_columns_known,
                             filter_columns_known,
                             scoring_fingerprint,
+                            segments_total: prune.segments_total,
+                            segments_skipped: prune.segments_skipped,
                         })
                     });
                 let outcome = scan.await;
@@ -10484,7 +11506,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<GetVectorBackendRequest>,
     ) -> Result<Response<GetVectorBackendResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let Some(index) = guard.index.as_ref() else {
             return Ok(Response::new(GetVectorBackendResponse {
                 descriptor: None,
@@ -10517,7 +11539,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<GetCalibrationRequest>,
     ) -> Result<Response<GetCalibrationResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let (dim, bit_width, num_vectors, shift, scale) = match guard.index.as_ref() {
             Some(index) => {
                 let (shift, scale) = calibration_of(index).unwrap_or_default();
@@ -10583,7 +11605,7 @@ impl NodeService for NodeServiceImpl {
                 self.seal_if_due().await?;
             }
             let (total, wal_generation) = {
-                let guard = self.state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&self.state);
                 (
                     guard.index.as_ref().map_or(0, |i| i.len() as u64),
                     guard.wal.as_ref().map_or(0, WalWriter::generation),
@@ -10860,7 +11882,7 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             let (total, wal_generation) = {
-                let guard = self.state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&self.state);
                 (
                     guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
                     guard.wal.as_ref().map_or(0, WalWriter::generation),
@@ -10885,7 +11907,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::DeleteDocuments, request, |request| async move {
             let req = request.into_inner();
             let _mutation = self.mutation_gate.read().await;
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             self.delete_documents_locked(&mut guard, &req.doc_ids, req.expected_wal_generation)
                 .map(Response::new)
         })
@@ -10899,7 +11921,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::CommitReplacements, request, |request| async move {
             let req = request.into_inner();
             let _mutation = self.mutation_gate.read().await;
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             self.commit_replacements_locked(
                 &mut guard,
                 &req.replacements,
@@ -10991,7 +12013,7 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             let (total, wal_generation) = {
-                let guard = self.state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&self.state);
                 (
                     guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
                     guard.wal.as_ref().map_or(0, WalWriter::generation),
@@ -11021,7 +12043,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<TermStatsResponse>, Status> {
         crate::metrics::timed(Route::TermStats, request, |request| async move {
             let req = request.into_inner();
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard
                 .bm25
                 .as_ref()
@@ -11110,7 +12132,7 @@ impl NodeService for NodeServiceImpl {
             if req.prefix.is_empty() {
                 return Err(Status::invalid_argument("a term prefix must be non-empty"));
             }
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let Some(store) = guard.bm25.as_ref() else {
                 return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
                     terms: Vec::new(),
@@ -11170,7 +12192,7 @@ impl NodeService for NodeServiceImpl {
                     "max_scan must be positive: it bounds the dictionary scan",
                 ));
             }
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let tombstoned_rows = guard.live_docs.deleted_count();
             let unknown = || crate::pb::SuggestTermsResponse {
                 entries: Vec::new(),
@@ -11321,11 +12343,11 @@ impl NodeService for NodeServiceImpl {
                 // k-th best (gated by the node's floor knobs, never blocking
                 // the scan — dropped raises are superseded by the next one),
                 // and hand back the highest coordinator floor seen.
-                let share = service.config.share_floors;
-                let floor_delta = service.config.floor_delta;
-                let min_interval = (service.config.floor_min_interval_ms > 0).then(|| {
-                    std::time::Duration::from_millis(service.config.floor_min_interval_ms)
-                });
+                let share = service.knobs.share_floors();
+                let floor_delta = service.knobs.floor_delta();
+                let floor_min_interval_ms = service.knobs.floor_min_interval_ms();
+                let min_interval = (floor_min_interval_ms > 0)
+                    .then(|| std::time::Duration::from_millis(floor_min_interval_ms));
                 let scan_tx = tx.clone();
                 let hook_cancelled = Arc::clone(&cancelled);
                 let mut last_published = f32::NEG_INFINITY;
@@ -11476,7 +12498,7 @@ impl NodeService for NodeServiceImpl {
                     // Stage parameters validate everywhere they arrive; a
                     // malformed stage is a request error, not a shard gap.
                     let specs = parse_score_stages(&req.stages)?;
-                    let guard = state.read().expect("shard state lock poisoned");
+                    let guard = read_shard(&state);
                     let projection_leaves = {
                         let mut leaves = Vec::new();
                         for p in &req.projections {
@@ -11579,7 +12601,7 @@ impl NodeService for NodeServiceImpl {
             let offset = self.config.slot_offset;
             let state = self.state.clone();
             let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
-                let guard = state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&state);
                 // A shard with no index holds none of the candidates.
                 let Some(index) = guard.index.as_ref() else {
                     return Ok(Vec::new());
@@ -11658,7 +12680,7 @@ impl NodeService for NodeServiceImpl {
             .map_err(|_| Status::unavailable("exact rerank worker budget closed"))?;
         let result = tokio::task::spawn_blocking(move || -> Result<ExactVectorRescoreResponse, Status> {
             let _permits = permits;
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&state);
             // Product shards may own exact rows for a clustered vector
             // collection without also serving a local provider image. The
             // product slot range is therefore the maximum aligned artifact,
@@ -11750,7 +12772,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::GetDocuments, request, |request| async move {
             let req = request.into_inner();
             let offset = self.config.slot_offset;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let mut documents = Vec::new();
             if let Some(store) = guard.bm25.as_ref() {
                 let source_metadata = store;
@@ -11795,7 +12817,7 @@ impl NodeService for NodeServiceImpl {
             const SELF_PARENT_TAG: u64 = 1 << 63;
             let req = request.into_inner();
             let offset = self.config.slot_offset;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let rows = guard
                 .index
                 .as_ref()
@@ -11818,11 +12840,16 @@ impl NodeService for NodeServiceImpl {
                 if guard.live_docs.is_deleted(local as usize) {
                     continue;
                 }
-                let parent_id = u32::try_from(local)
+                let lineage = u32::try_from(local)
                     .ok()
-                    .and_then(|local| store.and_then(|store| store.lineage(local)))
-                    .map_or(SELF_PARENT_TAG | doc_id, |lineage| lineage.parent_id);
-                parents.push(ResolvedParent { doc_id, parent_id });
+                    .and_then(|local| store.and_then(|store| store.lineage(local)));
+                let (parent_id, group_id) =
+                    lineage.map_or((SELF_PARENT_TAG | doc_id, 0), |l| (l.parent_id, l.group_id));
+                parents.push(ResolvedParent {
+                    doc_id,
+                    parent_id,
+                    group_id,
+                });
             }
             Ok(Response::new(ResolveParentsResponse { parents }))
         })
@@ -12193,7 +13220,7 @@ impl NodeServiceImpl {
                 "terms and global_doc_frequencies must have the same length",
             ));
         }
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         // The request's filters, resolved ONCE against this shard's
         // tables and shared by facet counting and the scorers below —
@@ -12253,6 +13280,24 @@ impl NodeServiceImpl {
             }
             _ => None,
         };
+        // Sealed segments the predicate rules out (docs/segment-pruning.md)
+        // leave the postings walks below: the scorers and the facet
+        // counts take the masked reader, whose per-document reads still
+        // cover the whole shard.
+        let prune = match guard.bm25.as_ref() {
+            Some(store) => prune_segments(
+                store,
+                doc_filter.as_ref().and_then(|f| f.pred.as_ref()),
+                self.knobs.segment_pruning(),
+            ),
+            None => SegmentPrune::default(),
+        };
+        let masked_index = match (guard.bm25.as_ref(), prune.mask.as_ref()) {
+            (Some(Bm25Shard::Segmented(segmented)), Some(mask)) => {
+                Some(segmented.masked(Arc::clone(mask)))
+            }
+            _ => None,
+        };
         // Count-then-rank facets over the match set — term matches
         // that survive the filters — before any k/floor narrowing
         // (see count_facets). A shard with no lexical half has no
@@ -12266,9 +13311,12 @@ impl NodeServiceImpl {
                     || !req.stats_fields.is_empty()
                     || !req.cardinality_fields.is_empty() =>
             {
-                let index = store.as_index().ok_or_else(|| {
-                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                })?;
+                let index: &dyn Bm25Index = match masked_index.as_ref() {
+                    Some(masked) => masked,
+                    None => store.as_index().ok_or_else(|| {
+                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                    })?,
+                };
                 let numeric_read = ShardNumericRead(store);
                 let filter_ctx: bm25::FilterCtx = doc_filter
                     .as_ref()
@@ -12381,9 +13429,12 @@ impl NodeServiceImpl {
         };
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
-                let index = store.as_index().ok_or_else(|| {
-                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                })?;
+                let index: &dyn Bm25Index = match masked_index.as_ref() {
+                    Some(masked) => masked,
+                    None => store.as_index().ok_or_else(|| {
+                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                    })?,
+                };
                 // 0/absent means no supplied score floor (scores are positive).
                 let floor = if req.min_score == 0.0 {
                     f64::NEG_INFINITY
@@ -12471,8 +13522,35 @@ impl NodeServiceImpl {
                 };
                 let highlight = highlight_plan(store, req.highlight.as_ref())?;
                 let body = store.field_name(0);
+                // The explain breakdown, only for the hits that survived
+                // the top-k (docs/explain.md): the flat route is one
+                // field at weight 1 in the fused scorer's terms.
+                let flat_query = [bm25::FieldQuery {
+                    index,
+                    terms: &req.terms,
+                    stats: stats.clone(),
+                    params,
+                    weight: 1.0,
+                }];
+                let presence = req.explain.then(|| {
+                    let ids: Vec<u32> = docs.iter().map(|doc| doc.doc_id).collect();
+                    bm25::breakdown(&flat_query, &ids)
+                });
                 docs.into_iter()
-                    .map(|doc| -> Result<Bm25Hit, Status> {
+                    .enumerate()
+                    .map(|(hit_index, doc)| -> Result<Bm25Hit, Status> {
+                        let explain = presence.as_ref().map(|presence| {
+                            let mut explain =
+                                explain_terms(&flat_query, &[body], &presence[hit_index], None);
+                            explain_stages(
+                                &mut explain,
+                                &chain,
+                                &req.score_stages,
+                                doc.doc_id,
+                                &numeric_read,
+                            );
+                            explain
+                        });
                         let snippets = match highlight.as_ref() {
                             Some(plan) => {
                                 let occurrences: Vec<(usize, (u32, u32))> = doc
@@ -12488,6 +13566,7 @@ impl NodeServiceImpl {
                         };
                         Ok(Bm25Hit {
                             identity: store.document_identity(doc.doc_id),
+                            explain,
                             snippets,
                             projected: resolved_projections
                                 .iter()
@@ -12529,6 +13608,8 @@ impl NodeServiceImpl {
             0.0
         };
         Ok(Bm25QueryResponse {
+            segments_total: prune.stats.segments_total,
+            segments_skipped: prune.stats.segments_skipped,
             projection_leaves_known,
             hits,
             kth_best,
@@ -12567,7 +13648,7 @@ impl NodeServiceImpl {
             dfs: req.global_doc_frequencies.clone(),
         };
         let offset = self.config.slot_offset;
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         let (hits, stage_columns_known) = match guard.bm25.as_ref() {
             Some(store) => {
@@ -12593,6 +13674,7 @@ impl NodeServiceImpl {
                     .into_iter()
                     .map(|doc| Bm25Hit {
                         identity: store.document_identity(doc.doc_id),
+                        explain: None,
                         snippets: Vec::new(),
                         projected: Vec::new(),
                         doc_id: offset + u64::from(doc.doc_id),

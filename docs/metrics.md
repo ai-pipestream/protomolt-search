@@ -62,6 +62,12 @@ pays the same plus one bool check per polled message.
 
 ## What is exported
 
+The same registry is also served as values by
+`DiagnosticsService.GetMetricsSnapshot` and streamed by
+`StreamMetrics` (`docs/diagnostics.md`); a test holds the snapshot and
+this page equal.
+
+
 ### Requests, by route
 
 Counted at ARRIVAL (a shard erroring under load shows as traffic, not
@@ -82,7 +88,7 @@ with one row per route. Node (shard) routes:
 
 Coordinator public routes:
 
-    search  bm25_search  phrase_search  hybrid_search  query  suggest
+    search  bm25_search  phrase_search  hybrid_search  query  suggest  term_suggest
     query_stream  plan_index  routed_ingest_mapped
     freeze_topology_writes  publish_topology  abort_topology_cutover
     aggregate  cluster_health  broadcast_vector_backend

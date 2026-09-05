@@ -1595,6 +1595,8 @@ impl DurableControlPlane {
                     replica: route.replica.clone().unwrap_or_default(),
                     hash_lo: route.hash_lo,
                     hash_hi: route.hash_hi,
+                    has_placement: false,
+                    placement: 0,
                 })
                 .collect(),
         }

@@ -144,8 +144,66 @@ completes with no output; the plane lists drops for retired copies
 after a promotion. A drop is refused, and the action stays pending,
 when the plane still lists this node's copy as the shard's primary, or
 when the shard is configured statically on the node (remove it from the
-configuration instead). `COMPACT_SHARD`, `SPLIT_SHARD`, and
-`MERGE_SHARDS` are logged as unhandled by name and stay pending.
+configuration instead). `COMPACT_SHARD` and `MERGE_SHARDS` are logged as
+unhandled by name and stay pending; `SPLIT_SHARD` runs the sequence
+below.
+
+## Shard split
+
+`SPLIT_SHARD` on the node serving a primary splits it online into two
+children that tile its hash range, with queries served throughout and
+ingest paused only for the final drain. The sequence, durable in
+`<data-dir>/<shard_id>.split/split.toml` so a crash at any point resumes
+the same split:
+
+1. Choose: two children named `<shard_id>-0` and `<shard_id>-1`, the
+   range halved at its midpoint, and fresh slot ranges above every
+   range the plan and this node know (spaced by the source's row count
+   rounded up to a mebi), so a child's ids never reuse another shard's.
+   A source with tombstones refuses ("compact it first"): the live tail
+   moves appends only.
+2. Build: `reshard::split_stable_logs_ranged` replays the source's own
+   full-history WAL and writes each child's image (vectors, the FP32
+   sidecar, postings rebuilt through the node's analysis backend),
+   partitioned by the stable routing key's hash into the two ranges; a
+   row without a stable key refuses by name (legacy rows are rebuilt
+   before a live split). The images move into the children's placed
+   directories and each child opens on a fresh listener with
+   `installed = true`, exactly as a placed replica does.
+3. Tail: `replication::catch_up_children_once` streams the source's log
+   after the baseline cutoff and applies each record to the child its
+   key routes to, until the children are within `--replica-lag-bound`.
+4. Fence and drain: the source's ingest is fenced
+   (`NodeServiceImpl::fence_ingest`; every later ingest stream refuses
+   `FAILED_PRECONDITION` naming the children and the action, queries
+   keep answering), the tail runs once more, and the source's watermark
+   must not move past it. The fenced source is reported so the plane's
+   record carries its final counts, and the children's rows are checked
+   against them here as well.
+5. Complete: `CompletePlacementAction` with the children as ready
+   primaries at the action's target generation. The plane's checks (range
+   tiling, row conservation, the scoring and analysis identity) replace
+   the source's record with the children's and publish the topology; a
+   refusal leaves the source fenced and reported, and the next tick
+   retries.
+6. Retire: the source is no longer served or reported. A placed source
+   is removed like a dropped copy; a configured source keeps its files
+   and leaves a marker under `<data-dir>/retired/<shard_id>`, which the
+   agent honors across restarts until the shard is removed from the
+   configuration and the marker deleted.
+
+The children are single-image shards built from images, so they carry
+`preexisting` rows in their WAL manifests: a later split of a child
+waits on image-aware resharding (`docs/resharding.md`). Ingest routed
+by the old topology between the fence and the publication is refused,
+not lost; the client retries against the new generation.
+`tests/split_shard.rs` pins the sequence: the plane plans the split of an
+over-full primary, rows ingested after the plan reach the children
+through the tail, the hook before completion sees the fence refusal by
+name, the plan shows two ready primaries tiling the range and
+conserving the rows, the coordinator answers with the same scores from
+the published children, and a restart keeps the source retired and
+re-serves the children.
 
 Costs: the copy under the source's read lock is the export's copy time
 (`ExportSnapshotResponse.copy_millis`; 7-11 ms for the 195 KB test
@@ -182,7 +240,8 @@ actions assigned to their node:
   its WAL tail up ("Replica bootstrap" above);
 - `DROP_REPLICA`: remove a retired copy after promotion;
 - `COMPACT_SHARD`: run bounded segment compaction;
-- `SPLIT_SHARD`: build every child covering the source range;
+- `SPLIT_SHARD`: build every child covering the source range ("Shard
+  split" above);
 - `MERGE_SHARDS`: combine the named adjacent pair.
 
 `CompletePlacementAction` is the commit point. COPY/COMPACT/MERGE return one

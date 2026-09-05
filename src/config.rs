@@ -137,6 +137,9 @@ pub struct ShardMapShard {
     /// Inclusive hash-range bounds (`fnv1a64(vector_id)` space).
     pub hash_lo: Option<u64>,
     pub hash_hi: Option<u64>,
+    /// The placement code this shard serves (`docs/placement.md`), when
+    /// the map has a `[placement]` tree. Required on every shard then.
+    pub placement: Option<u64>,
 }
 
 /// The id-to-shard authority for one cluster generation
@@ -149,6 +152,10 @@ pub struct ShardMap {
     pub generation: u64,
     /// One entry per shard, in fan-out order (= merge tie-break order).
     pub shards: Vec<ShardMapShard>,
+    /// The placement tree (`docs/placement.md`): which leaf each shard
+    /// serves and the predicates that route a document there.
+    #[serde(default)]
+    pub placement: Option<crate::placement::PlacementTreeConfig>,
 }
 
 /// Read one complete shard-map candidate. Callers validate its routing
@@ -210,6 +217,10 @@ pub struct Config {
     /// (v5 files). `false` forces the exhaustive scorer — the A/B
     /// baseline; results are identical either way.
     pub block_max: bool,
+    /// Skip sealed segments a request's filter cannot match, from
+    /// their column summaries (docs/segment-pruning.md). `false` keeps
+    /// every segment in the scan; the answer is the same either way.
+    pub segment_pruning: bool,
     /// Serve a shard whose BM25 bulk build was interrupted: a
     /// `.bm25.build` spill directory with no `.bm25` beside it.
     ///
@@ -269,6 +280,8 @@ pub struct Config {
     pub max_rerank_bytes: u64,
     /// Optional generation-bound measured candidate-depth profile.
     pub dense_quality_profile: Option<PathBuf>,
+    /// Optional synonym table (`docs/synonyms.md`), a TOML file.
+    pub synonyms: Option<PathBuf>,
     /// Optional generation-bound dense execution policy for AUTO
     /// (`docs/dense-execution-policy.md`).
     pub dense_execution_policy: Option<PathBuf>,
@@ -439,6 +452,7 @@ pub struct CollectionConfig {
     pub bm25_k1: f32,
     pub bm25_b: f32,
     pub dense_quality_profile: Option<PathBuf>,
+    pub synonyms: Option<PathBuf>,
     pub dense_execution_policy: Option<PathBuf>,
     pub replica_state_path: Option<PathBuf>,
     pub control_state_path: Option<PathBuf>,
@@ -454,6 +468,7 @@ struct FileCollection {
     bm25_k1: Option<f32>,
     bm25_b: Option<f32>,
     dense_quality_profile: Option<String>,
+    synonyms: Option<String>,
     dense_execution_policy: Option<String>,
     replica_state: Option<String>,
     control_state: Option<String>,
@@ -492,6 +507,7 @@ struct FileConfig {
     chunk_blocks: Option<usize>,
     floor_sharing: Option<bool>,
     block_max: Option<bool>,
+    segment_pruning: Option<bool>,
     allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
@@ -508,6 +524,7 @@ struct FileConfig {
     max_k: Option<u32>,
     max_rerank_mib: Option<u64>,
     dense_quality_profile: Option<String>,
+    synonyms: Option<String>,
     dense_execution_policy: Option<String>,
     query_dim: Option<usize>,
     save_on_shutdown: Option<bool>,
@@ -1079,6 +1096,10 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         Some(s) => parse_env_bool(&s),
         None => file.block_max.unwrap_or(true),
     };
+    let segment_pruning = match opt(args, "segment-pruning", "TURBOVEC_SEGMENT_PRUNING", None) {
+        Some(s) => parse_env_bool(&s),
+        None => file.segment_pruning.unwrap_or(true),
+    };
     let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
         || match opt(
             args,
@@ -1565,6 +1586,14 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     )
     .filter(|path| !path.trim().is_empty())
     .map(PathBuf::from);
+    let synonyms = opt(
+        args,
+        "synonyms",
+        "PIPESTREAM_SEARCH_SYNONYMS",
+        file.synonyms.as_deref(),
+    )
+    .filter(|path| !path.trim().is_empty())
+    .map(PathBuf::from);
     let dense_execution_policy = opt(
         args,
         "dense-execution-policy",
@@ -1991,6 +2020,11 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     .as_ref()
                     .map(PathBuf::from)
                     .or_else(|| dense_quality_profile.clone()),
+                synonyms: c
+                    .synonyms
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or_else(|| synonyms.clone()),
                 dense_execution_policy: c
                     .dense_execution_policy
                     .as_ref()
@@ -2200,6 +2234,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         chunk_blocks,
         share_floors,
         block_max,
+        segment_pruning,
         allow_missing_bm25,
         coalesce,
         scan_parallel,
@@ -2217,6 +2252,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         max_k,
         max_rerank_bytes,
         dense_quality_profile,
+        synonyms,
         dense_execution_policy,
         query_dim,
         bit_width,

@@ -167,7 +167,7 @@ async fn each_public_unary_route_enforces_its_declared_action() {
     for principal in ["writer", "admin"] {
         refuses!(principal; search: SearchRequest, bm25_search: Bm25SearchRequest,
             phrase_search: PhraseSearchRequest, hybrid_search: HybridSearchRequest,
-            variant_search: VariantSearchRequest, query: QueryRequest, aggregate: AggregateRequest, suggest: SuggestRequest);
+            variant_search: VariantSearchRequest, query: QueryRequest, aggregate: AggregateRequest, suggest: SuggestRequest, term_suggest: TermSuggestRequest);
         let error = SearchService::query_stream(
             &set,
             request(
@@ -186,7 +186,7 @@ async fn each_public_unary_route_enforces_its_declared_action() {
     for principal in ["reader", "writer"] {
         refuses!(principal; broadcast_vector_backend: BroadcastVectorBackendRequest,
             broadcast_calibration: BroadcastCalibrationRequest, plan_index: PlanIndexRequest,
-            describe_schema: DescribeSchemaRequest,
+            describe_schema: DescribeSchemaRequest, plan_placement: PlanPlacementRequest,
             freeze_topology_writes: FreezeTopologyWritesRequest, publish_topology: PublishTopologyRequest,
             abort_topology_cutover: AbortTopologyCutoverRequest, cluster_health: ClusterHealthRequest);
     }

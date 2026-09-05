@@ -105,12 +105,14 @@ match set is the union over every leg's terms). Facet counting rides
 the scoring RPC, so the stats-epoch refusal-retry covers it with no
 extra machinery.
 
-Hybrid queries do not carry facets yet: the vector leg matched the
-whole corpus, so "counts over the matches" had no single honest answer
-there. Vector-leg filters have since landed
-(`docs/vector-filters.md`), so a FILTERED hybrid query's match set is
-a set and counts over it are well-defined — that is the seam to
-revisit, and counting them is the increment nobody has written.
+Hybrid queries carry their counts through the public Query route:
+`QueryRequest.aggregate` (`docs/aggregations.md`, "Aggregating a
+query's pool") folds group-by counts, stats, histograms, and
+cardinality over the candidate pool a hybrid page was drawn from, and
+over a browse's exact filter match set. The vector leg matched the
+corpus, so the honest scope of a hybrid count is the pool the page
+ranked, and that is the scope the fold reports (`matched` is its
+size). The legacy `HybridSearchRequest` carries no facets.
 
 ## Aggregations beyond counting (2026-08-24)
 

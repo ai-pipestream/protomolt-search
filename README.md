@@ -6,6 +6,8 @@ quality claims. Vector engines plug in behind one descriptor/configuration
 contract. The shipped `embedded-turbovec` adapter provides exhaustive
 TurboQuant scoring and collaborative live-floor streaming.
 
+New here? The user manual is [docs/manual/README.md](docs/manual/README.md).
+
 ## Repository map
 
 | Repository | Role | Depends on |
@@ -47,7 +49,9 @@ for renamed surfaces, compatibility aliases, and rebuild impact.
 Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
 The implemented public query contract is [docs/query-api.md](docs/query-api.md):
 selection first, candidate-scoped boosts second, then a named-signal composite
-scorer. [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
+scorer, with multi-key sort and collapse over the result. Query-time synonyms
+and did-you-mean are [docs/synonyms.md](docs/synonyms.md); the per-hit
+explain tree is [docs/explain.md](docs/explain.md). [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
 provisional replacement revisions and an explicit terminal certificate.
 `DENSE_EXECUTION_MODE_AUTO` chooses a dense traversal only through the
 generation-bound policy in
@@ -345,6 +349,12 @@ cargo run --release --example sweep -- \
 `--write-indexes DIR` additionally persists the shards as `.tv` files and
 prints ready-to-paste `[[shards]]` config entries — this is how the indexes
 for a real deployment are produced (shared calibration baked in).
+
+`partition_bench` is the layout counterpart: one segment-layout shard with a
+`year` column, the same cases on the bucket layout and after a partitioned
+`CompactShard`, each with segment pruning on and off, asserting identical
+answers throughout. Numbers and the command line:
+[docs/benchmarks/partition-pruning-2026-09.md](docs/benchmarks/partition-pruning-2026-09.md).
 
 ## BM25 lexical search (hybrid half)
 
@@ -774,23 +784,23 @@ promoted rather than the list shrinking, blend statistics see only the
 filtered set, and in cascade it tightens the phase-1 gate ahead of the
 rescore fan-out. Score-defined, hence layout-invariant. 0 = off.
 
-### The console (test harness UI)
+### The console (JSON facade and web UI)
 
 `cargo run --release --bin console -- --coordinator=host:port
---nodes=host:port,... --analysis=host:port [--listen=127.0.0.1:8600]`
-serves a single-file web UI for exercising every hybrid knob by hand
-against a RUNNING cluster (the console is purely a client). Query text
-is embedded through the sidecar's Model2Vec model (`EmbeddingOptions`,
-sentence embeddings mean-pooled and L2-normalized), the search runs
-through the coordinator's `HybridSearch` with `debug` always on, and
-hit texts come from the owning nodes (`GetDocuments`, which is why the
-console takes the node list in shard order). The UI exposes fusion
-mode, leg_k/rrf_k/weights, score-blend normalization + combination,
-boost rescore, and the analysis spec (tokenizer/stemmer/term source —
-must match ingest); renders per-hit provenance with term highlighting,
-the phase-timing bar, and the per-shard waterfall (cascade scan stats
-included); and holds any result as "A" for side-by-side comparison
-with movement markers.
+[--nodes=host:port,...] [--analysis=host:port] [--listen=127.0.0.1:8600]`
+serves the operator's front end for a running cluster; it is a client
+only and holds the TLS material and bearer token so a browser carries
+neither. `POST /api/rpc/<Service>/<Method>` transcodes proto3 JSON to
+any unary method of `SearchService` and `DiagnosticsService` and back,
+from the compiled descriptor set, and `/api/stream/...` exposes the
+server-streaming ones as server-sent events. The search page builds a
+`Query` from a form (lexical, dense, hybrid composite, boolean tree,
+browse; CEL filter, sort, collapse, highlight, aggregations, explain,
+profile, cursor paging), with typeahead and did-you-mean, the streaming
+query, an A/B panel over `VariantSearch`, and a raw view that yields a
+working `grpcurl` line. The dashboard streams the metrics registry,
+edits runtime knobs, draws the shard map from segment summaries, and
+lists recent queries. Details: [The console](docs/console-facade.md).
 
 ### Boost rescore (any mode)
 
@@ -1212,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundations checkpoint on main (2026-09-05).** The ProtoMolt Search
+  namespace, source preservation, local document catalog and collection
+  capabilities are reconciled with sorting, explain, partitioned compaction,
+  diagnostics, the console and the reserved placement contract. See the
+  [reconciliation instructions](docs/foundations-checkpoint-2026-09-05.md)
+  before integrating either placement branch. Foundations remain in progress.
+
 - **Lexical result identity (2026-09-05, `feat/search-foundations`).**
   BM25 search and rescoring return the imported document key, version and
   chunk ordinal from the scored shard state. Simple lexical `Query` and its
@@ -1305,6 +1322,86 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Reserved 2026-09-05: placement trees.** `PlacementTree` and
+  `PlacementNode` in the proto, the `[placement]` table of the shard map,
+  `src/placement.rs` (validation, the prefix code), and
+  `SearchService.PlanPlacement` refusing by name until the dry run
+  exists. Ingest evaluation, fan-out pruning, the dry run, and the leaf
+  reshard follow on their own branches. [Placement trees](docs/placement.md).
+- **Landed 2026-09-05: the diagnostics service.** `DiagnosticsService`
+  on every node and coordinator listener: runtime knobs that flip live
+  (`floor_sharing`, `segment_pruning`, the floor parameters, `max_k`,
+  the hedge delay) beside the startup-only settings, the metrics
+  registry as a snapshot and as a stream, per-shard layout diagnostics
+  with segment summaries and partition ranges, and the coordinator's
+  ring of recent requests; guarded by `admin = true` principals. Details:
+  [The diagnostics service](docs/diagnostics.md).
+- **Landed 2026-09-05: partitioned compaction and segment summaries.**
+  Every sealed segment records, per integer and double column, its value
+  range and how many rows carry one; `CompactShardRequest.partition_column`
+  orders a shard's rows by an integer column and seals them as segments
+  over disjoint ascending value ranges, the rows without the column apart,
+  through the ordinary online cutover. Details: [Immutable aligned
+  segments](docs/immutable-segments.md), "Segment summaries" and
+  "Partitioned layout".
+- **Landed 2026-09-05: the console facade and web UI.** The `console`
+  binary transcodes proto3 JSON to every unary public RPC and back from
+  the compiled descriptor set (`/api/rpc/<Service>/<Method>`), exposes
+  the streaming ones as server-sent events, and serves a two-page UI: a
+  search page that builds the unified `Query` from a form with typeahead,
+  did-you-mean, explain trees, aggregations, collapse, paging, the
+  streaming query, and an A/B panel; and a dashboard over the
+  diagnostics service. Details: [The console](docs/console-facade.md).
+- **Landed 2026-09-05: segment pruning from summaries.** A sealed
+  segment's column summary rules it out of a request whose filter it
+  cannot match: the vector scan never opens the image, the postings walks
+  skip the part, the slot loops skip the rows, and the boolean planner
+  skips the segments a required keyword is absent from. Sound by
+  construction (`AND` prunes on any child, `OR` on all, `NOT` never;
+  facet, map, geo, and string leaves never), off with
+  `--segment-pruning=false`, and counted on every route and in
+  `QueryProfile`. Results are bitwise unchanged. Details:
+  [Segment pruning from summaries](docs/segment-pruning.md).
+- **Landed 2026-09-04 (evening): synonyms and did-you-mean.** Query-time
+  synonym rules (symmetric or one-way) on the coordinator's table
+  (`--synonyms=<toml>`) and on the request, analyzed under the field's spec
+  so a rule written as words matches stems; an expansion is an ordinary
+  query term with its own statistics, reported per matched term.
+  `SearchService.TermSuggest` proposes dictionary terms within an edit bound
+  of each analyzed term over the same bounded scan autocomplete uses.
+  Details: [Synonyms and did-you-mean](docs/synonyms.md).
+- **Landed 2026-09-05: the explain tree.** `QueryRequest.explain` hands
+  each hit an `Explanation` tree whose root is the served score and whose
+  nodes state their arithmetic: per-term BM25 inputs and contributions on
+  a lexical leaf (expansions grouped under their prefix or source term,
+  score stages in order), the native or exact FP32 dense score, the
+  fusion formula per leg, the boolean clause sum, the scorer's dimensions.
+  Assembled from numbers the engine already computed, so hits and order
+  are bitwise unchanged with the flag on. Details:
+  [The explain tree](docs/explain.md).
+- **Landed 2026-09-05: aggregation over a query's pool, cardinality, and
+  calendar histograms.** `QueryRequest.aggregate` folds the Aggregate
+  route's exact folds over the candidate pool a page was drawn from, on
+  a leaf, a composite, a scorer or boost pool, under a collapse, and over
+  a browse's exact filter match set, so a hybrid page carries its facet
+  counts; `AGGREGATE_OP_CARDINALITY` counts distinct values exactly
+  (shard distinct sets unioned, a loud `max_distinct` cap, never a
+  sketch); `HistogramSpec.calendar` buckets epoch-micros timestamps at
+  minute, hour, day, ISO-week, month, quarter, and year boundaries in a
+  fixed UTC offset with hand-rolled proleptic Gregorian arithmetic.
+  Details: [Aggregations](docs/aggregations.md), sections 8 to 10.
+- **Landed 2026-09-04 (evening): the online shard split.** The node worker
+  executes `SPLIT_SHARD`: two children built from the source's own WAL by
+  stable-key range, placed on fresh listeners, tailed by key, the source
+  fenced for the final drain, completion with the children as primaries, the
+  source retired; durable in `split.toml`. Details: [Durable cluster
+  control](docs/cluster-control.md), "Shard split".
+- **Landed 2026-09-04 (evening): multi-key sort and collapse.** Sort over
+  i64, f64, and facet columns and the lineage keys on the browse route and
+  on a single lexical leaf (its exact term membership walked without
+  scores); collapse with inner hits on every scored shape, a single leaf
+  deepening its pool until the page has its groups. Details:
+  [Public query contract](docs/query-api.md), "Sorting" and "Collapse".
 - **Landed 2026-09-04 (evening): the fleet's measurement pass.** The
   four-machine fleet (86,633,399 court chunks, 8 shards) rebuilt on the
   segment layout, compacted online on the Pi shards, and moved to mTLS with
