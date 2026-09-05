@@ -34,6 +34,13 @@ pub(crate) struct ScanIdentities {
 }
 
 impl ScanIdentities {
+    pub(crate) fn range(&self) -> Option<crate::pb::StreamIdentityRange> {
+        (self.rows > 0).then(|| crate::pb::StreamIdentityRange {
+            first_id: self.base,
+            last_id: self.base + (self.rows - 1) as u64,
+        })
+    }
+
     /// All arguments must come from the read guard that scored the scan.
     pub(crate) fn new(
         base: u64,

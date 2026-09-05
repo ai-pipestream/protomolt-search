@@ -64,7 +64,8 @@ hashes each document's stable key into one topology generation and forwards one
 ordinary stream per owning shard. The generation must be named explicitly; zero
 is rejected, so an automatic retry cannot cross a reshard cutover.
 
-- Under a placement tree (`docs/placement.md`) the coordinator first evaluates
+- Under a placement tree (`docs/placement.md`, predicate partitioning: the
+  partition function is a filter-dialect predicate) the coordinator first evaluates
   the tree over the document's own columns, first match per level and the
   level's default when no predicate is true, then hashes the key inside that
   leaf's shards. The shard fills the placement column from the leaf it is

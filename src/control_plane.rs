@@ -19,10 +19,11 @@ use crate::coordinator::{CoordinatorServiceImpl, TopologyRoute};
 use crate::metrics::Route;
 use crate::pb::cluster_control_server::{ClusterControl, ClusterControlServer};
 use crate::pb::{
-    ClusterNode, ClusterNodeState, ClusterPlan, CompletePlacementActionRequest, DrainNodeRequest,
-    GetClusterPlanRequest, NodeCapacity, NodeLease, PlacementAction, PlacementActionKind,
-    ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest, ReportShardRequest,
-    RollbackClusterRequest, ShardReplicaRole, ShardReplicaState,
+    BalanceExclusion, BalanceMove, ClusterNode, ClusterNodeState, ClusterPlan,
+    CompletePlacementActionRequest, DrainNodeRequest, GetClusterPlanRequest, NodeCapacity,
+    NodeLease, NodeLoad, NodeResidency, PlacementAction, PlacementActionKind, PlanBalanceRequest,
+    PlanBalanceResponse, ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest,
+    ReportShardRequest, RollbackClusterRequest, ShardReplicaRole, ShardReplicaState,
 };
 
 #[derive(Debug, Clone)]
@@ -65,6 +66,18 @@ struct StoredCapacity {
     memory_bytes: u64,
     search_threads: u32,
     failure_domain: String,
+    /// Absent in state files written before the fields existed.
+    #[serde(default)]
+    scan_bytes_per_second: u64,
+    #[serde(default)]
+    scan_rate_observed_unix_ms: u64,
+    #[serde(default)]
+    scan_rate_samples: u32,
+    #[serde(default)]
+    scan_rate_window_ms: u64,
+    /// `NodeResidency` as its wire number; 0 is unspecified.
+    #[serde(default)]
+    residency: i32,
 }
 
 impl From<NodeCapacity> for StoredCapacity {
@@ -75,6 +88,11 @@ impl From<NodeCapacity> for StoredCapacity {
             memory_bytes: value.memory_bytes,
             search_threads: value.search_threads,
             failure_domain: value.failure_domain,
+            scan_bytes_per_second: value.scan_bytes_per_second,
+            scan_rate_observed_unix_ms: value.scan_rate_observed_unix_ms,
+            scan_rate_samples: value.scan_rate_samples,
+            scan_rate_window_ms: value.scan_rate_window_ms,
+            residency: value.residency,
         }
     }
 }
@@ -87,6 +105,11 @@ impl From<&StoredCapacity> for NodeCapacity {
             memory_bytes: value.memory_bytes,
             search_threads: value.search_threads,
             failure_domain: value.failure_domain.clone(),
+            scan_bytes_per_second: value.scan_bytes_per_second,
+            scan_rate_observed_unix_ms: value.scan_rate_observed_unix_ms,
+            scan_rate_samples: value.scan_rate_samples,
+            scan_rate_window_ms: value.scan_rate_window_ms,
+            residency: value.residency,
         }
     }
 }
@@ -205,6 +228,329 @@ impl Default for StoredState {
             completed_actions: BTreeSet::new(),
         }
     }
+}
+
+/// Defaults of a [`PlanBalanceRequest`] (`docs/bandwidth-budget.md`).
+pub const BALANCE_DEFAULT_MIN_GAIN: f64 = 0.10;
+pub const BALANCE_DEFAULT_MAX_MOVES: u32 = 8;
+pub const BALANCE_DEFAULT_MAX_RATE_AGE_MS: u64 = 10 * 60 * 1000;
+
+/// The nodes a shard's primary may move among: the placement leaf's
+/// node set when the topology has a tree and the leaf names nodes,
+/// otherwise every node (`docs/placement.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BalancePool {
+    pub leaf: String,
+    /// `None` is "any node"; `Some` restricts to these node ids.
+    pub node_ids: Option<BTreeSet<String>>,
+}
+
+/// One node as the planner sees it.
+#[derive(Debug, Clone)]
+struct BalanceNode {
+    node_id: String,
+    failure_domain: String,
+    rate: u64,
+    bytes: u64,
+    /// `(shard index, shard id, replica addr, bytes)` of the primaries here.
+    shards: Vec<(u32, String, String, u64)>,
+    exclusion: Option<&'static str>,
+}
+
+impl BalanceNode {
+    fn eligible(&self) -> bool {
+        self.exclusion.is_none()
+    }
+
+    fn seconds(&self) -> f64 {
+        match self.rate {
+            0 => 0.0,
+            rate => self.bytes as f64 / rate as f64,
+        }
+    }
+}
+
+/// Strip a scheme so a route address and a node's advertised address
+/// compare as `host:port`.
+fn bare_addr(addr: &str) -> &str {
+    addr.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+}
+
+/// The balance dry run (`docs/bandwidth-budget.md`): a pure function of
+/// the durable state, the request, the provider's encoded row bytes, the
+/// per-shard pools, and the clock. It moves nothing.
+fn plan_balance(
+    state: &StoredState,
+    request: &PlanBalanceRequest,
+    row_bytes: u64,
+    pool_of: &dyn Fn(&str) -> BalancePool,
+    now: u64,
+) -> Result<PlanBalanceResponse, Status> {
+    if !request.min_gain.is_finite() || !(0.0..=1.0).contains(&request.min_gain) {
+        return Err(Status::invalid_argument(format!(
+            "plan_balance: min_gain {} is outside [0, 1] (0 selects {BALANCE_DEFAULT_MIN_GAIN})",
+            request.min_gain
+        )));
+    }
+    if row_bytes == 0 {
+        return Err(Status::failed_precondition(
+            "plan_balance: the provider's encoded row bytes are unknown (no reachable shard \
+             reported its geometry), so no load can be expressed in the rate's units",
+        ));
+    }
+    let min_gain = if request.min_gain == 0.0 {
+        BALANCE_DEFAULT_MIN_GAIN
+    } else {
+        request.min_gain
+    };
+    let max_moves = if request.max_moves == 0 {
+        BALANCE_DEFAULT_MAX_MOVES
+    } else {
+        request.max_moves
+    };
+    let max_rate_age_ms = if request.max_rate_age_ms == 0 {
+        BALANCE_DEFAULT_MAX_RATE_AGE_MS
+    } else {
+        request.max_rate_age_ms
+    };
+    let shard_index: BTreeMap<&str, u32> = state
+        .topology
+        .routes
+        .iter()
+        .enumerate()
+        .map(|(i, route)| (bare_addr(&route.addr), i as u32))
+        .collect();
+
+    let mut nodes: BTreeMap<String, BalanceNode> = state
+        .nodes
+        .iter()
+        .map(|(node_id, node)| {
+            let capacity = &node.capacity;
+            let exclusion = if node.state == StoredNodeState::Expired || node.expires_unix_ms <= now
+            {
+                Some("no-lease")
+            } else if node.state == StoredNodeState::Draining {
+                Some("draining")
+            } else if capacity.residency == NodeResidency::Device as i32 {
+                Some("device")
+            } else if capacity.residency != NodeResidency::Server as i32 {
+                Some("residency-unspecified")
+            } else if capacity.scan_bytes_per_second == 0 {
+                Some("unmeasured")
+            } else if now.saturating_sub(capacity.scan_rate_observed_unix_ms) > max_rate_age_ms {
+                Some("stale")
+            } else {
+                None
+            };
+            (
+                node_id.clone(),
+                BalanceNode {
+                    node_id: node_id.clone(),
+                    failure_domain: capacity.failure_domain.clone(),
+                    rate: if exclusion.is_none() {
+                        capacity.scan_bytes_per_second
+                    } else {
+                        0
+                    },
+                    bytes: 0,
+                    shards: Vec::new(),
+                    exclusion,
+                },
+            )
+        })
+        .collect();
+    // Ready replicas per shard, for the failure-domain rule: a primary
+    // is not moved into the domain of a copy that would then share it.
+    let mut replica_domains: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for replica in state.replicas.values() {
+        if replica.role == StoredRole::Primary {
+            let bytes = replica.rows.saturating_mul(row_bytes);
+            if let Some(node) = nodes.get_mut(&replica.node_id) {
+                let index = shard_index
+                    .get(bare_addr(&replica.addr))
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                node.bytes = node.bytes.saturating_add(bytes);
+                node.shards
+                    .push((index, replica.shard_id.clone(), replica.addr.clone(), bytes));
+            }
+        } else if replica.ready {
+            if let Some(node) = state.nodes.get(&replica.node_id) {
+                replica_domains
+                    .entry(replica.shard_id.clone())
+                    .or_default()
+                    .insert(node.capacity.failure_domain.clone());
+            }
+        }
+    }
+    for node in nodes.values_mut() {
+        node.shards.sort_by(|a, b| a.1.cmp(&b.1));
+    }
+
+    let slowest = |nodes: &BTreeMap<String, BalanceNode>| -> f64 {
+        nodes
+            .values()
+            .filter(|n| n.eligible())
+            .map(BalanceNode::seconds)
+            .fold(0.0, f64::max)
+    };
+    let seconds_before = slowest(&nodes);
+    let mut moves = Vec::new();
+    let mut current = seconds_before;
+    for _ in 0..max_moves {
+        // The slowest eligible node that holds a primary; ties by id.
+        let Some(source_id) = nodes
+            .values()
+            .filter(|n| n.eligible() && !n.shards.is_empty())
+            .max_by(|a, b| {
+                a.seconds()
+                    .partial_cmp(&b.seconds())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.node_id.cmp(&a.node_id))
+            })
+            .map(|n| n.node_id.clone())
+        else {
+            break;
+        };
+        let source = nodes[&source_id].clone();
+        let mut best: Option<(f64, String, usize)> = None;
+        for (position, (_, shard_id, addr, bytes)) in source.shards.iter().enumerate() {
+            let pool = pool_of(addr);
+            let domains = replica_domains.get(shard_id);
+            for target in nodes.values() {
+                if !target.eligible() || target.node_id == source_id {
+                    continue;
+                }
+                if let Some(allowed) = &pool.node_ids {
+                    if !allowed.contains(&target.node_id) {
+                        continue;
+                    }
+                }
+                if domains.is_some_and(|d| d.contains(&target.failure_domain)) {
+                    continue;
+                }
+                let after = nodes
+                    .values()
+                    .filter(|n| n.eligible())
+                    .map(|n| {
+                        let bytes_after = if n.node_id == source_id {
+                            n.bytes - bytes
+                        } else if n.node_id == target.node_id {
+                            n.bytes + bytes
+                        } else {
+                            n.bytes
+                        };
+                        bytes_after as f64 / n.rate as f64
+                    })
+                    .fold(0.0, f64::max);
+                let better = match &best {
+                    None => true,
+                    Some((best_after, best_target, best_position)) => {
+                        after < *best_after
+                            || (after == *best_after
+                                && (target.node_id.as_str(), shard_id.as_str())
+                                    < (
+                                        best_target.as_str(),
+                                        source.shards[*best_position].1.as_str(),
+                                    ))
+                    }
+                };
+                if better {
+                    best = Some((after, target.node_id.clone(), position));
+                }
+            }
+        }
+        let Some((after, target_id, position)) = best else {
+            break;
+        };
+        if after > current * (1.0 - min_gain) {
+            break;
+        }
+        let (index, shard_id, addr, bytes) = source.shards[position].clone();
+        let leaf = pool_of(&addr).leaf;
+        {
+            let from = nodes.get_mut(&source_id).expect("source exists");
+            from.bytes -= bytes;
+            from.shards.remove(position);
+        }
+        {
+            let to = nodes.get_mut(&target_id).expect("target exists");
+            to.bytes += bytes;
+            to.shards.push((index, shard_id.clone(), addr, bytes));
+            to.shards.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        current = after;
+        moves.push(BalanceMove {
+            shard: index,
+            from_node: source_id,
+            to_node: target_id,
+            bytes,
+            leaf,
+            seconds_after: after,
+        });
+    }
+
+    let loads = state
+        .nodes
+        .keys()
+        .map(|node_id| {
+            // Loads report the state BEFORE the moves: what the plan saw.
+            let bytes: u64 = state
+                .replicas
+                .values()
+                .filter(|r| r.role == StoredRole::Primary && &r.node_id == node_id)
+                .map(|r| r.rows.saturating_mul(row_bytes))
+                .fold(0u64, u64::saturating_add);
+            let node = &state.nodes[node_id];
+            let measured = nodes[node_id].eligible();
+            let mut shards: Vec<u32> = state
+                .replicas
+                .values()
+                .filter(|r| r.role == StoredRole::Primary && &r.node_id == node_id)
+                .map(|r| {
+                    shard_index
+                        .get(bare_addr(&r.addr))
+                        .copied()
+                        .unwrap_or(u32::MAX)
+                })
+                .collect();
+            shards.sort_unstable();
+            NodeLoad {
+                node_id: node_id.clone(),
+                bytes,
+                scan_bytes_per_second: node.capacity.scan_bytes_per_second,
+                seconds: if measured && node.capacity.scan_bytes_per_second > 0 {
+                    bytes as f64 / node.capacity.scan_bytes_per_second as f64
+                } else {
+                    0.0
+                },
+                shards,
+                residency: node.capacity.residency,
+            }
+        })
+        .collect();
+    let excluded = nodes
+        .values()
+        .filter_map(|n| {
+            n.exclusion.map(|reason| BalanceExclusion {
+                node_id: n.node_id.clone(),
+                reason: reason.to_string(),
+            })
+        })
+        .collect();
+    Ok(PlanBalanceResponse {
+        topology_generation: state.topology.generation,
+        control_revision: state.revision,
+        loads,
+        moves,
+        seconds_before,
+        seconds_after: current,
+        excluded,
+        min_gain,
+        max_moves,
+    })
 }
 
 fn now_ms() -> u64 {
@@ -1496,6 +1842,21 @@ impl DurableControlPlane {
         Ok(Self::plan_of(&state))
     }
 
+    /// The balance dry run over the durable state; see [`plan_balance`].
+    pub fn plan_balance(
+        &self,
+        request: &PlanBalanceRequest,
+        row_bytes: u64,
+        pool_of: &dyn Fn(&str) -> BalancePool,
+        now: u64,
+    ) -> Result<PlanBalanceResponse, Status> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        plan_balance(&state, request, row_bytes, pool_of, now)
+    }
+
     fn topology_routes(&self) -> Result<(u64, Vec<TopologyRoute>), Status> {
         let state = self
             .state
@@ -1717,6 +2078,98 @@ impl ClusterControlService {
     fn publish_if_needed(&self) -> Result<(), Status> {
         self.publish_current_topology()
     }
+
+    /// What the planner needs beyond the durable state: the encoded row
+    /// bytes of the provider (one geometry cluster-wide, read from the
+    /// live shards' health and required to agree) and each shard's
+    /// placement pool (its leaf's node set, matched to registered nodes
+    /// by advertised address or node id). Needs the coordinator: without
+    /// one the plane cannot express any load in the rate's units.
+    async fn balance_context(
+        &self,
+        collection: &str,
+    ) -> Result<(u64, BTreeMap<String, BalancePool>), Status> {
+        let Some(coordinator) = &self.coordinator else {
+            return Err(Status::failed_precondition(
+                "plan_balance: this control plane has no coordinator attached, so the \
+                 provider geometry and the placement pools are unknown",
+            ));
+        };
+        let health = crate::pb::search_service_server::SearchService::cluster_health(
+            coordinator,
+            Request::new(crate::pb::ClusterHealthRequest {
+                collection: collection.to_string(),
+            }),
+        )
+        .await?
+        .into_inner();
+        let mut geometry: Option<(u32, u32)> = None;
+        for target in &health.targets {
+            let Some(shard_health) = target.health.as_ref().filter(|_| target.reachable) else {
+                continue;
+            };
+            if shard_health.dim == 0 || shard_health.bits_per_dimension == 0 {
+                continue;
+            }
+            let seen = (shard_health.dim, shard_health.bits_per_dimension);
+            match geometry {
+                None => geometry = Some(seen),
+                Some(first) if first != seen => {
+                    return Err(Status::failed_precondition(format!(
+                        "plan_balance: shard {} at {} reports geometry {}x{} bits but another \
+                         shard reports {}x{} bits; one provider geometry is required",
+                        target.shard, target.addr, seen.0, seen.1, first.0, first.1
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        let row_bytes = geometry.map_or(0, |(dim, bits)| {
+            crate::chunked::encoded_row_bytes(dim as usize, bits as usize)
+        });
+        let mut pools = BTreeMap::new();
+        if let Some(placement) = coordinator.current_placement() {
+            let node_ids_by_addr: BTreeMap<String, String> = {
+                let state = self
+                    .plane
+                    .state
+                    .lock()
+                    .map_err(|_| Status::internal("control state lock poisoned"))?;
+                state
+                    .nodes
+                    .values()
+                    .map(|n| (bare_addr(&n.addr).to_string(), n.node_id.clone()))
+                    .collect()
+            };
+            for route in coordinator.current_topology_routes() {
+                let Some(code) = route.placement else {
+                    continue;
+                };
+                let Some(leaf) = placement.leaf_by_code(code) else {
+                    continue;
+                };
+                let node_ids = (!leaf.nodes.is_empty()).then(|| {
+                    leaf.nodes
+                        .iter()
+                        .map(|entry| {
+                            node_ids_by_addr
+                                .get(bare_addr(entry))
+                                .cloned()
+                                .unwrap_or_else(|| entry.clone())
+                        })
+                        .collect::<BTreeSet<String>>()
+                });
+                pools.insert(
+                    bare_addr(&route.addr).to_string(),
+                    BalancePool {
+                        leaf: leaf.name.clone(),
+                        node_ids,
+                    },
+                );
+            }
+        }
+        Ok((row_bytes, pools))
+    }
 }
 
 #[tonic::async_trait]
@@ -1831,6 +2284,30 @@ impl ClusterControl for ClusterControlService {
         .await
     }
 
+    /// Balance dry run (`docs/bandwidth-budget.md`): the provider's row
+    /// geometry from the live shards' health and the placement pools
+    /// from the coordinator, then the pure planner over the durable
+    /// state. Cluster trust, like the other control routes.
+    async fn plan_balance(
+        &self,
+        request: Request<crate::pb::PlanBalanceRequest>,
+    ) -> Result<Response<crate::pb::PlanBalanceResponse>, Status> {
+        crate::metrics::timed(Route::PlanBalance, request, |request| async move {
+            self.membership(&request)?;
+            self.admit(&request.get_ref().collection)?;
+            let request = request.into_inner();
+            let (row_bytes, pools) = self.balance_context(&request.collection).await?;
+            let pool_of = |addr: &str| -> BalancePool {
+                pools.get(bare_addr(addr)).cloned().unwrap_or_default()
+            };
+            let response = self
+                .plane
+                .plan_balance(&request, row_bytes, &pool_of, now_ms())?;
+            Ok(Response::new(response))
+        })
+        .await
+    }
+
     async fn rollback_cluster(
         &self,
         request: Request<RollbackClusterRequest>,
@@ -1924,6 +2401,395 @@ mod tests {
                 now,
             )
             .unwrap();
+    }
+
+    /// A node with an observed rate and a residency, renewed so the
+    /// capacity is stored.
+    fn measured(
+        plane: &DurableControlPlane,
+        lease: &NodeLease,
+        domain: &str,
+        rate: u64,
+        observed: u64,
+        residency: NodeResidency,
+        now: u64,
+    ) {
+        plane
+            .renew(
+                RenewNodeLeaseRequest {
+                    collection: String::new(),
+                    node_id: lease.node_id.clone(),
+                    lease_token: lease.lease_token,
+                    capacity: Some(NodeCapacity {
+                        disk_bytes: 1_000,
+                        failure_domain: domain.into(),
+                        scan_bytes_per_second: rate,
+                        scan_rate_observed_unix_ms: observed,
+                        scan_rate_samples: 8,
+                        scan_rate_window_ms: 600_000,
+                        residency: residency as i32,
+                        ..Default::default()
+                    }),
+                    lease_ms: 10_000,
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    /// A primary shard on `lease`'s node at its own listener address.
+    fn primary_at(
+        plane: &DurableControlPlane,
+        lease: &NodeLease,
+        shard: &str,
+        addr: &str,
+        rows: u64,
+        now: u64,
+    ) {
+        plane
+            .report(
+                ReportShardRequest {
+                    collection: String::new(),
+                    node_id: lease.node_id.clone(),
+                    lease_token: lease.lease_token,
+                    replica: Some(ShardReplicaState {
+                        shard_id: shard.into(),
+                        addr: addr.into(),
+                        generation: 7,
+                        hash_lo: 0,
+                        hash_hi: u64::MAX,
+                        rows,
+                        role: ShardReplicaRole::Primary as i32,
+                        ready: true,
+                        scoring_fingerprint: "score-v1".into(),
+                        analysis_fingerprint: "analysis-v1".into(),
+                        immutable_segments: 1,
+                        ..Default::default()
+                    }),
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    fn any_pool(_: &str) -> BalancePool {
+        BalancePool::default()
+    }
+
+    /// Three measured servers with rates 100, 50 and 25 (bytes per
+    /// second, with row bytes of 1 so rows are bytes): the slow node
+    /// holds the most, the plan moves whole shards off it toward the
+    /// node that ends up lowest, deterministically, until a move would
+    /// gain less than `min_gain`.
+    #[test]
+    fn a_balance_plan_is_deterministic_and_bounded() {
+        let plane = DurableControlPlane::in_memory(ControlPolicy::default());
+        let now = 1_000_000;
+        let a = register(&plane, "a", "10.0.0.1:1", "z1", now);
+        let b = register(&plane, "b", "10.0.0.2:1", "z2", now);
+        let c = register(&plane, "c", "10.0.0.3:1", "z3", now);
+        measured(&plane, &a, "z1", 100, now, NodeResidency::Server, now);
+        measured(&plane, &b, "z2", 50, now, NodeResidency::Server, now);
+        measured(&plane, &c, "z3", 25, now, NodeResidency::Server, now);
+        // c: three shards of 1000 rows (120 s); a: one of 1000 (10 s);
+        // b: one of 1000 (20 s).
+        primary_at(&plane, &c, "s0", "10.0.0.3:100", 1_000, now);
+        primary_at(&plane, &c, "s1", "10.0.0.3:101", 1_000, now);
+        primary_at(&plane, &c, "s2", "10.0.0.3:102", 1_000, now);
+        primary_at(&plane, &a, "s3", "10.0.0.1:100", 1_000, now);
+        primary_at(&plane, &b, "s4", "10.0.0.2:100", 1_000, now);
+        let request = PlanBalanceRequest {
+            collection: String::new(),
+            min_gain: 0.0,
+            max_moves: 0,
+            max_rate_age_ms: 0,
+        };
+        let plan = plane.plan_balance(&request, 1, &any_pool, now).unwrap();
+        assert_eq!(plan.min_gain, BALANCE_DEFAULT_MIN_GAIN);
+        assert_eq!(plan.max_moves, BALANCE_DEFAULT_MAX_MOVES);
+        assert_eq!(plan.control_revision, plane.state.lock().unwrap().revision);
+        assert!(plan.excluded.is_empty(), "{:?}", plan.excluded);
+        assert_eq!(plan.seconds_before, 120.0);
+        // Greedy: s0 leaves c (120 s) for a (a 20 s; the maximum is c at
+        // 80 s), then s1 leaves c for a (a 30 s, c 40 s: maximum 40 s).
+        // Moving s2 too would leave a at 40 s, no lower than c's 40 s,
+        // so the plan stops there.
+        let moved: Vec<(String, String, String)> = plan
+            .moves
+            .iter()
+            .map(|m| (m.from_node.clone(), m.to_node.clone(), m.leaf.clone()))
+            .collect();
+        assert_eq!(
+            moved,
+            vec![
+                ("c".to_string(), "a".to_string(), String::new()),
+                ("c".to_string(), "a".to_string(), String::new()),
+            ],
+            "{:?}",
+            plan.moves
+        );
+        assert_eq!(plan.moves[0].bytes, 1_000);
+        assert_eq!(plan.moves[0].seconds_after, 80.0);
+        assert_eq!(plan.moves[1].seconds_after, 40.0);
+        assert_eq!(plan.seconds_after, 40.0);
+        // Loads describe the state the plan saw, not the state after.
+        let c_load = plan.loads.iter().find(|l| l.node_id == "c").unwrap();
+        assert_eq!(c_load.bytes, 3_000);
+        assert_eq!(c_load.seconds, 120.0);
+        assert_eq!(c_load.residency, NodeResidency::Server as i32);
+        // The same state plans the same moves again.
+        let again = plane.plan_balance(&request, 1, &any_pool, now).unwrap();
+        assert_eq!(again.moves, plan.moves);
+        // A move budget of one keeps the first move only.
+        let one = plane
+            .plan_balance(
+                &PlanBalanceRequest {
+                    max_moves: 1,
+                    ..request.clone()
+                },
+                1,
+                &any_pool,
+                now,
+            )
+            .unwrap();
+        assert_eq!(one.moves.len(), 1);
+        assert_eq!(one.seconds_after, 80.0);
+        // A gain threshold above what any move earns plans nothing.
+        let strict = plane
+            .plan_balance(
+                &PlanBalanceRequest {
+                    min_gain: 0.9,
+                    ..request.clone()
+                },
+                1,
+                &any_pool,
+                now,
+            )
+            .unwrap();
+        assert!(strict.moves.is_empty());
+        assert_eq!(strict.seconds_after, strict.seconds_before);
+        // Row bytes scale every load and every estimate.
+        let scaled = plane.plan_balance(&request, 36, &any_pool, now).unwrap();
+        assert_eq!(scaled.seconds_before, 120.0 * 36.0);
+        assert_eq!(scaled.moves[0].bytes, 36_000);
+    }
+
+    #[test]
+    fn balance_refusals_and_exclusions_name_their_reason() {
+        let plane = DurableControlPlane::in_memory(ControlPolicy::default());
+        let now = 10_000_000;
+        let request = PlanBalanceRequest::default();
+        for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let err = plane
+                .plan_balance(
+                    &PlanBalanceRequest {
+                        min_gain: bad,
+                        ..request.clone()
+                    },
+                    1,
+                    &any_pool,
+                    now,
+                )
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad}: {err}");
+            assert!(err.message().contains("min_gain"), "{err}");
+        }
+        let err = plane.plan_balance(&request, 0, &any_pool, now).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("row bytes"), "{err}");
+
+        let fast = register(&plane, "fast", "10.0.0.1:1", "z1", now);
+        let unmeasured = register(&plane, "unmeasured", "10.0.0.2:1", "z2", now);
+        let stale = register(&plane, "stale", "10.0.0.3:1", "z3", now);
+        let phone = register(&plane, "phone", "10.0.0.4:1", "z4", now);
+        let unspecified = register(&plane, "unspecified", "10.0.0.5:1", "z5", now);
+        let draining = register(&plane, "draining", "10.0.0.6:1", "z6", now);
+        let lapsed = register(&plane, "lapsed", "10.0.0.7:1", "z7", now);
+        measured(&plane, &fast, "z1", 1_000, now, NodeResidency::Server, now);
+        measured(&plane, &unmeasured, "z2", 0, 0, NodeResidency::Server, now);
+        measured(
+            &plane,
+            &stale,
+            "z3",
+            1_000,
+            now - 3_600_000,
+            NodeResidency::Server,
+            now,
+        );
+        measured(
+            &plane,
+            &phone,
+            "z4",
+            1_000_000,
+            now,
+            NodeResidency::Device,
+            now,
+        );
+        measured(
+            &plane,
+            &unspecified,
+            "z5",
+            1_000,
+            now,
+            NodeResidency::Unspecified,
+            now,
+        );
+        measured(
+            &plane,
+            &draining,
+            "z6",
+            1_000,
+            now,
+            NodeResidency::Server,
+            now,
+        );
+        measured(
+            &plane,
+            &lapsed,
+            "z7",
+            1_000,
+            now,
+            NodeResidency::Server,
+            now,
+        );
+        plane
+            .drain(
+                DrainNodeRequest {
+                    collection: String::new(),
+                    node_id: "draining".into(),
+                    lease_token: draining.lease_token,
+                },
+                now,
+            )
+            .unwrap();
+        // The phone is the fastest node and holds the heaviest shard; the
+        // slow server holds one too. Neither the phone's shard nor any
+        // shard may involve the phone.
+        primary_at(&plane, &phone, "p0", "10.0.0.4:100", 100_000, now);
+        primary_at(&plane, &fast, "f0", "10.0.0.1:100", 10_000, now);
+        primary_at(&plane, &fast, "f1", "10.0.0.1:101", 10_000, now);
+        primary_at(&plane, &unmeasured, "u0", "10.0.0.2:100", 10_000, now);
+        let late = now + 30_000; // past every 10 s lease
+        let plan = plane.plan_balance(&request, 1, &any_pool, now).unwrap();
+        let reasons: BTreeMap<String, String> = plan
+            .excluded
+            .iter()
+            .map(|e| (e.node_id.clone(), e.reason.clone()))
+            .collect();
+        assert_eq!(
+            reasons.get("unmeasured").map(String::as_str),
+            Some("unmeasured")
+        );
+        assert_eq!(reasons.get("stale").map(String::as_str), Some("stale"));
+        assert_eq!(reasons.get("phone").map(String::as_str), Some("device"));
+        assert_eq!(
+            reasons.get("unspecified").map(String::as_str),
+            Some("residency-unspecified")
+        );
+        assert_eq!(
+            reasons.get("draining").map(String::as_str),
+            Some("draining")
+        );
+        assert!(!reasons.contains_key("fast"));
+        assert!(!reasons.contains_key("lapsed"), "still leased at {now}");
+        for m in &plan.moves {
+            assert_ne!(m.from_node, "phone");
+            assert_ne!(m.to_node, "phone");
+            assert_ne!(m.to_node, "unmeasured");
+            assert_ne!(m.to_node, "draining");
+        }
+        // The only eligible peers are fast and lapsed; fast's two shards
+        // (20 s) can spread to lapsed (0 s): one move leaves both at 10 s.
+        assert_eq!(plan.moves.len(), 1, "{:?}", plan.moves);
+        assert_eq!(plan.moves[0].from_node, "fast");
+        assert_eq!(plan.moves[0].to_node, "lapsed");
+        assert_eq!(
+            plan.moves[0].shard,
+            u32::MAX,
+            "no topology names the shard's index"
+        );
+        let phone_load = plan.loads.iter().find(|l| l.node_id == "phone").unwrap();
+        assert_eq!(phone_load.bytes, 100_000);
+        assert_eq!(phone_load.seconds, 0.0, "no estimate for an excluded node");
+        // Later, lapsed's lease has run out: it is excluded and nothing moves.
+        let later = plane.plan_balance(&request, 1, &any_pool, late).unwrap();
+        assert!(later
+            .excluded
+            .iter()
+            .any(|e| e.node_id == "lapsed" && e.reason == "no-lease"));
+        assert!(later.moves.is_empty(), "{:?}", later.moves);
+    }
+
+    /// A pool confines a move to the leaf's node set, and a ready copy's
+    /// failure domain is never the destination.
+    #[test]
+    fn balance_moves_stay_inside_the_pool_and_off_the_replicas_domain() {
+        let plane = DurableControlPlane::in_memory(ControlPolicy::default());
+        let now = 1_000_000;
+        let a = register(&plane, "a", "10.0.0.1:1", "z1", now);
+        let b = register(&plane, "b", "10.0.0.2:1", "z2", now);
+        let c = register(&plane, "c", "10.0.0.3:1", "z3", now);
+        for (lease, domain) in [(&a, "z1"), (&b, "z2"), (&c, "z3")] {
+            measured(&plane, lease, domain, 100, now, NodeResidency::Server, now);
+        }
+        primary_at(&plane, &a, "s0", "10.0.0.1:100", 1_000, now);
+        primary_at(&plane, &a, "s1", "10.0.0.1:101", 1_000, now);
+        // Without a pool the plan spreads s0 (or s1) to b or c; the pool
+        // "leaf-x" allows c only.
+        let pool = |_: &str| BalancePool {
+            leaf: "leaf-x".into(),
+            node_ids: Some(["c".to_string()].into_iter().collect()),
+        };
+        let plan = plane
+            .plan_balance(&PlanBalanceRequest::default(), 1, &pool, now)
+            .unwrap();
+        assert_eq!(plan.moves.len(), 1, "{:?}", plan.moves);
+        assert_eq!(plan.moves[0].to_node, "c");
+        assert_eq!(plan.moves[0].leaf, "leaf-x");
+        // A pool that names no eligible node plans nothing.
+        let nowhere = |_: &str| BalancePool {
+            leaf: "leaf-y".into(),
+            node_ids: Some(["zz".to_string()].into_iter().collect()),
+        };
+        let plan = plane
+            .plan_balance(&PlanBalanceRequest::default(), 1, &nowhere, now)
+            .unwrap();
+        assert!(plan.moves.is_empty());
+        // A ready replica of s0 on c puts c's domain off limits for s0;
+        // s1 has no replica, so s1 goes to c and s0 stays.
+        plane
+            .report(
+                ReportShardRequest {
+                    collection: String::new(),
+                    node_id: "c".into(),
+                    lease_token: c.lease_token,
+                    replica: Some(ShardReplicaState {
+                        shard_id: "s0".into(),
+                        addr: "10.0.0.3:100".into(),
+                        generation: 7,
+                        hash_lo: 0,
+                        hash_hi: u64::MAX,
+                        rows: 1_000,
+                        role: ShardReplicaRole::Replica as i32,
+                        ready: true,
+                        scoring_fingerprint: "score-v1".into(),
+                        analysis_fingerprint: "analysis-v1".into(),
+                        immutable_segments: 1,
+                        ..Default::default()
+                    }),
+                },
+                now,
+            )
+            .unwrap();
+        let plan = plane
+            .plan_balance(&PlanBalanceRequest::default(), 1, &pool, now)
+            .unwrap();
+        assert_eq!(plan.moves.len(), 1, "{:?}", plan.moves);
+        assert_eq!(plan.moves[0].to_node, "c");
+        let moved_addr_is_s1 = plan.moves[0].bytes == 1_000;
+        assert!(moved_addr_is_s1);
+        let c_after: Vec<&BalanceMove> = plan.moves.iter().collect();
+        assert!(c_after.iter().all(|m| m.from_node == "a"));
     }
 
     fn action_output(

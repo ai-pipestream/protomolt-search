@@ -46,6 +46,7 @@ async fn fixture() -> (
     NodeServiceImpl,
     NodeServiceClient<Channel>,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    String,
 ) {
     let corpus = common::unit_vectors(4, 64, 721);
     let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, 64, 4).unwrap();
@@ -77,7 +78,7 @@ async fn fixture() -> (
     let client = NodeServiceClient::connect(format!("http://{addr}"))
         .await
         .unwrap();
-    (node, client, server)
+    (node, client, server, format!("http://{addr}"))
 }
 
 fn limits() -> StreamIdentityLimits {
@@ -143,8 +144,96 @@ async fn select(tx: &mpsc::Sender<StreamSearchRequest>, ids: Vec<u64>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_relays_resolve_original_identities_after_leaf_rows_are_replaced() {
+    let (node, _client, server, addr) = fixture().await;
+    let (relay, _, first) = pipestream_search::harness::start_relay(vec![addr]).await;
+    let (relay, _, second) = pipestream_search::harness::start_relay(vec![relay]).await;
+    let mut client = NodeServiceClient::connect(relay).await.unwrap();
+    let (tx, mut inbound) = start(&mut client, limits()).await;
+    ready(&mut inbound).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || node.with_bm25(Some(store(99)))),
+    )
+    .await
+    .expect("relays must not retain the leaf's scan lock")
+    .unwrap();
+    select(&tx, vec![103, 102, 100]).await;
+    let response::Payload::Identities(found) =
+        inbound.message().await.unwrap().unwrap().payload.unwrap()
+    else {
+        panic!("identities")
+    };
+    assert_eq!(
+        found
+            .rows
+            .iter()
+            .map(|row| row.vector_id)
+            .collect::<Vec<_>>(),
+        [103, 102, 100]
+    );
+    assert_eq!(found.rows[0].identity.as_ref().unwrap().version, 7);
+    assert!(found.rows[1].identity.is_none());
+    assert_eq!(
+        found.rows[2].identity.as_ref().unwrap().document_key,
+        [0, 255, 0]
+    );
+    let response::Payload::Summary(summary) =
+        inbound.message().await.unwrap().unwrap().payload.unwrap()
+    else {
+        panic!("summary")
+    };
+    assert!(summary.completed);
+    assert!(inbound.message().await.unwrap().is_none());
+    first.abort();
+    second.abort();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_enforce_selection_bounds_and_release_a_timed_out_child_exchange() {
+    let (_, _, server, addr) = fixture().await;
+    let (relay, _, relay_task) = pipestream_search::harness::start_relay(vec![addr]).await;
+    let mut client = NodeServiceClient::connect(relay).await.unwrap();
+    for ids in [vec![99], vec![100, 100], vec![104]] {
+        let (tx, mut inbound) = start(&mut client, limits()).await;
+        ready(&mut inbound).await;
+        select(&tx, ids).await;
+        assert_eq!(
+            inbound.message().await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let mut short = limits();
+    short.timeout_ms = 50;
+    let (_tx, mut inbound) = start(&mut client, short).await;
+    ready(&mut inbound).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), inbound.message())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    let (tx, mut inbound) = start(&mut client, limits()).await;
+    ready(&mut inbound).await;
+    tx.send(StreamSearchRequest {
+        payload: Some(request::Payload::Stop(StopStreamSearch {})),
+    })
+    .await
+    .unwrap();
+    let response::Payload::Summary(summary) =
+        inbound.message().await.unwrap().unwrap().payload.unwrap()
+    else {
+        panic!("stopped summary")
+    };
+    assert!(!summary.completed);
+    relay_task.abort();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn solo_classic_scan_carries_the_same_identity_and_excludes_deleted_rows() {
-    let (_, mut client, server) = fixture().await;
+    let (_, mut client, server, _) = fixture().await;
     let mut inbound = client
         .search_shard(tokio_stream::iter([
             pipestream_search::pb::SearchShardRequest {
@@ -182,7 +271,7 @@ async fn solo_classic_scan_carries_the_same_identity_and_excludes_deleted_rows()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identities_keep_the_scored_binding_after_row_reuse_without_holding_the_shard_lock() {
-    let (node, mut client, server) = fixture().await;
+    let (node, mut client, server, _) = fixture().await;
     let (tx, mut inbound) = start(&mut client, limits()).await;
     ready(&mut inbound).await;
     // Replace exactly the same positional rows while the old scan waits.
@@ -233,7 +322,7 @@ async fn identities_keep_the_scored_binding_after_row_reuse_without_holding_the_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn selection_rejects_deleted_out_of_range_duplicate_and_oversized_requests() {
-    let (_, mut client, server) = fixture().await;
+    let (_, mut client, server, _) = fixture().await;
     for (ids, bytes, expected) in [
         (vec![101], 4096, tonic::Code::PermissionDenied),
         (vec![u64::MAX], 4096, tonic::Code::InvalidArgument),
@@ -258,7 +347,7 @@ async fn selection_rejects_deleted_out_of_range_duplicate_and_oversized_requests
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identity_wait_expires_and_stop_never_certifies_completion() {
-    let (_, mut client, server) = fixture().await;
+    let (_, mut client, server, _) = fixture().await;
     let (_tx, mut inbound) = start(
         &mut client,
         StreamIdentityLimits {

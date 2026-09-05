@@ -576,12 +576,22 @@ impl NodeAgent {
         } else {
             self.inner.config.scan_parallel
         } as u32;
+        let rate = crate::node::scan_rate();
         NodeCapacity {
             disk_bytes,
             used_disk_bytes,
             memory_bytes: memory_bytes(),
             search_threads,
             failure_domain: self.inner.config.failure_domain.clone(),
+            // The process-wide window's rate (docs/bandwidth-budget.md):
+            // zero is unknown. A server process: the device residency is
+            // declared by the phone transport, which does not register
+            // through this agent.
+            scan_bytes_per_second: rate.bytes_per_second,
+            scan_rate_observed_unix_ms: rate.observed_unix_ms,
+            scan_rate_samples: rate.samples,
+            scan_rate_window_ms: rate.window_ms,
+            residency: crate::pb::NodeResidency::Server as i32,
         }
     }
 

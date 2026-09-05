@@ -436,7 +436,63 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    if matches!(cfg.role, Role::Coordinator | Role::Both) {
+    if cfg.relay {
+        // A relay (docs/relay-coordinators.md): this coordinator's shard
+        // set behind the node-facing surface, on the coordinator listener,
+        // with the parent-facing UDP lane on the same port. The startup
+        // check refuses children whose slot ranges are not contiguous.
+        let listener = TcpListener::bind(cfg.coord_listen).await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let (coordinator, _control) = build_corpus(
+            &cfg,
+            CorpusSpec {
+                name: "",
+                node_addrs: &cfg.node_addrs,
+                replica_addrs: &cfg.replica_addrs,
+                shard_map: cfg.shard_map.as_ref(),
+                shard_map_path: cfg.shard_map_path.as_deref(),
+                analysis_addr: cfg.analysis_addr.as_ref(),
+                bm25_k1: cfg.bm25_k1,
+                bm25_b: cfg.bm25_b,
+                dense_quality_profile: cfg.dense_quality_profile.as_deref(),
+                synonyms: cfg.synonyms.as_deref(),
+                dense_execution_policy: cfg.dense_execution_policy.as_deref(),
+                replica_state_path: cfg.replica_state_path.as_deref(),
+                control_state_path: None,
+                clustered_turbovec: cfg.clustered_turbovec.as_ref(),
+            },
+            &phrase_index,
+            &shutdown_rx,
+            &mut handles,
+        )
+        .await?;
+        let relay = pipestream_search::relay::RelayService::new(std::sync::Arc::new(coordinator));
+        let health = relay
+            .check_children()
+            .await
+            .map_err(|status| format!("relay startup: {}", status.message()))?;
+        relay.spawn_floor_listener(addr);
+        eprintln!(
+            "relay NodeService listening on {addr} over {} children, slots {}..{} ({} vectors, \
+             {} documents)",
+            relay.children().len(),
+            health.slot_offset,
+            health.slot_offset + health.num_vectors.max(health.bm25_docs),
+            health.num_vectors,
+            health.bm25_docs
+        );
+        let max = cfg.max_message_bytes;
+        let mut shutdown = shutdown_rx.clone();
+        handles.push(tokio::spawn(
+            secured_server(cfg.tls.as_ref(), true)?
+                .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
+                .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
+                .add_service(relay.into_server(max))
+                .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
+                    let _ = shutdown.wait_for(|v| *v).await;
+                }),
+        ));
+    } else if matches!(cfg.role, Role::Coordinator | Role::Both) {
         let listener = TcpListener::bind(cfg.coord_listen).await?;
         let addr: SocketAddr = listener.local_addr()?;
         let (search_set, control_set) =

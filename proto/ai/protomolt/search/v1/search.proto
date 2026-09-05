@@ -878,6 +878,13 @@ service ClusterControl {
   rpc ReconcileCluster(ReconcileClusterRequest) returns (ClusterPlan);
   rpc GetClusterPlan(GetClusterPlanRequest) returns (ClusterPlan);
   rpc RollbackCluster(RollbackClusterRequest) returns (ClusterPlan);
+
+  // Balance dry run (docs/bandwidth-budget.md): with each node's observed
+  // scan rate and the index bytes it serves, the whole-shard moves that
+  // would bring the slowest node's unfiltered scan time down, within each
+  // placement leaf's node set. Reads only; nothing moves. Cluster trust,
+  // like the other control routes: not a public route.
+  rpc PlanBalance(PlanBalanceRequest) returns (PlanBalanceResponse);
 }
 
 // One shard's slice of a filter-only browse.
@@ -1519,6 +1526,16 @@ message StreamIdentityReady {
   // retains identity metadata until ResolveStreamIdentities, cancellation,
   // disconnect or timeout. No more candidate batches follow this message.
   StreamSearchSummary scan = 1;
+  // Inclusive global-ID bounds captured by this scan. Absent for an empty
+  // range. A relay uses child ranges to route winners without retaining all
+  // candidate IDs. Child ranges must not overlap; selection within a range
+  // still enforces its captured live/filter eligibility.
+  StreamIdentityRange range = 2;
+}
+
+message StreamIdentityRange {
+  uint64 first_id = 1;
+  uint64 last_id = 2;
 }
 
 message StreamIdentity {
@@ -5944,6 +5961,32 @@ message NodeCapacity {
   uint64 memory_bytes = 3;
   uint32 search_threads = 4;
   string failure_domain = 5;
+  // Observed vector-scan throughput (docs/bandwidth-budget.md): encoded
+  // index bytes the provider scan processed per second of active scan
+  // time, over the sample window, reported on every lease renewal. A
+  // shared batched pass counts once. Zero means unknown; the balancer
+  // never turns an unknown rate into a time. Never a declared figure.
+  uint64 scan_bytes_per_second = 6;
+  // When the rate was last observed (unix ms), how many scans the window
+  // holds, and the window's length, so the authority can judge staleness
+  // and applicability instead of trusting a rate because leases renew.
+  uint64 scan_rate_observed_unix_ms = 7;
+  uint32 scan_rate_samples = 8;
+  uint64 scan_rate_window_ms = 9;
+  // Where the node's bytes live (docs/device-shards.md). A DEVICE node's
+  // documents, index, vectors, WAL and snapshots never leave it: it is
+  // ineligible for export, replication, relocation and segment copying
+  // in every plan, regardless of any rate.
+  NodeResidency residency = 10;
+}
+
+enum NodeResidency {
+  // Treated as SERVER by plans that predate the field, except that an
+  // unspecified residency is reported and never assumed movable by a
+  // balancer.
+  NODE_RESIDENCY_UNSPECIFIED = 0;
+  NODE_RESIDENCY_SERVER = 1;
+  NODE_RESIDENCY_DEVICE = 2;
 }
 
 message RegisterNodeRequest {
@@ -6034,6 +6077,73 @@ message ReconcileClusterRequest {
 message GetClusterPlanRequest {
   // The collection whose plan to return (docs/collections.md).
   string collection = 1;
+}
+
+message PlanBalanceRequest {
+  // The collection this request addresses (docs/collections.md).
+  string collection = 1;
+  // Ignore moves saving less than this fraction of the slowest node's
+  // estimated scan time. Finite, in [0, 1]; 0 selects 0.10.
+  double min_gain = 2;
+  // Moves the plan may propose at most; 0 selects 8.
+  uint32 max_moves = 3;
+  // A rate observed longer ago than this is stale and its node is
+  // reported as unmeasured; 0 selects 10 minutes.
+  uint64 max_rate_age_ms = 4;
+}
+
+// One node's share of the scan work, in the units of its rate: encoded
+// index bytes the node serves across its shards (sealed segments plus
+// tail), summed over every shard on the node.
+message NodeLoad {
+  string node_id = 1;
+  uint64 bytes = 2;
+  uint64 scan_bytes_per_second = 3;
+  // bytes / scan_bytes_per_second, an estimate of the node's unfiltered
+  // scan time. Absent (zero, with the node listed in `excluded`) when
+  // the rate is unknown or stale.
+  double seconds = 4;
+  repeated uint32 shards = 5;
+  NodeResidency residency = 6;
+}
+
+// One proposed move of a whole shard's primary between two nodes of one
+// placement leaf. Never a segment subset: a later segment plan carries
+// its own identity and does not reuse these fields.
+message BalanceMove {
+  uint32 shard = 1;
+  string from_node = 2;
+  string to_node = 3;
+  uint64 bytes = 4;
+  // The placement leaf whose node set bounds the move ("" without a tree).
+  string leaf = 5;
+  // Estimated slowest-node seconds after this move alone.
+  double seconds_after = 6;
+}
+
+// Why a node took no part in a plan.
+message BalanceExclusion {
+  string node_id = 1;
+  // "unmeasured", "stale", "device", "draining", "no-lease", or
+  // "failure-domain"; the text names the reason.
+  string reason = 2;
+}
+
+message PlanBalanceResponse {
+  uint64 topology_generation = 1;
+  // The control revision the plan was computed from; a plan from another
+  // revision is not this cluster's plan.
+  uint64 control_revision = 2;
+  repeated NodeLoad loads = 3;
+  repeated BalanceMove moves = 4;
+  // The slowest measured node's estimated scan time before and after
+  // every move, in order. Estimates for a named workload, not capacity.
+  double seconds_before = 5;
+  double seconds_after = 6;
+  repeated BalanceExclusion excluded = 7;
+  // The gain threshold and move budget the plan used.
+  double min_gain = 8;
+  uint32 max_moves = 9;
 }
 
 message RollbackClusterRequest {

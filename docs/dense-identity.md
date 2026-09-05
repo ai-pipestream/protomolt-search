@@ -43,8 +43,9 @@ use the legacy protocol pending their own identity integration.
 
 Without `identity_limits`, nodes preserve `Batch* -> Summary`. A stopped scan
 returns `completed=false` without readiness. Stop during the identity wait also
-returns an incomplete terminal summary. Closing the request stream during an
-opted-in exchange cancels it: retain the sender until resolution finishes.
+returns an incomplete terminal summary. Closing the request stream before
+selection cancels an opted-in exchange. After selection is accepted, dropping
+the response stream cancels the remaining work.
 
 An upgraded plain dense coordinator requires the handshake. An older node or
 relay that ignores the field and sends a terminal summary is refused, not
@@ -55,7 +56,8 @@ using that coordinator path. Stored-index formats are unchanged.
 
 Request limits must be positive. Server maxima are 1,000,000 selected rows,
 64 MiB for the encoded identity response, and 60 seconds after scanning.
-The plain coordinator requests k rows, 32 MiB and 60 seconds per child.
+The plain coordinator requests k rows, 32 MiB and 60 seconds per child, and
+also enforces 32 MiB for the combined encoded identity rows.
 Oversized results error as a whole, never silently truncate identities. These
 bounds do not replace transport message limits or the overall query deadline.
 
@@ -79,13 +81,18 @@ mandatory selection and disclosure before exposing a device/public bridge.
 
 ## Relay handoff
 
-Relays supporting the extension must retain child stream ownership through the
-exchange, preserve original IDs and route selected IDs to the originating
-child's captured view. Wait for every child readiness certificate. Resolve the
-parent's winners and release other children with empty selections. Return rows
-in the parent's order and issue a terminal certificate only after every child
-finishes its own exchange. Bound aggregate memory and propagate remaining time;
-never turn timeout into identity absence or fetch current rows from a replica.
+Relays retain child stream ownership through the exchange and route selected IDs
+to each child's captured view. `IdentityReady.range` carries inclusive global-ID
+bounds from that view; the relay refuses inverted or overlapping child ranges.
+This needs one range per child, without retaining transient candidates or adding
+a ranking heap. A range may contain filter/deletion holes: the leaf still checks
+the selected IDs against its captured eligibility.
+
+The relay waits for every child readiness certificate, resolves the parent's
+winners and releases other children with empty selections. Rows return in the
+parent's order, and the terminal certificate follows every child's completed
+exchange. The aggregate response has the parent's byte limit; timeout never
+becomes identity absence or a fetch from a replica's current rows.
 
 Relays without support must refuse opt-in requests; they may still serve the
 legacy candidate protocol. This adds no k or relay heap requirement and does
@@ -105,3 +112,7 @@ the monolithic bitwise ranking and floor-sharing gates.
 Coordinator protocol tests reject wrong IDs, missing or changed certificates,
 duplicate replies and premature closure. A full request-lane regression failed
 with unbounded cancellation and now verifies timeout cleanup completes.
+Nested-relay tests replace leaf rows after readiness and verify that original
+identities and explicit legacy absence survive both relay levels. They also
+cover invalid selections, timeout and Stop. The relay conformance suite compares
+flat, one-level and two-level ranking bit for bit.

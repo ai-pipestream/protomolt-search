@@ -72,6 +72,7 @@ pub mod quality;
 pub mod query;
 mod query_identity;
 pub mod rankdiff;
+pub mod relay;
 #[cfg(feature = "net")]
 pub mod replication;
 pub mod reshard;

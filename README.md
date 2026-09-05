@@ -1337,18 +1337,49 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   and remaining query-shape integration are still pending.
   [Dense identity](docs/dense-identity.md).
 
+- **Landed 2026-09-05: the restricted relay coordinator.** `--relay`
+  serves the node-facing surface over a coordinator's shard set and
+  presents itself to a parent as one shard: `StreamSearch` forwarded
+  untouched with floors and cancellation relayed on its own signed lane,
+  `TermStats` summed with checked arithmetic under a token bound to the
+  children's epochs, `Health` over contiguous children, every other route
+  refused by name. The map arrives through a revision-carrying interface
+  and every decision pins its revision. Flat, one-level, and two-level
+  execution agree bit for bit (`tests/relay.rs`).
+  [Relay coordinators](docs/relay-coordinators.md).
+
+- **Proposed 2026-09-05: replicated control authority.** The foundations
+  work owns OpenRaft state, storage, transport and recovery; Fable owns relay
+  consumers of the complete revisioned map. The design covers deterministic
+  commands, retry receipts, durable ownership fencing, learner trust, migration
+  and recovery gates. Implementation follows design review and the budget
+  merge. The current relay build keeps the single authority.
+  [Raft control design](docs/raft-control-design.md).
+
 - **Proposed 2026-09-05: scale-out coordination.** A relay coordinator
   that presents itself to its parent as one shard over the existing
   node-facing surface, a standby-then-Raft control plane, a scan rate
   observed on each node and carried on its lease, and a balance dry run
   within a placement leaf's node set. Nothing built; the reserved contract
   is on `feat/scale-out-reservation-2026-09` awaiting contract revisions.
-  [Scale-out coordination](docs/scale-out-coordination.md).
+  [Scale-out coordination](docs/scale-out-coordination.md). The replicated control
+  authority design is reviewed in
+  [raft-control-review-2026-09-05.md](docs/raft-control-review-2026-09-05.md).
   The [2026-09-05 review](docs/scale-out-coordination-review-2026-09-05.md)
   requests contract changes and defines the restricted query relay and scan
   instrumentation that can proceed. Transparent route composition, automatic
   standby promotion and segment movement are not cleared; phone shards stay
   on their originating devices.
+- **Landed 2026-09-05: the observed scan rate and the balance dry run.**
+  Every kernel call counts the encoded bytes it streamed and its wall
+  time, once however many queries shared it (`turbovec_scan_bytes_total`,
+  `turbovec_scan_active_nanoseconds_total`); the node keeps a bounded
+  window and its lease renewal reports the rate with its freshness and
+  the node's residency. `ClusterControl.PlanBalance` plans whole-shard
+  moves within a placement leaf's node set from those rates, excludes a
+  device node by declaration, and moves nothing.
+  [Bandwidth as the budget](docs/bandwidth-budget.md).
+
 - **Landed 2026-09-05: placement ingest and shard pruning.** Under a
   placement tree the coordinator evaluates the tree per routed document
   and hashes inside the leaf; a node declares the column

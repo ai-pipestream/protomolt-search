@@ -74,6 +74,19 @@ proves this process owns the freeze. If publication fails after the map is
 durable, writes stay frozen: restart from the durable map or retry publication
 and do not reopen the old generation and losing a tail.
 
+## Relay coordinators
+
+`--relay` on a coordinator makes it serve the node-facing surface over
+its shard set and present itself to a parent coordinator as one shard,
+which is how a root stands over thousands of shards with a level in
+between. A relay serves `StreamSearch`, `TermStats`, and `Health` and
+refuses every other node route by name; it takes one unnamed collection
+on a dedicated endpoint, needs children with contiguous slot ranges, and
+under a placement tree serves one leaf. Its statistics epoch is a token
+bound to its children's epochs and to the map revision it was issued
+under; a parent that holds an older token is refused and refetches.
+Reference: `docs/relay-coordinators.md`.
+
 ## Splits, merges, and resharding
 
 Records are routed to write-ahead-log bucket files by the same partition
@@ -119,6 +132,14 @@ Nodes register with `--node-id`, `--control-addr`, `--failure-domain`, and
 a worker that executes placement actions. `--advertise-addr` is required when a
 shard listener binds `0.0.0.0`. `--replica-listen` with port 0 lets the OS
 choose, and the bound port is remembered across restarts.
+
+Every lease renewal carries the node's observed scan rate (encoded
+index bytes per second of kernel time, over its last scans) with its
+observation time and sample count, and the node's residency: a phone
+declares `DEVICE` and is never a source or a destination of any plan.
+`ClusterControl.PlanBalance` is a read-only dry run that reports the
+whole-shard moves that would lower the slowest node's estimated scan
+time, with every excluded node and its reason (`docs/bandwidth-budget.md`).
 
 Policy settings and defaults: `--control-reconcile-ms` 1000,
 `--control-lease-ms` 15000, `--control-replication-factor` 2 (the primary

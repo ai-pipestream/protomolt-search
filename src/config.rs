@@ -278,6 +278,12 @@ pub struct Config {
     /// holds the only top-k). Identical results, different pruning
     /// locus. Off by default.
     pub stream_search: bool,
+    /// Coordinator: serve as a RELAY (`docs/relay-coordinators.md`): the
+    /// node-facing surface over this coordinator's shard set, presented
+    /// to a parent coordinator as one shard. StreamSearch, TermStats,
+    /// and Health only; every other node route refuses by name. Needs
+    /// the coordinator role with one unnamed collection. Off by default.
+    pub relay: bool,
     /// Coordinator: run BM25 fan-out over the exact candidate stream.
     /// The coordinator owns the global heap and inclusive floor; every
     /// shard must return a matching scoring fingerprint and successful
@@ -535,6 +541,7 @@ struct FileConfig {
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
     stream_search: Option<bool>,
+    relay: Option<bool>,
     bm25_stream: Option<bool>,
     max_k: Option<u32>,
     max_rerank_mib: Option<u64>,
@@ -1580,6 +1587,28 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
 
+    let relay = flag_present(args, "relay")
+        || std::env::var("PIPESTREAM_SEARCH_RELAY")
+            .map(|s| parse_env_bool(&s))
+            .unwrap_or(false)
+        || file.relay.unwrap_or(false);
+    if relay {
+        if role != Role::Coordinator {
+            return Err(
+                "--relay serves the node-facing surface over a coordinator's shard set and \
+                 takes --role=coordinator only"
+                    .to_string(),
+            );
+        }
+        if !file.collections.is_empty() {
+            return Err(
+                "--relay serves one unnamed collection on a dedicated endpoint; named \
+                 [[collections]] are not multiplexed through a relay"
+                    .to_string(),
+            );
+        }
+    }
+
     let bm25_stream = if flag_present(args, "bm25-stream") {
         true
     } else {
@@ -2312,6 +2341,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         max_message_bytes,
         demo_query,
         stream_search,
+        relay,
         bm25_stream,
         max_k,
         max_rerank_bytes,
@@ -2637,6 +2667,7 @@ slot_offset = 20000
     #[test]
     fn cli_overrides_file() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("pipestream_search_ovr_{}.toml", std::process::id()));
         std::fs::write(
             &path,
@@ -2656,6 +2687,7 @@ slot_offset = 20000
     #[test]
     fn file_shard_needs_exactly_one_source() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("pipestream_search_bad_{}.toml", std::process::id()));
         std::fs::write(&path, "role = \"node\"\n\n[[shards]]\nslot_offset = 7\n").unwrap();
         let result = parse(&args(&[&format!("--config={}", path.display())]));

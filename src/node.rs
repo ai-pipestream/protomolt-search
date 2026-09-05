@@ -27,8 +27,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::bm25::{self, Bm25Params};
 use crate::chunked::{
-    chunked_topk, chunked_topk_batch, chunked_topk_collapsed, BatchQuery, ChunkHit, ScanStats,
-    DEFAULT_CHUNK_BLOCKS,
+    chunked_topk, chunked_topk_collapsed, BatchQuery, ChunkHit, ScanStats, DEFAULT_CHUNK_BLOCKS,
 };
 use crate::exact_vectors::ExactVectorStore;
 use crate::fusion::{self, Leg};
@@ -3948,6 +3947,129 @@ const MAX_COALESCE: usize = 4;
 static SCAN_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SCAN_BATCHED_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Scans the window keeps at most.
+pub const SCAN_WINDOW_SAMPLES: usize = 64;
+/// A sample older than this leaves the window.
+pub const SCAN_WINDOW_MS: u64 = 10 * 60 * 1000;
+/// Fewer samples than this report an unknown rate.
+pub const SCAN_WINDOW_MIN_SAMPLES: usize = 4;
+
+/// One scan's cost as the window keeps it.
+#[derive(Debug, Clone, Copy)]
+struct ScanSample {
+    at: std::time::Instant,
+    unix_ms: u64,
+    bytes: u64,
+    nanos: u64,
+}
+
+/// The node's observed scan rate (`docs/bandwidth-budget.md`): the ratio
+/// of encoded bytes to active kernel time over the recent scans the
+/// window holds. `bytes_per_second` is zero, meaning unknown, below
+/// [`SCAN_WINDOW_MIN_SAMPLES`] or when no active time was observed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanRate {
+    pub bytes_per_second: u64,
+    /// When the newest sample was taken (unix ms); 0 with no sample.
+    pub observed_unix_ms: u64,
+    pub samples: u32,
+    pub window_ms: u64,
+}
+
+/// The bounded window of recent scans behind [`scan_rate`].
+pub struct ScanWindow {
+    samples: std::sync::Mutex<std::collections::VecDeque<ScanSample>>,
+}
+
+impl ScanWindow {
+    pub const fn new() -> Self {
+        ScanWindow {
+            samples: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Record one scan: the bytes its kernel calls streamed and their
+    /// active time. A scan that streamed nothing (a lazy index, or a
+    /// filter that emptied it) is not a rate sample.
+    pub fn observe(&self, bytes: u64, nanos: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let sample = ScanSample {
+            at: now,
+            unix_ms: crate::diagnostics::unix_ms(),
+            bytes,
+            nanos,
+        };
+        let mut samples = self.samples.lock().expect("scan window poisoned");
+        Self::expire(&mut samples, now);
+        if samples.len() == SCAN_WINDOW_SAMPLES {
+            samples.pop_front();
+        }
+        samples.push_back(sample);
+    }
+
+    fn expire(samples: &mut std::collections::VecDeque<ScanSample>, now: std::time::Instant) {
+        let horizon = std::time::Duration::from_millis(SCAN_WINDOW_MS);
+        while let Some(oldest) = samples.front() {
+            if now.duration_since(oldest.at) > horizon {
+                samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn rate(&self) -> ScanRate {
+        let mut samples = self.samples.lock().expect("scan window poisoned");
+        Self::expire(&mut samples, std::time::Instant::now());
+        let count = samples.len();
+        let observed_unix_ms = samples.back().map_or(0, |s| s.unix_ms);
+        let (bytes, nanos) = samples.iter().fold((0u128, 0u128), |(b, n), s| {
+            (b + u128::from(s.bytes), n + u128::from(s.nanos))
+        });
+        let bytes_per_second = if count < SCAN_WINDOW_MIN_SAMPLES || nanos == 0 {
+            0
+        } else {
+            u64::try_from(bytes * 1_000_000_000 / nanos).unwrap_or(u64::MAX)
+        };
+        ScanRate {
+            bytes_per_second,
+            observed_unix_ms,
+            samples: count as u32,
+            window_ms: SCAN_WINDOW_MS,
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&self) {
+        self.samples.lock().expect("scan window poisoned").clear();
+    }
+}
+
+impl Default for ScanWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process-wide window: one rate per node process, which is what the
+/// lease renewal reports (`docs/bandwidth-budget.md`).
+static SCAN_WINDOW: ScanWindow = ScanWindow::new();
+
+/// The node's observed scan rate for the lease renewal.
+pub fn scan_rate() -> ScanRate {
+    SCAN_WINDOW.rate()
+}
+
+/// Account one scan over this shard: the process counters take the pass
+/// bytes and time once, and the window takes them as one sample.
+pub fn observe_scan(bytes: u64, nanos: u64) {
+    crate::metrics::record_scan_pass(bytes, nanos);
+    SCAN_WINDOW.observe(bytes, nanos);
+}
+
 /// Process-wide coalescing telemetry: `(batches formed, jobs in them)`.
 /// Jobs exceeding batches means multi-query batches actually formed —
 /// the observable that coalescing engaged, used by tests and benchmarks.
@@ -4125,13 +4247,22 @@ fn run_scan_batch(
             allow: allow.as_deref(),
         })
         .collect();
-    let results = chunked_topk_batch(
+    let mut pass_bytes = 0u64;
+    let mut pass_nanos = 0u64;
+    let results = crate::chunked::chunked_topk_batch_observed(
         index,
         &queries,
         chunk_blocks,
         &mut |qi| (externals[qi])(),
         &mut |qi, floor| (publishers[qi])(floor),
+        &mut |pass| {
+            pass_bytes = pass_bytes.saturating_add(pass.bytes);
+            pass_nanos = pass_nanos.saturating_add(pass.nanos);
+        },
     );
+    // One sample for the batched scan, whatever the batch size: the
+    // pass over the shard happened once (docs/bandwidth-budget.md).
+    observe_scan(pass_bytes, pass_nanos);
     for (((done, (hits, mut stats)), (geo_columns_known, filter_columns_known)), prune) in
         dones.into_iter().zip(results).zip(knowns).zip(prunes)
     {
@@ -7144,7 +7275,7 @@ impl NodeServiceImpl {
                         "hybrid vector coordinate {coord} is invalid: {value}"
                     )));
                 }
-                let (hits, _) = chunked_topk(
+                let (hits, scan_stats) = chunked_topk(
                     index,
                     vector,
                     k,
@@ -7154,6 +7285,7 @@ impl NodeServiceImpl {
                     false,
                     allow.as_deref(),
                 );
+                observe_scan(scan_stats.bytes_scanned, scan_stats.scan_nanos);
                 vector_leg = hits
                     .into_iter()
                     .map(|h| {
@@ -10063,6 +10195,8 @@ impl NodeService for NodeServiceImpl {
                         );
                         stats.segments_total = prune.segments_total;
                         stats.segments_skipped = prune.segments_skipped;
+                        crate::metrics::record_scan(&stats);
+                        observe_scan(stats.bytes_scanned, stats.scan_nanos);
                         let identities = guard
                             .bm25
                             .as_ref()
@@ -10206,6 +10340,7 @@ impl NodeService for NodeServiceImpl {
                             stats.segments_total = prune.segments_total;
                             stats.segments_skipped = prune.segments_skipped;
                             crate::metrics::record_scan(&stats);
+                            observe_scan(stats.bytes_scanned, stats.scan_nanos);
                             Ok(ScanOutcome {
                                 hits,
                                 identities: guard
@@ -11718,7 +11853,7 @@ impl NodeService for NodeServiceImpl {
                             identity_ready.store(true, AtomicOrdering::Release);
                             tx.send(Ok(StreamSearchResponse {
                                 payload: Some(stream_search_response::Payload::IdentityReady(
-                                    crate::pb::StreamIdentityReady { scan: Some(summary.clone()) },
+                                    crate::pb::StreamIdentityReady { scan: Some(summary.clone()), range: identities.range() },
                                 )),
                             })).await.map_err(|_| Status::cancelled("identity response stream closed"))?;
                             let selection = (&mut pump).await
@@ -13965,6 +14100,52 @@ impl NodeServiceImpl {
             hits,
             stage_columns_known,
         })
+    }
+}
+
+#[cfg(test)]
+mod scan_window_tests {
+    use super::*;
+
+    /// The window reports unknown below the minimum sample count, then
+    /// the ratio of the bytes and active time it holds; a scan that
+    /// streamed nothing is not a sample.
+    #[test]
+    fn the_window_reports_unknown_until_it_holds_enough_scans() {
+        let window = ScanWindow::new();
+        assert_eq!(
+            window.rate(),
+            ScanRate {
+                window_ms: SCAN_WINDOW_MS,
+                ..Default::default()
+            }
+        );
+        window.observe(0, 5_000);
+        assert_eq!(window.rate().samples, 0, "an empty scan is not a sample");
+        for _ in 0..(SCAN_WINDOW_MIN_SAMPLES - 1) {
+            window.observe(1_000, 1_000_000);
+        }
+        let rate = window.rate();
+        assert_eq!(rate.samples as usize, SCAN_WINDOW_MIN_SAMPLES - 1);
+        assert_eq!(rate.bytes_per_second, 0, "below the minimum is unknown");
+        assert!(rate.observed_unix_ms > 0);
+        window.observe(1_000, 1_000_000);
+        let rate = window.rate();
+        assert_eq!(rate.samples as usize, SCAN_WINDOW_MIN_SAMPLES);
+        // 4,000 bytes in 4 ms is one million bytes per second.
+        assert_eq!(rate.bytes_per_second, 1_000_000);
+        // The window keeps at most SCAN_WINDOW_SAMPLES scans.
+        for _ in 0..(2 * SCAN_WINDOW_SAMPLES) {
+            window.observe(2_000, 1_000_000);
+        }
+        let rate = window.rate();
+        assert_eq!(rate.samples as usize, SCAN_WINDOW_SAMPLES);
+        assert_eq!(
+            rate.bytes_per_second, 2_000_000,
+            "only the newest scans remain"
+        );
+        window.clear();
+        assert_eq!(window.rate().samples, 0);
     }
 }
 

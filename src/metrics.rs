@@ -111,12 +111,14 @@ pub enum Route {
     /// `SearchService.PlanPlacement` (docs/placement.md).
     PlanPlacement,
     DescribeSchema,
+    /// `ClusterControl.PlanBalance` (docs/bandwidth-budget.md).
+    PlanBalance,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 64] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 65] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -189,6 +191,7 @@ const REQUEST_ROUTES: [(Route, &str, bool); 64] = [
     (Route::RecentQueries, "recent_queries", false),
     (Route::PlanPlacement, "plan_placement", false),
     (Route::DescribeSchema, "describe_schema", false),
+    (Route::PlanBalance, "plan_balance", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();
@@ -317,7 +320,7 @@ pub struct Reading {
 
 /// The process-wide scan and ingest counters, in page order: name,
 /// help text, the atomic.
-const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 7] = [
+const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 9] = [
     (
         "turbovec_scan_chunk_calls_total",
         "Per-chunk kernel calls made by vector scans.",
@@ -342,6 +345,17 @@ const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 7] = [
         "turbovec_scan_floor_updates_applied_total",
         "Chunks that ran under a coordinator-pushed floor.",
         &SCAN_FLOOR_UPDATES_APPLIED,
+    ),
+    (
+        "turbovec_scan_bytes_total",
+        "Encoded index bytes the vector kernel streamed, one count per kernel call \
+         however many queries shared it (docs/bandwidth-budget.md).",
+        &SCAN_BYTES,
+    ),
+    (
+        "turbovec_scan_active_nanoseconds_total",
+        "Wall time inside vector kernel calls, in nanoseconds, counted the same way.",
+        &SCAN_ACTIVE_NANOS,
     ),
     (
         "turbovec_documents_added_total",
@@ -421,6 +435,11 @@ static SCAN_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 static SCAN_FLOORS_OFFERED: AtomicU64 = AtomicU64::new(0);
 static SCAN_FLOORS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 static SCAN_FLOOR_UPDATES_APPLIED: AtomicU64 = AtomicU64::new(0);
+/// Encoded index bytes the vector kernel streamed, once per kernel call
+/// however many queries shared it (`docs/bandwidth-budget.md`).
+static SCAN_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Wall time inside those kernel calls, in nanoseconds, the same way.
+static SCAN_ACTIVE_NANOS: AtomicU64 = AtomicU64::new(0);
 static DOCUMENTS_ADDED: AtomicU64 = AtomicU64::new(0);
 static VECTORS_ADDED: AtomicU64 = AtomicU64::new(0);
 
@@ -622,6 +641,26 @@ pub fn record_scan(stats: &crate::chunked::ScanStats) {
     SCAN_FLOORS_OFFERED.fetch_add(stats.floors_offered, Ordering::Relaxed);
     SCAN_FLOORS_PUBLISHED.fetch_add(stats.floors_published, Ordering::Relaxed);
     SCAN_FLOOR_UPDATES_APPLIED.fetch_add(stats.floor_updates_applied, Ordering::Relaxed);
+    // Bytes and active time are NOT taken from per-query stats: a batched
+    // query carries the pass it shared, and the pass is counted once by
+    // `record_scan_pass`.
+}
+
+/// Count one kernel pass: the encoded bytes it streamed and its wall
+/// time. Called once per kernel call whatever the batch size, so a shared
+/// pass is one count (`docs/bandwidth-budget.md`).
+pub fn record_scan_pass(bytes: u64, nanos: u64) {
+    SCAN_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    SCAN_ACTIVE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+/// The process-wide scan byte and active-time totals, for tests and the
+/// node's own accounting.
+pub fn scan_pass_totals() -> (u64, u64) {
+    (
+        SCAN_BYTES.load(Ordering::Relaxed),
+        SCAN_ACTIVE_NANOS.load(Ordering::Relaxed),
+    )
 }
 
 /// Count ingested items: `documents` from AddDocuments streams,
