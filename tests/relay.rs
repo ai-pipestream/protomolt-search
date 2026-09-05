@@ -616,6 +616,59 @@ async fn unsupported_routes_refuse_by_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vector_backend_merges_the_children_and_refuses_a_mismatch() {
+    let leaves = leaves().await;
+    let (relay_addr, _relay, _handle) =
+        start_relay(vec![leaves.addrs[0].clone(), leaves.addrs[1].clone()]).await;
+    let leaf = NodeServiceClient::connect(leaves.addrs[0].clone())
+        .await
+        .unwrap()
+        .get_vector_backend(pipestream_search::pb::GetVectorBackendRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let merged = NodeServiceClient::connect(relay_addr)
+        .await
+        .unwrap()
+        .get_vector_backend(pipestream_search::pb::GetVectorBackendRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(leaf.descriptor.is_some());
+    assert_eq!(merged.descriptor, leaf.descriptor);
+    assert_eq!(merged.config, leaf.config);
+    assert_eq!(merged.num_vectors, (2 * LEAF_ROWS) as u64);
+
+    // A child of another dimension is contiguous in slots and healthy,
+    // yet a different provider identity: the relay refuses by name.
+    let wide = DIM * 2;
+    let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, wide, BIT_WIDTH).unwrap();
+    index.add(&unit_vectors(100, wide, 0x6A9), wide).unwrap();
+    index.prepare().unwrap();
+    let (other, _handle) = start_node(
+        index,
+        NodeConfig {
+            slot_offset: LEAF_ROWS as u64,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (relay_addr, _relay, _handle) = start_relay(vec![leaves.addrs[0].clone(), other]).await;
+    let err = NodeServiceClient::connect(relay_addr)
+        .await
+        .unwrap()
+        .get_vector_backend(pipestream_search::pb::GetVectorBackendRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("child 1") && err.message().contains("descriptor"),
+        "{}",
+        err.message()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn health_merges_contiguous_children_and_refuses_a_gap() {
     let leaves = leaves().await;
     let (relay_addr, relay, _handle) =

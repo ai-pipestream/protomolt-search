@@ -117,6 +117,13 @@ per-shard fusion (`HybridShard`) or unary vector search (`SearchShard`)
 through this level. The cascade's vector gate takes `SearchShard`, so a
 cascade does not run through a relay yet; its rescoring half does.
 
+`GetVectorBackend`. The root's dense preflight asks each shard for its
+provider identity before a public query scores anything, so the relay
+answers with the descriptor and configuration its children share and
+their vector counts summed. A child without a backend, or one whose
+descriptor or configuration differs from child 0's, refuses by name: a
+relay presents one provider identity, never a mixture behind one answer.
+
 ## The epoch token
 
 A node's `TermStats` epoch is its own counter, and a scoring request that

@@ -562,9 +562,64 @@ fn grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
 fn refused(route: &str) -> Status {
     Status::unimplemented(format!(
         "relay: NodeService.{route} is not served by a relay coordinator; a relay forwards \
-         StreamSearch, TermStats, Health, and the keyword leg (Bm25Query, Bm25PhraseQuery, \
-         Bm25QueryStream, Bm25Rescore, ShardLegs) only (docs/relay-coordinators.md)"
+         StreamSearch, TermStats, Health, GetVectorBackend, and the keyword leg (Bm25Query, \
+         Bm25PhraseQuery, Bm25QueryStream, Bm25Rescore, ShardLegs) only \
+         (docs/relay-coordinators.md)"
     ))
+}
+
+/// The children's vector backends as one: the descriptor and the
+/// configuration must match child for child (the root's preflight
+/// treats a shard's identity as generation-wide, so a relay hiding a
+/// mismatch behind one answer would break that contract), rows sum
+/// with checked arithmetic, and an unconfigured child refuses by name.
+pub fn merge_vector_backend(
+    children: &[String],
+    reports: &[crate::pb::GetVectorBackendResponse],
+) -> Result<crate::pb::GetVectorBackendResponse, Status> {
+    let Some(first) = reports.first() else {
+        return Err(Status::failed_precondition(
+            "relay: a relay coordinator has no children",
+        ));
+    };
+    let name = |shard: usize| children.get(shard).map_or("", String::as_str);
+    let mut num_vectors: u64 = 0;
+    for (shard, report) in reports.iter().enumerate() {
+        if report.descriptor.is_none() {
+            return Err(Status::failed_precondition(format!(
+                "relay: child {shard} ({}) has no vector backend configured; a relay answers \
+                 for configured children only",
+                name(shard)
+            )));
+        }
+        if report.descriptor != first.descriptor {
+            return Err(Status::failed_precondition(format!(
+                "relay: child {shard} ({}) advertises a different vector backend descriptor \
+                 than child 0 ({}); a relay presents one provider identity",
+                name(shard),
+                name(0)
+            )));
+        }
+        if report.config != first.config {
+            return Err(Status::failed_precondition(format!(
+                "relay: child {shard} ({}) runs a different vector backend configuration \
+                 than child 0 ({}); a relay presents one provider identity",
+                name(shard),
+                name(0)
+            )));
+        }
+        num_vectors = num_vectors.checked_add(report.num_vectors).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "relay: child {shard} ({}) overflows the summed vector count",
+                name(shard)
+            ))
+        })?;
+    }
+    Ok(crate::pb::GetVectorBackendResponse {
+        descriptor: first.descriptor.clone(),
+        config: first.config.clone(),
+        num_vectors,
+    })
 }
 
 /// Sum the children's statistics shares into the parent's view of one
@@ -2186,11 +2241,51 @@ impl NodeService for RelayService {
         Err(refused("ReadWal"))
     }
 
+    /// The children's provider identity as the one shard the parent
+    /// sees: the root's dense preflight asks each shard for it before a
+    /// public query scores anything, so a relay answers with the
+    /// descriptor and configuration its children share, rows summed,
+    /// and refuses by name when a child differs.
     async fn get_vector_backend(
         &self,
-        _request: Request<crate::pb::GetVectorBackendRequest>,
+        request: Request<crate::pb::GetVectorBackendRequest>,
     ) -> Result<Response<crate::pb::GetVectorBackendResponse>, Status> {
-        Err(refused("GetVectorBackend"))
+        let timeout = grpc_timeout(request.metadata());
+        let (pinned, frozen) = self.pin();
+        let children = frozen.node_addresses().to_vec();
+        let mut tasks = Vec::with_capacity(children.len());
+        for (shard, addr) in children.iter().enumerate() {
+            let mut link = frozen.node_client(addr)?;
+            let addr = addr.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut request = Request::new(crate::pb::GetVectorBackendRequest {});
+                if let Some(timeout) = timeout {
+                    request.set_timeout(timeout);
+                }
+                link.get_vector_backend(request)
+                    .await
+                    .map(|r| r.into_inner())
+                    .map_err(|status| {
+                        Status::new(
+                            status.code(),
+                            format!(
+                                "relay child {shard} ({addr}) vector backend: {}",
+                                status.message()
+                            ),
+                        )
+                    })
+            }));
+        }
+        let mut reports = Vec::with_capacity(children.len());
+        for task in tasks {
+            reports.push(
+                task.await
+                    .map_err(|e| Status::internal(format!("relay vector backend task: {e}")))??,
+            );
+        }
+        let merged = merge_vector_backend(&children, &reports)?;
+        self.still_current(&pinned, "GetVectorBackend")?;
+        Ok(Response::new(merged))
     }
 
     async fn configure_vector_backend(
