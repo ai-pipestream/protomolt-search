@@ -669,6 +669,10 @@ pub(crate) fn compile_projections(
 
 /// The compiled aggregate request: everything the fan-out sends and
 /// the merge needs.
+/// The distinct-value cap a CARDINALITY aggregation gets when the
+/// request names none (docs/aggregations.md "Cardinality").
+pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;
+
 pub(crate) struct CompiledAggregate {
     aggregations: Vec<crate::pb::CompiledAggregation>,
     histograms: Vec<crate::pb::CompiledHistogram>,
@@ -723,9 +727,17 @@ pub(crate) fn compile_aggregations(
                 a.name
             )));
         }
-        crate::node::agg_op_of(a.op).map_err(|e| {
+        let op = crate::node::agg_op_of(a.op).map_err(|e| {
             Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message()))
         })?;
+        let cardinality = op == crate::pb::AggregateOp::Cardinality;
+        if a.max_distinct != 0 && !cardinality {
+            return Err(Status::invalid_argument(format!(
+                "aggregation {:?}: max_distinct applies to CARDINALITY, not {}",
+                a.name,
+                crate::node::agg_op_name(op)
+            )));
+        }
         let expr = crate::cel::compile_value(&a.expression).map_err(|e| {
             Status::invalid_argument(format!("aggregation {:?}: {}", a.name, e.message()))
         })?;
@@ -733,6 +745,11 @@ pub(crate) fn compile_aggregations(
             expr: Some(expr),
             op: a.op,
             name: a.name.clone(),
+            max_distinct: match (cardinality, a.max_distinct) {
+                (false, _) => 0,
+                (true, 0) => DEFAULT_MAX_DISTINCT,
+                (true, cap) => cap,
+            },
         });
     }
     let mut compiled_hists = Vec::with_capacity(histograms.len());
@@ -748,18 +765,47 @@ pub(crate) fn compile_aggregations(
                 h.name
             )));
         }
-        if h.calendar != 0 || h.utc_offset_minutes != 0 {
-            return Err(Status::unimplemented(format!(
-                "histogram {:?}: calendar intervals are reserved and not served yet",
-                h.name
-            )));
-        }
-        if !(h.interval > 0.0 && h.interval.is_finite()) {
-            return Err(Status::invalid_argument(format!(
-                "histogram {:?}: the interval must be positive and finite, got {}",
-                h.name, h.interval
-            )));
-        }
+        let calendar = if h.calendar != 0 {
+            let unit = crate::calendar::interval_of(h.calendar).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "histogram {:?}: unknown calendar interval {}",
+                    h.name, h.calendar
+                ))
+            })?;
+            if h.interval != 0.0 {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: a calendar histogram buckets by {}; its fixed \
+                     interval must be zero, got {}",
+                    h.name,
+                    crate::calendar::interval_name(unit),
+                    h.interval
+                )));
+            }
+            if h.utc_offset_minutes.abs() > crate::calendar::MAX_UTC_OFFSET_MINUTES {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: utc_offset_minutes {} is outside +-{}",
+                    h.name,
+                    h.utc_offset_minutes,
+                    crate::calendar::MAX_UTC_OFFSET_MINUTES
+                )));
+            }
+            Some(unit)
+        } else {
+            if h.utc_offset_minutes != 0 {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: utc_offset_minutes applies to a calendar histogram; \
+                     name a calendar interval",
+                    h.name
+                )));
+            }
+            if !(h.interval > 0.0 && h.interval.is_finite()) {
+                return Err(Status::invalid_argument(format!(
+                    "histogram {:?}: the interval must be positive and finite, got {}",
+                    h.name, h.interval
+                )));
+            }
+            None
+        };
         let expr = crate::cel::compile_value(&h.expression).map_err(|e| {
             Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
         })?;
@@ -772,6 +818,8 @@ pub(crate) fn compile_aggregations(
                 h.max_buckets
             },
             name: h.name.clone(),
+            calendar: calendar.map_or(0, |unit| unit as i32),
+            utc_offset_minutes: h.utc_offset_minutes,
         });
     }
     let mut compiled_pcts = Vec::with_capacity(percentiles.len());
@@ -893,6 +941,10 @@ impl PctMerge {
 struct AggMerge {
     vt: Option<crate::pb::AggregateValueType>,
     present: u64,
+    /// CARDINALITY: the fleet-wide union of the shards' distinct
+    /// values, typed by the vote. A BTreeSet so the union is
+    /// deterministic whatever the shard order.
+    distinct: Distinct,
     int_sum: i128,
     int_min: i64,
     int_max: i64,
@@ -904,11 +956,28 @@ struct AggMerge {
     m2: f64,
 }
 
+/// The exact distinct-value union behind CARDINALITY, one set per
+/// type; doubles by canonical bits, strings by dictionary term.
+#[derive(Default)]
+struct Distinct {
+    ints: std::collections::BTreeSet<i64>,
+    doubles: std::collections::BTreeSet<u64>,
+    strings: std::collections::BTreeSet<String>,
+    bools: std::collections::BTreeSet<bool>,
+}
+
+impl Distinct {
+    fn len(&self) -> usize {
+        self.ints.len() + self.doubles.len() + self.strings.len() + self.bools.len()
+    }
+}
+
 impl AggMerge {
     fn new() -> Self {
         Self {
             vt: None,
             present: 0,
+            distinct: Distinct::default(),
             int_sum: 0,
             int_min: 0,
             int_max: 0,
@@ -934,8 +1003,13 @@ impl AggMerge {
 
     /// Fold one shard's partial in. Shard order is the caller's
     /// contract; every fold here is deterministic given that order.
-    fn fold(&mut self, p: &crate::pb::AggregatePartial, name: &str) -> Result<(), Status> {
+    fn fold(
+        &mut self,
+        p: &crate::pb::AggregatePartial,
+        agg: &crate::pb::CompiledAggregation,
+    ) -> Result<(), Status> {
         use crate::pb::AggregateValueType as T;
+        let name = agg.name.as_str();
         let vt = match T::try_from(p.vtype) {
             Ok(T::Absent) => return Ok(()),
             Ok(T::Unspecified) | Err(_) => {
@@ -998,10 +1072,27 @@ impl AggMerge {
                     self.m2 += p.m2 + delta * delta * (na as f64 * nb as f64 / n);
                 }
             }
-            T::String => {}
+            T::String | T::Bool => {}
             T::Absent | T::Unspecified => unreachable!("handled above"),
         }
         self.present += p.present;
+        if agg.op == crate::pb::AggregateOp::Cardinality as i32 {
+            self.distinct.ints.extend(p.distinct_ints.iter().copied());
+            self.distinct
+                .doubles
+                .extend(p.distinct_double_bits.iter().copied());
+            self.distinct
+                .strings
+                .extend(p.distinct_strings.iter().cloned());
+            self.distinct.bools.extend(p.distinct_bools.iter().copied());
+            if self.distinct.len() > agg.max_distinct as usize {
+                return Err(Status::failed_precondition(format!(
+                    "aggregation {name:?}: more than {} distinct values across the \
+                     fleet; raise max_distinct or tighten the filter",
+                    agg.max_distinct
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1017,6 +1108,7 @@ impl AggMerge {
         let int_typed = self.vt == Some(T::Int);
         let value = match op {
             O::Count => Some(W::IntValue(self.present as i64)),
+            O::Cardinality => Some(W::IntValue(self.distinct.len() as i64)),
             _ if self.present == 0 => None,
             O::Sum if int_typed => match i64::try_from(self.int_sum) {
                 Ok(v) => Some(W::IntValue(v)),
@@ -1036,11 +1128,6 @@ impl AggMerge {
             O::Mean => Some(W::DoubleValue(self.mean)),
             O::Variance => Some(W::DoubleValue(self.m2 / self.present as f64)),
             O::Stddev => Some(W::DoubleValue((self.m2 / self.present as f64).sqrt())),
-            O::Cardinality => {
-                return Err(Status::unimplemented(format!(
-                    "aggregation {name:?}: cardinality is reserved and not served yet"
-                )));
-            }
             O::Unspecified => unreachable!("compile refused the unspecified op"),
         };
         Ok(crate::pb::AggregateResult {
@@ -1058,6 +1145,7 @@ fn agg_vt_name(vt: crate::pb::AggregateValueType) -> &'static str {
         T::Int => "int",
         T::Double => "double",
         T::String => "string",
+        T::Bool => "bool",
         T::Absent | T::Unspecified => "absent",
     }
 }
@@ -8385,7 +8473,7 @@ impl CoordinatorServiceImpl {
                 .iter_mut()
                 .zip(response.partials.iter().zip(aggregations))
             {
-                m.fold(p, &agg.name)?;
+                m.fold(p, agg)?;
             }
             for shard_group in &response.groups {
                 if shard_group.partials.len() != aggregations.len() {
@@ -8404,7 +8492,7 @@ impl CoordinatorServiceImpl {
                     .iter_mut()
                     .zip(shard_group.partials.iter().zip(aggregations))
                 {
-                    m.fold(p, &agg.name)?;
+                    m.fold(p, agg)?;
                 }
                 if groups.len() > group_cap {
                     return Err(Status::failed_precondition(format!(
@@ -8490,10 +8578,22 @@ impl CoordinatorServiceImpl {
                 name: spec.name.clone(),
                 buckets: hist_buckets[i]
                     .iter()
-                    .map(|(&idx, &count)| crate::pb::HistogramBucket {
-                        lower: idx as f64 * spec.interval,
-                        count,
-                        lower_int: 0,
+                    .map(|(&idx, &count)| {
+                        if spec.calendar != 0 {
+                            // A calendar bucket's key IS its start
+                            // instant, in the expression's micros.
+                            crate::pb::HistogramBucket {
+                                lower: idx as f64,
+                                lower_int: idx,
+                                count,
+                            }
+                        } else {
+                            crate::pb::HistogramBucket {
+                                lower: idx as f64 * spec.interval,
+                                lower_int: 0,
+                                count,
+                            }
+                        }
                     })
                     .collect(),
                 present: hist_present[i],

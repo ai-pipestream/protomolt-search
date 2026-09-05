@@ -1952,6 +1952,8 @@ enum AggAcc {
         sum: i128,
         min: i64,
         max: i64,
+        /// CARDINALITY: the distinct values seen.
+        distinct: Option<std::collections::HashSet<i64>>,
     },
     Double {
         present: u64,
@@ -1964,10 +1966,35 @@ enum AggAcc {
         /// Welford.
         mean: f64,
         m2: f64,
+        /// CARDINALITY: the distinct canonical bit patterns seen.
+        distinct: Option<std::collections::HashSet<u64>>,
     },
     Str {
         present: u64,
+        /// CARDINALITY: the distinct (map, column, ordinal) reads seen;
+        /// rendered against the dictionary on the way out.
+        distinct: Option<std::collections::HashSet<(bool, usize, u32)>>,
     },
+    /// CARDINALITY over a boolean expression: which of the values
+    /// occurred.
+    Bool {
+        present: u64,
+        seen_true: bool,
+        seen_false: bool,
+    },
+}
+
+/// One bit pattern per double value for the distinct count: a single
+/// NaN and a single zero, so `-0.0` and `0.0` are one value and every
+/// NaN payload is one value. Everything else is its own bits.
+fn canonical_double_bits(x: f64) -> u64 {
+    if x.is_nan() {
+        f64::NAN.to_bits()
+    } else if x == 0.0 {
+        0
+    } else {
+        x.to_bits()
+    }
 }
 
 impl AggAcc {
@@ -1980,6 +2007,7 @@ impl AggAcc {
                     sum,
                     min,
                     max,
+                    distinct,
                 },
                 crate::values::Val::Int(x),
             ) => {
@@ -1992,6 +2020,9 @@ impl AggAcc {
                 }
                 *present += 1;
                 *sum += i128::from(x);
+                if let Some(set) = distinct {
+                    set.insert(x);
+                }
             }
             (
                 AggAcc::Double {
@@ -2002,9 +2033,13 @@ impl AggAcc {
                     max,
                     mean,
                     m2,
+                    distinct,
                 },
                 crate::values::Val::Double(x),
             ) => {
+                if let Some(set) = distinct {
+                    set.insert(canonical_double_bits(x));
+                }
                 if *present == 0 {
                     *min = x;
                     *max = x;
@@ -2031,15 +2066,60 @@ impl AggAcc {
                 *mean += delta / n;
                 *m2 += delta * (x - *mean);
             }
-            (AggAcc::Str { present }, crate::values::Val::FacetOrd { .. })
-            | (AggAcc::Str { present }, crate::values::Val::MapFacetOrd { .. }) => {
+            (AggAcc::Str { present, distinct }, crate::values::Val::FacetOrd { column, ord }) => {
                 *present += 1;
+                if let Some(set) = distinct {
+                    set.insert((false, column, ord));
+                }
+            }
+            (
+                AggAcc::Str { present, distinct },
+                crate::values::Val::MapFacetOrd { column, ord },
+            ) => {
+                *present += 1;
+                if let Some(set) = distinct {
+                    set.insert((true, column, ord));
+                }
+            }
+            (
+                AggAcc::Bool {
+                    present,
+                    seen_true,
+                    seen_false,
+                },
+                crate::values::Val::Bool(b),
+            ) => {
+                *present += 1;
+                if b {
+                    *seen_true = true;
+                } else {
+                    *seen_false = true;
+                }
             }
             _ => unreachable!("resolution typed the accumulator"),
         }
     }
 
-    fn partial(&self) -> crate::pb::AggregatePartial {
+    /// This shard's distinct-value count, when CARDINALITY asked for
+    /// one.
+    fn distinct_len(&self) -> Option<usize> {
+        match self {
+            AggAcc::Absent => None,
+            AggAcc::Int { distinct, .. } => distinct.as_ref().map(|s| s.len()),
+            AggAcc::Double { distinct, .. } => distinct.as_ref().map(|s| s.len()),
+            AggAcc::Str { distinct, .. } => distinct.as_ref().map(|s| s.len()),
+            AggAcc::Bool {
+                seen_true,
+                seen_false,
+                ..
+            } => Some(usize::from(*seen_true) + usize::from(*seen_false)),
+        }
+    }
+
+    /// The wire partial. `store` renders string ordinals; only a
+    /// document-less shard, whose accumulators are all absent, has
+    /// none to offer.
+    fn partial(&self, store: Option<&Bm25Shard>) -> crate::pb::AggregatePartial {
         use crate::pb::AggregateValueType as T;
         let mut p = crate::pb::AggregatePartial {
             vtype: T::Absent as i32,
@@ -2052,6 +2132,7 @@ impl AggAcc {
                 sum,
                 min,
                 max,
+                distinct,
             } => {
                 p.vtype = T::Int as i32;
                 p.present = *present;
@@ -2059,6 +2140,11 @@ impl AggAcc {
                 p.int_sum_lo = *sum as u64;
                 p.int_min = *min;
                 p.int_max = *max;
+                if let Some(set) = distinct {
+                    let mut values: Vec<i64> = set.iter().copied().collect();
+                    values.sort_unstable();
+                    p.distinct_ints = values;
+                }
             }
             AggAcc::Double {
                 present,
@@ -2068,6 +2154,7 @@ impl AggAcc {
                 max,
                 mean,
                 m2,
+                distinct,
             } => {
                 p.vtype = T::Double as i32;
                 p.present = *present;
@@ -2077,18 +2164,53 @@ impl AggAcc {
                 p.double_max = *max;
                 p.mean = *mean;
                 p.m2 = *m2;
+                if let Some(set) = distinct {
+                    let mut values: Vec<u64> = set.iter().copied().collect();
+                    values.sort_unstable();
+                    p.distinct_double_bits = values;
+                }
             }
-            AggAcc::Str { present } => {
+            AggAcc::Str { present, distinct } => {
                 p.vtype = T::String as i32;
                 p.present = *present;
+                if let (Some(set), Some(store)) = (distinct, store) {
+                    let mut values: Vec<String> = set
+                        .iter()
+                        .map(|&(map, column, ord)| {
+                            if map {
+                                store.map_facet_value(column, ord).to_string()
+                            } else {
+                                store.facet_value(column, ord).to_string()
+                            }
+                        })
+                        .collect();
+                    values.sort_unstable();
+                    values.dedup();
+                    p.distinct_strings = values;
+                }
+            }
+            AggAcc::Bool {
+                present,
+                seen_true,
+                seen_false,
+            } => {
+                p.vtype = T::Bool as i32;
+                p.present = *present;
+                if *seen_false {
+                    p.distinct_bools.push(false);
+                }
+                if *seen_true {
+                    p.distinct_bools.push(true);
+                }
             }
         }
         p
     }
 }
 
-/// A fresh accumulator for one resolved type.
-fn acc_of(vt: crate::values::ValueType) -> AggAcc {
+/// A fresh accumulator for one resolved type; `cardinality` adds the
+/// distinct set the op counts.
+fn acc_of(vt: crate::values::ValueType, cardinality: bool) -> AggAcc {
     match vt {
         crate::values::ValueType::Unknown => AggAcc::Absent,
         crate::values::ValueType::Int => AggAcc::Int {
@@ -2096,6 +2218,7 @@ fn acc_of(vt: crate::values::ValueType) -> AggAcc {
             sum: 0,
             min: 0,
             max: 0,
+            distinct: cardinality.then(Default::default),
         },
         crate::values::ValueType::Double => AggAcc::Double {
             present: 0,
@@ -2105,10 +2228,35 @@ fn acc_of(vt: crate::values::ValueType) -> AggAcc {
             max: 0.0,
             mean: 0.0,
             m2: 0.0,
+            distinct: cardinality.then(Default::default),
         },
-        crate::values::ValueType::Str => AggAcc::Str { present: 0 },
-        crate::values::ValueType::Bool => unreachable!("check_agg_type refused booleans"),
+        crate::values::ValueType::Str => AggAcc::Str {
+            present: 0,
+            distinct: cardinality.then(Default::default),
+        },
+        crate::values::ValueType::Bool => {
+            debug_assert!(
+                cardinality,
+                "check_agg_type admits booleans under CARDINALITY only"
+            );
+            AggAcc::Bool {
+                present: 0,
+                seen_true: false,
+                seen_false: false,
+            }
+        }
     }
+}
+
+/// How one histogram buckets: a fixed width over doubles, or a
+/// calendar unit over epoch-micros ints (docs/aggregations.md).
+#[derive(Clone, Copy)]
+enum Bucketing {
+    Fixed(f64),
+    Calendar {
+        unit: crate::pb::CalendarInterval,
+        utc_offset_minutes: i32,
+    },
 }
 
 /// One shard's sparse histogram fold.
@@ -2133,8 +2281,31 @@ impl HistAcc {
             self.unbucketable += 1;
             return Ok(());
         }
+        self.count(idx_f as i64, cap, name)
+    }
+
+    /// Fold one present epoch-micros value into its calendar bucket,
+    /// keyed by the bucket's start instant. `Err` = this shard alone
+    /// exceeds the bucket cap.
+    fn push_calendar(
+        &mut self,
+        micros: i64,
+        unit: crate::pb::CalendarInterval,
+        utc_offset_minutes: i32,
+        cap: usize,
+        name: &str,
+    ) -> Result<(), Status> {
+        self.present += 1;
+        let Some(start) = crate::calendar::bucket_start(micros, unit, utc_offset_minutes) else {
+            self.unbucketable += 1;
+            return Ok(());
+        };
+        self.count(start, cap, name)
+    }
+
+    fn count(&mut self, key: i64, cap: usize, name: &str) -> Result<(), Status> {
         let n = self.buckets.len();
-        let slot = self.buckets.entry(idx_f as i64).or_insert(0);
+        let slot = self.buckets.entry(key).or_insert(0);
         *slot += 1;
         if *slot == 1 && n == cap {
             return Err(Status::failed_precondition(format!(
@@ -2238,6 +2409,10 @@ fn check_agg_type(
 ) -> Result<(), Status> {
     use crate::pb::AggregateOp as O;
     use crate::values::ValueType as V;
+    if op == O::Cardinality {
+        // Distinct values exist for every type, booleans included.
+        return Ok(());
+    }
     match vt {
         V::Bool => Err(Status::invalid_argument(format!(
             "aggregation {name:?}: a boolean aggregates nowhere; filter on the \
@@ -9652,7 +9827,7 @@ impl NodeService for NodeServiceImpl {
                     partials: req
                         .aggregations
                         .iter()
-                        .map(|_| AggAcc::Absent.partial())
+                        .map(|_| AggAcc::Absent.partial(None))
                         .collect(),
                     matched: 0,
                     geo_columns_known,
@@ -9690,11 +9865,18 @@ impl NodeService for NodeServiceImpl {
             // Resolve every expression and admit its op against the
             // resolved type BEFORE touching any document: a type conflict
             // refuses the request, it never mis-aggregates.
-            let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType)> =
+            let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType, bool)> =
                 Vec::with_capacity(req.aggregations.len());
             let mut totals: Vec<AggAcc> = Vec::with_capacity(req.aggregations.len());
             for agg in &req.aggregations {
                 let op = agg_op_of(agg.op)?;
+                let cardinality = op == crate::pb::AggregateOp::Cardinality;
+                if cardinality && agg.max_distinct == 0 {
+                    return Err(Status::internal(format!(
+                        "aggregation {:?} arrived without a distinct cap",
+                        agg.name
+                    )));
+                }
                 let expr = agg.expr.as_ref().ok_or_else(|| {
                     Status::invalid_argument(format!(
                         "aggregation {:?} without an expression",
@@ -9705,23 +9887,37 @@ impl NodeService for NodeServiceImpl {
                     Status::invalid_argument(format!("aggregation {:?}: {}", agg.name, e.message()))
                 })?;
                 check_agg_type(&agg.name, op, vt)?;
-                totals.push(acc_of(vt));
-                exprs.push((rv, vt));
+                totals.push(acc_of(vt, cardinality));
+                exprs.push((rv, vt, cardinality));
             }
             let mut hists: Vec<(
                 Option<crate::values::ResolvedValue>,
-                f64,
+                Bucketing,
                 usize,
                 String,
                 HistAcc,
             )> = Vec::with_capacity(req.histograms.len());
             for h in &req.histograms {
-                if !(h.interval > 0.0 && h.interval.is_finite()) {
-                    return Err(Status::internal(format!(
-                        "histogram {:?} arrived with an unvalidated interval",
-                        h.name
-                    )));
-                }
+                let bucketing = if h.calendar != 0 {
+                    let unit = crate::calendar::interval_of(h.calendar).ok_or_else(|| {
+                        Status::internal(format!(
+                            "histogram {:?} arrived with an unvalidated calendar unit",
+                            h.name
+                        ))
+                    })?;
+                    Bucketing::Calendar {
+                        unit,
+                        utc_offset_minutes: h.utc_offset_minutes,
+                    }
+                } else {
+                    if !(h.interval > 0.0 && h.interval.is_finite()) {
+                        return Err(Status::internal(format!(
+                            "histogram {:?} arrived with an unvalidated interval",
+                            h.name
+                        )));
+                    }
+                    Bucketing::Fixed(h.interval)
+                };
                 let expr = h.expr.as_ref().ok_or_else(|| {
                     Status::invalid_argument(format!(
                         "histogram {:?} without an expression",
@@ -9731,30 +9927,43 @@ impl NodeService for NodeServiceImpl {
                 let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
                     Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
                 })?;
-                let rv = match vt {
-                    crate::values::ValueType::Double => Some(rv),
-                    crate::values::ValueType::Unknown => None,
-                    crate::values::ValueType::Int => {
+                let type_name = |vt: crate::values::ValueType| match vt {
+                    crate::values::ValueType::Str => "string",
+                    crate::values::ValueType::Bool => "boolean",
+                    crate::values::ValueType::Int => "int",
+                    crate::values::ValueType::Double => "double",
+                    crate::values::ValueType::Unknown => "unknown",
+                };
+                let rv = match (bucketing, vt) {
+                    (_, crate::values::ValueType::Unknown) => None,
+                    (Bucketing::Fixed(_), crate::values::ValueType::Double) => Some(rv),
+                    (Bucketing::Fixed(_), crate::values::ValueType::Int) => {
                         return Err(Status::invalid_argument(format!(
                             "histogram {:?} takes a double expression; convert explicitly \
                          with double()",
                             h.name
                         )));
                     }
-                    other => {
+                    (Bucketing::Fixed(_), other) => {
                         return Err(Status::invalid_argument(format!(
                             "histogram {:?} takes a double expression, not a {}",
                             h.name,
-                            match other {
-                                crate::values::ValueType::Str => "string",
-                                _ => "boolean",
-                            }
+                            type_name(other)
+                        )));
+                    }
+                    (Bucketing::Calendar { .. }, crate::values::ValueType::Int) => Some(rv),
+                    (Bucketing::Calendar { .. }, other) => {
+                        return Err(Status::invalid_argument(format!(
+                            "histogram {:?} buckets by calendar over an int expression in \
+                             epoch micros (a timestamp column), not a {}",
+                            h.name,
+                            type_name(other)
                         )));
                     }
                 };
                 hists.push((
                     rv,
-                    h.interval,
+                    bucketing,
                     h.max_buckets as usize,
                     h.name.clone(),
                     HistAcc::default(),
@@ -9812,7 +10021,13 @@ impl NodeService for NodeServiceImpl {
                         Some(ord) => {
                             let n_groups = groups.len();
                             let entry = groups.entry(ord).or_insert_with(|| {
-                                (0, exprs.iter().map(|(_, vt)| acc_of(*vt)).collect())
+                                (
+                                    0,
+                                    exprs
+                                        .iter()
+                                        .map(|(_, vt, cardinality)| acc_of(*vt, *cardinality))
+                                        .collect(),
+                                )
                             });
                             if entry.0 == 0 && n_groups == group_cap {
                                 return Err(Status::failed_precondition(format!(
@@ -9833,7 +10048,7 @@ impl NodeService for NodeServiceImpl {
                     None
                 };
                 let mut group_accs = group.map(|g| &mut g.1);
-                for (i, (rv, _)) in exprs.iter().enumerate() {
+                for (i, (rv, _, _)) in exprs.iter().enumerate() {
                     // Absent-typed totals imply an absent-typed group
                     // accumulator: the type is the expression's, not the
                     // group's.
@@ -9847,11 +10062,22 @@ impl NodeService for NodeServiceImpl {
                         }
                     }
                 }
-                for (rv, interval, cap, name, acc) in hists.iter_mut() {
+                for (rv, bucketing, cap, name, acc) in hists.iter_mut() {
                     let Some(rv) = rv else { continue };
-                    if let Some(crate::values::Val::Double(x)) = crate::values::eval(rv, doc, &cols)
-                    {
-                        acc.push(x, *interval, *cap, name)?;
+                    match (*bucketing, crate::values::eval(rv, doc, &cols)) {
+                        (Bucketing::Fixed(interval), Some(crate::values::Val::Double(x))) => {
+                            acc.push(x, interval, *cap, name)?;
+                        }
+                        (
+                            Bucketing::Calendar {
+                                unit,
+                                utc_offset_minutes,
+                            },
+                            Some(crate::values::Val::Int(micros)),
+                        ) => {
+                            acc.push_calendar(micros, unit, utc_offset_minutes, *cap, name)?;
+                        }
+                        _ => {}
                     }
                 }
                 for (resolved, acc) in pcts.iter_mut() {
@@ -9860,6 +10086,17 @@ impl NodeService for NodeServiceImpl {
                     };
                     if let Some(v) = crate::values::eval(rv, doc, &cols) {
                         acc.push(rankable_bits(v, *int_typed));
+                    }
+                }
+            }
+            for (agg, acc) in req.aggregations.iter().zip(&totals) {
+                if let Some(n) = acc.distinct_len() {
+                    if n > agg.max_distinct as usize {
+                        return Err(Status::failed_precondition(format!(
+                            "aggregation {:?}: more than {} distinct values on one shard; \
+                             raise max_distinct or tighten the filter",
+                            agg.name, agg.max_distinct
+                        )));
                     }
                 }
             }
@@ -9875,13 +10112,13 @@ impl NodeService for NodeServiceImpl {
                         .map(|(ord, m, accs)| crate::pb::AggregateShardGroup {
                             value: store.facet_value(fi, *ord).to_string(),
                             matched: *m,
-                            partials: accs.iter().map(AggAcc::partial).collect(),
+                            partials: accs.iter().map(|acc| acc.partial(Some(store))).collect(),
                         })
                         .collect()
                 })
                 .unwrap_or_default();
             Ok(Response::new(crate::pb::AggregateShardResponse {
-                partials: totals.iter().map(AggAcc::partial).collect(),
+                partials: totals.iter().map(|acc| acc.partial(Some(store))).collect(),
                 matched,
                 geo_columns_known,
                 filter_columns_known,

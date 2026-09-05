@@ -26,6 +26,7 @@
 
 pub mod analyzer;
 pub mod bm25;
+pub mod calendar;
 pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;

@@ -5908,6 +5908,11 @@ message Aggregation {
 
   // The fold.
   AggregateOp op = 3;
+  // CARDINALITY only: the loud cap on distinct values, fleet-wide and
+  // per shard; zero selects 100000. Past the cap the request refuses
+  // by name; the count is never a sketch. On any other op a nonzero
+  // value refuses (docs/aggregations.md "Cardinality").
+  uint32 max_distinct = 4;
 }
 
 // The aggregate operations. Typing: COUNT serves every expression
@@ -6117,6 +6122,10 @@ message CompiledHistogram {
 
   // The request's name, so shard-side refusals name the histogram.
   string name = 4;
+  // Calendar bucketing after validation; zero means the fixed
+  // `interval` applies.
+  CalendarInterval calendar = 5;
+  sint32 utc_offset_minutes = 6;
 }
 
 // One compiled aggregation.
@@ -6129,6 +6138,8 @@ message CompiledAggregation {
 
   // The request's name, so shard-side refusals name the aggregation.
   string name = 3;
+  // CARDINALITY: the distinct-value cap after defaulting.
+  uint32 max_distinct = 4;
 }
 
 message AggregateShardResponse {
@@ -6280,6 +6291,14 @@ message AggregatePartial {
   // shard's present values in doc order.
   double mean = 11;
   double m2 = 12;
+  // CARDINALITY: this shard's exact distinct values, one list per
+  // type (the others empty). Doubles travel as canonical bits (one
+  // NaN, one zero); strings are the dictionary terms themselves, so
+  // shards with different dictionaries union by value.
+  repeated sint64 distinct_ints = 13;
+  repeated fixed64 distinct_double_bits = 14;
+  repeated string distinct_strings = 15;
+  repeated bool distinct_bools = 16;
 }
 
 // The type a shard resolved one aggregation expression to.
@@ -6294,6 +6313,8 @@ enum AggregateValueType {
   AGGREGATE_VALUE_TYPE_DOUBLE = 3;
   // A facet or map-facet read; COUNT only.
   AGGREGATE_VALUE_TYPE_STRING = 4;
+  // A boolean expression; admitted under CARDINALITY only.
+  AGGREGATE_VALUE_TYPE_BOOL = 5;
 }
 
 // Comparison operations over value subexpressions.

@@ -1040,6 +1040,7 @@ async fn recursive_boolean_is_exact_across_hybrid_signals_filters_aggregation_an
                     name: "year_sum".into(),
                     expression: "year".into(),
                     op: AggregateOp::Sum as i32,
+                    max_distinct: 0,
                 }],
                 ..Default::default()
             }),
@@ -1239,6 +1240,7 @@ async fn an_empty_boolean_match_set_has_an_empty_aggregate() {
                         name: "count".into(),
                         expression: "year".into(),
                         op: AggregateOp::Count as i32,
+                        max_distinct: 0,
                     }],
                     ..Default::default()
                 }),
