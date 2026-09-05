@@ -53,6 +53,41 @@ can occur once in each affected segment. Legacy image writers refuse to discard
 retained sources. Older readers reject the new column kind; source-free images
 keep their existing representation.
 
+## Immutable identity views
+
+`identity_snapshot()` on the heap store, spill builder and image reader captures
+row-to-identity bindings. The segmented store and `Bm25Shard` expose the same
+view across sealed parts, a frozen seal and the mutable tail. Segment ranges
+are captured with the metadata and checked for overlap/order/overflow; a lookup
+cannot fall through a gap into the wrong part. Missing legacy identities remain
+absent, including when a later append fills a previously empty row.
+
+Capture the view while holding the state lock used to select/score rows. It
+remains usable after that state is released, moved into a sealed segment,
+replaced or dropped. Taking a view after an unfenced query cannot recover the
+query's earlier generation. The view contains no live-row filter, policy decision
+or document-catalog head and does not itself certify search eligibility.
+
+Heap and spill metadata use shared pages of 1,024 entries. Creating a view
+clones the page-directory handles; a subsequent write detaches the directory
+and touched pages, sharing unchanged key bytes. Directory copying costs one
+pointer per page, so it is not a constant-cost write guarantee. Image readers
+share their parsed archive index. A segmented capture visits its parts; cloning
+the resulting view is constant-time. Views retain metadata and exact keys, but
+no original payload blobs, frozen stores or mapped index files. Tests verify
+that those owners can be dropped and their files removed while old bindings
+remain readable.
+
+A comparison with the writer at checkpoint `b9c99ea`, using sparse rows across
+page boundaries with and without logical identities, produced byte-identical
+format-1 and format-2 archives.
+
+This changes no protobuf fields, archive format or persisted identity meaning.
+It is the metadata retention seam for query generation handling; dense and
+other currently unsupported result routes do not gain identity merely because
+a view exists. Their scan, completion and result propagation still need to
+carry the matching view or bindings end to end.
+
 ## Write log and lifecycle
 
 WAL format 2 adds `sources.wal` within each generation directory. It begins with

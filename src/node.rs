@@ -600,6 +600,16 @@ impl Bm25Shard {
         }
     }
 
+    /// Capture bindings from the state being scored, before releasing its lock.
+    pub fn identity_snapshot(&self) -> Result<crate::source_archive::IdentitySnapshot, String> {
+        match self {
+            Bm25Shard::Building(s) => Ok(s.identity_snapshot()),
+            Bm25Shard::Spilling(s) => Ok(s.identity_snapshot()),
+            Bm25Shard::Resident(s) => Ok(s.identity_snapshot()),
+            Bm25Shard::Segmented(s) => s.identity_snapshot(),
+        }
+    }
+
     pub fn document_identity(&self, doc: u32) -> Option<crate::pb::DocumentIdentity> {
         match self {
             Bm25Shard::Building(s) => s.document_identity(doc),

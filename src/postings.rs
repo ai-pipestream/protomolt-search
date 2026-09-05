@@ -1703,6 +1703,10 @@ impl Bm25Store {
         self.sources.identity(row)
     }
 
+    pub fn identity_snapshot(&self) -> crate::source_archive::IdentitySnapshot {
+        self.sources.identity_snapshot()
+    }
+
     pub fn source_archive_mut(&mut self) -> &mut crate::source_archive::SourceArchive {
         &mut self.sources
     }
@@ -4603,6 +4607,10 @@ pub struct SpillBuilder {
 impl SpillBuilder {
     pub fn document_identity(&self, row: u32) -> Option<crate::pb::DocumentIdentity> {
         self.sources.identity(row)
+    }
+
+    pub fn identity_snapshot(&self) -> crate::source_archive::IdentitySnapshot {
+        self.sources.identity_snapshot()
     }
 
     pub fn source_archive_mut(&mut self) -> &mut crate::source_archive::SourceArchive {
@@ -7506,6 +7514,13 @@ pub struct Bm25Reader {
 }
 
 impl Bm25Reader {
+    pub fn identity_snapshot(&self) -> crate::source_archive::IdentitySnapshot {
+        self.source_section
+            .as_ref()
+            .map(|(_, _, reader)| reader.identity_snapshot())
+            .unwrap_or_default()
+    }
+
     pub fn document_identity(&self, row: u32) -> Option<crate::pb::DocumentIdentity> {
         self.source_section
             .as_ref()

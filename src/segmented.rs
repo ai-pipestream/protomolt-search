@@ -203,6 +203,24 @@ impl std::fmt::Debug for SegmentedShard {
 }
 
 impl SegmentedShard {
+    /// Retain identity metadata for this segment set, frozen seal and tail.
+    /// The view does not retain the source blobs or mapped index files.
+    pub fn identity_snapshot(&self) -> Result<crate::source_archive::IdentitySnapshot, String> {
+        let mut parts = Vec::with_capacity(self.parts.len() + 2);
+        for (index, part) in self.parts.iter().enumerate() {
+            parts.push((part.base, part.rows, self.reader(index).identity_snapshot()));
+        }
+        if let Some(frozen) = &self.frozen {
+            parts.push((frozen.base, frozen.rows, frozen.store.identity_snapshot()));
+        }
+        parts.push((
+            self.tail_base,
+            self.tail.next_doc_id(),
+            self.tail.identity_snapshot(),
+        ));
+        crate::source_archive::IdentitySnapshot::from_parts(parts)
+    }
+
     pub fn document_identity(&self, doc: u32) -> Option<crate::pb::DocumentIdentity> {
         match self.place(doc) {
             Placement::Sealed { part, local } => self.reader(part).document_identity(local),

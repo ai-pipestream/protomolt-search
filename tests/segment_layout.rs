@@ -448,6 +448,33 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
     let mut union = SegmentedShard::open(&root, tail()).unwrap();
     let mut whole = tail();
     let mut next = 0u32;
+    let mut snapshots = Vec::new();
+    let mut mapped_sets = Vec::new();
+    let mut frozen_stores = Vec::new();
+    let identity = |row: u32| {
+        (row % 3 != 1).then(|| pipestream_search::pb::DocumentIdentity {
+            document_key: [vec![0, 255], row.to_le_bytes().to_vec()].concat(),
+            version: u64::MAX - u64::from(row),
+            chunk_ordinal: row.is_multiple_of(2).then_some(0),
+        })
+    };
+    let attach = |store: &mut Bm25Store, local: u32, row: u32, text: &str| {
+        if let Some(identity) = identity(row) {
+            store
+                .source_archive_mut()
+                .attach_source_with_identity(
+                    local,
+                    &pipestream_search::pb::ProtobufSource {
+                        descriptor_set: b"opaque producer descriptor".to_vec(),
+                        message_type: "test.Doc".into(),
+                        payload: text.as_bytes().to_vec(),
+                    },
+                    identity.chunk_ordinal,
+                    Some(&identity),
+                )
+                .unwrap();
+        }
+    };
     // Seal the first two batches by hand through the catalog: the same
     // path the node takes, minus the node.
     for batch in &BATCHES[..2] {
@@ -460,16 +487,21 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
                 .add_document(next, text.to_string(), doc.clone(), None)
                 .unwrap();
             union.tail_mut().set_facet(0, local, court);
+            attach(union.tail_mut(), local, next, text);
             union.sync_tail();
             whole.add_document(next, text.to_string(), doc);
             whole.set_facet(0, next, court);
+            attach(&mut whole, next, next, text);
             next += 1;
         }
+        snapshots.push((next, union.identity_snapshot().unwrap()));
         // Freeze the tail as the node's seal does, and read through the
         // frozen part before its segment exists: the same rows answer.
         let frozen = union
             .freeze_tail(tail(), union.tail().next_doc_id())
             .unwrap();
+        snapshots.push((next, union.identity_snapshot().unwrap()));
+        frozen_stores.push(std::sync::Arc::downgrade(&frozen));
         let (base, rows, _) = union.frozen().unwrap();
         assert_eq!(u64::from(base) + u64::from(rows), u64::from(next));
         assert_eq!(union.df("court"), whole.df("court"), "frozen part served");
@@ -503,6 +535,8 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
             .unwrap();
         union.republish(published).unwrap();
         assert!(union.frozen().is_none());
+        snapshots.push((next, union.identity_snapshot().unwrap()));
+        mapped_sets.push(std::sync::Arc::downgrade(union.snapshot()));
     }
     for (text, court) in BATCHES[2] {
         let doc =
@@ -512,9 +546,11 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
             .add_document(next, text.to_string(), doc.clone(), None)
             .unwrap();
         union.tail_mut().set_facet(0, local, court);
+        attach(union.tail_mut(), local, next, text);
         union.sync_tail();
         whole.add_document(next, text.to_string(), doc);
         whole.set_facet(0, next, court);
+        attach(&mut whole, next, next, text);
         next += 1;
     }
     assert_eq!(union.next_doc_id(), whole.next_doc_id());
@@ -583,7 +619,27 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
         union.expand_prefix("cour", 1),
         whole.expand_prefix("cour", 1)
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    snapshots.push((next, union.identity_snapshot().unwrap()));
+    for row in 0..next {
+        assert_eq!(union.document_identity(row), identity(row));
+    }
+    drop(cursor);
+    drop(union);
+    drop(whole);
+    assert!(mapped_sets.iter().all(|weak| weak.upgrade().is_none()));
+    assert!(frozen_stores.iter().all(|weak| weak.upgrade().is_none()));
+    std::fs::remove_dir_all(&dir).unwrap();
+    for (rows, snapshot) in snapshots {
+        for row in 0..rows {
+            assert_eq!(snapshot.identity(row), identity(row));
+        }
+        for row in rows..=next {
+            assert!(
+                snapshot.identity(row).is_none(),
+                "snapshot acquired new row {row}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

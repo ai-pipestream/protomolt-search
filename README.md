@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Immutable identity metadata (2026-09-05, `feat/identity-snapshots-2026-09`).**
+  Heap, spill, mapped and segmented stores can retain row bindings across
+  appends, sealing and replacement without retaining original payloads or
+  mapped files. Public dense identity propagation remains unfinished. See
+  [source storage](docs/protobuf-source-storage.md#immutable-identity-views).
+
 - **Foundations checkpoint on main (2026-09-05).** The ProtoMolt Search
   namespace, source preservation, local document catalog and collection
   capabilities are reconciled with sorting, explain, partitioned compaction,
