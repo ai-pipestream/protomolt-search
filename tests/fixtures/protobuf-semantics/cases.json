@@ -1,0 +1,537 @@
+[
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "required bytes present empty",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00"
+  },
+  {
+    "name": "required unindexed bytes missing",
+    "valid": false,
+    "wire": "08011201781a040000803f"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed enum absent default",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed enum unknown only",
+    "valid": true,
+    "wire": "08011201781a040000803f7a003863"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "7": 1
+    },
+    "name": "closed enum known then unknown",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0038013863"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "7": 0
+    },
+    "name": "closed enum unknown then explicit zero",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0038633800"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed enum negative unknown",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0038ffffffffffffffffff01"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "7": 1
+    },
+    "name": "closed enum truncates to int32",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00388180808010"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "oneof unknown does not select",
+    "valid": true,
+    "wire": "08011201781a040000803f7a002063"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "5": 7
+    },
+    "name": "oneof unknown preserves another member",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0028072063"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "4": 1
+    },
+    "name": "oneof unknown preserves same member",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0020012063"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "4": 0
+    },
+    "name": "oneof explicit zero selects",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0028072000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "14": 99,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "open imported enum accepts unknown",
+    "valid": true,
+    "wire": "08011201781a040000803f7a007063"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "14": -1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "open imported enum accepts negative",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0070ffffffffffffffffff01"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "8": [
+        0,
+        1,
+        0
+      ]
+    },
+    "name": "closed repeated packed and unpacked",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004204006301634000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed repeated only unknown",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0042026362"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed map unknown discarded",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a050a01611063"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 1
+      }
+    },
+    "name": "closed map unknown preserves old entry",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a050a016110014a050a01611063"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed map known unknown within entry",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a070a016110011063"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed map unknown known within entry",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a070a016110631001"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 0
+      }
+    },
+    "name": "closed map omitted value default",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a030a0161"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "11": {
+        "1": 3,
+        "2": 4
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "required nested partial fragments merge",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005a0208035a021004"
+  },
+  {
+    "name": "required nested field absent",
+    "valid": false,
+    "wire": "08011201781a040000803f7a005a020803"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "10": [
+        {
+          "1": 3,
+          "2": 4
+        },
+        {
+          "1": 3,
+          "2": 4
+        }
+      ],
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "required repeated elements complete",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00520408031004520408031004"
+  },
+  {
+    "name": "required repeated elements do not merge",
+    "valid": false,
+    "wire": "08011201781a040000803f7a005202080352021004"
+  },
+  {
+    "name": "required map entry value absent",
+    "valid": false,
+    "wire": "08011201781a040000803f7a0062030a0161"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "12": {
+        "a": {
+          "1": 3,
+          "2": 4
+        }
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "required map message fragments merge",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00620b0a01611202080312021004"
+  },
+  {
+    "name": "required map duplicate entry replaces",
+    "valid": false,
+    "wire": "08011201781a040000803f7a0062090a016112040803100462070a016112020803"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "6": {
+        "1": 3,
+        "2": 4
+      }
+    },
+    "name": "oneof message fragments merge",
+    "valid": true,
+    "wire": "08011201781a040000803f7a003202080332021004"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "5": 7
+    },
+    "name": "oneof replaced incomplete message ignored",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00320208032807"
+  },
+  {
+    "name": "oneof switching back starts fresh",
+    "valid": false,
+    "wire": "08011201781a040000803f7a00320408031004280732020803"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "6": {
+        "1": 3,
+        "2": 4
+      }
+    },
+    "name": "oneof unknown preserves message merge",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0032020803206332021004"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "13": {
+        "1": 0
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "group required explicit zero",
+    "valid": true,
+    "wire": "08011201781a040000803f7a006b08006c"
+  },
+  {
+    "name": "group required absent",
+    "valid": false,
+    "wire": "08011201781a040000803f7a006b6c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "13": {
+        "1": 1,
+        "2": "label"
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "group fragments merge",
+    "valid": true,
+    "wire": "08011201781a040000803f7a006b12056c6162656c6c6b08016c"
+  },
+  {
+    "name": "group mismatched end",
+    "valid": false,
+    "wire": "08011201781a040000803f7a006b080164"
+  },
+  {
+    "name": "group missing end",
+    "valid": false,
+    "wire": "08011201781a040000803f7a006b0801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "unknown group accepted",
+    "valid": true,
+    "wire": "08011201781a040000803f7a009b0608019c06"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "100": {
+        "1": 3,
+        "2": 4
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "required extension fragments merge",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00a206020803a206021004"
+  },
+  {
+    "name": "required extension absent child",
+    "valid": false,
+    "wire": "08011201781a040000803f7a00a206020803"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "101": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed enum extension unknown preserves known",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00a80601a80663"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "102": [
+        0,
+        1
+      ],
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "closed repeated enum extension",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00b20603006301b00663"
+  },
+  {
+    "name": "malformed unindexed repeated child",
+    "valid": false,
+    "wire": "08011201781a040000803f7a0052020880"
+  }
+]

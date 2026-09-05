@@ -58,6 +58,7 @@ pub mod node_agent;
 pub mod pb;
 pub mod phrases;
 pub mod postings;
+mod protobuf;
 pub mod proximity;
 pub mod quality;
 pub mod query;

@@ -75,6 +75,188 @@ fn base_wire() -> Vec<u8> {
     wire
 }
 
+const SEMANTICS_DESCRIPTOR: &[u8] = include_bytes!("fixtures/protobuf-semantics/descriptor.bin");
+
+fn semantics_wire(suffix: &[u8]) -> Vec<u8> {
+    let mut bytes = base_wire();
+    bytes.extend([122, 0]); // Explicitly present required bytes, not indexed.
+    bytes.extend(suffix);
+    bytes
+}
+
+#[test]
+fn closed_enum_oneof_does_not_replace_a_known_member() {
+    let extractor = Extractor::new(SEMANTICS_DESCRIPTOR, "semantics.Doc", "body").unwrap();
+    let rows = extractor
+        .extract(&semantics_wire(&[40, 7, 32, 99, 56, 1, 56, 99]))
+        .unwrap();
+    assert!(rows[0]
+        .request
+        .integers
+        .iter()
+        .any(|v| v.field == "other" && v.value == 7));
+    assert!(!rows[0].request.facets.iter().any(|v| v.field == "state"));
+    assert!(rows[0]
+        .request
+        .facets
+        .iter()
+        .any(|v| v.field == "status" && v.value == "READY"));
+}
+
+#[test]
+fn open_enum_unknown_values_project_as_decimal_facets() {
+    let extractor = Extractor::new(SEMANTICS_DESCRIPTOR, "semantics.Doc", "body").unwrap();
+    let rows = extractor.extract(&semantics_wire(&[112, 99])).unwrap();
+    assert!(rows[0]
+        .request
+        .facets
+        .iter()
+        .any(|v| v.field == "open_state" && v.value == "99"));
+    let rows = extractor.extract(&semantics_wire(&[112, 1])).unwrap();
+    assert!(rows[0]
+        .request
+        .facets
+        .iter()
+        .any(|v| v.field == "open_state" && v.value == "OPEN_READY"));
+}
+
+#[test]
+fn required_fields_are_validated_even_when_not_indexed() {
+    let extractor = Extractor::new(SEMANTICS_DESCRIPTOR, "semantics.Doc", "body").unwrap();
+    for (wire, path) in [
+        (base_wire(), "required_token"),
+        (semantics_wire(&[82, 2, 8, 3]), "details[0].right"),
+        (
+            semantics_wire(&[162, 6, 2, 8, 3]),
+            "[semantics.extra].right",
+        ),
+    ] {
+        let error = extractor
+            .extract(&wire)
+            .err()
+            .expect("missing required field");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains(path), "{error}");
+    }
+}
+
+#[test]
+fn groups_project_after_merging_and_validate_required_fields() {
+    let extractor = Extractor::new(SEMANTICS_DESCRIPTOR, "semantics.Doc", "body").unwrap();
+    // Two occurrences of the same singular group merge. Explicit zero remains present.
+    let rows = extractor
+        .extract(&semantics_wire(&[107, 18, 1, b'x', 108, 107, 8, 0, 108]))
+        .unwrap();
+    assert!(rows[0]
+        .request
+        .integers
+        .iter()
+        .any(|v| v.field == "legacy_count" && v.value == 0));
+    assert!(rows[0]
+        .request
+        .fields
+        .iter()
+        .any(|v| v.field == "legacy_label" && v.text == "x"));
+    assert!(extractor
+        .extract(&semantics_wire(&[107, 108]))
+        .err()
+        .expect("missing required group field")
+        .message()
+        .contains("legacy.count"));
+    assert!(extractor
+        .extract(&semantics_wire(&[107, 8, 0, 100]))
+        .is_err());
+}
+
+#[test]
+fn extension_decode_semantics_participate_in_fingerprint() {
+    let original = FileDescriptorSet::decode(SEMANTICS_DESCRIPTOR).unwrap();
+    let baseline = derive_plan(SEMANTICS_DESCRIPTOR, "semantics.Doc").unwrap();
+    for change in 0..4 {
+        let mut changed = original.clone();
+        let file = changed
+            .file
+            .iter_mut()
+            .find(|f| f.name() == "closed.proto")
+            .unwrap();
+        match change {
+            0 => {
+                file.extension.pop();
+            }
+            1 => {
+                file.extension[1].number = Some(103);
+            }
+            2 => {
+                file.extension[1].type_name = Some(".semantics.OpenState".into());
+            }
+            3 => {
+                let mut nested = file
+                    .message_type
+                    .iter()
+                    .find(|m| m.name() == "Detail")
+                    .unwrap()
+                    .clone();
+                nested.name = Some("ExtensionDetail".into());
+                nested.field[0].r#type = Some(Type::Sint64 as i32);
+                file.message_type.push(nested);
+                file.extension[0].type_name = Some(".semantics.ExtensionDetail".into());
+            }
+            _ => unreachable!(),
+        }
+        let plan = derive_plan(&changed.encode_to_vec(), "semantics.Doc").unwrap();
+        assert_eq!(baseline.fields, plan.fields, "projection remains unchanged");
+        assert_ne!(baseline.fingerprint, plan.fingerprint, "change {change}");
+    }
+    let mut reordered = original.clone();
+    reordered
+        .file
+        .iter_mut()
+        .find(|f| f.name() == "closed.proto")
+        .unwrap()
+        .extension
+        .reverse();
+    reordered.file.reverse();
+    assert_eq!(
+        baseline.fingerprint,
+        derive_plan(&reordered.encode_to_vec(), "semantics.Doc")
+            .unwrap()
+            .fingerprint
+    );
+}
+
+#[test]
+fn reachable_messageset_is_refused_before_ingest() {
+    let mut schema = FileDescriptorSet::decode(SEMANTICS_DESCRIPTOR).unwrap();
+    let file = schema
+        .file
+        .iter_mut()
+        .find(|f| f.name() == "closed.proto")
+        .unwrap();
+    file.message_type.push(DescriptorProto {
+        name: Some("LegacySet".into()),
+        options: Some(prost_types::MessageOptions {
+            message_set_wire_format: Some(true),
+            ..Default::default()
+        }),
+        extension_range: vec![prost_types::descriptor_proto::ExtensionRange {
+            start: Some(100),
+            end: Some(536870912),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    // An unrelated MessageSet does not affect this root.
+    derive_plan(&schema.encode_to_vec(), "semantics.Doc").unwrap();
+    let file = schema
+        .file
+        .iter_mut()
+        .find(|f| f.name() == "closed.proto")
+        .unwrap();
+    file.extension[0].type_name = Some(".semantics.LegacySet".into());
+    let error = derive_plan(&schema.encode_to_vec(), "semantics.Doc").unwrap_err();
+    assert!(error.message().contains("MessageSet"), "{error}");
+}
+
 #[test]
 fn decode_changes_invalidate_the_plan() {
     let original = schema();

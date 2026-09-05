@@ -330,7 +330,7 @@ fn the_fingerprint_is_deterministic_and_pinned() {
     assert_eq!(a.fingerprint.len(), 64);
     assert!(a.fingerprint.bytes().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(
-        a.fingerprint, "d32c4247b2ef4c38bf699ea26083be13c22c68854688bffb0d2745fe1fd33934",
+        a.fingerprint, "89fb8a8e5ad205fa29a62a1292a49912ea264de1f5c8570f775fdfd4a86895b5",
         "the derivation semantics or canonical encoding changed; if that \
          was deliberate, bump FINGERPRINT_VERSION and re-pin"
     );

@@ -1,0 +1,7 @@
+syntax = "proto3";
+package semantics;
+
+enum OpenState {
+  OPEN_UNSPECIFIED = 0;
+  OPEN_READY = 1;
+}

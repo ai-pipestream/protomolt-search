@@ -5034,8 +5034,8 @@ message MappedPlan {
 
   // Lowercase hex SHA-256 over the canonical encoding of this plan
   // and its reachable wire schema (fixed-layout bytes, never protobuf
-  // serialization). The v2 identity covers decoder semantics as well as
-  // projection policy. A drift at restore time is
+  // serialization). The v3 identity covers decoder semantics, reachable
+  // extension declarations and projection policy. A drift at restore time is
   // an index compatibility event, not a warning.
   string fingerprint = 3;
 

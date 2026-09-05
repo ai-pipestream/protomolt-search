@@ -63,7 +63,7 @@ const MAX_DEPTH: usize = 8;
 /// change to derivation semantics or to the canonical encoding: a
 /// changed fingerprint is how drift is caught, and a drift at restore
 /// time is an index compatibility event, not a warning.
-const FINGERPRINT_VERSION: &str = "pipestream-search.plan.v2";
+const FINGERPRINT_VERSION: &str = "pipestream-search.plan.v3";
 
 /// One refusal, uniformly shaped: every message begins `plan: `.
 fn refuse(msg: impl Into<String>) -> Status {
@@ -95,7 +95,7 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
     })?;
     let index = TypeIndex::build(&set);
     check_extension_declarations(&set)?;
-    DescriptorPool::decode(descriptor_set)
+    let pool = DescriptorPool::decode(descriptor_set)
         .map_err(|e| refuse(format!("invalid descriptor set: {e}")))?;
     let hint_map = extract_hints(descriptor_set)?;
     let root = index.messages.get(message_type).ok_or_else(|| {
@@ -105,6 +105,19 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
             index.sample_types()
         ))
     })?;
+    for message in reachable_messages(&pool, message_type) {
+        if message
+            .descriptor_proto()
+            .options
+            .as_ref()
+            .is_some_and(|options| options.message_set_wire_format())
+        {
+            return Err(refuse(format!(
+                "{} uses MessageSet wire format, which mapped ingest does not decode",
+                message.full_name()
+            )));
+        }
+    }
 
     let mut fields = Vec::new();
     let mut visiting = Vec::new();
@@ -173,7 +186,7 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         chunk_id_path: chunk_id_path.unwrap_or_default(),
         descriptor_sha256: sha256::hex_digest(descriptor_set),
     };
-    plan.fingerprint = fingerprint(&plan, &set);
+    plan.fingerprint = fingerprint(&plan, &set, &pool);
     Ok(plan)
 }
 
@@ -270,7 +283,8 @@ impl<'a> TypeIndex<'a> {
                 ));
             }
             match field.r#type() {
-                prost_types::field_descriptor_proto::Type::Message => {
+                prost_types::field_descriptor_proto::Type::Message
+                | prost_types::field_descriptor_proto::Type::Group => {
                     current = self.message_by_type_name(field.type_name(), path)?.desc;
                 }
                 _ => {
@@ -565,7 +579,7 @@ fn shape<'a>(
 ) -> Result<Shape<'a>, Status> {
     use prost_types::field_descriptor_proto::Type;
     match field.r#type() {
-        Type::Message => {
+        Type::Message | Type::Group => {
             let entry = index.message_by_type_name(field.type_name(), path)?;
             let full = field.type_name().trim_start_matches('.').to_string();
             let map = entry.desc.options.as_ref().is_some_and(|o| o.map_entry());
@@ -584,7 +598,6 @@ fn shape<'a>(
             }
             Ok(Shape::Enum)
         }
-        Type::Group => Err(refuse_at(path, "proto2 groups are not supported")),
         other => Ok(Shape::Scalar(other)),
     }
 }
@@ -1165,11 +1178,11 @@ fn vector_shaped_name(name: &str) -> bool {
 /// canonical) hashed with SHA-256, lowercase hex. The descriptor
 /// content address is deliberately NOT covered: two descriptor sets
 /// may derive the same plan. The reachable wire schema is covered separately.
-fn fingerprint(plan: &pb::MappedPlan, set: &FileDescriptorSet) -> String {
+fn fingerprint(plan: &pb::MappedPlan, set: &FileDescriptorSet, pool: &DescriptorPool) -> String {
     let mut hasher = sha256::Sha256::new();
     write_str(&mut hasher, FINGERPRINT_VERSION);
     write_str(&mut hasher, &plan.message_type);
-    hash_wire_schema(&mut hasher, set, &plan.message_type);
+    hash_wire_schema(&mut hasher, set, pool, &plan.message_type);
     write_str(&mut hasher, &plan.vector_path);
     write_str(&mut hasher, &plan.doc_id_path);
     write_str(&mut hasher, &plan.chunks_path);
@@ -1192,7 +1205,12 @@ fn fingerprint(plan: &pb::MappedPlan, set: &FileDescriptorSet) -> String {
 
 /// Hash the reachable descriptor graph independently of file order and source comments.
 /// Projection policy is hashed separately above; this graph pins decoding meaning.
-fn hash_wire_schema(hasher: &mut sha256::Sha256, set: &FileDescriptorSet, root: &str) {
+fn hash_wire_schema(
+    hasher: &mut sha256::Sha256,
+    set: &FileDescriptorSet,
+    pool: &DescriptorPool,
+    root: &str,
+) {
     let index = TypeIndex::build(set);
     let enums = collect_enum_descriptors(set);
     let mut pending = vec![root.to_owned()];
@@ -1202,7 +1220,13 @@ fn hash_wire_schema(hasher: &mut sha256::Sha256, set: &FileDescriptorSet, root: 
             continue;
         }
         if let Some(entry) = index.messages.get(&name) {
-            for field in &entry.desc.field {
+            let message = pool.get_message_by_name(&name).expect("validated message");
+            let extensions: Vec<_> = message.extensions().collect();
+            for field in entry.desc.field.iter().chain(
+                extensions
+                    .iter()
+                    .map(|extension| extension.field_descriptor_proto()),
+            ) {
                 if !field.type_name().is_empty() {
                     pending.push(field.type_name().trim_start_matches('.').to_owned());
                 }
@@ -1218,10 +1242,22 @@ fn hash_wire_schema(hasher: &mut sha256::Sha256, set: &FileDescriptorSet, root: 
             hasher.update(&[u8::from(
                 entry.desc.options.as_ref().is_some_and(|o| o.map_entry()),
             )]);
-            let mut fields: Vec<_> = entry.desc.field.iter().collect();
-            fields.sort_by_key(|f| f.number());
+            let message = pool.get_message_by_name(&name).expect("validated message");
+            let extensions: Vec<_> = message.extensions().collect();
+            let mut fields: Vec<_> =
+                entry
+                    .desc
+                    .field
+                    .iter()
+                    .map(|f| ("", f))
+                    .chain(extensions.iter().map(|extension| {
+                        (extension.full_name(), extension.field_descriptor_proto())
+                    }))
+                    .collect();
+            fields.sort_by_key(|(_, f)| f.number());
             hasher.update(&(fields.len() as u32).to_le_bytes());
-            for field in fields {
+            for (extension_name, field) in fields {
+                write_str(hasher, extension_name);
                 write_str(hasher, field.name());
                 hasher.update(&field.number().to_le_bytes());
                 hasher.update(&field.r#type.unwrap_or_default().to_le_bytes());
@@ -1256,6 +1292,27 @@ fn hash_wire_schema(hasher: &mut sha256::Sha256, set: &FileDescriptorSet, root: 
             }
         }
     }
+}
+
+fn reachable_messages(pool: &DescriptorPool, root: &str) -> Vec<MessageDescriptor> {
+    let mut seen = std::collections::BTreeMap::new();
+    let mut pending = vec![pool.get_message_by_name(root).expect("validated root")];
+    while let Some(message) = pending.pop() {
+        if seen.contains_key(message.full_name()) {
+            continue;
+        }
+        for kind in message
+            .fields()
+            .map(|f| f.kind())
+            .chain(message.extensions().map(|f| f.kind()))
+        {
+            if let prost_reflect::Kind::Message(child) = kind {
+                pending.push(child);
+            }
+        }
+        seen.insert(message.full_name().to_string(), message);
+    }
+    seen.into_values().collect()
 }
 
 fn write_str(hasher: &mut sha256::Sha256, text: &str) {
@@ -1569,8 +1626,7 @@ impl Extractor {
     pub fn extract(&self, bytes: &[u8]) -> Result<Vec<ExtractedDoc>, Status> {
         let mut slots: Vec<Option<Slot>> = (0..self.leaves.len()).map(|_| None).collect();
         let mut chunks: Vec<Vec<Option<Slot>>> = Vec::new();
-        let message = DynamicMessage::decode(self.descriptor.clone(), bytes)
-            .map_err(|e| refuse(format!("malformed document: {e}")))?;
+        let message = crate::protobuf::decode(self.descriptor.clone(), bytes)?;
         self.project_message(&message, &self.root, &mut slots, &mut chunks)?;
         if self.chunked.is_none() {
             return Ok(vec![self.assemble(&slots, None)?]);
@@ -2004,14 +2060,12 @@ fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
     Ok(match (&leaf.land, value) {
         (Land::Text | Land::FacetStr, Value::String(v)) => Slot::Str(v.clone()),
         (Land::FacetBool, Value::Bool(v)) => Slot::Str(v.to_string()),
-        (Land::FacetEnum(table), Value::EnumNumber(v)) => {
-            Slot::Str(table.get(&i64::from(*v)).cloned().ok_or_else(|| {
-                refuse_at(
-                    &leaf.path,
-                    format!("enum value {v} is not declared in the descriptor"),
-                )
-            })?)
-        }
+        (Land::FacetEnum(table), Value::EnumNumber(v)) => Slot::Str(
+            table
+                .get(&i64::from(*v))
+                .cloned()
+                .unwrap_or_else(|| v.to_string()),
+        ),
         (Land::FacetInt, v) => Slot::Str(integer(v)?.to_string()),
         (Land::Int, v) => Slot::Int(integer(v)?),
         (Land::Num, Value::F32(v)) => Slot::Num(f64::from(*v)),

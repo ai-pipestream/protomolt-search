@@ -1,0 +1,48 @@
+syntax = "proto2";
+package semantics;
+
+import "open.proto";
+
+enum State {
+  option allow_alias = true;
+  UNKNOWN = 0;
+  READY = 1;
+  AVAILABLE = 1;
+}
+
+message Detail {
+  required int64 left = 1;
+  required int64 right = 2;
+  repeated int32 numbers = 3;
+  optional State state = 4;
+}
+
+message Doc {
+  optional int64 id = 1;
+  optional string body = 2;
+  repeated float embedding = 3;
+  oneof choice {
+    State state = 4;
+    int64 other = 5;
+    Detail detail = 6;
+  }
+  optional State status = 7 [default = READY];
+  repeated State states = 8 [packed = true];
+  map<string, State> states_by_key = 9;
+  repeated Detail details = 10;
+  optional Detail metadata = 11;
+  map<string, Detail> detail_by_key = 12;
+  optional group Legacy = 13 {
+    required int64 count = 1;
+    optional string label = 2;
+  }
+  optional OpenState open_state = 14;
+  required bytes required_token = 15;
+  extensions 100 to max;
+}
+
+extend Doc {
+  optional Detail extra = 100;
+  optional State extra_state = 101;
+  repeated State extra_states = 102 [packed = true];
+}

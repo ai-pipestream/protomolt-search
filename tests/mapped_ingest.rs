@@ -1062,13 +1062,6 @@ async fn document_refusals_name_position_and_field() {
         "no body text",
     );
 
-    let mut bad_enum = doc(0);
-    bad_enum.status = Some(99);
-    expect_refusal(
-        ingest(&addr, bind(), vec![bad_enum.encode()]).await,
-        "enum value 99",
-    );
-
     let mut truncated = doc(0).encode();
     truncated.truncate(truncated.len() - 3);
     expect_refusal(ingest(&addr, bind(), vec![truncated]).await, "document 0");
@@ -1087,6 +1080,54 @@ async fn document_refusals_name_position_and_field() {
         .await
         .expect("the shard ingests after refusals");
     assert_eq!(response.added, 1);
+}
+
+#[tokio::test]
+async fn closed_enum_unknowns_preserve_presence_and_prior_values_in_query() {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let (addr, _node) = start_empty_node(case_node_config(analysis.clone())).await;
+    seed_calibration(&addr).await;
+
+    let mut unknown = doc(0);
+    unknown.status = Some(99);
+    let mut known_then_unknown = doc(1).encode();
+    known_then_unknown.extend([40, 99]);
+    let mut unknown_then_known = unknown.encode();
+    unknown_then_known.extend([40, 1]);
+    let response = ingest(
+        &addr,
+        bind(),
+        vec![unknown.encode(), known_then_unknown, unknown_then_known],
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.added, 3);
+    let coordinator =
+        CoordinatorServiceImpl::new(vec![addr]).with_bm25(Some(analysis), Default::default());
+    let hits = coordinator
+        .bm25_search(Request::new(Bm25SearchRequest {
+            text: "case".into(),
+            k: 3,
+            projections: vec![NamedProjection {
+                name: "status".into(),
+                expression: "status".into(),
+            }],
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(hits.len(), 3);
+    for hit in hits {
+        let expected = match hit.doc_id {
+            0 => None,
+            1 => Some(projected_value::Value::StringValue("CLOSED".into())),
+            2 => Some(projected_value::Value::StringValue("OPEN".into())),
+            other => panic!("unexpected row {other}"),
+        };
+        assert_eq!(hit.projected[0].value, expected);
+    }
 }
 
 /// A shard whose document leg ran ahead cannot take mapped documents:

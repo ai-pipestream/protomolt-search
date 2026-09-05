@@ -8,7 +8,7 @@ establish completion of the three workstreams.
 
 | Requirement | Required evidence | Current state |
 |---|---|---|
-| Faithful protobuf decoding and compatible index binding | Generated-runtime differential fixtures for presence, oneofs, merges, scalar encodings, unknown values and schema evolution | Oneof, explicit presence, implicit defaults, merged messages and int32 projection corrected; coverage expanding |
+| Faithful protobuf decoding and compatible index binding | Generated-runtime differential fixtures for presence, oneofs, merges, scalar encodings, unknown values and schema evolution | Oneof, presence, merged messages, int32, enum openness, required fields and groups corrected; v3 includes reachable extensions; coverage expanding |
 | Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Not implemented |
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Not implemented; current mapped WAL stores reduced columns |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
@@ -58,22 +58,22 @@ values. Implicit-presence scalars project their protobuf defaults consistently
 whether omitted or explicitly encoded; an absent explicit-presence field remains
 missing. An absent enclosing message does not invent child values.
 
-The v2 plan fingerprint includes the reachable wire schema as well as the
+The v3 plan fingerprint includes the reachable wire schema as well as the
 projection. Field numbers, scalar encodings, cardinality, syntax, defaults,
 oneof membership, enum declarations and map-entry shape participate. Descriptor
 file order, unrelated files and source comments do not. The original descriptor
 content hash remains separate.
 
-This is an index compatibility change. Existing v1 mapped generations remain
-readable, but a new bind derives v2 and refuses to append into a v1 binding.
+This is an index compatibility change. Existing v1/v2 mapped generations remain
+readable, but a new bind derives v3 and refuses to append into a v1/v2 binding.
 Rebuild mapped data from original protobuf sources into a new generation. Do not
 rewrite stored fingerprints or replay reduced columns as proof of corrected
 extraction. Unmapped generations do not acquire a new mapping or require a
 rebuild from this change alone.
 
 Remaining protobuf work includes original-source retention, complete shape
-reporting, unsigned columns, repeated/nested correlation, enum openness,
-required-field validation, extensions/groups, well-known types and Editions.
+reporting, unsigned columns, repeated/nested correlation, extension indexing,
+well-known types and Editions. Reachable MessageSet types are explicitly refused.
 The decoder dependency does not itself prove those contracts. Its behavior must
 be covered or adapted by the conformance suite before support is claimed.
 
@@ -81,6 +81,27 @@ be covered or adapted by the conformance suite before support is claimed.
 oracles and adversarial wire encodings. `tests/descriptor_mappings.rs` pins the
 new fingerprint. `tests/mapped_ingest.rs` exercises binding, column landing,
 restart, routed ingest, replication and resharding through the real handlers.
+
+`src/protobuf.rs` intercepts closed-enum values before the reflected message
+mutates, so an unknown number cannot erase a known value or change oneof
+selection. Unknown closed-enum map values omit the entire entry from projection.
+Open enums retain unknown numbers, rendered as decimal facet strings; declared
+numbers retain the first alias name. Openness follows the enum's defining file,
+including proto3 enums imported by proto2 messages. Protobuf framing and recursion
+limits remain in prost; no parallel wire parser was added.
+
+Required fields are validated after all message fragments merge. The check
+includes unindexed repeated/map messages, groups and present extensions, while
+inactive oneof members and absent optional messages do not invent requirements.
+Singular groups now expand and project like singular messages. Registered
+extensions and their reachable message/enum types participate in the v3 hash;
+reordering files or extension declarations does not change it.
+
+The checked-in fixtures under `tests/fixtures/protobuf-semantics/` compare merged
+values and required-field validity against Google's protobuf 6.33.5 runtime.
+They cover decoding, not original-source preservation: the private projection
+decoder intentionally excludes closed-enum unknowns from its value tree. Its
+output must never substitute for the original payload in future source storage.
 
 ## Capability increment
 

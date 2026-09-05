@@ -17,7 +17,7 @@ the CEL front-end), each field mapped onto the engine column family it
 would land on (`ColumnFamily` — repeated scalars and OBJECT/NESTED/
 BINARY fields visibly map to FAMILY_NONE, never silently dropped), and
 the whole plan identified by a lowercase-hex SHA-256 over a canonical
-fixed-layout encoding (compatibility tag `pipestream-search.plan.v2`,
+fixed-layout encoding (compatibility tag `pipestream-search.plan.v3`,
 including the reachable wire schema; hash from
 the hand-rolled `src/sha256.rs`, pinned to the NIST vectors). Every
 refusal in section 2 is implemented and pinned by tests: ambiguous or
@@ -222,12 +222,17 @@ of the bound type. The contract, piece by piece:
   as ordinary multi-field columns. A chunked plan, a plan with no TEXT
   field, and a TEXT-kind document id all refuse at bind.
 - **Decode before projection.** `prost-reflect` validates the descriptor and
-  decodes the whole message before the compiled field-number projection reads
+  the merge adapter in `src/protobuf.rs` decodes the whole message before the
+  compiled field-number projection reads
   values. Oneof alternatives replace each other, repeated values concatenate,
   and singular submessages merge before indexing. Invalid wire data, including
   malformed unindexed known fields, refuses the document. Explicitly present
-  empty strings are retained. Enum names and signed columns retain their current
-  restrictions: unknown enum numbers and unsigned values above i64::MAX refuse.
+  empty strings are retained. Required fields are checked after merging,
+  including unindexed fields and present extensions. Closed-enum unknowns do
+  not replace existing values or select oneofs. Open-enum unknowns project as
+  decimal facet strings; declared numbers use the first declared alias.
+  Singular proto2 groups expand like messages. Unsigned values above i64::MAX
+  still refuse in signed columns.
   Timestamp and vector projections retain their existing units and narrowing.
   The decoder does not make source preservation or every shape queryable; see
   the foundation completion requirements.
