@@ -257,6 +257,7 @@ fn inspect_disk(
         );
         let id = reader.unsigned_integer_index("id").unwrap();
         let counter = reader.unsigned_integer_index("counter").unwrap();
+        let derived = reader.unsigned_integer_index("derived_uint").unwrap();
         for row in 0..reader.next_doc_id() {
             let key = reader.unsigned_integer_value(id, row).unwrap();
             let source = reader.protobuf_source(row).unwrap().unwrap().0;
@@ -264,6 +265,7 @@ fn inspect_disk(
             assert_eq!(source.message_type, TYPE);
             let decoded = Record::decode(source.payload.as_slice()).unwrap();
             assert_eq!(reader.unsigned_integer_value(counter, row), decoded.counter);
+            assert_eq!(reader.unsigned_integer_value(derived, row), decoded.counter);
             assert!(found.insert(key, source.payload).is_none());
         }
     };
@@ -324,6 +326,7 @@ async fn unsigned_mapped_queries_sources_and_keys_survive_reopen_and_compaction(
                 .iter()
                 .filter(|f| f.family == pb::ColumnFamily::U64 as i32)
                 .map(|f| f.name.clone())
+                .chain(["derived_uint".into()])
                 .collect(),
             integer_fields: vec!["signed_hint".into()],
             ..Default::default()
@@ -340,8 +343,16 @@ async fn unsigned_mapped_queries_sources_and_keys_survive_reopen_and_compaction(
             .await
             .unwrap();
         let mut expected = std::collections::BTreeMap::new();
+        let mut bind = mapped_bind();
+        bind.materialize = Some(pb::MaterializeSpec {
+            columns: vec![pb::MaterializedColumn {
+                name: "derived_uint".into(),
+                expression: "counter + 0u".into(),
+                kind: pb::MaterializeKind::U64 as i32,
+            }],
+        });
         let mut requests = vec![pb::IngestMappedRequest {
-            payload: Some(pb::ingest_mapped_request::Payload::Bind(mapped_bind())),
+            payload: Some(pb::ingest_mapped_request::Payload::Bind(bind)),
         }];
         for (id, counter) in records {
             let mut doc = record(id, counter);
@@ -385,12 +396,20 @@ async fn unsigned_mapped_queries_sources_and_keys_survive_reopen_and_compaction(
                         analysis: Some(body_spec()),
                         filter,
                         k: 5,
+                        projections: vec![pb::NamedProjection {
+                            name: "copy".into(),
+                            expression: "derived_uint".into(),
+                        }],
                         ..Default::default()
                     }))
                     .await
                     .unwrap()
                     .into_inner();
                 assert_eq!(response.hits.len(), 1);
+                assert_eq!(
+                    response.hits[0].projected[0].value,
+                    counter.map(pb::projected_value::Value::UintValue)
+                );
             }
             if pass == 0 {
                 client
@@ -491,7 +510,7 @@ async fn mapped_binding_refuses_legacy_fingerprints_and_signed_column_tables() {
 }
 
 #[tokio::test]
-async fn unsigned_materialization_refuses_before_discarding_a_value() {
+async fn unsigned_materialization_rejects_wrong_target_even_when_input_is_absent() {
     use pipestream_search::{
         analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
         node::NodeConfig,
@@ -566,7 +585,7 @@ async fn unsigned_materialization_refuses_before_discarding_a_value() {
             };
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert!(
-                error.message().contains("unsigned")
+                error.message().contains("Uint")
                     && error.message().contains("counter")
                     && error.message().contains("materializ"),
                 "{error}"

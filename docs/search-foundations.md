@@ -129,8 +129,8 @@ ingest and reopen; segment summaries keep unsigned ranges in `uint_columns`.
 Schema checks reject a tail or segment with different ordered columns before
 it can change the meaning of a column ordinal. Existing signed storage bytes
 and protobuf contracts are unchanged. Storage alone does not establish mapped unsigned semantics. The following
-increments add typed ingest, filtering and descriptor mapping; unsigned value
-expressions and other query operators remain unfinished.
+increments add typed ingest, filtering, descriptor mapping and value expressions;
+unsigned sorting, collapse and aggregation remain unfinished.
 See `tests/unsigned_columns.rs` and `docs/range-facets.md`.
 
 The next increment connects `UnsignedIntegerValue` to ordinary protobuf ingest,
@@ -185,12 +185,11 @@ conversion. Ambiguous column names now refuse during planning, including
 parent/chunk aliases and flattened paths with the same output name.
 
 A regression test reproduced mapped ingest acknowledging an expression over an
-unsigned input that the materialization environment did not represent. Declared
-unsigned reads now refuse at bind and in the node's compiled-spec validation;
-the shared coordinator path checks actual unsigned request inputs before
-building the value environment. This is an explicit unsupported-operation
-boundary while unsigned value evaluation remains unfinished, not unsigned
-materialization support. Unrelated signed expressions remain supported.
+unsigned input that the materialization environment did not represent. The
+initial explicit refusal has now been replaced with typed uint evaluation and
+U64 outputs. Node spec validation checks declared input types before ingest,
+including absent optional inputs; shared coordinator materialization checks the
+actual request types. Wrong target families and mixed numeric expressions refuse.
 
 `tests/unsigned_mapping.rs` covers optional/implicit presence, oneof clearing,
 merged nested messages, full unsigned parent and chunk keys, repeated/map source
@@ -198,8 +197,18 @@ preservation, signed hint refusal, old binding refusal, and mapped ingest,
 reopen, exact key filtering and repeated compaction on both layouts. Legacy
 mapped ingest still does not publish catalog `DocumentIdentity`; retaining
 indexed key values and original bytes is not completion of the identity,
-conditional-write or receipt contract. Unsigned value expressions, sorting,
-aggregation and the other protobuf shapes also remain required.
+conditional-write or receipt contract. Unsigned sorting, collapse, aggregation
+and the other protobuf shapes also remain required.
+
+Validation of the unsigned value-expression increment on 2026-09-05: 422
+library tests, 530 integration tests across 90 targets and 11 embedded tests
+passed; one existing sidecar test was ignored. All five Android/iOS Rust target
+checks passed with the three existing relay dead-code warnings. Tests/examples
+compilation, formatting and vendored-proto checks passed. Descriptor comparison
+against `41f27a9` confirms exactly three additive declarations: the uint literal,
+typed uint projected result and U64 materialization kind. Existing declarations
+are unchanged. This checkpoint remains on the unsigned feature branch; main and
+the fleet were not changed.
 
 Validation of the mapping increment on 2026-09-05: 422 library tests, 527
 integration tests across 89 targets and 11 embedded tests passed; one existing

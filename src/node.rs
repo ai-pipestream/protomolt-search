@@ -2065,6 +2065,9 @@ impl crate::values::ColumnLookup for Bm25Shard {
     fn integer_index(&self, name: &str) -> Option<usize> {
         Bm25Shard::integer_index(self, name)
     }
+    fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::unsigned_integer_index(self, name)
+    }
     fn facet_index(&self, name: &str) -> Option<usize> {
         Bm25Shard::facet_index(self, name)
     }
@@ -2143,6 +2146,7 @@ fn projected_value(
     let value = match val {
         None => None,
         Some(crate::values::Val::Int(v)) => Some(W::IntValue(v)),
+        Some(crate::values::Val::Uint(v)) => Some(W::UintValue(v)),
         Some(crate::values::Val::Double(v)) => Some(W::DoubleValue(v)),
         Some(crate::values::Val::FacetOrd { column, ord }) => {
             Some(W::StringValue(store.facet_value(column, ord).to_string()))
@@ -2438,6 +2442,9 @@ impl AggAcc {
 fn acc_of(vt: crate::values::ValueType, cardinality: bool) -> AggAcc {
     match vt {
         crate::values::ValueType::Unknown => AggAcc::Absent,
+        crate::values::ValueType::Uint => {
+            unreachable!("check_agg_type refuses uint until typed accumulators are available")
+        }
         crate::values::ValueType::Int => AggAcc::Int {
             present: 0,
             sum: 0,
@@ -2593,6 +2600,9 @@ fn resolve_rankable(
     let (rv, vt) = crate::values::resolve(expr, store)
         .map_err(|e| Status::invalid_argument(format!("{what} {name:?}: {}", e.message())))?;
     match vt {
+        crate::values::ValueType::Uint => Err(Status::invalid_argument(format!(
+            "{what} {name:?}: uint rank expressions are not supported yet"
+        ))),
         crate::values::ValueType::Int => Ok(Some((rv, true))),
         crate::values::ValueType::Double => Ok(Some((rv, false))),
         crate::values::ValueType::Unknown => Ok(None),
@@ -2634,6 +2644,11 @@ fn check_agg_type(
 ) -> Result<(), Status> {
     use crate::pb::AggregateOp as O;
     use crate::values::ValueType as V;
+    if vt == V::Uint {
+        return Err(Status::invalid_argument(format!(
+            "aggregation {name:?}: uint accumulators are not supported yet"
+        )));
+    }
     if op == O::Cardinality {
         // Distinct values exist for every type, booleans included.
         return Ok(());
@@ -8351,12 +8366,33 @@ impl NodeServiceImpl {
             }
         }
         let columns = compile_materialize_spec(spec)?;
-        validate_materialize_inputs(&columns, |name| {
-            self.config
-                .unsigned_integer_fields
-                .iter()
-                .any(|field| field == name)
-        })?;
+        let types = crate::values::NumericTypes {
+            numerics: &self.config.numeric_fields,
+            integers: &self.config.integer_fields,
+            unsigned_integers: &self.config.unsigned_integer_fields,
+            map_numerics: &self.config.map_numeric_fields,
+        };
+        for ((name, expr, kind), source) in columns.iter().zip(&spec.columns) {
+            let (_, vt) = crate::values::resolve(expr, &types).map_err(|e| {
+                Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
+            })?;
+            let expected = match kind {
+                crate::pb::MaterializeKind::F64 => crate::values::ValueType::Double,
+                crate::pb::MaterializeKind::I64 => crate::values::ValueType::Int,
+                crate::pb::MaterializeKind::U64 => crate::values::ValueType::Uint,
+                _ => unreachable!("compile_materialize_spec checked the kind"),
+            };
+            if vt != crate::values::ValueType::Unknown && vt != expected {
+                let hint = if vt == crate::values::ValueType::Bool {
+                    "wrap the boolean in a ternary that yields the target numeric type"
+                } else {
+                    "align the target kind with the expression; use double(...) for an explicit F64 conversion"
+                };
+                return Err(Status::invalid_argument(format!(
+                    "materialize: column {name:?}, expression {:?}, declares {kind:?} but resolves to {vt:?}; {hint}", source.expression
+                )));
+            }
+        }
         *cache = Some(CompiledMaterialize {
             spec: spec.clone(),
             columns: columns.clone(),
@@ -8453,10 +8489,11 @@ pub(crate) fn compile_materialize_spec(
         let kind = match crate::pb::MaterializeKind::try_from(column.kind) {
             Ok(crate::pb::MaterializeKind::F64) => crate::pb::MaterializeKind::F64,
             Ok(crate::pb::MaterializeKind::I64) => crate::pb::MaterializeKind::I64,
+            Ok(crate::pb::MaterializeKind::U64) => crate::pb::MaterializeKind::U64,
             _ => {
                 return Err(Status::invalid_argument(format!(
                     "materialize: column {:?} declares no target kind; kinds are \
-                     explicit (MATERIALIZE_KIND_F64 or MATERIALIZE_KIND_I64), \
+                     explicit (MATERIALIZE_KIND_F64, MATERIALIZE_KIND_I64, or MATERIALIZE_KIND_U64), \
                      never inferred from data",
                     column.name
                 )))
@@ -8474,32 +8511,6 @@ pub(crate) fn compile_materialize_spec(
     Ok(columns)
 }
 
-// Until the value evaluator represents unsigned inputs, treating one as a
-// missing signed/double value would silently discard the derived column.
-// Validate declared types at the node and actual request types at the shared
-// coordinator entry point, including reads nested inside value expressions.
-fn validate_materialize_inputs(
-    compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
-    is_unsigned: impl Fn(&str) -> bool,
-) -> Result<(), Status> {
-    for (output, expr, _) in compiled {
-        let mut leaves = Vec::new();
-        crate::values::column_leaves(expr, &mut leaves);
-        for leaf in leaves {
-            let name = match &leaf {
-                crate::values::ValueLeaf::Column(name) => name,
-                crate::values::ValueLeaf::Map { column, .. } => column,
-            };
-            if is_unsigned(name) {
-                return Err(Status::invalid_argument(format!(
-                    "materialize: column {output:?} reads unsigned input {name:?}; unsigned value materialization is not supported"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Evaluate compiled materialized columns over one document's own
 /// values and push the results into its `numerics` / `integers`
 /// lists. Shared by node ingest and the coordinator's placement
@@ -8509,13 +8520,6 @@ pub(crate) fn apply_materialize(
     mut doc: AddDocumentsRequest,
     compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
 ) -> Result<AddDocumentsRequest, Status> {
-    if !doc.unsigned_integers.is_empty() {
-        validate_materialize_inputs(compiled, |name| {
-            doc.unsigned_integers
-                .iter()
-                .any(|field| field.field == name)
-        })?;
-    }
     {
         let mut env = crate::values::IngestEnv::default();
         for nv in &doc.numerics {
@@ -8523,6 +8527,9 @@ pub(crate) fn apply_materialize(
         }
         for iv in &doc.integers {
             env.integers.insert(iv.field.clone(), iv.value);
+        }
+        for iv in &doc.unsigned_integers {
+            env.unsigned_integers.insert(iv.field.clone(), iv.value);
         }
         for entry in &doc.map_numerics {
             env.map_numerics
@@ -8544,7 +8551,7 @@ pub(crate) fn apply_materialize(
                 Some(crate::values::IngestVal::Double(v)) => {
                     if *kind != crate::pb::MaterializeKind::F64 {
                         return Err(Status::invalid_argument(format!(
-                            "materialize: column {name:?} declares I64 but its \
+                            "materialize: column {name:?} declares {kind:?} but its \
                              expression evaluated double on this document; stock CEL \
                              does not coerce — align the kind or the expression"
                         )));
@@ -8557,12 +8564,23 @@ pub(crate) fn apply_materialize(
                 Some(crate::values::IngestVal::Int(v)) => {
                     if *kind != crate::pb::MaterializeKind::I64 {
                         return Err(Status::invalid_argument(format!(
-                            "materialize: column {name:?} declares F64 but its \
+                            "materialize: column {name:?} declares {kind:?} but its \
                              expression evaluated int on this document; write \
                              double(...) to land it in the f64 family"
                         )));
                     }
                     doc.integers.push(crate::pb::IntegerValue {
+                        field: name.clone(),
+                        value: v,
+                    });
+                }
+                Some(crate::values::IngestVal::Uint(v)) => {
+                    if *kind != crate::pb::MaterializeKind::U64 {
+                        return Err(Status::invalid_argument(format!(
+                            "materialize: column {name:?} declares {kind:?} but evaluated uint; align the kind or convert explicitly with double()"
+                        )));
+                    }
+                    doc.unsigned_integers.push(crate::pb::UnsignedIntegerValue {
                         field: name.clone(),
                         value: v,
                     });
@@ -11115,6 +11133,7 @@ impl NodeService for NodeServiceImpl {
                     crate::values::ValueType::Str => "string",
                     crate::values::ValueType::Bool => "boolean",
                     crate::values::ValueType::Int => "int",
+                    crate::values::ValueType::Uint => "uint",
                     crate::values::ValueType::Double => "double",
                     crate::values::ValueType::Unknown => "unknown",
                 };
@@ -14411,7 +14430,7 @@ mod unsigned_materialize_tests {
     use super::*;
 
     #[test]
-    fn shared_materialization_refuses_unsigned_reads_before_they_become_absent() {
+    fn shared_materialization_preserves_uint_and_checks_target_family() {
         let doc = AddDocumentsRequest {
             unsigned_integers: vec![crate::pb::UnsignedIntegerValue {
                 field: "counter".into(),
@@ -14419,18 +14438,36 @@ mod unsigned_materialize_tests {
             }],
             ..Default::default()
         };
-        for expression in ["counter", "double(counter) + 1.0", "counter > 0 ? 1 : 0"] {
-            let columns = compile_materialize_spec(&crate::pb::MaterializeSpec {
+        for (expression, value) in [
+            ("counter", Some(u64::MAX)),
+            ("counter + 1u", None),
+            ("counter - 1u", Some(u64::MAX - 1)),
+            ("counter > 0u ? counter : 0u", Some(u64::MAX)),
+        ] {
+            let mut spec = crate::pb::MaterializeSpec {
                 columns: vec![crate::pb::MaterializedColumn {
                     name: "derived".into(),
                     expression: expression.into(),
-                    kind: crate::pb::MaterializeKind::I64 as i32,
+                    kind: crate::pb::MaterializeKind::U64 as i32,
                 }],
-            })
-            .unwrap();
-            let error = apply_materialize(doc.clone(), &columns).unwrap_err();
-            assert_eq!(error.code(), tonic::Code::InvalidArgument);
-            assert!(error.message().contains("unsigned input \"counter\""));
+            };
+            let compiled = compile_materialize_spec(&spec).unwrap();
+            let result = apply_materialize(doc.clone(), &compiled).unwrap();
+            assert_eq!(
+                result
+                    .unsigned_integers
+                    .iter()
+                    .find(|v| v.field == "derived")
+                    .map(|v| v.value),
+                value
+            );
+            if value.is_some() {
+                spec.columns[0].kind = crate::pb::MaterializeKind::I64 as i32;
+                let error =
+                    apply_materialize(doc.clone(), &compile_materialize_spec(&spec).unwrap())
+                        .unwrap_err();
+                assert!(error.message().contains("evaluated uint"), "{error}");
+            }
         }
     }
 }

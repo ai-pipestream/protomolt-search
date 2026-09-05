@@ -2091,6 +2091,11 @@ async fn collapse_keys(
             continue;
         };
         let key = match value {
+            crate::pb::projected_value::Value::UintValue(_) => {
+                return Err(refuse(format!(
+                    "collapse by {column:?}: uint group identities are not supported yet"
+                )));
+            }
             crate::pb::projected_value::Value::IntValue(i) => GroupKey::Integer(*i),
             crate::pb::projected_value::Value::StringValue(t) => GroupKey::Text(t.clone()),
             crate::pb::projected_value::Value::DoubleValue(_) => {

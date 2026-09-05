@@ -7,7 +7,7 @@
 //! names against its OWN dictionaries — a name this shard's tables lack
 //! is ABSENT for every document here, exactly the filter rule — and
 //! finishes the type check stock CEL's rules demand: int with int,
-//! double with double, mixed refused naming `double()`, strings joining
+//! uint with uint, double with double, mixed refused naming `double()`, strings joining
 //! no arithmetic. Evaluation is then array reads and register
 //! arithmetic per RETURNED hit; nothing is interpreted, and nothing
 //! runs per candidate.
@@ -41,6 +41,8 @@ pub trait ColumnLookup {
     fn numeric_index(&self, name: &str) -> Option<usize>;
     /// i64 column index for `name`.
     fn integer_index(&self, name: &str) -> Option<usize>;
+    /// u64 column index for `name`.
+    fn unsigned_integer_index(&self, name: &str) -> Option<usize>;
     /// Facet column index for `name`.
     fn facet_index(&self, name: &str) -> Option<usize>;
     /// Map-numeric column index for `name`.
@@ -58,11 +60,60 @@ pub trait ColumnLookup {
     fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32>;
 }
 
+/// Declared numeric families used to type-check materialization before a
+/// document arrives. Missing values do not erase a declared column's type.
+pub struct NumericTypes<'a> {
+    /// f64 column names.
+    pub numerics: &'a [String],
+    /// i64 column names.
+    pub integers: &'a [String],
+    /// u64 column names.
+    pub unsigned_integers: &'a [String],
+    /// Map-numeric column names.
+    pub map_numerics: &'a [String],
+}
+
+impl ColumnLookup for NumericTypes<'_> {
+    fn numeric_index(&self, name: &str) -> Option<usize> {
+        self.numerics.iter().position(|n| n == name)
+    }
+    fn integer_index(&self, name: &str) -> Option<usize> {
+        self.integers.iter().position(|n| n == name)
+    }
+    fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.unsigned_integers.iter().position(|n| n == name)
+    }
+    fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        self.map_numerics.iter().position(|n| n == name)
+    }
+    // Keys can be absent per document; the declared family still fixes their type.
+    fn map_numeric_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        Some(0)
+    }
+    fn facet_index(&self, _: &str) -> Option<usize> {
+        None
+    }
+    fn map_facet_index(&self, _: &str) -> Option<usize> {
+        None
+    }
+    fn map_facet_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn facet_value_ord_of(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn map_facet_value_ord_of(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+}
+
 /// Static type of a resolved value expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
     /// CEL int (i64 columns, int literals).
     Int,
+    /// CEL uint (u64 columns and unsigned literals).
+    Uint,
     /// CEL double (f64 and map-numeric columns, double literals,
     /// `double()`).
     Double,
@@ -81,6 +132,7 @@ impl ValueType {
     fn name(self) -> &'static str {
         match self {
             ValueType::Int => "int",
+            ValueType::Uint => "uint",
             ValueType::Double => "double",
             ValueType::Str => "string",
             ValueType::Bool => "bool",
@@ -128,6 +180,8 @@ pub enum ResolvedValue {
     NumCol(usize),
     /// i64 column read.
     IntCol(usize),
+    /// u64 column read.
+    UintCol(usize),
     /// Facet column read (whole-expression string).
     FacetCol(usize),
     /// Map-numeric entry read.
@@ -148,6 +202,8 @@ pub enum ResolvedValue {
     Absent,
     /// Int literal.
     ConstInt(i64),
+    /// Unsigned integer literal.
+    ConstUint(u64),
     /// Double literal.
     ConstDouble(f64),
     /// Binary arithmetic; operand types agree by construction.
@@ -220,6 +276,8 @@ pub enum ResolvedValue {
 pub enum Val {
     /// CEL int.
     Int(i64),
+    /// CEL uint, preserved without conversion.
+    Uint(u64),
     /// CEL double.
     Double(f64),
     /// A facet value ordinal in facet column `column`.
@@ -257,9 +315,11 @@ pub fn resolve(
         V::Column(name) => {
             let num = cols.numeric_index(name);
             let int = cols.integer_index(name);
+            let uint = cols.unsigned_integer_index(name);
             let facet = cols.facet_index(name);
             let families = usize::from(num.is_some())
                 + usize::from(int.is_some())
+                + usize::from(uint.is_some())
                 + usize::from(facet.is_some());
             if families > 1 {
                 return Err(refuse(format!(
@@ -271,6 +331,8 @@ pub fn resolve(
                 Ok((ResolvedValue::NumCol(ni), ValueType::Double))
             } else if let Some(ii) = int {
                 Ok((ResolvedValue::IntCol(ii), ValueType::Int))
+            } else if let Some(ui) = uint {
+                Ok((ResolvedValue::UintCol(ui), ValueType::Uint))
             } else if let Some(fi) = facet {
                 Ok((ResolvedValue::FacetCol(fi), ValueType::Str))
             } else {
@@ -314,6 +376,7 @@ pub fn resolve(
             }
         }
         V::IntLiteral(v) => Ok((ResolvedValue::ConstInt(*v), ValueType::Int)),
+        V::UintLiteral(v) => Ok((ResolvedValue::ConstUint(*v), ValueType::Uint)),
         V::FloatLiteral(v) => Ok((ResolvedValue::ConstDouble(*v), ValueType::Double)),
         V::ToDouble(inner) => {
             let (rv, vt) = resolve(inner, cols)?;
@@ -333,6 +396,7 @@ pub fn resolve(
         V::Negate(inner) => {
             let (rv, vt) = resolve(inner, cols)?;
             match vt {
+                ValueType::Uint => return Err(refuse("unary minus over a uint")),
                 ValueType::Str => return Err(refuse("unary minus over a string column")),
                 ValueType::Bool => {
                     return Err(refuse(
@@ -376,6 +440,7 @@ pub fn resolve(
             };
             let vt = match (lt, rt) {
                 (ValueType::Int, ValueType::Int) => ValueType::Int,
+                (ValueType::Uint, ValueType::Uint) => ValueType::Uint,
                 (ValueType::Double, ValueType::Double) => ValueType::Double,
                 (ValueType::Unknown, other) | (other, ValueType::Unknown) => {
                     // One side can never hold a value, so the result
@@ -385,7 +450,7 @@ pub fn resolve(
                 }
                 _ => {
                     return Err(refuse(
-                        "arithmetic mixes an int column and a double column; stock CEL \
+                        "arithmetic mixes numeric types; stock CEL \
                          does not coerce — convert explicitly with double()",
                     ));
                 }
@@ -489,7 +554,7 @@ pub fn resolve(
                     }
                     if lt != rt {
                         return Err(refuse(
-                            "a comparison mixes an int and a double; stock CEL does \
+                            "a comparison mixes numeric types; stock CEL does \
                              not coerce — convert explicitly with double()",
                         ));
                     }
@@ -534,7 +599,7 @@ pub fn resolve(
                         if let Some(k) = known {
                             if k != t {
                                 return Err(refuse(format!(
-                                    "{display} mixes int and double operands; stock CEL \
+                                    "{display} mixes numeric types; stock CEL \
                                      does not coerce — convert explicitly with double()"
                                 )));
                             }
@@ -544,7 +609,7 @@ pub fn resolve(
                 }
                 args.push(rv);
             }
-            if !type_preserving && known == Some(ValueType::Int) {
+            if !type_preserving && matches!(known, Some(ValueType::Int | ValueType::Uint)) {
                 return Err(refuse(format!(
                     "{display} takes a double; convert explicitly with double()"
                 )));
@@ -686,7 +751,7 @@ fn string_ordering(op: CmpOp) -> Status {
 }
 
 /// Integer comparison.
-fn cmp_int(op: CmpOp, a: i64, b: i64) -> bool {
+fn cmp_int<T: Ord>(op: CmpOp, a: T, b: T) -> bool {
     match op {
         CmpOp::Eq => a == b,
         CmpOp::Ne => a != b,
@@ -717,6 +782,7 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
     match rv {
         ResolvedValue::NumCol(ni) => cols.value(*ni, doc_id).map(Val::Double),
         ResolvedValue::IntCol(ii) => cols.int_value(*ii, doc_id).map(Val::Int),
+        ResolvedValue::UintCol(ui) => cols.uint_value(*ui, doc_id).map(Val::Uint),
         ResolvedValue::FacetCol(fi) => cols
             .facet_ord(*fi, doc_id)
             .map(|ord| Val::FacetOrd { column: *fi, ord }),
@@ -731,9 +797,11 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
             }),
         ResolvedValue::Absent => None,
         ResolvedValue::ConstInt(v) => Some(Val::Int(*v)),
+        ResolvedValue::ConstUint(v) => Some(Val::Uint(*v)),
         ResolvedValue::ConstDouble(v) => Some(Val::Double(*v)),
         ResolvedValue::ToDouble(inner) => match eval(inner, doc_id, cols)? {
             Val::Int(v) => Some(Val::Double(v as f64)),
+            Val::Uint(v) => Some(Val::Double(v as f64)),
             Val::Double(v) => Some(Val::Double(v)),
             Val::FacetOrd { .. } | Val::MapFacetOrd { .. } | Val::Bool(_) => {
                 unreachable!("resolution refused double() over a non-number")
@@ -741,6 +809,7 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
         },
         ResolvedValue::Negate(inner) => match eval(inner, doc_id, cols)? {
             Val::Int(v) => v.checked_neg().map(Val::Int),
+            Val::Uint(_) => unreachable!("resolution refused unary minus over a uint"),
             Val::Double(v) => Some(Val::Double(-v)),
             Val::FacetOrd { .. } | Val::MapFacetOrd { .. } | Val::Bool(_) => {
                 unreachable!("resolution refused unary minus over a non-number")
@@ -751,6 +820,7 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
             let r = eval(right, doc_id, cols)?;
             match (l, r) {
                 (Val::Int(a), Val::Int(b)) => int_arith(*op, a, b).map(Val::Int),
+                (Val::Uint(a), Val::Uint(b)) => uint_arith(*op, a, b).map(Val::Uint),
                 (Val::Double(a), Val::Double(b)) => Some(Val::Double(double_arith(*op, a, b))),
                 _ => unreachable!("resolution type-checked the operands"),
             }
@@ -761,6 +831,7 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
             let r = eval(right, doc_id, cols)?;
             let b = match (l, r) {
                 (Val::Int(a), Val::Int(b)) => cmp_int(*op, a, b),
+                (Val::Uint(a), Val::Uint(b)) => cmp_int(*op, a, b),
                 (Val::Double(a), Val::Double(b)) => cmp_double(*op, a, b),
                 (Val::Bool(a), Val::Bool(b)) => match op {
                     CmpOp::Eq => a == b,
@@ -822,6 +893,17 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
             Val::Bool(false) => eval(otherwise, doc_id, cols),
             _ => unreachable!("resolution type-checked the condition"),
         },
+    }
+}
+
+/// Checked u64 arithmetic: overflow, underflow and zero divisors yield absence.
+fn uint_arith(op: Op, a: u64, b: u64) -> Option<u64> {
+    match op {
+        Op::Add => a.checked_add(b),
+        Op::Sub => a.checked_sub(b),
+        Op::Mul => a.checked_mul(b),
+        Op::Div => a.checked_div(b),
+        Op::Mod => a.checked_rem(b),
     }
 }
 
@@ -909,11 +991,13 @@ fn eval_fn(f: pb::ValueFn, vals: &[Val]) -> Option<Val> {
     match f {
         F::Abs => match vals[0] {
             Val::Int(v) => v.checked_abs().map(Val::Int),
+            Val::Uint(v) => Some(Val::Uint(v)),
             Val::Double(v) => Some(Val::Double(v.abs())),
             _ => unreachable!("resolution typed the argument numeric"),
         },
         F::Sign => match vals[0] {
             Val::Int(v) => Some(Val::Int(v.signum())),
+            Val::Uint(v) => Some(Val::Uint(u64::from(v != 0))),
             Val::Double(v) => Some(Val::Double(if v.is_nan() {
                 v
             } else if v > 0.0 {
@@ -951,6 +1035,18 @@ fn eval_fn(f: pb::ValueFn, vals: &[Val]) -> Option<Val> {
                         }
                     }
                     Some(Val::Int(acc))
+                }
+                Val::Uint(first) => {
+                    let mut acc = first;
+                    for v in &vals[1..] {
+                        let Val::Uint(x) = v else {
+                            unreachable!("resolution typed the arguments alike")
+                        };
+                        if (greatest && *x > acc) || (!greatest && *x < acc) {
+                            acc = *x;
+                        }
+                    }
+                    Some(Val::Uint(acc))
                 }
                 Val::Double(first) => {
                     let mut acc = first;
@@ -1050,7 +1146,8 @@ pub fn column_leaves(expr: &pb::ValueExpr, out: &mut Vec<ValueLeaf>) {
                 column_leaves(part, out);
             }
         }
-        Some(V::IntLiteral(_))
+        Some(V::UintLiteral(_))
+        | Some(V::IntLiteral(_))
         | Some(V::FloatLiteral(_))
         | Some(V::BoolLiteral(_))
         | Some(V::StringLiteral(_))
@@ -1066,6 +1163,7 @@ pub fn leaf_known(leaf: &ValueLeaf, cols: &dyn ColumnLookup) -> bool {
         ValueLeaf::Column(name) => {
             cols.numeric_index(name).is_some()
                 || cols.integer_index(name).is_some()
+                || cols.unsigned_integer_index(name).is_some()
                 || cols.facet_index(name).is_some()
         }
         ValueLeaf::Map { column, key } => {
@@ -1096,8 +1194,48 @@ pub struct IngestEnv {
     pub numerics: HashMap<String, f64>,
     /// i64 values by column name.
     pub integers: HashMap<String, i64>,
+    /// u64 values by column name.
+    pub unsigned_integers: HashMap<String, u64>,
     /// Map-numeric values by (column, key).
     pub map_numerics: HashMap<(String, String), f64>,
+}
+
+// Resolution-only lookup: the returned indexes identify types, not row storage.
+// eval_ingest_inner reads the original maps by name after this type check.
+impl ColumnLookup for IngestEnv {
+    fn numeric_index(&self, name: &str) -> Option<usize> {
+        self.numerics.contains_key(name).then_some(0)
+    }
+    fn integer_index(&self, name: &str) -> Option<usize> {
+        self.integers.contains_key(name).then_some(0)
+    }
+    fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.unsigned_integers.contains_key(name).then_some(0)
+    }
+    fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        self.map_numerics
+            .keys()
+            .any(|(n, _)| n == name)
+            .then_some(0)
+    }
+    fn map_numeric_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        Some(0)
+    }
+    fn facet_index(&self, _: &str) -> Option<usize> {
+        None
+    }
+    fn map_facet_index(&self, _: &str) -> Option<usize> {
+        None
+    }
+    fn map_facet_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn facet_value_ord_of(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn map_facet_value_ord_of(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// One evaluated ingest value.
@@ -1105,6 +1243,8 @@ pub struct IngestEnv {
 pub enum IngestVal {
     /// Lands in the i64 family.
     Int(i64),
+    /// CEL uint, preserved without conversion.
+    Uint(u64),
     /// Lands in the f64 family.
     Double(f64),
     /// A comparison or logic result. Never stored: the kind check
@@ -1118,6 +1258,13 @@ pub enum IngestVal {
 /// exposes — int mixed with double, an ambiguous name — refused loudly
 /// per the loud-failure rule, never stored as a guess.
 pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<IngestVal>, Status> {
+    // Check all branches without evaluating them. A type error in an untaken
+    // branch is still an error; arithmetic absence there must not propagate.
+    resolve(expr, env)?;
+    eval_ingest_inner(expr, env)
+}
+
+fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<IngestVal>, Status> {
     use pb::value_expr::Expr as V;
     match expr
         .expr
@@ -1127,33 +1274,39 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
         V::Column(name) => {
             let num = env.numerics.get(name);
             let int = env.integers.get(name);
-            if num.is_some() && int.is_some() {
+            let uint = env.unsigned_integers.get(name);
+            if usize::from(num.is_some()) + usize::from(int.is_some()) + usize::from(uint.is_some())
+                > 1
+            {
                 return Err(refuse(format!(
-                    "materialization input {name:?} arrives as both a numeric and an \
-                     integer on this document"
+                    "materialization input {name:?} arrives in more than one numeric family on this document"
                 )));
             }
             Ok(num
                 .map(|v| IngestVal::Double(*v))
-                .or(int.map(|v| IngestVal::Int(*v))))
+                .or(int.map(|v| IngestVal::Int(*v)))
+                .or(uint.map(|v| IngestVal::Uint(*v))))
         }
         V::Map(read) => Ok(env
             .map_numerics
             .get(&(read.column.clone(), read.key.clone()))
             .map(|v| IngestVal::Double(*v))),
         V::IntLiteral(v) => Ok(Some(IngestVal::Int(*v))),
+        V::UintLiteral(v) => Ok(Some(IngestVal::Uint(*v))),
         V::FloatLiteral(v) => Ok(Some(IngestVal::Double(*v))),
-        V::ToDouble(inner) => Ok(match eval_ingest(inner, env)? {
+        V::ToDouble(inner) => Ok(match eval_ingest_inner(inner, env)? {
             None => None,
             Some(IngestVal::Int(i)) => Some(IngestVal::Double(i as f64)),
+            Some(IngestVal::Uint(i)) => Some(IngestVal::Double(i as f64)),
             Some(IngestVal::Double(d)) => Some(IngestVal::Double(d)),
             Some(IngestVal::Bool(_)) => {
                 return Err(refuse("double() over a bool; only numbers convert"));
             }
         }),
-        V::Negate(inner) => Ok(match eval_ingest(inner, env)? {
+        V::Negate(inner) => Ok(match eval_ingest_inner(inner, env)? {
             None => None,
             Some(IngestVal::Int(v)) => v.checked_neg().map(IngestVal::Int),
+            Some(IngestVal::Uint(_)) => return Err(refuse("unary minus over a uint")),
             Some(IngestVal::Double(v)) => Some(IngestVal::Double(-v)),
             Some(IngestVal::Bool(_)) => {
                 return Err(refuse(
@@ -1170,7 +1323,10 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                 .right
                 .as_ref()
                 .ok_or_else(|| refuse("arithmetic node without a right operand"))?;
-            let (l, r) = (eval_ingest(left, env)?, eval_ingest(right, env)?);
+            let (l, r) = (
+                eval_ingest_inner(left, env)?,
+                eval_ingest_inner(right, env)?,
+            );
             let op = match pb::ArithOp::try_from(arith.op) {
                 Ok(pb::ArithOp::Add) => Op::Add,
                 Ok(pb::ArithOp::Sub) => Op::Sub,
@@ -1188,6 +1344,9 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                 (Some(IngestVal::Int(a)), Some(IngestVal::Int(b))) => {
                     Ok(int_arith(op, a, b).map(IngestVal::Int))
                 }
+                (Some(IngestVal::Uint(a)), Some(IngestVal::Uint(b))) => {
+                    Ok(uint_arith(op, a, b).map(IngestVal::Uint))
+                }
                 (Some(IngestVal::Double(a)), Some(IngestVal::Double(b))) => {
                     if op == Op::Mod {
                         return Err(refuse(
@@ -1197,7 +1356,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                     Ok(Some(IngestVal::Double(double_arith(op, a, b))))
                 }
                 _ => Err(refuse(
-                    "materialization arithmetic mixes an int input and a double input \
+                    "materialization arithmetic mixes numeric types \
                      on this document; stock CEL does not coerce — convert explicitly \
                      with double()",
                 )),
@@ -1234,7 +1393,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                     })));
                 }
                 let other = if is_lit(left) { right } else { left };
-                return match eval_ingest(other, env)? {
+                return match eval_ingest_inner(other, env)? {
                     // Materialization reads no facets, so the read
                     // side is absent on every document — Kleene.
                     None => Ok(None),
@@ -1244,10 +1403,16 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                     )),
                 };
             }
-            let (l, r) = (eval_ingest(left, env)?, eval_ingest(right, env)?);
+            let (l, r) = (
+                eval_ingest_inner(left, env)?,
+                eval_ingest_inner(right, env)?,
+            );
             match (l, r) {
                 (None, _) | (_, None) => Ok(None),
                 (Some(IngestVal::Int(a)), Some(IngestVal::Int(b))) => {
+                    Ok(Some(IngestVal::Bool(cmp_int(op, a, b))))
+                }
+                (Some(IngestVal::Uint(a)), Some(IngestVal::Uint(b))) => {
                     Ok(Some(IngestVal::Bool(cmp_int(op, a, b))))
                 }
                 (Some(IngestVal::Double(a)), Some(IngestVal::Double(b))) => {
@@ -1261,8 +1426,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                     )),
                 },
                 _ => Err(refuse(
-                    "a materialization comparison mixes an int input and a double \
-                     input on this document; stock CEL does not coerce — convert \
+                    "a materialization comparison mixes numeric types on this document; stock CEL does not coerce — convert \
                      explicitly with double()",
                 )),
             }
@@ -1283,15 +1447,15 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
             let mut vals: Vec<Option<Val>> = Vec::with_capacity(func.args.len());
             let mut known: Option<ValueType> = None;
             for a in &func.args {
-                let v = match eval_ingest(a, env)? {
+                let v = match eval_ingest_inner(a, env)? {
                     None => None,
                     Some(IngestVal::Bool(_)) => {
                         return Err(refuse(format!("{display} over a bool; it takes numbers")));
                     }
                     Some(IngestVal::Int(v)) => {
-                        if known == Some(ValueType::Double) {
+                        if known.is_some_and(|t| t != ValueType::Int) {
                             return Err(refuse(format!(
-                                "{display} mixes int and double operands on this \
+                                "{display} mixes numeric types on this \
                                  document; stock CEL does not coerce — convert \
                                  explicitly with double()"
                             )));
@@ -1299,10 +1463,21 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                         known = Some(ValueType::Int);
                         Some(Val::Int(v))
                     }
-                    Some(IngestVal::Double(v)) => {
-                        if known == Some(ValueType::Int) {
+                    Some(IngestVal::Uint(v)) => {
+                        if known.is_some_and(|t| t != ValueType::Uint) {
                             return Err(refuse(format!(
-                                "{display} mixes int and double operands on this \
+                                "{display} mixes numeric types on this \
+                                 document; stock CEL does not coerce — convert \
+                                 explicitly with double()"
+                            )));
+                        }
+                        known = Some(ValueType::Uint);
+                        Some(Val::Uint(v))
+                    }
+                    Some(IngestVal::Double(v)) => {
+                        if known.is_some_and(|t| t != ValueType::Double) {
+                            return Err(refuse(format!(
+                                "{display} mixes numeric types on this \
                                  document; stock CEL does not coerce — convert \
                                  explicitly with double()"
                             )));
@@ -1313,7 +1488,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                 };
                 vals.push(v);
             }
-            if !type_preserving && known == Some(ValueType::Int) {
+            if !type_preserving && matches!(known, Some(ValueType::Int | ValueType::Uint)) {
                 return Err(refuse(format!(
                     "{display} takes a double; convert explicitly with double()"
                 )));
@@ -1323,6 +1498,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
             };
             Ok(eval_fn(f, &vals).map(|v| match v {
                 Val::Int(i) => IngestVal::Int(i),
+                Val::Uint(i) => IngestVal::Uint(i),
                 Val::Double(d) => IngestVal::Double(d),
                 Val::Bool(b) => IngestVal::Bool(b),
                 Val::FacetOrd { .. } | Val::MapFacetOrd { .. } => {
@@ -1345,7 +1521,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
             let mut absent = false;
             let mut determined = false;
             for child in &logic.children {
-                match eval_ingest(child, env)? {
+                match eval_ingest_inner(child, env)? {
                     None => absent = true,
                     Some(IngestVal::Bool(b)) => {
                         if b != and {
@@ -1369,7 +1545,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                 Some(IngestVal::Bool(and))
             })
         }
-        V::Not(inner) => Ok(match eval_ingest(inner, env)? {
+        V::Not(inner) => Ok(match eval_ingest_inner(inner, env)? {
             None => None,
             Some(IngestVal::Bool(b)) => Some(IngestVal::Bool(!b)),
             Some(_) => {
@@ -1389,10 +1565,10 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
                 .else_value
                 .as_ref()
                 .ok_or_else(|| refuse("ternary node without an else-branch"))?;
-            match eval_ingest(cond, env)? {
+            match eval_ingest_inner(cond, env)? {
                 None => Ok(None),
-                Some(IngestVal::Bool(true)) => eval_ingest(then, env),
-                Some(IngestVal::Bool(false)) => eval_ingest(otherwise, env),
+                Some(IngestVal::Bool(true)) => eval_ingest_inner(then, env),
+                Some(IngestVal::Bool(false)) => eval_ingest_inner(otherwise, env),
                 Some(_) => Err(refuse(
                     "the ternary's condition is a number; a condition is a boolean",
                 )),

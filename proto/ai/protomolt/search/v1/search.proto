@@ -6262,7 +6262,7 @@ message CompiledProjection {
 message ValueExpr {
   oneof expr {
     // Read one column by engine name. Resolves per shard to an f64,
-    // i64, facet, or map-numeric-free column; the value's type is the
+    // i64, u64, or facet column; the value's type is the
     // column's. Absent value = absent result.
     string column = 1;
 
@@ -6278,15 +6278,16 @@ message ValueExpr {
     // Binary arithmetic over two subexpressions of the SAME type.
     ValueArith arith = 5;
 
-    // CEL double(x): int to double conversion (identity on double).
+    // CEL double(x): int/uint to double conversion (identity on double).
+    // Conversion can round integers above 2^53.
     ValueExpr to_double = 6;
 
-    // Unary minus. Kept as its own node because -x and 0-x differ on
+    // Unary minus (uint operands refuse). Kept as its own node because -x and 0-x differ on
     // IEEE signed zero, and stock CEL negates.
     ValueExpr negate = 7;
 
     // One comparison, bool-typed. Numeric sides follow the arithmetic
-    // rule (int with int, double with double, mixed refused naming
+    // rule (int with int, uint with uint, double with double, mixed refused naming
     // double()); `==`/`!=` also compare a facet or map-facet read
     // against a string literal, and two bool subexpressions. String
     // and bool ORDERING refuse by name. Doubles compare IEEE: every
@@ -6321,12 +6322,15 @@ message ValueExpr {
     // math extension's semantics; the `engine.*` names are this
     // engine's own transcendentals, documented in docs/cel-values.md.
     ValueFunc func = 14;
+
+    // Unsigned integer literal (CEL uint, full u64 domain).
+    uint64 uint_literal = 15;
   }
 }
 
 // The function vocabulary. Typing per function: ABS, SIGN, GREATEST,
 // and LEAST are type-preserving over one numeric type (int with int,
-// double with double, mixed refused naming double()); the rest take
+// uint with uint, double with double, mixed refused naming double()); the rest take
 // doubles only (an int converts explicitly with double()) and return
 // a double, except the three predicates, which return bool. All
 // results are IEEE values, never errors: sqrt(-1.0) is NaN,
@@ -7083,6 +7087,9 @@ message ProjectedValue {
     // A bool result: a comparison, Kleene logic, `!`, or a bool
     // literal as the whole expression.
     bool bool_value = 4;
+
+    // A uint-typed result. Presence distinguishes zero from absence.
+    uint64 uint_value = 5;
   }
 }
 
@@ -7090,7 +7097,8 @@ message ProjectedValue {
 // stream, like the quality and geography specs.
 message MaterializeSpec {
   // Derived columns, evaluated in list order against each document's
-  // own request values (numerics, integers, map numerics). Names must
+  // own request values (numerics, integers, unsigned integers, map numerics).
+  // Outputs do not become inputs for subsequent expressions in this spec. Names must
   // not collide with each other or with columns the request itself
   // carries — a collision refuses the document, it never overwrites.
   repeated MaterializedColumn columns = 1;
@@ -7107,6 +7115,8 @@ enum MaterializeKind {
   MATERIALIZE_KIND_F64 = 1;
   // The i64 family; the expression must evaluate int-typed.
   MATERIALIZE_KIND_I64 = 2;
+  // The u64 family; the expression must evaluate uint-typed.
+  MATERIALIZE_KIND_U64 = 3;
 }
 
 // One derived column.

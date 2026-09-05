@@ -132,8 +132,9 @@ metadata remains conservative.
 
 Unsigned descriptor mappings now land on the u64 family
 ([mapping contract](descriptor-mappings.md#unsigned-numeric-mapping-2026-09-05-feature-branch)).
-Value projections, arithmetic, sorting and aggregations still require typed
-unsigned support; a uint value literal in a projection currently refuses by name.
+Typed uint projections, checked arithmetic and U64 materialized outputs are
+supported by [the value dialect](cel-values.md). Unsigned sorting, collapse and
+aggregations remain unfinished.
 `tests/unsigned_filters.rs` checks an independent IEEE integer-ratio oracle,
 fixed expected query results across heap and reopened persisted layouts,
 placement evaluation, mixed-domain fan-out proofs, and segment pruning.

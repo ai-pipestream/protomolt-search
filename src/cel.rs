@@ -1540,6 +1540,7 @@ fn parse_rfc3339_micros(s: &str) -> Result<i64, Status> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VType {
     Int,
+    Uint,
     Double,
     /// A comparison, Kleene logic, `!`, or a bool literal.
     Bool,
@@ -1551,6 +1552,7 @@ impl VType {
     fn name(self) -> &'static str {
         match self {
             VType::Int => "int",
+            VType::Uint => "uint",
             VType::Double => "double",
             VType::Bool => "bool",
             VType::Str => "string",
@@ -1620,7 +1622,7 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
             None,
         )),
         Ast::Int(v) => Ok((value_of(V::IntLiteral(int_literal(*v)?)), Some(VType::Int))),
-        Ast::Uint(_) => Err(refuse("uint value projections are not implemented")),
+        Ast::Uint(v) => Ok((value_of(V::UintLiteral(*v)), Some(VType::Uint))),
         Ast::Float(v) => {
             if !v.is_finite() {
                 return Err(refuse(format!(
@@ -1632,6 +1634,7 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
         Ast::Neg(inner) => {
             let (expr, vt) = compile_value_ast(inner, depth + 1)?;
             match vt {
+                Some(VType::Uint) => return Err(refuse("unary minus over a uint")),
                 Some(VType::Bool) => {
                     return Err(refuse(
                         "unary minus over a boolean; booleans negate with `!`",
@@ -1662,13 +1665,13 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
                              as `==`/`!=` comparison operands",
                         ));
                     }
-                    VType::Int | VType::Double => {}
+                    VType::Int | VType::Uint | VType::Double => {}
                 }
             }
             let vt = match (lt, rt) {
                 (Some(a), Some(b)) if a != b => {
                     return Err(refuse(format!(
-                        "`{}` mixes int and double operands; stock CEL does not coerce — \
+                        "`{}` mixes numeric types; stock CEL does not coerce — \
                          convert explicitly with double()",
                         op.name()
                     )));
@@ -1806,7 +1809,7 @@ fn compile_math_call(
             Some(t) => match known {
                 Some(k) if k != t => {
                     return Err(refuse(format!(
-                        "{display} mixes int and double operands; stock CEL does not \
+                        "{display} mixes numeric types; stock CEL does not \
                          coerce — convert explicitly with double()"
                     )));
                 }
@@ -1819,7 +1822,7 @@ fn compile_math_call(
     let vt = if type_preserving {
         known
     } else {
-        if known == Some(VType::Int) {
+        if matches!(known, Some(VType::Int | VType::Uint)) {
             return Err(refuse(format!(
                 "{display} takes a double; convert explicitly with double()"
             )));

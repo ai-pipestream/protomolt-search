@@ -64,7 +64,8 @@ values through `18446744073709551615`; they do not inherit the numeric i64 limit
 Their query representation remains `STRING_FACET`, so equality and sorting use
 string semantics. Unhinted unsigned fields instead use `UNSIGNED_INTEGER`
 query representation and full-domain u64 columns. Their constraints explicitly
-report the remaining value-expression, sorting and aggregation limitations.
+report typed value-expression support and the remaining sorting, collapse and
+aggregation limitations.
 
 Preservation means exact bytes in the retained original protobuf. Unknown fields
 share that rule. `PlanIndex` reports that legacy mapped ingest requires at least

@@ -1,6 +1,7 @@
 # First-class CEL values: projections and materialized columns
 
-Status: implemented (increment 1). CEL selects (`docs/cel-filters.md`)
+Status: implemented; uint values added on the unsigned feature branch
+(2026-09-05). CEL selects (`docs/cel-filters.md`)
 and function chains score (`docs/score-functions.md`); this document
 covers the third and fourth uses of the same compiler: expressions that
 PRODUCE values. Query-time **projections** compute named values per
@@ -15,20 +16,23 @@ A value expression is:
 
 - **Column reads.** A bare or dotted identifier (`price`,
   `meta.page_count` — dots are just characters in the flat column
-  namespace) reads the f64, i64, or facet column of that name. Map
+  namespace) reads the f64, i64, u64, or facet column of that name. Map
   entries read with a string-literal key: `prices["usd"]`.
 - **Literals.** Integer and double literals, with CEL's types: `7` is
-  an int, `7.0` a double. NaN and infinity do not lex.
-- **Arithmetic.** `+ - * / %` with CEL precedence, plus unary minus and
-  parentheses. `%` is integer-only, as in CEL.
-- **`double(x)`.** The one conversion: int to double (identity on
-  double). There is no `int()`, no `uint()`, no string conversion.
+  an int, `7u` a uint, `7.0` a double. Decimal and hexadecimal uint literals
+  cover zero through `18446744073709551615u`. NaN and infinity do not lex.
+- **Arithmetic.** `+ - * / %` with CEL precedence, plus parentheses and
+  unary minus for signed numbers. Unary minus refuses uint. `%` is
+  integer-only, as in CEL.
+- **`double(x)`.** The one conversion: int or uint to double (identity on
+  double). Integer values above 2^53 can lose precision during this explicit
+  conversion. There is no `int()`, no `uint()`, no string conversion.
 - **The conditional layer** (2026-08-27). Comparisons
   (`== != < <= > >=`), Kleene `&&`/`||`/`!`, bool literals, and CEL's
   ternary `cond ? a : b` — the full conditional grammar, at CEL's
   precedence (`?:` lowest and right-associative, then `||`, `&&`,
   relations, arithmetic). Comparisons follow the arithmetic typing
-  rule (int with int, double with double, mixed refused naming
+  rule (int with int, uint with uint, double with double, mixed refused naming
   `double()`); doubles compare IEEE, so every comparison with NaN is
   false except `!=`. `==`/`!=` also compare a DIRECT facet or
   map-facet read against a string literal — resolved per shard to a
@@ -51,7 +55,7 @@ A value expression is:
   `engine.log10`, `engine.pow(x, y)` — deliberately OUTSIDE `math.*`
   so the official namespace stays exactly the official extension.
   Typing is the house rule: `abs`/`sign`/`greatest`/`least` preserve
-  one agreed numeric type; everything else takes doubles only (ints
+  one agreed numeric type (int, uint or double); everything else takes doubles only (integers
   convert with `double()`). Results are IEEE values, never errors —
   `math.sqrt(-1.0)` is NaN, `engine.ln(0.0)` is -inf — with one
   integer edge: `math.abs(i64::MIN)` overflows, so it evaluates
@@ -77,7 +81,7 @@ the coordinator does not know column kinds:
   conflicts literals already pin down (`1 + 2.0`, `3.5 % 2.0`) refuse
   immediately.
 - **Resolution time** (each shard, per request): column reads take the
-  kind of the table they resolve in — i64 columns are ints, f64 and
+  kind of the table they resolve in — i64 columns are ints, u64 columns are uints, f64 and
   map-numeric columns are doubles, facet and map-facet columns are
   strings — and the remaining checks finish there. A string column
   joins no arithmetic and does not convert; a bare facet read is legal
@@ -98,8 +102,8 @@ Two places deliberately deviate from stock CEL, both pinned in
 - **Missing inputs.** Stock CEL errors on an unbound variable. The
   engine answers ABSENT: over a corpus where absence is normal, a
   per-document error would make every projection partial-failure.
-- **Integer arithmetic errors.** Stock CEL errors on i64 overflow,
-  division by zero, and the `i64::MIN` edge cases. The engine's checked
+- **Integer arithmetic errors.** Stock CEL errors on integer overflow, unsigned underflow,
+  division or remainder by zero, and the `i64::MIN` edge cases. The engine's checked
   arithmetic answers ABSENT.
 
 The conditional layer needs no third deviation, because Kleene logic
@@ -156,7 +160,7 @@ values; hits return them as `QueryHit.projected`.
 
 `AddDocumentsRequest.materialize` declares derived columns:
 `(name, expression, kind)`, kind one of `MATERIALIZE_KIND_F64` /
-`MATERIALIZE_KIND_I64` — **explicit, never inferred**, so the column's
+`MATERIALIZE_KIND_I64` / `MATERIALIZE_KIND_U64` — **explicit, never inferred**, so the column's
 family cannot drift with the data. The expression's evaluated type must
 match per document: an int result into an F64 column refuses naming
 `double(...)` as the fix.
@@ -168,7 +172,7 @@ quality and geography layers use (`docs/quality-columns.md`):
    (cached against spec equality), never per document.
 2. Per document — after the quality and geography layers, so their
    derived columns are readable inputs — each expression evaluates
-   against the document's OWN values: its `numerics`, `integers`, and
+   against the document's OWN values: its `numerics`, `integers`, `unsigned_integers`, and
    `map_numerics` by name. Facet strings are not inputs;
    materialization computes numbers.
 3. A BOOL result never stores — the refusal names the ternary
@@ -176,10 +180,11 @@ quality and geography layers use (`docs/quality-columns.md`):
    is bucketing (`year >= 1994 ? 1 : 0`) into an ordinary numeric
    column.
 4. Numeric results are pushed into the request's ordinary `numerics` /
-   `integers` lists, so name resolution, the duplicate-column refusal,
+   `integers` / `unsigned_integers` lists, so name resolution, duplicate-column refusal,
    the declared-table check, the apply, and the WAL record all take the
    one path they already took. The target name must be a declared
-   column (`--numeric-fields` / `--integer-fields`), like any other.
+   column (`--numeric-fields` / `--integer-fields` / `--unsigned-integer-fields`),
+   like any other.
 5. The spec is cleared before the WAL logs the document: the logged
    request carries the values, so **replay never evaluates twice** and
    a later spec change cannot silently rewrite history.
@@ -213,3 +218,32 @@ from a protobuf document's own mapped values with the same contract.
   argued in `docs/score-functions.md`.
 - Not interpreted: `cel-interpreter` remains a test-only oracle. The
   serving binary compiles, resolves, and runs array reads.
+
+## Unsigned value contract (2026-09-05, feature branch)
+
+`ValueExpr.uint_literal` (field 15), `ProjectedValue.uint_value` (field 5),
+and `MATERIALIZE_KIND_U64` (enum value 3) are additive. Existing field numbers
+and wire types are unchanged. An unset projected oneof means absence; a
+present `uint_value: 0` is zero. Unsigned materialized outputs use the existing
+u64 storage/WAL family and survive reopen and compaction without narrowing.
+
+The node checks materialization expressions against declared numeric families
+before storing a binding or accepting documents, including when an input is
+absent. The shared evaluator also checks the actual document's types, including
+untaken branches, before evaluation. Untaken arithmetic overflow remains local
+to that branch. Outputs must match their declared family; there is no implicit
+signed/unsigned conversion. Inputs are the original request values; expressions
+do not consume earlier outputs from the same materialization spec.
+
+The uint forms of `math.abs` and `math.sign` follow the
+[CEL math extension](https://github.com/cel-expr/cel-go/blob/master/ext/math.go).
+The engine retains its documented single-type rule for comparisons, ternaries
+and `greatest`/`least`, and requires explicit double conversion for the other
+math functions. Unsigned sorting, collapse and aggregate accumulators remain
+separate unfinished query work; they do not silently narrow a uint result.
+
+`tests/unsigned_values.rs` compares arithmetic against an independent u128
+oracle and stock CEL where CEL produces values. It covers numeric boundaries,
+wire presence, typing, branch evaluation and distributed projection reads across
+reopen and compaction. `tests/unsigned_mapping.rs` also exercises materialized
+uint outputs from descriptor-mapped ingest while preserving original source bytes.

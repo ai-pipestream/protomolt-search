@@ -74,14 +74,13 @@ including flattened paths and parent/chunk collisions. Set distinct indexing
 schema description remains available for these descriptors. Previously bound
 ambiguous plans need corrected hints and a new generation.
 
-CEL unsigned filters and presence tests are supported. Unsigned value
-projections, arithmetic, materialized outputs, sorting and aggregation remain
-unfinished and are reported as limitations in the schema report. Materialization
-that reads a declared unsigned column refuses at bind, including when the first
-document omits the value. Ordinary node ingest and shared coordinator
-materialization also reject unsigned reads rather than treating a supplied
-unsigned value as absent. Signed-only expressions still work on documents that
-carry unrelated unsigned columns. Legacy
+CEL unsigned filters, presence tests, typed projections, checked arithmetic and
+`MATERIALIZE_KIND_U64` outputs preserve the full unsigned domain. `double()` is
+an explicit, potentially lossy conversion. Materialization validates declared
+input types before documents arrive, so a uint input assigned to an I64 output
+refuses even when the input is absent. Unsigned sorting, collapse and
+aggregation remain unfinished and are reported as limitations in the schema
+report. See [the value dialect](cel-values.md). Legacy
 `IngestMapped` retains original bytes but does not publish catalog
 `DocumentIdentity` or the source-authority write receipts. The mapped lifecycle
 test verifies unsigned key values, filtering, and byte-preserving source

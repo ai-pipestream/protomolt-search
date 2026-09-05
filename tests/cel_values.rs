@@ -449,7 +449,7 @@ async fn math_functions_match_their_pinned_semantics() {
     // Resolution-time refusals name the function.
     for (expr, needle) in [
         ("math.ceil(year)", "takes a double"),
-        ("math.greatest(price, year)", "mixes int and double"),
+        ("math.greatest(price, year)", "mixes numeric types"),
         ("math.abs(court)", "takes numbers"),
     ] {
         let status = run_projections(&coordinator, vec![projection("p", expr)])
@@ -475,7 +475,7 @@ async fn projection_refusals_name_the_problem() {
     let cases: [(&str, &str); 10] = [
         ("pricee * 2.0", "no shard has column pricee"),
         ("price + year", "double()"),
-        ("price > year", "mixes an int and a double"),
+        ("price > year", "mixes numeric types"),
         ("size(court)", "size()"),
         ("price % 2.0", "integer-only"),
         ("court * 2", "arithmetic"),

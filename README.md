@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Unsigned value expressions (2026-09-05, feature branch).** Projections and
+  materialized U64 columns now retain uint values through checked arithmetic,
+  comparisons and conditional expressions. `double()` converts explicitly;
+  wrong target families refuse even when declared inputs are absent. Typed
+  results survive mapped ingest, distributed fetch, reopen and compaction.
+  Unsigned sorting, collapse and aggregation remain in progress.
+  See [CEL values](docs/cel-values.md#unsigned-value-contract-2026-09-05-feature-branch).
+
 - **Unsigned descriptor mappings (2026-09-05, feature branch).** All four
   protobuf unsigned encodings infer unsigned kinds and land in the u64 family.
   Binding checks the new fingerprint and column declarations. Planning refuses
