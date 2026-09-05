@@ -210,6 +210,47 @@ Readings.
   the next measurement, and the two comparison coordinators were
   stopped after the run to give the memory back to the nodes.
 
+### The same filters as a shard allowlist
+
+The table above sent each filter as a `FilterQuery` leaf inside a
+`BooleanQuery`, which is the membership-bitmap path. The public route
+also takes a filter as a clause of an AND `CompositeSearchStrategy`
+around one search leaf, and that shape ships the predicate tree to the
+shards, where it is an allowlist on the postings walk or the scan
+(`docs/manual/03-filters.md`, "The vector branch"). Same root :19391
+through the relay, same terms and vector, k = 10, one cold pass, later
+the same evening:
+
+| Query | :19391 relay | Shards (asked / skipped) | Segments (visited / skipped) |
+|---|---|---|---|
+| lexical "grandfathered status", `court == "scotus"` | 369 ms | 7 / 0 | 322 / 0 |
+| lexical "firearm drugs payment", `year >= 2024` | 68 ms | 7 / 0 | 322 / 236 |
+| lexical "qualified immunity", `year >= 2018` | 16 ms | 7 / 0 | 322 / 165 |
+| lexical "qualified immunity", `year >= 2015` | 15 ms | 7 / 0 | 322 / 132 |
+| lexical "qualified immunity", `year < 2015` | 66 ms | 7 / 1 (recent leaf) | 132 / 0 |
+| dense row 7, `court == "scotus"` | 555 ms | 7 / 0 | scan |
+| dense row 7, `year >= 2024` | 537 ms | 7 / 0 | scan |
+| dense row 7, `year >= 2018` | 735 ms | 7 / 0 | scan |
+| dense row 7, `year < 2015` | 258 ms | 7 / 1 (recent leaf) | scan |
+
+The relay forwards this shape (the filter rides inside `Bm25Query` and
+the packed stream), so the root answers it; `year < 2015` prunes the
+relay's leaf at the root and asks six shards. Row 7 comes back first at
+1.000 under `year < 2015`, as it should, since it sits in the archive.
+The boolean-route hits were not kept by id in that run and the direct
+roots are stopped, so the two shapes were not compared at this scale;
+`tests/query_api.rs` and `tests/boolean_masked.rs` pin their agreement
+on small corpora.
+
+Filtered search over 86.6M rows is therefore a millisecond operation
+on the public route. The boolean route's cost is not the filter, it is
+the coordinator materializing a filter leaf's membership as an id set,
+which at 66M rows is the 50 GB above. That is the design item: a filter
+leaf under MUST should reach its sibling clauses as a shard allowlist,
+and boolean set algebra between search clauses should stay on the shard
+that holds the bitmaps, with the coordinator merging ranked candidates
+only.
+
 
 ## What remains
 
@@ -223,12 +264,14 @@ Readings.
 - A partitioned compaction per shard: the segments sealed in ingest
   order, so the year summaries overlap and segment pruning has little to
   skip inside a leaf (`docs/segment-pruning.md`).
-- The filtered boolean path on this binary is slow at 86M rows: the
-  match set travels as a bitmap and becomes a coordinator id set per
-  query (35-75 s for a year range over tens of millions of rows, 1 s for
-  a court filter). Main after the dense-mask merge (49ea0f6) changes the
-  candidate scoring; the coordinator-side set arithmetic is the next
-  measurement.
+- The boolean route with a filter leaf is slow at 86M rows and can
+  take the coordinator down: the filter's match set becomes a
+  coordinator id set per query (35-75 s for a year range over tens of
+  millions of rows, 1 s for a court filter, 50 GB and an OOM kill for
+  66M rows), while the same filter as an AND-composite clause costs
+  15-735 ms through the relay (section above). The planner should push
+  a MUST filter leaf down as the sibling clauses' allowlist and keep
+  set algebra between search clauses on the shards.
 - Placement pruning only excludes a leaf whose own predicate
   contradicts the filter: `year < 2015` skips the recent leaf, but
   `year >= 2015` does not skip the archive, because the archive is the
