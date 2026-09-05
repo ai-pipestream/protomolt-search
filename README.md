@@ -34,6 +34,9 @@ desktop. Its coordinator reaches shards through an in-process link
 no HTTP/2, hyper, or Tokio networking — a `cargo tree` gate in its tests
 keeps it that way. See
 [Embedded and mobile Protomolt Search](docs/embedded-mobile.md).
+The proposed [device-shard contract](docs/device-shards.md) describes shared
+searches with indexes retained on iOS and Android phones and the remaining
+transport, embedding, and availability work.
 
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
 uses TurboVec's current `.tv` persistence format. Provider images are opaque to

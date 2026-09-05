@@ -24,7 +24,8 @@ type QueryReceiver =
 
 struct OpenStream {
     owner: u64,
-    receiver: QueryReceiver,
+    receiver: Option<QueryReceiver>,
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 struct Registry {
@@ -350,12 +351,18 @@ fn query_stream_open_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
         let search = search(handle)?;
         let receiver = runtime()?.block_on(search.query_stream(request))?;
         let mut registry = lock_registry()?;
+        if !registry.searches.contains_key(&handle) {
+            return Err(BridgeError::not_found(format!(
+                "unknown search handle {handle}"
+            )));
+        }
         let stream_handle = registry.allocate()?;
         registry.streams.insert(
             stream_handle,
             OpenStream {
                 owner: handle,
-                receiver,
+                receiver: Some(receiver),
+                cancel: tokio::sync::watch::channel(false).0,
             },
         );
         Ok(success(&MobileQueryStreamOpenResponse { stream_handle }))
@@ -364,32 +371,61 @@ fn query_stream_open_bytes(handle: u64, input: &[u8]) -> Vec<u8> {
 
 fn query_stream_next_bytes(stream_handle: u64) -> Vec<u8> {
     response(|| {
-        let mut open = lock_registry()?
-            .streams
-            .remove(&stream_handle)
-            .ok_or_else(|| {
+        let (mut receiver, mut cancel) = {
+            let mut registry = lock_registry()?;
+            let open = registry.streams.get_mut(&stream_handle).ok_or_else(|| {
                 BridgeError::not_found(format!("unknown stream handle {stream_handle}"))
             })?;
-        match runtime()?.block_on(open.receiver.next()) {
+            let receiver = open.receiver.take().ok_or_else(|| BridgeError {
+                code: MobileErrorCode::FailedPrecondition,
+                message: "a read is already pending on this stream".into(),
+            })?;
+            (receiver, open.cancel.subscribe())
+        };
+        let item = runtime()?.block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => None,
+                item = receiver.next() => Some(item),
+            }
+        });
+        let mut registry = lock_registry()?;
+        if !registry.streams.contains_key(&stream_handle) || item.is_none() {
+            return Err(BridgeError {
+                code: MobileErrorCode::Cancelled,
+                message: "mobile query stream closed".into(),
+            });
+        }
+        match item.unwrap() {
             Some(Ok(item)) => {
-                lock_registry()?.streams.insert(stream_handle, open);
+                registry.streams.get_mut(&stream_handle).unwrap().receiver = Some(receiver);
                 Ok(success(&MobileQueryStreamNextResponse {
                     response: Some(item),
                     end: false,
                 }))
             }
-            Some(Err(status)) => Err(status.into()),
-            None => Ok(success(&MobileQueryStreamNextResponse {
-                response: None,
-                end: true,
-            })),
+            Some(Err(status)) => {
+                registry.streams.remove(&stream_handle);
+                Err(status.into())
+            }
+            None => {
+                registry.streams.remove(&stream_handle);
+                Ok(success(&MobileQueryStreamNextResponse {
+                    response: None,
+                    end: true,
+                }))
+            }
         }
     })
 }
 
 fn query_stream_close_bytes(stream_handle: u64) -> Vec<u8> {
     response(|| {
-        let closed = lock_registry()?.streams.remove(&stream_handle).is_some();
+        let stream = lock_registry()?.streams.remove(&stream_handle);
+        let closed = stream.is_some();
+        if let Some(stream) = stream {
+            let _ = stream.cancel.send(true);
+        }
         Ok(success(&MobileCloseResponse { closed }))
     })
 }
@@ -406,7 +442,14 @@ fn close_bytes(handle: u64) -> Vec<u8> {
     response(|| {
         let mut registry = lock_registry()?;
         let closed = registry.searches.remove(&handle).is_some();
-        registry.streams.retain(|_, stream| stream.owner != handle);
+        registry.streams.retain(|_, stream| {
+            if stream.owner == handle {
+                let _ = stream.cancel.send(true);
+                false
+            } else {
+                true
+            }
+        });
         Ok(success(&MobileCloseResponse { closed }))
     })
 }
@@ -772,6 +815,101 @@ mod tests {
             .expect("read test index tree")
             .map(|entry| tree_bytes(&entry.expect("test index entry").path()))
             .sum()
+    }
+
+    fn blocked_read_is_cancelled(close_owner: bool) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let receiver = runtime()
+            .unwrap()
+            .block_on(pipestream_search::metrics::timed_stream(
+                pipestream_search::metrics::Route::QueryStream,
+                tonic::Request::new(()),
+                |_| async { Ok(tonic::Response::new(ReceiverStream::new(receiver))) },
+            ))
+            .unwrap()
+            .into_inner();
+        let opened: MobileOpenResponse = payload(&open_bytes(
+            &MobileOpenRequest {
+                shards: vec![MobileShardConfig {
+                    in_memory: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            false,
+        ));
+        let owner = opened.handle;
+        let stream_handle = {
+            let mut registry = lock_registry().unwrap();
+            let stream_handle = registry.allocate().unwrap();
+            registry.streams.insert(
+                stream_handle,
+                OpenStream {
+                    owner,
+                    receiver: Some(receiver),
+                    cancel: tokio::sync::watch::channel(false).0,
+                },
+            );
+            stream_handle
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            done_tx
+                .send(query_stream_next_bytes(stream_handle))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if lock_registry().unwrap().streams[&stream_handle]
+                .receiver
+                .is_none()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "reader did not start");
+            std::thread::yield_now();
+        }
+        let mobile_response::Outcome::Error(error) =
+            outcome(&query_stream_next_bytes(stream_handle))
+        else {
+            panic!("concurrent read unexpectedly succeeded");
+        };
+        assert_eq!(error.code(), MobileErrorCode::FailedPrecondition);
+        if close_owner {
+            let closed: MobileCloseResponse = payload(&close_bytes(owner));
+            assert!(closed.closed);
+        } else {
+            let closed: MobileCloseResponse = payload(&query_stream_close_bytes(stream_handle));
+            assert!(closed.closed);
+        }
+        let bytes = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("close must wake a blocked read");
+        reader.join().unwrap();
+        let mobile_response::Outcome::Error(error) = outcome(&bytes) else {
+            panic!("closed read unexpectedly succeeded");
+        };
+        assert_eq!(error.code(), MobileErrorCode::Cancelled);
+        assert!(!lock_registry()
+            .unwrap()
+            .streams
+            .contains_key(&stream_handle));
+        assert!(sender.is_closed(), "close must drop the query receiver");
+        let closed: MobileCloseResponse = payload(&query_stream_close_bytes(stream_handle));
+        assert!(!closed.closed);
+        let owner_closed: MobileCloseResponse = payload(&close_bytes(owner));
+        assert_eq!(owner_closed.closed, !close_owner);
+    }
+
+    #[test]
+    fn closing_stream_wakes_pending_read_without_restoring_handle() {
+        blocked_read_is_cancelled(false);
+    }
+
+    #[test]
+    fn closing_owner_wakes_pending_read_without_restoring_handle() {
+        blocked_read_is_cancelled(true);
     }
 
     #[test]

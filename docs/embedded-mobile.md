@@ -30,6 +30,11 @@ server stream comes back as the handler's own receiver. So the embedded
 runtime maintains no second ranking or schema implementation, and it links
 no HTTP/2 to get there.
 
+For opt-in shared searches over shards that remain on iOS and Android devices,
+see the proposed [device-shard integration contract](device-shards.md).
+The current package implements private local search; the collaboration transport
+is not implemented.
+
 ## Contract
 
 The runtime exposes all public search routes:
@@ -276,3 +281,11 @@ bill of health; cargo-audit does not classify them as vulnerabilities.
 - delete/replace state and rankings survive flush/reopen;
 - create refuses existing private data;
 - remote analysis configuration is rejected before startup.
+
+### Concurrent stream lifecycle
+
+A stream permits one pending `next` call. A second concurrent read returns
+`FAILED_PRECONDITION`. Closing a stream or its owning runtime wakes a pending
+read with `CANCELLED` and releases its receiver. Calls using an already removed
+handle return `NOT_FOUND`; repeated stream close reports `closed=false`. Run
+blocking byte-ABI calls off the application UI thread.
