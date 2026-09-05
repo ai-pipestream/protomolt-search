@@ -395,6 +395,10 @@ pub struct PrincipalConfig {
     /// Documents per second through routed ingest, as a token bucket
     /// with one second of burst; 0 means unlimited.
     pub ingest_docs_per_sec: u32,
+    /// May call the diagnostics service (`docs/diagnostics.md`): read
+    /// and set runtime knobs, read metrics, layouts, and recent
+    /// queries. Off by default.
+    pub admin: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -409,6 +413,7 @@ pub struct Principal {
     pub name: String,
     pub max_k: u32,
     pub concurrency: u32,
+    pub admin: bool,
     in_flight: AtomicU64,
     ingest: Option<Mutex<TokenBucket>>,
 }
@@ -419,6 +424,7 @@ impl Principal {
             name: config.name.clone(),
             max_k: config.max_k,
             concurrency: config.concurrency,
+            admin: config.admin,
             in_flight: AtomicU64::new(0),
             ingest: (config.ingest_docs_per_sec > 0)
                 .then(|| Mutex::new(TokenBucket::new(f64::from(config.ingest_docs_per_sec)))),
@@ -897,6 +903,7 @@ mod tests {
                 max_k: 50,
                 concurrency: 1,
                 ingest_docs_per_sec: 2,
+                admin: false,
             },
             PrincipalConfig {
                 name: "batch".into(),

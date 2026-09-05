@@ -101,12 +101,19 @@ pub enum Route {
     ReconcileCluster,
     GetClusterPlan,
     RollbackCluster,
+    // Diagnostics (docs/diagnostics.md), on both nodes and coordinators.
+    GetRuntimeKnobs,
+    SetRuntimeKnob,
+    GetMetricsSnapshot,
+    StreamMetrics,
+    GetShardDiagnostics,
+    RecentQueries,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 56] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 62] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -171,6 +178,12 @@ const REQUEST_ROUTES: [(Route, &str, bool); 56] = [
     (Route::ReconcileCluster, "reconcile_cluster", false),
     (Route::GetClusterPlan, "get_cluster_plan", false),
     (Route::RollbackCluster, "rollback_cluster", false),
+    (Route::GetRuntimeKnobs, "get_runtime_knobs", false),
+    (Route::SetRuntimeKnob, "set_runtime_knob", false),
+    (Route::GetMetricsSnapshot, "get_metrics_snapshot", false),
+    (Route::StreamMetrics, "stream_metrics", true),
+    (Route::GetShardDiagnostics, "get_shard_diagnostics", false),
+    (Route::RecentQueries, "recent_queries", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();
@@ -776,6 +789,148 @@ pub fn render(gauges: &[GaugeProvider]) -> String {
 /// listeners, `docs/security.md`, not this one): bind the listener to
 /// a trusted interface.
 #[cfg(feature = "net")]
+/// The registry as values (`docs/diagnostics.md`): the same counters,
+/// gauges, and histograms [`render`] prints, in the same order, with the
+/// same names and labels, so a dashboard and a scraper never disagree.
+pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSnapshot {
+    use crate::pb::{
+        HistogramBucketSample, HistogramSample, MetricKind, MetricLabel, MetricSample,
+    };
+    fn label(name: &str, value: &str) -> MetricLabel {
+        MetricLabel {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+    fn counter(name: &str, labels: Vec<MetricLabel>, value: u64) -> MetricSample {
+        MetricSample {
+            name: name.to_string(),
+            labels,
+            kind: MetricKind::Counter as i32,
+            value: value as f64,
+        }
+    }
+    fn gauge(name: &str, labels: Vec<MetricLabel>, value: u64) -> MetricSample {
+        MetricSample {
+            name: name.to_string(),
+            labels,
+            kind: MetricKind::Gauge as i32,
+            value: value as f64,
+        }
+    }
+    fn histogram(labels: Vec<MetricLabel>, h: &Histogram) -> HistogramSample {
+        let mut cumulative = 0u64;
+        let mut buckets = Vec::with_capacity(BUCKETS.len());
+        for (i, (_, le)) in BUCKETS.iter().enumerate() {
+            cumulative += h.buckets[i].load(Ordering::Relaxed);
+            buckets.push(HistogramBucketSample {
+                le: if *le == u64::MAX {
+                    f64::INFINITY
+                } else {
+                    *le as f64 / 1e9
+                },
+                cumulative_count: cumulative,
+            });
+        }
+        HistogramSample {
+            name: DURATION.to_string(),
+            labels,
+            buckets,
+            sum: h.sum_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            count: cumulative,
+        }
+    }
+
+    let mut samples = Vec::new();
+    let mut histograms = Vec::new();
+    for (i, (_, name, _)) in REQUEST_ROUTES.iter().enumerate() {
+        samples.push(counter(
+            "turbovec_requests_total",
+            vec![label("rpc", name)],
+            REQUESTS[i].load(Ordering::Relaxed),
+        ));
+    }
+    for (i, (_, name, _)) in REQUEST_ROUTES.iter().enumerate() {
+        samples.push(gauge(
+            "turbovec_requests_in_flight",
+            vec![label("rpc", name)],
+            IN_FLIGHT[i].load(Ordering::Relaxed),
+        ));
+    }
+    for (i, (_, name, streaming)) in REQUEST_ROUTES.iter().enumerate() {
+        if *streaming {
+            histograms.push(histogram(
+                vec![label("rpc", name), label("phase", "first_response")],
+                &FIRST_RESPONSE[i],
+            ));
+            histograms.push(histogram(
+                vec![label("rpc", name), label("phase", "complete")],
+                &COMPLETE[i],
+            ));
+        } else {
+            histograms.push(histogram(vec![label("rpc", name)], &COMPLETE[i]));
+        }
+    }
+    for (i, (_, name, _)) in REQUEST_ROUTES.iter().enumerate() {
+        for (c, code) in ERROR_CODES.iter().enumerate() {
+            samples.push(counter(
+                "turbovec_request_errors_total",
+                vec![label("rpc", name), label("code", code)],
+                ERRORS[i][c].load(Ordering::Relaxed),
+            ));
+        }
+    }
+    for (name, atomic) in [
+        ("turbovec_scan_chunk_calls_total", &SCAN_CHUNK_CALLS),
+        ("turbovec_scan_candidates_total", &SCAN_CANDIDATES),
+        ("turbovec_scan_floors_offered_total", &SCAN_FLOORS_OFFERED),
+        (
+            "turbovec_scan_floors_published_total",
+            &SCAN_FLOORS_PUBLISHED,
+        ),
+        (
+            "turbovec_scan_floor_updates_applied_total",
+            &SCAN_FLOOR_UPDATES_APPLIED,
+        ),
+        ("turbovec_documents_added_total", &DOCUMENTS_ADDED),
+        ("turbovec_vectors_added_total", &VECTORS_ADDED),
+    ] {
+        samples.push(counter(name, Vec::new(), atomic.load(Ordering::Relaxed)));
+    }
+    let (batches, jobs) = crate::node::scan_batch_counters();
+    samples.push(counter("turbovec_scan_batches_total", Vec::new(), batches));
+    samples.push(counter(
+        "turbovec_scan_batched_jobs_total",
+        Vec::new(),
+        jobs,
+    ));
+    if !gauges.is_empty() {
+        let shards: Vec<ShardGauges> = gauges.iter().map(|g| g()).collect();
+        for (name, read) in [
+            (
+                "turbovec_shard_vectors",
+                (|s| s.vectors) as fn(&ShardGauges) -> u64,
+            ),
+            ("turbovec_shard_documents", |s| s.documents),
+            ("turbovec_shard_stats_epoch", |s| s.stats_epoch),
+        ] {
+            for shard in &shards {
+                samples.push(gauge(
+                    name,
+                    vec![label("slot_offset", &shard.slot_offset.to_string())],
+                    read(shard),
+                ));
+            }
+        }
+    }
+    crate::pb::MetricsSnapshot {
+        unix_ms: crate::diagnostics::unix_ms(),
+        process: process.to_string(),
+        samples,
+        histograms,
+    }
+}
+
 pub async fn serve(listener: tokio::net::TcpListener, gauges: Vec<GaugeProvider>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let gauges = std::sync::Arc::new(gauges);

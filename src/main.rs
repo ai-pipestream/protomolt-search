@@ -286,11 +286,13 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             let max = cfg.max_message_bytes;
             let mut shutdown = shutdown_rx.clone();
+            let diagnostics = node.diagnostics_server(max);
             handles.push(tokio::spawn(
                 secured_server(cfg.tls.as_ref(), true)?
                     .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                     .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                     .add_service(NodeServiceImpl::into_server(node, max))
+                    .add_service(diagnostics)
                     .serve_with_incoming_shutdown(
                         harness::nodelay_incoming(listener),
                         async move {
@@ -436,12 +438,21 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             build_collections(&cfg, &phrase_index, &shutdown_rx, &mut handles, addr).await?;
         let max = cfg.max_message_bytes;
         let mut shutdown = shutdown_rx.clone();
+        let gauges: Vec<pipestream_search::metrics::GaugeProvider> = node_services
+            .iter()
+            .map(|node| node.metrics_provider())
+            .collect();
+        let diagnostics = search_set
+            .diagnostics()
+            .with_gauges(gauges)
+            .into_server(max);
         handles.push(tokio::spawn(
             secured_server(cfg.tls.as_ref(), false)?
                 .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                 .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
                 .add_optional_service(control_set.map(|set| set.into_server(max)))
                 .add_service(search_set.into_server(max))
+                .add_service(diagnostics)
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;
                 }),

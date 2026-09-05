@@ -96,6 +96,102 @@ fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, St
         .transpose()
 }
 
+/// A node's runtime knobs from its config (docs/diagnostics.md): the
+/// live ones as atomics, the rest listed as read-at-startup.
+fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
+    use crate::diagnostics::{FixedKnob, Knobs, NodeKnobValues};
+    use crate::pb::KnobKind;
+    let process = format!("node:{}", config.slot_offset);
+    let fixed = vec![
+        FixedKnob {
+            name: "chunk_blocks",
+            kind: KnobKind::Int,
+            value: config.chunk_blocks.to_string(),
+            description: "SIMD blocks per scan chunk (--chunk-blocks).",
+        },
+        FixedKnob {
+            name: "block_max",
+            kind: KnobKind::Bool,
+            value: config.block_max.to_string(),
+            description: "Block-max pruning on the lexical leg (--block-max).",
+        },
+        FixedKnob {
+            name: "coalesce",
+            kind: KnobKind::Bool,
+            value: config.coalesce.to_string(),
+            description: "Coalesce concurrent scans into one pass (--coalesce).",
+        },
+        FixedKnob {
+            name: "scan_parallel",
+            kind: KnobKind::Int,
+            value: config.scan_parallel.to_string(),
+            description: "Scan slots (--scan-parallel).",
+        },
+        FixedKnob {
+            name: "rerank_parallel",
+            kind: KnobKind::Int,
+            value: config.rerank_parallel.to_string(),
+            description: "Exact rerank slots (--rerank-parallel).",
+        },
+        FixedKnob {
+            name: "layout",
+            kind: KnobKind::String,
+            value: match config.layout {
+                Layout::Segments => "segments".to_string(),
+                Layout::SingleImage => "single-image".to_string(),
+            },
+            description: "On-disk layout of a new persisted shard (--layout).",
+        },
+        FixedKnob {
+            name: "vector_mmap",
+            kind: KnobKind::Bool,
+            value: config.vector_mmap.to_string(),
+            description: "Serve sealed vector images through a memory map (--vector-mmap).",
+        },
+        FixedKnob {
+            name: "seal_tail_docs",
+            kind: KnobKind::Int,
+            value: config.seal_tail_docs.to_string(),
+            description: "Rows that seal the tail into a segment (--seal-tail-docs).",
+        },
+        FixedKnob {
+            name: "bit_width",
+            kind: KnobKind::Int,
+            value: config.bit_width.to_string(),
+            description: "Quantized bits per dimension (--bit-width).",
+        },
+        FixedKnob {
+            name: "slot_offset",
+            kind: KnobKind::Int,
+            value: config.slot_offset.to_string(),
+            description: "First global id of this shard.",
+        },
+        FixedKnob {
+            name: "collection",
+            kind: KnobKind::String,
+            value: config.collection.clone(),
+            description: "The collection this shard belongs to.",
+        },
+        FixedKnob {
+            name: "vector_backend",
+            kind: KnobKind::String,
+            value: config.vector_backend.clone(),
+            description: "The vector backend the shard was built with.",
+        },
+    ];
+    Knobs::node(
+        process,
+        NodeKnobValues {
+            share_floors: config.share_floors,
+            segment_pruning: config.segment_pruning,
+            floor_delta: config.floor_delta,
+            floor_warmup_chunks: config.floor_warmup_chunks,
+            floor_min_interval_ms: config.floor_min_interval_ms,
+        },
+        fixed,
+    )
+}
+
 fn resolved_rerank_parallel(configured: usize) -> usize {
     if configured == 0 {
         std::thread::available_parallelism()
@@ -3595,6 +3691,8 @@ pub struct NodeServiceImpl {
     /// keeps serving queries.
     ingest_fence: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) config: NodeConfig,
+    /// Runtime knobs read at request time (docs/diagnostics.md).
+    knobs: Arc<crate::diagnostics::Knobs>,
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
     scan_jobs: Arc<std::sync::OnceLock<mpsc::Sender<ScanJob>>>,
@@ -3825,7 +3923,7 @@ struct ScanJob {
 async fn scan_scheduler(
     state: Arc<std::sync::RwLock<ShardState>>,
     chunk_blocks: usize,
-    segment_pruning: bool,
+    knobs: Arc<crate::diagnostics::Knobs>,
     parallel: usize,
     mut jobs: mpsc::Receiver<ScanJob>,
 ) {
@@ -3851,6 +3949,7 @@ async fn scan_scheduler(
         SCAN_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SCAN_BATCHED_JOBS.fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let state = state.clone();
+        let segment_pruning = knobs.segment_pruning();
         tokio::task::spawn_blocking(move || {
             let _slot = permit;
             run_scan_batch(&state, chunk_blocks, segment_pruning, batch);
@@ -4128,7 +4227,9 @@ impl NodeServiceImpl {
         let wal = open_wal(index.as_ref(), &config);
         let vocab = open_vocab(&config);
         let rerank_parallel = resolved_rerank_parallel(config.rerank_parallel);
+        let knobs = Arc::new(node_knobs(&config));
         Self {
+            knobs,
             state: Arc::new(RwLock::new(ShardState {
                 index,
                 exact_vectors: None,
@@ -4247,7 +4348,7 @@ impl NodeServiceImpl {
                 tokio::spawn(scan_scheduler(
                     self.state.clone(),
                     self.config.chunk_blocks,
-                    self.config.segment_pruning,
+                    Arc::clone(&self.knobs),
                     parallel,
                     rx,
                 ));
@@ -4475,6 +4576,117 @@ impl NodeServiceImpl {
     /// A metrics gauge sampler over this shard's live state
     /// (`docs/metrics.md`): called at scrape time, reads under the
     /// state lock, and so can never go stale.
+    /// The knobs this node reads at request time (docs/diagnostics.md).
+    pub fn knobs(&self) -> &Arc<crate::diagnostics::Knobs> {
+        &self.knobs
+    }
+
+    /// The diagnostics service over this node, for the same listener
+    /// as its `NodeService`.
+    pub fn diagnostics_server(
+        &self,
+        max_message_bytes: usize,
+    ) -> crate::pb::diagnostics_service_server::DiagnosticsServiceServer<
+        crate::diagnostics::NodeDiagnostics,
+    > {
+        crate::diagnostics::NodeDiagnostics::new(self.clone()).into_server(max_message_bytes)
+    }
+
+    /// This shard's layout for `GetShardDiagnostics`
+    /// (docs/diagnostics.md): the catalog's sealed segments with their
+    /// summaries, the tail, rows, tombstones, and the live knob values.
+    pub fn shard_diagnostics(
+        &self,
+        shard: u32,
+        address: String,
+    ) -> crate::pb::ShardLayoutDiagnostics {
+        use crate::pb::{SegmentColumnRange, SegmentDiagnostics, ShardLayoutDiagnostics};
+        let guard = self.state.read().expect("shard state lock poisoned");
+        let vector_rows = guard.index.as_ref().map_or(0, |i| i.len() as u64);
+        let doc_rows = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
+        let rows = vector_rows.max(doc_rows);
+        let tombstones = guard.live_docs.deleted_count();
+        let scoring_fingerprint = guard
+            .index
+            .as_ref()
+            .map(|i| i.descriptor().scoring_fingerprint)
+            .unwrap_or_default();
+        let mut out = ShardLayoutDiagnostics {
+            shard,
+            address,
+            layout: match guard.bm25.as_ref() {
+                Some(Bm25Shard::Segmented(_)) => "segments".to_string(),
+                Some(_) => "single-image".to_string(),
+                None => match self.config.layout {
+                    Layout::Segments => "segments".to_string(),
+                    Layout::SingleImage => "single-image".to_string(),
+                },
+            },
+            rows,
+            live_rows: rows.saturating_sub(tombstones),
+            tombstones,
+            scoring_fingerprint,
+            segment_pruning: self.knobs.segment_pruning(),
+            floor_sharing: self.knobs.share_floors(),
+            ..Default::default()
+        };
+        if let Some(Bm25Shard::Segmented(segmented)) = guard.bm25.as_ref() {
+            let set = segmented.snapshot();
+            out.catalog_epoch = set.epoch();
+            out.partition_key = set.manifest().partition_key.clone().unwrap_or_default();
+            out.tail_rows = u64::from(
+                segmented
+                    .next_doc_id()
+                    .saturating_sub(segmented.tail_base()),
+            );
+            for i in 0..set.len() {
+                let meta = set.metadata(i);
+                let mut columns = Vec::new();
+                let mut partition = None;
+                if let Some(summary) = meta.summary.as_ref() {
+                    for c in &summary.int_columns {
+                        columns.push(SegmentColumnRange {
+                            column: c.name.clone(),
+                            lo: c.min,
+                            hi: c.max,
+                            present: c.present,
+                            ..Default::default()
+                        });
+                    }
+                    for c in &summary.numeric_columns {
+                        columns.push(SegmentColumnRange {
+                            column: c.name.clone(),
+                            lo_f: c.min,
+                            hi_f: c.max,
+                            present: c.present,
+                            floating: true,
+                            ..Default::default()
+                        });
+                    }
+                    partition = summary.partition.as_ref().map(|p| SegmentColumnRange {
+                        column: p.column.clone(),
+                        lo: p.lo,
+                        hi: p.hi,
+                        present: meta.live_rows,
+                        ..Default::default()
+                    });
+                }
+                out.segments.push(SegmentDiagnostics {
+                    segment_id: meta.segment_id.clone(),
+                    generation: meta.generation,
+                    base: meta.base_label,
+                    rows: meta.rows,
+                    live_rows: meta.live_rows,
+                    has_summary: meta.summary.is_some(),
+                    columns,
+                    partition,
+                    mapped: set.vector(i).is_some_and(|v| v.is_mapped()),
+                });
+            }
+        }
+        out
+    }
+
     pub fn metrics_provider(&self) -> crate::metrics::GaugeProvider {
         let state = Arc::clone(&self.state);
         let slot_offset = self.config.slot_offset;
@@ -6370,7 +6582,7 @@ impl NodeServiceImpl {
                 // leg's walk (docs/segment-pruning.md): the views the
                 // scorers, the facet counts, and the phrase gates take
                 // are rebuilt over the admitted parts.
-                let prune = prune_segments(store, pred.as_ref(), self.config.segment_pruning);
+                let prune = prune_segments(store, pred.as_ref(), self.knobs.segment_pruning());
                 fused_prune = prune.stats;
                 if let Some(mask) = prune.mask.as_ref() {
                     views = leg_of_view
@@ -6729,7 +6941,7 @@ impl NodeServiceImpl {
             filters.geo,
             &filters.regions,
             filters.tree,
-            self.config.segment_pruning,
+            self.knobs.segment_pruning(),
         )?;
 
         let mut vector_leg: Vec<(u64, f64)> = Vec::new();
@@ -9327,6 +9539,7 @@ impl NodeService for NodeServiceImpl {
             let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
             let state = self.state.clone();
             let config = self.config.clone();
+            let knobs = Arc::clone(&self.knobs);
             let scan_queue = config.coalesce.then(|| self.scan_queue());
 
             tokio::spawn(async move {
@@ -9395,9 +9608,9 @@ impl NodeService for NodeServiceImpl {
                     }
                 });
 
-                let share = config.share_floors;
-                let segment_pruning = config.segment_pruning;
-                let floor_delta = config.floor_delta;
+                let share = knobs.share_floors();
+                let segment_pruning = knobs.segment_pruning();
+                let floor_delta = knobs.floor_delta();
                 let chunk_blocks = config.chunk_blocks;
                 let slot_offset = config.slot_offset;
                 let scan_tx = tx.clone();
@@ -9406,9 +9619,10 @@ impl NodeService for NodeServiceImpl {
                 // disposable (they are monotone, so the next chunk's publish
                 // supersedes any dropped one). The terminal Done is sent
                 // with `.await` below and cannot be dropped.
-                let warmup = config.floor_warmup_chunks;
-                let min_interval = (config.floor_min_interval_ms > 0)
-                    .then(|| std::time::Duration::from_millis(config.floor_min_interval_ms));
+                let warmup = knobs.floor_warmup_chunks();
+                let floor_min_interval_ms = knobs.floor_min_interval_ms();
+                let min_interval = (floor_min_interval_ms > 0)
+                    .then(|| std::time::Duration::from_millis(floor_min_interval_ms));
                 let mut last_published = f32::NEG_INFINITY;
                 let mut offers = 0u32;
                 let mut last_at: Option<std::time::Instant> = None;
@@ -9799,8 +10013,11 @@ impl NodeService for NodeServiceImpl {
                 phrase: Vec::new(),
             };
             let cols = ShardNumericRead(store);
-            let prune =
-                prune_segments(store, doc_filter.pred.as_ref(), self.config.segment_pruning);
+            let prune = prune_segments(
+                store,
+                doc_filter.pred.as_ref(),
+                self.knobs.segment_pruning(),
+            );
             if !req.sort.is_empty() {
                 // Column-ordered browse: walk the FULL admitted set with a
                 // k-bounded heap. Exhaustive by construction, so the
@@ -10017,7 +10234,7 @@ impl NodeService for NodeServiceImpl {
                 &req.geo_filters,
                 &geo_regions,
                 req.filter.as_ref(),
-                self.config.segment_pruning,
+                self.knobs.segment_pruning(),
             )?;
             let allow = allow.unwrap_or_else(|| vec![true; label_count]);
             let mut bits = vec![0u8; label_count.div_ceil(8)];
@@ -10070,13 +10287,13 @@ impl NodeService for NodeServiceImpl {
                 let skipped = lacking.iter().filter(|&&lacks| lacks).count() as u32;
                 let stats = crate::segment_prune::PruneStats {
                     segments_total: lacking.len() as u32,
-                    segments_skipped: if self.config.segment_pruning {
+                    segments_skipped: if self.knobs.segment_pruning() {
                         skipped
                     } else {
                         0
                     },
                 };
-                let masked = (self.config.segment_pruning && skipped > 0).then(|| {
+                let masked = (self.knobs.segment_pruning() && skipped > 0).then(|| {
                     segmented.masked(lacking.iter().map(|&lacks| !lacks).collect::<Arc<[bool]>>())
                 });
                 (masked, stats)
@@ -10338,8 +10555,11 @@ impl NodeService for NodeServiceImpl {
             };
             let cols = ShardNumericRead(store);
             let n = u64::from(store.next_doc_id());
-            let prune =
-                prune_segments(store, doc_filter.pred.as_ref(), self.config.segment_pruning);
+            let prune = prune_segments(
+                store,
+                doc_filter.pred.as_ref(),
+                self.knobs.segment_pruning(),
+            );
             let id_allowlist = req.restrict_doc_ids.then(|| {
                 req.doc_ids
                     .iter()
@@ -10551,8 +10771,11 @@ impl NodeService for NodeServiceImpl {
             };
             let cols = ShardNumericRead(store);
             let n = u64::from(store.next_doc_id());
-            let prune =
-                prune_segments(store, doc_filter.pred.as_ref(), self.config.segment_pruning);
+            let prune = prune_segments(
+                store,
+                doc_filter.pred.as_ref(),
+                self.knobs.segment_pruning(),
+            );
             let id_allowlist = req.restrict_doc_ids.then(|| {
                 req.doc_ids
                     .iter()
@@ -10848,7 +11071,7 @@ impl NodeService for NodeServiceImpl {
             let (tx, rx) = mpsc::channel::<Result<StreamSearchResponse, Status>>(64);
             let state = self.state.clone();
             let slot_offset = self.config.slot_offset;
-            let segment_pruning = self.config.segment_pruning;
+            let segment_pruning = self.knobs.segment_pruning();
             let stream_signals = Arc::clone(&self.stream_signals);
 
             tokio::spawn(async move {
@@ -11947,11 +12170,11 @@ impl NodeService for NodeServiceImpl {
                 // k-th best (gated by the node's floor knobs, never blocking
                 // the scan — dropped raises are superseded by the next one),
                 // and hand back the highest coordinator floor seen.
-                let share = service.config.share_floors;
-                let floor_delta = service.config.floor_delta;
-                let min_interval = (service.config.floor_min_interval_ms > 0).then(|| {
-                    std::time::Duration::from_millis(service.config.floor_min_interval_ms)
-                });
+                let share = service.knobs.share_floors();
+                let floor_delta = service.knobs.floor_delta();
+                let floor_min_interval_ms = service.knobs.floor_min_interval_ms();
+                let min_interval = (floor_min_interval_ms > 0)
+                    .then(|| std::time::Duration::from_millis(floor_min_interval_ms));
                 let scan_tx = tx.clone();
                 let hook_cancelled = Arc::clone(&cancelled);
                 let mut last_published = f32::NEG_INFINITY;
@@ -12888,7 +13111,7 @@ impl NodeServiceImpl {
             Some(store) => prune_segments(
                 store,
                 doc_filter.as_ref().and_then(|f| f.pred.as_ref()),
-                self.config.segment_pruning,
+                self.knobs.segment_pruning(),
             ),
             None => SegmentPrune::default(),
         };

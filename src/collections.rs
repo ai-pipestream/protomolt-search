@@ -192,6 +192,116 @@ impl RequestK for QueryStreamRequest {
     }
 }
 
+/// The figures a public response contributes to its ring entry
+/// (docs/diagnostics.md), read without cloning the response.
+trait RecentFields {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        Default::default()
+    }
+}
+
+impl RecentFields for SearchResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: self.hits.len() as u32,
+            segments_total: self.segments_total,
+            segments_skipped: self.segments_skipped,
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for Bm25SearchResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: self.hits.len() as u32,
+            segments_total: self.segments_total,
+            segments_skipped: self.segments_skipped,
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for HybridSearchResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: (self.hits.len() + self.cascade_hits.len()) as u32,
+            candidates_collected: self
+                .debug
+                .as_ref()
+                .map(|d| {
+                    d.shards
+                        .iter()
+                        .filter_map(|s| s.scan.as_ref())
+                        .map(|s| s.candidates_collected)
+                        .sum()
+                })
+                .unwrap_or(0),
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for QueryResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        let (segments_total, segments_skipped) = self
+            .profile
+            .as_ref()
+            .map_or((0, 0), |p| (p.segments_total, p.segments_skipped));
+        crate::diagnostics::RecentFigures {
+            hits: (self.hits.len() + self.groups.iter().map(|g| g.hits.len()).sum::<usize>())
+                as u32,
+            segments_total,
+            segments_skipped,
+            executed: self.executed.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for VariantSearchResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: self.results.iter().map(|r| r.hits.len()).sum::<usize>() as u32,
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for AggregateResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: u32::try_from(self.matched).unwrap_or(u32::MAX),
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for SuggestResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: self.suggestions.len() as u32,
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for TermSuggestResponse {
+    fn figures(&self) -> crate::diagnostics::RecentFigures {
+        crate::diagnostics::RecentFigures {
+            hits: self.terms.len() as u32,
+            ..Default::default()
+        }
+    }
+}
+
+impl RecentFields for PlanIndexResponse {}
+impl RecentFields for BroadcastVectorBackendResponse {}
+impl RecentFields for BroadcastCalibrationResponse {}
+impl RecentFields for FreezeTopologyWritesResponse {}
+impl RecentFields for PublishTopologyResponse {}
+impl RecentFields for AbortTopologyCutoverResponse {}
+
 impl RequestK for PhraseSearchRequest {}
 impl RequestK for AggregateRequest {}
 impl RequestK for PlanIndexRequest {}
@@ -215,6 +325,9 @@ pub struct CollectionSet {
     /// Bearer principals (`docs/security.md`); `None` serves anonymous
     /// callers with no quotas.
     principals: Option<Arc<Principals>>,
+    /// The recent-request ring the diagnostics service reads
+    /// (docs/diagnostics.md).
+    ring: Arc<crate::diagnostics::RecentRing>,
 }
 
 impl CollectionSet {
@@ -223,6 +336,7 @@ impl CollectionSet {
         CollectionSet {
             members: Members::single(coordinator),
             principals: None,
+            ring: Arc::new(crate::diagnostics::RecentRing::default()),
         }
     }
 
@@ -307,6 +421,7 @@ impl CollectionSet {
         Ok(CollectionSet {
             members: Members::named(members, default, "collections")?,
             principals: None,
+            ring: Arc::new(crate::diagnostics::RecentRing::default()),
         })
     }
 
@@ -337,6 +452,70 @@ impl CollectionSet {
     /// Ask every node of every collection which collection it serves and
     /// refuse the set when any answer disagrees with the coordinator that
     /// lists it. Run at startup so a misconfigured fleet never serves.
+    /// The diagnostics service over this set (docs/diagnostics.md):
+    /// the members' knobs and layouts, this set's principals for the
+    /// admin rule, and the ring of recent requests.
+    pub fn diagnostics(&self) -> crate::diagnostics::CoordinatorDiagnostics {
+        let members = self
+            .members()
+            .into_iter()
+            .map(|(name, member)| (name.to_string(), member.clone()))
+            .collect();
+        crate::diagnostics::CoordinatorDiagnostics::new(
+            members,
+            self.principals.clone(),
+            Arc::clone(&self.ring),
+        )
+    }
+
+    /// One ring entry per public request, pushed after the handler
+    /// answers; the figures come from the response without cloning it.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        route: &'static str,
+        collection: &str,
+        k: u32,
+        principal: String,
+        started: std::time::Instant,
+        outcome: Result<crate::diagnostics::RecentFigures, tonic::Code>,
+    ) {
+        const PUBLIC: [&str; 10] = [
+            "search",
+            "bm25_search",
+            "phrase_search",
+            "hybrid_search",
+            "variant_search",
+            "query",
+            "query_stream",
+            "aggregate",
+            "suggest",
+            "term_suggest",
+        ];
+        if !PUBLIC.contains(&route) {
+            return;
+        }
+        let (status, figures) = match outcome {
+            Ok(figures) => ("OK".to_string(), figures),
+            Err(code) => (format!("{code:?}"), Default::default()),
+        };
+        self.ring.push(crate::pb::RecentQuery {
+            unix_ms: crate::diagnostics::unix_ms(),
+            request_id: String::new(),
+            route: route.to_string(),
+            executed: figures.executed,
+            k,
+            total_ms: started.elapsed().as_secs_f32() * 1000.0,
+            status,
+            principal,
+            segments_total: figures.segments_total,
+            segments_skipped: figures.segments_skipped,
+            candidates_collected: figures.candidates_collected,
+            hits: figures.hits,
+            collection: collection.to_string(),
+        });
+    }
+
     pub async fn verify_membership(&self) -> Result<(), Status> {
         for (_, member) in self.members() {
             member.verify_collection_membership().await?;
@@ -367,13 +546,27 @@ macro_rules! search_service_over_collections {
                     &self,
                     mut request: Request<$req>,
                 ) -> Result<Response<$resp>, Status> {
+                    let started = std::time::Instant::now();
                     let principal = self.authenticate(&request)?;
                     let (name, target) = self.members.resolve(&request.get_ref().collection)?;
                     let target = target.clone();
                     let _permit =
                         Self::admit_under(principal.as_ref(), &request, target.max_k())?;
-                    request.get_mut().collection = name;
-                    SearchService::$name(&target, request).await
+                    request.get_mut().collection = name.clone();
+                    let k = request.get_ref().k().unwrap_or(0);
+                    let who = principal.as_ref().map(|p| p.name.clone()).unwrap_or_default();
+                    let out = SearchService::$name(&target, request).await;
+                    self.record(
+                        stringify!($name),
+                        &name,
+                        k,
+                        who,
+                        started,
+                        out.as_ref()
+                            .map(|r| RecentFields::figures(r.get_ref()))
+                            .map_err(Status::code),
+                    );
+                    out
                 }
             )*
 
@@ -381,12 +574,27 @@ macro_rules! search_service_over_collections {
                 &self,
                 mut request: Request<QueryStreamRequest>,
             ) -> Result<Response<Self::QueryStreamStream>, Status> {
+                let started = std::time::Instant::now();
                 let principal = self.authenticate(&request)?;
                 let (name, target) = self.members.resolve(&request.get_ref().collection)?;
                 let target = target.clone();
                 let permit = Self::admit_under(principal.as_ref(), &request, target.max_k())?;
-                request.get_mut().collection = name;
-                let response = SearchService::query_stream(&target, request).await?;
+                request.get_mut().collection = name.clone();
+                let k = request.get_ref().k().unwrap_or(0);
+                let who = principal.as_ref().map(|p| p.name.clone()).unwrap_or_default();
+                let response = SearchService::query_stream(&target, request).await;
+                self.record(
+                    "query_stream",
+                    &name,
+                    k,
+                    who,
+                    started,
+                    response
+                        .as_ref()
+                        .map(|_| crate::diagnostics::RecentFigures::default())
+                        .map_err(Status::code),
+                );
+                let response = response?;
                 Ok(response.map(|stream| Guarded::new(stream, permit)))
             }
 
