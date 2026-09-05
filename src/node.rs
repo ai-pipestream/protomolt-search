@@ -3965,7 +3965,7 @@ fn run_scan_batch(
     segment_pruning: bool,
     batch: Vec<ScanJob>,
 ) {
-    let guard = state.read().expect("shard state lock poisoned");
+    let guard = read_shard(state);
     let index = match guard.index.as_ref() {
         Some(index) => index,
         None => {
@@ -4066,6 +4066,61 @@ struct IngestGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for IngestGuard {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Wait for a shard lock without holding a runtime worker hostage.
+///
+/// `ShardState` sits behind a std `RwLock`, and most acquisitions are
+/// uncontended and short, so they happen inline. A contended one is a
+/// different matter on a tokio worker: a compaction cutover holds the
+/// write lock while it analyzes its last records over the network, and
+/// that stream is served by the same runtime. A worker that parks in the
+/// futex under those conditions takes the tasks in its slot with it, and
+/// the cutover then waits for a stream the parked worker was about to
+/// drive: both sides wait forever. Measured on 2026-09-05 with a stack
+/// dump of the hung test process, not inferred.
+///
+/// So a contended wait on a multi-thread runtime goes through
+/// `block_in_place`, which hands the worker's queue to another thread
+/// before this one parks. Off the runtime, or on a current-thread
+/// runtime (where `block_in_place` is not allowed and the wait is the
+/// caller's own), the wait happens inline.
+fn wait_off_runtime<T>(wait: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
+/// The shard read lock; see [`wait_off_runtime`].
+pub(crate) fn read_shard(state: &RwLock<ShardState>) -> std::sync::RwLockReadGuard<'_, ShardState> {
+    match state.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("shard state lock poisoned: {poisoned}")
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            wait_off_runtime(|| state.read().expect("shard state lock poisoned"))
+        }
+    }
+}
+
+/// The shard write lock; see [`wait_off_runtime`].
+pub(crate) fn write_shard(
+    state: &RwLock<ShardState>,
+) -> std::sync::RwLockWriteGuard<'_, ShardState> {
+    match state.try_write() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("shard state lock poisoned: {poisoned}")
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            wait_off_runtime(|| state.write().expect("shard state lock poisoned"))
+        }
     }
 }
 
@@ -4500,7 +4555,7 @@ impl NodeServiceImpl {
     /// under.
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             guard.mapped_binding = store.as_ref().and_then(|s| s.binding().cloned());
             guard.bm25 = store;
             guard.stats_epoch += 1;
@@ -4512,7 +4567,7 @@ impl NodeServiceImpl {
     /// must describe exactly the provider slots in this shard generation.
     pub fn with_exact_vectors(self, store: Option<ExactVectorStore>) -> Result<Self, String> {
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             if let Some(exact) = store.as_ref() {
                 if let Some(index) = guard.index.as_ref() {
                     if exact.len() != index.len() || exact.dim() != index.dim_opt() {
@@ -4543,7 +4598,7 @@ impl NodeServiceImpl {
     /// Attach the persisted generation overlay loaded at startup.
     pub fn with_live_docs(self, live_docs: LiveDocs) -> Result<Self, String> {
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             let rows = physical_rows(&guard);
             if live_docs.persisted_rows() > rows {
                 return Err(format!(
@@ -4601,7 +4656,7 @@ impl NodeServiceImpl {
         address: String,
     ) -> crate::pb::ShardLayoutDiagnostics {
         use crate::pb::{SegmentColumnRange, SegmentDiagnostics, ShardLayoutDiagnostics};
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let vector_rows = guard.index.as_ref().map_or(0, |i| i.len() as u64);
         let doc_rows = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let rows = vector_rows.max(doc_rows);
@@ -4691,7 +4746,7 @@ impl NodeServiceImpl {
         let state = Arc::clone(&self.state);
         let slot_offset = self.config.slot_offset;
         Box::new(move || {
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&state);
             crate::metrics::ShardGauges {
                 slot_offset,
                 vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
@@ -4723,7 +4778,7 @@ impl NodeServiceImpl {
     ) -> Arc<Vec<u64>> {
         const SELF_PARENT_TAG: u64 = 1 << 63;
         {
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(state);
             if let Some(p) = guard.parents.as_ref() {
                 if p.len() == n {
                     return Arc::clone(p);
@@ -4731,7 +4786,7 @@ impl NodeServiceImpl {
             }
         }
         let built = {
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(state);
             let store = guard.bm25.as_ref().and_then(|b| b.as_index());
             let mut parents = Vec::with_capacity(n);
             for slot in 0..n {
@@ -4743,7 +4798,7 @@ impl NodeServiceImpl {
             }
             Arc::new(parents)
         };
-        state.write().expect("shard state lock poisoned").parents = Some(Arc::clone(&built));
+        write_shard(state).parents = Some(Arc::clone(&built));
         built
     }
 
@@ -4837,7 +4892,7 @@ impl NodeServiceImpl {
         let outcome = self.write_segment(&plan);
         let _ = std::fs::remove_dir_all(&plan.stage);
         let published = outcome?;
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_mut() else {
             return Err(Status::internal(
                 "the segmented shard changed layout while a seal was in flight",
@@ -4873,7 +4928,7 @@ impl NodeServiceImpl {
     /// pick up the frozen part a failed seal left) and gather what the
     /// writer needs. `None` when there is nothing to seal.
     fn freeze_tail(&self) -> Result<Option<SealPlan>, Status> {
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let ShardState {
             bm25,
             index,
@@ -4986,7 +5041,7 @@ impl NodeServiceImpl {
                     .write(&vector_path)
                     .map_err(|e| Status::internal(format!("seal vectors: {e}")))?;
                 let (dim, values) = {
-                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let guard = read_shard(&self.state);
                     let exact = guard.exact_vectors.as_ref().ok_or_else(|| {
                         Status::failed_precondition(
                             "sealing a segment with vectors needs the exact-vector sidecar for \
@@ -5037,7 +5092,7 @@ impl NodeServiceImpl {
             return false;
         }
         let bound = self.config.seal_tail_docs as usize;
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
             return false;
         };
@@ -5090,7 +5145,7 @@ impl NodeServiceImpl {
 
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let Some(config_path) = self.config.index_path.clone() else {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             return Ok(FlushResponse {
                 path: String::new(),
                 num_vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
@@ -5104,7 +5159,7 @@ impl NodeServiceImpl {
         // whose records the log lost would silently drop those records
         // from every future replay (reshard, recovery).
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             if let Some(wal) = guard.wal.as_mut() {
                 wal.flush().map_err(|e| {
                     Status::internal(format!("wal fsync {}: {e}", wal.dir().display()))
@@ -5114,7 +5169,7 @@ impl NodeServiceImpl {
         // A segmented shard seals its tail with the lock free (see
         // `seal_tail`); the single-image writes below hold it.
         let sealed = self.seal_tail()?;
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
         let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let (vector_path, exact_path, bm25_path) =
@@ -5415,7 +5470,7 @@ impl NodeServiceImpl {
         // score one shard in another space (docs/mmap-vectors.md).
         {
             let incoming = loaded.descriptor();
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let serving_kind = guard
                 .index
                 .as_ref()
@@ -5494,7 +5549,7 @@ impl NodeServiceImpl {
             ));
         }
 
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         // Scoring comparability: a shard with a locked backend configuration
         // only accepts an image with the identical scoring fingerprint.
         if let Some(index) = guard.index.as_ref() {
@@ -5626,7 +5681,7 @@ impl NodeServiceImpl {
     /// Per-field analysis fingerprints of the BM25 store, in field-table
     /// order (empty without a store).
     pub fn analysis_fingerprints(&self) -> Vec<u64> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         Self::analysis_fingerprints_of(&guard)
     }
 
@@ -5642,7 +5697,7 @@ impl NodeServiceImpl {
     /// the segment layout, one for a disk-resident single image, zero
     /// for a heap builder or an empty shard.
     pub fn immutable_segments(&self) -> u32 {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         match guard.bm25.as_ref() {
             Some(Bm25Shard::Segmented(shard)) => shard.sealed_parts() as u32,
             Some(Bm25Shard::Resident(_)) => 1,
@@ -5689,7 +5744,7 @@ impl NodeServiceImpl {
         let mut attempts = 0u32;
         let (manifest, bytes) = loop {
             attempts += 1;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             match guard.wal.as_ref() {
                 Some(wal) if wal.is_dirty() => {
                     drop(guard);
@@ -5705,7 +5760,7 @@ impl NodeServiceImpl {
                 Some(_) => break self.export_locked(&guard, &index_path, directory)?,
                 None => {
                     drop(guard);
-                    let guard = self.state.write().expect("shard state lock poisoned");
+                    let guard = write_shard(&self.state);
                     break self.export_locked(&guard, &index_path, directory)?;
                 }
             }
@@ -5898,7 +5953,7 @@ impl NodeServiceImpl {
             ));
         }
         {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             if Self::served_layout(&guard) == LAYOUT_SEGMENTS && physical_rows(&guard) > 0 {
                 return Err(Status::failed_precondition(format!(
                     "this shard serves a segment catalog with {} rows; a single-image snapshot \
@@ -5943,7 +5998,7 @@ impl NodeServiceImpl {
             ));
         }
         {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             if guard.generation.is_some() {
                 return Err(Status::failed_precondition(
                     "this shard serves an installed single-image generation; a segment-catalog \
@@ -5984,7 +6039,7 @@ impl NodeServiceImpl {
         };
         let incoming = incoming.or_else(|| plain_image.as_ref().map(|i| i.descriptor()));
         {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let serving_kind = guard
                 .index
                 .as_ref()
@@ -6056,7 +6111,7 @@ impl NodeServiceImpl {
         drop(staged);
         drop(plain_image);
 
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         if let (Some(index), Some(incoming)) = (guard.index.as_ref(), incoming.as_ref()) {
             let current = index.descriptor();
             if current.backend_kind != incoming.backend_kind
@@ -6223,7 +6278,7 @@ impl NodeServiceImpl {
             VectorIndex::from_backend_config(dim, &config)
                 .map_err(|e| Status::invalid_argument(format!("invalid backend config: {e}")))
         };
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let result = match guard.index.as_ref() {
             Some(index) if !index.is_empty() => Err(Status::failed_precondition(format!(
                 "shard holds {} vectors; vector backend configuration is locked for the generation",
@@ -6290,7 +6345,7 @@ impl NodeServiceImpl {
         batch: AddVectorsRequest,
         stable_routing_key: Option<Vec<u8>>,
     ) -> Result<(u64, u64), Status> {
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         self.apply_batch_locked(&mut guard, batch, stable_routing_key)
     }
 
@@ -6507,7 +6562,7 @@ impl NodeServiceImpl {
         if let Some(f) = req.filter.as_ref() {
             crate::filter::validate_filter(f)?;
         }
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         // Filled inside the scoring arm (the facet walk reuses the
         // resolved field views); a shard with no lexical half answers
@@ -6925,7 +6980,7 @@ impl NodeServiceImpl {
         expected_stats_epoch: u64,
         filters: &LegFilters<'_>,
     ) -> Result<LegResults, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(expected_stats_epoch)?;
         // One resolution for both legs (docs/vector-filters.md): the
         // allowlist the vector kernel scans under and the predicate the
@@ -8454,7 +8509,7 @@ impl NodeServiceImpl {
         // makes replay exact — the logged request carries the values, so
         // replay never calls the sidecar and never derives twice.
         let (doc, analyzed) = self.materialize_document(doc, analyzed)?;
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         self.apply_document_locked(
             &mut guard,
             doc,
@@ -9201,7 +9256,7 @@ impl NodeServiceImpl {
             body_path: extractor.body_path().to_string(),
             materialize_sha: materialize_sha(bind.materialize.as_ref()),
         };
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         match &guard.mapped_binding {
             Some(bound) if *bound != incoming => {
                 let mut differs = Vec::new();
@@ -9686,7 +9741,7 @@ impl NodeService for NodeServiceImpl {
                     let geo_regions = geo_regions.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         let n = {
-                            let guard = state.read().expect("shard state lock poisoned");
+                            let guard = read_shard(&state);
                             let index = guard.index.as_ref().ok_or_else(|| {
                                 Status::failed_precondition(
                                     "shard has no index yet (set calibration or add vectors)",
@@ -9698,7 +9753,7 @@ impl NodeService for NodeServiceImpl {
                         // parent_map takes its own locks (read to build, write
                         // to cache), so the validation guard is dropped first.
                         let parents = Self::parent_map(&state, slot_offset, n);
-                        let guard = state.read().expect("shard state lock poisoned");
+                        let guard = read_shard(&state);
                         let index = guard.index.as_ref().ok_or_else(|| {
                             Status::failed_precondition("shard index disappeared mid-setup")
                         })?;
@@ -9787,7 +9842,7 @@ impl NodeService for NodeServiceImpl {
                         // batch runner holds the read lock for the scan, the
                         // same consistency the solo path gets.
                         let validated = {
-                            let guard = state.read().expect("shard state lock poisoned");
+                            let guard = read_shard(&state);
                             match guard.index.as_ref() {
                                 Some(index) => Self::validate_start(index, &start),
                                 None => Err(Status::failed_precondition(
@@ -9834,7 +9889,7 @@ impl NodeService for NodeServiceImpl {
                             // scan: adds (write lock) never interleave with a
                             // scan, so a search sees one consistent index
                             // snapshot.
-                            let guard = state.read().expect("shard state lock poisoned");
+                            let guard = read_shard(&state);
                             let index = guard.index.as_ref().ok_or_else(|| {
                                 Status::failed_precondition(
                                     "shard has no index yet (set calibration or add vectors)",
@@ -9941,7 +9996,7 @@ impl NodeService for NodeServiceImpl {
                 return Err(Status::invalid_argument("browse requires k > 0"));
             }
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             let slot_offset = self.config.slot_offset;
@@ -10220,7 +10275,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::ResolveFilterBitmap, request, |request| async move {
             let req = request.into_inner();
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             let label_count = guard
@@ -10261,7 +10316,7 @@ impl NodeService for NodeServiceImpl {
         request: Request<LexicalBitmapRequest>,
     ) -> Result<Response<MembershipBitmapResponse>, Status> {
         let req = request.into_inner();
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let Some(shard) = guard.bm25.as_ref() else {
             return Ok(Response::new(MembershipBitmapResponse {
                 segments_total: 0,
@@ -10327,7 +10382,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<VectorBitmapRequest>,
     ) -> Result<Response<MembershipBitmapResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let label_count = guard.index.as_ref().map_or(0, VectorIndex::len);
         let mut bits = vec![0xffu8; label_count.div_ceil(8)];
         if let Some(last) = bits.last_mut() {
@@ -10368,7 +10423,7 @@ impl NodeService for NodeServiceImpl {
             let grouping = !req.group_by.is_empty();
             let group_cap = req.max_groups as usize;
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             // Expression column leaves: aggregations first, then
@@ -10732,7 +10787,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::QuantileCounts, request, |request| async move {
             let req = request.into_inner();
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let Some(store) = guard.bm25.as_ref() else {
                 return Ok(Response::new(crate::pb::QuantileCountsResponse {
                     counts: vec![0; req.targets.len()],
@@ -10840,7 +10895,7 @@ impl NodeService for NodeServiceImpl {
                         })??;
                 }
                 let snapshot = {
-                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let guard = read_shard(&self.state);
                     let wal = guard.wal.as_ref().ok_or_else(|| {
                         Status::failed_precondition(
                             "this shard has no WAL; live catch-up is unavailable",
@@ -10956,7 +11011,7 @@ impl NodeService for NodeServiceImpl {
             body_path: req.body_path,
             materialize_sha: req.materialize_sha,
         };
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = write_shard(&self.state);
         let already_bound = Self::apply_binding_locked(&mut guard, incoming)?;
         Ok(Response::new(crate::pb::ApplyWalBindingResponse {
             already_bound,
@@ -10982,7 +11037,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let (num_vectors, dim, bit_width, vector_backend, scoring_fingerprint, quality_contract) =
             match guard.index.as_ref() {
                 Some(index) => {
@@ -11166,14 +11221,14 @@ impl NodeService for NodeServiceImpl {
                         // path.
                         let parents = if start.collapse_parents {
                             let n = {
-                                let guard = state.read().expect("shard state lock poisoned");
+                                let guard = read_shard(&state);
                                 guard.index.as_ref().map_or(0, |index| index.len())
                             };
                             Some(Self::parent_map(&state, slot_offset, n))
                         } else {
                             None
                         };
-                        let guard = state.read().expect("shard state lock poisoned");
+                        let guard = read_shard(&state);
                         let index = guard.index.as_ref().ok_or_else(|| {
                             Status::failed_precondition(
                                 "shard has no index yet (set calibration or add vectors)",
@@ -11352,7 +11407,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<GetVectorBackendRequest>,
     ) -> Result<Response<GetVectorBackendResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let Some(index) = guard.index.as_ref() else {
             return Ok(Response::new(GetVectorBackendResponse {
                 descriptor: None,
@@ -11384,7 +11439,7 @@ impl NodeService for NodeServiceImpl {
         &self,
         _request: Request<GetCalibrationRequest>,
     ) -> Result<Response<GetCalibrationResponse>, Status> {
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         let (dim, bit_width, num_vectors, shift, scale) = match guard.index.as_ref() {
             Some(index) => {
                 let (shift, scale) = calibration_of(index).unwrap_or_default();
@@ -11446,7 +11501,7 @@ impl NodeService for NodeServiceImpl {
                 self.seal_if_due().await?;
             }
             let (total, wal_generation) = {
-                let guard = self.state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&self.state);
                 (
                     guard.index.as_ref().map_or(0, |i| i.len() as u64),
                     guard.wal.as_ref().map_or(0, WalWriter::generation),
@@ -11719,7 +11774,7 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             let (total, wal_generation) = {
-                let guard = self.state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&self.state);
                 (
                     guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
                     guard.wal.as_ref().map_or(0, WalWriter::generation),
@@ -11743,7 +11798,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<DeleteDocumentsResponse>, Status> {
         crate::metrics::timed(Route::DeleteDocuments, request, |request| async move {
             let req = request.into_inner();
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             self.delete_documents_locked(&mut guard, &req.doc_ids, req.expected_wal_generation)
                 .map(Response::new)
         })
@@ -11756,7 +11811,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<CommitReplacementsResponse>, Status> {
         crate::metrics::timed(Route::CommitReplacements, request, |request| async move {
             let req = request.into_inner();
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = write_shard(&self.state);
             self.commit_replacements_locked(
                 &mut guard,
                 &req.replacements,
@@ -11840,7 +11895,7 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             let (total, wal_generation) = {
-                let guard = self.state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&self.state);
                 (
                     guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
                     guard.wal.as_ref().map_or(0, WalWriter::generation),
@@ -11870,7 +11925,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<TermStatsResponse>, Status> {
         crate::metrics::timed(Route::TermStats, request, |request| async move {
             let req = request.into_inner();
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard
                 .bm25
                 .as_ref()
@@ -11959,7 +12014,7 @@ impl NodeService for NodeServiceImpl {
             if req.prefix.is_empty() {
                 return Err(Status::invalid_argument("a term prefix must be non-empty"));
             }
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let Some(store) = guard.bm25.as_ref() else {
                 return Ok(Response::new(crate::pb::ExpandTermPrefixResponse {
                     terms: Vec::new(),
@@ -12019,7 +12074,7 @@ impl NodeService for NodeServiceImpl {
                     "max_scan must be positive: it bounds the dictionary scan",
                 ));
             }
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let tombstoned_rows = guard.live_docs.deleted_count();
             let unknown = || crate::pb::SuggestTermsResponse {
                 entries: Vec::new(),
@@ -12325,7 +12380,7 @@ impl NodeService for NodeServiceImpl {
                     // Stage parameters validate everywhere they arrive; a
                     // malformed stage is a request error, not a shard gap.
                     let specs = parse_score_stages(&req.stages)?;
-                    let guard = state.read().expect("shard state lock poisoned");
+                    let guard = read_shard(&state);
                     let projection_leaves = {
                         let mut leaves = Vec::new();
                         for p in &req.projections {
@@ -12428,7 +12483,7 @@ impl NodeService for NodeServiceImpl {
             let offset = self.config.slot_offset;
             let state = self.state.clone();
             let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
-                let guard = state.read().expect("shard state lock poisoned");
+                let guard = read_shard(&state);
                 // A shard with no index holds none of the candidates.
                 let Some(index) = guard.index.as_ref() else {
                     return Ok(Vec::new());
@@ -12507,7 +12562,7 @@ impl NodeService for NodeServiceImpl {
             .map_err(|_| Status::unavailable("exact rerank worker budget closed"))?;
         let result = tokio::task::spawn_blocking(move || -> Result<ExactVectorRescoreResponse, Status> {
             let _permits = permits;
-            let guard = state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&state);
             // Product shards may own exact rows for a clustered vector
             // collection without also serving a local provider image. The
             // product slot range is therefore the maximum aligned artifact,
@@ -12599,7 +12654,7 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::GetDocuments, request, |request| async move {
             let req = request.into_inner();
             let offset = self.config.slot_offset;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let mut documents = Vec::new();
             if let Some(store) = guard.bm25.as_ref() {
                 let store = store.as_index().ok_or_else(|| {
@@ -12640,7 +12695,7 @@ impl NodeService for NodeServiceImpl {
             const SELF_PARENT_TAG: u64 = 1 << 63;
             let req = request.into_inner();
             let offset = self.config.slot_offset;
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = read_shard(&self.state);
             let rows = guard
                 .index
                 .as_ref()
@@ -13043,7 +13098,7 @@ impl NodeServiceImpl {
                 "terms and global_doc_frequencies must have the same length",
             ));
         }
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         // The request's filters, resolved ONCE against this shard's
         // tables and shared by facet counting and the scorers below —
@@ -13470,7 +13525,7 @@ impl NodeServiceImpl {
             dfs: req.global_doc_frequencies.clone(),
         };
         let offset = self.config.slot_offset;
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
         let (hits, stage_columns_known) = match guard.bm25.as_ref() {
             Some(store) => {

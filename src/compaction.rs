@@ -51,8 +51,15 @@ use crate::wal::{self, ClockedTail, WalWriter};
 /// request does not say.
 const DEFAULT_TAIL_BOUND: u32 = 256;
 /// Unlocked tail passes before compaction gives up on a log that grows
-/// faster than the shadow applies it.
+/// faster than the shadow applies it. A backstop only: the stall rule
+/// below is what fires in practice.
 const MAX_TAIL_PASSES: u64 = 10_000;
+/// Consecutive unlocked passes that fail to read fewer records than the
+/// smallest pass so far. Each pass pays an fsync the writer does not, so
+/// once a pass is slow enough for the writer to refill the tail the loop
+/// makes no progress and no later pass will: the refusal names it at
+/// once instead of after the pass cap.
+const STALLED_TAIL_PASSES: u64 = 8;
 /// Times the cutover releases the lock and applies an over-bound tail
 /// unlocked before refusing.
 const LOCKED_PASS_RETRIES: usize = 16;
@@ -416,7 +423,7 @@ impl NodeServiceImpl {
         // The prefix through the cutoff goes to disk before the replay
         // reads it; writes keep landing on the live shard meanwhile.
         {
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = crate::node::write_shard(&self.state);
             if let Some(wal) = guard.wal.as_mut() {
                 wal.flush()
                     .map_err(|e| Status::internal(format!("wal fsync before compaction: {e}")))?;
@@ -487,7 +494,7 @@ impl NodeServiceImpl {
                  to compact",
             )
         })?;
-        let guard = self.state.read().expect("shard state lock poisoned");
+        let guard = crate::node::read_shard(&self.state);
         if guard.pending_compaction.is_some() {
             return Err(Status::failed_precondition(
                 "a compaction cutover is pending its closing flush on this shard; call Flush",
@@ -826,7 +833,7 @@ impl NodeServiceImpl {
                 self.closing_flush()?;
                 let closing_flush_ms = closing.elapsed().as_millis() as u64;
                 let (rows_after, stats_epoch) = {
-                    let guard = self.state.read().expect("shard state lock poisoned");
+                    let guard = crate::node::read_shard(&self.state);
                     (crate::node::physical_rows(&guard), guard.stats_epoch)
                 };
                 Ok(CompactShardResponse {
@@ -1041,7 +1048,7 @@ impl NodeServiceImpl {
             .map(|s| s.segment_id.clone())
             .collect();
         let epoch_at_open = {
-            let guard = self.state.read().expect("shard state lock poisoned");
+            let guard = crate::node::read_shard(&self.state);
             match guard.bm25.as_ref() {
                 Some(Bm25Shard::Segmented(shard)) => shard.snapshot().epoch(),
                 _ => live_manifest.epoch,
@@ -1471,7 +1478,7 @@ impl NodeServiceImpl {
     /// Fsync the live log and return its high watermark: the bound of
     /// one tail pass. Brief, under the write lock.
     fn flush_live_wal(&self, pre: &Preflight) -> Result<u64, Status> {
-        let mut guard = self.state.write().expect("shard state lock poisoned");
+        let mut guard = crate::node::write_shard(&self.state);
         Self::flush_live_wal_locked(&mut guard, pre)
     }
 
@@ -1506,6 +1513,8 @@ impl NodeServiceImpl {
     ) -> Result<(u64, u64, u64), Status> {
         let mut tail = ClockedTail::start(&pre.gen_dir, pre.cutoff_clock);
         let mut passes = 0u64;
+        let mut smallest = usize::MAX;
+        let mut stalled = 0u64;
         loop {
             passes += 1;
             if passes > MAX_TAIL_PASSES {
@@ -1523,6 +1532,20 @@ impl NodeServiceImpl {
             if count < tail_bound {
                 break;
             }
+            if count < smallest {
+                smallest = count;
+                stalled = 0;
+            } else {
+                stalled += 1;
+                if stalled >= STALLED_TAIL_PASSES {
+                    return Err(Status::resource_exhausted(format!(
+                        "writes outpace compaction: {STALLED_TAIL_PASSES} consecutive tail \
+                         passes read no fewer than {smallest} records (last {count}, \
+                         tail_bound {tail_bound}) after {passes} passes; pause writes or \
+                         raise tail_bound"
+                    )));
+                }
+            }
         }
 
         // Cutover. A seal in flight finishes on the old state first; the
@@ -1532,7 +1555,7 @@ impl NodeServiceImpl {
         loop {
             attempt += 1;
             let started = Instant::now();
-            let mut guard = self.state.write().expect("shard state lock poisoned");
+            let mut guard = crate::node::write_shard(&self.state);
             let watermark = Self::flush_live_wal_locked(&mut guard, pre)?;
             let records = tail
                 .read_through(watermark)

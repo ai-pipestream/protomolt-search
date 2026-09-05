@@ -78,6 +78,11 @@ The shape is the live reshard's, in one process:
    id the map does not know is an error, never a skip; documents are analyzed
    through the node's own analysis backend in one batch per pass. The loop
    repeats until fewer than `tail_bound` records (default 256) remain.
+   Each pass pays an fsync the writer does not, so a writer can refill the
+   tail as fast as a pass drains it; eight consecutive passes that read no
+   fewer records than the smallest pass so far is a stall, and the call
+   refuses at once ("writes outpace compaction", with the counts) rather
+   than run to its pass cap. Pause writes or raise `tail_bound` and retry.
 5. **Cutover.** Under the write lock (after any seal in flight has
    finished): fsync, apply the remaining records, fsync the shadow's
    generation, write the commit marker, move the rewritten generation into

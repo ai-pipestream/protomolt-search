@@ -262,9 +262,18 @@ fn is_stale_generation(status: &tonic::Status) -> bool {
         && status.message().contains("stale WAL generation")
 }
 
-/// Keep writing through the public RPCs until told to stop: appends,
-/// with every fifth append followed by a delete of an earlier one and
-/// every seventh by a replacement. Tracks the product's view.
+/// Appends the writer makes at most. The stop flag ends it first on an
+/// unloaded machine (about 700 appends); the cap is what makes the
+/// compaction's tail loop converge on any machine, because a loop that
+/// exits on "fewer than tail_bound records arrived during a pass" only
+/// terminates against a writer that stops, and this one stops after a
+/// count, not after a time.
+const WRITER_APPEND_CAP: usize = 1_500;
+
+/// Keep writing through the public RPCs until told to stop or the append
+/// cap is reached: appends, with every fifth append followed by a delete
+/// of an earlier one and every seventh by a replacement. Tracks the
+/// product's view.
 async fn writer(
     addr: String,
     tracked: Arc<Mutex<Tracked>>,
@@ -279,7 +288,7 @@ async fn writer(
         stats.calls += 1;
         stats.max_call = stats.max_call.max(started.elapsed());
     };
-    while !stop.load(Ordering::Acquire) {
+    while !stop.load(Ordering::Acquire) && i - start_at < WRITER_APPEND_CAP {
         let fresh = row(i, false);
         let started = Instant::now();
         let id = append(&mut client, &fresh).await;
