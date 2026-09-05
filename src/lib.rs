@@ -64,6 +64,7 @@ pub mod node_agent;
 pub mod pb;
 pub mod phrases;
 pub mod placement;
+pub mod placement_plan;
 pub mod postings;
 mod protobuf;
 pub mod proximity;

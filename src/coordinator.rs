@@ -10318,6 +10318,180 @@ impl PlacementRouter {
     }
 }
 
+/// The dry run's counting state: filtered counts per shard, memoized by
+/// node and restriction, so a default node's subtraction reuses its
+/// siblings' counts (`src/placement_plan.rs` for the arithmetic).
+struct PlanCounter<'a> {
+    coordinator: &'a CoordinatorServiceImpl,
+    base: Option<crate::pb::FilterExpr>,
+    column: String,
+    memo: std::collections::HashMap<(String, Option<i64>), Vec<u64>>,
+}
+
+impl PlanCounter<'_> {
+    /// Rows per shard passing `tree` (all live rows for `None`). With
+    /// `refuse_unknown`, a leaf no shard can resolve refuses by name.
+    async fn count(
+        &self,
+        tree: Option<crate::pb::FilterExpr>,
+        refuse_unknown: bool,
+        node_name: &str,
+    ) -> Result<Vec<u64>, Status> {
+        if let Some(expr) = tree.as_ref() {
+            crate::filter::validate_filter(expr).map_err(|status| {
+                Status::invalid_argument(format!(
+                    "plan_placement: node {node_name:?}: the combined predicate {}",
+                    status.message()
+                ))
+            })?;
+        }
+        let filters = RequestFilters {
+            geo: Vec::new(),
+            tree,
+        };
+        let count = crate::pb::CompiledAggregation {
+            expr: Some(crate::cel::compile_value("1")?),
+            op: crate::pb::AggregateOp::Count as i32,
+            name: "rows".to_string(),
+            max_distinct: 0,
+        };
+        let mut tasks = Vec::with_capacity(self.coordinator.node_addrs.len());
+        for node in &self.coordinator.node_addrs {
+            let request = crate::pb::AggregateShardRequest {
+                filter: filters.tree.clone(),
+                geo_filters: Vec::new(),
+                aggregations: vec![count.clone()],
+                group_by: String::new(),
+                max_groups: 0,
+                histograms: Vec::new(),
+                percentiles: Vec::new(),
+                doc_ids: Vec::new(),
+                restrict_doc_ids: false,
+            };
+            let client = self.coordinator.node_client(node);
+            tasks.push(tokio::spawn(async move {
+                client?
+                    .aggregate_shard(request)
+                    .await
+                    .map(|r| r.into_inner())
+            }));
+        }
+        let mut known = FilterKnown::new(&filters);
+        let mut counts = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let response = task
+                .await
+                .map_err(|e| Status::internal(format!("plan_placement task failed: {e}")))??;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            counts.push(response.matched);
+        }
+        if refuse_unknown {
+            known.refuse_unknown(&filters).map_err(|status| {
+                Status::new(
+                    status.code(),
+                    format!("plan_placement: node {node_name:?}: {}", status.message()),
+                )
+            })?;
+        }
+        Ok(counts)
+    }
+
+    /// Rows per shard that land on the node at `path` (indices from the
+    /// root chain), restricted to `extra` when given.
+    fn first<'s>(
+        &'s mut self,
+        plan: &'s [crate::placement_plan::PlanNode],
+        path: &'s [usize],
+        extra: Option<crate::pb::FilterExpr>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u64>, Status>> + Send + 's>>
+    {
+        Box::pin(async move {
+            let node = node_at(plan, path);
+            let extra_code = extra.as_ref().map(|_| self.code_of(extra.as_ref()));
+            let key = (node.name.clone(), extra_code);
+            if let Some(counts) = self.memo.get(&key) {
+                return Ok(counts.clone());
+            }
+            let refuse_unknown = extra.is_none();
+            let counts = if !node.is_default {
+                let (a, ab) = crate::placement_plan::first_match_trees(
+                    node,
+                    self.base.as_ref(),
+                    extra.as_ref(),
+                );
+                let all = self.count(a, refuse_unknown, &node.name).await?;
+                match ab {
+                    Some(ab) => {
+                        let taken = self.count(Some(ab), refuse_unknown, &node.name).await?;
+                        all.iter()
+                            .zip(&taken)
+                            .map(|(a, b)| a.saturating_sub(*b))
+                            .collect()
+                    }
+                    None => all,
+                }
+            } else {
+                // The default: the parent's rows minus the siblings'.
+                let parent_path = &path[..path.len() - 1];
+                let mut counts = if parent_path.is_empty() {
+                    let (a, _) = crate::placement_plan::first_match_trees(
+                        node,
+                        self.base.as_ref(),
+                        extra.as_ref(),
+                    );
+                    self.count(a, refuse_unknown, &node.name).await?
+                } else {
+                    self.first(plan, parent_path, extra.clone()).await?
+                };
+                let siblings = if parent_path.is_empty() {
+                    plan
+                } else {
+                    &node_at(plan, parent_path).children
+                };
+                for (i, sibling) in siblings.iter().enumerate() {
+                    if sibling.is_default {
+                        continue;
+                    }
+                    let mut sibling_path = parent_path.to_vec();
+                    sibling_path.push(i);
+                    let taken = self.first(plan, &sibling_path, extra.clone()).await?;
+                    for (c, t) in counts.iter_mut().zip(&taken) {
+                        *c = c.saturating_sub(*t);
+                    }
+                }
+                counts
+            };
+            self.memo.insert(key, counts.clone());
+            Ok(counts)
+        })
+    }
+
+    /// The code an `extra` restriction names (the memo key); the
+    /// restriction is always `column == code` here.
+    fn code_of(&self, extra: Option<&crate::pb::FilterExpr>) -> i64 {
+        match extra.and_then(|e| e.expr.as_ref()) {
+            Some(crate::pb::filter_expr::Expr::Number(n)) => {
+                match n.min.as_ref().and_then(|b| b.value.as_ref()) {
+                    Some(crate::pb::filter_bound::Value::Int(code)) => *code,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+fn node_at<'p>(
+    plan: &'p [crate::placement_plan::PlanNode],
+    path: &[usize],
+) -> &'p crate::placement_plan::PlanNode {
+    let mut node = &plan[path[0]];
+    for &i in &path[1..] {
+        node = &node.children[i];
+    }
+    node
+}
+
 #[tonic::async_trait]
 impl SearchService for CoordinatorServiceImpl {
     type QueryStreamStream =
@@ -11422,25 +11596,97 @@ impl SearchService for CoordinatorServiceImpl {
         .await
     }
 
-    /// Placement dry run (`docs/placement.md`). Reserved: the contract is
-    /// in the proto; the evaluation over every shard's stored columns is
-    /// the next branch's work, and until then the call refuses by name
-    /// rather than answering with counts it did not compute.
+    /// Placement dry run (`docs/placement.md`, "The dry run"): what a
+    /// proposed tree would do to the rows this topology holds, from
+    /// filtered counts (`src/placement_plan.rs` has the arithmetic). It
+    /// reads only. A predicate naming a column no shard holds is refused
+    /// by name, the rule every filtered route applies to a typo.
     async fn plan_placement(
         &self,
         request: Request<crate::pb::PlanPlacementRequest>,
     ) -> Result<Response<crate::pb::PlanPlacementResponse>, Status> {
         crate::metrics::timed(Route::PlanPlacement, request, |request| async move {
             self.admit(&request.get_ref().collection)?;
-            let proposed = request.get_ref().proposed.as_ref().ok_or_else(|| {
+            if let Some(snapshot) = self.request_snapshot() {
+                return Box::pin(SearchService::plan_placement(
+                    &snapshot,
+                    crate::metrics::nested(request),
+                ))
+                .await;
+            }
+            let req = request.into_inner();
+            let proposed = req.proposed.as_ref().ok_or_else(|| {
                 Status::invalid_argument("plan_placement: proposed tree is absent")
             })?;
             let config = crate::placement::PlacementTreeConfig::from_proto(proposed);
-            crate::placement::Placement::validate(&config).map_err(Status::invalid_argument)?;
-            Err(Status::unimplemented(
-                "plan_placement: the dry run is not implemented yet (docs/placement.md); the \
-                 proposed tree validated",
-            ))
+            let placement =
+                crate::placement::Placement::validate(&config).map_err(Status::invalid_argument)?;
+            let plan = crate::placement_plan::plan(&placement).map_err(Status::invalid_argument)?;
+            let base = RequestFilters::compile(&[], &req.filter)?;
+            let mut counter = PlanCounter {
+                coordinator: self,
+                base: base.tree,
+                column: placement.column().to_string(),
+                memo: std::collections::HashMap::new(),
+            };
+            let mut cells = Vec::new();
+            let mut rows = 0u64;
+            let mut moving_rows = 0u64;
+            let mut defaulted_rows = 0u64;
+            let mut stack: Vec<(Vec<usize>, &crate::placement_plan::PlanNode)> =
+                plan.iter().enumerate().map(|(i, n)| (vec![i], n)).collect();
+            // Leaves in code order: depth-first, chain order.
+            let mut leaves: Vec<(Vec<usize>, &crate::placement_plan::PlanNode)> = Vec::new();
+            stack.reverse();
+            while let Some((path, node)) = stack.pop() {
+                if node.is_leaf() {
+                    leaves.push((path, node));
+                } else {
+                    for (i, child) in node.children.iter().enumerate().rev() {
+                        let mut p = path.clone();
+                        p.push(i);
+                        stack.push((p, child));
+                    }
+                }
+            }
+            for (path, leaf) in leaves {
+                let per_shard = counter.first(&plan, &path, None).await?;
+                let staying = counter
+                    .first(
+                        &plan,
+                        &path,
+                        Some(crate::placement_plan::code_equals(
+                            &counter.column.clone(),
+                            leaf.code,
+                        )),
+                    )
+                    .await?;
+                for (shard, (count, stay)) in per_shard.iter().zip(&staying).enumerate() {
+                    if *count == 0 {
+                        continue;
+                    }
+                    let moving = count.saturating_sub(*stay);
+                    rows += count;
+                    moving_rows += moving;
+                    if leaf.is_default {
+                        defaulted_rows += count;
+                    }
+                    cells.push(crate::pb::PlacementCell {
+                        shard: shard as u32,
+                        code: leaf.code as u64,
+                        leaf: leaf.name.clone(),
+                        rows: *count,
+                        moving_rows: moving,
+                    });
+                }
+            }
+            Ok(Response::new(crate::pb::PlanPlacementResponse {
+                topology_generation: self.current_topology_generation(),
+                cells,
+                rows,
+                moving_rows,
+                defaulted_rows,
+            }))
         })
         .await
     }

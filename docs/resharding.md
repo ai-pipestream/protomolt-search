@@ -108,6 +108,15 @@ scores share one identity. BM25 postings are
 rebuilt from the logged document records; global df/avgdl re-aggregate
 from `TermStats` at query time as usual.
 
+- **Split by placement code** (`docs/placement.md`): `reshard
+  --placement-column=<col> --placement-ranges=lo..=hi,...[,default]`
+  assigns each logged row to the child whose code range holds the value
+  its placement column carries, with no CEL at replay. Ranges may not
+  overlap; the `default` child takes rows with no value or an uncovered
+  code, and without one such a row refuses the split by id. Children keep
+  the parent's full hash coverage, because routing under a tree is by
+  code first and by hash inside the group.
+
 ### Snapshot installation
 
 `InstallSnapshot` was designed for bulk load and is exactly phase 3 of
