@@ -832,6 +832,28 @@ pub async fn execute(
         .selection
         .as_ref()
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
+    // A pool aggregation (docs/aggregations.md "Aggregating a query's
+    // pool") compiles before anything runs, so a bad spec refuses
+    // without a fan-out; the fold itself runs once the pool is fixed.
+    let pool_aggregate = match req.aggregate.as_ref() {
+        None => None,
+        Some(aggregate) => {
+            if matches!(selection.node, Some(selection_query::Node::Boolean(_))) {
+                return Err(refuse(
+                    "a boolean root aggregates over its exact match set on \
+                     BooleanQuery.aggregate; QueryRequest.aggregate serves the pooled \
+                     shapes (a leaf, a composite, a scorer or boost pool) and a browse",
+                ));
+            }
+            if !aggregate.filter.trim().is_empty() || !aggregate.geo_filters.is_empty() {
+                return Err(refuse(
+                    "QueryRequest.aggregate folds over the selection's candidate pool; its \
+                     own filter and geo_filters must be empty",
+                ));
+            }
+            Some(crate::coordinator::compile_aggregations(aggregate)?)
+        }
+    };
     // Snippets are cut around the lexical leg's occurrence spans, which
     // only the single lexical selection carries to the client; every
     // other shape — the boolean planner included — refuses rather than
@@ -1086,11 +1108,14 @@ pub async fn execute(
     // (and the paging pool), with a scorer it is the pool the scorer
     // reorders, and with a boost it is the pool the boost rescores
     // (the honest form of the rescore window).
+    // An aggregation reads the pool too: it is the set the fold runs
+    // over, so the depth is fixed and paging moves inside it.
     let pooled = matches!(plan.shape, Shape::Composite { .. })
         || scorer.is_some()
         || !req.boosts.is_empty()
         || fp32_rerank
-        || req.collapse.is_some();
+        || req.collapse.is_some()
+        || pool_aggregate.is_some();
     // A collapse over a single leaf deepens its pool itself (below), so
     // the leaf's own depth rules (paging by fetching deeper, a policy
     // depth) do not apply; every other collapse is a fixed pool.
@@ -1158,7 +1183,7 @@ pub async fn execute(
 
     match &plan.shape {
         Shape::Browse => {
-            execute_browse(
+            let mut response = execute_browse(
                 coordinator,
                 &req,
                 &plan,
@@ -1171,9 +1196,30 @@ pub async fn execute(
                 prof,
                 t_total,
             )
-            .await
+            .await?;
+            if let Some(compiled) = &pool_aggregate {
+                // A browse has no pool: its membership is the filter's
+                // exact match set, which the aggregation fan-out
+                // evaluates on the shards directly; `matched` is that
+                // set's size, whatever page was asked for.
+                let filters =
+                    crate::coordinator::RequestFilters::compile(&plan.geo_filters, &filter)?;
+                response.aggregate = Some(
+                    coordinator
+                        .fanout_aggregate(&filters, compiled, None)
+                        .await?,
+                );
+            }
+            Ok(response)
         }
         Shape::Lexical { id, query } if !req.sort.is_empty() => {
+            if pool_aggregate.is_some() {
+                return Err(refuse(
+                    "aggregate over a sorted lexical leaf is not served: the leaf's term \
+                     membership is walked page by page and never held as a set; sort by \
+                     relevance (a pool) or name the membership as a filter (a browse)",
+                ));
+            }
             // A sorted lexical leaf: its exact term membership, walked in
             // column order (validated above: no relevance shape rides
             // along). Analysis happens once here; the shards read the
@@ -1254,6 +1300,7 @@ pub async fn execute(
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed =
                 apply_scorer(coordinator, &scorer, &mut hits, "bm25_search", &mut prof).await?;
+            let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
             let (hits, mut groups, next, executed) = match page_or_collapse(
                 coordinator,
                 hits,
@@ -1280,6 +1327,8 @@ pub async fn execute(
             );
             response.groups = groups;
             response.synonym_expansions = synonym_expansions;
+            response.aggregate =
+                aggregate_pool(coordinator, pool_aggregate.as_ref(), &pool_ids).await?;
             Ok(response)
         }
         Shape::Dense { id, query } => {
@@ -1350,6 +1399,7 @@ pub async fn execute(
             };
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
+            let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
             let (mut hits, mut groups, next, executed) = match page_or_collapse(
                 coordinator,
                 hits,
@@ -1376,6 +1426,8 @@ pub async fn execute(
                 finish_prof(prof, t_total),
             );
             response.groups = groups;
+            response.aggregate =
+                aggregate_pool(coordinator, pool_aggregate.as_ref(), &pool_ids).await?;
             if auto_default_depth {
                 if let (Some(outcome), Some(resolution)) =
                     (dense_execution.as_mut(), quality_resolution.as_ref())
@@ -1549,6 +1601,7 @@ pub async fn execute(
             };
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
+            let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
             let (mut hits, mut groups, next, executed) = match page_or_collapse(
                 coordinator,
                 hits,
@@ -1576,9 +1629,31 @@ pub async fn execute(
             );
             response.groups = groups;
             response.dense_execution = dense_execution;
+            response.aggregate =
+                aggregate_pool(coordinator, pool_aggregate.as_ref(), &pool_ids).await?;
             Ok(response)
         }
     }
+}
+
+/// Fold a pool aggregation over the candidate pool the page was drawn
+/// from (docs/aggregations.md "Aggregating a query's pool"): the same
+/// explicit-id fan-out the boolean root uses, so `matched` is the
+/// pool's size and the folds are the exact ones the Aggregate route
+/// computes over a filter.
+async fn aggregate_pool(
+    coordinator: &CoordinatorServiceImpl,
+    compiled: Option<&crate::coordinator::CompiledAggregate>,
+    pool_ids: &[u64],
+) -> Result<Option<crate::pb::AggregateResponse>, Status> {
+    let Some(compiled) = compiled else {
+        return Ok(None);
+    };
+    let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
+    coordinator
+        .fanout_aggregate(&empty, compiled, Some(pool_ids))
+        .await
+        .map(Some)
 }
 
 /// Apply the composite scorer (when present) to the candidate pool and
