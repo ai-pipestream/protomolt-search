@@ -133,22 +133,102 @@ pub struct TopologyRoute {
     pub addr: String,
     pub replica: Option<String>,
     /// Inclusive stable-key hash range. Every route must either provide a
-    /// range or omit one; mixed/ragged maps are refused.
+    /// range or omit one; mixed/ragged maps are refused. Under a
+    /// placement tree the ranges tile the hash space per leaf.
     pub hash_range: Option<(u64, u64)>,
+    /// The placement code this shard serves (`docs/placement.md`);
+    /// required on every route when the map has a tree, refused
+    /// without one.
+    pub placement: Option<i64>,
 }
 
 struct CoordinatorTopology {
     generation: u64,
     routes: Vec<TopologyRoute>,
     stats_cache: Arc<crate::stats_cache::StatsCache>,
+    /// The validated placement tree of this generation, if any.
+    placement: Option<Arc<crate::placement::Placement>>,
+}
+
+/// One generation's routing inputs: generation, hash range per shard,
+/// placement code per shard, and whether the map has a tree.
+type RoutingView = (u64, Vec<Option<(u64, u64)>>, Vec<Option<i64>>, bool);
+
+/// Inclusive hash ranges `(lo, hi, shard)` must tile `0..=u64::MAX`
+/// with no gap and no overlap.
+fn check_hash_tiling(mut ranges: Vec<(u64, u64, usize)>, scope: &str) -> Result<(), String> {
+    ranges.sort_by_key(|range| range.0);
+    let mut expected = 0u64;
+    for (position, (lo, hi, shard)) in ranges.iter().copied().enumerate() {
+        if lo != expected {
+            return Err(format!(
+                "topology hash space{scope} has a gap or overlap before shard {shard}: expected {expected}, got {lo}"
+            ));
+        }
+        if position + 1 == ranges.len() {
+            if hi != u64::MAX {
+                return Err(format!(
+                    "topology hash space{scope} ends at {hi}, not {}",
+                    u64::MAX
+                ));
+            }
+        } else {
+            expected = hi.checked_add(1).ok_or_else(|| {
+                format!("topology shard {shard} reaches the hash-space end too early")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn build_topology(
     generation: u64,
     routes: Vec<TopologyRoute>,
+    tree: Option<&crate::placement::PlacementTreeConfig>,
 ) -> Result<CoordinatorTopology, String> {
     if routes.is_empty() {
         return Err("topology requires at least one primary shard".to_string());
+    }
+    let placement = match tree {
+        Some(tree) => Some(Arc::new(crate::placement::Placement::validate(tree)?)),
+        None => None,
+    };
+    match placement.as_ref() {
+        None => {
+            if let Some(shard) = routes.iter().position(|route| route.placement.is_some()) {
+                return Err(format!(
+                    "topology shard {shard} carries a placement code but the map has no \
+                     placement tree"
+                ));
+            }
+        }
+        Some(placement) => {
+            let mut served = vec![0usize; placement.leaves().len()];
+            for (shard, route) in routes.iter().enumerate() {
+                let Some(code) = route.placement else {
+                    return Err(format!(
+                        "topology shard {shard} has no placement code; the map has a placement \
+                         tree, so every shard names the leaf it serves"
+                    ));
+                };
+                let Some(index) = placement.leaves().iter().position(|leaf| leaf.code == code)
+                else {
+                    return Err(format!(
+                        "topology shard {shard} names placement code {code}, which is no leaf \
+                         of the tree"
+                    ));
+                };
+                served[index] += 1;
+            }
+            for (leaf, count) in placement.leaves().iter().zip(&served) {
+                if *count == 0 {
+                    return Err(format!(
+                        "placement leaf {:?} (code {}) has no shard",
+                        leaf.name, leaf.code
+                    ));
+                }
+            }
+        }
     }
     let mut addresses = std::collections::HashSet::new();
     for (shard, route) in routes.iter().enumerate() {
@@ -186,33 +266,26 @@ fn build_topology(
         return Err("topology must provide hash ranges for every shard or none".to_string());
     }
     if ranged != 0 {
-        let mut ranges: Vec<(u64, u64, usize)> = routes
-            .iter()
-            .enumerate()
-            .map(|(shard, route)| {
-                let (lo, hi) = route.hash_range.expect("all routes ranged");
-                (lo, hi, shard)
-            })
-            .collect();
-        ranges.sort_by_key(|range| range.0);
-        let mut expected = 0u64;
-        for (position, (lo, hi, shard)) in ranges.iter().copied().enumerate() {
-            if lo != expected {
-                return Err(format!(
-                    "topology hash space has a gap or overlap before shard {shard}: expected {expected}, got {lo}"
-                ));
-            }
-            if position + 1 == ranges.len() {
-                if hi != u64::MAX {
-                    return Err(format!(
-                        "topology hash space ends at {hi}, not {}",
-                        u64::MAX
-                    ));
+        let ranges = |code: Option<i64>| -> Vec<(u64, u64, usize)> {
+            routes
+                .iter()
+                .enumerate()
+                .filter(|(_, route)| code.is_none() || route.placement == code)
+                .map(|(shard, route)| {
+                    let (lo, hi) = route.hash_range.expect("all routes ranged");
+                    (lo, hi, shard)
+                })
+                .collect()
+        };
+        match placement.as_ref() {
+            None => check_hash_tiling(ranges(None), "")?,
+            Some(placement) => {
+                for leaf in placement.leaves() {
+                    check_hash_tiling(
+                        ranges(Some(leaf.code)),
+                        &format!(" of placement leaf {:?}", leaf.name),
+                    )?;
                 }
-            } else {
-                expected = hi.checked_add(1).ok_or_else(|| {
-                    format!("topology shard {shard} reaches the hash-space end too early")
-                })?;
             }
         }
     }
@@ -220,6 +293,7 @@ fn build_topology(
         generation,
         stats_cache: Arc::new(crate::stats_cache::StatsCache::new(routes.len())),
         routes,
+        placement,
     })
 }
 
@@ -349,6 +423,10 @@ pub struct CoordinatorServiceImpl {
     /// Inclusive stable-key ranges parallel to `node_addrs`. Empty for the
     /// legacy explicitly addressed topology.
     hash_ranges: Vec<Option<(u64, u64)>>,
+    /// Placement codes parallel to `node_addrs` (`docs/placement.md`),
+    /// and the validated tree they name. Empty and `None` without one.
+    placement_codes: Vec<Option<i64>>,
+    placement: Option<Arc<crate::placement::Placement>>,
     /// Hot topology authority. Public RPC entry points snapshot this once and
     /// recurse into a frozen clone with this field cleared, so no request can
     /// observe half of two generations.
@@ -1652,10 +1730,28 @@ impl FilterKnown {
         Ok(())
     }
 
+    /// Count the filter leaves that excluded a shard before fan-out as
+    /// resolved (`docs/placement.md`): the leaf predicate that ruled the
+    /// shard out named the same column, so the column is real.
+    fn merge_pruned(&mut self, mask: Option<&crate::placement::ShardMask>) {
+        if let Some(mask) = mask {
+            mark_known(&mut self.tree, &mask.known);
+        }
+    }
+
     /// Refuse a name NO shard resolved.
     fn refuse_unknown(&self, filters: &RequestFilters) -> Result<(), Status> {
         refuse_unknown_geo_columns(&filters.geo, &self.geo)?;
         refuse_unknown_filter_leaves(filters.tree.as_ref(), &self.tree)
+    }
+}
+
+/// Mark filter leaves (indices in walk order) as resolved.
+fn mark_known(flags: &mut [bool], leaves: &[usize]) {
+    for &leaf in leaves {
+        if let Some(flag) = flags.get_mut(leaf) {
+            *flag = true;
+        }
     }
 }
 
@@ -1739,6 +1835,7 @@ impl CoordinatorServiceImpl {
                 crate::diagnostics::CoordinatorKnobValues {
                     max_k: DEFAULT_MAX_K,
                     hedge_delay_ms: 0,
+                    shard_pruning: true,
                 },
                 Vec::new(),
             )),
@@ -1755,6 +1852,8 @@ impl CoordinatorServiceImpl {
             dense_execution_policy: None,
             topology_generation: 0,
             hash_ranges: Vec::new(),
+            placement_codes: Vec::new(),
+            placement: None,
             live_topology: None,
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
             cutover_guard: Arc::new(Mutex::new(None)),
@@ -1815,9 +1914,16 @@ impl CoordinatorServiceImpl {
 
     /// Enable atomic topology replacement. The current fields become the
     /// configured generation's immutable request snapshot.
-    pub fn with_hot_topology(
+    pub fn with_hot_topology(self, hash_ranges: Vec<Option<(u64, u64)>>) -> Result<Self, String> {
+        self.with_hot_topology_placed(hash_ranges, None)
+    }
+
+    /// [`Self::with_hot_topology`] under a placement tree: one code per
+    /// shard, parallel to the addresses (`docs/placement.md`).
+    pub fn with_hot_topology_placed(
         mut self,
         hash_ranges: Vec<Option<(u64, u64)>>,
+        placement: Option<(crate::placement::PlacementTreeConfig, Vec<Option<i64>>)>,
     ) -> Result<Self, String> {
         if hash_ranges.len() != self.node_addrs.len() {
             return Err(format!(
@@ -1826,6 +1932,19 @@ impl CoordinatorServiceImpl {
                 hash_ranges.len()
             ));
         }
+        let (tree, codes) = match placement {
+            Some((tree, codes)) => {
+                if codes.len() != self.node_addrs.len() {
+                    return Err(format!(
+                        "topology has {} shard addresses but {} placement codes",
+                        self.node_addrs.len(),
+                        codes.len()
+                    ));
+                }
+                (Some(tree), codes)
+            }
+            None => (None, vec![None; self.node_addrs.len()]),
+        };
         let routes = self
             .node_addrs
             .iter()
@@ -1834,10 +1953,13 @@ impl CoordinatorServiceImpl {
                 addr: addr.clone(),
                 replica: self.replica_addrs.get(shard).cloned().flatten(),
                 hash_range: hash_ranges.get(shard).copied().flatten(),
+                placement: codes.get(shard).copied().flatten(),
             })
             .collect();
-        let topology = build_topology(self.topology_generation, routes)?;
+        let topology = build_topology(self.topology_generation, routes, tree.as_ref())?;
         self.hash_ranges = hash_ranges;
+        self.placement_codes = codes;
+        self.placement = topology.placement.clone();
         self.live_topology = Some(Arc::new(RwLock::new(Arc::new(topology))));
         Ok(self)
     }
@@ -1848,25 +1970,27 @@ impl CoordinatorServiceImpl {
         &self,
         generation: u64,
         routes: Vec<TopologyRoute>,
+        placement: Option<&crate::placement::PlacementTreeConfig>,
     ) -> Result<(), String> {
         if self.cutover_pending.load(AtomicOrdering::Acquire) {
             return Err(
                 "topology cutover has frozen writes; publish or abort it first".to_string(),
             );
         }
-        self.publish_topology_inner(generation, routes)
+        self.publish_topology_inner(generation, routes, placement)
     }
 
     fn publish_topology_inner(
         &self,
         generation: u64,
         routes: Vec<TopologyRoute>,
+        placement: Option<&crate::placement::PlacementTreeConfig>,
     ) -> Result<(), String> {
         let authority = self
             .live_topology
             .as_ref()
             .ok_or_else(|| "hot topology is not enabled".to_string())?;
-        let replacement = Arc::new(build_topology(generation, routes)?);
+        let replacement = Arc::new(build_topology(generation, routes, placement)?);
         let mut current = authority
             .write()
             .map_err(|_| "topology authority lock is poisoned".to_string())?;
@@ -1904,18 +2028,43 @@ impl CoordinatorServiceImpl {
                 addr: addr.clone(),
                 replica: self.replica_addrs.get(shard).cloned().flatten(),
                 hash_range: self.hash_ranges.get(shard).copied().flatten(),
+                placement: self.placement_codes.get(shard).copied().flatten(),
             })
             .collect()
+    }
+
+    /// The placement tree of the current generation, if the map has one.
+    pub fn current_placement(&self) -> Option<Arc<crate::placement::Placement>> {
+        if let Some(authority) = &self.live_topology {
+            return authority
+                .read()
+                .expect("topology authority lock poisoned")
+                .placement
+                .clone();
+        }
+        self.placement.clone()
     }
 
     /// Resolve an opaque stable product identity under one immutable map.
     /// Returns `(generation, shard_index)` for ingest stamping.
     pub fn route_stable_key(&self, key: &[u8]) -> Result<(u64, usize), String> {
+        self.route_stable_key_in(key, None)
+    }
+
+    /// [`Self::route_stable_key`] inside one placement leaf: under a
+    /// tree the hash ranges tile the space per leaf, so the leaf's code
+    /// is part of the route. A placed topology refuses a leafless route
+    /// and an unplaced one refuses a leaf.
+    pub fn route_stable_key_in(
+        &self,
+        key: &[u8],
+        leaf: Option<i64>,
+    ) -> Result<(u64, usize), String> {
         if key.is_empty() {
             return Err("stable routing key is empty".to_string());
         }
         let hash = stable_routing_hash(key);
-        let (generation, ranges): (u64, Vec<Option<(u64, u64)>>) =
+        let (generation, ranges, codes, placed): RoutingView =
             if let Some(authority) = &self.live_topology {
                 let topology = authority
                     .read()
@@ -1928,18 +2077,92 @@ impl CoordinatorServiceImpl {
                         .iter()
                         .map(|route| route.hash_range)
                         .collect(),
+                    topology
+                        .routes
+                        .iter()
+                        .map(|route| route.placement)
+                        .collect(),
+                    topology.placement.is_some(),
                 )
             } else {
-                (self.topology_generation, self.hash_ranges.clone())
+                (
+                    self.topology_generation,
+                    self.hash_ranges.clone(),
+                    self.placement_codes.clone(),
+                    self.placement.is_some(),
+                )
             };
         if ranges.is_empty() || ranges.iter().any(Option::is_none) {
             return Err("topology has no complete stable hash ranges".to_string());
         }
+        match (placed, leaf) {
+            (true, None) => {
+                return Err(
+                    "the topology has a placement tree; a stable key routes inside a leaf"
+                        .to_string(),
+                )
+            }
+            (false, Some(code)) => {
+                return Err(format!(
+                    "placement code {code} given, but the topology has no placement tree"
+                ))
+            }
+            _ => {}
+        }
         let shard = ranges
             .iter()
-            .position(|range| range.is_some_and(|(lo, hi)| hash >= lo && hash <= hi))
-            .ok_or_else(|| format!("stable hash {hash} is not covered by the topology"))?;
+            .enumerate()
+            .position(|(shard, range)| {
+                leaf.is_none_or(|code| codes.get(shard).copied().flatten() == Some(code))
+                    && range.is_some_and(|(lo, hi)| hash >= lo && hash <= hi)
+            })
+            .ok_or_else(|| match leaf {
+                Some(code) => {
+                    format!("stable hash {hash} is not covered inside placement leaf {code}")
+                }
+                None => format!("stable hash {hash} is not covered by the topology"),
+            })?;
         Ok((generation, shard))
+    }
+
+    /// The shards `filter` cannot match under this generation's placement
+    /// tree (`docs/placement.md`), or `None` when there is no tree, no
+    /// filter, or the `shard_pruning` knob is off. Every fan-out that
+    /// carries a filter asks once and skips the masked shards.
+    pub(crate) fn shard_mask(
+        &self,
+        filter: Option<&crate::pb::FilterExpr>,
+    ) -> Option<crate::placement::ShardMask> {
+        let placement = self.placement.as_ref()?;
+        let filter = filter?;
+        if !self.knobs.shard_pruning() {
+            return None;
+        }
+        Some(crate::placement::ShardMask::compute(
+            placement,
+            &self.placement_codes,
+            filter,
+        ))
+    }
+
+    /// `(shards in the topology, shards the filter skips)` for a profile.
+    pub fn shard_prune_counts(&self, filters: &RequestFilters) -> (u32, u32) {
+        let total = self.node_addrs.len() as u32;
+        let skipped = self
+            .shard_mask(filters.tree.as_ref())
+            .map_or(0, |mask| mask.skipped_count());
+        (total, skipped)
+    }
+
+    /// The known-column accumulator for one fan-out, with the leaves a
+    /// mask already resolved marked.
+    fn filter_known(
+        filters: &RequestFilters,
+        mask: Option<&crate::placement::ShardMask>,
+    ) -> FilterKnown {
+        let mut known = FilterKnown::new(filters);
+        known.merge_pruned(mask);
+        known
     }
 
     fn request_snapshot(&self) -> Option<Self> {
@@ -1965,6 +2188,12 @@ impl CoordinatorServiceImpl {
             .iter()
             .map(|route| route.hash_range)
             .collect();
+        frozen.placement_codes = topology
+            .routes
+            .iter()
+            .map(|route| route.placement)
+            .collect();
+        frozen.placement = topology.placement.clone();
         frozen.stats_cache = topology.stats_cache.clone();
         frozen.live_topology = None;
         Some(frozen)
@@ -2079,19 +2308,29 @@ impl CoordinatorServiceImpl {
     /// omitting `k` runs at). Zero is rejected at config parse time, so
     /// this takes the already-validated value.
     pub fn with_max_k(mut self, max_k: u32) -> Self {
-        self.rebuild_knobs(max_k, self.knobs.hedge_delay());
+        self.rebuild_knobs(max_k, self.knobs.hedge_delay(), self.knobs.shard_pruning());
+        self.refresh_fixed_knobs();
+        self
+    }
+
+    /// Whether a filtered request skips the shards its placement leaf
+    /// rules out (`docs/placement.md`); `false` is the A/B switch and
+    /// changes no answer. Live afterwards as the `shard_pruning` knob.
+    pub fn with_shard_pruning(mut self, enabled: bool) -> Self {
+        self.rebuild_knobs(self.knobs.max_k(), self.knobs.hedge_delay(), enabled);
         self.refresh_fixed_knobs();
         self
     }
 
     /// Builders run before the coordinator is shared, so a knob change
     /// at build time replaces the set; the live values carry over.
-    fn rebuild_knobs(&mut self, max_k: u32, hedge_delay: Option<Duration>) {
+    fn rebuild_knobs(&mut self, max_k: u32, hedge_delay: Option<Duration>, shard_pruning: bool) {
         self.knobs = Arc::new(crate::diagnostics::Knobs::coordinator(
             self.knobs.process().to_string(),
             crate::diagnostics::CoordinatorKnobValues {
                 max_k,
                 hedge_delay_ms: hedge_delay.map_or(0, |d| d.as_millis() as u64),
+                shard_pruning,
             },
             Vec::new(),
         ));
@@ -2292,7 +2531,11 @@ impl CoordinatorServiceImpl {
     /// Configure per-shard deadlines and hedging.
     pub fn with_limits(mut self, limits: FanoutLimits) -> Self {
         self.limits = limits;
-        self.rebuild_knobs(self.knobs.max_k(), limits.hedge_delay);
+        self.rebuild_knobs(
+            self.knobs.max_k(),
+            limits.hedge_delay,
+            self.knobs.shard_pruning(),
+        );
         self.refresh_fixed_knobs();
         self
     }
@@ -3395,7 +3638,11 @@ impl CoordinatorServiceImpl {
                 progress: self.query_progress.clone(),
             }))
         });
+        let mask = self.shard_mask(filter);
         for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = Bm25QueryRequest {
                 highlight: highlight.cloned(),
                 projections: projections.to_vec(),
@@ -3624,6 +3871,9 @@ impl CoordinatorServiceImpl {
             )));
         }
         refuse_unknown_geo_columns(geo_filters, &geo_known)?;
+        if let Some(mask) = mask.as_ref() {
+            mark_known(&mut filter_known, &mask.known);
+        }
         refuse_unknown_filter_leaves(filter, &filter_known)?;
         // A projection column NO shard knows is a typo answering
         // all-absent — refuse it by name. A partially-known column is
@@ -4608,7 +4858,11 @@ impl CoordinatorServiceImpl {
                 progress: self.query_progress.clone(),
             }))
         });
+        let mask = self.shard_mask(filter);
         for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = Bm25QueryRequest {
                 highlight: highlight.cloned(),
                 projections: Vec::new(),
@@ -4758,6 +5012,9 @@ impl CoordinatorServiceImpl {
             }
         }
         refuse_unknown_geo_columns(geo_filters, &geo_known)?;
+        if let Some(mask) = mask.as_ref() {
+            mark_known(&mut filter_known, &mask.known);
+        }
         refuse_unknown_filter_leaves(filter, &filter_known)?;
         let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
@@ -5044,8 +5301,12 @@ impl CoordinatorServiceImpl {
         let mut vector_global = fusion::merge_legs_by_score(vector_shards);
 
         let (_, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = ShardLegsRequest {
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
@@ -5071,7 +5332,7 @@ impl CoordinatorServiceImpl {
         }
         let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
         let mut shard_debug = Vec::new();
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         for task in shard_tasks {
             let (shard, elapsed, response) = task
                 .await
@@ -5206,8 +5467,12 @@ impl CoordinatorServiceImpl {
         }
         let t_legs = std::time::Instant::now();
         let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = ShardLegsRequest {
                 request_id: String::new(),
                 k: legs.leg_k,
@@ -5238,7 +5503,7 @@ impl CoordinatorServiceImpl {
         let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
         let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
         let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         for task in shard_tasks {
             let (shard, rpc_ms, response) = task
                 .await
@@ -5393,8 +5658,12 @@ impl CoordinatorServiceImpl {
             .clustered_local_vector_legs(request_id, vector, legs.leg_k, filters, &ranges)
             .await?;
         let (_, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = ShardLegsRequest {
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
@@ -5420,7 +5689,7 @@ impl CoordinatorServiceImpl {
         }
         let mut shard_lists: Vec<(u32, Vec<HybridLegHit>)> = Vec::with_capacity(tasks.len());
         let mut shard_debug = Vec::new();
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         for task in tasks {
             let (shard, elapsed, response) = task
                 .await
@@ -5558,8 +5827,12 @@ impl CoordinatorServiceImpl {
         let t_legs = std::time::Instant::now();
         // Level one: per-shard local fusion.
         let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = HybridShardRequest {
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
@@ -5594,7 +5867,7 @@ impl CoordinatorServiceImpl {
         }
         let mut shard_lists: Vec<(u32, Vec<crate::pb::HybridLegHit>)> = Vec::new();
         let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         for task in shard_tasks {
             let (shard, rpc_ms, mut hits, geo_known, filter_known) = task
                 .await
@@ -5729,7 +6002,8 @@ impl CoordinatorServiceImpl {
         // is untouched by them: a filter only REMOVES documents, so
         // every bound that dominated the unfiltered corpus still
         // dominates the survivors (docs/vector-filters.md).
-        let mut known = FilterKnown::new(filters);
+        let mask = self.shard_mask(filters.tree.as_ref());
+        let mut known = Self::filter_known(filters, mask.as_ref());
         let w_v = f64::from(legs.vector_weight);
         let w_b = f64::from(legs.bm25_weight);
         let fused_of = |v: f32, b: f32| w_v * f64::from(v) + w_b * f64::from(b);
@@ -5745,6 +6019,9 @@ impl CoordinatorServiceImpl {
         if !terms.is_empty() {
             let mut leg_tasks = Vec::with_capacity(n_nodes);
             for (shard, node) in self.node_addrs.iter().enumerate() {
+                if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                    continue;
+                }
                 let request = Bm25QueryRequest {
                     highlight: None,
                     projections: Vec::new(),
@@ -5947,6 +6224,15 @@ impl CoordinatorServiceImpl {
             let mut fanout =
                 self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
             let mut remaining = n_nodes;
+            for (shard, summary) in summaries.iter_mut().enumerate() {
+                if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                    *summary = Some(StreamSearchSummary {
+                        completed: true,
+                        ..Default::default()
+                    });
+                    remaining -= 1;
+                }
+            }
             while remaining > 0 {
                 let (shard, msg) = match fanout.next_message(&summaries).await {
                     Ok(Some(pair)) => pair,
@@ -6357,11 +6643,18 @@ impl CoordinatorServiceImpl {
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
-        let mut known = FilterKnown::new(filters);
+        let mask = self.shard_mask(filters.tree.as_ref());
+        let mut known = Self::filter_known(filters, mask.as_ref());
+        let active = (0..n_nodes)
+            .filter(|shard| !mask.as_ref().is_some_and(|m| m.skipped[*shard]))
+            .count();
 
         let (done_tx, mut done_rx) =
             mpsc::channel::<(u32, f32, Result<SearchShardDone, Status>)>(n_nodes);
         for shard in 0..n_nodes {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let primary = self.node_client(&self.node_addrs[shard])?;
             let replica = match self.replica_addrs.get(shard).and_then(|r| r.as_deref()) {
                 Some(addr) => Some(self.node_client(addr)?),
@@ -6383,7 +6676,16 @@ impl CoordinatorServiceImpl {
         let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = Vec::with_capacity(n_nodes);
         let mut shard_stats: Vec<Option<ShardScanStats>> = Vec::with_capacity(n_nodes);
         let mut shard_wall_ms: Vec<(u32, f32)> = Vec::with_capacity(n_nodes);
-        for _ in 0..n_nodes {
+        // A skipped shard is a shard with no matching row: no hits, no
+        // stats, no wall time.
+        for shard in 0..n_nodes {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                shard_hits.push((shard as u32, Vec::new()));
+                shard_stats.push(None);
+                shard_wall_ms.push((shard as u32, 0.0));
+            }
+        }
+        for _ in 0..active {
             match done_rx.recv().await {
                 Some((shard, wall_ms, Ok(done))) => {
                     known.merge(&done.geo_columns_known, &done.filter_columns_known)?;
@@ -6445,7 +6747,13 @@ impl CoordinatorServiceImpl {
         let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
             Vec::with_capacity(n_nodes);
         let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
+        let mask = self.shard_mask(filters.tree.as_ref());
         for shard in 0..n_nodes {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                floor_txs.push(None);
+                udp_lanes.push(None);
+                continue;
+            }
             let mut client = self.node_client(&self.node_addrs[shard])?;
             let lane = self
                 .floor_target(&self.node_addrs[shard])
@@ -6578,7 +6886,8 @@ impl CoordinatorServiceImpl {
             });
         }
 
-        let mut known = FilterKnown::new(filters);
+        let mask = self.shard_mask(filters.tree.as_ref());
+        let mut known = Self::filter_known(filters, mask.as_ref());
         let mut fanout =
             self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
 
@@ -6588,6 +6897,15 @@ impl CoordinatorServiceImpl {
             std::collections::BinaryHeap::with_capacity(k as usize + 1);
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;
+        for (shard, summary) in summaries.iter_mut().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                *summary = Some(StreamSearchSummary {
+                    completed: true,
+                    ..Default::default()
+                });
+                remaining -= 1;
+            }
+        }
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
         let mut floors_sent = 0u64;
         let mut scoring_fingerprint: Option<String> = None;
@@ -6757,11 +7075,21 @@ impl CoordinatorServiceImpl {
                 floors_sent: 0,
             });
         }
-        let mut known = FilterKnown::new(filters);
+        let mask = self.shard_mask(filters.tree.as_ref());
+        let mut known = Self::filter_known(filters, mask.as_ref());
         let mut fanout = self.open_stream_fanout(request_id, vector, None, true, filters)?;
         let mut parents: HashMap<u64, ParentAgg> = HashMap::new();
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;
+        for (shard, summary) in summaries.iter_mut().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                *summary = Some(StreamSearchSummary {
+                    completed: true,
+                    ..Default::default()
+                });
+                remaining -= 1;
+            }
+        }
         // The k-th best parent score, recomputed lazily: only a batch
         // that raised some parent's best (or added a parent) can move
         // it, and floors derive from nothing else.
@@ -6938,11 +7266,18 @@ impl CoordinatorServiceImpl {
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
-        let mut known = FilterKnown::new(filters);
+        let mask = self.shard_mask(filters.tree.as_ref());
+        let mut known = Self::filter_known(filters, mask.as_ref());
+        let active = (0..n_nodes)
+            .filter(|shard| !mask.as_ref().is_some_and(|m| m.skipped[*shard]))
+            .count();
 
         let (done_tx, mut done_rx) =
             mpsc::channel::<(u32, f32, Result<SearchShardDone, Status>)>(n_nodes);
         for shard in 0..n_nodes {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let primary = self.node_client(&self.node_addrs[shard])?;
             let replica = match self.replica_addrs.get(shard).and_then(|r| r.as_deref()) {
                 Some(addr) => Some(self.node_client(addr)?),
@@ -6968,7 +7303,16 @@ impl CoordinatorServiceImpl {
         // vector id asc (globally unique), deterministic across arrival
         // orders.
         let mut best: HashMap<u64, ScoredHit> = HashMap::new();
-        for _ in 0..n_nodes {
+        // A skipped shard is a shard with no matching row: no hits, no
+        // stats, no wall time.
+        for shard in 0..n_nodes {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                shard_hits.push((shard as u32, Vec::new()));
+                shard_stats.push(None);
+                shard_wall_ms.push((shard as u32, 0.0));
+            }
+        }
+        for _ in 0..active {
             match done_rx.recv().await {
                 Some((shard, wall_ms, Ok(done))) => {
                     known.merge(&done.geo_columns_known, &done.filter_columns_known)?;
@@ -7728,8 +8072,12 @@ impl CoordinatorServiceImpl {
     ) -> Result<BrowseRows, Status> {
         use crate::sortkeys::{cmp_rows, Key, Value};
         let k = self.resolve_k(k)?;
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = crate::pb::BrowseShardRequest {
                 k,
                 after: after.as_ref().map_or(0, |a| a.id),
@@ -7748,7 +8096,7 @@ impl CoordinatorServiceImpl {
                 client?.browse_shard(request).await.map(|r| r.into_inner())
             }));
         }
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         let mut sort_known = vec![false; sort.len()];
         struct Row {
             keys: Vec<Key>,
@@ -7932,8 +8280,12 @@ impl CoordinatorServiceImpl {
         &self,
         filters: &RequestFilters,
     ) -> Result<MembershipSet, Status> {
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = crate::pb::FilterBitmapRequest {
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
@@ -7946,7 +8298,7 @@ impl CoordinatorServiceImpl {
                     .map(|response| response.into_inner())
             }));
         }
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         let mut merged = MembershipSet::default();
         for task in tasks {
             let response = task.await.map_err(|error| {
@@ -8077,8 +8429,12 @@ impl CoordinatorServiceImpl {
             return Ok(None);
         }
 
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = crate::pb::FilterBitmapRequest {
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
@@ -8092,7 +8448,7 @@ impl CoordinatorServiceImpl {
             }));
         }
 
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         let mut bitmaps = Vec::with_capacity(tasks.len());
         for task in tasks {
             let response = task.await.map_err(|error| {
@@ -8656,8 +9012,12 @@ impl CoordinatorServiceImpl {
         } = compiled;
         let grouping = !group_by.is_empty();
         let group_cap = *max_groups as usize;
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = crate::pb::AggregateShardRequest {
                 filter: filters.tree.clone(),
                 geo_filters: filters.geo.clone(),
@@ -8688,7 +9048,7 @@ impl CoordinatorServiceImpl {
         {
             crate::values::column_leaves(expr, &mut leaves);
         }
-        let mut known = FilterKnown::new(filters);
+        let mut known = Self::filter_known(filters, mask.as_ref());
         let mut leaves_known = vec![false; leaves.len()];
         let mut group_column_known = !grouping;
         let mut matched = 0u64;
@@ -8993,8 +9353,12 @@ impl CoordinatorServiceImpl {
         targets: &[crate::pb::QuantileTarget],
         doc_ids: Option<&[u64]>,
     ) -> Result<Vec<u64>, Status> {
+        let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
             let request = crate::pb::QuantileCountsRequest {
                 filter: filters.tree.clone(),
                 geo_filters: filters.geo.clone(),
@@ -9780,8 +10144,17 @@ impl CoordinatorServiceImpl {
         let mapped_bind = bind
             .bind
             .ok_or_else(|| Status::invalid_argument("routed mapped bind is missing bind"))?;
+        // Under a placement tree the coordinator evaluates the tree over
+        // each document's own columns and routes inside the leaf it
+        // picks (docs/placement.md); the leaf's shards fill the
+        // placement column from their pinned code.
+        let placer = match self.placement.as_ref() {
+            Some(placement) => Some(PlacementRouter::new(Arc::clone(placement), &mapped_bind)?),
+            None => None,
+        };
         let mut batches: Vec<Vec<crate::pb::IngestMappedRequest>> =
             vec![Vec::new(); self.node_addrs.len()];
+        let mut position = 0u64;
         while let Some(message) = tokio_stream::StreamExt::next(&mut inbound)
             .await
             .transpose()?
@@ -9801,8 +10174,13 @@ impl CoordinatorServiceImpl {
                     ))
                 }
             };
+            let leaf = match placer.as_ref() {
+                Some(placer) => Some(placer.leaf_of(&document.document, position)?),
+                None => None,
+            };
+            position += 1;
             let (_, shard) = self
-                .route_stable_key(&document.stable_key)
+                .route_stable_key_in(&document.stable_key, leaf)
                 .map_err(Status::invalid_argument)?;
             if batches[shard].is_empty() {
                 batches[shard].push(crate::pb::IngestMappedRequest {
@@ -9857,6 +10235,86 @@ impl CoordinatorServiceImpl {
             served_topology_generation: self.topology_generation,
             shards,
         })
+    }
+}
+
+/// One routed ingest stream's placement evaluator: the bind's plan as
+/// an extractor, its materialize spec compiled, and the tree. A source
+/// document's rows (one per chunk on a chunked plan) must agree on the
+/// leaf, since the rows of one source go to one shard.
+struct PlacementRouter {
+    placement: Arc<crate::placement::Placement>,
+    extractor: crate::mapping::Extractor,
+    materialize: Vec<(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)>,
+}
+
+impl PlacementRouter {
+    fn new(
+        placement: Arc<crate::placement::Placement>,
+        bind: &crate::pb::MappedBind,
+    ) -> Result<Self, Status> {
+        let extractor = crate::mapping::Extractor::new(
+            &bind.descriptor_set,
+            &bind.message_type,
+            &bind.body_path,
+        )?;
+        let materialize = match bind.materialize.as_ref() {
+            Some(spec) => crate::node::compile_materialize_spec(spec)?,
+            None => Vec::new(),
+        };
+        Ok(PlacementRouter {
+            placement,
+            extractor,
+            materialize,
+        })
+    }
+
+    /// The placement code of one source document at `position` in the
+    /// stream. Quality and geography columns are derived on the node
+    /// after analysis and are absent here, so a predicate on one is
+    /// UNKNOWN at routing time and falls through to the default.
+    fn leaf_of(&self, bytes: &[u8], position: u64) -> Result<i64, Status> {
+        let rows = self.extractor.extract(bytes).map_err(|status| {
+            Status::new(
+                status.code(),
+                format!("document {position}: {}", status.message()),
+            )
+        })?;
+        if rows.is_empty() {
+            let empty = crate::pb::AddDocumentsRequest::default();
+            let leaf = self
+                .placement
+                .evaluate(&empty)
+                .map_err(Status::invalid_argument)?;
+            return Ok(leaf.code);
+        }
+        let mut chosen: Option<(i64, String)> = None;
+        for extracted in rows {
+            let doc = crate::node::apply_materialize(extracted.request, &self.materialize)
+                .map_err(|status| {
+                    Status::new(
+                        status.code(),
+                        format!("document {position}: {}", status.message()),
+                    )
+                })?;
+            let leaf = self
+                .placement
+                .evaluate(&doc)
+                .map_err(|e| Status::invalid_argument(format!("document {position}: {e}")))?;
+            match chosen.as_ref() {
+                None => chosen = Some((leaf.code, leaf.name.clone())),
+                Some((code, name)) if *code != leaf.code => {
+                    return Err(Status::invalid_argument(format!(
+                        "document {position}: its rows evaluate to placement leaves {name:?} and \
+                         {:?}; the rows of one source document go to one shard, so a placement \
+                         predicate reads parent-scope columns, not chunk-scope ones",
+                        leaf.name
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(chosen.expect("at least one row").0)
     }
 }
 
@@ -10879,8 +11337,13 @@ impl SearchService for CoordinatorServiceImpl {
                     replica: (!shard.replica.is_empty())
                         .then(|| crate::config::normalize_addr(shard.replica)),
                     hash_range: Some((shard.hash_lo, shard.hash_hi)),
+                    placement: shard.has_placement.then_some(shard.placement as i64),
                 })
                 .collect();
+            let tree = req
+                .placement
+                .as_ref()
+                .map(crate::placement::PlacementTreeConfig::from_proto);
             let mut held = self
                 .cutover_guard
                 .lock()
@@ -10893,7 +11356,7 @@ impl SearchService for CoordinatorServiceImpl {
             if *token != req.cutover_token {
                 return Err(Status::permission_denied("cutover token does not match"));
             }
-            self.publish_topology_inner(req.generation, routes)
+            self.publish_topology_inner(req.generation, routes, tree.as_ref())
                 .map_err(Status::invalid_argument)?;
             held.take();
             self.cutover_pending.store(false, AtomicOrdering::Release);
@@ -11630,19 +12093,20 @@ mod stream_cancel_tests {
             addr: addr.to_string(),
             replica: None,
             hash_range: Some((lo, hi)),
+            placement: None,
         }
     }
 
     #[test]
     fn topology_refuses_ragged_or_incomplete_hash_space() {
         assert!(
-            build_topology(1, vec![route("a", 0, 9), route("b", 11, u64::MAX)])
+            build_topology(1, vec![route("a", 0, 9), route("b", 11, u64::MAX)], None)
                 .err()
                 .expect("gap must be refused")
                 .contains("gap or overlap")
         );
         assert!(
-            build_topology(1, vec![route("a", 0, 10), route("b", 10, u64::MAX)])
+            build_topology(1, vec![route("a", 0, 10), route("b", 10, u64::MAX)], None)
                 .err()
                 .expect("overlap must be refused")
                 .contains("gap or overlap")
@@ -11655,8 +12119,10 @@ mod stream_cancel_tests {
                     addr: "b".to_string(),
                     replica: None,
                     hash_range: None,
+                    placement: None,
                 }
-            ]
+            ],
+            None
         )
         .err()
         .expect("ragged ranges must be refused")
@@ -11668,9 +12134,11 @@ mod stream_cancel_tests {
                     addr: "a".into(),
                     replica: Some("b".into()),
                     hash_range: Some((0, 9)),
+                    placement: None,
                 },
                 route("b", 10, u64::MAX),
             ],
+            None,
         )
         .err()
         .expect("a replica cannot also serve another logical shard")
@@ -11686,7 +12154,7 @@ mod stream_cancel_tests {
         let old = coordinator.request_snapshot().unwrap();
 
         coordinator
-            .reload_topology(5, vec![route("new", 0, u64::MAX)])
+            .reload_topology(5, vec![route("new", 0, u64::MAX)], None)
             .unwrap();
         let new = coordinator.request_snapshot().unwrap();
 
@@ -11696,7 +12164,7 @@ mod stream_cancel_tests {
         assert_eq!(new.node_addrs, vec!["new"]);
         assert_eq!(coordinator.current_topology_generation(), 5);
         assert!(coordinator
-            .reload_topology(5, vec![route("newer", 0, u64::MAX)])
+            .reload_topology(5, vec![route("newer", 0, u64::MAX)], None)
             .unwrap_err()
             .contains("must increase"));
     }
@@ -11718,7 +12186,7 @@ mod stream_cancel_tests {
         .unwrap()
         .into_inner();
         assert!(coordinator
-            .reload_topology(5, vec![route("other", 0, u64::MAX)])
+            .reload_topology(5, vec![route("other", 0, u64::MAX)], None)
             .unwrap_err()
             .contains("frozen writes"));
 

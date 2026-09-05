@@ -63,6 +63,7 @@ fn topology_routes(map: &ShardMap) -> Result<Vec<TopologyRoute>, String> {
                 addr: normalize_addr(entry.addr.clone()),
                 replica: entry.replica.clone().map(normalize_addr),
                 hash_range,
+                placement: entry.placement.map(|code| code as i64),
             })
         })
         .collect()
@@ -245,6 +246,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 map_facet_fields: cfg.map_facet_fields.clone(),
                 map_numeric_fields: cfg.map_numeric_fields.clone(),
                 integer_fields: cfg.integer_fields.clone(),
+                placement_column: cfg.placement_column.clone(),
+                placement_leaf: cfg.placement_leaf,
                 geo_fields: cfg.geo_fields.clone(),
                 wal: shard.wal,
                 wal_buckets: shard.wal_buckets,
@@ -340,6 +343,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             map_facet_fields: cfg.map_facet_fields.clone(),
             map_numeric_fields: cfg.map_numeric_fields.clone(),
             integer_fields: cfg.integer_fields.clone(),
+            placement_column: cfg.placement_column.clone(),
+            placement_leaf: cfg.placement_leaf,
             geo_fields: cfg.geo_fields.clone(),
             position_fields: cfg.position_fields.clone(),
             bigram_fields: cfg.bigram_fields.clone(),
@@ -659,6 +664,7 @@ async fn build_corpus(
         .with_stream_search(cfg.stream_search)
         .with_bm25_stream(cfg.bm25_stream)
         .with_max_k(cfg.max_k)
+        .with_shard_pruning(cfg.shard_pruning)
         .with_max_rerank_bytes(cfg.max_rerank_bytes)
         .with_topology_generation(dataset.shard_map.map_or(0, |map| map.generation))
         .with_collection(dataset.name);
@@ -729,11 +735,13 @@ async fn build_corpus(
         coordinator = coordinator.with_clustered_turbovec(backend);
     }
     if let Some(map) = dataset.shard_map {
-        let ranges = topology_routes(map)?
-            .into_iter()
-            .map(|route| route.hash_range)
-            .collect();
-        coordinator = coordinator.with_hot_topology(ranges)?;
+        let routes = topology_routes(map)?;
+        let ranges = routes.iter().map(|route| route.hash_range).collect();
+        let placement = map
+            .placement
+            .clone()
+            .map(|tree| (tree, routes.iter().map(|route| route.placement).collect()));
+        coordinator = coordinator.with_hot_topology_placed(ranges, placement)?;
         eprintln!(
             "shard map generation {} ({} shards)",
             map.generation,
@@ -771,9 +779,13 @@ async fn build_corpus(
                                 continue;
                             }
                             let generation = candidate.generation;
-                            match topology_routes(&candidate)
-                                .and_then(|routes| reload.reload_topology(generation, routes))
-                            {
+                            match topology_routes(&candidate).and_then(|routes| {
+                                reload.reload_topology(
+                                    generation,
+                                    routes,
+                                    candidate.placement.as_ref(),
+                                )
+                            }) {
                                 Ok(()) => eprintln!(
                                     "shard-map generation {generation} published atomically ({} shards)",
                                     candidate.shards.len()

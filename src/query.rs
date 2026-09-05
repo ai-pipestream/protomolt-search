@@ -630,6 +630,10 @@ async fn execute_recursive_boolean(
         profile.selection_ms = ms(t_selection);
         profile.segments_total = plan_prune.segments_total;
         profile.segments_skipped = plan_prune.segments_skipped;
+        // A boolean root resolves each clause on its own shard set; the
+        // profile counts the topology and reports no plan-level skip.
+        let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
+        profile.shards_total = coordinator.shard_prune_counts(&empty).0;
     }
     apply_boosts(
         coordinator,
@@ -904,6 +908,14 @@ pub async fn execute(
         .map(|c| format!("({c})"))
         .collect::<Vec<_>>()
         .join(" && ");
+    if let Some(p) = prof.as_mut() {
+        // The shards the plan's filter rules out before fan-out
+        // (docs/placement.md); a plan without a filter skips none.
+        let filters = crate::coordinator::RequestFilters::compile(&plan.geo_filters, &filter)?;
+        let (total, skipped) = coordinator.shard_prune_counts(&filters);
+        p.shards_total = total;
+        p.shards_skipped = skipped;
+    }
     let mut dense_execution = match &plan.shape {
         Shape::Dense { query, .. } | Shape::Composite { dense: query, .. } => {
             let requested = dense_execution_mode(query)?;

@@ -1511,6 +1511,7 @@ impl DurableControlPlane {
                     addr: route.addr.clone(),
                     replica: route.replica.clone(),
                     hash_range: Some((route.hash_lo, route.hash_hi)),
+                    placement: None,
                 })
                 .collect(),
         ))
@@ -1685,6 +1686,15 @@ impl ClusterControlService {
             return Ok(());
         };
         let (generation, routes) = self.plane.topology_routes()?;
+        // The durable control state holds hash ranges and addresses, not
+        // placement codes: publishing over a placed generation would
+        // strip the tree, so it is refused until the plane carries it.
+        if coordinator.current_placement().is_some() {
+            return Err(Status::failed_precondition(
+                "the live topology has a placement tree (docs/placement.md); the control \
+                 plane does not publish placed topologies yet",
+            ));
+        }
         let current = coordinator.current_topology_generation();
         if generation == current {
             if routes == coordinator.current_topology_routes() {
@@ -1700,7 +1710,7 @@ impl ClusterControlService {
             )));
         }
         coordinator
-            .reload_topology(generation, routes)
+            .reload_topology(generation, routes, None)
             .map_err(|error| Status::failed_precondition(format!("publish topology: {error}")))
     }
 
@@ -2188,6 +2198,7 @@ mod tests {
             addr: "http://a".into(),
             replica: None,
             hash_range: Some((0, u64::MAX)),
+            placement: None,
         }];
         plane.bootstrap_topology(4, &routes).unwrap();
         let node = register(&plane, "a", "http://a", "az-a", 100);
@@ -2216,6 +2227,7 @@ mod tests {
                     addr: "http://a".into(),
                     replica: None,
                     hash_range: None,
+                    placement: None,
                 }],
             )
             .unwrap_err();
@@ -2228,6 +2240,7 @@ mod tests {
                     addr: "http://a".into(),
                     replica: None,
                     hash_range: Some((0, u64::MAX)),
+                    placement: None,
                 }],
             )
             .unwrap();
@@ -2238,6 +2251,7 @@ mod tests {
                     addr: "http://b".into(),
                     replica: None,
                     hash_range: Some((0, u64::MAX)),
+                    placement: None,
                 }],
             )
             .unwrap();

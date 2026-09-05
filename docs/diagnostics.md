@@ -41,7 +41,8 @@ value that does not parse for the knob's kind returns
 | `floor_min_interval_ms` | node | int | yes | Shortest gap between floor publications; 0 publishes on each movement. |
 | `max_k` | coordinator | int | yes | Largest `k` a request may ask for, and the depth an omitted `k` runs at (`--max-k`). Zero is rejected. |
 | `hedge_delay_ms` | coordinator | int | yes | Wait on a shard's primary before racing its replica; 0 disables hedging. |
-| `chunk_blocks`, `block_max`, `coalesce`, `scan_parallel`, `rerank_parallel`, `layout`, `vector_mmap`, `seal_tail_docs`, `bit_width`, `slot_offset`, `collection`, `vector_backend` | node | | no | Read at startup. |
+| `shard_pruning` | coordinator | bool | yes | Skip shards whose placement leaf rules out the request's filter before fan-out (`--shard-pruning`, `docs/placement.md`). |
+| `chunk_blocks`, `block_max`, `coalesce`, `scan_parallel`, `rerank_parallel`, `layout`, `vector_mmap`, `seal_tail_docs`, `bit_width`, `slot_offset`, `collection`, `vector_backend`, `placement_column`, `placement_leaf` | node | | no | Read at startup. |
 | `collection`, `nodes`, `replicas`, `stream_search`, `bm25_stream`, `max_rerank_bytes`, `shard_deadline_ms`, `dense_execution_policy` | coordinator | | no | Read at startup. |
 
 A coordinator serving several collections shares one process-wide set
@@ -91,7 +92,9 @@ answers for its own shard: the layout (`segments` or `single-image`),
 the catalog epoch, rows, live rows, tombstones, rows in the unsealed
 tail, the partition key when a partitioned compaction set one, the
 scoring fingerprint, the live values of `segment_pruning` and
-`floor_sharing`, and every sealed segment with its id, generation, base
+`floor_sharing`, the placement code the shard serves and whether its
+segments carry more than one (`docs/placement.md`), and every sealed
+segment with its id, generation, base
 row, rows, live rows, whether it has a summary, the summary's
 column ranges (integer columns with `lo`/`hi`, double columns with
 `lo_f`/`hi_f` and `floating = true`, each with the count of rows that have a

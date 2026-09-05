@@ -1322,6 +1322,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Landed 2026-09-05: placement ingest and shard pruning.** Under a
+  placement tree the coordinator evaluates the tree per routed document
+  and hashes inside the leaf; a node declares the column
+  (`--placement-column`) and pins its leaf (`--placement-leaf`), filling
+  the value on direct ingest and refusing another code by name. Every
+  filtered fan-out skips the shards whose leaf rules the filter out,
+  with `--shard-pruning` as the A/B switch, the coordinator knob
+  `shard_pruning` live, and `shards_total` / `shards_skipped` on the
+  profile. The answer is identical either way (`tests/placement.rs`).
+  [Placement trees](docs/placement.md).
+
 - **Reserved 2026-09-05: placement trees.** `PlacementTree` and
   `PlacementNode` in the proto, the `[placement]` table of the shard map,
   `src/placement.rs` (validation, the prefix code), and
