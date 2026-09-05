@@ -27,6 +27,15 @@
 //! - `Health`: the children's reports merged, served only when the
 //!   children's slot ranges are contiguous so the range the parent
 //!   derives is real. A relay has no WAL and reports none.
+//! - The keyword leg (`Bm25Query`, `Bm25PhraseQuery`, `Bm25QueryStream`,
+//!   `Bm25Rescore`): the root's global statistics travel to each child
+//!   unchanged, the parent's epoch claim (a relay token) is translated
+//!   into each child's recorded claim, candidates and cutoffs pass
+//!   untouched, and the children's terminal responses merge by value
+//!   with checked arithmetic. Column statistics and exact cardinalities
+//!   are refused by name (a fold whose order the root pins, and a union
+//!   of values, are not this level's to compute). `Bm25Rescore` routes
+//!   each candidate id to the child whose slot range holds it.
 //!
 //! Every other `NodeService` route refuses UNIMPLEMENTED naming the route
 //! and the relay: no ingest, no administration, no aggregation, no
@@ -57,9 +66,12 @@ use crate::metrics::Route;
 use crate::node::STALE_STATS_EPOCH;
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
-    stream_search_request, stream_search_response, HealthRequest, HealthResponse,
-    StreamSearchRequest, StreamSearchResponse, StreamSearchSummary, TermStatsRequest,
-    TermStatsResponse,
+    bm25_query_stream_request, bm25_query_stream_response, stream_search_request,
+    stream_search_response, Bm25PhraseQueryRequest, Bm25QueryRequest, Bm25QueryResponse,
+    Bm25QueryStreamRequest, Bm25QueryStreamResponse, Bm25RescoreRequest, Bm25RescoreResponse,
+    Bm25StreamCompletion, FloorUpdate, HealthRequest, HealthResponse, ShardLegsRequest,
+    ShardLegsResponse, StopBm25Query, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, TermStatsRequest, TermStatsResponse,
 };
 
 /// Relay tokens retained per relay; the oldest is forgotten first. A
@@ -550,7 +562,8 @@ fn grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
 fn refused(route: &str) -> Status {
     Status::unimplemented(format!(
         "relay: NodeService.{route} is not served by a relay coordinator; a relay forwards \
-         StreamSearch, TermStats, and Health only (docs/relay-coordinators.md)"
+         StreamSearch, TermStats, Health, and the keyword leg (Bm25Query, Bm25PhraseQuery, \
+         Bm25QueryStream, Bm25Rescore, ShardLegs) only (docs/relay-coordinators.md)"
     ))
 }
 
@@ -849,7 +862,7 @@ async fn relay_stream(
             "relay: a relay coordinator has no children",
         ));
     }
-    let identity_limits = start.identity_limits.clone();
+    let identity_limits = start.identity_limits;
     if let Some(limits) = identity_limits.as_ref() {
         crate::query_identity::validate_limits(limits)?;
     }
@@ -861,7 +874,7 @@ async fn relay_stream(
         start.initial_floor,
         start.collapse_parents,
         &filters,
-        identity_limits.clone(),
+        identity_limits,
     )?;
     let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n];
     let mut remaining = n;
@@ -1129,7 +1142,7 @@ async fn relay_stream(
                 .flatten()
                 .fold(None::<crate::pb::StreamIdentityRange>, |acc, range| {
                     Some(match acc {
-                        None => range.clone(),
+                        None => *range,
                         Some(acc) => crate::pb::StreamIdentityRange {
                             first_id: acc.first_id.min(range.first_id),
                             last_id: acc.last_id.max(range.last_id),
@@ -1253,12 +1266,617 @@ async fn relay_stream(
     Ok(())
 }
 
+// --- The keyword leg ---------------------------------------------------
+
+/// A child's error as the parent must read it. The stale-epoch prefix
+/// stays at the front so the parent's retry rule fires; everything else
+/// gets the child named after the code.
+fn child_error(shard: usize, addr: &str, route: &str, status: Status) -> Status {
+    let message = status.message();
+    let text = match message.strip_prefix(STALE_STATS_EPOCH) {
+        Some(rest) => format!(
+            "{STALE_STATS_EPOCH}: relay child {shard} ({addr}) {route}{}",
+            rest
+        ),
+        None => format!("relay child {shard} ({addr}) {route}: {message}"),
+    };
+    Status::new(status.code(), text)
+}
+
+/// The two request shapes this level does not merge: column statistics
+/// fold floating-point partials in an order the root pins, and an exact
+/// cardinality is a union of values, not a sum. Both are refused by name
+/// rather than answered with a different reduction.
+fn refuse_bm25_aggregates(
+    route: &str,
+    stats_fields: &[String],
+    cardinality_fields: &[String],
+) -> Result<(), Status> {
+    if !stats_fields.is_empty() {
+        return Err(Status::unimplemented(format!(
+            "relay: {route} with stats_fields {stats_fields:?} is not served through a relay; \
+             a column statistic folds in the root's shard order and this level would change \
+             it"
+        )));
+    }
+    if !cardinality_fields.is_empty() {
+        return Err(Status::unimplemented(format!(
+            "relay: {route} with cardinality_fields {cardinality_fields:?} is not served \
+             through a relay; an exact cardinality is a union of values, not a sum of counts"
+        )));
+    }
+    Ok(())
+}
+
+/// OR one child's per-column flags into the accumulator, which every
+/// child must size the same way.
+fn merge_known(
+    what: &str,
+    shard: usize,
+    acc: &mut Option<Vec<bool>>,
+    share: &[bool],
+) -> Result<(), Status> {
+    match acc {
+        None => *acc = Some(share.to_vec()),
+        Some(flags) => {
+            if flags.len() != share.len() {
+                return Err(Status::internal(format!(
+                    "relay: child {shard} answered {} {what} flags while an earlier child \
+                     answered {}",
+                    share.len(),
+                    flags.len()
+                )));
+            }
+            for (a, b) in flags.iter_mut().zip(share) {
+                *a |= *b;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The children's terminal responses merged into the one the parent
+/// reads as a shard's: every child's local top-k concatenated (the
+/// parent's global merge picks from the union, and nothing this level
+/// could drop is provably outside the parent's top-k), facet counts
+/// summed by value, range buckets summed by position, column-known
+/// flags ORed, segment counts added with a check. A facet no child knows
+/// stays `known = false` for the root's typo rule; refusing it here
+/// would answer for shards this relay does not see.
+pub fn merge_bm25_responses(
+    req: &Bm25QueryRequest,
+    shares: Vec<Bm25QueryResponse>,
+) -> Result<Bm25QueryResponse, Status> {
+    let facet_slots = req.facet_fields.len() + req.map_facet_fields.len();
+    let range_slots = req.range_facet_fields.len();
+    let mut hits = Vec::new();
+    let mut facet_known = vec![false; facet_slots];
+    let mut facet_names: Vec<(String, String)> = Vec::new();
+    let mut facet_sums: Vec<HashMap<String, u64>> =
+        (0..facet_slots).map(|_| HashMap::new()).collect();
+    let mut range_known = vec![false; range_slots];
+    let mut range_sums: Vec<Option<Vec<crate::pb::RangeBucket>>> = vec![None; range_slots];
+    let mut range_columns: Vec<(String, String)> = Vec::new();
+    let mut stage_known = None;
+    let mut geo_known = None;
+    let mut filter_known = None;
+    let mut projection_known = None;
+    let mut segments_total: u32 = 0;
+    let mut segments_skipped: u32 = 0;
+    for (shard, share) in shares.into_iter().enumerate() {
+        if share.facets.len() != facet_slots {
+            return Err(Status::internal(format!(
+                "relay: child {shard} answered {} facet fields for {facet_slots} requested",
+                share.facets.len()
+            )));
+        }
+        if share.range_facets.len() != range_slots {
+            return Err(Status::internal(format!(
+                "relay: child {shard} answered {} range facets for {range_slots} requested",
+                share.range_facets.len()
+            )));
+        }
+        for (fi, ff) in share.facets.iter().enumerate() {
+            if facet_names.len() <= fi {
+                facet_names.push((ff.field.clone(), ff.key.clone()));
+            }
+            facet_known[fi] |= ff.known;
+            for c in &ff.counts {
+                let acc = facet_sums[fi].entry(c.value.clone()).or_default();
+                *acc = acc.checked_add(c.count).ok_or_else(|| {
+                    Status::internal(format!(
+                        "relay: facet {:?} value {:?} count overflows u64 across children",
+                        ff.field, c.value
+                    ))
+                })?;
+            }
+        }
+        for (ri, rf) in share.range_facets.iter().enumerate() {
+            if range_columns.len() <= ri {
+                range_columns.push((rf.column.clone(), rf.key.clone()));
+            }
+            range_known[ri] |= rf.known;
+            if !rf.known {
+                continue;
+            }
+            match range_sums[ri].as_mut() {
+                None => range_sums[ri] = Some(rf.buckets.clone()),
+                Some(acc) => {
+                    if acc.len() != rf.buckets.len() {
+                        return Err(Status::internal(format!(
+                            "relay: child {shard} answered {} buckets on range facet {:?} \
+                             while an earlier child answered {}",
+                            rf.buckets.len(),
+                            rf.column,
+                            acc.len()
+                        )));
+                    }
+                    // The coordinator forwarded one edge list, so bucket
+                    // i is the same interval on every child.
+                    for (a, b) in acc.iter_mut().zip(&rf.buckets) {
+                        a.count = a.count.checked_add(b.count).ok_or_else(|| {
+                            Status::internal(format!(
+                                "relay: range facet {:?} bucket overflows u64 across children",
+                                rf.column
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
+        merge_known(
+            "stage-column",
+            shard,
+            &mut stage_known,
+            &share.stage_columns_known,
+        )?;
+        merge_known(
+            "geo-column",
+            shard,
+            &mut geo_known,
+            &share.geo_columns_known,
+        )?;
+        merge_known(
+            "filter-leaf",
+            shard,
+            &mut filter_known,
+            &share.filter_columns_known,
+        )?;
+        merge_known(
+            "projection-leaf",
+            shard,
+            &mut projection_known,
+            &share.projection_leaves_known,
+        )?;
+        segments_total = segments_total
+            .checked_add(share.segments_total)
+            .ok_or_else(|| Status::internal("relay: segments_total overflows u32"))?;
+        segments_skipped = segments_skipped
+            .checked_add(share.segments_skipped)
+            .ok_or_else(|| Status::internal("relay: segments_skipped overflows u32"))?;
+        hits.extend(share.hits);
+    }
+    // The monolith's order: score, then id. The parent re-merges under
+    // its own total order; this order only decides the k-th seed below.
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    let k = req.k as usize;
+    let kth_best = if k > 0 && hits.len() >= k {
+        crate::bm25::floor_seed(hits[k - 1].score)
+    } else {
+        0.0
+    };
+    let facets = facet_names
+        .into_iter()
+        .zip(facet_known)
+        .zip(facet_sums)
+        .map(|(((field, key), known), sum)| {
+            let mut counts: Vec<crate::pb::FacetCount> = sum
+                .into_iter()
+                .map(|(value, count)| crate::pb::FacetCount { value, count })
+                .collect();
+            counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+            crate::pb::FacetFieldCounts {
+                field,
+                known,
+                counts: if known { counts } else { Vec::new() },
+                key,
+            }
+        })
+        .collect();
+    let range_facets = range_columns
+        .into_iter()
+        .zip(range_known)
+        .zip(range_sums)
+        .map(
+            |(((column, key), known), sums)| crate::pb::RangeFacetCounts {
+                column,
+                key,
+                known,
+                buckets: sums.unwrap_or_default(),
+            },
+        )
+        .collect();
+    Ok(Bm25QueryResponse {
+        hits,
+        kth_best,
+        facets,
+        stage_columns_known: stage_known.unwrap_or_default(),
+        range_facets,
+        geo_columns_known: geo_known.unwrap_or_default(),
+        filter_columns_known: filter_known.unwrap_or_default(),
+        stats: Vec::new(),
+        distinct: Vec::new(),
+        projection_leaves_known: projection_known.unwrap_or_default(),
+        segments_total,
+        segments_skipped,
+    })
+}
+
+/// Which child holds a global id: the one whose slot range (from its
+/// health report) contains it. Contiguity was checked at startup; a gap
+/// that appeared since refuses by name here.
+fn child_of_id(ranges: &[(u64, u64)], id: u64) -> Option<usize> {
+    ranges
+        .iter()
+        .position(|&(offset, span)| id >= offset && id - offset < span)
+}
+
+#[allow(clippy::large_enum_variant)]
+enum Bm25Event {
+    Child(usize, Result<Option<Bm25QueryStreamResponse>, Status>),
+    Parent(Option<Result<Bm25QueryStreamRequest, Status>>),
+    Deadline,
+    MapMoved(u64),
+}
+
+impl RelayService {
+    /// One request per child with the parent's claim translated into
+    /// that child's, or the stale-epoch refusal when the token is not
+    /// one this relay can translate under the current map.
+    fn child_claims(&self, token: u64, children: usize) -> Result<Vec<u64>, Status> {
+        let claims = self.translate_epoch(token)?;
+        if claims.len() != children {
+            return Err(Status::failed_precondition(format!(
+                "{STALE_STATS_EPOCH}: relay token {token} names {} children and the map has \
+                 {children}; refetch TermStats",
+                claims.len()
+            )));
+        }
+        Ok(claims)
+    }
+
+    /// The forwarding loop of one relayed `Bm25QueryStream`: children's
+    /// candidate batches go up untouched, their cutoff raises go up
+    /// monotone, the parent's raises and its stop go down, and the
+    /// relay's completion follows the last child's.
+    #[allow(clippy::too_many_arguments)]
+    async fn relay_bm25_stream(
+        &self,
+        frozen: CoordinatorServiceImpl,
+        pinned: MapSnapshot,
+        mut map_changes: watch::Receiver<u64>,
+        req: Bm25QueryRequest,
+        claims: Vec<u64>,
+        mut inbound: Streaming<Bm25QueryStreamRequest>,
+        tx: mpsc::Sender<Result<Bm25QueryStreamResponse, Status>>,
+        deadline: Option<tokio::time::Instant>,
+        timeout: Option<Duration>,
+    ) -> Result<(), Status> {
+        map_changes.mark_unchanged();
+        if *map_changes.borrow() != pinned.control_revision {
+            map_changes.mark_changed();
+        }
+        let children = frozen.node_addresses().to_vec();
+        let n = children.len();
+        // One outbound leg per child and one shared inbound lane the
+        // children's reader tasks feed, tagged by child.
+        let (events_tx, mut events_rx) =
+            mpsc::channel::<(usize, Result<Option<Bm25QueryStreamResponse>, Status>)>(64);
+        let mut legs: Vec<Option<mpsc::Sender<Bm25QueryStreamRequest>>> = Vec::with_capacity(n);
+        let mut readers = Vec::with_capacity(n);
+        for (shard, addr) in children.iter().enumerate() {
+            let mut link = frozen.node_client(addr)?;
+            let (out_tx, out_rx) = mpsc::channel::<Bm25QueryStreamRequest>(8);
+            let mut child_req = req.clone();
+            child_req.expected_stats_epoch = claims[shard];
+            out_tx
+                .send(Bm25QueryStreamRequest {
+                    payload: Some(bm25_query_stream_request::Payload::Start(child_req)),
+                })
+                .await
+                .map_err(|_| Status::internal("relay: child request channel closed at start"))?;
+            let mut request = Request::new(ReceiverStream::new(out_rx));
+            if let Some(timeout) = timeout {
+                request.set_timeout(timeout);
+            }
+            let events = events_tx.clone();
+            let addr = addr.clone();
+            readers.push(tokio::spawn(async move {
+                let mut stream = match link.bm25_query_stream(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(status) => {
+                        let _ = events
+                            .send((shard, Err(child_error(shard, &addr, "bm25 stream", status))))
+                            .await;
+                        return;
+                    }
+                };
+                loop {
+                    let next = stream.message().await;
+                    let done = matches!(next, Ok(None) | Err(_));
+                    let item =
+                        next.map_err(|status| child_error(shard, &addr, "bm25 stream", status));
+                    if events.send((shard, item)).await.is_err() || done {
+                        return;
+                    }
+                }
+            }));
+            legs.push(Some(out_tx));
+        }
+        drop(events_tx);
+        let stop_children = |legs: &mut Vec<Option<mpsc::Sender<Bm25QueryStreamRequest>>>| {
+            let stops: Vec<mpsc::Sender<Bm25QueryStreamRequest>> =
+                legs.iter_mut().filter_map(Option::take).collect();
+            async move {
+                for leg in stops {
+                    let _ = leg
+                        .send(Bm25QueryStreamRequest {
+                            payload: Some(bm25_query_stream_request::Payload::Stop(
+                                StopBm25Query {},
+                            )),
+                        })
+                        .await;
+                }
+            }
+        };
+        let mut completions: Vec<Option<Bm25StreamCompletion>> = vec![None; n];
+        let mut remaining = n;
+        let mut forwarded: u64 = 0;
+        let mut last_up = f32::NEG_INFINITY;
+        let mut last_down = f32::NEG_INFINITY;
+        let mut fingerprint: Option<String> = None;
+        let mut parent_open = true;
+        let mut sleep = deadline.map(|at| Box::pin(tokio::time::sleep_until(at)));
+        let outcome: Result<Option<Bm25StreamCompletion>, Status> = loop {
+            if remaining == 0 {
+                break Ok(None);
+            }
+            let event = tokio::select! {
+                biased;
+                _ = async { sleep.as_mut().expect("guarded").await }, if sleep.is_some() => Bm25Event::Deadline,
+                moved = map_changes.changed() => match moved {
+                    Ok(()) => Bm25Event::MapMoved(*map_changes.borrow_and_update()),
+                    Err(_) => {
+                        map_changes = watch::channel(pinned.control_revision).1;
+                        continue;
+                    }
+                },
+                message = inbound.message(), if parent_open => Bm25Event::Parent(message.transpose()),
+                event = events_rx.recv() => match event {
+                    Some((shard, item)) => Bm25Event::Child(shard, item),
+                    None => break Err(Status::internal("relay: every child reader ended before completion")),
+                },
+            };
+            match event {
+                Bm25Event::Deadline => {
+                    break Err(Status::deadline_exceeded(
+                        "relay: the parent's deadline passed before every child completed",
+                    ));
+                }
+                Bm25Event::MapMoved(revision) => {
+                    if revision == pinned.control_revision {
+                        continue;
+                    }
+                    break Err(Status::failed_precondition(format!(
+                        "relay: the shard map moved from revision {} (generation {}) to \
+                         revision {revision} during Bm25QueryStream; the stream was opened \
+                         under the older map and is not completed; retry under the current one",
+                        pinned.control_revision, pinned.topology_generation
+                    )));
+                }
+                Bm25Event::Parent(Some(Ok(Bm25QueryStreamRequest {
+                    payload: Some(bm25_query_stream_request::Payload::FloorUpdate(u)),
+                }))) => {
+                    if !u.floor.is_nan() && u.floor > last_down {
+                        last_down = u.floor;
+                        for leg in legs.iter().flatten() {
+                            let _ = leg
+                                .send(Bm25QueryStreamRequest {
+                                    payload: Some(bm25_query_stream_request::Payload::FloorUpdate(
+                                        FloorUpdate { floor: u.floor },
+                                    )),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                Bm25Event::Parent(Some(Ok(Bm25QueryStreamRequest {
+                    payload: Some(bm25_query_stream_request::Payload::Stop(_)),
+                }))) => {
+                    // The parent's stop: the children are told, and the
+                    // relay certifies an incomplete scan without waiting
+                    // on children that may hold their answer.
+                    stop_children(&mut legs).await;
+                    break Ok(Some(Bm25StreamCompletion {
+                        completed: false,
+                        response: None,
+                        scoring_fingerprint: fingerprint.clone().unwrap_or_default(),
+                        candidates_emitted: forwarded,
+                    }));
+                }
+                Bm25Event::Parent(Some(Ok(_))) => {}
+                Bm25Event::Parent(Some(Err(_))) | Bm25Event::Parent(None) => {
+                    // The parent's leg closed: gone, or done sending.
+                    // The children finish on their own unless the
+                    // response side is closed too, which `tx.closed()`
+                    // in the caller turns into a cancel.
+                    parent_open = false;
+                }
+                Bm25Event::Child(_, Err(status)) => break Err(status),
+                Bm25Event::Child(shard, Ok(None)) => {
+                    if completions[shard].is_none() {
+                        break Err(Status::data_loss(format!(
+                            "relay child {shard} ({}): BM25 stream ended without a completion \
+                             certificate",
+                            children[shard]
+                        )));
+                    }
+                }
+                Bm25Event::Child(shard, Ok(Some(message))) => {
+                    if completions[shard].is_some() {
+                        break Err(Status::internal(format!(
+                            "relay child {shard} ({}): message after its completion",
+                            children[shard]
+                        )));
+                    }
+                    match message.payload {
+                        Some(bm25_query_stream_response::Payload::CandidateBatch(batch)) => {
+                            if batch.candidates.len() % 12 != 0 {
+                                break Err(Status::data_loss(format!(
+                                    "relay child {shard} ({}): BM25 candidate batch has {} \
+                                     bytes, not 12-byte records",
+                                    children[shard],
+                                    batch.candidates.len()
+                                )));
+                            }
+                            forwarded += (batch.candidates.len() / 12) as u64;
+                            if tx
+                                .send(Ok(Bm25QueryStreamResponse {
+                                    payload: Some(
+                                        bm25_query_stream_response::Payload::CandidateBatch(batch),
+                                    ),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break Err(Status::cancelled("relay: parent response closed"));
+                            }
+                        }
+                        Some(bm25_query_stream_response::Payload::FloorUpdate(u)) => {
+                            if !u.floor.is_nan() && u.floor > last_up {
+                                last_up = u.floor;
+                                if tx
+                                    .send(Ok(Bm25QueryStreamResponse {
+                                        payload: Some(
+                                            bm25_query_stream_response::Payload::FloorUpdate(u),
+                                        ),
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    break Err(Status::cancelled("relay: parent response closed"));
+                                }
+                            }
+                        }
+                        Some(bm25_query_stream_response::Payload::Completion(completion)) => {
+                            if completion.scoring_fingerprint.is_empty() {
+                                break Err(Status::data_loss(format!(
+                                    "relay child {shard} ({}): BM25 completion omitted its \
+                                     scoring fingerprint",
+                                    children[shard]
+                                )));
+                            }
+                            match fingerprint.as_ref() {
+                                Some(seen) if seen != &completion.scoring_fingerprint => {
+                                    break Err(Status::failed_precondition(format!(
+                                        "relay child {shard} ({}): scoring fingerprint {} \
+                                         differs from {seen}; one relay serves one score space",
+                                        children[shard], completion.scoring_fingerprint
+                                    )));
+                                }
+                                None => fingerprint = Some(completion.scoring_fingerprint.clone()),
+                                _ => {}
+                            }
+                            completions[shard] = Some(completion);
+                            legs[shard] = None;
+                            remaining -= 1;
+                        }
+                        Some(bm25_query_stream_response::Payload::Done(_)) => {
+                            break Err(Status::failed_precondition(format!(
+                                "relay child {shard} ({}): BM25 stream used the obsolete \
+                                 uncertified terminal response",
+                                children[shard]
+                            )));
+                        }
+                        None => {}
+                    }
+                }
+            }
+        };
+        let completion = match outcome {
+            Ok(Some(incomplete)) => incomplete,
+            Ok(None) => {
+                self.still_current(&pinned, "Bm25QueryStream")?;
+                let mut completed = true;
+                let mut emitted: u64 = 0;
+                let mut responses = Vec::with_capacity(n);
+                for (shard, completion) in completions.into_iter().enumerate() {
+                    let completion = completion.expect("remaining reached zero");
+                    completed &= completion.completed;
+                    emitted = emitted
+                        .checked_add(completion.candidates_emitted)
+                        .ok_or_else(|| {
+                            Status::internal("relay: candidates_emitted overflows u64")
+                        })?;
+                    match completion.response {
+                        Some(response) => responses.push(response),
+                        None if completion.completed => {
+                            return Err(Status::data_loss(format!(
+                                "relay child {shard} ({}): BM25 completion omitted its response",
+                                children[shard]
+                            )));
+                        }
+                        None => {}
+                    }
+                }
+                if emitted != forwarded {
+                    return Err(Status::data_loss(format!(
+                        "relay: children certified {emitted} candidates but {forwarded} were \
+                         forwarded"
+                    )));
+                }
+                let response = if completed {
+                    Some(merge_bm25_responses(&req, responses)?)
+                } else {
+                    None
+                };
+                Bm25StreamCompletion {
+                    completed,
+                    response,
+                    scoring_fingerprint: fingerprint.unwrap_or_default(),
+                    candidates_emitted: forwarded,
+                }
+            }
+            Err(status) => {
+                stop_children(&mut legs).await;
+                for reader in &readers {
+                    reader.abort();
+                }
+                return Err(status);
+            }
+        };
+        for reader in &readers {
+            reader.abort();
+        }
+        tx.send(Ok(Bm25QueryStreamResponse {
+            payload: Some(bm25_query_stream_response::Payload::Completion(completion)),
+        }))
+        .await
+        .map_err(|_| Status::cancelled("relay: parent response closed"))
+    }
+}
+
 #[tonic::async_trait]
 impl NodeService for RelayService {
     type SearchShardStream = ReceiverStream<Result<crate::pb::SearchShardResponse, Status>>;
     type StreamSearchStream =
         crate::metrics::Timed<ReceiverStream<Result<StreamSearchResponse, Status>>>;
-    type Bm25QueryStreamStream = ReceiverStream<Result<crate::pb::Bm25QueryStreamResponse, Status>>;
+    type Bm25QueryStreamStream =
+        crate::metrics::Timed<ReceiverStream<Result<Bm25QueryStreamResponse, Status>>>;
     type ReadWalStream = ReceiverStream<Result<crate::pb::ReadWalResponse, Status>>;
     type StreamSnapshotStream = ReceiverStream<Result<crate::pb::SnapshotChunk, Status>>;
 
@@ -1503,9 +2121,62 @@ impl NodeService for RelayService {
 
     async fn bm25_query_stream(
         &self,
-        _request: Request<Streaming<crate::pb::Bm25QueryStreamRequest>>,
+        request: Request<Streaming<Bm25QueryStreamRequest>>,
     ) -> Result<Response<Self::Bm25QueryStreamStream>, Status> {
-        Err(refused("Bm25QueryStream"))
+        crate::metrics::timed_stream(Route::Bm25QueryStream, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+            let mut inbound = request.into_inner();
+            let req = match inbound.message().await? {
+                Some(Bm25QueryStreamRequest {
+                    payload: Some(bm25_query_stream_request::Payload::Start(req)),
+                }) => req,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "first Bm25QueryStreamRequest must be a Bm25QueryRequest start",
+                    ))
+                }
+            };
+            refuse_bm25_aggregates(
+                "Bm25QueryStream",
+                &req.stats_fields,
+                &req.cardinality_fields,
+            )?;
+            let (pinned, frozen) = self.pin();
+            let claims =
+                self.child_claims(req.expected_stats_epoch, frozen.node_addresses().len())?;
+            if frozen.node_addresses().is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let map_changes = self.inner.map.changes();
+            let (tx, rx) = mpsc::channel::<Result<Bm25QueryStreamResponse, Status>>(64);
+            let relay = self.clone();
+            tokio::spawn(async move {
+                let work = relay.relay_bm25_stream(
+                    frozen,
+                    pinned,
+                    map_changes,
+                    req,
+                    claims,
+                    inbound,
+                    tx.clone(),
+                    deadline,
+                    timeout,
+                );
+                let result = tokio::select! {
+                    _ = tx.closed() => Err(Status::cancelled("relay: parent response closed")),
+                    result = work => result,
+                };
+                if let Err(status) = result {
+                    let _ = tokio::time::timeout(Duration::from_millis(250), tx.send(Err(status)))
+                        .await;
+                }
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     async fn read_wal(
@@ -1594,16 +2265,106 @@ impl NodeService for RelayService {
 
     async fn bm25_query(
         &self,
-        _request: Request<crate::pb::Bm25QueryRequest>,
-    ) -> Result<Response<crate::pb::Bm25QueryResponse>, Status> {
-        Err(refused("Bm25Query"))
+        request: Request<Bm25QueryRequest>,
+    ) -> Result<Response<Bm25QueryResponse>, Status> {
+        crate::metrics::timed(Route::Bm25Query, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            refuse_bm25_aggregates("Bm25Query", &req.stats_fields, &req.cardinality_fields)?;
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let claims = self.child_claims(req.expected_stats_epoch, children.len())?;
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, addr) in children.iter().enumerate() {
+                let mut link = frozen.node_client(addr)?;
+                let mut child_req = req.clone();
+                child_req.expected_stats_epoch = claims[shard];
+                let addr = addr.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.bm25_query(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "bm25 query", status))
+                }));
+            }
+            let mut shares = Vec::with_capacity(children.len());
+            for task in tasks {
+                shares.push(
+                    task.await
+                        .map_err(|e| Status::internal(format!("relay bm25 query task: {e}")))??,
+                );
+            }
+            let merged = merge_bm25_responses(&req, shares)?;
+            self.still_current(&pinned, "Bm25Query")?;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn bm25_phrase_query(
         &self,
-        _request: Request<crate::pb::Bm25PhraseQueryRequest>,
-    ) -> Result<Response<crate::pb::Bm25QueryResponse>, Status> {
-        Err(refused("Bm25PhraseQuery"))
+        request: Request<Bm25PhraseQueryRequest>,
+    ) -> Result<Response<Bm25QueryResponse>, Status> {
+        crate::metrics::timed(Route::Bm25PhraseQuery, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let query = req
+                .query
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("Bm25PhraseQuery: query is absent"))?;
+            refuse_bm25_aggregates(
+                "Bm25PhraseQuery",
+                &query.stats_fields,
+                &query.cardinality_fields,
+            )?;
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let claims = self.child_claims(query.expected_stats_epoch, children.len())?;
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, addr) in children.iter().enumerate() {
+                let mut link = frozen.node_client(addr)?;
+                let mut child_req = req.clone();
+                if let Some(q) = child_req.query.as_mut() {
+                    q.expected_stats_epoch = claims[shard];
+                }
+                let addr = addr.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.bm25_phrase_query(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "bm25 phrase query", status))
+                }));
+            }
+            let mut shares = Vec::with_capacity(children.len());
+            for task in tasks {
+                shares.push(
+                    task.await
+                        .map_err(|e| Status::internal(format!("relay bm25 phrase task: {e}")))??,
+                );
+            }
+            let merged = merge_bm25_responses(query, shares)?;
+            self.still_current(&pinned, "Bm25PhraseQuery")?;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn get_documents(
@@ -1622,9 +2383,84 @@ impl NodeService for RelayService {
 
     async fn bm25_rescore(
         &self,
-        _request: Request<crate::pb::Bm25RescoreRequest>,
-    ) -> Result<Response<crate::pb::Bm25RescoreResponse>, Status> {
-        Err(refused("Bm25Rescore"))
+        request: Request<Bm25RescoreRequest>,
+    ) -> Result<Response<Bm25RescoreResponse>, Status> {
+        crate::metrics::timed(Route::Bm25Rescore, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let claims = self.child_claims(req.expected_stats_epoch, children.len())?;
+            // Each candidate goes to the child whose slot range holds it;
+            // the ranges come from the children's health reports.
+            let reports = self.children_health(&frozen, timeout).await?;
+            let ranges: Vec<(u64, u64)> = reports
+                .iter()
+                .map(|r| (r.slot_offset, health_span(r)))
+                .collect();
+            let mut by_child: Vec<Vec<u64>> = vec![Vec::new(); children.len()];
+            for &id in &req.candidate_ids {
+                match child_of_id(&ranges, id) {
+                    Some(child) => by_child[child].push(id),
+                    None => {
+                        return Err(Status::failed_precondition(format!(
+                            "relay: candidate id {id} is in no child's slot range {:?}",
+                            ranges
+                                .iter()
+                                .map(|(o, s)| format!("{o}..{}", o + s))
+                                .collect::<Vec<_>>()
+                        )));
+                    }
+                }
+            }
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, ids) in by_child.into_iter().enumerate() {
+                if ids.is_empty() {
+                    continue;
+                }
+                let mut link = frozen.node_client(&children[shard])?;
+                let mut child_req = req.clone();
+                child_req.candidate_ids = ids;
+                child_req.expected_stats_epoch = claims[shard];
+                let addr = children[shard].clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.bm25_rescore(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "bm25 rescore", status))
+                }));
+            }
+            let mut hits = Vec::new();
+            let mut stage_known: Option<Vec<bool>> = None;
+            for (i, task) in tasks.into_iter().enumerate() {
+                let share = task
+                    .await
+                    .map_err(|e| Status::internal(format!("relay bm25 rescore task: {e}")))??;
+                merge_known(
+                    "stage-column",
+                    i,
+                    &mut stage_known,
+                    &share.stage_columns_known,
+                )?;
+                hits.extend(share.hits);
+            }
+            self.still_current(&pinned, "Bm25Rescore")?;
+            Ok(Response::new(Bm25RescoreResponse {
+                hits,
+                stage_columns_known: stage_known
+                    .unwrap_or_else(|| vec![false; req.score_stages.len()]),
+            }))
+        })
+        .await
     }
 
     async fn fetch_values(
@@ -1671,9 +2507,68 @@ impl NodeService for RelayService {
 
     async fn shard_legs(
         &self,
-        _request: Request<crate::pb::ShardLegsRequest>,
-    ) -> Result<Response<crate::pb::ShardLegsResponse>, Status> {
-        Err(refused("ShardLegs"))
+        request: Request<ShardLegsRequest>,
+    ) -> Result<Response<ShardLegsResponse>, Status> {
+        crate::metrics::timed(Route::ShardLegs, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let claims = self.child_claims(req.expected_stats_epoch, children.len())?;
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, addr) in children.iter().enumerate() {
+                let mut link = frozen.node_client(addr)?;
+                let mut child_req = req.clone();
+                child_req.expected_stats_epoch = claims[shard];
+                let addr = addr.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.shard_legs(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "shard legs", status))
+                }));
+            }
+            // Raw per-leg lists: the parent merges them by score across
+            // its shards, and the union of the children's lists holds the
+            // subtree's top of each leg. Competition ranks at the parent
+            // make the order of equal scores immaterial.
+            let mut merged = ShardLegsResponse::default();
+            let mut geo_known = None;
+            let mut filter_known = None;
+            for (shard, task) in tasks.into_iter().enumerate() {
+                let share = task
+                    .await
+                    .map_err(|e| Status::internal(format!("relay shard legs task: {e}")))??;
+                merge_known(
+                    "geo-column",
+                    shard,
+                    &mut geo_known,
+                    &share.geo_columns_known,
+                )?;
+                merge_known(
+                    "filter-leaf",
+                    shard,
+                    &mut filter_known,
+                    &share.filter_columns_known,
+                )?;
+                merged.vector_hits.extend(share.vector_hits);
+                merged.bm25_hits.extend(share.bm25_hits);
+            }
+            merged.geo_columns_known = geo_known.unwrap_or_default();
+            merged.filter_columns_known = filter_known.unwrap_or_default();
+            self.still_current(&pinned, "ShardLegs")?;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn browse_shard(
