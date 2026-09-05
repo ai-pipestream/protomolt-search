@@ -132,7 +132,19 @@ tables and evaluate per RETURNED hit — k evaluations, after selection,
 never per candidate, so projections cannot perturb pruning, floors, or
 any completion certificate. Values ride each hit
 (`Bm25Hit.projected`, aligned with the request order) through the
-ordinary merge.
+ordinary merge. Each shard also reports `Bm25QueryResponse.projection_types`,
+one resolved scalar type per requested projection, even for zero hits or k=0.
+The same metadata travels in the streaming completion response. Coordinators
+and relays join an absent type with a known type, refuse conflicting concrete
+types, and validate each returned value against its originating shard's type.
+An unsigned column on one shard and a signed or double column on another cannot
+silently produce a mixed projection. Explicit `double()` remains a conversion.
+Queries whose analysis produces no terms still validate requested projections.
+
+Regenerate clients and use matching node, relay and coordinator builds. Older
+nodes omit the new metadata and projected queries refuse with
+`FAILED_PRECONDITION`; queries without projections retain their wire behavior.
+The change does not alter stored index formats.
 
 The filter rules for missing columns carry over exactly:
 
@@ -248,3 +260,10 @@ oracle and stock CEL where CEL produces values. It covers numeric boundaries,
 wire presence, typing, branch evaluation and distributed projection reads across
 reopen and compaction. `tests/unsigned_mapping.rs` also exercises materialized
 uint outputs from descriptor-mapped ingest while preserving original source bytes.
+
+`tests/bm25_projection_types.rs` exercises the same projected queries through
+flat, one-level and nested relay topologies, with unary and streamed shard
+responses. It checks exact full-range uint values, missing columns, conflicting
+int/uint/double declarations even with empty match sets, and malformed child
+metadata and row widths. Candidate-scoped fetches use the same type and row
+validators. Fused multi-field projections remain explicitly unsupported.

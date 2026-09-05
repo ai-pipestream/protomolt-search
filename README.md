@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Lexical projection type agreement (2026-09-05, feature branch).** BM25
+  responses declare each projection's scalar type even when no hits match.
+  Unary, streamed and nested relay merges refuse inconsistent types or malformed
+  projected rows using the same validators as candidate-value fetches. Empty
+  analysis still checks projection types. Use matching server builds; index
+  formats are unchanged. See [CEL projections](docs/cel-values.md#4-query-time-projections).
+
 - **Unsigned sort and collapse (2026-09-05, feature branch).** u64 columns and
   lineage IDs retain their full domain in sort results, cursor keys, collapse
   groups and inner hits. Shards advertise scalar types before merging sort or

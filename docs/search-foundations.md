@@ -204,9 +204,10 @@ sort values, distinct unsigned cursor components, collapse representatives and
 inner hits. Sorted browse and candidate-scoped `FetchValues` publish scalar
 metadata, including empty responses; coordinators refuse missing metadata,
 incompatible shard types and rows that disagree with their declared type. The
-native BM25 projection merge still needs the corresponding type-consistency
-audit. Sorted lexical queries now return requested projections; a lifecycle
-test reproduced their previous silent omission. Tests restart pagination after
+native BM25 projection merge now applies the same validation, including streamed
+completions and nested relay merges; zero-hit and empty-analysis queries still
+check projection types. Sorted lexical queries now return requested projections;
+a lifecycle test reproduced their previous silent omission. Tests restart pagination after
 compaction and do not claim cursor validity across generation changes.
 
 Validation of the ordering increment on 2026-09-05: 422 library tests, 533
@@ -368,3 +369,18 @@ cover flat/fused BM25, both node delivery modes, rescoring and terminal streamin
 with exact binary keys, large versions, absent identities and optional chunk
 ordinals. Both compaction layouts verify lexical identities after renumbering,
 reopening and replay.
+
+
+Validation of the lexical projection type increment on 2026-09-05: 422 library
+and 537 integration tests across 92 targets passed, plus 11 embedded tests;
+one existing sidecar conformance test was ignored. The first integration run
+stopped when `ltr::scorer_interplays_refuse_by_name` encountered a transport
+error during fixture ingest, before query assertions. The entire six-target
+group passed on an unchanged-source rerun, followed by all remaining groups.
+All five Android/iOS Rust target checks passed with the three existing relay
+dead-code warnings. Tests/examples compilation, formatting, vendored-proto
+identity and whitespace checks passed. Descriptor comparison against `209f166`
+verified exactly one additive field, `Bm25QueryResponse.projection_types = 13`,
+and no changes to existing declarations. This checkpoint remains on the unsigned
+feature branch; the broader shape, authorization and document-lifecycle goals
+are not complete.

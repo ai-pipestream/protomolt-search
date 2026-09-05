@@ -1361,6 +1361,7 @@ pub fn merge_bm25_responses(
     let mut geo_known = None;
     let mut filter_known = None;
     let mut projection_known = None;
+    let mut projection_types = vec![crate::pb::ScalarValueType::Unspecified; req.projections.len()];
     let mut segments_total: u32 = 0;
     let mut segments_skipped: u32 = 0;
     for (shard, share) in shares.into_iter().enumerate() {
@@ -1454,6 +1455,14 @@ pub fn merge_bm25_responses(
         segments_skipped = segments_skipped
             .checked_add(share.segments_skipped)
             .ok_or_else(|| Status::internal("relay: segments_skipped overflows u32"))?;
+        crate::values::merge_projection_types(
+            &req.projections,
+            &mut projection_types,
+            &share.projection_types,
+        )?;
+        for hit in &share.hits {
+            crate::values::validate_projection_row(&hit.projected, &share.projection_types)?;
+        }
         hits.extend(share.hits);
     }
     // The monolith's order: score, then id. The parent re-merges under
@@ -1511,6 +1520,7 @@ pub fn merge_bm25_responses(
         stats: Vec::new(),
         distinct: Vec::new(),
         projection_leaves_known: projection_known.unwrap_or_default(),
+        projection_types: projection_types.into_iter().map(|ty| ty as i32).collect(),
         segments_total,
         segments_skipped,
     })

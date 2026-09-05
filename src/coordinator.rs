@@ -3588,7 +3588,10 @@ impl CoordinatorServiceImpl {
             self.expand_synonyms("body", spec, synonyms, synonyms_off, &mut terms)
                 .await?,
         );
-        if terms.is_empty() || k == 0 {
+        // An empty lexical selection still needs the projection schema
+        // agreement. Request metadata without scoring when analysis is empty.
+        let k = if terms.is_empty() { 0 } else { k };
+        if k == 0 && projections.is_empty() {
             return Ok((
                 Vec::new(),
                 Vec::new(),
@@ -3747,6 +3750,7 @@ impl CoordinatorServiceImpl {
                             response.stats,
                             response.distinct,
                             response.projection_leaves_known,
+                            response.projection_types,
                             (response.segments_total, response.segments_skipped),
                             Some(r.scoring_fingerprint),
                         )
@@ -3768,6 +3772,7 @@ impl CoordinatorServiceImpl {
                         r.stats,
                         r.distinct,
                         r.projection_leaves_known,
+                        r.projection_types,
                         (r.segments_total, r.segments_skipped),
                         None,
                     )
@@ -3794,6 +3799,7 @@ impl CoordinatorServiceImpl {
             leaves
         };
         let mut projection_known = vec![false; projection_leaves.len()];
+        let mut projection_types = vec![crate::pb::ScalarValueType::Unspecified; projections.len()];
         let mut shard_stats: Vec<Vec<crate::pb::ColumnStats>> = Vec::new();
         let mut shard_distinct: Vec<Vec<crate::pb::FacetDistinct>> = Vec::new();
         let mut scoring_fingerprint: Option<String> = None;
@@ -3809,6 +3815,7 @@ impl CoordinatorServiceImpl {
                 sstats,
                 sdistinct,
                 pknown,
+                ptypes,
                 sprune,
                 fingerprint,
             ) = task
@@ -3834,6 +3841,10 @@ impl CoordinatorServiceImpl {
             }
             for (acc, k) in projection_known.iter_mut().zip(&pknown) {
                 *acc |= *k;
+            }
+            crate::values::merge_projection_types(projections, &mut projection_types, &ptypes)?;
+            for hit in &hits {
+                crate::values::validate_projection_row(&hit.projected, &ptypes)?;
             }
             all.extend(hits.into_iter().map(|h| (shard, h)));
             shard_facets.push(facets);
@@ -8024,22 +8035,11 @@ impl CoordinatorServiceImpl {
             {
                 return Err(Status::failed_precondition("shard omitted projection type or known-column metadata; use matching server builds"));
             }
-            for (i, &raw) in resp.projection_types.iter().enumerate() {
-                let ty = crate::pb::ScalarValueType::try_from(raw).map_err(|_| {
-                    Status::failed_precondition("unknown projection type from shard")
-                })?;
-                if ty != crate::pb::ScalarValueType::Unspecified {
-                    if projection_types[i] != crate::pb::ScalarValueType::Unspecified
-                        && projection_types[i] != ty
-                    {
-                        return Err(Status::failed_precondition(format!(
-                            "projection {:?} has incompatible types across shards: {:?} and {:?}",
-                            projections[i].name, projection_types[i], ty
-                        )));
-                    }
-                    projection_types[i] = ty;
-                }
-            }
+            crate::values::merge_projection_types(
+                projections,
+                &mut projection_types,
+                &resp.projection_types,
+            )?;
             for (known, shard) in stage_known.iter_mut().zip(&resp.stage_columns_known) {
                 *known |= shard;
             }
@@ -8055,14 +8055,7 @@ impl CoordinatorServiceImpl {
                         "shard returned a projection row with the wrong width",
                     ));
                 }
-                for (value, &raw) in row.values.iter().zip(&resp.projection_types) {
-                    let actual = crate::values::projected_type(value);
-                    if actual != crate::pb::ScalarValueType::Unspecified && actual as i32 != raw {
-                        return Err(Status::failed_precondition(
-                            "shard projected value disagrees with its declared type",
-                        ));
-                    }
-                }
+                crate::values::validate_projection_row(&row.values, &resp.projection_types)?;
                 for (i, sv) in row.stage_values.iter().enumerate() {
                     if let Some(crate::pb::projected_value::Value::DoubleValue(v)) = sv.value {
                         out.stage_rows[i].insert(row.doc_id, v);

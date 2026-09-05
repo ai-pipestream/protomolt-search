@@ -7293,6 +7293,7 @@ impl NodeServiceImpl {
             segments_total: fused_prune.segments_total,
             segments_skipped: fused_prune.segments_skipped,
             projection_leaves_known: Vec::new(),
+            projection_types: Vec::new(),
             hits,
             kth_best,
             facets,
@@ -14018,6 +14019,32 @@ impl NodeServiceImpl {
                 .collect(),
             None => vec![false; projection_leaves.len()],
         };
+        // Resolve independently of k and matches so empty shards still
+        // participate in the distributed type agreement. Even a shard with
+        // no lexical store validates literal expressions and malformed trees.
+        let empty_columns = crate::values::NumericTypes {
+            numerics: &[],
+            integers: &[],
+            unsigned_integers: &[],
+            map_numerics: &[],
+        };
+        let columns: &dyn crate::values::ColumnLookup = match guard.bm25.as_ref() {
+            Some(store) => store,
+            None => &empty_columns,
+        };
+        let (resolved_projections, projection_types): (Vec<_>, Vec<i32>) = req
+            .projections
+            .iter()
+            .map(|p| {
+                let expr = p.expr.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("projection: empty compiled expression")
+                })?;
+                crate::values::resolve(expr, columns)
+                    .map(|(rv, ty)| (rv, crate::pb::ScalarValueType::from(ty) as i32))
+            })
+            .collect::<Result<Vec<_>, Status>>()?
+            .into_iter()
+            .unzip();
         let hits = match guard.bm25.as_ref() {
             Some(store) if req.k > 0 => {
                 let index: &dyn Bm25Index = match masked_index.as_ref() {
@@ -14037,18 +14064,6 @@ impl NodeServiceImpl {
                 // With no stages the ctx is None and every scorer below
                 // is bit-identical to its unchained form.
                 let chain = store.resolve_chain(&stage_specs);
-                // Projections resolve against this shard's tables once
-                // per request; type conflicts refuse here, by name.
-                let resolved_projections: Vec<crate::values::ResolvedValue> = req
-                    .projections
-                    .iter()
-                    .map(|p| {
-                        let expr = p.expr.as_ref().ok_or_else(|| {
-                            Status::invalid_argument("projection: empty compiled expression")
-                        })?;
-                        crate::values::resolve(expr, store).map(|(rv, _)| rv)
-                    })
-                    .collect::<Result<_, Status>>()?;
                 let numeric_read = ShardNumericRead(store);
                 let chain_ctx: bm25::ChainCtx = if stage_specs.is_empty() {
                     None
@@ -14202,6 +14217,7 @@ impl NodeServiceImpl {
             segments_total: prune.stats.segments_total,
             segments_skipped: prune.stats.segments_skipped,
             projection_leaves_known,
+            projection_types,
             hits,
             kth_best,
             facets,

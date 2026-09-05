@@ -3364,6 +3364,12 @@ message Bm25QueryResponse {
   // (docs/segment-pruning.md). The answer is the same with pruning off.
   uint32 segments_total = 11;
   uint32 segments_skipped = 12;
+  // One resolved type per projection in request order, including k=0 and
+  // empty match sets. UNSPECIFIED means the expression is absent on this
+  // shard. Relays and coordinators join absent with known types and refuse
+  // conflicting concrete types. Every present projected value must agree
+  // with its declared type. Also carried by stream completion responses.
+  repeated ScalarValueType projection_types = 13;
 }
 
 // One message on the client-to-shard leg of `Bm25QueryStream`.
