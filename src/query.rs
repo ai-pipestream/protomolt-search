@@ -585,6 +585,7 @@ async fn execute_recursive_boolean(
     let mut hits: Vec<QueryHit> = evaluated
         .into_iter()
         .map(|(doc_id, hit)| QueryHit {
+            identity: None,
             snippets: Vec::new(),
             projected: Vec::new(),
             doc_id,
@@ -1136,6 +1137,7 @@ pub async fn execute(
                 .iter()
                 .enumerate()
                 .map(|(i, &doc_id)| QueryHit {
+                    identity: None,
                     snippets: Vec::new(),
                     projected: Vec::new(),
                     doc_id,
@@ -1202,6 +1204,7 @@ pub async fn execute(
                 .hits
                 .iter()
                 .map(|h| QueryHit {
+                    identity: h.identity.clone(),
                     snippets: h.snippets.clone(),
                     projected: h.projected.clone(),
                     doc_id: h.doc_id,
@@ -1248,6 +1251,7 @@ pub async fn execute(
                 .hits
                 .iter()
                 .map(|h| QueryHit {
+                    identity: None,
                     snippets: Vec::new(),
                     projected: Vec::new(),
                     doc_id: h.vector_id,
@@ -1401,6 +1405,7 @@ pub async fn execute(
                             }
                         }
                         QueryHit {
+                            identity: None,
                             snippets: Vec::new(),
                             projected: Vec::new(),
                             doc_id: h.doc_id,
@@ -1451,6 +1456,7 @@ pub async fn execute(
                             }
                         }
                         QueryHit {
+                            identity: None,
                             snippets: Vec::new(),
                             projected: Vec::new(),
                             doc_id: h.doc_id,

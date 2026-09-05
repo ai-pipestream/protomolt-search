@@ -2738,7 +2738,7 @@ message TermOccurrences {
 
 // One BM25 hit, highlight-ready.
 message Bm25Hit {
-  // Global doc id (slot_offset + local id).
+  // Generation-local row locator (slot_offset + local id).
   uint64 doc_id = 1;
   // BM25 score computed with GLOBAL corpus stats; comparable across
   // shards. Higher is better.
@@ -2757,6 +2757,9 @@ message Bm25Hit {
   // Server-side snippets when the request carried a HighlightSpec
   // (docs/highlighting.md), in text order per field.
   repeated Snippet snippets = 5;
+  // Logical source version and chunk, read with the scored row. Absent
+  // for legacy rows without an explicitly imported logical identity.
+  DocumentIdentity identity = 6;
 }
 
 // A shard's BM25 top-k.
@@ -4856,6 +4859,10 @@ message QueryHit {
   repeated DimensionScore dimensions = 8;
   // Snippets when the request carried a HighlightSpec.
   repeated Snippet snippets = 9;
+  // Logical source version and chunk carried by simple lexical selection.
+  // Dense, hybrid, Boolean and browse selection do not expose identity yet;
+  // absence makes no stable-identity claim about doc_id.
+  DocumentIdentity identity = 10;
 }
 
 // One named raw relevance signal.

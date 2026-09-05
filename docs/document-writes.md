@@ -140,6 +140,20 @@ operation IDs and cannot reconstruct the persistent idempotency authority.
 
 ## Remaining lifecycle work
 
+Imported row identities now accompany `Bm25Hit` from flat and fused lexical
+search and lexical rescoring. Each node reads the identity under the same
+shard-state guard that produces the score. Coordinator merging preserves it,
+and simple lexical selection carries it into `QueryHit`, including the final
+`QueryStream` response. Keys, versions and optional chunk ordinals survive
+compaction and reopening; `doc_id` remains a generation-local locator.
+Rows ingested without an identity report absence rather than a fabricated key.
+
+This does not yet cover dense, hybrid, Boolean or browse result identity,
+nor provisional candidate revisions. It reports the imported row metadata;
+it does not certify that the catalog accepted that version or that it is the
+current authorized version. Publication and authorization must supply those
+guarantees before this becomes the complete document-facing search contract.
+
 This API does not feed legacy `IngestMapped` automatically. Its accepted deletes
 do not remove existing legacy search rows. Legacy ingest still lacks these
 transactional receipts and still loses mapped parents that produce no rows.

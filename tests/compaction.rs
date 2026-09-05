@@ -423,20 +423,23 @@ async fn texts_of(
     .documents
     .into_iter()
     .map(|d| {
-        let number: usize = d
-            .text
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .strip_prefix("row")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let expected = logical_identity(&row(number, d.text.contains("revised")));
+        let expected = identity_for_text(&d.text);
         assert_eq!(d.identity, Some(expected));
         (d.doc_id, (d.text, d.lineage))
     })
     .collect()
+}
+
+fn identity_for_text(text: &str) -> pipestream_search::pb::DocumentIdentity {
+    let number = text
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .strip_prefix("row")
+        .unwrap()
+        .parse()
+        .unwrap();
+    logical_identity(&row(number, text.contains("revised")))
 }
 
 fn sorted(mut hits: Vec<(String, u32)>) -> Vec<(String, u32)> {
@@ -458,6 +461,7 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
     async fn resolve(
         nodes: &mut [NodeServiceClient<Channel>],
         ids: Vec<(u64, u32)>,
+        identities: Option<&BTreeMap<u64, pipestream_search::pb::DocumentIdentity>>,
     ) -> Vec<(String, u32)> {
         let mut out = Vec::with_capacity(ids.len());
         for (id, bits) in ids {
@@ -466,6 +470,9 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
             let (text, _) = texts
                 .remove(&id)
                 .expect("hit resolves to a stored document");
+            if let Some(identities) = identities {
+                assert_eq!(identities[&id], identity_for_text(&text));
+            }
             out.push((text, bits));
         }
         sorted(out)
@@ -490,7 +497,22 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
             .iter()
             .map(|h| (h.doc_id, h.score.to_bits()))
             .collect();
-        lexical.push((probe.to_string(), resolve(&mut nodes, hits).await));
+        let identities = response
+            .hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.doc_id,
+                    hit.identity
+                        .clone()
+                        .expect("lexical hit has source identity"),
+                )
+            })
+            .collect();
+        lexical.push((
+            probe.to_string(),
+            resolve(&mut nodes, hits, Some(&identities)).await,
+        ));
         let mut counts: Vec<(String, u64)> = response
             .facets
             .iter()
@@ -518,7 +540,7 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
             .iter()
             .map(|h| (h.vector_id, h.score.to_bits()))
             .collect();
-        dense.push(resolve(&mut nodes, hits).await);
+        dense.push(resolve(&mut nodes, hits, None).await);
         let response = SearchService::hybrid_search(
             &coordinator,
             Request::new(HybridSearchRequest {
@@ -536,7 +558,7 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
             .iter()
             .map(|h| (h.doc_id, h.fused_score.to_bits()))
             .collect();
-        hybrid.push(resolve(&mut nodes, hits).await);
+        hybrid.push(resolve(&mut nodes, hits, None).await);
     }
     // Sorted browse and parents on the first node only (the routes are
     // per shard).

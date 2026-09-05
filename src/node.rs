@@ -6165,6 +6165,7 @@ impl NodeServiceImpl {
                             None => Vec::new(),
                         };
                         Ok(Bm25Hit {
+                            identity: store.document_identity(doc.doc_id),
                             snippets,
                             projected: Vec::new(),
                             doc_id: self.config.slot_offset + u64::from(doc.doc_id),
@@ -12486,6 +12487,7 @@ impl NodeServiceImpl {
                             None => Vec::new(),
                         };
                         Ok(Bm25Hit {
+                            identity: store.document_identity(doc.doc_id),
                             snippets,
                             projected: resolved_projections
                                 .iter()
@@ -12590,6 +12592,7 @@ impl NodeServiceImpl {
                 let hits = bm25::score_candidates(index, &req.terms, &stats, params, &local)
                     .into_iter()
                     .map(|doc| Bm25Hit {
+                        identity: store.document_identity(doc.doc_id),
                         snippets: Vec::new(),
                         projected: Vec::new(),
                         doc_id: offset + u64::from(doc.doc_id),

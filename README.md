@@ -1212,6 +1212,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Lexical result identity (2026-09-05, `feat/search-foundations`).**
+  BM25 search and rescoring return the imported document key, version and
+  chunk ordinal from the scored shard state. Simple lexical `Query` and its
+  streamed terminal response preserve those values through merging and paging.
+  Compaction and reopening retain the same identities after row renumbering.
+  Other selection routes and catalog-backed publication remain; see
+  [document writes](docs/document-writes.md).
+
 - **Search protocol namespace (2026-09-05, `feat/search-foundations`).**
   Search-owned public, node, storage, WAL and mobile protobuf contracts now
   use `ai.protomolt.search.*` under `proto/ai/protomolt/search/`. Regenerate

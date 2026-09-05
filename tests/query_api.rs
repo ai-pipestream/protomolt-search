@@ -52,6 +52,27 @@ async fn start_cluster_with_addrs() -> (
     ),
     Vec<String>,
 ) {
+    start_cluster_with_identities(false).await
+}
+
+fn fixture_identity(id: u64) -> Option<pipestream_search::pb::DocumentIdentity> {
+    (id != 0).then(|| pipestream_search::pb::DocumentIdentity {
+        document_key: [vec![0, 255], id.to_le_bytes().to_vec()].concat(),
+        version: u64::MAX - id,
+        chunk_ordinal: id.is_multiple_of(2).then_some(0),
+    })
+}
+
+async fn start_cluster_with_identities(
+    identities: bool,
+) -> (
+    (
+        CoordinatorServiceImpl,
+        Vec<f32>,
+        Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
+    ),
+    Vec<String>,
+) {
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = unit_vectors(N_DOCS, DIM, 0xC0FE_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus);
@@ -85,6 +106,14 @@ async fn start_cluster_with_addrs() -> (
             };
             tx.send(AddDocumentsRequest {
                 text,
+                original_source: identities
+                    .then(|| common::protobuf_source("fixture", &id.to_string())),
+                identity: identities.then(|| fixture_identity(id as u64)).flatten(),
+                source_chunk_ordinal: if identities {
+                    fixture_identity(id as u64).and_then(|identity| identity.chunk_ordinal)
+                } else {
+                    None
+                },
                 integers: vec![IntegerValue {
                     field: "year".into(),
                     value: id as i64,
@@ -112,6 +141,77 @@ async fn start_cluster_with_addrs() -> (
     let coordinator =
         CoordinatorServiceImpl::new(addrs.clone()).with_bm25(Some(analysis), Default::default());
     ((coordinator, corpus[..DIM].to_vec(), handles), addrs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lexical_results_preserve_imported_identity_through_public_and_streamed_queries() {
+    let ((coordinator, _, handles), addrs) = start_cluster_with_identities(true).await;
+    let request = QueryRequest {
+        k: N_DOCS as u32,
+        selection: Some(lexical_leaf("lex", "document")),
+        ..Default::default()
+    };
+    for stream in [false, true] {
+        let coordinator = coordinator.clone().with_bm25_stream(stream);
+        for fused in [false, true] {
+            let lexical = coordinator
+                .bm25_search(Request::new(Bm25SearchRequest {
+                    text: "document".into(),
+                    k: N_DOCS as u32,
+                    fields: if fused {
+                        vec![pipestream_search::pb::QueryField {
+                            field: "body".into(),
+                            ..Default::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(lexical.hits.len(), N_DOCS);
+            for hit in &lexical.hits {
+                assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+            }
+        }
+        let response = query(&coordinator, request.clone()).await.unwrap();
+        assert_eq!(response.hits.len(), N_DOCS);
+        for hit in &response.hits {
+            assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+        }
+    }
+    let events = streamed_query(&coordinator, Some(request), 0).await;
+    let (_, completion) = stream_parts(&events);
+    let response = completion.response.as_ref().unwrap();
+    assert_eq!(response.hits.len(), N_DOCS);
+    for hit in &response.hits {
+        assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+    }
+    for addr in addrs {
+        let rescored = NodeServiceClient::connect(addr)
+            .await
+            .unwrap()
+            .bm25_rescore(pipestream_search::pb::Bm25RescoreRequest {
+                terms: vec!["document".into()],
+                global_doc_count: N_DOCS as u64,
+                global_total_doc_length: (N_DOCS * 3) as u64,
+                global_doc_frequencies: vec![N_DOCS as u32],
+                candidate_ids: (0..N_DOCS as u64).collect(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(rescored.hits.len(), SHARD_DOCS);
+        for hit in rescored.hits {
+            assert_eq!(hit.identity, fixture_identity(hit.doc_id));
+        }
+    }
+    for handle in handles {
+        handle.abort();
+    }
 }
 
 fn lexical_leaf(id: &str, text: &str) -> SelectionQuery {

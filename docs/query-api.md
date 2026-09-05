@@ -1,5 +1,12 @@
 # Public query contract
 
+Simple lexical selection returns the imported `DocumentIdentity` with each hit
+when present on the scored row. The terminal `QueryStream` response carries the
+same identity. It is read with the score, without a later positional-ID lookup.
+`doc_id` is still a generation-local locator. Dense, hybrid, Boolean, browse and
+provisional candidates do not expose logical identity yet; see
+[document writes](document-writes.md) for the remaining publication contract.
+
 Status: `SearchService.Query` and its certified streaming form
 `SearchService.QueryStream` are IMPLEMENTED. Increment 1 landed on 2026-08-24:
 `Query` executes the shapes in the mapping table below by delegating to `Search`,

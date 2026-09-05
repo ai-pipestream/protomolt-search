@@ -14,7 +14,7 @@ establish completion of the three workstreams.
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public routes enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
 | Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Not implemented |
-| Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported row identities persist through image/WAL lifecycle and node fetch; linking catalog publication and returning identities on every search route remain |
+| Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and lexical results; catalog publication and the other result routes remain |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
 | Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Local source acceptance has durable/volatile receipts and abrupt-process-exit coverage; searchable publication remains |
 
@@ -175,10 +175,21 @@ backup/migration, workspace binding and document/field grants remain unfinished.
 ## Row identity increment
 
 `DocumentIdentity` and interned archive metadata retain exact document keys,
-versions and chunk ordinals independently of physical rows. Node fetch exposes
-that metadata, and compaction tests verify it after row renumbering and recovery.
+versions and chunk ordinals independently of physical rows. Node fetch and
+lexical hits expose that metadata, and compaction tests verify it after row
+renumbering and recovery. Simple lexical `Query` selection and its streamed
+terminal response preserve the scored row's identity. Dense, hybrid, Boolean,
+browse and provisional result identities remain.
 Identity-bearing archives use format 2, and their WAL records require format 3.
 This storage/import capability does not establish authority over versions on
 legacy ingest or propagate identity through every query response. The publisher
 must still attach identities from accepted versions and atomically control which
 version's complete chunk set is visible.
+
+The lexical result increment passed 356 library tests, 432 integration tests
+(one existing ignored test), 10 embedded tests, all five mobile target checks,
+examples/tests compilation, and the vendored-proto byte gate. The public tests
+cover flat/fused BM25, both node delivery modes, rescoring and terminal streaming
+with exact binary keys, large versions, absent identities and optional chunk
+ordinals. Both compaction layouts verify lexical identities after renumbering,
+reopening and replay.
