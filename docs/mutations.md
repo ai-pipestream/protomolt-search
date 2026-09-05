@@ -100,8 +100,21 @@ The shape is the live reshard's, in one process:
 The response reports rows before and after, tombstones reclaimed, tail
 records applied (and how many under the lock), the write-lock hold and the
 closing flush in milliseconds, the new WAL generation, the cutoff clock, the
-layout, and the stats epoch. `dry_run` runs the preflight only and reports
-what a compaction would work from, writing nothing.
+layout, the stats epoch, and the partition column. `dry_run` runs the
+preflight only and reports what a compaction would work from, writing
+nothing.
+
+`partition_column` names an integer column (timestamps included) and asks
+for the partitioned layout on the segment layout: the outputs hold the
+rows in that column's order, each covering one ascending value range at
+most `tail_bound` rows long, with the rows that lack the column in a final
+unkeyed segment (`docs/immutable-segments.md`, "Partitioned layout"). The
+tail that arrives after the cutoff is sealed unordered as usual, and the
+next partitioned compaction folds it in. An empty column keeps the bucket
+layout; a request without it on a partitioned shard returns the shard to
+the bucket layout. A double or facet column, a name that is not a column,
+a column no document carries, and the single-image layout are each
+rejected by name before any work.
 
 Refused by name: an in-memory shard; a shard without a WAL; a generation
 with legacy unclocked records; a generation that began with preexisting

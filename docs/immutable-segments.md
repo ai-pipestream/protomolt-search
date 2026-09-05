@@ -171,6 +171,64 @@ drained and the accepted generation has passed its soak and backup policy.
 `CompactShard` retires the directories it replaced in its closing flush,
 since its rollback protocol covers the window before it.
 
+## Segment summaries
+
+`segment.json` carries a `summary` written at seal time from the sealed
+BM25 image: for every integer column and every double column of the
+shard's table, the least and greatest stored value and how many rows carry
+one, over every row the segment holds (a row deleted after the seal keeps
+counting; a range over a superset is still sound). A column with no value
+in the segment is listed with `present == 0` and an inverted placeholder
+range (the integer range inverted; `f64::MAX` over `f64::MIN` for doubles,
+since JSON has no infinities). Facet and map columns are not summarized:
+each segment's own dictionary already says which values it holds.
+
+A summary describes the segment and never changes its contents, so a
+segment sealed before summaries existed opens as it always did, with no
+summary; a planner treats such a segment as one that may hold anything.
+The summaries are what lets a query rule a segment out without opening
+its images: a predicate whose range cannot meet the column's, or a
+required column with `present == 0`, admits no row of that segment.
+
+## Partitioned layout
+
+A compaction normally seals one segment per WAL hash bucket, so a
+column's values are scattered across every segment and a summary rarely
+rules one out. `CompactShardRequest.partition_column` names an integer
+column (timestamps included) and asks for the other layout: the live rows
+in that column's order, cut into segments of at most `tail_bound` rows,
+each covering one ascending value range, recorded as the summary's
+`partition` (`lo..=hi` over that column) and as the set manifest's
+`partition_key`. Rows inside a segment are in key order too, ties by
+source id. Rows whose document does not carry the column, and vector-only
+rows, follow in one or more unkeyed segments (no partition range, the
+column absent) after the keyed ones.
+
+The build runs in three passes and holds no more than one WAL bucket or
+one output partition in memory at a time: the buckets replay once to
+yield each live row's key and the cut; they replay again while each live
+row's records are appended to a spill log per partition (a single-bucket
+WAL generation under the work directory); each spill log then replays
+into its image. A cut prefers a key boundary: a run of equal keys moves to
+the next segment as a unit when it would overflow the current one, so
+ranges are disjoint wherever the data allows, and only a run longer than
+the bound is split, the neighbours then sharing that one key. Every output
+declares the shard's full column tables, whether or not it holds a record
+of each column, so the set opens under the node's configuration.
+
+The online path is the ordinary one (`docs/mutations.md`): the staged
+outputs, the shadow shard, the cutover, the closing flush. Rows that
+arrive after the cutoff seal into an unordered tail segment; the manifest
+keeps its key, that segment has no partition range (its column summary
+still counts), and the next partitioned compaction folds it in. A
+compaction without the column returns the shard to the bucket layout and
+clears the key. Rejected by name before any work: a double or facet
+column, a name that is not a column, a column no document of the shard
+carries, and the single-image layout. Global ids, lineage, statistics, and
+every read path are unchanged by the layout; `tests/compaction.rs` pins
+the partitioned outputs and their summaries against a shard built fresh
+from the same rows.
+
 ## Control-plane execution
 
 The authority schedules `COMPACT_SHARD`, `SPLIT_SHARD`, and `MERGE_SHARDS`

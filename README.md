@@ -1214,6 +1214,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Landed 2026-09-05: partitioned compaction and segment summaries.**
+  Every sealed segment records, per integer and double column, its value
+  range and how many rows carry one; `CompactShardRequest.partition_column`
+  orders a shard's rows by an integer column and seals them as segments
+  over disjoint ascending value ranges, the rows without the column apart,
+  through the ordinary online cutover. Details: [Immutable aligned
+  segments](docs/immutable-segments.md), "Segment summaries" and
+  "Partitioned layout".
 - **Landed 2026-09-05: the explain tree.** `QueryRequest.explain` hands
   each hit an `Explanation` tree whose root is the served score and whose
   nodes state their arithmetic: per-term BM25 inputs and contributions on
