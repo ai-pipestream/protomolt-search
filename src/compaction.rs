@@ -324,6 +324,13 @@ struct Preflight {
     backend_kind: String,
     scoring_fingerprint: String,
     stats_epoch: u64,
+    /// The integer column the outputs are ordered by
+    /// (docs/immutable-segments.md "Partitioned layout"); `None` keeps
+    /// the bucket layout.
+    partition: Option<String>,
+    /// The live shard's column tables on the segment layout, given to
+    /// the build so every output declares them.
+    columns: Option<crate::reshard::ColumnTables>,
 }
 
 /// A segment-layout tail caught between the two calls of a legacy append:
@@ -371,11 +378,6 @@ impl NodeServiceImpl {
                  Tokio runtime context",
             )
         })?;
-        if !request.partition_column.is_empty() {
-            return Err(Status::unimplemented(
-                "CompactShardRequest.partition_column is reserved and not served yet",
-            ));
-        }
         let tail_bound = if request.tail_bound == 0 {
             DEFAULT_TAIL_BOUND
         } else {
@@ -407,6 +409,7 @@ impl NodeServiceImpl {
                 layout: layout_name(preflight.segmented).to_string(),
                 dry_run: true,
                 stats_epoch: preflight.stats_epoch,
+                partition_column: preflight.partition.clone().unwrap_or_default(),
                 ..Default::default()
             });
         }
@@ -528,6 +531,89 @@ impl NodeServiceImpl {
                 })
                 .unzip()
         });
+        let partition = if request.partition_column.is_empty() {
+            None
+        } else {
+            let column = request.partition_column.as_str();
+            if !segmented {
+                return Err(Status::failed_precondition(format!(
+                    "partition_column {column:?} needs the segment layout; this shard is a \
+                     single image"
+                )));
+            }
+            let Some(shard) = guard.bm25.as_ref() else {
+                return Err(Status::failed_precondition(format!(
+                    "partition_column {column:?}: this shard holds no documents, so no column \
+                     can order it"
+                )));
+            };
+            let Some(ii) = shard.integer_index(column) else {
+                let kind = if shard.numeric_index(column).is_some() {
+                    "a double column"
+                } else if shard.facet_index(column).is_some() {
+                    "a facet column"
+                } else {
+                    "not a column of this shard"
+                };
+                return Err(Status::invalid_argument(format!(
+                    "partition_column {column:?} is {kind}; a partitioned compaction orders \
+                     by an integer column (--integer-fields, timestamps included)"
+                )));
+            };
+            let Bm25Shard::Segmented(segmented) = shard else {
+                return Err(Status::internal(
+                    "the segment layout serves a segmented shard",
+                ));
+            };
+            // Before any work: a column no document of the shard carries
+            // cannot order it. The sealed summaries count the segments'
+            // rows; the tail is scanned.
+            let sealed: u64 = segmented
+                .snapshot()
+                .manifest()
+                .segments
+                .iter()
+                .filter_map(|segment| segment.summary.as_ref())
+                .flat_map(|summary| summary.int_columns.iter())
+                .filter(|c| c.name == column)
+                .map(|c| c.present)
+                .sum();
+            let tail = segmented.tail();
+            let in_tail = (0..tail.next_doc_id()).any(|doc| tail.integer_value(ii, doc).is_some());
+            if sealed == 0 && !in_tail {
+                return Err(Status::failed_precondition(format!(
+                    "partition_column {column:?}: no document of this shard carries it, so it \
+                     cannot order the rows"
+                )));
+            }
+            Some(column.to_string())
+        };
+        // The live column tables, for every segmented build: a bucket or
+        // a partition with no record of a declared column still declares
+        // it, or the output would not open under this configuration.
+        let columns = match guard.bm25.as_ref() {
+            Some(Bm25Shard::Segmented(s)) => Some(crate::reshard::ColumnTables {
+                facets: (0..s.facet_count())
+                    .map(|i| s.facet_name(i).to_string())
+                    .collect(),
+                numerics: (0..s.numeric_count())
+                    .map(|i| s.numeric_name(i).to_string())
+                    .collect(),
+                map_facets: (0..s.map_facet_count())
+                    .map(|i| s.map_facet_name(i).to_string())
+                    .collect(),
+                map_numerics: (0..s.map_numeric_count())
+                    .map(|i| s.map_numeric_name(i).to_string())
+                    .collect(),
+                integers: (0..s.integer_count())
+                    .map(|i| s.integer_name(i).to_string())
+                    .collect(),
+                geo: (0..s.geo_count())
+                    .map(|i| s.geo_name(i).to_string())
+                    .collect(),
+            }),
+            _ => None,
+        };
         if fields.is_some() && self.config.analysis_addr.is_none() {
             return Err(Status::unavailable(
                 "no analysis backend configured for this shard (analysis_addr); compaction \
@@ -600,6 +686,8 @@ impl NodeServiceImpl {
             backend_kind,
             scoring_fingerprint,
             stats_epoch: guard.stats_epoch,
+            partition,
+            columns,
         }))
     }
 
@@ -685,16 +773,33 @@ impl NodeServiceImpl {
                 }
                 Ok(())
             };
-            crate::reshard::compact_log(
-                &pre.gen_dir,
-                pre.cutoff_clock,
-                &build_dir,
-                pre.segmented,
-                names.as_deref(),
-                pins.as_deref(),
-                &mut analyze,
-                &mut sink,
-            )
+            match pre.partition.as_deref() {
+                Some(column) => crate::reshard::compact_log_partitioned(
+                    &pre.gen_dir,
+                    pre.cutoff_clock,
+                    &build_dir,
+                    crate::reshard::PartitionSpec {
+                        column,
+                        bound: tail_bound,
+                    },
+                    names.as_deref(),
+                    pins.as_deref(),
+                    pre.columns.as_ref(),
+                    &mut analyze,
+                    &mut sink,
+                ),
+                None => crate::reshard::compact_log(
+                    &pre.gen_dir,
+                    pre.cutoff_clock,
+                    &build_dir,
+                    pre.segmented,
+                    names.as_deref(),
+                    pins.as_deref(),
+                    pre.columns.as_ref(),
+                    &mut analyze,
+                    &mut sink,
+                ),
+            }
             .map_err(|e| Status::failed_precondition(format!("compaction build: {e}")))?
         };
         if build.binding != bound_first {
@@ -738,7 +843,7 @@ impl NodeServiceImpl {
                     closing_flush_ms,
                     tail_passes,
                     stats_epoch,
-                    partition_column: String::new(),
+                    partition_column: pre.partition.clone().unwrap_or_default(),
                 })
             }
             Err(status) => {
@@ -984,6 +1089,7 @@ impl NodeServiceImpl {
                     .then_some(image.exact_vector_path.as_path()),
                 bm25_path: image.bm25_path.as_deref().expect("checked above"),
                 live_docs_path: live,
+                partition_column: pre.partition.as_deref(),
             })
             .collect();
         let staged = crate::segments::stage_segments(&root, sources)
@@ -996,6 +1102,7 @@ impl NodeServiceImpl {
             let manifest = SegmentSetManifest {
                 epoch: epoch_at_open,
                 segments: staged.clone(),
+                partition_key: pre.partition.clone(),
                 ..Default::default()
             };
             let catalog = SegmentCatalog::open_staged(&root, manifest, self.config.vector_load())

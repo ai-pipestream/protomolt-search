@@ -507,7 +507,7 @@ impl Bm25Shard {
 
     /// The facet-table index of the facet field named `name`, if the
     /// active table has it.
-    fn facet_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn facet_index(&self, name: &str) -> Option<usize> {
         match self {
             Bm25Shard::Building(s) => s.facet_index(name),
             Bm25Shard::Spilling(s) => s.facet_index(name),
@@ -561,7 +561,7 @@ impl Bm25Shard {
 
     /// The numeric-table index of the numeric field named `name`, if
     /// the active table has it.
-    fn numeric_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn numeric_index(&self, name: &str) -> Option<usize> {
         match self {
             Bm25Shard::Building(s) => s.numeric_index(name),
             Bm25Shard::Spilling(s) => s.numeric_index(name),
@@ -593,7 +593,7 @@ impl Bm25Shard {
 
     /// The integer-table index of the i64 field named `name`, if the
     /// active table has it.
-    fn integer_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn integer_index(&self, name: &str) -> Option<usize> {
         match self {
             Bm25Shard::Building(s) => s.integer_index(name),
             Bm25Shard::Spilling(s) => s.integer_index(name),
@@ -4673,6 +4673,7 @@ impl NodeServiceImpl {
             exact_vector_path: exact_path.as_deref(),
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
+            partition_column: None,
         };
         plan.catalog
             .append(source)
