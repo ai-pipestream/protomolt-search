@@ -690,7 +690,74 @@ fn cases() -> Vec<(&'static str, SelectionQuery, u32)> {
             boolean(vec![cel("f", "year >= 2020"), lexical("l", "search")]),
             0,
         ),
+        // Clauses a leaf implies are dropped from that shard's tree
+        // (docs/placement.md, "Implied clauses"): the recent leaves
+        // receive no `year` clause here, old is ruled out, other keeps it.
+        (
+            "dense >= 2015 implied",
+            and(vec![cel("f", "year >= 2015"), dense("v")]),
+            1,
+        ),
+        (
+            "dense scotus implied",
+            and(vec![cel("f", "court_code == \"scotus\""), dense("v")]),
+            0,
+        ),
+        (
+            "dense has year implied",
+            and(vec![cel("f", "has(year)"), dense("v")]),
+            0,
+        ),
+        (
+            "dense implied under or",
+            and(vec![
+                cel("f", "year >= 2015 || court_code == \"ca9\""),
+                dense("v"),
+            ]),
+            0,
+        ),
+        (
+            "lexical whole tree implied",
+            and(vec![
+                cel("f", "year >= 2010 && has(court_code)"),
+                lexical("l", "search"),
+            ]),
+            1,
+        ),
+        (
+            "boolean implied",
+            boolean(vec![cel("f", "year >= 2010"), lexical("l", "search")]),
+            0,
+        ),
     ]
+}
+
+/// The mask the pruning coordinator computes for the shapes above: which
+/// clauses each consulted shard is spared. The wire cannot show a
+/// dropped clause, so this reads the verdict the fan-out reads.
+#[test]
+fn the_recent_leaves_are_spared_the_clauses_they_imply() {
+    use pipestream_search::cel::compile_filter;
+    use pipestream_search::placement::ShardMask;
+    let placement = Placement::validate(&tree()).unwrap();
+    let codes: Vec<Option<i64>> = codes().into_iter().map(Some).collect();
+    let filter = compile_filter("year >= 2010 && has(court_code)")
+        .unwrap()
+        .unwrap();
+    let mask = ShardMask::compute(&placement, &codes, &filter);
+    // LEAVES order: old, recent.scotus, recent.rest, other.
+    assert_eq!(mask.skipped, vec![true, false, false, false]);
+    assert_eq!(
+        mask.filter_for(1, &filter),
+        None,
+        "scotus pins year and court"
+    );
+    let rest = mask.filter_for(2, &filter).unwrap();
+    assert!(matches!(
+        rest.expr,
+        Some(pipestream_search::pb::filter_expr::Expr::Has(_))
+    ));
+    assert_eq!(mask.filter_for(3, &filter), Some(filter.clone()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

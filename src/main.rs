@@ -720,6 +720,7 @@ async fn build_corpus(
         .with_stream_search(cfg.stream_search)
         .with_bm25_stream(cfg.bm25_stream)
         .with_max_k(cfg.max_k)
+        .with_signal_batch(cfg.signal_batch)
         .with_shard_pruning(cfg.shard_pruning)
         .with_max_rerank_bytes(cfg.max_rerank_bytes)
         .with_topology_generation(dataset.shard_map.map_or(0, |map| map.generation))

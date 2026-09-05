@@ -1347,6 +1347,22 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Landed 2026-09-05: the boolean group's survivors are scored in one call,
+  and implied clauses are dropped per shard.** The BM25 candidate scorer
+  searched its growing result list on every match, quadratic in the
+  candidates of one call, which is why a boolean group sent its survivors to
+  the shards in `max_k` pieces; it now lands each match in its candidate's
+  slot, the coordinator sends a shard's survivors in `signal_batch` ids per
+  call (its own knob, no longer `max_k`), and a dense clause's
+  membership is the universe rather than a fetched list of every id. The
+  keyword-gated dense cases over 2,000,000 rows drop accordingly
+  (`docs/benchmarks/partition-pruning-2026-09.md`, the dated section). Under a placement tree a
+  consulted shard is sent the request filter without the clauses its leaf
+  implies, one bitmap less per implied clause, with the known handshake
+  mapped back. Answers are identical either way (`tests/boolean_masked.rs`,
+  `tests/placement.rs`). [Boolean execution](docs/query-api.md),
+  [Placement trees](docs/placement.md).
+
 - **Landed 2026-09-05: dense identity on product-owned nodes.** Classic and
   coalesced top-k capture source identity with their scored snapshot. Streaming
   top-k resolves only winners through a bounded exchange on the same stream,

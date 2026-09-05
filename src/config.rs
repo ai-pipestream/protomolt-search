@@ -294,6 +294,10 @@ pub struct Config {
     /// are refused (never clamped); a request omitting `k` runs at this
     /// depth. Must be at least 1.
     pub max_k: u32,
+    /// Coordinator: candidate ids per rescore call when a boolean group
+    /// scores a clause over its surviving ids (`--signal-batch`,
+    /// docs/query-api.md). At least 1.
+    pub signal_batch: u32,
     /// Coordinator-wide logical FP32 payload bound for one rerank request.
     pub max_rerank_bytes: u64,
     /// Optional generation-bound measured candidate-depth profile.
@@ -544,6 +548,7 @@ struct FileConfig {
     relay: Option<bool>,
     bm25_stream: Option<bool>,
     max_k: Option<u32>,
+    signal_batch: Option<u32>,
     max_rerank_mib: Option<u64>,
     dense_quality_profile: Option<String>,
     synonyms: Option<String>,
@@ -1641,6 +1646,25 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     })
     .transpose()?
     .unwrap_or(crate::coordinator::DEFAULT_MAX_K);
+    let signal_batch = opt(
+        args,
+        "signal-batch",
+        "TURBOVEC_SIGNAL_BATCH",
+        file.signal_batch.map(|v| v.to_string()).as_deref(),
+    )
+    .map(|s| {
+        s.parse::<u32>()
+            .map_err(|e| format!("invalid signal batch: {e}"))
+            .and_then(|v| {
+                if v == 0 {
+                    Err("signal batch must be at least 1 (ids per rescore call)".to_string())
+                } else {
+                    Ok(v)
+                }
+            })
+    })
+    .transpose()?
+    .unwrap_or(crate::coordinator::DEFAULT_SIGNAL_BATCH);
     let max_rerank_bytes = opt(
         args,
         "max-rerank-mib",
@@ -2344,6 +2368,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         relay,
         bm25_stream,
         max_k,
+        signal_batch,
         max_rerank_bytes,
         dense_quality_profile,
         synonyms,

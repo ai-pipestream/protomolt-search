@@ -134,6 +134,33 @@ same global statistics as the ordinary lexical route. A shard statistics epoch
 change aborts the attempt; the coordinator retries the complete plan once and
 then fails rather than combining generations.
 
+A dense clause's membership is not fetched: every row that has a vector
+matches it, which is every live row, so the clause is the universe and the
+group's other clauses name the rows (a group whose positive clauses are all
+dense starts from the live-document bitmap). A row the rescore returns no
+product for has no vector and leaves the group, the rows the vector bitmap
+used to exclude. A lone dense clause under a rare term therefore costs the
+term's bitmap and one rescore, not the corpus's id list.
+
+Scoring the survivors is candidate-scoped on both kinds of clause. A lexical
+clause goes through `Bm25Rescore`: per term, one cursor walks the sorted
+candidates through the postings' skip runs, and each match lands in the slot
+of its candidate, so a call costs the candidates plus the matched postings and
+comes back doc id ascending. A dense clause goes through `VectorRescore`: the
+candidates become the shard's allowlist and the node runs one masked scan of
+its index, the same kernel and the same calibrated products a full search
+emits, with the sealed parts and SIMD blocks no candidate sits in left unread.
+The coordinator sends a shard's survivors in `signal_batch` ids per call
+(`--signal-batch`, default 10,000, live as a coordinator knob), its own
+setting rather than `max_k`; the answer does not depend on the batch
+(`tests/boolean_masked.rs`), and on the local benchmark pieces of 10,000 and
+one call per shard are within 6% of each other, since a piece pipelines the
+wire with the shard's work. Until 2026-09-05 the lexical scorer searched its
+growing result list on every match, quadratic in the candidates of one call,
+and the survivors went out in `max_k` pieces to keep each call small: a
+600,000-row membership over 2,000,000 rows spent about 2 s in that search
+(`docs/benchmarks/partition-pruning-2026-09.md`).
+
 This is exact set algebra, not a candidate-depth heuristic. ANN cannot certify
 recursive membership and is refused. Each leaf contributes its actual indexed
 domain: lexical and filter leaves contain document rows, while a dense leaf can
