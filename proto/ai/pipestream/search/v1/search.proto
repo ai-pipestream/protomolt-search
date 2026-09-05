@@ -873,6 +873,14 @@ message CompactShardRequest {
   // tombstone counts the compaction would work from, with no build and
   // no files written.
   bool dry_run = 3;
+  // Optional partition column (docs/immutable-segments.md "Partitioned
+  // layout"): an integer column whose value orders the rows of the
+  // compacted output. Each output segment then covers one ascending,
+  // disjoint value range, recorded in its summary, and rows without the
+  // column go to one final unkeyed segment. Empty keeps the bucket
+  // layout. A column no document carries, or a non-integer column,
+  // is rejected by name.
+  string partition_column = 4;
 }
 
 message CompactShardResponse {
@@ -912,6 +920,9 @@ message CompactShardResponse {
   // Whether the compaction bumped the shard's stats epoch (always, after
   // a non-dry run): coordinators refetch term statistics.
   uint64 stats_epoch = 13;
+  // The partition column the outputs were ordered by; empty for the
+  // bucket layout.
+  string partition_column = 14;
 }
 
 // One shard's liveness and shape.
@@ -1149,6 +1160,13 @@ message ShardScanStats {
   // them. This field used to be missing and `floors_published` counted
   // offers, so the broadcast knobs measured as having no effect.
   uint64 floors_offered = 5;
+  // Segments in the shard's snapshot, and how many of them the scan
+  // ruled out from their summaries before opening them
+  // (docs/immutable-segments.md "Segment summaries"). Skipped segments
+  // contain no row that could pass the request's filters; the answer
+  // is the same with pruning off.
+  uint32 segments_total = 6;
+  uint32 segments_skipped = 7;
 }
 
 // One scored vector. Ids are global across the cluster (see
@@ -5105,6 +5123,10 @@ message QueryProfile {
   uint32 rerank_tasks = 11;
   // Collapse: key resolution and grouping over the candidate pool.
   float collapse_ms = 12;
+  // Segments across all shards the selection consulted, and how many
+  // were ruled out from their summaries without being opened.
+  uint32 segments_total = 13;
+  uint32 segments_skipped = 14;
 }
 
 // One public hit with score provenance.

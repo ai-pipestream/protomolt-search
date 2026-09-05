@@ -371,6 +371,11 @@ impl NodeServiceImpl {
                  Tokio runtime context",
             )
         })?;
+        if !request.partition_column.is_empty() {
+            return Err(Status::unimplemented(
+                "CompactShardRequest.partition_column is reserved and not served yet",
+            ));
+        }
         let tail_bound = if request.tail_bound == 0 {
             DEFAULT_TAIL_BOUND
         } else {
@@ -733,6 +738,7 @@ impl NodeServiceImpl {
                     closing_flush_ms,
                     tail_passes,
                     stats_epoch,
+                    partition_column: String::new(),
                 })
             }
             Err(status) => {

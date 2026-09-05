@@ -32,7 +32,54 @@ pub struct SegmentArtifact {
     pub sha256: String,
 }
 
+/// One column's range over a sealed segment: the least and greatest
+/// stored value and how many rows carry one. A segment whose range
+/// cannot intersect a request's predicate holds no row that passes it,
+/// so a planner may leave the segment unopened without changing the
+/// answer (docs/immutable-segments.md "Segment summaries").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntColumnSummary {
+    pub name: String,
+    pub min: i64,
+    pub max: i64,
+    pub present: u64,
+}
+
+/// [`IntColumnSummary`] for a double column.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NumericColumnSummary {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+    pub present: u64,
+}
+
+/// The value range a partitioned compaction gave this segment
+/// (docs/immutable-segments.md "Partitioned layout"): every row that
+/// carries `column` has a value in `lo..=hi`, and the segments of one
+/// set cover disjoint ascending ranges. Absent on a bucket-layout
+/// segment and on the unkeyed segment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartitionRange {
+    pub column: String,
+    pub lo: i64,
+    pub hi: i64,
+}
+
+/// Per-segment column ranges, written at seal time from the sealed
+/// BM25 image. Columns with no stored value in the segment are listed
+/// with `present == 0` and a `min > max` placeholder range.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SegmentSummary {
+    #[serde(default)]
+    pub int_columns: Vec<IntColumnSummary>,
+    #[serde(default)]
+    pub numeric_columns: Vec<NumericColumnSummary>,
+    #[serde(default)]
+    pub partition: Option<PartitionRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentMetadata {
     pub segment_id: String,
     pub generation: u64,
@@ -48,6 +95,10 @@ pub struct SegmentMetadata {
     pub exact_vectors: SegmentArtifact,
     pub bm25: SegmentArtifact,
     pub live_docs: SegmentArtifact,
+    /// Absent on segments sealed before summaries existed; such a
+    /// segment is never pruned.
+    #[serde(default)]
+    pub summary: Option<SegmentSummary>,
 }
 
 impl SegmentMetadata {
@@ -58,11 +109,18 @@ impl SegmentMetadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentSetManifest {
     pub format: u32,
     pub epoch: u64,
     pub segments: Vec<SegmentMetadata>,
+    /// The integer column a partitioned compaction ordered this set by
+    /// (docs/immutable-segments.md "Partitioned layout"); absent for the
+    /// bucket layout. A later seal appends an unordered tail segment
+    /// and leaves the key in place: the ordered segments keep their
+    /// ranges, and the next partitioned compaction folds the tail in.
+    #[serde(default)]
+    pub partition_key: Option<String>,
 }
 
 impl Default for SegmentSetManifest {
@@ -71,6 +129,7 @@ impl Default for SegmentSetManifest {
             format: SET_FORMAT,
             epoch: 0,
             segments: Vec::new(),
+            partition_key: None,
         }
     }
 }
@@ -1250,6 +1309,7 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
             exact_vectors: exact_artifact,
             bm25: bm25_artifact,
             live_docs: live_artifact,
+            summary: Some(summarize_columns(&bm25, rows as u32)),
         };
         write_json_atomic(&temp_dir.join(SEGMENT_META_FILE), &metadata)?;
         std::fs::File::open(&temp_dir)
@@ -1310,6 +1370,57 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> 
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync {}: {error}", parent.display()))
+}
+
+/// The column ranges of a sealed BM25 image, over every stored row
+/// (deleted rows included: a range over a superset is still sound for
+/// pruning, and the live bitmap keeps changing after the seal).
+pub(crate) fn summarize_columns(bm25: &Bm25Reader, rows: u32) -> SegmentSummary {
+    let int_columns = (0..bm25.integer_count())
+        .map(|ii| {
+            let mut present = 0u64;
+            let mut min = i64::MAX;
+            let mut max = i64::MIN;
+            for doc in 0..rows {
+                if let Some(value) = bm25.integer_value(ii, doc) {
+                    present += 1;
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+            }
+            IntColumnSummary {
+                name: bm25.integer_name(ii).to_string(),
+                min,
+                max,
+                present,
+            }
+        })
+        .collect();
+    let numeric_columns = (0..bm25.numeric_count())
+        .map(|ni| {
+            let mut present = 0u64;
+            let mut min = f64::INFINITY;
+            let mut max = f64::NEG_INFINITY;
+            for doc in 0..rows {
+                if let Some(value) = bm25.numeric_value(ni, doc) {
+                    present += 1;
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+            }
+            NumericColumnSummary {
+                name: bm25.numeric_name(ni).to_string(),
+                min,
+                max,
+                present,
+            }
+        })
+        .collect();
+    SegmentSummary {
+        int_columns,
+        numeric_columns,
+        partition: None,
+    }
 }
 
 #[cfg(test)]
