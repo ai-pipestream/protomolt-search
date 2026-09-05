@@ -136,6 +136,7 @@ fn body_only(text: &str) -> SearchVariant {
     SearchVariant {
         label: "body-only".to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -175,6 +176,7 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
     SearchVariant {
         label: label.to_string(),
         query: Some(search_variant::Query::Bm25(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -543,6 +545,7 @@ async fn a_failing_arm_is_named_in_the_error() {
 async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
     let (coord, _nodes, _mock) = cluster().await;
     let bm25 = |k: u32| Bm25SearchRequest {
+        explain: false,
         collection: String::new(),
         highlight: None,
         projections: Vec::new(),

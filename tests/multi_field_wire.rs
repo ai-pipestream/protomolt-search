@@ -683,6 +683,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -713,6 +714,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     let err = SearchService::bm25_search(
         &coord,
         tonic::Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -949,6 +951,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
     assert_eq!(added.added, 3);
 
     let leg = |fingerprint: u64| Bm25QueryRequest {
+        explain: false,
         highlight: None,
         projections: Vec::new(),
         filter: None,

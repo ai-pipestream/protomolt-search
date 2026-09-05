@@ -428,6 +428,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     let resp = SearchService::bm25_search(
         &distributed,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),
@@ -539,6 +540,7 @@ async fn stage_and_ingest_refusals_are_loud() {
     let err = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),

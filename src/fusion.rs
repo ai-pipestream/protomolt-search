@@ -43,6 +43,9 @@ pub struct FusedHit {
     pub leg_ranks: Vec<Option<u32>>,
     /// Per-leg raw score (`None` when the doc is not in the leg).
     pub leg_scores: Vec<Option<f64>>,
+    /// SCORE_BLEND only: each leg's normalized score, the value the
+    /// combination consumed (`docs/explain.md`); empty for RRF.
+    pub leg_norms: Vec<Option<f64>>,
 }
 
 /// Fuse `legs` with RRF and return the top-`depth`, fused score
@@ -79,6 +82,7 @@ pub fn rrf_fuse(legs: &[Leg], rrf_k: f64, depth: usize) -> Vec<FusedHit> {
                 fused_score: 0.0,
                 leg_ranks: vec![None; legs.len()],
                 leg_scores: vec![None; legs.len()],
+                leg_norms: Vec::new(),
             });
             entry.fused_score += contribution;
             entry.leg_ranks[li] = Some(rank);
@@ -210,6 +214,7 @@ pub fn blend_fuse(
                         fused_score: 0.0,
                         leg_ranks: vec![None; legs.len()],
                         leg_scores: vec![None; legs.len()],
+                        leg_norms: Vec::new(),
                     },
                     vec![None; legs.len()],
                 )
@@ -225,6 +230,7 @@ pub fn blend_fuse(
         .into_values()
         .map(|(mut hit, norms)| {
             hit.fused_score = combine(&norms, legs, combination, total_weight);
+            hit.leg_norms = norms;
             hit
         })
         .collect();

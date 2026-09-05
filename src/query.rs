@@ -609,6 +609,11 @@ async fn execute_recursive_boolean(
             .total_cmp(&a.score)
             .then_with(|| a.doc_id.cmp(&b.doc_id))
     });
+    if req.explain {
+        for hit in &mut hits {
+            hit.explain = Some(crate::explain::boolean(hit));
+        }
+    }
     let mut profile: Option<crate::pb::QueryProfile> = req.profile.then(Default::default);
     if let Some(profile) = profile.as_mut() {
         profile.selection_ms = ms(t_selection);
@@ -629,6 +634,10 @@ async fn execute_recursive_boolean(
         &mut profile,
     )
     .await?;
+    if req.explain {
+        let scorer_name: Option<String> = scorer.as_ref().map(|s| s.executed_suffix());
+        crate::explain::finish(&mut hits, &window_boosts(&boosts), scorer_name.as_deref())?;
+    }
     let aggregate = if let Some(aggregate) = &boolean.aggregate {
         if !aggregate.filter.trim().is_empty() || !aggregate.geo_filters.is_empty() {
             return Err(refuse(
@@ -1103,6 +1112,22 @@ pub async fn execute(
     }
 
     let boosts = parse_boosts(&req.boosts, &plan.shape, scorer.is_some())?;
+    if req.explain {
+        // The tree explains a score; a shape that computes none has
+        // no tree to give and says so (docs/explain.md).
+        if matches!(plan.shape, Shape::Browse) {
+            return Err(refuse(
+                "explain needs a SCORED selection: a browse computes no relevance, and its                  id (or column) order is the whole contract of the route",
+            ));
+        }
+        if !req.sort.is_empty() {
+            return Err(refuse(
+                "explain is served on relevance-ordered results: a column sort over a                  lexical leaf walks its exact membership and computes no score to explain",
+            ));
+        }
+    }
+    let window_boosts = window_boosts(&boosts);
+    let scorer_name: Option<String> = scorer.as_ref().map(|s| s.executed_suffix());
     // On a single-leaf shape without a scorer or boost no phase uses
     // extra selection depth; on a composite it is the leg/gate depth
     // (and the paging pool), with a scorer it is the pool the scorer
@@ -1269,6 +1294,7 @@ pub async fn execute(
                     highlight: req.highlight.clone(),
                     synonyms: query.synonyms.clone(),
                     synonyms_off: query.synonyms_off,
+                    explain: req.explain,
                     ..Default::default()
                 })))
                 .await?
@@ -1297,10 +1323,23 @@ pub async fn execute(
                     explain: None,
                 })
                 .collect();
+            if req.explain {
+                for (hit, source) in hits.iter_mut().zip(&response.hits) {
+                    hit.explain = Some(crate::explain::lexical(
+                        id,
+                        source,
+                        &response.prefix_expansions,
+                        &response.synonym_expansions,
+                    )?);
+                }
+            }
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed =
                 apply_scorer(coordinator, &scorer, &mut hits, "bm25_search", &mut prof).await?;
             let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
+            if req.explain {
+                crate::explain::finish(&mut hits, &window_boosts, scorer_name.as_deref())?;
+            }
             let (hits, mut groups, next, executed) = match page_or_collapse(
                 coordinator,
                 hits,
@@ -1367,6 +1406,7 @@ pub async fn execute(
                     explain: None,
                 })
                 .collect();
+            let dense_mode = dense_score_mode(query)?;
             let route = if fp32_rerank {
                 let t0 = std::time::Instant::now();
                 let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
@@ -1378,6 +1418,14 @@ pub async fn execute(
                             hit.doc_id
                         ))
                     })?;
+                    if req.explain {
+                        hit.explain = Some(crate::explain::dense(
+                            id,
+                            score,
+                            dense_mode,
+                            Some(hit.score),
+                        ));
+                    }
                     hit.score = score;
                     hit.signals[0].score = score;
                 }
@@ -1395,11 +1443,19 @@ pub async fn execute(
                 }
                 "search:fp32_rerank"
             } else {
+                if req.explain {
+                    for hit in &mut hits {
+                        hit.explain = Some(crate::explain::dense(id, hit.score, dense_mode, None));
+                    }
+                }
                 "search"
             };
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
+            if req.explain {
+                crate::explain::finish(&mut hits, &window_boosts, scorer_name.as_deref())?;
+            }
             let (mut hits, mut groups, next, executed) = match page_or_collapse(
                 coordinator,
                 hits,
@@ -1599,9 +1655,51 @@ pub async fn execute(
                 FusionMode::Decomposed => "hybrid_search:decomposed",
                 _ => "hybrid_search:cascade",
             };
+            if req.explain {
+                let fusion = crate::explain::Fusion::resolve(mode, &legs);
+                let legacy_boost = match &boosts {
+                    BoostPlan::LegacyHybrid(id, b) => Some(crate::explain::LegacyBoost {
+                        id: id.clone(),
+                        base_weight: if b.base_weight == 0.0 {
+                            1.0
+                        } else {
+                            f64::from(b.base_weight)
+                        },
+                        boost_weight: if b.boost_weight == 0.0 {
+                            1.0
+                        } else {
+                            f64::from(b.boost_weight)
+                        },
+                    }),
+                    _ => None,
+                };
+                if matches!(strategy, Strategy::Cascade) {
+                    for (hit, source) in hits.iter_mut().zip(&response.cascade_hits) {
+                        hit.explain = Some(crate::explain::cascade(
+                            source,
+                            dense_id,
+                            lexical_id,
+                            legacy_boost.as_ref(),
+                        ));
+                    }
+                } else {
+                    for (hit, source) in hits.iter_mut().zip(&response.hits) {
+                        hit.explain = Some(crate::explain::composite(
+                            source,
+                            &fusion,
+                            dense_id,
+                            lexical_id,
+                            legacy_boost.as_ref(),
+                        )?);
+                    }
+                }
+            }
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
+            if req.explain {
+                crate::explain::finish(&mut hits, &window_boosts, scorer_name.as_deref())?;
+            }
             let (mut hits, mut groups, next, executed) = match page_or_collapse(
                 coordinator,
                 hits,
@@ -2652,6 +2750,33 @@ async fn apply_boosts(
         p.boost_ms = ms(t0);
     }
     Ok(())
+}
+
+/// The window boosts the explain tree reports (docs/explain.md): the
+/// adapter-planned boosts with their reorder weights defaulted the way
+/// `apply_boosts` defaults them. A legacy hybrid boost is reported by
+/// the composite builder instead; a scorer-owned boost is a plain
+/// signal and appears as a dimension.
+fn window_boosts(plan: &BoostPlan<'_>) -> Vec<crate::explain::WindowBoost> {
+    match plan {
+        BoostPlan::Adapter(list) => list
+            .iter()
+            .map(|b| crate::explain::WindowBoost {
+                id: b.id.to_string(),
+                base_weight: if b.base_weight == 0.0 {
+                    1.0
+                } else {
+                    f64::from(b.base_weight)
+                },
+                boost_weight: if b.boost_weight == 0.0 {
+                    1.0
+                } else {
+                    f64::from(b.boost_weight)
+                },
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Every id in the request — search leaves, filters, boosts — must be

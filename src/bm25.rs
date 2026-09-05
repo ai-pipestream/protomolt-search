@@ -252,6 +252,83 @@ pub fn score_candidates(
     docs
 }
 
+/// One (field, term) occurrence in a document, as the explain tree
+/// reports it (`docs/explain.md`): the raw inputs the contribution is
+/// computed from. `field` indexes the `fields` slice handed to
+/// [`breakdown`]; `term` indexes that field's terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermPresence {
+    pub field: usize,
+    pub term: usize,
+    pub tf: u32,
+    pub doc_len: u32,
+}
+
+/// The (field, term) pairs each of `doc_ids` contains, with tf and
+/// document length, in accumulation order (fields in slice order,
+/// terms in leg order). The returned vector is parallel to `doc_ids`.
+/// A term with global df 0 is skipped exactly as the scorers skip it.
+///
+/// The walk is [`score_candidates`]' walk: per term, the impact cursor
+/// advances through the sorted candidates when the reader has one,
+/// else a merge-join over the posting stream; it never rescans a
+/// posting list per document. Cost is O(terms * (candidates + matched
+/// postings)) and it runs only for the hits a request asked to
+/// explain, after the top-k is fixed.
+pub fn breakdown(fields: &[FieldQuery], doc_ids: &[u32]) -> Vec<Vec<TermPresence>> {
+    let mut sorted: Vec<u32> = doc_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut found: std::collections::HashMap<u32, Vec<TermPresence>> =
+        sorted.iter().map(|&id| (id, Vec::new())).collect();
+    for (fi, fq) in fields.iter().enumerate() {
+        debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
+        for (ti, term) in fq.terms.iter().enumerate() {
+            if fq.stats.dfs[ti] == 0 {
+                continue;
+            }
+            let mut record = |doc_id: u32, tf: u32| {
+                if let Some(list) = found.get_mut(&doc_id) {
+                    list.push(TermPresence {
+                        field: fi,
+                        term: ti,
+                        tf,
+                        doc_len: fq.index.doc_length(doc_id),
+                    });
+                }
+            };
+            match fq.index.impacts(term) {
+                Some(mut cursor) => {
+                    for &cand in &sorted {
+                        if cursor.exhausted() {
+                            break;
+                        }
+                        cursor.advance_shallow(cand);
+                        if cursor.doc_id() == cand {
+                            record(cand, cursor.tf());
+                        }
+                    }
+                }
+                None => {
+                    let mut ci = 0usize;
+                    fq.index.for_each_doc_tf(term, &mut |doc_id, tf| {
+                        while ci < sorted.len() && sorted[ci] < doc_id {
+                            ci += 1;
+                        }
+                        if ci < sorted.len() && sorted[ci] == doc_id {
+                            record(doc_id, tf);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    doc_ids
+        .iter()
+        .map(|id| found.get(id).cloned().unwrap_or_default())
+        .collect()
+}
+
 /// Score `terms` over the shard's postings with the supplied (global)
 /// stats; return the top-k, score descending, ties by ascending doc id.
 ///

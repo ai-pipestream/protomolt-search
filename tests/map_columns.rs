@@ -344,6 +344,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     let resp = SearchService::bm25_search(
         &coordinator,
         Request::new(Bm25SearchRequest {
+            explain: false,
             collection: String::new(),
             highlight: None,
             projections: Vec::new(),

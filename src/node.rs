@@ -2447,6 +2447,106 @@ pub(crate) fn agg_op_name(op: crate::pb::AggregateOp) -> &'static str {
     }
 }
 
+/// The explain breakdown of one scored document (docs/explain.md):
+/// each present (field, term) pair's inputs and contribution, computed
+/// with the scorers' own `idf` and `tf_norm` in the scorers' own
+/// operand order, and the pre-stage sum recomposed from them in
+/// accumulation order. `names[fi]` is the field name reported for
+/// `fields[fi]`; `phrase` is the phrase leg's view index and parallel
+/// term weights when the phrase scorer ran.
+fn explain_terms(
+    fields: &[bm25::FieldQuery<'_>],
+    names: &[&str],
+    presence: &[bm25::TermPresence],
+    phrase: Option<(usize, &[f64])>,
+) -> crate::pb::Bm25Explain {
+    let mut base = 0.0f64;
+    let mut phrase_max = 0.0f64;
+    let mut terms = Vec::with_capacity(presence.len());
+    for hit in presence {
+        let fq = &fields[hit.field];
+        let avgdl = fq.stats.avgdl();
+        let idf = bm25::idf(fq.stats.doc_count, fq.stats.dfs[hit.term]);
+        let tf_norm = bm25::tf_norm(fq.params, hit.tf, hit.doc_len, avgdl);
+        let mut contribution = fq.weight * idf * tf_norm;
+        let mut phrase_group = false;
+        let mut phrase_weight = 1.0;
+        match phrase {
+            Some((view, weights)) if view == hit.field => {
+                phrase_group = true;
+                phrase_weight = weights[hit.term];
+                contribution *= phrase_weight;
+                phrase_max = phrase_max.max(contribution);
+            }
+            _ => base += contribution,
+        }
+        terms.push(crate::pb::Bm25TermExplain {
+            field: names[hit.field].to_string(),
+            term: fq.terms[hit.term].clone(),
+            tf: hit.tf,
+            doc_length: hit.doc_len,
+            avgdl,
+            k1: fq.params.k1,
+            b: fq.params.b,
+            tf_norm,
+            doc_count: fq.stats.doc_count,
+            df: fq.stats.dfs[hit.term],
+            idf,
+            weight: fq.weight,
+            contribution,
+            phrase_group,
+            phrase_weight,
+        });
+    }
+    crate::pb::Bm25Explain {
+        terms,
+        bm25: base + phrase_max,
+        stages: Vec::new(),
+        phrase: phrase.is_some(),
+        phrase_max,
+    }
+}
+
+/// The score-stage rows of an explain breakdown: the chain replayed
+/// stage by stage from the pre-stage sum with the same reads and the
+/// same float expressions `ScoreChain::eval` uses.
+fn explain_stages(
+    explain: &mut crate::pb::Bm25Explain,
+    chain: &crate::scorefn::ScoreChain,
+    specs: &[crate::pb::ScoreStage],
+    doc_id: u32,
+    columns: &dyn crate::scorefn::NumericRead,
+) {
+    let mut score = explain.bm25;
+    for (i, stage) in chain.stages.iter().enumerate() {
+        let spec = &specs[i];
+        let mut row = crate::pb::ScoreStageExplain {
+            stage: i as u32,
+            column: spec.column.clone(),
+            key: spec.key.clone(),
+            present: false,
+            input: 0.0,
+            contribution: 0.0,
+            output: score,
+        };
+        if let (Some(input), Some(contribution)) = (
+            stage.input(doc_id, columns),
+            stage.contribution(doc_id, columns),
+        ) {
+            score = if stage.is_additive() {
+                score + contribution
+            } else {
+                score * contribution
+            };
+            row.present = true;
+            row.input = input;
+            row.contribution = contribution;
+            row.output = score;
+        }
+        explain.stages.push(row);
+    }
+}
+
 fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,
     deleted: Option<Arc<Vec<u64>>>,
@@ -6319,8 +6419,36 @@ impl NodeServiceImpl {
                 let text_index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
                 })?;
+                // The explain breakdown, only for the hits that survived
+                // the top-k (docs/explain.md).
+                let presence = req.explain.then(|| {
+                    let ids: Vec<u32> = docs.iter().map(|doc| doc.doc_id).collect();
+                    bm25::breakdown(&queries, &ids)
+                });
+                let leg_names: Vec<&str> = leg_of_view
+                    .iter()
+                    .map(|&li| req.fields[li].field.as_str())
+                    .collect();
+                let phrase_weights: Option<(usize, Vec<f64>)> =
+                    phrase_view.map(|(view, weights)| {
+                        (
+                            view,
+                            weights.iter().map(|&value| f64::from(value)).collect(),
+                        )
+                    });
                 docs.into_iter()
-                    .map(|doc| -> Result<Bm25Hit, Status> {
+                    .enumerate()
+                    .map(|(hit_index, doc)| -> Result<Bm25Hit, Status> {
+                        let explain = presence.as_ref().map(|presence| {
+                            explain_terms(
+                                &queries,
+                                &leg_names,
+                                &presence[hit_index],
+                                phrase_weights
+                                    .as_ref()
+                                    .map(|(view, weights)| (*view, weights.as_slice())),
+                            )
+                        });
                         let snippets = match highlight.as_ref() {
                             Some(plan) => {
                                 // Body occurrences only (the stored text
@@ -6340,6 +6468,7 @@ impl NodeServiceImpl {
                             None => Vec::new(),
                         };
                         Ok(Bm25Hit {
+                            explain,
                             snippets,
                             projected: Vec::new(),
                             doc_id: self.config.slot_offset + u64::from(doc.doc_id),
@@ -12740,8 +12869,35 @@ impl NodeServiceImpl {
                 };
                 let highlight = highlight_plan(store, req.highlight.as_ref())?;
                 let body = store.field_name(0);
+                // The explain breakdown, only for the hits that survived
+                // the top-k (docs/explain.md): the flat route is one
+                // field at weight 1 in the fused scorer's terms.
+                let flat_query = [bm25::FieldQuery {
+                    index,
+                    terms: &req.terms,
+                    stats: stats.clone(),
+                    params,
+                    weight: 1.0,
+                }];
+                let presence = req.explain.then(|| {
+                    let ids: Vec<u32> = docs.iter().map(|doc| doc.doc_id).collect();
+                    bm25::breakdown(&flat_query, &ids)
+                });
                 docs.into_iter()
-                    .map(|doc| -> Result<Bm25Hit, Status> {
+                    .enumerate()
+                    .map(|(hit_index, doc)| -> Result<Bm25Hit, Status> {
+                        let explain = presence.as_ref().map(|presence| {
+                            let mut explain =
+                                explain_terms(&flat_query, &[body], &presence[hit_index], None);
+                            explain_stages(
+                                &mut explain,
+                                &chain,
+                                &req.score_stages,
+                                doc.doc_id,
+                                &numeric_read,
+                            );
+                            explain
+                        });
                         let snippets = match highlight.as_ref() {
                             Some(plan) => {
                                 let occurrences: Vec<(usize, (u32, u32))> = doc
@@ -12756,6 +12912,7 @@ impl NodeServiceImpl {
                             None => Vec::new(),
                         };
                         Ok(Bm25Hit {
+                            explain,
                             snippets,
                             projected: resolved_projections
                                 .iter()
@@ -12860,6 +13017,7 @@ impl NodeServiceImpl {
                 let hits = bm25::score_candidates(index, &req.terms, &stats, params, &local)
                     .into_iter()
                     .map(|doc| Bm25Hit {
+                        explain: None,
                         snippets: Vec::new(),
                         projected: Vec::new(),
                         doc_id: offset + u64::from(doc.doc_id),

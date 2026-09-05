@@ -155,6 +155,7 @@ impl Arm {
                 ..Default::default()
             }),
             None => search_variant::Query::Bm25(Bm25SearchRequest {
+                explain: false,
                 collection: String::new(),
                 highlight: None,
                 projections: Vec::new(),

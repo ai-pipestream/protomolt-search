@@ -48,7 +48,8 @@ Engine internals and measured numbers: [docs/optimizations.md](docs/optimization
 The implemented public query contract is [docs/query-api.md](docs/query-api.md):
 selection first, candidate-scoped boosts second, then a named-signal composite
 scorer, with multi-key sort and collapse over the result. Query-time synonyms
-and did-you-mean are [docs/synonyms.md](docs/synonyms.md). [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
+and did-you-mean are [docs/synonyms.md](docs/synonyms.md); the per-hit
+explain tree is [docs/explain.md](docs/explain.md). [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
 provisional replacement revisions and an explicit terminal certificate.
 `DENSE_EXECUTION_MODE_AUTO` chooses a dense traversal only through the
 generation-bound policy in
@@ -1213,6 +1214,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Landed 2026-09-05: the explain tree.** `QueryRequest.explain` hands
+  each hit an `Explanation` tree whose root is the served score and whose
+  nodes state their arithmetic: per-term BM25 inputs and contributions on
+  a lexical leaf (expansions grouped under their prefix or source term,
+  score stages in order), the native or exact FP32 dense score, the
+  fusion formula per leg, the boolean clause sum, the scorer's dimensions.
+  Assembled from numbers the engine already computed, so hits and order
+  are bitwise unchanged with the flag on. Details:
+  [The explain tree](docs/explain.md).
 - **Landed 2026-09-04 (evening): synonyms and did-you-mean.** Query-time
   synonym rules (symmetric or one-way) on the coordinator's table
   (`--synonyms=<toml>`) and on the request, analyzed under the field's spec
