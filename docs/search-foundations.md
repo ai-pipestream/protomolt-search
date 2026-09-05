@@ -12,7 +12,7 @@ establish completion of the three workstreams.
 | Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Not implemented |
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Not implemented; current mapped WAL stores reduced columns |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
-| Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Not implemented |
+| Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public routes enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
 | Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Not implemented |
 | Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Not implemented; public row IDs remain positional |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Not implemented |
@@ -81,3 +81,13 @@ be covered or adapted by the conformance suite before support is claimed.
 oracles and adversarial wire encodings. `tests/descriptor_mappings.rs` pins the
 new fingerprint. `tests/mapped_ingest.rs` exercises binding, column landing,
 restart, routed ingest, replication and resharding through the real handlers.
+
+## Capability increment
+
+`authorization.proto` and `src/authorization.rs` supply exact workspace-bound
+collection grants, an ecosystem authority adapter, revisioned decisions and
+stream revocation. `CollectionSet` enforces separate search, ingest and admin
+capabilities on every public RPC. Bearer configuration now requires an explicit
+policy; credentials without grants deny access. [Security](security.md) records
+the route table, migration, tests and remaining direct-node/document/field gaps.
+This does not complete authorization or the overall foundation.

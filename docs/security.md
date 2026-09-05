@@ -1,4 +1,4 @@
-# Security: TLS, mTLS, bearer principals, signed datagrams, quotas
+# Security: transport, principals, capabilities and quotas
 
 Implemented on branch 2026-09-02 (the rest of roadmap item 12). Three rules shape it,
 stated once:
@@ -68,6 +68,18 @@ token = "…at least 16 bytes…"
 max_k = 200              # 0: the coordinator's max_k
 concurrency = 8          # 0: unlimited
 ingest_docs_per_sec = 500  # 0: unlimited
+
+[policy]
+format_version = 1
+revision = 1
+[[policy.resources]]
+workspace = "legal"
+collection = "opinions"   # "" only for the unnamed dataset
+[[policy.grants]]
+principal = "console"
+workspace = "legal"
+collection = "opinions"
+actions = ["search"]
 ```
 
 With principals configured every `SearchService` call — search, query,
@@ -75,11 +87,68 @@ streaming query, aggregate, plan, routed ingest, topology, broadcast,
 cluster health — needs `authorization: Bearer <token>`. A missing,
 malformed, or unknown token is `UNAUTHENTICATED` naming which. Tokens
 are compared in constant time. Without `--bearer-tokens` the surface is
-anonymous, as before.
+anonymous, as before. An authenticated principal without a configured policy
+is denied; loading a bearer file without an explicit `[policy]` refuses startup.
 
 The check happens in `CollectionSet`, the one place every public call
 passes through, before the collection is resolved: the principal is
 known before any shard is asked.
+
+## Workspace and collection capabilities
+
+The product-owned `authorization.proto` defines `AccessPolicy`, workspace-bound
+`CollectionResource`s, exact `CollectionGrant`s and `AccessDecision`. The TOML
+above is a configuration adapter for that protobuf contract. Credentials supply
+identity; they grant no capability by themselves. Empty grants deny access.
+`format_version` must be 1. Future restrictions require a new format version,
+so an older reader rejects them instead of silently dropping restrictions.
+Unknown actions, duplicate resources or grants, and grants whose workspace does
+not own the collection are configuration errors. Configuration typos refuse.
+
+Every public route in `CollectionSet` declares one capability:
+
+| Capability | Routes |
+|---|---|
+| `search` | Search, Bm25Search, PhraseSearch, HybridSearch, VariantSearch, Query, QueryStream, Aggregate, Suggest |
+| `ingest` | RoutedIngestMapped |
+| `admin` | PlanIndex, BroadcastVectorBackend, BroadcastCalibration, FreezeTopologyWrites, PublishTopology, AbortTopologyCutover, ClusterHealth |
+
+No capability implies another. An administrator who also needs to search or
+write needs those grants explicitly. Names are exact; there are no implicit
+wildcards. The service resolves the collection (including its configured
+default) before applying the resource binding. Workspace ownership comes from
+the authority's policy, not caller metadata. Authenticated callers receive the
+same denial for an unknown collection and an unauthorized one; naming errors
+cannot disclose the served collection list. Unnamed `ClusterHealth` on a named
+set lists only collections with an admin grant, and denies when none are allowed.
+
+`authorization::Authorizer` is the integration seam for a workspace authority.
+`PolicyAuthority` supplies validated snapshots and atomic replacement. Revision
+must be nonzero and strictly increase on replacement. Decisions are pinned to
+one revision; a replacement invalidates outstanding decisions even if their
+capabilities would remain unchanged. Unary results are checked again before
+return. Query streams check before disclosing each item and wake on policy
+replacement even while their producer is pending. Routed ingest checks the bind
+before schema/fan-out work and checks each subsequent stream item. Already
+admitted mutations are not rolled back by revocation or a later stream error.
+
+Authorization precedes coordinator cache lookup. Revoked callers cannot retrieve
+a previous cached response through the public service. This does not yet make
+cache entries safe for different document/field policies within one collection;
+those mandatory selection and disclosure rules remain foundation work.
+
+Library hosts can retain `Arc<PolicyAuthority>` and call `replace`, or supply an
+`Authorizer` through `Principals::with_authorizer`. The command-line bearer file
+is loaded at startup; editing it does not reload a running process. Persist the
+accepted revision in the ecosystem authority across restarts. `AccessDecision`
+is diagnostic context, not a credential for untrusted clients or node calls.
+
+**Migration:** add `[policy]` to existing bearer files before upgrading. Grant
+only the exact datasets/actions required. `mkcerts.sh` generates a policy for the
+fleet tools' unnamed dataset when creating a new file; it does not overwrite an
+existing file. This increment does not alter the separate node mTLS or cluster
+control membership rules. It does not establish document/field authorization or
+secure a direct node call by applying the public collection policy.
 
 ## Quotas, per principal
 
@@ -169,8 +238,12 @@ key, and one principal with its token file.
 - No per-principal metrics labels yet (`docs/metrics.md` counts routes).
 - No TLS to the analysis sidecar or the clustered TurboVec backend:
   those are separate services with their own transports.
-- No authorization beyond quotas: a principal that authenticates may
-  call every public method on every collection.
+- No document/field policy enforcement yet. A collection search grant currently
+  includes that entire collection's public search results and projections.
+- No public-policy enforcement on direct node or cluster-control operations;
+  those still trust cluster membership. A public bearer is not that membership.
+- No automatic access-policy file reload or persisted revision high watermark
+  in the command-line process; dynamic authority providers own that lifecycle.
 
 ## Tests
 
@@ -188,3 +261,8 @@ configuration refusals. `src/node.rs` unit-tests the signed floor lane
 (forged, wrong-key, replayed, and stale sequences leave the floor
 untouched); `src/stream_signal.rs` and `src/security.rs` unit-test the
 frames, HMAC vectors, principals, and buckets.
+
+`tests/authorization.rs` checks the public route capability table, workspace
+bindings, resolved defaults, hidden collection names, scoped health listing,
+malformed policies, monotonic revisions, cache-entry revocation, routed-ingest
+admission, and cancellation of pending/disclosing streams on policy replacement.

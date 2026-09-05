@@ -94,6 +94,18 @@ token = "$(cat "$out/bearer.token")"
 max_k = 0
 concurrency = 0
 ingest_docs_per_sec = 0
+
+[policy]
+format_version = 1
+revision = 1
+[[policy.resources]]
+workspace = "fleet"
+collection = ""
+[[policy.grants]]
+principal = "tools"
+workspace = "fleet"
+collection = ""
+actions = ["search", "ingest", "admin"]
 TOML
   chmod 600 "$out/principals.toml"
 fi

@@ -157,6 +157,16 @@ fn principals() -> Arc<Principals> {
                 ..Default::default()
             },
         ])
+        .unwrap()
+        .with_policy(common::access_policy(
+            &["console", "batch"],
+            &[""],
+            &[
+                pipestream_search::pb::AccessAction::Search,
+                pipestream_search::pb::AccessAction::Ingest,
+                pipestream_search::pb::AccessAction::Admin,
+            ],
+        ))
         .unwrap(),
     )
 }
@@ -675,7 +685,7 @@ fn configuration_refuses_plaintext_off_loopback_and_incomplete_material() {
     // The complete material, principals, and a UDP key all load.
     let tokens = write(
         "tokens.toml",
-        "[[principals]]\nname = \"console\"\ntoken = \"console-token-0123456789\"\nmax_k = 10\n",
+        "[[principals]]\nname = \"console\"\ntoken = \"console-token-0123456789\"\nmax_k = 10\n\n[policy]\nformat_version = 1\nrevision = 1\n[[policy.resources]]\nworkspace = \"test\"\ncollection = \"\"\n[[policy.grants]]\nprincipal = \"console\"\nworkspace = \"test\"\ncollection = \"\"\nactions = [\"search\"]\n",
     );
     let udp = write("udp.key", "000102030405060708090a0b0c0d0e0f\n");
     let client_cert = certs.join("client.pem").display().to_string();

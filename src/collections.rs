@@ -25,6 +25,8 @@
 //!   collections it contains. An unnamed request is never routed to
 //!   "whichever" dataset.
 
+use crate::authorization::{AccessPermit, AuthorizedStream};
+use crate::pb::AccessAction;
 use std::collections::BTreeMap;
 
 use tonic::{Request, Response, Status, Streaming};
@@ -239,6 +241,40 @@ impl CollectionSet {
         }
     }
 
+    fn authorize(
+        &self,
+        principal: Option<&Arc<Principal>>,
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<Option<AccessPermit>, Status> {
+        match principal {
+            Some(principal) => self
+                .principals
+                .as_ref()
+                .expect("authenticated above")
+                .authorize(principal, collection, action)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn resolve_authorized<'a>(
+        &'a self,
+        principal: Option<&Arc<Principal>>,
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<(String, &'a CoordinatorServiceImpl, Option<AccessPermit>), Status> {
+        let (name, target) = self.members.resolve(collection).map_err(|error| {
+            if principal.is_some() {
+                Status::permission_denied("operation is not authorized for this collection")
+            } else {
+                error
+            }
+        })?;
+        let permit = self.authorize(principal, &name, action)?;
+        Ok((name, target, permit))
+    }
+
     /// Admit an authenticated request under its principal's quotas: `k`
     /// against `max_k`, and one in-flight slot, held by the returned
     /// permit for the request's life. An unset `k` keeps its meaning —
@@ -353,11 +389,11 @@ impl CollectionSet {
 /// its `collection` names, with the resolved name written on it so the
 /// member's own admission check sees the same answer.
 macro_rules! search_service_over_collections {
-    ($( $name:ident : $req:ty => $resp:ty ),* $(,)?) => {
+    ($( $name:ident [$action:ident] : $req:ty => $resp:ty ),* $(,)?) => {
         #[tonic::async_trait]
         impl SearchService for CollectionSet {
             type QueryStreamStream =
-                Guarded<<CoordinatorServiceImpl as SearchService>::QueryStreamStream>;
+                Guarded<AuthorizedStream<<CoordinatorServiceImpl as SearchService>::QueryStreamStream>>;
 
             $(
                 async fn $name(
@@ -365,12 +401,15 @@ macro_rules! search_service_over_collections {
                     mut request: Request<$req>,
                 ) -> Result<Response<$resp>, Status> {
                     let principal = self.authenticate(&request)?;
-                    let (name, target) = self.members.resolve(&request.get_ref().collection)?;
+                    let (name, target, access) = self.resolve_authorized(principal.as_ref(), &request.get_ref().collection, AccessAction::$action)?;
                     let target = target.clone();
                     let _permit =
                         Self::admit_under(principal.as_ref(), &request, target.max_k())?;
                     request.get_mut().collection = name;
-                    SearchService::$name(&target, request).await
+                    if let Some(access) = &access { request.extensions_mut().insert(access.decision().clone()); }
+                    let response = SearchService::$name(&target, request).await;
+                    if let Some(access) = &access { access.check()?; }
+                    response
                 }
             )*
 
@@ -379,12 +418,14 @@ macro_rules! search_service_over_collections {
                 mut request: Request<QueryStreamRequest>,
             ) -> Result<Response<Self::QueryStreamStream>, Status> {
                 let principal = self.authenticate(&request)?;
-                let (name, target) = self.members.resolve(&request.get_ref().collection)?;
+                let (name, target, access) = self.resolve_authorized(principal.as_ref(), &request.get_ref().collection, AccessAction::Search)?;
                 let target = target.clone();
                 let permit = Self::admit_under(principal.as_ref(), &request, target.max_k())?;
                 request.get_mut().collection = name;
-                let response = SearchService::query_stream(&target, request).await?;
-                Ok(response.map(|stream| Guarded::new(stream, permit)))
+                if let Some(access) = &access { request.extensions_mut().insert(access.decision().clone()); }
+                let response = SearchService::query_stream(&target, request).await;
+                if let Some(access) = &access { access.check()?; }
+                Ok(response?.map(|stream| Guarded::new(AuthorizedStream::new(stream, access), permit)))
             }
 
             async fn routed_ingest_mapped(
@@ -392,41 +433,53 @@ macro_rules! search_service_over_collections {
                 request: Request<Streaming<RoutedIngestMappedRequest>>,
             ) -> Result<Response<RoutedIngestMappedResponse>, Status> {
                 let (_permit, principal) = self.admit(&request)?;
-                let mut inbound = MeteredIngest::new(request.into_inner(), principal);
+                let mut inbound = MeteredIngest::new(request.into_inner(), principal.clone());
                 let mut bind = CoordinatorServiceImpl::routed_bind(&mut inbound).await?;
-                let (name, target) = self.members.resolve(&bind.collection)?;
+                let (name, target, access) = self.resolve_authorized(principal.as_ref(), &bind.collection, AccessAction::Ingest)?;
                 let target = target.clone();
                 bind.collection = name;
-                target
-                    .routed_ingest_mapped_bound(bind, inbound)
-                    .await
-                    .map(Response::new)
+                let inbound = AuthorizedStream::new(inbound, access.clone());
+                let response = target.routed_ingest_mapped_bound(bind, inbound).await;
+                if let Some(access) = &access { access.check()?; }
+                response.map(Response::new)
             }
 
             async fn cluster_health(
                 &self,
                 mut request: Request<ClusterHealthRequest>,
             ) -> Result<Response<ClusterHealthResponse>, Status> {
-                let (_permit, _) = self.admit(&request)?;
+                let (_permit, principal) = self.admit(&request)?;
                 let requested = request.get_ref().collection.clone();
                 // An unnamed health request on a named set lists every
                 // collection separately; counts are never summed across them.
                 if requested.is_empty() && self.members.unnamed.is_none() {
                     let mut collections = Vec::with_capacity(self.members.named.len());
+                    let mut decisions = Vec::new();
                     for (name, member) in &self.members.named {
+                        let access = match self.authorize(principal.as_ref(), name, AccessAction::Admin) {
+                            Ok(access) => access,
+                            Err(error) if error.code() == tonic::Code::PermissionDenied => continue,
+                            Err(error) => return Err(error),
+                        };
+                        decisions.push(access);
                         let health = SearchService::cluster_health(
                             member,
                             Request::new(ClusterHealthRequest {
                                 collection: name.clone(),
                             }),
                         )
-                        .await?
-                        .into_inner();
+                        .await;
+                        if let Some(access) = decisions.last().and_then(Option::as_ref) { access.check()?; }
+                        let health = health?.into_inner();
                         collections.push(CollectionHealth {
                             name: name.clone(),
                             health: Some(health),
                         });
                     }
+                    if principal.is_some() && collections.is_empty() {
+                        return Err(Status::permission_denied("no authorized collections"));
+                    }
+                    for access in decisions.iter().flatten() { access.check()?; }
                     return Ok(Response::new(ClusterHealthResponse {
                         targets: Vec::new(),
                         clustered_vector: None,
@@ -435,30 +488,32 @@ macro_rules! search_service_over_collections {
                         topology_generation: 0,
                     }));
                 }
-                let (name, target) = self.members.resolve(&requested)?;
+                let (name, target, access) = self.resolve_authorized(principal.as_ref(), &requested, AccessAction::Admin)?;
                 let target = target.clone();
                 request.get_mut().collection = name;
-                SearchService::cluster_health(&target, request).await
+                let response = SearchService::cluster_health(&target, request).await;
+                if let Some(access) = &access { access.check()?; }
+                response
             }
         }
     };
 }
 
 search_service_over_collections! {
-    search: SearchRequest => SearchResponse,
-    bm25_search: Bm25SearchRequest => Bm25SearchResponse,
-    phrase_search: PhraseSearchRequest => Bm25SearchResponse,
-    hybrid_search: HybridSearchRequest => HybridSearchResponse,
-    broadcast_vector_backend: BroadcastVectorBackendRequest => BroadcastVectorBackendResponse,
-    broadcast_calibration: BroadcastCalibrationRequest => BroadcastCalibrationResponse,
-    variant_search: VariantSearchRequest => VariantSearchResponse,
-    query: QueryRequest => QueryResponse,
-    plan_index: PlanIndexRequest => PlanIndexResponse,
-    freeze_topology_writes: FreezeTopologyWritesRequest => FreezeTopologyWritesResponse,
-    publish_topology: PublishTopologyRequest => PublishTopologyResponse,
-    abort_topology_cutover: AbortTopologyCutoverRequest => AbortTopologyCutoverResponse,
-    aggregate: AggregateRequest => AggregateResponse,
-    suggest: SuggestRequest => SuggestResponse,
+    search [Search]: SearchRequest => SearchResponse,
+    bm25_search [Search]: Bm25SearchRequest => Bm25SearchResponse,
+    phrase_search [Search]: PhraseSearchRequest => Bm25SearchResponse,
+    hybrid_search [Search]: HybridSearchRequest => HybridSearchResponse,
+    broadcast_vector_backend [Admin]: BroadcastVectorBackendRequest => BroadcastVectorBackendResponse,
+    broadcast_calibration [Admin]: BroadcastCalibrationRequest => BroadcastCalibrationResponse,
+    variant_search [Search]: VariantSearchRequest => VariantSearchResponse,
+    query [Search]: QueryRequest => QueryResponse,
+    plan_index [Admin]: PlanIndexRequest => PlanIndexResponse,
+    freeze_topology_writes [Admin]: FreezeTopologyWritesRequest => FreezeTopologyWritesResponse,
+    publish_topology [Admin]: PublishTopologyRequest => PublishTopologyResponse,
+    abort_topology_cutover [Admin]: AbortTopologyCutoverRequest => AbortTopologyCutoverResponse,
+    aggregate [Search]: AggregateRequest => AggregateResponse,
+    suggest [Search]: SuggestRequest => SuggestResponse,
 }
 
 /// The cluster-control surface over one durable plane per collection.

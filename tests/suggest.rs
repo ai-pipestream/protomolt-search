@@ -709,6 +709,12 @@ async fn the_bearer_gate_applies_as_on_every_public_route() {
             token: TOKEN.into(),
             ..Default::default()
         }])
+        .unwrap()
+        .with_policy(common::access_policy(
+            &["console"],
+            &[""],
+            &[pipestream_search::pb::AccessAction::Search],
+        ))
         .unwrap(),
     );
     let set = CollectionSet::single(coordinator(vec![addr])).with_principals(principals);

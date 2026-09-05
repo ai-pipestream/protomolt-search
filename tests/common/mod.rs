@@ -100,3 +100,34 @@ impl Cluster {
         }
     }
 }
+
+/// Explicit capabilities for isolated test collections; no wildcard grants.
+pub fn access_policy(
+    principals: &[&str],
+    collections: &[&str],
+    actions: &[pipestream_search::pb::AccessAction],
+) -> pipestream_search::pb::AccessPolicy {
+    use pipestream_search::pb::{AccessPolicy, CollectionGrant, CollectionResource};
+    AccessPolicy {
+        format_version: 1,
+        revision: 1,
+        resources: collections
+            .iter()
+            .map(|c| CollectionResource {
+                workspace: "test".into(),
+                collection: (*c).into(),
+            })
+            .collect(),
+        grants: principals
+            .iter()
+            .flat_map(|p| {
+                collections.iter().map(move |c| CollectionGrant {
+                    principal: (*p).into(),
+                    workspace: "test".into(),
+                    collection: (*c).into(),
+                    actions: actions.iter().map(|a| *a as i32).collect(),
+                })
+            })
+            .collect(),
+    }
+}

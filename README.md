@@ -1212,6 +1212,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **In progress after PRE_ASTRA: workspace capabilities.** Public search,
+  ingest and admin operations require separate workspace/collection grants.
+  Revisioned policies invalidate pending query streams and deny cached responses
+  after revocation. Existing bearer files need explicit policies. Direct-node
+  and document/field enforcement remain outstanding. See [Security](docs/security.md).
+
 - **In progress after PRE_ASTRA: search foundations.** Descriptor validation,
   oneof and presence corrections, and a v2 mapping fingerprint covering wire
   interpretation. Existing mapped indexes require a source rebuild before

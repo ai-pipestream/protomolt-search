@@ -25,6 +25,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod analyzer;
+pub mod authorization;
 pub mod bm25;
 pub mod cel;
 pub mod chunked;

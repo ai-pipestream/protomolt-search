@@ -383,7 +383,7 @@ pub type PublicChannel =
 /// One public client, as configured: a name, its bearer token, and its
 /// quotas. A quota of 0 means "no limit of that kind".
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PrincipalConfig {
     pub name: String,
     pub token: String,
@@ -398,9 +398,70 @@ pub struct PrincipalConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct PrincipalsFile {
     principals: Vec<PrincipalConfig>,
+    policy: Option<PolicyConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyConfig {
+    format_version: u32,
+    revision: u64,
+    #[serde(default)]
+    resources: Vec<ResourceConfig>,
+    #[serde(default)]
+    grants: Vec<GrantConfig>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceConfig {
+    workspace: String,
+    collection: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantConfig {
+    principal: String,
+    workspace: String,
+    collection: String,
+    actions: Vec<String>,
+}
+impl PolicyConfig {
+    fn into_policy(self) -> Result<crate::pb::AccessPolicy, String> {
+        let mut grants = Vec::new();
+        for grant in self.grants {
+            let mut actions = Vec::new();
+            for action in grant.actions {
+                actions.push(match action.as_str() {
+                    "search" => crate::pb::AccessAction::Search as i32,
+                    "ingest" => crate::pb::AccessAction::Ingest as i32,
+                    "admin" => crate::pb::AccessAction::Admin as i32,
+                    _ => return Err(format!("unknown access action {action:?}")),
+                });
+            }
+            grants.push(crate::pb::CollectionGrant {
+                principal: grant.principal,
+                workspace: grant.workspace,
+                collection: grant.collection,
+                actions,
+            });
+        }
+        Ok(crate::pb::AccessPolicy {
+            format_version: self.format_version,
+            revision: self.revision,
+            resources: self
+                .resources
+                .into_iter()
+                .map(|r| crate::pb::CollectionResource {
+                    workspace: r.workspace,
+                    collection: r.collection,
+                })
+                .collect(),
+            grants,
+        })
+    }
 }
 
 /// A principal's live quota state.
@@ -553,6 +614,7 @@ impl TokenBucket {
 #[derive(Debug, Clone)]
 pub struct Principals {
     by_token: HashMap<String, Arc<Principal>>,
+    authorizer: Option<Arc<dyn crate::authorization::Authorizer>>,
 }
 
 impl Principals {
@@ -562,7 +624,10 @@ impl Principals {
             .map_err(|e| format!("read bearer tokens {}: {e}", path.display()))?;
         let file: PrincipalsFile = toml::from_str(&text)
             .map_err(|e| format!("parse bearer tokens {}: {e}", path.display()))?;
-        Self::from_configs(&file.principals)
+        let policy = file.policy.ok_or(
+            "bearer tokens require an explicit [policy]; credentials do not grant capabilities",
+        )?;
+        Self::from_configs(&file.principals)?.with_policy(policy.into_policy()?)
     }
 
     pub fn from_configs(configs: &[PrincipalConfig]) -> Result<Self, String> {
@@ -595,7 +660,49 @@ impl Principals {
                 ));
             }
         }
-        Ok(Principals { by_token })
+        Ok(Principals {
+            by_token,
+            authorizer: None,
+        })
+    }
+
+    /// Install a validated protobuf policy. Principals without a grant are denied.
+    pub fn with_policy(self, policy: crate::pb::AccessPolicy) -> Result<Self, String> {
+        for grant in &policy.grants {
+            if !self.by_token.values().any(|p| p.name == grant.principal) {
+                return Err(format!(
+                    "access grant names unknown principal {:?}",
+                    grant.principal
+                ));
+            }
+        }
+        Ok(
+            self.with_authorizer(Arc::new(crate::authorization::PolicyAuthority::new(
+                policy,
+            )?)),
+        )
+    }
+
+    /// Integrate an ecosystem authority without changing token authentication.
+    pub fn with_authorizer(
+        mut self,
+        authorizer: Arc<dyn crate::authorization::Authorizer>,
+    ) -> Self {
+        self.authorizer = Some(authorizer);
+        self
+    }
+
+    pub fn authorize(
+        &self,
+        principal: &Principal,
+        collection: &str,
+        action: crate::pb::AccessAction,
+    ) -> Result<crate::authorization::AccessPermit, Status> {
+        let authority = self
+            .authorizer
+            .clone()
+            .ok_or_else(|| Status::permission_denied("no access policy is configured"))?;
+        crate::authorization::AccessPermit::acquire(authority, &principal.name, collection, action)
     }
 
     /// The principal behind a request's `authorization: Bearer <token>`

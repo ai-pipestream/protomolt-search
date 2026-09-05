@@ -17,9 +17,10 @@ the dense quality profile, fan-out limits. A **collection is one of
 those, under a name**. `CollectionSet` (`src/collections.rs`) contains
 several and routes each public request to the one its `collection`
 field names. There is no table two collections share, so there is
-nothing to leak through: the same term has a different df in each
+no shared statistics table: the same term has a different df in each
 collection because each keeps its own statistics cache over its own
-shards.
+shards. Access to those isolated datasets is separately enforced by the
+workspace/collection capabilities in [Security](security.md).
 
 A **shard belongs to only one collection.** The node is configured
 with it (`--collection`, or `collection` per `[[shards]]` entry), reports
@@ -105,9 +106,9 @@ plan's `ClusterPlan`, `ClusterNode`, `ShardReplicaState`, and
 `PlacementAction` records carry the collection they govern.
 
 `ClusterHealth` with no name on a named set returns one
-`CollectionHealth` per collection, each with its own targets, and an
-empty top-level target list: row counts are never summed across
-collections.
+`CollectionHealth` per authorized collection, each with its own targets, and
+an empty top-level target list: row counts are never summed across collections.
+Authenticated clients need an admin grant for each listed collection.
 
 ## Cluster control
 

@@ -1,0 +1,47 @@
+syntax = "proto3";
+package ai.pipestream.search.v1;
+
+// Public service capabilities. No action implies another action.
+enum AccessAction {
+  ACCESS_ACTION_UNSPECIFIED = 0;
+  ACCESS_ACTION_SEARCH = 1;
+  ACCESS_ACTION_INGEST = 2;
+  ACCESS_ACTION_ADMIN = 3;
+}
+
+// Collection names are resolved by the service before authorization. Workspace
+// ownership comes from this policy binding, never from caller metadata.
+message CollectionResource {
+  string workspace = 1;
+  string collection = 2;
+}
+
+// An exact grant; no implicit wildcard, role expansion or inheritance.
+message CollectionGrant {
+  string principal = 1;
+  string workspace = 2;
+  string collection = 3;
+  repeated AccessAction actions = 4;
+}
+
+// A complete policy snapshot supplied by the workspace authority. Revision must
+// increase on replacement. Empty grants deny every authenticated principal.
+// Document and field policies are separate contracts, not implied by this grant.
+message AccessPolicy {
+  uint64 revision = 1;
+  repeated CollectionResource resources = 2;
+  repeated CollectionGrant grants = 3;
+  // Required: 1 for this contract. Adding policy restrictions requires a new
+  // format version so older readers reject rather than ignore restrictions.
+  uint32 format_version = 4;
+}
+
+// The decision that binds a public operation to one policy revision. This is
+// diagnostic context, not a credential accepted from an untrusted client.
+message AccessDecision {
+  uint64 policy_revision = 1;
+  string principal = 2;
+  string workspace = 3;
+  string collection = 4;
+  AccessAction action = 5;
+}
