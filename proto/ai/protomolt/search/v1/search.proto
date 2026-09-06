@@ -1147,10 +1147,17 @@ message ApplyWalBindingRequest {
   // The collection the binding belongs to; a node of another
   // collection refuses (docs/collections.md).
   string collection = 4;
+  // Empty for legacy bindings, otherwise 64 lowercase hex SHA-256 characters.
+  string analysis_sha = 5;
+  // Canonical serialized MappedAnalysisContract; required with analysis_sha.
+  bytes analysis_contract = 6;
 }
 
 message ApplyWalBindingResponse {
   bool already_bound = 1;
+  // Echo of the installed analysis contract. Explicit bindings require this
+  // acknowledgement; an older receiver cannot acknowledge the new contract.
+  string analysis_sha = 2;
 }
 
 message CompactShardRequest {
@@ -5895,8 +5902,8 @@ message MappedBind {
 
   // Body analysis options for every document on the stream. Absent =
   // sidecar defaults, the same rule as AddDocumentsRequest.analysis.
-  // Non-body text fields analyze under sidecar defaults in this
-  // increment; the plan's analyzer NAMES are recorded, not resolved.
+  // With no field_analysis, non-body text uses sidecar defaults.
+  // Mutually exclusive with field_analysis. Analyzer names remain labels.
   AnalysisSpec analysis = 5;
 
   // CEL materialization (docs/cel-values.md) applied to every mapped
@@ -5908,6 +5915,32 @@ message MappedBind {
   // The collection this bind writes into; a node of another
   // collection refuses (docs/collections.md).
   string collection = 7;
+  // Explicit analysis for EVERY projected TEXT path, including the body.
+  // Paths are source-relative (e.g. nested.caption), not engine column names.
+  // Duplicate, unknown, non-text, missing paths and absent specs refuse.
+  // Specs must name explicit nonzero enums; token/normalized-stem sources
+  // require nonempty normalizer chains. Server defaults are refused.
+  // Order does not matter. The complete contract is bound even on an empty
+  // stream; Flush makes it durable. Changing it requires rebuilding from sources.
+  // Empty retains the legacy body-only analysis behavior.
+  repeated MappedFieldAnalysis field_analysis = 8;
+}
+
+message MappedFieldAnalysis {
+  string path = 1;
+  AnalysisSpec analysis = 2;
+}
+
+// Resolved durable contract, encoded in binding metadata and WAL records.
+// Fields sort by source path; names are unique physical BM25 names, with
+// exactly one body. Unknown fields and noncanonical encodings refuse replay.
+message MappedAnalysisContract {
+  repeated MappedAnalysisColumn fields = 1;
+}
+message MappedAnalysisColumn {
+  string path = 1;
+  string name = 2;
+  AnalysisSpec analysis = 3;
 }
 
 message IngestMappedResponse {

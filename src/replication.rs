@@ -407,16 +407,22 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                 ));
             }
             Some(wal_record::Op::Bind(binding)) => {
+                let analysis_sha = binding.analysis_sha.clone();
                 let response = replica
                     .apply_wal_binding(ApplyWalBindingRequest {
                         collection: String::new(),
                         plan_fingerprint: binding.plan_fingerprint,
                         body_path: binding.body_path,
                         materialize_sha: binding.materialize_sha,
+                        analysis_sha: binding.analysis_sha,
+                        analysis_contract: binding.analysis_contract,
                     })
                     .await
                     .map_err(|error| format!("replicate mapped binding: {error}"))?
                     .into_inner();
+                if response.analysis_sha != analysis_sha {
+                    return Err("replica did not acknowledge the mapped analysis contract; upgrade the receiver".into());
+                }
                 changed |= !response.already_bound;
             }
             Some(wal_record::Op::Flush(_)) | None => {}

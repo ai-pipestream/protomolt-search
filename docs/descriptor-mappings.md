@@ -83,14 +83,62 @@ and unrelated plans retain their fingerprints. Report version 2 identifies
 wrapper and Timestamp components as INPUT paths, with `value_path` identifying
 the consuming query value. See [schema reports](schema-report.md).
 
-Analysis-name hints remain recorded rather than resolved. MappedBind currently
-provides an explicit AnalysisSpec only for the body. Native embedded analysis
-therefore supports the wrapped body and scalar columns but refuses populated
-non-body text without an explicit specification; the current mapped API cannot
-supply one. Per-field analysis configuration remains required for complete
-mobile mapped indexing. The lifecycle conformance test uses the supported
-sidecar path for nested text; a separate embedded test exercises native body
-analysis and wrapper scalar defaults.
+Analysis-name hints remain labels rather than being resolved implicitly. Use
+`MappedBind.field_analysis` for explicit analysis of every projected TEXT path,
+including native analysis of non-body wrapped and nested text.
+
+## Explicit mapped analysis (2026-09-05, feature branch)
+
+A nonempty `MappedBind.field_analysis` supplies one `MappedFieldAnalysis` for
+**every projected TEXT path**, including the selected body. Use source paths
+such as `nested.caption` or `chunks.body`, not physical names such as
+`nested_caption`. The plan still chooses projections and physical field names;
+analyzer hints are descriptive labels, while these specifications control analysis.
+Duplicates, missing paths, non-text/source-only paths, missing specifications,
+unknown enum values and combining this list with legacy `analysis` refuse at bind.
+
+Specifications must name tokenizer, stemmer, mode and source explicitly. Token
+and normalized-stem sources also require an explicit nonempty normalizer chain;
+zero/unspecified steps refuse. STEMS ignores normalizers and permits an empty
+chain, but requires a stemmer. This avoids pinning a server default that may
+change. Native shards validate every specification before binding, even on an
+empty stream or for a field absent from every source document. Sidecar enum
+validation does not establish the availability of optional models; existing
+sidecar capability and analysis checks still apply.
+
+The resolved `MappedAnalysisContract` contains each source path, physical column
+name (`body` for the selected body), and full specification, sorted by source
+path. Canonical protobuf bytes are hashed with SHA-256 after the domain tag
+`protomolt.search.mapped-analysis.v1` and a NUL byte. Reordering the input list
+has no effect; changing a specification or its ordered normalizer chain changes
+the contract. The binding retains both bytes and digest. Decoding refuses digest
+mismatches, unknown/noncanonical encoding, duplicate names, unsorted paths and
+an inconsistent body. This is separate from the schema plan fingerprint.
+
+Ordinary ingest into an explicitly bound shard must supply the matching body
+and present-field specifications; unspecified analysis cannot bypass the binding.
+Mapped ingest applies each field's specification and initializes fingerprints for all
+bound text columns, including absent ones, before sealing segments. WAL replay,
+replication, compaction and resharding retain the binding and its declared text
+fields. Reopening recovers a binding from the WAL even if its stream accepted no
+rows. A different analysis contract requires rebuilding from original sources;
+removing the explicit contract does not convert an existing index to legacy mode.
+
+Persistence uses BM25 table kind **12**: the three legacy u16-length-prefixed
+strings, the analysis digest as a fourth string, then a u32 byte length and the
+canonical protobuf contract. It has no payload sections and remains inside the
+TVBM2508 integrity envelope. Explicit binding upgrades its WAL manifest to
+**format 4 before appending the record**. Existing kind 6 bindings and legacy
+WALs remain readable; identity-only WALs still need format 3. Older readers
+refuse the new binding kind and WAL format. Replication requires the receiver to
+echo the installed digest; a missing/different acknowledgement fails catch-up.
+Deploy matching nodes, coordinators and regenerated clients before using the
+new field. Existing servers do not understand this additive request field.
+
+An empty `field_analysis` preserves legacy behavior: `analysis` applies only to
+the body and non-body fields use sidecar defaults. It does not provide native
+non-body analysis. Explicit bindings use a different durable identity and cannot
+be appended to a legacy binding without rebuilding.
 
 ## Timestamp projection validation (2026-09-05, feature branch)
 
@@ -396,28 +444,27 @@ of the bound type. The contract, piece by piece:
   loses nothing today.
 
 - **The binding is durable: an index only ever pairs with the plan it
-  was written under.** The FIRST bind pins the shard to the triple
-  (plan fingerprint, body path, materialize-spec hash — the spec is
-  part of the identity because changing a materialization expression
-  changes what an index means). Every later bind must match exactly or
+  was written under.** The FIRST bind pins the shard to the plan fingerprint,
+  body path, materialize-spec hash and optional explicit analysis contract.
+  The materialize spec is part of the identity because changing its expression
+  changes what an index means. Every later bind must match exactly or
   refuses naming what differs; changing the mapping is a rebuild,
   never a rebind. Durability follows the store: the binding persists
-  as the kind-6 entry of the kinded column table — inside the v8
-  integrity envelope, so it lives and dies with the columns it
+  as kind 6 (legacy) or kind 12 (explicit analysis) in the column table, inside
+  the v8 integrity envelope, so it lives and dies with the columns it
   describes and cannot vanish separately — written at flush, adopted
   from the file at startup. The bind is also a WAL record (in
   `markers.wal`), so reshard replay carries the binding onto rebuilt
   children and refuses inputs bound to different plans. A snapshot
   install replaces the binding along with everything else (the image's
   own, usually none): a wholesale replace replaces the plan identity
-  too. A bind that never flushed evaporates with the columns it never
-  wrote — consistency with the store is the invariant, not the bind
-  ceremony.
+  too. Startup also recovers the binding from the WAL, including an empty
+  bound stream with no BM25 rows. Flush is still the durability boundary;
+  receiving a successful bind is not an independent durable-write receipt.
 
-What remains deliberately left out: per-field analyzer resolution
-(the plan records analyzer NAMES; non-body text fields analyze under
-sidecar defaults, and analysis identity is enforced by the analysis
-fingerprint as everywhere).
+Analyzer-name resolution remains explicit client work: the plan records labels,
+while `field_analysis` supplies the concrete specifications. Only legacy bindings
+leave non-body analysis to sidecar defaults.
 
 ## 5. Vendoring and the BYO-descriptor flow
 

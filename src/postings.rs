@@ -111,6 +111,9 @@ const COLUMN_KIND_GEO: u8 = 5;
 /// declared under the reserved name collides with the table's
 /// name-uniqueness rule and refuses at save, loudly.
 const COLUMN_KIND_BINDING: u8 = 6;
+/// Explicit analysis binding: the three legacy strings followed by analysis SHA-256.
+/// A distinct kind makes old readers refuse rather than discard the contract.
+const COLUMN_KIND_ANALYSIS_BINDING: u8 = 12;
 const COLUMN_KIND_SOURCES: u8 = 9;
 const SOURCES_ENTRY_NAME: &str = "protobuf-sources";
 const SOURCE_ENTRY_BYTES: u64 = 2 + SOURCES_ENTRY_NAME.len() as u64 + 1 + 16;
@@ -452,14 +455,23 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:sources"), u64_at(base)));
                     cursor = base + 16;
                 }
-                COLUMN_KIND_BINDING => {
-                    // Inline payload only: three length-prefixed
+                COLUMN_KIND_BINDING | COLUMN_KIND_ANALYSIS_BINDING => {
+                    // Inline payload only: three or four length-prefixed
                     // strings, no sections to name.
                     let mut skip = base;
-                    for _ in 0..3 {
+                    for _ in 0..if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                        4
+                    } else {
+                        3
+                    } {
                         let len =
                             u16::from_le_bytes(map[skip..skip + 2].try_into().unwrap()) as usize;
                         skip += 2 + len;
+                    }
+                    if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                        let len =
+                            u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
+                        skip += 4 + len;
                     }
                     cursor = skip;
                 }
@@ -1648,6 +1660,10 @@ pub struct StoredBinding {
     /// changes what an index means (`docs/cel-values.md`), so it is
     /// part of the bound identity.
     pub materialize_sha: String,
+    /// Complete explicit mapped analysis contract, empty for legacy bindings.
+    pub analysis_sha: String,
+    /// Canonical protobuf MappedAnalysisContract, empty for legacy bindings.
+    pub analysis_contract: Vec<u8>,
 }
 
 /// Header bytes of the binding's column-table entry, 0 when unbound.
@@ -1661,6 +1677,11 @@ fn binding_entry_size(binding: Option<&StoredBinding>) -> u64 {
             + b.body_path.len() as u64
             + 2
             + b.materialize_sha.len() as u64
+            + if b.analysis_sha.is_empty() {
+                0
+            } else {
+                2 + b.analysis_sha.len() as u64 + 4 + b.analysis_contract.len() as u64
+            }
     })
 }
 
@@ -1669,10 +1690,33 @@ fn write_binding_entry<W: Write>(w: &mut W, binding: Option<&StoredBinding>) -> 
     let Some(b) = binding else { return Ok(()) };
     write_u16(w, BINDING_ENTRY_NAME.len() as u16)?;
     w.write_all(BINDING_ENTRY_NAME.as_bytes())?;
-    w.write_all(&[COLUMN_KIND_BINDING])?;
-    for value in [&b.plan_fingerprint, &b.body_path, &b.materialize_sha] {
-        write_u16(w, value.len() as u16)?;
+    crate::mapped_analysis::decode_contract(&b.analysis_sha, &b.analysis_contract, &b.body_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    w.write_all(&[if b.analysis_sha.is_empty() {
+        COLUMN_KIND_BINDING
+    } else {
+        COLUMN_KIND_ANALYSIS_BINDING
+    }])?;
+    for value in [&b.plan_fingerprint, &b.body_path, &b.materialize_sha]
+        .into_iter()
+        .chain((!b.analysis_sha.is_empty()).then_some(&b.analysis_sha))
+    {
+        write_u16(
+            w,
+            u16::try_from(value.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "binding string exceeds u16")
+            })?,
+        )?;
         w.write_all(value.as_bytes())?;
+    }
+    if !b.analysis_sha.is_empty() {
+        write_u32(
+            w,
+            u32::try_from(b.analysis_contract.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "analysis contract exceeds u32")
+            })?,
+        )?;
+        w.write_all(&b.analysis_contract)?;
     }
     Ok(())
 }
@@ -4331,10 +4375,14 @@ impl Bm25Store {
                         sources_meta = Some((u64_at(base)?, u64_at(base + 8)?));
                         cursor = base + 16;
                     }
-                    COLUMN_KIND_BINDING => {
+                    COLUMN_KIND_BINDING | COLUMN_KIND_ANALYSIS_BINDING => {
                         let mut vals: Vec<String> = Vec::with_capacity(3);
                         let mut cur = base;
-                        for _ in 0..3 {
+                        for _ in 0..if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                            4
+                        } else {
+                            3
+                        } {
                             let len = u64::from(u16_at(at(cur, 2)?));
                             vals.push(
                                 String::from_utf8(at(cur + 2, len)?.to_vec())
@@ -4342,12 +4390,34 @@ impl Bm25Store {
                             );
                             cur += 2 + len;
                         }
+                        if kind == COLUMN_KIND_ANALYSIS_BINDING
+                            && !crate::mapped_analysis::valid_digest(&vals[3])
+                        {
+                            return Err(invalid("invalid mapped analysis digest"));
+                        }
+                        let analysis_contract = if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                            let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
+                            let bytes = at(cur + 4, len)?.to_vec();
+                            cur += 4 + len;
+                            bytes
+                        } else {
+                            Vec::new()
+                        };
                         let mut it = vals.into_iter();
                         binding_meta = Some(StoredBinding {
                             plan_fingerprint: it.next().expect("three strings"),
                             body_path: it.next().expect("three strings"),
                             materialize_sha: it.next().expect("three strings"),
+                            analysis_sha: it.next().unwrap_or_default(),
+                            analysis_contract,
                         });
+                        let bound = binding_meta.as_ref().unwrap();
+                        crate::mapped_analysis::decode_contract(
+                            &bound.analysis_sha,
+                            &bound.analysis_contract,
+                            &bound.body_path,
+                        )
+                        .map_err(|e| invalid(&e))?;
                         cursor = cur;
                     }
                     k => {
@@ -6948,7 +7018,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     source_section = Some((u64_at(base)?, u64_at(base + 8)?));
                     cursor = base + 16;
                 }
-                COLUMN_KIND_BINDING => {
+                COLUMN_KIND_BINDING | COLUMN_KIND_ANALYSIS_BINDING => {
                     // The reserved binding record: pinned name, inline
                     // payload, no sections. Duplicates fall to the
                     // table's name-uniqueness rule above.
@@ -6960,10 +7030,30 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                         )));
                     }
                     let mut cur = base;
-                    for _ in 0..3 {
+                    let mut values = Vec::new();
+                    for part in 0..if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                        4
+                    } else {
+                        3
+                    } {
                         let len = u64::from(u16_at(bytes_at(cur, 2)?));
-                        bytes_at(cur + 2, len)?;
+                        let value = std::str::from_utf8(bytes_at(cur + 2, len)?)
+                            .map_err(|_| invalid("invalid utf-8 in binding record".into()))?;
+                        if part == 3 && !crate::mapped_analysis::valid_digest(value) {
+                            return Err(invalid("invalid mapped analysis digest".into()));
+                        }
+                        values.push(value);
                         cur += 2 + len;
+                    }
+                    if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                        let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
+                        crate::mapped_analysis::decode_contract(
+                            values[3],
+                            bytes_at(cur + 4, len)?,
+                            values[1],
+                        )
+                        .map_err(invalid)?;
+                        cur += 4 + len;
                     }
                     cursor = cur;
                 }
@@ -8665,10 +8755,14 @@ impl Bm25Reader {
                         source_section = Some((off, len, reader));
                         cursor = base + 16;
                     }
-                    COLUMN_KIND_BINDING => {
+                    COLUMN_KIND_BINDING | COLUMN_KIND_ANALYSIS_BINDING => {
                         let mut vals: Vec<String> = Vec::with_capacity(3);
                         let mut cur = base;
-                        for _ in 0..3 {
+                        for _ in 0..if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                            4
+                        } else {
+                            3
+                        } {
                             let len =
                                 u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
                             vals.push(
@@ -8676,11 +8770,22 @@ impl Bm25Reader {
                             );
                             cur += 2 + len;
                         }
+                        let analysis_contract = if kind == COLUMN_KIND_ANALYSIS_BINDING {
+                            let len =
+                                u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
+                            let bytes = map[cur + 4..cur + 4 + len].to_vec();
+                            cur += 4 + len;
+                            bytes
+                        } else {
+                            Vec::new()
+                        };
                         let mut it = vals.into_iter();
                         binding = Some(StoredBinding {
                             plan_fingerprint: it.next().expect("three strings"),
                             body_path: it.next().expect("three strings"),
                             materialize_sha: it.next().expect("three strings"),
+                            analysis_sha: it.next().unwrap_or_default(),
+                            analysis_contract,
                         });
                         cursor = cur;
                     }

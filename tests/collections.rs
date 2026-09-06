@@ -274,6 +274,8 @@ async fn a_node_serves_one_collection_and_says_so() {
             plan_fingerprint: "fp".into(),
             body_path: "body".into(),
             materialize_sha: String::new(),
+            analysis_sha: String::new(),
+            analysis_contract: Vec::new(),
             collection: "b".into(),
         })
         .await

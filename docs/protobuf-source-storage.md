@@ -99,8 +99,9 @@ the writer appends its first source reference; this build reads both versions.
 Pre-source-storage binaries reject format 2. A document carrying logical identity
 upgrades the WAL manifest to format 3 before the referencing record is appended,
 so a format-2 reader cannot silently discard that metadata during replay. This
-build reads formats 1 through 3; ordinary new node logs start at format 2 and
-advance only when identity is used. The source-blob framing remains unchanged.
+build reads formats 1 through 4; ordinary new node logs start at format 2.
+Identity needs format 3; an explicit mapped analysis contract needs format 4
+(see [mapped analysis](descriptor-mappings.md#explicit-mapped-analysis-2026-09-05-feature-branch)). The source-blob framing remains unchanged.
 
 Source blobs are written before referencing row frames and fsynced before the
 row logs at Flush. The generation directory is also synced. An incomplete,

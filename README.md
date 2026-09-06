@@ -1222,13 +1222,21 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Explicit mapped text analysis (2026-09-05, feature branch).**
+  `MappedBind.field_analysis` supplies specifications for every projected TEXT
+  path, including native nested/wrapped non-body fields. The full resolved
+  contract and digest persist across empty-stream restart, sealing, compaction,
+  resharding and replication. Absent fields retain their analysis fingerprints.
+  Explicit bindings use BM25 kind 12 and WAL format 4; legacy bindings remain
+  readable. See [mapped analysis](docs/descriptor-mappings.md#explicit-mapped-analysis-2026-09-05-feature-branch).
+
 - **Scalar wrapper projection (2026-09-05, feature branch).** Standard scalar
   wrappers project at their declared field paths and retain message presence.
   Type/name/identity hints apply to the containing field; unusable ID projections
   refuse during planning. Empty string facets are present values. Schema report
   version 2 identifies wrapper and Timestamp inputs separately from queryable
   values. Wrapper bindings need new plans and rebuilt columns. Native mapped
-  non-body analysis still needs an explicit per-field configuration contract.
+  non-body analysis uses the explicit field configuration described above.
   See [scalar wrappers](docs/descriptor-mappings.md#scalar-wrappers-2026-09-05-feature-branch).
 
 - **Timestamp semantics (2026-09-05, feature branch).** DATE plans verify the

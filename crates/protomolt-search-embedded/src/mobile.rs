@@ -1290,6 +1290,7 @@ mod tests {
                         body_path: "body".into(),
                         analysis: Some(body_spec()),
                         materialize: None,
+                        field_analysis: Vec::new(),
                     })),
                 },
                 IngestMappedRequest {

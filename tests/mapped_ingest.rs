@@ -319,7 +319,23 @@ fn bind() -> MappedBind {
         body_path: "title".into(),
         analysis: None,
         materialize: None,
+        field_analysis: Vec::new(),
     }
+}
+
+fn explicit_bind() -> MappedBind {
+    let mut binding = bind();
+    binding.field_analysis = derive_plan(&case_set(), "law.v1.Case")
+        .unwrap()
+        .fields
+        .into_iter()
+        .filter(|field| field.family == pipestream_search::pb::ColumnFamily::TextField as i32)
+        .map(|field| pipestream_search::pb::MappedFieldAnalysis {
+            path: field.path,
+            analysis: Some(pipestream_search::analyzer::body_spec()),
+        })
+        .collect();
+    binding
 }
 
 async fn ingest(
@@ -366,9 +382,18 @@ fn expect_refusal(result: Result<IngestMappedResponse, tonic::Status>, needle: &
 
 #[tokio::test]
 async fn clocked_wal_catches_a_replica_up_idempotently() {
+    replicated_binding(false).await;
+}
+#[tokio::test]
+async fn explicit_analysis_replication_preserves_the_binding_and_is_idempotent() {
+    replicated_binding(true).await;
+}
+async fn replicated_binding(explicit: bool) {
     let (analysis, _mock) = start_mock_analysis().await;
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("tvmapped_replication_{}", std::process::id()));
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "tvmapped_replication_{explicit}_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let (primary, primary_handle) = start_empty_node(NodeConfig {
@@ -392,7 +417,11 @@ async fn clocked_wal_catches_a_replica_up_idempotently() {
     let response = client
         .ingest_mapped(tokio_stream::iter([
             IngestMappedRequest {
-                payload: Some(ingest_mapped_request::Payload::Bind(bind())),
+                payload: Some(ingest_mapped_request::Payload::Bind(if explicit {
+                    explicit_bind()
+                } else {
+                    bind()
+                })),
             },
             IngestMappedRequest {
                 payload: Some(ingest_mapped_request::Payload::RoutedDocument(
@@ -430,6 +459,36 @@ async fn clocked_wal_catches_a_replica_up_idempotently() {
         .expect("idempotent empty catch-up");
     assert!(second.clock >= first.clock);
 
+    if explicit {
+        let mut replica_client = NodeServiceClient::connect(replica.clone()).await.unwrap();
+        for extra in [false, true] {
+            let error = replica_client
+                .add_documents(tokio_stream::iter([
+                    pipestream_search::pb::AddDocumentsRequest {
+                        text: "rogue".into(),
+                        analysis: extra.then(pipestream_search::analyzer::body_spec),
+                        fields: if extra {
+                            vec![pipestream_search::pb::DocumentField {
+                                field: "meta_author".into(),
+                                text: "rogue".into(),
+                                analysis: None,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    },
+                ]))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                error.message().contains("explicit mapped binding"),
+                "{error}"
+            );
+        }
+    }
+
     let source = NodeServiceClient::connect(primary)
         .await
         .unwrap()
@@ -452,7 +511,19 @@ async fn clocked_wal_catches_a_replica_up_idempotently() {
         &pipestream_search::node::bm25_sidecar_path(&root.join("replica.tv")),
     )
     .unwrap();
-    assert_eq!(replica_store.binding(), Some(&expected_binding()));
+    if explicit {
+        let generation = pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(
+            &root.join("primary.tv"),
+        ))
+        .unwrap();
+        let source_binding = pipestream_search::reshard::read_generation_binding(&generation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_binding.analysis_sha.len(), 64);
+        assert_eq!(replica_store.binding(), Some(&source_binding));
+    } else {
+        assert_eq!(replica_store.binding(), Some(&expected_binding()));
+    }
     assert_eq!(
         replica_store.protobuf_source(0).unwrap(),
         Some((
@@ -1253,6 +1324,8 @@ fn expected_binding() -> pipestream_search::postings::StoredBinding {
         plan_fingerprint: derive_plan(&case_set(), "law.v1.Case").unwrap().fingerprint,
         body_path: "title".into(),
         materialize_sha: String::new(),
+        analysis_sha: String::new(),
+        analysis_contract: Vec::new(),
     }
 }
 
@@ -1375,9 +1448,18 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
 /// their parent was written under.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reshard_replay_carries_the_binding() {
+    reshard_binding(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_analysis_reshard_replay_keeps_the_complete_binding() {
+    reshard_binding(true).await;
+}
+async fn reshard_binding(explicit: bool) {
     let (analysis, _mock) = start_mock_analysis().await;
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("tvmapped_reshard_{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "tvmapped_reshard_{explicit}_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let index_path = dir.join("shard.tv");
@@ -1390,9 +1472,13 @@ async fn reshard_replay_carries_the_binding() {
     })
     .await;
     seed_calibration(&addr).await;
-    ingest(&addr, bind(), (0..4).map(|i| doc(i).encode()).collect())
-        .await
-        .expect("mapped ingest succeeds");
+    ingest(
+        &addr,
+        if explicit { explicit_bind() } else { bind() },
+        (0..4).map(|i| doc(i).encode()).collect(),
+    )
+    .await
+    .expect("mapped ingest succeeds");
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     client
         .flush(pipestream_search::pb::FlushRequest {})
@@ -1431,6 +1517,13 @@ async fn reshard_replay_carries_the_binding() {
     let gen =
         pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path))
             .unwrap();
+    let source_binding = pipestream_search::reshard::read_generation_binding(&gen)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        source_binding.analysis_sha.len(),
+        if explicit { 64 } else { 0 }
+    );
     let out_dir = dir.join("out");
     let output = pipestream_search::reshard::merge(
         &[gen],
@@ -1448,7 +1541,7 @@ async fn reshard_replay_carries_the_binding() {
         .expect("documents were replayed");
     let child = pipestream_search::postings::Bm25Store::load(child_bm25).unwrap();
     assert_eq!(child.doc_count(), 4);
-    assert_eq!(child.binding(), Some(&expected_binding()));
+    assert_eq!(child.binding(), Some(&source_binding));
     for row in 0..4 {
         let original = (0..4)
             .find(|i| child.text(row) == doc(*i).title.as_deref())
@@ -1630,6 +1723,7 @@ fn opinion_bind() -> MappedBind {
         body_path: String::new(),
         analysis: None,
         materialize: None,
+        field_analysis: Vec::new(),
     }
 }
 

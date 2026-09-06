@@ -170,3 +170,13 @@ concurrent client runtimes. The former reproduces the old failure deterministica
 on the second client runtime. Library tests verify pool release on shutdown and
 the error returned outside a runtime. Stream, query and ranking tests exercise
 the same shared client path.
+
+## Mapped text fields
+
+Use `MappedBind.field_analysis` to specify analysis for every projected TEXT
+source path, including the body. Native validation happens before binding even
+for absent fields; the durable contract initializes their fingerprints before
+segment sealing. Nested and wrapped text work through the same native path.
+The legacy body-only binding remains supported, with its existing non-body
+limitations. See [explicit mapped analysis](descriptor-mappings.md#explicit-mapped-analysis-2026-09-05-feature-branch)
+for the complete contract and the BM25 kind 12 / WAL format 4 migration.

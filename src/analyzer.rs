@@ -523,6 +523,10 @@ fn native_field(analyzed: protomolt_analyzer::AnalyzedDocument) -> crate::postin
     }
 }
 
+pub(crate) fn validate_native_spec(spec: &AnalysisSpec) -> Result<(), Status> {
+    native_spec(Some(spec)).map(|_| ())
+}
+
 fn native_spec(spec: Option<&AnalysisSpec>) -> Result<protomolt_analyzer::AnalysisSpec, Status> {
     use protomolt_analyzer::{
         AnalysisSpec as NativeSpec, NormalizerStep, Stemmer, TermVectorMode, TermVectorSource,

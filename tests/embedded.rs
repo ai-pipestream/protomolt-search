@@ -423,6 +423,7 @@ async fn descriptor_plan_and_mapped_ingest_use_the_embedded_schema() {
                         body_path: "body".into(),
                         analysis: Some(body_spec()),
                         materialize: None,
+                        field_analysis: Vec::new(),
                     })),
                 },
                 IngestMappedRequest {

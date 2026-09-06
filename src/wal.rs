@@ -122,7 +122,9 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Current on-disk format version (manifest `format_version`).
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
+/// Logical row identity requires format 3, independently of mapped analysis.
+pub const IDENTITY_FORMAT_VERSION: u32 = 3;
 /// Source references without logical row identity remain readable by format-2 binaries.
 pub const BASE_FORMAT_VERSION: u32 = 2;
 
@@ -1189,6 +1191,30 @@ impl WalWriter {
     /// caller (the node) splits batches into per-vector records, so
     /// `first_id` routes the whole record.
     pub fn append(&mut self, mut op: wal_record::Op) -> io::Result<()> {
+        if let wal_record::Op::Bind(binding) = &op {
+            crate::mapped_analysis::decode_contract(
+                &binding.analysis_sha,
+                &binding.analysis_contract,
+                &binding.body_path,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            if !binding.analysis_sha.is_empty() {
+                if !crate::mapped_analysis::valid_digest(&binding.analysis_sha) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid mapped analysis digest",
+                    ));
+                }
+                // Persist the version gate before the new record. An older binary
+                // must never replay an explicit binding as a legacy body-only bind.
+                if self.manifest.format_version < FORMAT_VERSION {
+                    let mut upgraded = self.manifest.clone();
+                    upgraded.format_version = FORMAT_VERSION;
+                    write_manifest(&self.dir, &upgraded)?;
+                    self.manifest = upgraded;
+                }
+            }
+        }
         if let wal_record::Op::AddDocuments(batch) = &mut op {
             if !batch.source_references.is_empty() {
                 return Err(io::Error::new(
@@ -1210,7 +1236,7 @@ impl WalWriter {
                         document.source_chunk_ordinal,
                     )
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                    required_version = FORMAT_VERSION;
+                    required_version = IDENTITY_FORMAT_VERSION;
                 }
             }
             if batch
@@ -1451,6 +1477,54 @@ mod tests {
         batch.documents[0].original_source = Some(source.clone());
         batch.documents[0].source_chunk_ordinal = Some(id as u32);
         wal_record::Op::AddDocuments(batch)
+    }
+
+    #[test]
+    fn explicit_analysis_upgrades_the_wal_before_appending_the_binding() {
+        let dir = tempdir("mapped-analysis");
+        let mut base = manifest(2);
+        base.format_version = BASE_FORMAT_VERSION;
+        let mut writer = WalWriter::create(&dir, base).unwrap();
+        let mut binding = crate::pb::wal::LoggedBinding {
+            plan_fingerprint: "plan".into(),
+            body_path: "body".into(),
+            analysis_sha: String::new(),
+            ..Default::default()
+        };
+        writer
+            .append(wal_record::Op::Bind(binding.clone()))
+            .unwrap();
+        assert_eq!(writer.manifest().format_version, BASE_FORMAT_VERSION);
+        binding.analysis_sha = "invalid".into();
+        assert!(writer
+            .append(wal_record::Op::Bind(binding.clone()))
+            .is_err());
+        assert_eq!(writer.high_watermark(), 1);
+        assert_eq!(writer.manifest().format_version, BASE_FORMAT_VERSION);
+        let contract = crate::pb::MappedAnalysisContract {
+            fields: vec![crate::pb::MappedAnalysisColumn {
+                path: "body".into(),
+                name: "body".into(),
+                analysis: Some(crate::analyzer::body_spec()),
+            }],
+        }
+        .encode_to_vec();
+        let mut hasher = crate::sha256::Sha256::new();
+        hasher.update(b"protomolt.search.mapped-analysis.v1\0");
+        hasher.update(&contract);
+        binding.analysis_sha = crate::sha256::to_hex(&hasher.finalize());
+        binding.analysis_contract = contract;
+        writer
+            .append(wal_record::Op::Bind(binding.clone()))
+            .unwrap();
+        // The on-disk gate precedes the record, even before Flush.
+        assert_eq!(read_manifest(writer.dir()).unwrap().format_version, 4);
+        writer.flush().unwrap();
+        let generation = writer.dir().to_owned();
+        drop(writer);
+        let records = read_clocked_records(&generation, 0).unwrap();
+        assert_eq!(records[1].op, Some(wal_record::Op::Bind(binding)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

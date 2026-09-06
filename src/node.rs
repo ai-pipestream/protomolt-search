@@ -4578,6 +4578,10 @@ impl NodeServiceImpl {
     pub fn new(index: Option<VectorIndex>, mut config: NodeConfig) -> Self {
         declare_placement_column(&mut config);
         let wal = open_wal(index.as_ref(), &config);
+        let mapped_binding = wal.as_ref().and_then(|wal| {
+            crate::reshard::read_generation_binding(wal.dir())
+                .unwrap_or_else(|error| panic!("cannot recover mapped binding: {error}"))
+        });
         let vocab = open_vocab(&config);
         let rerank_parallel = resolved_rerank_parallel(config.rerank_parallel);
         let knobs = Arc::new(node_knobs(&config));
@@ -4591,7 +4595,7 @@ impl NodeServiceImpl {
                 generation: None,
                 wal,
                 parents: None,
-                mapped_binding: None,
+                mapped_binding,
                 stats_epoch: 1,
                 pending_compaction: None,
             })),
@@ -4865,7 +4869,14 @@ impl NodeServiceImpl {
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         {
             let mut guard = write_shard(&self.state);
-            guard.mapped_binding = store.as_ref().and_then(|s| s.binding().cloned());
+            let persisted = store.as_ref().and_then(|s| s.binding().cloned());
+            if let (Some(recovered), Some(persisted)) = (&guard.mapped_binding, &persisted) {
+                assert_eq!(
+                    recovered, persisted,
+                    "WAL and BM25 mapped bindings disagree"
+                );
+            }
+            guard.mapped_binding = persisted.or_else(|| guard.mapped_binding.clone());
             guard.bm25 = store;
             guard.stats_epoch += 1;
         }
@@ -7788,6 +7799,7 @@ struct MappedSource<'a> {
     /// Session properties from the bind, attached to every decoded
     /// document.
     analysis: Option<crate::pb::AnalysisSpec>,
+    field_analysis: std::collections::BTreeMap<String, crate::pb::AnalysisSpec>,
     materialize: Option<crate::pb::MaterializeSpec>,
     /// Source documents decoded so far; extraction errors name the
     /// failing position.
@@ -7890,6 +7902,9 @@ impl MappedSource<'_> {
                 None
             };
             req.analysis = self.analysis.clone();
+            for field in &mut req.fields {
+                field.analysis = self.field_analysis.get(&field.field).cloned();
+            }
             req.materialize = self.materialize.clone();
             self.rows.push_back(IngestDoc {
                 req,
@@ -9230,6 +9245,46 @@ impl NodeServiceImpl {
         // half not scores both halves against one idf.
         {
             let shard = guard.bm25.as_mut().expect("builder just ensured");
+            if let Some(binding) = &guard.mapped_binding {
+                let contract = crate::mapped_analysis::decode_contract(
+                    &binding.analysis_sha,
+                    &binding.analysis_contract,
+                    &binding.body_path,
+                )
+                .map_err(Status::failed_precondition)?;
+                for field in &contract.fields {
+                    let offered = if field.name == "body" {
+                        Some(doc.analysis.as_ref())
+                    } else {
+                        doc.fields
+                            .iter()
+                            .find(|value| value.field == field.name)
+                            .map(|value| value.analysis.as_ref())
+                    };
+                    if offered.is_some_and(|spec| spec != field.analysis.as_ref()) {
+                        return Err(Status::failed_precondition(format!(
+                            "field {:?} analysis does not match the explicit mapped binding",
+                            field.name
+                        )));
+                    }
+                }
+                for field in contract.fields {
+                    let fi = (0..shard.field_count())
+                        .find(|&fi| shard.field_name(fi) == field.name)
+                        .ok_or_else(|| {
+                            Status::failed_precondition(format!(
+                                "bound analysis field {:?} is absent from the shard",
+                                field.name
+                            ))
+                        })?;
+                    shard
+                        .set_analysis_fingerprint(
+                            fi,
+                            crate::analyzer::analysis_fingerprint(field.analysis.as_ref()),
+                        )
+                        .map_err(Status::failed_precondition)?;
+                }
+            }
             let body = crate::analyzer::analysis_fingerprint(doc.analysis.as_ref());
             shard
                 .set_analysis_fingerprint(0, body)
@@ -9732,7 +9787,13 @@ impl NodeServiceImpl {
     fn bind_mapped(
         &self,
         bind: &crate::pb::MappedBind,
-    ) -> Result<crate::mapping::Extractor, Status> {
+    ) -> Result<
+        (
+            crate::mapping::Extractor,
+            crate::mapped_analysis::MappedAnalysis,
+        ),
+        Status,
+    > {
         if bind.expected_fingerprint.is_empty() {
             return Err(Status::invalid_argument(
                 "expected_fingerprint is required: dry-run the plan with PlanIndex first, \
@@ -9744,6 +9805,10 @@ impl NodeServiceImpl {
             &bind.message_type,
             &bind.body_path,
         )?;
+        let analysis = crate::mapped_analysis::MappedAnalysis::resolve(bind, &extractor)?;
+        if self.config.analysis_addr.as_deref() == Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND) {
+            analysis.validate_native()?;
+        }
         let plan = extractor.plan();
         if plan.fingerprint != bind.expected_fingerprint {
             return Err(Status::failed_precondition(format!(
@@ -9810,6 +9875,8 @@ impl NodeServiceImpl {
             plan_fingerprint: plan.fingerprint.clone(),
             body_path: extractor.body_path().to_string(),
             materialize_sha: materialize_sha(bind.materialize.as_ref()),
+            analysis_sha: analysis.digest.clone(),
+            analysis_contract: analysis.contract.clone(),
         };
         let mut guard = write_shard(&self.state);
         match &guard.mapped_binding {
@@ -9827,6 +9894,9 @@ impl NodeServiceImpl {
                         bound.body_path, incoming.body_path
                     ));
                 }
+                if bound.analysis_sha != incoming.analysis_sha {
+                    differs.push("the field analysis specs".to_string());
+                }
                 if bound.materialize_sha != incoming.materialize_sha {
                     differs.push("the materialize spec".to_string());
                 }
@@ -9838,7 +9908,7 @@ impl NodeServiceImpl {
                     if differs.len() == 1 { "s" } else { "" }
                 )))
             }
-            Some(_) => Ok(extractor),
+            Some(_) => Ok((extractor, analysis)),
             None => {
                 wal_append_or_degrade(
                     &mut guard.wal,
@@ -9846,10 +9916,12 @@ impl NodeServiceImpl {
                         plan_fingerprint: incoming.plan_fingerprint.clone(),
                         body_path: incoming.body_path.clone(),
                         materialize_sha: incoming.materialize_sha.clone(),
+                        analysis_sha: incoming.analysis_sha.clone(),
+                        analysis_contract: incoming.analysis_contract.clone(),
                     }),
                 );
                 guard.mapped_binding = Some(incoming);
-                Ok(extractor)
+                Ok((extractor, analysis))
             }
         }
     }
@@ -11625,12 +11697,16 @@ impl NodeService for NodeServiceImpl {
             plan_fingerprint: req.plan_fingerprint,
             body_path: req.body_path,
             materialize_sha: req.materialize_sha,
+            analysis_sha: req.analysis_sha,
+            analysis_contract: req.analysis_contract,
         };
         let _mutation = self.mutation_gate.read().await;
         let mut guard = write_shard(&self.state);
+        let analysis_sha = incoming.analysis_sha.clone();
         let already_bound = Self::apply_binding_locked(&mut guard, incoming)?;
         Ok(Response::new(crate::pb::ApplyWalBindingResponse {
             already_bound,
+            analysis_sha,
         }))
     }
 
@@ -12543,7 +12619,7 @@ impl NodeService for NodeServiceImpl {
                 }
             };
             self.admit_collection(&bind.collection)?;
-            let extractor = {
+            let (extractor, analysis) = {
                 let _mutation = self.mutation_gate.read().await;
                 self.bind_mapped(&bind)?
             };
@@ -12553,7 +12629,8 @@ impl NodeService for NodeServiceImpl {
             let mut source = IngestSource::Mapped(Box::new(MappedSource {
                 stream: &mut inbound,
                 extractor,
-                analysis: bind.analysis.clone(),
+                analysis: analysis.body,
+                field_analysis: analysis.fields,
                 materialize: bind.materialize.clone(),
                 position: 0,
                 parents: 0,
@@ -13683,6 +13760,12 @@ impl NodeServiceImpl {
         guard: &mut ShardState,
         incoming: crate::postings::StoredBinding,
     ) -> Result<bool, Status> {
+        crate::mapped_analysis::decode_contract(
+            &incoming.analysis_sha,
+            &incoming.analysis_contract,
+            &incoming.body_path,
+        )
+        .map_err(Status::invalid_argument)?;
         match guard.mapped_binding.as_ref() {
             Some(bound) if *bound != incoming => Err(Status::failed_precondition(format!(
                 "replica is bound to plan {} body {:?}, source WAL requires plan {} body {:?}",
@@ -13704,6 +13787,8 @@ impl NodeServiceImpl {
                         plan_fingerprint: incoming.plan_fingerprint.clone(),
                         body_path: incoming.body_path.clone(),
                         materialize_sha: incoming.materialize_sha.clone(),
+                        analysis_sha: incoming.analysis_sha.clone(),
+                        analysis_contract: incoming.analysis_contract.clone(),
                     }),
                 );
                 guard.mapped_binding = Some(incoming);

@@ -64,6 +64,8 @@ fn full_unsigned_domain_survives_both_writers_readers_and_other_column_kinds() {
                     plan_fingerprint: "test-plan".into(),
                     body_path: "body".into(),
                     materialize_sha: String::new(),
+                    analysis_sha: String::new(),
+                    analysis_contract: Vec::new(),
                 };
                 heap.set_binding(Some(binding.clone()));
                 spill.set_binding(Some(binding));

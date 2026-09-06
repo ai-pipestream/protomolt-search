@@ -756,6 +756,8 @@ impl NodeServiceImpl {
                     plan_fingerprint: binding.plan_fingerprint.clone(),
                     body_path: binding.body_path.clone(),
                     materialize_sha: binding.materialize_sha.clone(),
+                    analysis_sha: binding.analysis_sha.clone(),
+                    analysis_contract: binding.analysis_contract.clone(),
                 }))
                 .map_err(|e| Status::internal(format!("rewrite binding record: {e}")))?;
         }
@@ -1385,6 +1387,8 @@ impl NodeServiceImpl {
                         plan_fingerprint: bind.plan_fingerprint,
                         body_path: bind.body_path,
                         materialize_sha: bind.materialize_sha,
+                        analysis_sha: bind.analysis_sha,
+                        analysis_contract: bind.analysis_contract,
                     },
                 )?;
             }

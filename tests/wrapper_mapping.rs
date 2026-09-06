@@ -493,6 +493,22 @@ fn bind() -> pb::MappedBind {
         ..Default::default()
     }
 }
+fn explicit_bind() -> pb::MappedBind {
+    pb::MappedBind {
+        analysis: None,
+        field_analysis: vec![
+            pb::MappedFieldAnalysis {
+                path: "body".into(),
+                analysis: Some(pipestream_search::analyzer::body_spec()),
+            },
+            pb::MappedFieldAnalysis {
+                path: "nested.caption".into(),
+                analysis: Some(pipestream_search::analyzer::cased_body_spec()),
+            },
+        ],
+        ..bind()
+    }
+}
 fn inspect_sources(
     path: &std::path::Path,
     layout: pipestream_search::node::Layout,
@@ -552,7 +568,20 @@ fn inspect_sources(
 }
 #[tokio::test]
 async fn wrapper_queries_and_originals_survive_flush_reopen_and_compaction() {
-    let (analysis, mock) = common::mock::start_mock_analysis().await;
+    wrapper_lifecycle(false).await;
+}
+#[tokio::test]
+async fn explicit_native_fields_survive_flush_reopen_and_compaction() {
+    wrapper_lifecycle(true).await;
+}
+async fn wrapper_lifecycle(explicit: bool) {
+    let (sidecar, mock) = common::mock::start_mock_analysis().await;
+    let analysis = if explicit {
+        "native".to_owned()
+    } else {
+        sidecar
+    };
+    let binding = if explicit { explicit_bind() } else { bind() };
     use pipestream_search::{
         analyzer::body_spec,
         coordinator::CoordinatorServiceImpl,
@@ -581,7 +610,7 @@ async fn wrapper_queries_and_originals_survive_flush_reopen_and_compaction() {
             renamed: Some(i64::MAX),
             ratio: Some(0.5),
             nested: Some(Nested {
-                caption: Some("nested".into()),
+                caption: Some("NESTED".into()),
                 number: Some(i64::MIN),
             }),
             payload: Some(vec![0, 255]),
@@ -595,8 +624,10 @@ async fn wrapper_queries_and_originals_survive_flush_reopen_and_compaction() {
         ("single", Layout::SingleImage),
         ("segments", Layout::Segments),
     ] {
-        let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("wrapper_mapping_{label}_{}", std::process::id()));
+        let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "wrapper_mapping_{explicit}_{label}_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("shard.tv");
         let config = NodeConfig {
@@ -639,9 +670,45 @@ async fn wrapper_queries_and_originals_survive_flush_reopen_and_compaction() {
             })
             .await
             .unwrap();
+        if explicit {
+            let mut invalid = binding.clone();
+            invalid.field_analysis[1]
+                .analysis
+                .as_mut()
+                .unwrap()
+                .tokenizer = 2;
+            let error = client
+                .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
+                    payload: Some(pb::ingest_mapped_request::Payload::Bind(invalid)),
+                }]))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            client
+                .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
+                    payload: Some(pb::ingest_mapped_request::Payload::Bind(binding.clone())),
+                }]))
+                .await
+                .unwrap();
+            client.flush(pb::FlushRequest {}).await.unwrap();
+            drop(client);
+            server.abort();
+            let _ = server.await;
+            (address, server) = common::start_opened_node(config.clone()).await;
+            client = NodeServiceClient::connect(address.clone()).await.unwrap();
+            let mut changed = binding.clone();
+            changed.field_analysis[1].analysis = Some(body_spec());
+            let error = client
+                .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
+                    payload: Some(pb::ingest_mapped_request::Payload::Bind(changed)),
+                }]))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        }
         let mut expected = std::collections::BTreeMap::new();
         let mut requests = vec![pb::IngestMappedRequest {
-            payload: Some(pb::ingest_mapped_request::Payload::Bind(bind())),
+            payload: Some(pb::ingest_mapped_request::Payload::Bind(binding.clone())),
         }];
         for doc in &documents {
             let mut bytes = doc.encode_to_vec();
@@ -726,6 +793,49 @@ async fn wrapper_queries_and_originals_survive_flush_reopen_and_compaction() {
                         original.ratio.map(|v| Value::DoubleValue(f64::from(v))),
                         original.nested.and_then(|v| v.number).map(Value::IntValue)
                     ]
+                );
+            }
+            if explicit {
+                for (text, count) in [("NESTED", 1), ("nested", 0)] {
+                    let result = coordinator
+                        .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
+                            text: text.into(),
+                            k: 3,
+                            fields: vec![pb::QueryField {
+                                field: "nested_caption".into(),
+                                weight: 1.0,
+                                analysis: Some(pipestream_search::analyzer::cased_body_spec()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert_eq!(result.hits.len(), count);
+                }
+                let mut changed = binding.clone();
+                changed.field_analysis[1].analysis = Some(body_spec());
+                let error = client
+                    .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
+                        payload: Some(pb::ingest_mapped_request::Payload::Bind(changed)),
+                    }]))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                let generation = pipestream_search::reshard::resolve_gen(
+                    &pipestream_search::wal::wal_dir(&path),
+                )
+                .unwrap();
+                let bound = pipestream_search::reshard::read_generation_binding(&generation)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(bound.analysis_sha.len(), 64);
+                assert_eq!(
+                    pipestream_search::wal::read_manifest(&generation)
+                        .unwrap()
+                        .format_version,
+                    4
                 );
             }
             if pass == 0 {
@@ -914,6 +1024,13 @@ fn well_known_component_hints_are_not_silently_discarded() {
 
 #[tokio::test]
 async fn wrapped_body_and_scalar_defaults_work_in_the_embedded_native_runtime() {
+    embedded_wrappers(false).await;
+}
+#[tokio::test]
+async fn native_embedded_mapped_non_body_text_has_its_own_analysis() {
+    embedded_wrappers(true).await;
+}
+async fn embedded_wrappers(explicit: bool) {
     use pipestream_search::embedded::{EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig};
     let mut shard = EmbeddedShardConfig::in_memory(0);
     shard.node.bm25_fields = vec!["body".into(), "nested_caption".into()];
@@ -956,6 +1073,10 @@ async fn wrapped_body_and_scalar_defaults_work_in_the_embedded_native_runtime() 
         signed: Some(i64::MIN),
         unsigned: Some(0),
         status: Some(String::new()),
+        nested: explicit.then(|| Nested {
+            caption: Some("NESTED".into()),
+            number: None,
+        }),
         ..record(u64::MAX)
     };
     runtime
@@ -963,7 +1084,11 @@ async fn wrapped_body_and_scalar_defaults_work_in_the_embedded_native_runtime() 
             0,
             vec![
                 pb::IngestMappedRequest {
-                    payload: Some(pb::ingest_mapped_request::Payload::Bind(bind())),
+                    payload: Some(pb::ingest_mapped_request::Payload::Bind(if explicit {
+                        explicit_bind()
+                    } else {
+                        bind()
+                    })),
                 },
                 pb::IngestMappedRequest {
                     payload: Some(pb::ingest_mapped_request::Payload::Document(
@@ -993,4 +1118,21 @@ async fn wrapped_body_and_scalar_defaults_work_in_the_embedded_native_runtime() 
         .await
         .unwrap();
     assert_eq!(result.hits.len(), 1);
+    if explicit {
+        let result = runtime
+            .bm25_search(pb::Bm25SearchRequest {
+                text: "NESTED".into(),
+                k: 3,
+                fields: vec![pb::QueryField {
+                    field: "nested_caption".into(),
+                    weight: 1.0,
+                    analysis: Some(pipestream_search::analyzer::cased_body_spec()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.hits.len(), 1);
+    }
 }

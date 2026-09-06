@@ -130,4 +130,8 @@ message LoggedBinding {
   // SHA-256 over the canonical encoding of the bind's materialize
   // spec; empty when the bind carried none.
   string materialize_sha = 3;
+  // Complete explicit mapped analysis contract; empty for legacy binds.
+  string analysis_sha = 4;
+  // Canonical serialized ai.protomolt.search.v1.MappedAnalysisContract.
+  bytes analysis_contract = 5;
 }

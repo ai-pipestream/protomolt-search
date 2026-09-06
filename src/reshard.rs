@@ -488,7 +488,14 @@ fn read_gens_binding(gens: &[PathBuf]) -> Result<Option<crate::postings::StoredB
                 plan_fingerprint: bind.plan_fingerprint,
                 body_path: bind.body_path,
                 materialize_sha: bind.materialize_sha,
+                analysis_sha: bind.analysis_sha,
+                analysis_contract: bind.analysis_contract,
             };
+            crate::mapped_analysis::decode_contract(
+                &binding.analysis_sha,
+                &binding.analysis_contract,
+                &binding.body_path,
+            )?;
             match &bound {
                 Some((first, first_gen)) if *first != binding => {
                     return Err(format!(
@@ -606,6 +613,14 @@ fn build_child(
         // after an always-present phrase field in one hash child and before it
         // in another, producing incompatible positional schemas. Old logs
         // carry no extra fields and derive the single-field table.
+        let analysis_contract = match binding {
+            Some(binding) => crate::mapped_analysis::decode_contract(
+                &binding.analysis_sha,
+                &binding.analysis_contract,
+                &binding.body_path,
+            )?,
+            None => crate::pb::MappedAnalysisContract::default(),
+        };
         let table: Vec<String> = match bm25_fields {
             Some(t) => t.to_vec(),
             None => {
@@ -624,6 +639,12 @@ fn build_child(
                         extras.insert(bigram.field.clone());
                     }
                 }
+                extras.extend(
+                    analysis_contract
+                        .fields
+                        .iter()
+                        .map(|field| field.name.clone()),
+                );
                 extras.remove("body");
                 let mut t = vec!["body".to_string()];
                 t.extend(extras);
@@ -830,6 +851,21 @@ fn build_child(
                     .set_analysis_fingerprint(fi, *fingerprint)
                     .map_err(|error| format!("pin field {:?}: {error}", table[fi]))?;
             }
+        }
+        for field in &analysis_contract.fields {
+            let fi = table
+                .iter()
+                .position(|name| name == &field.name)
+                .ok_or_else(|| {
+                    format!(
+                        "bound analysis field {:?} is absent from child table",
+                        field.name
+                    )
+                })?;
+            builder.set_analysis_fingerprint(
+                fi,
+                crate::analyzer::analysis_fingerprint(field.analysis.as_ref()),
+            )?;
         }
         let mut i = 0;
         while i < mapped.len() {
