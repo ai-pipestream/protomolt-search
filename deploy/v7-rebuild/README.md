@@ -362,3 +362,27 @@ up before `calibrate` and `ingest` run on the driver host; the `down` and `serve
 disk; the other hosts' `plan` output is their gate. A node writes shard files under the host's
 assigned offsets, so files need not move between hosts after a build; to
 rebalance later, use the reshard tool rather than a copy.
+
+To cut a placement group into new leaves (the archive into year bands,
+say), write the new tree as a bare `[placement]` table or a full shard
+map and run the re-placement split over the group's WALs; each child
+comes out as a segment catalog a node serves directly, and memory is one
+WAL bucket of one child ([placement](../../docs/placement.md), "Changing
+the tree"):
+
+```
+A=/work/court-corpus/shards-v10/archive
+reshard --logs=$A/shard-0.tv.wal,$A/shard-1.tv.wal,...,$A/shard-5.tv.wal \
+  --placement-tree=/work/court-corpus/placement-tree-v11.toml \
+  --out-dir=/work/court-corpus/shards-v11/archive \
+  --slot-base=0 --slot-stride=16777216 \
+  --analysis-addr=http://127.0.0.1:19202 --analysis-streams=6
+# then per child i: --index=/work/court-corpus/shards-v11/archive/shard-$i.tv \
+#   --placement-column=placement --placement-leaf=<code from shard-map.toml> \
+#   --placement-tree=<the new map>
+```
+
+Pick the slot stride so the children sit below any other group's slots
+(the recent group starts at 132,907,008 in generation 10) and above the
+largest child; a child that outgrows its stride is refused by name. The
+spill under `<out>/spill` is about the sources' size for the run.

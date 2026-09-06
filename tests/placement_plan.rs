@@ -823,11 +823,13 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
         &dir.join("bands"),
         &[0, 1_000, 2_000],
         None,
+        reshard::TreeSplitOptions::default(),
         &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
     )
     .unwrap();
     assert_eq!(out.children, children);
     assert!(!dir.join("bands").join("spill").exists(), "spill removed");
+    assert!(!dir.join("bands").join("work").exists(), "work removed");
 
     // Every row is in the band its year names; the rows that changed
     // code are the ones outside 2000..2014 plus the codeless rows in it.
@@ -842,13 +844,57 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
     }
     assert_eq!(out.placed, expected.to_vec());
     assert_eq!(out.moved, moved);
+
+    // The default layout: the spill keeps the source's four buckets, each
+    // child is a catalog of one segment per non-empty bucket, and the
+    // largest replay is one bucket, not one child. Each segment's sealed
+    // summary shows the rewritten code and a year range inside the band.
+    assert_eq!(out.layout, reshard::TreeChildLayout::Segmented);
+    assert_eq!(out.spill_bucket_count, 4);
+    let largest_child = *expected.iter().max().unwrap();
+    assert!(
+        out.peak_replay_rows < largest_child,
+        "peak replay {} is not below the largest child {largest_child}",
+        out.peak_replay_rows
+    );
+    let band_bounds = [(2015, i64::MAX), (2000, 2014), (i64::MIN, 1999)];
     for (index, child) in out.images.children.iter().enumerate() {
         assert_eq!(child.num_documents, expected[index], "child {index}");
         assert_eq!(child.num_vectors, expected[index], "child {index}");
         assert_eq!(child.slot_offset, index as u64 * 1_000);
-        for &parent in &child.row_parent_ids {
-            assert_eq!(band_of(band_year(parent as usize)), index, "row {parent}");
+        assert!(child.row_parent_ids.is_empty());
+        assert_eq!(
+            child.vector_path,
+            dir.join("bands").join(format!("shard-{index}.tv"))
+        );
+        let root = pipestream_search::node::segments_root(&child.vector_path);
+        let set = pipestream_search::segments::OpenedSegmentSet::open(&root).unwrap();
+        assert_eq!(set.len(), out.segments[index], "child {index} segments");
+        assert!(set.len() > 1, "child {index} sealed one segment per bucket");
+        let mut rows = 0u64;
+        let mut next_label = 0u64;
+        for i in 0..set.len() {
+            let meta = set.metadata(i);
+            assert_eq!(meta.base_label, next_label, "segment {i} of child {index}");
+            next_label = meta.end_label_exclusive().unwrap();
+            rows += meta.rows;
+            assert!(meta.rows as u64 <= out.peak_replay_rows);
+            let summary = meta.summary.as_ref().unwrap();
+            let column = |name: &str| {
+                summary
+                    .int_columns
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap_or_else(|| panic!("segment {i} of child {index} has no {name}"))
+            };
+            let placement = column("placement");
+            assert_eq!((placement.min, placement.max), (children[index].code, children[index].code));
+            let year = column("year");
+            let (lo, hi) = band_bounds[index];
+            assert!(year.min >= lo && year.max <= hi, "child {index} years {}..{}", year.min, year.max);
         }
+        assert_eq!(rows, expected[index]);
+        assert!(next_label <= 1_000);
     }
     let map = reshard::tree_shard_map_toml(&out, &tree).unwrap();
     let parsed: pipestream_search::config::ShardMap = toml::from_str(&map).unwrap();
@@ -875,7 +921,7 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
         let (addr, handle) = pipestream_search::harness::start_opened_node(NodeConfig {
             index_path: Some(image.vector_path.clone()),
             slot_offset: image.slot_offset,
-            layout: Layout::SingleImage,
+            layout: Layout::Segments,
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
             integer_fields: vec!["year".to_string(), "placement".to_string()],
             placement_column: Some("placement".into()),
@@ -960,6 +1006,7 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
         &dir.join("offsets"),
         &[0, 1_000],
         None,
+        reshard::TreeSplitOptions::default(),
         &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
     )
     .unwrap_err();
@@ -983,6 +1030,7 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
         &dir.join("two"),
         &[0, 1_000, 2_000, 3_000],
         None,
+        reshard::TreeSplitOptions::default(),
         &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
     )
     .unwrap_err();
@@ -990,6 +1038,69 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
         err.contains("carries no stable key") && err.contains("\"recent\", which has 2 shards"),
         "{err}"
     );
+
+    // One image per child on request: the spill in one bucket, the
+    // largest replay is the largest child, the images carry the id maps,
+    // and a bound below a child's size is refused before any image.
+    let single = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &tree,
+        &dir.join("single"),
+        &[0, 1_000, 2_000],
+        None,
+        reshard::TreeSplitOptions {
+            layout: reshard::TreeChildLayout::SingleImage {
+                max_child_rows: largest_child,
+            },
+            spill_bucket_bits: Some(0),
+        },
+        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
+    )
+    .unwrap();
+    assert_eq!(single.spill_bucket_count, 1);
+    assert_eq!(single.peak_replay_rows, largest_child);
+    assert_eq!(single.segments, vec![1, 1, 1]);
+    assert_eq!(single.placed, expected.to_vec());
+    for (index, child) in single.images.children.iter().enumerate() {
+        assert_eq!(child.num_documents, expected[index], "child {index}");
+        assert_eq!(child.row_parent_ids.len() as u64, expected[index]);
+        for &parent in &child.row_parent_ids {
+            assert_eq!(band_of(band_year(parent as usize)), index, "row {parent}");
+        }
+        assert!(child.vector_path.ends_with(format!("shard-{index}.vector")));
+    }
+    let err = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &tree,
+        &dir.join("bounded"),
+        &[0, 1_000, 2_000],
+        None,
+        reshard::TreeSplitOptions {
+            layout: reshard::TreeChildLayout::SingleImage {
+                max_child_rows: largest_child - 1,
+            },
+            spill_bucket_bits: None,
+        },
+        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("above the single-image bound") && !dir.join("bounded").join("shard-0.vector").exists(),
+        "{err}"
+    );
+
+    // A slot stride a child outgrows is refused naming the child.
+    let err = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &tree,
+        &dir.join("narrow"),
+        &[0, 10, 2_000],
+        None,
+        reshard::TreeSplitOptions::default(),
+        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
+    )
+    .unwrap_err();
+    assert!(err.contains("past the next child's offset 10"), "{err}");
 
     for handle in handles {
         handle.abort();
