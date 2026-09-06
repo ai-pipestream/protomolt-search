@@ -395,9 +395,8 @@ pub struct PrincipalConfig {
     /// Documents per second through routed ingest, as a token bucket
     /// with one second of burst; 0 means unlimited.
     pub ingest_docs_per_sec: u32,
-    /// May call the diagnostics service (`docs/diagnostics.md`): read
-    /// and set runtime knobs, read metrics, layouts, and recent
-    /// queries. Off by default.
+    /// Enable diagnostics eligibility (`docs/diagnostics.md`). Calls also
+    /// require an Admin grant for every served collection. Off by default.
     pub admin: bool,
 }
 

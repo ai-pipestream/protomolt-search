@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Diagnostics authorization (2026-09-05, feature branch).** All six
+  coordinator diagnostics routes require admin grants for every served
+  collection in addition to the operator flag. Responses and metrics streams
+  recheck policy revisions; revocation wakes idle streams and releases their
+  producer. Existing operators need explicit grants before upgrading. See
+  [diagnostics](docs/diagnostics.md).
+
 - **Bound query cursors (2026-09-05, feature branch).** Unary and streamed
   `Query` now sign protobuf cursor envelopes and bind them to the resolved
   collection, principal/workspace/policy revision, query and routing generation.

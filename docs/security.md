@@ -68,7 +68,7 @@ token = "…at least 16 bytes…"
 max_k = 200              # 0: the coordinator's max_k
 concurrency = 8          # 0: unlimited
 ingest_docs_per_sec = 500  # 0: unlimited
-admin = false            # true: may call the diagnostics service
+admin = false            # diagnostics also require all served collections' admin grants
 
 [policy]
 format_version = 1
@@ -83,10 +83,13 @@ collection = "opinions"
 actions = ["search"]
 ```
 
-`admin = true` admits the principal to `DiagnosticsService`
-(`docs/diagnostics.md`): reading and setting runtime knobs, metrics
-snapshots, shard layouts, and recent queries. Any other principal gets
-`PERMISSION_DENIED` there. It grants no other quota or route.
+`DiagnosticsService` requires both `admin = true` and an explicit `admin` action
+grant for every collection served by the coordinator. Its runtime controls,
+metrics, shard layouts and recent-query ring cover the whole process. An
+operator flag alone, a missing policy or a grant for only some collections
+returns `PERMISSION_DENIED` before observation or mutation. This flag grants no
+search or ingest capability. See [diagnostics](diagnostics.md) for policy
+replacement, stream cancellation and deployment implications.
 
 With principals configured every `SearchService` call — search, query,
 streaming query, aggregate, plan, routed ingest, topology, broadcast,

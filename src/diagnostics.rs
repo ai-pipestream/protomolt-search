@@ -20,6 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::authorization::{AccessPermit, AuthorizedStream};
 use crate::metrics::Route;
 use crate::pb::diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer};
 use crate::pb::{
@@ -582,7 +583,10 @@ fn snapshot_stream(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = ticker.tick() => {},
+            }
             if tx.send(Ok(snapshot())).await.is_err() {
                 break;
             }
@@ -591,22 +595,11 @@ fn snapshot_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
-/// Admission: with principals configured the caller must be an admin.
-fn admit_admin<T>(
-    principals: Option<&Arc<Principals>>,
-    request: &Request<T>,
-) -> Result<Option<String>, Status> {
-    let Some(principals) = principals else {
-        return Ok(None);
-    };
-    let principal = principals.authenticate(request.metadata())?;
-    if !principal.admin {
-        return Err(Status::permission_denied(format!(
-            "principal {:?} is not an admin; the diagnostics service needs admin = true",
-            principal.name
-        )));
+fn check_access(permits: &[AccessPermit]) -> Result<(), Status> {
+    for permit in permits {
+        permit.check()?;
     }
-    Ok(Some(principal.name.clone()))
+    Ok(())
 }
 
 /// The service on a shard node.
@@ -720,7 +713,36 @@ pub struct CoordinatorDiagnostics {
 }
 
 impl CoordinatorDiagnostics {
-    /// `members` in collection order, the unnamed one under `""`.
+    /// These routes inspect or change the whole served process. A collection
+    /// administrator cannot use them to cross another collection's boundary.
+    fn admit<T>(&self, request: &Request<T>) -> Result<Vec<AccessPermit>, Status> {
+        let Some(principals) = &self.principals else {
+            return Ok(Vec::new());
+        };
+        let principal = principals.authenticate(request.metadata())?;
+        if !principal.admin {
+            return Err(Status::permission_denied(format!(
+                "principal {:?} is not an admin; the diagnostics service needs admin = true",
+                principal.name
+            )));
+        }
+        if self.members.is_empty() {
+            return Err(Status::permission_denied("no authorized collections"));
+        }
+        let permits = self
+            .members
+            .iter()
+            .map(|(name, _)| principals.authorize(&principal, name, crate::pb::AccessAction::Admin))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Acquiring a later collection may span a policy replacement. No
+        // response or mutation may proceed with a mixture of old and new grants.
+        check_access(&permits)?;
+        Ok(permits)
+    }
+
+    /// `members` in collection order, the unnamed one under `""`. Supply the
+    /// complete collection set for this process, including collections behind
+    /// the ring and gauge providers: metrics and controls are process-wide.
     pub fn new(
         members: Vec<(String, crate::coordinator::CoordinatorServiceImpl)>,
         principals: Option<Arc<Principals>>,
@@ -776,8 +798,10 @@ impl DiagnosticsService for CoordinatorDiagnostics {
         request: Request<GetRuntimeKnobsRequest>,
     ) -> Result<Response<RuntimeKnobs>, Status> {
         crate::metrics::timed(Route::GetRuntimeKnobs, request, |request| async move {
-            admit_admin(self.principals.as_ref(), &request)?;
-            Ok(Response::new(self.primary()?.knobs().list()))
+            let access = self.admit(&request)?;
+            let knobs = self.primary()?.knobs().list();
+            check_access(&access)?;
+            Ok(Response::new(knobs))
         })
         .await
     }
@@ -787,13 +811,18 @@ impl DiagnosticsService for CoordinatorDiagnostics {
         request: Request<SetRuntimeKnobRequest>,
     ) -> Result<Response<RuntimeKnobs>, Status> {
         crate::metrics::timed(Route::SetRuntimeKnob, request, |request| async move {
-            admit_admin(self.principals.as_ref(), &request)?;
+            let access = self.admit(&request)?;
             let req = request.into_inner();
             // Every collection's coordinator shares the process's caps.
             for (_, member) in &self.members {
-                member.knobs().set(&req.name, &req.value)?;
+                check_access(&access)?;
+                let result = member.knobs().set(&req.name, &req.value);
+                check_access(&access)?;
+                result?;
             }
-            Ok(Response::new(self.primary()?.knobs().list()))
+            let knobs = self.primary()?.knobs().list();
+            check_access(&access)?;
+            Ok(Response::new(knobs))
         })
         .await
     }
@@ -803,8 +832,10 @@ impl DiagnosticsService for CoordinatorDiagnostics {
         request: Request<MetricsSnapshotRequest>,
     ) -> Result<Response<MetricsSnapshot>, Status> {
         crate::metrics::timed(Route::GetMetricsSnapshot, request, |request| async move {
-            admit_admin(self.principals.as_ref(), &request)?;
-            Ok(Response::new(self.snapshot()))
+            let access = self.admit(&request)?;
+            let snapshot = self.snapshot();
+            check_access(&access)?;
+            Ok(Response::new(snapshot))
         })
         .await
     }
@@ -814,12 +845,13 @@ impl DiagnosticsService for CoordinatorDiagnostics {
         request: Request<StreamMetricsRequest>,
     ) -> Result<Response<Self::StreamMetricsStream>, Status> {
         crate::metrics::timed_stream(Route::StreamMetrics, request, |request| async move {
-            admit_admin(self.principals.as_ref(), &request)?;
+            let access = self.admit(&request)?;
             let interval = stream_interval(request.get_ref())?;
             let this = self.clone();
-            Ok(Response::new(snapshot_stream(interval, move || {
-                this.snapshot()
-            })))
+            let stream = snapshot_stream(interval, move || this.snapshot());
+            check_access(&access)?;
+            let stream: SnapshotStream = Box::pin(AuthorizedStream::with_permits(stream, access));
+            Ok(Response::new(stream))
         })
         .await
     }
@@ -829,13 +861,15 @@ impl DiagnosticsService for CoordinatorDiagnostics {
         request: Request<ShardDiagnosticsRequest>,
     ) -> Result<Response<ShardDiagnostics>, Status> {
         crate::metrics::timed(Route::GetShardDiagnostics, request, |request| async move {
-            admit_admin(self.principals.as_ref(), &request)?;
+            let access = self.admit(&request)?;
             let only = request.get_ref().shard;
             let primary = self.primary()?;
             let mut shards = Vec::new();
             for (_, member) in &self.members {
+                check_access(&access)?;
                 shards.extend(member.shard_diagnostics(only).await);
             }
+            check_access(&access)?;
             Ok(Response::new(ShardDiagnostics {
                 process: primary.knobs().process().to_string(),
                 topology_generation: primary.current_topology_generation(),
@@ -850,15 +884,17 @@ impl DiagnosticsService for CoordinatorDiagnostics {
         request: Request<RecentQueriesRequest>,
     ) -> Result<Response<RecentQueriesResponse>, Status> {
         crate::metrics::timed(Route::RecentQueries, request, |request| async move {
-            admit_admin(self.principals.as_ref(), &request)?;
+            let access = self.admit(&request)?;
             let limit = match request.get_ref().limit {
                 0 => RECENT_DEFAULT,
                 n => (n as usize).min(RECENT_RING),
             };
-            Ok(Response::new(RecentQueriesResponse {
+            let recent = RecentQueriesResponse {
                 queries: self.ring.recent(limit),
                 total_seen: self.ring.total_seen(),
-            }))
+            };
+            check_access(&access)?;
+            Ok(Response::new(recent))
         })
         .await
     }
@@ -877,6 +913,29 @@ pub fn unserved_layout(shard: u32, address: String, note: &str) -> ShardLayoutDi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closing_an_idle_snapshot_stream_drops_its_producer_immediately() {
+        struct Released(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let released = Released(Some(sender));
+        let mut stream = snapshot_stream(Duration::from_secs(60), move || {
+            let _ = &released;
+            MetricsSnapshot::default()
+        });
+        use tokio_stream::StreamExt;
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("dropping a revoked stream must release the producer before its next tick")
+            .unwrap();
+    }
 
     fn node_knobs() -> Knobs {
         Knobs::node(

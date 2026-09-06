@@ -13,7 +13,7 @@ establish completion of the three workstreams.
 | Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Mapped plans report their graph and projection/query dispositions; DescribeSchema also reports source-only graphs; configurable index definitions remain |
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing sources survive image/WAL lifecycle byte-for-byte; the catalog retains zero-row sources across restart; catalog backup and publication remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
-| Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public routes enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
+| Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public search and coordinator diagnostics enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
 | Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Not implemented |
 | Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and lexical results; catalog publication and the other result routes remain |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
@@ -695,3 +695,36 @@ second pages using each host's token, and checks cross-host refusal. The unsigne
 ordering test inspects its typed boundary inside the new envelope and still
 stitches pages exactly. These fixture updates preserve the original correctness
 checks while accounting for the new cursor contract.
+
+## Diagnostics capability checkpoint (2026-09-05)
+
+Regression tests reproduced all six coordinator diagnostics routes accepting an
+operator flag without an authority, or with administration of only one of two
+workspaces. This exposed process-wide observations and allowed runtime changes
+across collection boundaries. An idle metrics stream also survived revocation.
+
+Diagnostics now requires the operator flag and an Admin decision for every
+served collection. It validates the complete set before work, before each
+collection update or shard fan-out, and before disclosure. Metrics streams hold
+all resource permits, register every authority's revision channel, and recheck
+before and after producer polling. Replacement suppresses both result and error
+items and releases the idle snapshot producer without waiting for its next tick.
+Previously applied knob mutations are not rolled back by concurrent revocation.
+
+These endpoints remain operator views of the whole process. A library host must
+supply its complete collection membership, including the ring and gauge sources;
+the metrics registry is not tenant-scoped. Direct node/control membership and
+document/field grants remain unfinished. In particular, the next search-policy
+work must scope TermStats corpus counts and document frequencies as well as
+selection: the current request carries only terms/fields, and StatsCache keys
+shares by node, field and epoch. Filtering returned hits alone would still leak
+restricted documents through ranking and statistics.
+
+Validation: 444 library tests, 586 integration tests across 102 targets and
+11 embedded tests passed (1,041 total), with one existing sidecar conformance
+test ignored. The final suite passed without retries. All five Android/iOS Rust
+target checks passed with three existing relay dead-code warnings per target.
+Tests/examples compilation, formatting, vendored-proto byte identity and
+whitespace checks passed. Descriptor comparison against `b634bba` confirms all
+protobuf declarations are unchanged. These are local checks; no fleet service,
+index generation, or main-branch state changed.

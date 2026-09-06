@@ -47,7 +47,7 @@ token = "...at least 16 bytes..."
 max_k = 200                # 0: the coordinator's max_k
 concurrency = 8            # 0: unlimited
 ingest_docs_per_sec = 500  # 0: unlimited
-admin = false            # true: cluster-wide DiagnosticsService access
+admin = false            # diagnostics also require all served collections' admin grants
 
 [policy]
 format_version = 1
@@ -67,8 +67,9 @@ With principals configured, every public call needs
 UNAUTHENTICATED naming which of the three. Tokens are compared in constant time.
 Without the flag the public surface is anonymous. With bearer credentials,
 explicit workspace/collection grants separately permit `search`, `ingest`, and
-`admin`; no action implies another. The principal-level `admin` flag permits
-cluster diagnostics only. See [the capability contract](../security.md) for
+`admin`; no action implies another. Process-wide diagnostics require both the
+principal-level `admin` flag and an `admin` grant for every served collection.
+See [the capability contract](../security.md) for
 revision checks, stream revocation, and the remaining document/field boundary.
 
 - `max_k`: a `k` above it is rejected. `k = 0` keeps its meaning (the

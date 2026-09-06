@@ -482,14 +482,66 @@ async fn replacement_during_producer_poll_cannot_disclose_an_item() {
         }
     }
     for error_item in [false, true] {
+        let unchanged = Arc::new(PolicyAuthority::new(policy()).unwrap());
+        let unchanged_permit =
+            AccessPermit::acquire(unchanged, "reader", "a", AccessAction::Search).unwrap();
         let authority = Arc::new(PolicyAuthority::new(policy()).unwrap());
         let permit =
             AccessPermit::acquire(authority.clone(), "reader", "a", AccessAction::Search).unwrap();
-        let mut stream = AuthorizedStream::new(RevokeOnPoll(authority, error_item), Some(permit));
+        let mut stream = AuthorizedStream::with_permits(
+            RevokeOnPoll(authority, error_item),
+            vec![unchanged_permit, permit],
+        );
         assert_eq!(
             stream.next().await.unwrap().unwrap_err().code(),
             Code::PermissionDenied
         );
         assert!(stream.next().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn each_authority_can_wake_a_stream_with_multiple_resource_permits() {
+    for revoked in 0..2 {
+        let authorities: Vec<_> = (0..2)
+            .map(|_| Arc::new(PolicyAuthority::new(policy()).unwrap()))
+            .collect();
+        let permits = authorities
+            .iter()
+            .map(|authority| {
+                AccessPermit::acquire(authority.clone(), "reader", "a", AccessAction::Search)
+                    .unwrap()
+            })
+            .collect();
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<(), tonic::Status>>(1);
+        let mut stream = AuthorizedStream::with_permits(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+            permits,
+        );
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            std::future::poll_fn(|cx| {
+                use tokio_stream::Stream;
+                assert!(std::pin::Pin::new(&mut stream).poll_next(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            started.send(()).unwrap();
+            assert_eq!(
+                stream.next().await.unwrap().unwrap_err().code(),
+                Code::PermissionDenied
+            );
+            assert!(stream.next().await.is_none());
+        });
+        waiting.await.unwrap();
+        let mut next = policy();
+        next.revision = 2;
+        next.grants.clear();
+        authorities[revoked].replace(next).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("every authority must register a revocation waker")
+            .unwrap();
+        assert!(sender.is_closed());
     }
 }

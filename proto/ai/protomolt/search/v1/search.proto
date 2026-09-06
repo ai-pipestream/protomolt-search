@@ -662,8 +662,11 @@ message TermCandidate {
 // values, structured metrics snapshots and a stream of them, per-shard
 // layout diagnostics, and the coordinator's recent query log. Served on
 // the same listener as the data services. With bearer principals
-// configured every call needs a principal marked `admin`; without
-// principals it is open like the rest of the surface. Nothing here
+// configured on a coordinator, every call needs a principal marked `admin`
+// and an ADMIN grant for every collection that coordinator serves. These
+// process-wide responses are not collection-filtered. Policy replacement
+// invalidates pending responses and streams. Without principals the service
+// is open like the rest of the surface. Nothing here
 // changes what a query answers except SetRuntimeKnob, and a knob that
 // cannot be changed live is rejected by name.
 service DiagnosticsService {

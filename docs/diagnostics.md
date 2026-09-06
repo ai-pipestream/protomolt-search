@@ -7,12 +7,36 @@ coordinator's log of recent requests. It is served on the same listener
 as the data services, so it needs no extra port and inherits the
 listener's TLS.
 
-With bearer principals configured (`docs/security.md`), a call on the
-coordinator needs a principal with `admin = true` on its entry; any
-other principal gets `PERMISSION_DENIED` naming itself, and a missing
-token `UNAUTHENTICATED`. Without principals the service is open, like
-the rest of the surface. Nodes have no principals: their listeners are
-reached over mTLS by the coordinator and by operators.
+With bearer principals configured (`docs/security.md`), a coordinator call
+requires `admin = true` on the principal and an explicit workspace-bound `admin`
+grant for every collection that coordinator serves, including `""` for an
+unnamed dataset. Missing grants or a missing policy return `PERMISSION_DENIED`;
+a missing token returns `UNAUTHENTICATED`. All six routes have this rule because
+the controls and observations cover the whole process. Granting administration
+of one workspace cannot expose another workspace's recent requests or change
+its runtime controls. The response is not a collection-filtered view.
+
+All grants are checked before work and before returning observations. A policy
+replacement invalidates an in-flight response even when the replacement still
+grants access. Metrics streams recheck every grant before each item, wake on
+replacement while idle, return `PERMISSION_DENIED`, and release their producer.
+Knob changes already applied are not rolled back by concurrent revocation;
+remaining collection updates and response disclosure are refused.
+
+Library hosts must construct diagnostics with the complete collection set for
+the process, including its ring and gauge providers. `CollectionSet::diagnostics`
+does this for that set; do not combine separately authorized collection sets in
+one process and expose a subset over the shared metrics registry. There is no
+tenant-scoped metrics registry in this increment.
+
+Without principals the service remains open. Node diagnostics retain their
+separate mTLS membership boundary; this change does not add public collection
+policy enforcement to direct node calls.
+
+**Upgrade:** an existing diagnostics operator needs both the flag and policy
+grants. Add an `admin` action for each intended workspace/collection and increase
+the policy revision. Credentials alone no longer admit diagnostics. No protobuf
+field or index format changes are required.
 
 The only call that changes an answer is `SetRuntimeKnob`. Everything
 else reads.
@@ -156,4 +180,11 @@ rendered page; the stream at its interval and a fresh stream after a
 hang-up; shard diagnostics on a segmented shard with summaries and on a
 single-image shard, through the node and through the coordinator; the
 ring's contents and order; the admin rule on every coordinator RPC and
-the open service without principals.
+the open service without principals. `tests/diagnostics_authorization.rs`
+checks all six routes against partial workspace grants and an operator flag
+without a policy, admitted process-wide access, revocation during observation,
+idle stream replacement and empty membership. `tests/authorization.rs` checks
+that each of several authorities wakes a pending stream and that revocation
+during producer polling suppresses both results and error details. A unit test
+verifies that dropping an idle metrics stream releases its producer before the
+next timer tick.

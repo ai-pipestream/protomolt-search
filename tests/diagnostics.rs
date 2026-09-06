@@ -685,6 +685,17 @@ async fn the_ring_holds_recent_requests_newest_first() {
 }
 
 fn principals() -> Arc<Principals> {
+    let mut policy = common::access_policy(
+        &["console"],
+        &[""],
+        &[pipestream_search::pb::AccessAction::Search],
+    );
+    policy.grants.push(pipestream_search::pb::CollectionGrant {
+        principal: "ops".into(),
+        workspace: policy.resources[0].workspace.clone(),
+        collection: String::new(),
+        actions: vec![pipestream_search::pb::AccessAction::Admin as i32],
+    });
     Arc::new(
         Principals::from_configs(&[
             PrincipalConfig {
@@ -700,11 +711,7 @@ fn principals() -> Arc<Principals> {
             },
         ])
         .unwrap()
-        .with_policy(common::access_policy(
-            &["console"],
-            &[""],
-            &[pipestream_search::pb::AccessAction::Search],
-        ))
+        .with_policy(policy)
         .unwrap(),
     )
 }

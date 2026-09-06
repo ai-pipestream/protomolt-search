@@ -212,17 +212,24 @@ impl AccessPermit {
 /// producer. A policy revision is checked before each disclosed item.
 pub struct AuthorizedStream<S> {
     inner: Option<S>,
-    permit: Option<AccessPermit>,
-    revisions: Option<WatchStream<u64>>,
+    permits: Vec<AccessPermit>,
+    revisions: Vec<WatchStream<u64>>,
 }
 impl<S> AuthorizedStream<S> {
     pub fn new(inner: S, permit: Option<AccessPermit>) -> Self {
-        let revisions = permit
-            .as_ref()
-            .map(|p| WatchStream::new(p.revisions.clone()));
+        Self::with_permits(inner, permit.into_iter().collect())
+    }
+
+    /// A stream whose disclosure requires every resource decision to remain
+    /// valid. Subscribe to each authority so revocation wakes an idle producer.
+    pub fn with_permits(inner: S, permits: Vec<AccessPermit>) -> Self {
+        let revisions = permits
+            .iter()
+            .map(|p| WatchStream::new(p.revisions.clone()))
+            .collect();
         Self {
             inner: Some(inner),
-            permit,
+            permits,
             revisions,
         }
     }
@@ -236,10 +243,10 @@ where
         if self.inner.is_none() {
             return Poll::Ready(None);
         }
-        if let Some(revisions) = &mut self.revisions {
+        for revisions in &mut self.revisions {
             while let Poll::Ready(Some(_)) = Pin::new(&mut *revisions).poll_next(cx) {}
         }
-        if let Some(permit) = &self.permit {
+        for permit in &self.permits {
             if let Err(error) = permit.check() {
                 self.inner = None;
                 return Poll::Ready(Some(Err(error)));
@@ -248,7 +255,7 @@ where
         let result = Pin::new(self.inner.as_mut().expect("checked above")).poll_next(cx);
         // A producer may yield after doing work that spans a policy replacement.
         if matches!(result, Poll::Ready(Some(_))) {
-            if let Some(permit) = &self.permit {
+            for permit in &self.permits {
                 if let Err(error) = permit.check() {
                     self.inner = None;
                     return Poll::Ready(Some(Err(error)));
