@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_score: 0.0,
         fields: Vec::new(),
         expected_stats_epoch: 0,
+        expected_stats_incarnation: Vec::new(),
         range_facet_fields: Vec::new(),
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),
@@ -112,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Same reasoning as the fingerprint: hand-typed stats carry no
         // epoch claim.
         expected_stats_epoch: 0,
+        expected_stats_incarnation: Vec::new(),
         range_facet_fields: Vec::new(),
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),

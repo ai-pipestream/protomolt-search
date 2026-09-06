@@ -1,6 +1,7 @@
 //! Coordinator side: client-facing [`SearchService`] that fans queries out
 //! to shard nodes, aggregates their floors mid-scan, and merges results.
 
+use crate::stats_identity::StatsClaim;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -465,12 +466,9 @@ fn floor_token() -> u64 {
     z.max(1)
 }
 
-/// Whether a node refused a scoring request because its stats epoch
-/// moved past the request's claim. The retry contract: invalidate the
-/// cache, refetch fresh, and repeat the round ONCE with no claim
-/// (`expected_stats_epoch = 0`) — the pre-cache semantics, which cannot
-/// be refused, so a shard under continuous ingest degrades to exactly
-/// the behavior it had before the cache existed instead of livelocking.
+/// A stale lifetime or epoch invalidates cached shares. Retry once with fresh
+/// statistics and their complete claim; a second mutation returns the refusal.
+/// Never drop the fence to manufacture success under continuous writes.
 fn is_stale_stats(status: &Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
         && status.message().starts_with(crate::node::STALE_STATS_EPOCH)
@@ -1630,7 +1628,7 @@ pub struct BrowseRows {
 #[derive(Debug, Clone, Default)]
 pub struct MembershipSet {
     pub ids: BTreeSet<u64>,
-    pub epochs: Vec<u64>,
+    pub epochs: Vec<StatsClaim>,
     pub wire_bytes: u64,
     pub terms: Vec<String>,
     /// Sealed segments the shards consulted and ruled out while
@@ -1775,7 +1773,7 @@ struct FusedGlobals {
     totals: Vec<u64>,
     /// Per field: global df per term, in that field's term order.
     dfs: Vec<Vec<u32>>,
-    epochs: Vec<u64>,
+    epochs: Vec<StatsClaim>,
     /// Number of primary shards whose field table contains each field.
     known_shards: Vec<usize>,
     /// Number of primary shards whose field carries token positions
@@ -3609,11 +3607,11 @@ impl CoordinatorServiceImpl {
 
         // (b) each shard's share of the corpus stats, cached per node;
         // (c)+(d) run as a round so a stale-stats refusal can rerun
-        // them once against fresh stats with no claim.
+        // them once against fresh stats with a new fenced claim.
         let mut fresh = false;
         loop {
             let (global, epochs) = self.body_stats(&terms, fresh).await?;
-            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            let claims = epochs;
             match self
                 .bm25_query_round(
                     &terms,
@@ -3659,7 +3657,7 @@ impl CoordinatorServiceImpl {
         k: u32,
         min_score: f32,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         facet_fields: &[String],
         map_facet_fields: &[crate::pb::MapFacetField],
         range_facet_fields: &[crate::pb::RangeFacetField],
@@ -3710,7 +3708,8 @@ impl CoordinatorServiceImpl {
                 b: self.bm25_params.b as f32,
                 min_score,
                 fields: Vec::new(),
-                expected_stats_epoch: claims[shard],
+                expected_stats_epoch: claims[shard].epoch,
+                expected_stats_incarnation: claims[shard].incarnation(),
                 facet_fields: facet_fields.to_vec(),
                 map_facet_fields: map_facet_fields.to_vec(),
                 range_facet_fields: range_facet_fields.to_vec(),
@@ -4259,18 +4258,14 @@ impl CoordinatorServiceImpl {
             }
         }
         // (c)+(d) run as a round so a stale-stats refusal can rerun
-        // them once against fresh stats with no claim.
+        // them once against fresh stats with a new fenced claim.
         let n_shards = self.node_addrs.len();
         let mut fresh = false;
         loop {
             let globals = self
                 .fused_stats_probing(&stats_fields, fresh, probe_from)
                 .await?;
-            let claims = if fresh {
-                vec![0; globals.epochs.len()]
-            } else {
-                globals.epochs.clone()
-            };
+            let claims = globals.epochs.clone();
             let t_stats = t0.elapsed();
             // Resolve every field's route against what the fleet
             // answered, producing the leg list the round scores.
@@ -4534,11 +4529,7 @@ impl CoordinatorServiceImpl {
                     self.node_addrs.len()
                 )));
             }
-            let claims = if fresh {
-                vec![0; globals.epochs.len()]
-            } else {
-                globals.epochs.clone()
-            };
+            let claims = globals.epochs.clone();
             let t_stats = t0.elapsed();
             let fingerprints: Vec<u64> = fields
                 .iter()
@@ -4760,7 +4751,7 @@ impl CoordinatorServiceImpl {
             self.stats_cache.store(i, &[], stats_fields, &resp)?;
             shares[i] = Some(crate::stats_cache::FusedShare {
                 visibility_columns_known: resp.visibility_columns_known.clone(),
-                epoch: resp.stats_epoch,
+                epoch: StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?,
                 doc_count: resp.doc_count,
                 fields: resp
                     .field_stats
@@ -4836,7 +4827,7 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         field_terms: &[Vec<String>],
         globals: &FusedGlobals,
-        claims: &[u64],
+        claims: &[StatsClaim],
         // `(field index, parallel term weights, vocabulary fingerprint)`.
         phrase: Option<(usize, &[f32], u64)>,
         // Per field: the positional phrase constraint the shard applies
@@ -4941,7 +4932,8 @@ impl CoordinatorServiceImpl {
                 b: 0.0,
                 min_score,
                 fields: legs.clone(),
-                expected_stats_epoch: claims[shard],
+                expected_stats_epoch: claims[shard].epoch,
+                expected_stats_incarnation: claims[shard].incarnation(),
                 facet_fields: facet_fields.to_vec(),
                 map_facet_fields: map_facet_fields.to_vec(),
                 range_facet_fields: range_facet_fields.to_vec(),
@@ -5214,11 +5206,11 @@ impl CoordinatorServiceImpl {
 
         let t = std::time::Instant::now();
         // Stats + fusion run as a round: a stale-stats refusal from any
-        // shard reruns them once against fresh stats with no claim.
+        // shard reruns them once against fresh stats with a new fenced claim.
         let mut fresh = false;
         let (hits, mut dbg, stats_ms) = loop {
             let (global, epochs) = self.body_stats(&terms, fresh).await?;
-            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            let claims = epochs;
             let stats_ms = t.elapsed().as_secs_f32() * 1e3;
             let round = match legs.fusion_mode {
                 FusionMode::TwoLevel => {
@@ -5298,7 +5290,7 @@ impl CoordinatorServiceImpl {
         &self,
         terms: &[String],
         fresh: bool,
-    ) -> Result<(CorpusStats, Vec<u64>), Status> {
+    ) -> Result<(CorpusStats, Vec<StatsClaim>), Status> {
         let n = self.node_addrs.len();
         let mut shares: Vec<Option<crate::stats_cache::BodyShare>> = vec![None; n];
         if !fresh {
@@ -5338,7 +5330,7 @@ impl CoordinatorServiceImpl {
             self.stats_cache.store(i, terms, &[], &resp)?;
             shares[i] = Some(crate::stats_cache::BodyShare {
                 visibility_columns_known: resp.visibility_columns_known.clone(),
-                epoch: resp.stats_epoch,
+                epoch: StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?,
                 doc_count: resp.doc_count,
                 total_doc_length: resp.total_doc_length,
                 dfs: resp.doc_frequencies,
@@ -5372,7 +5364,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         legs: HybridLegs,
         debug: bool,
         filters: &RequestFilters,
@@ -5415,7 +5407,8 @@ impl CoordinatorServiceImpl {
                 global_doc_frequencies: leg_dfs.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
-                expected_stats_epoch: claims[shard],
+                expected_stats_epoch: claims[shard].epoch,
+                expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
             };
@@ -5551,7 +5544,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         legs: HybridLegs,
         debug: bool,
         filters: &RequestFilters,
@@ -5592,7 +5585,8 @@ impl CoordinatorServiceImpl {
                 global_doc_frequencies: leg_dfs.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
-                expected_stats_epoch: claims[shard],
+                expected_stats_epoch: claims[shard].epoch,
+                expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
             };
@@ -5757,7 +5751,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         legs: HybridLegs,
         debug: bool,
         filters: &RequestFilters,
@@ -5785,7 +5779,8 @@ impl CoordinatorServiceImpl {
                 global_doc_frequencies: leg_dfs.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
-                expected_stats_epoch: claims[shard],
+                expected_stats_epoch: claims[shard].epoch,
+                expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
             };
@@ -5923,7 +5918,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         legs: HybridLegs,
         debug: bool,
         filters: &RequestFilters,
@@ -5968,7 +5963,8 @@ impl CoordinatorServiceImpl {
                 rrf_k: legs.rrf_k as f32,
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
-                expected_stats_epoch: claims[shard],
+                expected_stats_epoch: claims[shard].epoch,
+                expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
             };
@@ -6112,7 +6108,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         legs: HybridLegs,
         debug: bool,
         filters: &RequestFilters,
@@ -6158,7 +6154,8 @@ impl CoordinatorServiceImpl {
                     b: self.bm25_params.b as f32,
                     min_score: 0.0,
                     fields: Vec::new(),
-                    expected_stats_epoch: claims[shard],
+                    expected_stats_epoch: claims[shard].epoch,
+                    expected_stats_incarnation: claims[shard].incarnation(),
                     // Hybrid queries do not carry facets (yet): the
                     // vector leg's match set is the whole corpus, so
                     // "counts over the matches" has no single honest
@@ -6625,7 +6622,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         by_shard: HashMap<u32, Vec<u64>>,
         score_stages: &[crate::pb::ScoreStage],
     ) -> Result<HashMap<u64, f32>, Status> {
@@ -6640,7 +6637,8 @@ impl CoordinatorServiceImpl {
                 candidate_ids: ids,
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
-                expected_stats_epoch: claims[shard as usize],
+                expected_stats_epoch: claims[shard as usize].epoch,
+                expected_stats_incarnation: claims[shard as usize].incarnation(),
                 score_stages: score_stages.to_vec(),
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
@@ -6688,7 +6686,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         global: &CorpusStats,
-        claims: &[u64],
+        claims: &[StatsClaim],
         by_shard: &std::collections::HashMap<u32, Vec<u64>>,
     ) -> Result<
         (
@@ -6709,7 +6707,8 @@ impl CoordinatorServiceImpl {
                 candidate_ids: ids.clone(),
                 k1: self.bm25_params.k1 as f32,
                 b: self.bm25_params.b as f32,
-                expected_stats_epoch: claims[shard as usize],
+                expected_stats_epoch: claims[shard as usize].epoch,
+                expected_stats_incarnation: claims[shard as usize].incarnation(),
                 score_stages: Vec::new(),
             };
             let mut client = self.node_client(node)?;
@@ -7701,7 +7700,7 @@ impl CoordinatorServiceImpl {
         }
         // Phase 2: route candidates to their owning shards for
         // rescoring. Stats + rescore run as a round (a stale-stats
-        // refusal reruns them once with fresh stats and no claim).
+        // refusal reruns them once with fresh stats and a new fenced claim).
         let t = std::time::Instant::now();
         let mut by_shard: std::collections::HashMap<u32, Vec<u64>> =
             std::collections::HashMap::new();
@@ -7711,7 +7710,7 @@ impl CoordinatorServiceImpl {
         let mut fresh = false;
         let (stats_ms, t_rescore, bm25_of, rescore_debug) = loop {
             let (global, epochs) = self.body_stats(&terms, fresh).await?;
-            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            let claims = epochs;
             let stats_ms = t.elapsed().as_secs_f32() * 1e3;
             let t_rescore = std::time::Instant::now();
             match self
@@ -7841,7 +7840,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         ids: &[u64],
-        expected_epochs: Option<&[u64]>,
+        expected_epochs: Option<&[StatsClaim]>,
     ) -> Result<HashMap<u64, f32>, Status> {
         self.lexical_signal_terms_with_stages(
             terms,
@@ -7860,7 +7859,7 @@ impl CoordinatorServiceImpl {
         terms: &[String],
         analysis_fingerprint: u64,
         ids: &[u64],
-        expected_epochs: Option<&[u64]>,
+        expected_epochs: Option<&[StatsClaim]>,
         score_stages: &[crate::pb::ScoreStage],
     ) -> Result<HashMap<u64, f32>, Status> {
         if terms.is_empty() || ids.is_empty() {
@@ -7870,7 +7869,7 @@ impl CoordinatorServiceImpl {
             .map(|s| (s as u32, ids.to_vec()))
             .collect();
         // Stats + rescore run as a round (a stale-stats refusal reruns
-        // them once with fresh stats and no claim) — the same protocol
+        // them once with fresh stats and a new fenced claim) — the same protocol
         // as every other stats consumer.
         let mut fresh = false;
         loop {
@@ -7883,7 +7882,7 @@ impl CoordinatorServiceImpl {
                     ));
                 }
             }
-            let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+            let claims = epochs;
             match self
                 .fanout_bm25_rescore_scores(
                     terms,
@@ -8244,7 +8243,7 @@ impl CoordinatorServiceImpl {
 
         // Candidate-scoped scoring of the window, routed by owning
         // shard. Stats + rescore run as a round (a stale-stats refusal
-        // reruns them once with fresh stats and no claim).
+        // reruns them once with fresh stats and a new fenced claim).
         let mut scores: HashMap<u64, f64> = HashMap::new();
         if window > 0 && !terms.is_empty() {
             let mut by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
@@ -8262,7 +8261,7 @@ impl CoordinatorServiceImpl {
             let mut fresh = false;
             let rescored = loop {
                 let (global, epochs) = self.body_stats(&terms, fresh).await?;
-                let claims = if fresh { vec![0; epochs.len()] } else { epochs };
+                let claims = epochs;
                 match self
                     .fanout_bm25_rescore_scores(
                         &terms,
@@ -8634,6 +8633,7 @@ impl CoordinatorServiceImpl {
                     label_count: response.label_count,
                     bits: response.bits,
                     stats_epoch: 0,
+                    stats_incarnation: Vec::new(),
                 },
             )?;
         }
@@ -8675,7 +8675,7 @@ impl CoordinatorServiceImpl {
         let terms = self.analyze_terms(text, spec).await?;
         if terms.is_empty() {
             return Ok(MembershipSet {
-                epochs: vec![0; self.node_addrs.len()],
+                epochs: vec![StatsClaim::default(); self.node_addrs.len()],
                 ..Default::default()
             });
         }
@@ -8698,7 +8698,10 @@ impl CoordinatorServiceImpl {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("lexical membership task failed: {error}"))
             })??;
-            merged.epochs.push(response.stats_epoch);
+            merged.epochs.push(StatsClaim::required(
+                response.stats_epoch,
+                &response.stats_incarnation,
+            )?);
             merged.prune.add(crate::segment_prune::PruneStats {
                 segments_total: response.segments_total,
                 segments_skipped: response.segments_skipped,

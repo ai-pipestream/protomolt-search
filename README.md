@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Statistics lifetime fencing (2026-09-06, feature branch).** Statistics and
+  lexical membership now identify the node lifetime as well as its mutation
+  count. Cache reuse, relay translation, and all lexical scoring routes carry
+  that complete claim, including the single retry. Same-address replacements
+  refetch; repeated changes refuse. Older responses lacking lifetime identity
+  refuse. Upgrade the whole coordinator/node/relay tree together; stored indexes
+  are unchanged. See [statistics lifetimes](docs/statistics-lifetimes.md).
+
 - **Visibility-scoped term statistics (2026-09-06, feature branch).** Nodes
   compute corpus counts, lengths and term frequencies for a typed document
   view; relays verify the view fingerprint, and caches separate views. Tests

@@ -129,28 +129,29 @@ cascade does not run through a relay yet; its rescoring half does.
 
 ## The epoch token
 
-A node's `TermStats` epoch is its own counter, and a scoring request that
-echoes it (`expected_stats_epoch`) is refused with the `stale stats
-epoch` prefix when the node's postings have moved since. A relay has no
-single counter to report, so it reports a token: a nonzero number bound
-to the tuple (collection, map revision, children in shard order, each
-child's epoch). The same tuple gets the same token, so a parent's stats
-cache keeps hitting while nothing moves; a moved child is a new token.
-The relay translates a token back into one claim per child
-(`RelayService::translate_epoch`), and the child enforces its own claim:
-every keyword-leg request the parent sends with the token as its
-`expected_stats_epoch` reaches each child with that child's recorded
-epoch instead, and a child whose postings moved since refuses with the
-`stale stats epoch` prefix, which the relay keeps at the front of the
-error so the parent's retry rule (invalidate, refetch, repeat once
-unclaimed) fires as it does for a node.
+A node's `TermStats` response carries a mutation epoch and a 32-byte opaque
+`stats_incarnation`. Scoring echoes both as `expected_stats_epoch` and
+`expected_stats_incarnation`. Either mismatch refuses with the `stale stats
+epoch` prefix. The identity changes on a new shard lifetime, including restart
+or replacement at the same network address; the mutation count alone is not
+sufficient.
 
-Tokens are `incarnation << 32 | counter`: the incarnation is taken at
-process start, so a token from before a restart is unknown afterwards
-rather than reused. The relay retains the newest 256 tokens. An unknown
-token, and a token issued under a map revision that is no longer current,
-refuse with the `stale stats epoch` prefix, and the parent refetches.
-Token 0 is no claim and translates to no claim on any child.
+A relay reports a token bound to the tuple (collection, map revision, children
+in shard order, each child's incarnation and epoch), plus its own independent
+32-byte incarnation. The same tuple gets the same token. The relay verifies its
+own incarnation, translates the token into a complete claim per child, and the
+children enforce those claims. This composes through multiple relay levels.
+The parent invalidates, refetches and retries once with a new complete claim;
+a second concurrent change refuses. No retry drops its fence.
+
+The legacy numeric token allocation retains its 32-bit clock prefix and counter,
+but restart isolation relies on the separate OS-random 32-byte identity, not
+the clock. The registry retains the newest 256 tokens. Counter exhaustion
+refuses allocation rather than wrapping. Unknown tokens and tokens issued under
+an older map revision refuse. Zero with an empty incarnation means no claim;
+a nonzero epoch without its incarnation refuses. New coordinators require a
+complete version in every statistics response, including empty shard shares.
+Upgrade the coordinator and its entire node/relay tree together.
 
 ## Map interface
 

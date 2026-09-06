@@ -155,6 +155,7 @@ async fn visibility_statistics_equal_a_physically_restricted_corpus() {
                 global_total_doc_length: share.total_doc_length,
                 global_doc_frequencies: share.doc_frequencies.clone(),
                 expected_stats_epoch: share.stats_epoch,
+                expected_stats_incarnation: share.stats_incarnation.clone(),
                 filter,
                 k: 10,
                 ..Default::default()

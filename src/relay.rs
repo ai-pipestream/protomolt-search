@@ -52,6 +52,7 @@
 //! map with its generation as the revision; a replicated control state
 //! implements the same interface behind the relay without touching it.
 
+use crate::stats_identity::{StatsClaim, StatsIncarnation};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -142,15 +143,15 @@ pub struct TokenTuple {
     pub control_revision: u64,
     pub topology_generation: u64,
     pub children: Vec<String>,
-    pub epochs: Vec<u64>,
+    pub epochs: Vec<StatsClaim>,
 }
 
 /// Relay tokens (`docs/relay-coordinators.md`, "The epoch token"): a
 /// nonzero allocation bound to a [`TokenTuple`], reused while the tuple
 /// repeats so a parent's stats cache keeps hitting, replaced the moment
-/// any child's epoch moves, retained for [`RETAINED_TOKENS`] tuples, and
-/// unknown after that or after a restart (the incarnation half of the
-/// token differs), which the parent sees as the stale-epoch refusal.
+/// any child's lifetime or epoch moves, and retained for [`RETAINED_TOKENS`]
+/// tuples. The relay's separate 32-byte identity fences a restart; the legacy
+/// numeric clock prefix below is not sufficient to identify a lifetime.
 pub struct TokenRegistry {
     incarnation: u64,
     counter: u32,
@@ -166,20 +167,23 @@ impl TokenRegistry {
         }
     }
 
-    fn allocate(&mut self, tuple: TokenTuple) -> u64 {
+    fn allocate(&mut self, tuple: TokenTuple) -> Result<u64, Status> {
         if let Some(position) = self.entries.iter().position(|(_, t)| *t == tuple) {
             let entry = self.entries.remove(position).expect("position from iter");
             let token = entry.0;
             self.entries.push_back(entry);
-            return token;
+            return Ok(token);
         }
-        self.counter = self.counter.wrapping_add(1).max(1);
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("relay statistics token space exhausted"))?;
         let token = (self.incarnation << 32) | u64::from(self.counter);
         self.entries.push_back((token, tuple));
         while self.entries.len() > RETAINED_TOKENS {
             self.entries.pop_front();
         }
-        token
+        Ok(token)
     }
 
     fn lookup(&self, token: u64) -> Option<&TokenTuple> {
@@ -274,6 +278,7 @@ pub struct RelayInner {
     map: Arc<dyn MapSource>,
     collection: String,
     tokens: Mutex<TokenRegistry>,
+    stats_incarnation: StatsIncarnation,
     signals: Arc<Mutex<HashMap<u64, Arc<RelaySignals>>>>,
 }
 
@@ -349,6 +354,7 @@ impl RelayService {
                 map,
                 collection,
                 tokens: Mutex::new(TokenRegistry::new(incarnation | 1)),
+                stats_incarnation: Default::default(),
                 signals: Arc::new(Mutex::new(HashMap::new())),
             }),
         }
@@ -407,9 +413,9 @@ impl RelayService {
     /// to the token's children (the current map's, or the token would
     /// have refused). Token 0 is no claim and translates to no claim on
     /// any child, exactly as a node reads it.
-    pub fn translate_epoch(&self, token: u64) -> Result<Vec<u64>, Status> {
+    pub fn translate_epoch(&self, token: u64) -> Result<Vec<StatsClaim>, Status> {
         if token == 0 {
-            return Ok(vec![0; self.children().len()]);
+            return Ok(vec![StatsClaim::default(); self.children().len()]);
         }
         Ok(self.token_tuple(token)?.epochs)
     }
@@ -708,6 +714,7 @@ pub fn merge_term_stats(
         doc_frequencies,
         field_stats,
         stats_epoch: 0,
+        stats_incarnation: Vec::new(),
         visibility_fingerprint: scope.fingerprint().to_vec(),
         visibility_columns_known,
     })
@@ -1506,7 +1513,13 @@ impl RelayService {
     /// One request per child with the parent's claim translated into
     /// that child's, or the stale-epoch refusal when the token is not
     /// one this relay can translate under the current map.
-    fn child_claims(&self, token: u64, children: usize) -> Result<Vec<u64>, Status> {
+    fn child_claims(
+        &self,
+        token: u64,
+        incarnation: &[u8],
+        children: usize,
+    ) -> Result<Vec<StatsClaim>, Status> {
+        self.stats_incarnation.check(token, token, incarnation)?;
         let claims = self.translate_epoch(token)?;
         if claims.len() != children {
             return Err(Status::failed_precondition(format!(
@@ -1529,7 +1542,7 @@ impl RelayService {
         pinned: MapSnapshot,
         mut map_changes: watch::Receiver<u64>,
         req: Bm25QueryRequest,
-        claims: Vec<u64>,
+        claims: Vec<StatsClaim>,
         mut inbound: Streaming<Bm25QueryStreamRequest>,
         tx: mpsc::Sender<Result<Bm25QueryStreamResponse, Status>>,
         deadline: Option<tokio::time::Instant>,
@@ -1551,7 +1564,8 @@ impl RelayService {
             let mut link = frozen.node_client(addr)?;
             let (out_tx, out_rx) = mpsc::channel::<Bm25QueryStreamRequest>(8);
             let mut child_req = req.clone();
-            child_req.expected_stats_epoch = claims[shard];
+            child_req.expected_stats_epoch = claims[shard].epoch;
+            child_req.expected_stats_incarnation = claims[shard].incarnation();
             out_tx
                 .send(Bm25QueryStreamRequest {
                     payload: Some(bm25_query_stream_request::Payload::Start(child_req)),
@@ -2017,19 +2031,23 @@ impl NodeService for RelayService {
                 );
             }
             let mut merged = merge_term_stats(&req, &shares)?;
+            merged.stats_incarnation = self.stats_incarnation.bytes()?;
             self.still_current(&pinned, "TermStats")?;
             let tuple = TokenTuple {
                 collection: self.collection.clone(),
                 control_revision: pinned.control_revision,
                 topology_generation: pinned.topology_generation,
                 children,
-                epochs: shares.iter().map(|s| s.stats_epoch).collect(),
+                epochs: shares
+                    .iter()
+                    .map(|s| StatsClaim::required(s.stats_epoch, &s.stats_incarnation))
+                    .collect::<Result<_, _>>()?,
             };
             merged.stats_epoch = self
                 .tokens
                 .lock()
                 .expect("relay token registry poisoned")
-                .allocate(tuple);
+                .allocate(tuple)?;
             Ok(Response::new(merged))
         })
         .await
@@ -2113,8 +2131,11 @@ impl NodeService for RelayService {
                 &req.cardinality_fields,
             )?;
             let (pinned, frozen) = self.pin();
-            let claims =
-                self.child_claims(req.expected_stats_epoch, frozen.node_addresses().len())?;
+            let claims = self.child_claims(
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+                frozen.node_addresses().len(),
+            )?;
             if frozen.node_addresses().is_empty() {
                 return Err(Status::failed_precondition(
                     "relay: a relay coordinator has no children",
@@ -2248,12 +2269,17 @@ impl NodeService for RelayService {
                     "relay: a relay coordinator has no children",
                 ));
             }
-            let claims = self.child_claims(req.expected_stats_epoch, children.len())?;
+            let claims = self.child_claims(
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+                children.len(),
+            )?;
             let mut tasks = Vec::with_capacity(children.len());
             for (shard, addr) in children.iter().enumerate() {
                 let mut link = frozen.node_client(addr)?;
                 let mut child_req = req.clone();
-                child_req.expected_stats_epoch = claims[shard];
+                child_req.expected_stats_epoch = claims[shard].epoch;
+                child_req.expected_stats_incarnation = claims[shard].incarnation();
                 let addr = addr.clone();
                 tasks.push(tokio::spawn(async move {
                     let mut request = Request::new(child_req);
@@ -2303,13 +2329,18 @@ impl NodeService for RelayService {
                     "relay: a relay coordinator has no children",
                 ));
             }
-            let claims = self.child_claims(query.expected_stats_epoch, children.len())?;
+            let claims = self.child_claims(
+                query.expected_stats_epoch,
+                &query.expected_stats_incarnation,
+                children.len(),
+            )?;
             let mut tasks = Vec::with_capacity(children.len());
             for (shard, addr) in children.iter().enumerate() {
                 let mut link = frozen.node_client(addr)?;
                 let mut child_req = req.clone();
                 if let Some(q) = child_req.query.as_mut() {
-                    q.expected_stats_epoch = claims[shard];
+                    q.expected_stats_epoch = claims[shard].epoch;
+                    q.expected_stats_incarnation = claims[shard].incarnation();
                 }
                 let addr = addr.clone();
                 tasks.push(tokio::spawn(async move {
@@ -2365,7 +2396,11 @@ impl NodeService for RelayService {
                     "relay: a relay coordinator has no children",
                 ));
             }
-            let claims = self.child_claims(req.expected_stats_epoch, children.len())?;
+            let claims = self.child_claims(
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+                children.len(),
+            )?;
             // Each candidate goes to the child whose slot range holds it;
             // the ranges come from the children's health reports.
             let reports = self.children_health(&frozen, timeout).await?;
@@ -2396,7 +2431,8 @@ impl NodeService for RelayService {
                 let mut link = frozen.node_client(&children[shard])?;
                 let mut child_req = req.clone();
                 child_req.candidate_ids = ids;
-                child_req.expected_stats_epoch = claims[shard];
+                child_req.expected_stats_epoch = claims[shard].epoch;
+                child_req.expected_stats_incarnation = claims[shard].incarnation();
                 let addr = children[shard].clone();
                 tasks.push(tokio::spawn(async move {
                     let mut request = Request::new(child_req);
@@ -2489,12 +2525,17 @@ impl NodeService for RelayService {
                     "relay: a relay coordinator has no children",
                 ));
             }
-            let claims = self.child_claims(req.expected_stats_epoch, children.len())?;
+            let claims = self.child_claims(
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+                children.len(),
+            )?;
             let mut tasks = Vec::with_capacity(children.len());
             for (shard, addr) in children.iter().enumerate() {
                 let mut link = frozen.node_client(addr)?;
                 let mut child_req = req.clone();
-                child_req.expected_stats_epoch = claims[shard];
+                child_req.expected_stats_epoch = claims[shard].epoch;
+                child_req.expected_stats_incarnation = claims[shard].incarnation();
                 let addr = addr.clone();
                 tasks.push(tokio::spawn(async move {
                     let mut request = Request::new(child_req);
@@ -2594,34 +2635,59 @@ mod tests {
             control_revision: 0,
             topology_generation: 0,
             children: vec!["a".into(), "b".into()],
-            epochs: epochs.to_vec(),
+            epochs: epochs
+                .iter()
+                .map(|&epoch| {
+                    if epoch == 0 {
+                        StatsClaim::default()
+                    } else {
+                        StatsClaim::required(epoch, &[1; 32]).unwrap()
+                    }
+                })
+                .collect(),
         }
     }
 
     #[test]
     fn tokens_repeat_for_one_tuple_and_move_with_an_epoch() {
         let mut registry = TokenRegistry::new(7);
-        let t1 = registry.allocate(tuple(&[1, 1]));
+        let t1 = registry.allocate(tuple(&[1, 1])).unwrap();
         assert_ne!(t1, 0);
         assert_eq!(t1 >> 32, 7, "the incarnation is the high half");
         assert_eq!(
-            registry.allocate(tuple(&[1, 1])),
+            registry.allocate(tuple(&[1, 1])).unwrap(),
             t1,
             "same tuple, same token"
         );
-        let t2 = registry.allocate(tuple(&[2, 1]));
+        let t2 = registry.allocate(tuple(&[2, 1])).unwrap();
         assert_ne!(t2, t1);
-        assert_eq!(registry.lookup(t1).unwrap().epochs, vec![1, 1]);
-        assert_eq!(registry.lookup(t2).unwrap().epochs, vec![2, 1]);
+        assert_eq!(registry.lookup(t1).unwrap().epochs, tuple(&[1, 1]).epochs);
+        assert_eq!(registry.lookup(t2).unwrap().epochs, tuple(&[2, 1]).epochs);
         assert!(registry.lookup(t1 + 1000).is_none());
+    }
+
+    #[test]
+    fn token_exhaustion_refuses_instead_of_reusing_an_old_token() {
+        let mut registry = TokenRegistry::new(1);
+        let issued = registry.allocate(tuple(&[1, 1])).unwrap();
+        registry.counter = u32::MAX;
+        assert_eq!(registry.allocate(tuple(&[1, 1])).unwrap(), issued);
+        assert_eq!(
+            registry.allocate(tuple(&[2, 1])).unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            registry.lookup(issued).unwrap().epochs,
+            tuple(&[1, 1]).epochs
+        );
     }
 
     #[test]
     fn retention_is_bounded() {
         let mut registry = TokenRegistry::new(1);
-        let first = registry.allocate(tuple(&[0, 0]));
+        let first = registry.allocate(tuple(&[0, 0])).unwrap();
         for i in 1..=(RETAINED_TOKENS as u64) {
-            registry.allocate(tuple(&[i, 0]));
+            registry.allocate(tuple(&[i, 0])).unwrap();
         }
         assert!(
             registry.lookup(first).is_none(),
@@ -2659,6 +2725,7 @@ mod tests {
                 sentences: false,
             }],
             stats_epoch: 3,
+            stats_incarnation: vec![1; 32],
         }
     }
 

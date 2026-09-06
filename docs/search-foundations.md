@@ -771,3 +771,30 @@ dead-code warnings per target. Tests/examples compilation, formatting,
 vendored-proto byte identity and whitespace checks passed. Descriptor comparison
 against `6631cb9` confirms exactly one new message and three additive fields;
 existing declarations are unchanged. No index format or fleet state changed.
+
+
+## Statistics lifetime checkpoint (2026-09-06)
+
+The visibility cache audit reproduced another correctness gap: two distinct
+node lifetimes at the same mutation count accepted each other's statistics.
+The coordinator's retry also discarded its epoch check after fetching again.
+Statistics and lexical membership now carry a 32-byte lifetime identity;
+caches, relays and lexical scoring preserve it alongside the epoch. All retry
+paths keep the newly fetched claim, and repeated change refuses. The same-address
+regression retains a pooled connection and compares warm-cache scores with a
+fresh coordinator, including through one and two relays. See
+[statistics lifetimes](statistics-lifetimes.md) for the wire contract, upgrade
+boundary and test scope.
+
+This fixes a prerequisite for correct permission-scoped ranking. It does not
+enable document/field grants or finish the durable identity/write requirements.
+
+
+Validation: 454 library tests, 595 integration tests across 104 targets, and
+11 embedded tests passed (1,060 total); one existing sidecar conformance test
+remains ignored. All five Android/iOS Rust target checks, tests/examples build
+checks, formatting and vendored-proto checks passed. Descriptor comparison
+against `d260c92` verifies exactly six additive fields with existing declarations
+unchanged. The network replacement and retry regressions pass, including direct,
+one-relay and two-relay cache reuse. No fleet deployment or device runtime test
+was performed; stored index formats are unchanged.

@@ -93,6 +93,7 @@ pub mod snapshot_repository;
 pub mod sortkeys;
 pub mod source_archive;
 pub mod stats_cache;
+pub mod stats_identity;
 mod stream_signal;
 pub mod synonyms;
 pub mod values;

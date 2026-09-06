@@ -1,30 +1,25 @@
 //! Coordinator-side cache of per-node BM25 term statistics.
 //!
-//! Every BM25-scoring query needs the GLOBAL corpus stats for its terms
-//! (docs/multi-field.md), which the coordinator assembles by summing
-//! each node's share. Those shares are a pure function of a node's BM25
-//! store, and the store advertises a `stats_epoch` that advances on
-//! every mutation — so a share fetched at epoch E may be reused for as
-//! long as the node still reports E, and the node itself enforces the
-//! claim: scoring requests echo the epoch back as
-//! `expected_stats_epoch`, and a shard whose store moved on REFUSES
-//! rather than scoring with stats that no longer describe it. The
-//! cache is therefore never a source of silent staleness; at worst it
-//! costs one refused round trip, after which the coordinator refetches
-//! and repeats the query under today's uncached semantics.
+//! Every scoring share is bound to a 32-byte shard lifetime identity and its
+//! mutation epoch. The coordinator echoes both on scoring requests, checked
+//! under the same read guard as postings. A replacement at the same address
+//! cannot reuse a cached share even if its counter happens to match.
+//!
+//! A stale claim invalidates the cache and retries once with freshly fetched
+//! statistics and their complete version. A second concurrent change refuses;
+//! retries never drop the fence. Missing identities from older nodes refuse.
 //!
 //! Shares are cached per node and validated document visibility. A response
 //! must echo its view fingerprint before insertion, and a restricted view
 //! cannot populate an unrestricted entry. Visibility is a data-view identity,
 //! not a substitute for the caller's current authorization decision.
 //!
-//! Shares are cached PER NODE rather than merged, because invalidation
-//! is per node: one shard taking an ingest batch must not evict seven
-//! other shards' shares. Epochs are process-local counters and are
-//! only ever compared against the same node they came from; in
-//! particular they are meaningless across a primary/replica pair, which
-//! is safe today because no BM25 request is hedged to a replica.
+//! Invalidation is per node and covers every visibility scope when its version
+//! changes. A primary and replica have distinct lifetimes, even when they serve
+//! the same persisted image. These versions are transient fencing identities,
+//! not durable public document identities or cross-shard snapshot versions.
 
+use crate::stats_identity::StatsClaim;
 use crate::visibility::VisibilityScope;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +40,7 @@ struct FieldShare {
 
 /// One node's cached share, valid at `epoch`.
 struct NodeShare {
-    epoch: u64,
+    epoch: StatsClaim,
     doc_count: u64,
     /// Body channel (`TermStatsRequest.terms`): the bare-terms share.
     /// Kept separate from a field literally named "body" because the
@@ -63,7 +58,7 @@ struct NodeShare {
 /// the share is valid at.
 #[derive(Clone)]
 pub struct BodyShare {
-    pub epoch: u64,
+    pub epoch: StatsClaim,
     pub doc_count: u64,
     pub total_doc_length: u64,
     /// Per requested term, in request order.
@@ -85,7 +80,7 @@ pub struct FusedFieldShare {
 /// A fused-channel lookup or fetch result for one node.
 #[derive(Clone)]
 pub struct FusedShare {
-    pub epoch: u64,
+    pub epoch: StatsClaim,
     pub doc_count: u64,
     /// Parallel to the requested fields.
     pub fields: Vec<FusedFieldShare>,
@@ -211,6 +206,7 @@ impl StatsCache {
         resp: &crate::pb::TermStatsResponse,
     ) -> Result<(), Status> {
         scope.validate_response(resp)?;
+        let claim = StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?;
         if resp.stats_epoch == 0
             || resp.doc_frequencies.len() != terms.len()
             || resp.field_stats.len() != fields.len()
@@ -229,13 +225,13 @@ impl StatsCache {
         };
         // A data mutation invalidates every view of that node. View churn is
         // bounded independently of the per-view term limits.
-        if slot.values().any(|share| share.epoch != resp.stats_epoch)
+        if slot.values().any(|share| share.epoch != claim)
             || (!slot.contains_key(scope) && slot.len() >= MAX_SCOPES_PER_NODE)
         {
             slot.clear();
         }
         let share = slot.entry(scope.clone()).or_insert_with(|| NodeShare {
-            epoch: resp.stats_epoch,
+            epoch: claim,
             doc_count: 0,
             body_total_len: 0,
             body_dfs: HashMap::new(),
@@ -303,6 +299,51 @@ mod scope_tests {
     };
 
     #[test]
+    fn replacing_a_lifetime_at_the_same_epoch_evicts_all_views() {
+        let cache = StatsCache::new(1);
+        let view = DocumentVisibility {
+            filter: Some(FilterExpr {
+                expr: Some(filter_expr::Expr::Facet(FacetPredicate {
+                    column: "tenant".into(),
+                    values: vec!["one".into()],
+                })),
+            }),
+        };
+        let restricted = VisibilityScope::new(Some(&view)).unwrap();
+        let scopes = [VisibilityScope::default(), restricted.clone()];
+        for scope in &scopes {
+            cache
+                .store_scoped(
+                    0,
+                    &[],
+                    &[],
+                    scope,
+                    &TermStatsResponse {
+                        stats_epoch: 3,
+                        stats_incarnation: vec![1; 32],
+                        doc_count: 2,
+                        visibility_fingerprint: scope.fingerprint().to_vec(),
+                        visibility_columns_known: vec![true; scope.column_count()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let mut next = TermStatsResponse {
+            stats_epoch: 3,
+            stats_incarnation: vec![],
+            doc_count: 7,
+            ..Default::default()
+        };
+        assert!(cache.store(0, &[], &[], &next).is_err());
+        assert_eq!(cache.lookup_body(0, &[]).unwrap().doc_count, 2);
+        next.stats_incarnation = vec![2; 32];
+        cache.store(0, &[], &[], &next).unwrap();
+        assert_eq!(cache.lookup_body(0, &[]).unwrap().doc_count, 7);
+        assert!(cache.lookup_body_scoped(0, &[], &restricted).is_none());
+    }
+
+    #[test]
     fn policy_churn_is_bounded_and_bad_shapes_do_not_poison_existing_shares() {
         let cache = StatsCache::new(1);
         for n in 0..1000 {
@@ -317,6 +358,7 @@ mod scope_tests {
             let scope = VisibilityScope::new(Some(&view)).unwrap();
             let response = TermStatsResponse {
                 stats_epoch: 1,
+                stats_incarnation: vec![1; 32],
                 doc_count: n,
                 visibility_fingerprint: scope.fingerprint().to_vec(),
                 visibility_columns_known: vec![true],

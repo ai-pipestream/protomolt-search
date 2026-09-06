@@ -52,8 +52,10 @@ retain the relay's existing homogeneous-child requirement.
 `StatsCache` has separate entries for validated visibility scopes within each
 node. Body and fused lookups carry the view's known-column flags. Restricted
 responses cannot enter the unrestricted cache, and the reverse is also refused.
-Insertion checks response dimensions and a nonzero epoch. Malformed shares do
-not replace valid cached entries. A node's epoch change evicts all its views;
+Insertion checks response dimensions, a nonzero epoch, and a 32-byte
+statistics incarnation. Rebinding an address to another node cannot reuse its
+shares, even at the same counter. See [statistics lifetimes](statistics-lifetimes.md). Malformed shares do
+not replace valid cached entries. A change to a node's incarnation or epoch evicts all its views;
 explicit invalidation also clears every view of that node. At most 32 scopes
 remain per node; adding another clears that node's cached views. The existing
 per-channel term limits still apply. This is not an authorization-decision cache:

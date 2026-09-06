@@ -522,6 +522,7 @@ async fn spilled_shard_serves_facets_after_flush() {
             min_score: 0.0,
             fields: Vec::new(),
             expected_stats_epoch: 0,
+            expected_stats_incarnation: Vec::new(),
             facet_fields: vec!["court".to_string()],
             range_facet_fields: Vec::new(),
             geo_filters: Vec::new(),

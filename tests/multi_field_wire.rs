@@ -558,6 +558,7 @@ async fn shard_legs_bm25_params_reach_scoring() {
             client
                 .shard_legs(ShardLegsRequest {
                     expected_stats_epoch: 0,
+                    expected_stats_incarnation: Vec::new(),
                     request_id: String::new(),
                     k: 3,
                     vector: Vec::new(),
@@ -974,6 +975,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
         score_stages: Vec::new(),
         facet_fields: Vec::new(),
         expected_stats_epoch: 0,
+        expected_stats_incarnation: Vec::new(),
         terms: Vec::new(),
         k: 5,
         global_doc_count: 3,

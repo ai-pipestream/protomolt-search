@@ -1032,6 +1032,7 @@ impl NodeServiceImpl {
                 parents: None,
                 mapped_binding,
                 stats_epoch: 0,
+                stats_incarnation: Default::default(),
                 pending_compaction: None,
             },
             id_map: BTreeMap::new(),
@@ -1196,6 +1197,7 @@ impl NodeServiceImpl {
                     parents: None,
                     mapped_binding,
                     stats_epoch: 0,
+                    stats_incarnation: Default::default(),
                     pending_compaction: None,
                 },
                 id_map: BTreeMap::new(),
@@ -1600,7 +1602,8 @@ impl NodeServiceImpl {
                 .flush()
                 .map_err(|e| Status::internal(format!("fsync the rewritten generation: {e}")))?;
             self.install(pre, shadow, &guard)?;
-            shadow.state.stats_epoch = guard.stats_epoch + 1;
+            shadow.state.stats_epoch = guard.stats_epoch;
+            shadow.state.advance_stats_epoch();
             shadow.state.parents = None;
             let previous = std::mem::replace(&mut *guard, std::mem::take(&mut shadow.state));
             let held = started.elapsed().as_millis() as u64;

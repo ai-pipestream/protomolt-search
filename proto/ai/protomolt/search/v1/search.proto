@@ -1052,13 +1052,16 @@ message MembershipBitmapResponse {
   uint64 label_count = 2;
   bytes bits = 3;
   // Lexical store epoch that produced the bitmap. Zero on the vector route.
-  // Candidate rescoring can echo this through expected_stats_epoch.
+  // Candidate rescoring echoes both this epoch and stats_incarnation.
   uint64 stats_epoch = 4;
   // Sealed segments in this shard's snapshot, and how many of them the
   // request ruled out from their summaries without opening them
   // (docs/segment-pruning.md). The answer is the same with pruning off.
   uint32 segments_total = 5;
   uint32 segments_skipped = 6;
+  // 32-byte opaque lifetime identity, paired with the statistics epoch.
+  // Nonzero claims require both; replacements generate a fresh identity.
+  bytes stats_incarnation = 7;
 }
 
 // One column's aggregate over a filtered match set (docs/facets.md).
@@ -2573,11 +2576,10 @@ message TermStatsResponse {
   // This shard's stats epoch: a counter that advances on every mutation
   // of the shard's BM25 store (ingest, flush, load, snapshot install).
   // Everything in this response is a pure function of the store at one
-  // epoch, so a caller may cache the response for as long as the shard
-  // still reports the same epoch — and may ask the shard to enforce
-  // that, by echoing the epoch back as `expected_stats_epoch` on a
-  // scoring request. Always >= 1 (0 is reserved to mean "no claim" in
-  // the echo).
+  // epoch and stats_incarnation. A caller may cache it while the complete
+  // version still matches, enforced by echoing expected_stats_epoch and
+  // expected_stats_incarnation on scoring requests. A nonzero claim without
+  // its incarnation refuses. Always >= 1; zero means no claim in the echo.
   uint64 stats_epoch = 5;
   // Empty for unrestricted requests. Otherwise SHA-256 of the UTF-8 domain
   // "protomolt.search.document-visibility.v1\0" followed by the normalized
@@ -2590,6 +2592,9 @@ message TermStatsResponse {
   // results. Relays OR these flags over children. A column unknown everywhere
   // must be refused by the planner, not treated as an empty authorized corpus.
   repeated bool visibility_columns_known = 7;
+  // 32-byte opaque lifetime identity, paired with the statistics epoch.
+  // Nonzero claims require both; replacements generate a fresh identity.
+  bytes stats_incarnation = 8;
 }
 
 // Phase (c) of the distributed BM25 flow: score with GLOBAL stats.
@@ -2632,11 +2637,11 @@ message Bm25QueryRequest {
   repeated Bm25FieldLeg fields = 9;
   // The stats epoch (TermStatsResponse.stats_epoch) the global stats in
   // this request were computed under, for THIS shard. When non-zero and
-  // the shard's current epoch differs, the shard REFUSES with
+  // the shard's epoch or expected_stats_incarnation differs, it REFUSES with
   // FAILED_PRECONDITION rather than scoring with stats that no longer
   // describe it: a coordinator serving stats from a cache would
   // otherwise degrade silently under ingest, with no bound on how stale
-  // the idf values could get. 0 means "no claim" and is never refused —
+  // the idf values could get. 0 with an empty incarnation means "no claim" —
   // the pre-epoch semantics, where the stats are simply whatever the
   // coordinator fetched moments before.
   uint64 expected_stats_epoch = 10;
@@ -2728,6 +2733,9 @@ message Bm25QueryRequest {
   // Explicit mapped bindings require a matching nonzero value. On legacy
   // bindings zero retains the unknown-analyzer behavior.
   uint64 analysis_fingerprint = 23;
+  // 32-byte opaque lifetime identity, paired with the statistics epoch.
+  // Nonzero claims require both; replacements generate a fresh identity.
+  bytes expected_stats_incarnation = 24;
 }
 
 // Internal exact phrase scoring request. `phrase_leg` indexes `query.fields`.
@@ -4254,6 +4262,9 @@ message HybridShardRequest {
   // Explicit mapped bindings require a matching nonzero value. On legacy
   // bindings zero retains the unknown-analyzer behavior.
   uint64 analysis_fingerprint = 16;
+  // 32-byte opaque lifetime identity, paired with the statistics epoch.
+  // Nonzero claims require both; replacements generate a fresh identity.
+  bytes expected_stats_incarnation = 17;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -4488,6 +4499,9 @@ message ShardLegsRequest {
   // Explicit mapped bindings require a matching nonzero value. On legacy
   // bindings zero retains the unknown-analyzer behavior.
   uint64 analysis_fingerprint = 13;
+  // 32-byte opaque lifetime identity, paired with the statistics epoch.
+  // Nonzero claims require both; replacements generate a fresh identity.
+  bytes expected_stats_incarnation = 14;
 }
 
 // One raw leg hit.
@@ -4605,6 +4619,9 @@ message Bm25RescoreRequest {
   // Explicit mapped bindings require a matching nonzero value. On legacy
   // bindings zero retains the unknown-analyzer behavior.
   uint64 analysis_fingerprint = 10;
+  // 32-byte opaque lifetime identity, paired with the statistics epoch.
+  // Nonzero claims require both; replacements generate a fresh identity.
+  bytes expected_stats_incarnation = 11;
 }
 
 // BM25 scores for the requested candidates, doc id ascending.

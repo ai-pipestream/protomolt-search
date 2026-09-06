@@ -325,11 +325,11 @@ async fn term_stats_through_a_relay_equal_the_flat_sum_and_the_token_translates(
     let claims = relay.translate_epoch(t1).unwrap();
     assert_eq!(claims.len(), 3);
     for (share, claim) in shares.iter().zip(&claims) {
-        assert_eq!(share.stats_epoch, *claim);
+        assert_eq!(share.stats_epoch, claim.epoch);
     }
     assert_eq!(
         relay.translate_epoch(0).unwrap(),
-        vec![0, 0, 0],
+        vec![pipestream_search::stats_identity::StatsClaim::default(); 3],
         "no claim stays no claim"
     );
     let unknown = relay.translate_epoch(t1 ^ 0x5555).unwrap_err();
@@ -340,7 +340,7 @@ async fn term_stats_through_a_relay_equal_the_flat_sum_and_the_token_translates(
         unknown.message()
     );
 
-    let bm25 = |epoch: u64| Bm25QueryRequest {
+    let bm25 = |epoch: pipestream_search::stats_identity::StatsClaim| Bm25QueryRequest {
         terms: vec!["court".into()],
         k: 5,
         global_doc_count: merged.doc_count,
@@ -348,7 +348,8 @@ async fn term_stats_through_a_relay_equal_the_flat_sum_and_the_token_translates(
         global_doc_frequencies: vec![merged.doc_frequencies[0]],
         k1: 1.2,
         b: 0.75,
-        expected_stats_epoch: epoch,
+        expected_stats_epoch: epoch.epoch,
+        expected_stats_incarnation: epoch.incarnation(),
         ..Default::default()
     };
     let mut child1 = NodeServiceClient::connect(children[1].clone())
@@ -977,6 +978,11 @@ fn scoring_request(stats: &TermStatsResponse, token: u64) -> Bm25QueryRequest {
         k1: 1.2,
         b: 0.75,
         expected_stats_epoch: token,
+        expected_stats_incarnation: if token == 0 {
+            Vec::new()
+        } else {
+            stats.stats_incarnation.clone()
+        },
         ..Default::default()
     }
 }
@@ -1161,6 +1167,11 @@ async fn a_rescore_through_a_relay_routes_each_id_to_its_child() {
         k1: 1.2,
         b: 0.75,
         expected_stats_epoch: claim,
+        expected_stats_incarnation: if claim == 0 {
+            Vec::new()
+        } else {
+            stats.stats_incarnation.clone()
+        },
         score_stages: Vec::new(),
     };
     let through = relay

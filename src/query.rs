@@ -45,7 +45,7 @@ enum PlannedSearchKind {
     Lexical {
         terms: Vec<String>,
         analysis_fingerprint: u64,
-        epochs: Vec<u64>,
+        epochs: Vec<crate::stats_identity::StatsClaim>,
         score_stages: Vec<crate::pb::ScoreStage>,
     },
     Dense {

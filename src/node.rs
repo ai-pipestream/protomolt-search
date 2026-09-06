@@ -261,6 +261,7 @@ fn bm25_scoring_fingerprint(req: &Bm25QueryRequest) -> String {
     canonical.k = 0;
     canonical.min_score = 0.0;
     canonical.expected_stats_epoch = 0;
+    canonical.expected_stats_incarnation.clear();
     canonical.facet_fields.clear();
     canonical.map_facet_fields.clear();
     canonical.range_facet_fields.clear();
@@ -3253,6 +3254,7 @@ pub(crate) struct ShardState {
     /// "no claim". Over-bumping is safe (a cache refetches); a missed
     /// bump is the only unsound direction.
     pub(crate) stats_epoch: u64,
+    pub(crate) stats_incarnation: crate::stats_identity::StatsIncarnation,
     /// A compaction cutover whose closing flush has not run yet
     /// (`docs/mutations.md`): the marker on disk says "roll back on
     /// restart" until the next flush writes the new generation's images
@@ -3267,6 +3269,16 @@ pub(crate) struct ShardState {
 pub(crate) const STALE_STATS_EPOCH: &str = "stale stats epoch";
 
 impl ShardState {
+    /// Never wrap a mutation version into one a coordinator may still hold.
+    pub(crate) fn advance_stats_epoch(&mut self) {
+        if let Some(next) = self.stats_epoch.checked_add(1) {
+            self.stats_epoch = next;
+        } else {
+            self.stats_incarnation = Default::default();
+            self.stats_epoch = 1;
+        }
+    }
+
     /// Check under the same guard that reads postings. A binding also pins fields
     /// with no rows yet; a field name alone does not establish term identity.
     fn check_query_analysis(&self, field: &str, offered: u64) -> Result<(), Status> {
@@ -3315,16 +3327,9 @@ impl ShardState {
     /// the same guard the scoring reads through — checking on one guard
     /// acquisition and scoring on another would leave a gap an ingest
     /// commit can slip into.
-    fn check_stats_epoch(&self, expected: u64) -> Result<(), Status> {
-        if expected != 0 && expected != self.stats_epoch {
-            return Err(Status::failed_precondition(format!(
-                "{STALE_STATS_EPOCH}: the request's global stats were computed at epoch \
-                 {expected} but this shard is at {}; its postings changed in between, so \
-                 those stats no longer describe it",
-                self.stats_epoch
-            )));
-        }
-        Ok(())
+    fn check_stats_epoch(&self, expected: u64, incarnation: &[u8]) -> Result<(), Status> {
+        self.stats_incarnation
+            .check(self.stats_epoch, expected, incarnation)
     }
 }
 
@@ -4670,6 +4675,7 @@ impl NodeServiceImpl {
                 parents: None,
                 mapped_binding,
                 stats_epoch: 1,
+                stats_incarnation: Default::default(),
                 pending_compaction: None,
             })),
             ingest_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4951,7 +4957,7 @@ impl NodeServiceImpl {
             }
             guard.mapped_binding = persisted.or_else(|| guard.mapped_binding.clone());
             guard.bm25 = store;
-            guard.stats_epoch += 1;
+            guard.advance_stats_epoch();
         }
         self
     }
@@ -5337,7 +5343,7 @@ impl NodeServiceImpl {
                 .republish(published)
                 .map_err(|e| Status::internal(format!("republish vectors: {e}")))?;
         }
-        guard.stats_epoch += 1;
+        guard.advance_stats_epoch();
         drop(guard);
         // The frozen tail just went out of scope: hand its freed pages
         // back to the kernel. glibc keeps freed small chunks in the
@@ -5680,7 +5686,7 @@ impl NodeServiceImpl {
             // The stats are the same numbers after a flush, but a
             // Spilling shard was refusing TermStats until now — the
             // bump is what tells a cache to come look again.
-            guard.stats_epoch += 1;
+            guard.advance_stats_epoch();
         }
         let written = sealed
             || guard.index.is_some()
@@ -6040,7 +6046,7 @@ impl NodeServiceImpl {
         guard.live_docs = incoming_live_docs;
         guard.parents = None;
         guard.generation = Some(snap.clone());
-        guard.stats_epoch += 1;
+        guard.advance_stats_epoch();
         Self::rotate_wal_after_install(
             &mut guard,
             &self.config,
@@ -6639,7 +6645,7 @@ impl NodeServiceImpl {
         guard.live_docs = live_docs;
         guard.parents = None;
         guard.generation = None;
-        guard.stats_epoch += 1;
+        guard.advance_stats_epoch();
         Self::rotate_wal_after_install(
             &mut guard,
             &self.config,
@@ -6994,7 +7000,7 @@ impl NodeServiceImpl {
             crate::filter::validate_filter(f)?;
         }
         let guard = read_shard(&self.state);
-        guard.check_stats_epoch(req.expected_stats_epoch)?;
+        guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
         for leg in &req.fields {
             guard.check_query_analysis(&leg.field, leg.analysis_fingerprint)?;
         }
@@ -7398,13 +7404,14 @@ impl NodeServiceImpl {
         params: Bm25Params,
         k: usize,
         expected_stats_epoch: u64,
+        expected_stats_incarnation: &[u8],
         filters: &LegFilters<'_>,
     ) -> Result<LegResults, Status> {
         let guard = read_shard(&self.state);
         if !terms.is_empty() {
             guard.check_query_analysis("body", analysis_fingerprint)?;
         }
-        guard.check_stats_epoch(expected_stats_epoch)?;
+        guard.check_stats_epoch(expected_stats_epoch, expected_stats_incarnation)?;
         // One resolution for both legs (docs/vector-filters.md): the
         // allowlist the vector kernel scans under and the predicate the
         // lexical heap gate applies are the same DocFilter, so the two
@@ -7554,6 +7561,7 @@ impl NodeServiceImpl {
             params_from(req.k1, req.b)?,
             k,
             req.expected_stats_epoch,
+            &req.expected_stats_incarnation,
             &LegFilters {
                 geo: &req.geo_filters,
                 regions: geo_regions,
@@ -9837,7 +9845,7 @@ impl NodeServiceImpl {
                 }),
             );
         }
-        guard.stats_epoch += 1;
+        guard.advance_stats_epoch();
         *added += 1;
         Ok(())
     }
@@ -11076,6 +11084,7 @@ impl NodeService for NodeServiceImpl {
                 label_count: 0,
                 bits: Vec::new(),
                 stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
             }));
         };
         let index = shard.as_index().ok_or_else(|| {
@@ -11124,6 +11133,7 @@ impl NodeService for NodeServiceImpl {
             label_count: label_count as u64,
             bits,
             stats_epoch: guard.stats_epoch,
+            stats_incarnation: guard.stats_incarnation.bytes()?,
             segments_total: prune.segments_total,
             segments_skipped: prune.segments_skipped,
         }))
@@ -11154,6 +11164,7 @@ impl NodeService for NodeServiceImpl {
             label_count: label_count as u64,
             bits,
             stats_epoch: 0,
+            stats_incarnation: Vec::new(),
         }))
     }
 
@@ -12886,6 +12897,7 @@ impl NodeService for NodeServiceImpl {
                 doc_frequencies,
                 field_stats,
                 stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
                 visibility_fingerprint: scope.fingerprint().to_vec(),
                 visibility_columns_known,
             }))
@@ -13675,6 +13687,7 @@ impl NodeService for NodeServiceImpl {
                     params_from(req.k1, req.b)?,
                     req.k as usize,
                     req.expected_stats_epoch,
+                    &req.expected_stats_incarnation,
                     &LegFilters {
                         geo: &req.geo_filters,
                         regions: geo_regions,
@@ -13770,7 +13783,7 @@ impl NodeServiceImpl {
             }
         }
         if deleted > 0 {
-            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
+            guard.advance_stats_epoch();
             guard.parents = None;
         }
         Ok(DeleteDocumentsResponse {
@@ -13848,7 +13861,7 @@ impl NodeServiceImpl {
             }
         }
         if committed > 0 {
-            guard.stats_epoch = guard.stats_epoch.saturating_add(1);
+            guard.advance_stats_epoch();
             guard.parents = None;
         }
         Ok(CommitReplacementsResponse {
@@ -14008,7 +14021,7 @@ impl NodeServiceImpl {
             ));
         }
         let guard = read_shard(&self.state);
-        guard.check_stats_epoch(req.expected_stats_epoch)?;
+        guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
         guard.check_query_analysis("body", req.analysis_fingerprint)?;
         // The request's filters, resolved ONCE against this shard's
         // tables and shared by facet counting and the scorers below —
@@ -14453,7 +14466,7 @@ impl NodeServiceImpl {
         };
         let offset = self.config.slot_offset;
         let guard = read_shard(&self.state);
-        guard.check_stats_epoch(req.expected_stats_epoch)?;
+        guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
         guard.check_query_analysis("body", req.analysis_fingerprint)?;
         let (hits, stage_columns_known) = match guard.bm25.as_ref() {
             Some(store) => {
@@ -14721,5 +14734,23 @@ mod unsigned_materialize_tests {
                 assert!(error.message().contains("evaluated uint"), "{error}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stats_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn mutation_counter_exhaustion_rotates_the_lifetime_instead_of_reusing_a_version() {
+        let mut state = ShardState {
+            stats_epoch: u64::MAX,
+            ..Default::default()
+        };
+        let previous = state.stats_incarnation.bytes().unwrap();
+        state.advance_stats_epoch();
+        assert_eq!(state.stats_epoch, 1);
+        assert_ne!(state.stats_incarnation.bytes().unwrap(), previous);
+        assert!(state.check_stats_epoch(1, &previous).is_err());
     }
 }

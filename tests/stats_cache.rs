@@ -184,6 +184,11 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
         min_score: 0.0,
         fields: Vec::new(),
         expected_stats_epoch: claim,
+        expected_stats_incarnation: if claim == 0 {
+            vec![]
+        } else {
+            stats.stats_incarnation.clone()
+        },
         range_facet_fields: Vec::new(),
         geo_filters: Vec::new(),
         stats_fields: Vec::new(),
@@ -428,5 +433,49 @@ async fn fused_repeated_query_reuses_cached_stats() {
     for h in handles {
         h.abort();
     }
+    mock.abort();
+}
+
+/// A process-local mutation counter is not a shard lifetime identity. A node
+/// replacement can have the same counter while serving a different corpus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_node_refuses_stats_from_previous_lifetime() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let config = NodeConfig {
+        analysis_addr: Some(analysis),
+        ..Default::default()
+    };
+    let (old_addr, old_node) = start_empty_node(config.clone()).await;
+    let (new_addr, new_node) = start_empty_node(config).await;
+    add_documents(&old_addr, &["rust rust", "rust"]).await;
+    add_documents(&new_addr, &["rust rust", "other other other other"]).await;
+    let mut old = NodeServiceClient::connect(old_addr).await.unwrap();
+    let mut new = NodeServiceClient::connect(new_addr).await.unwrap();
+    let req = TermStatsRequest {
+        terms: vec!["rust".into()],
+        ..Default::default()
+    };
+    let previous = old.term_stats(req.clone()).await.unwrap().into_inner();
+    let current = new.term_stats(req).await.unwrap().into_inner();
+    assert_eq!(
+        previous.stats_epoch, current.stats_epoch,
+        "same mutation count"
+    );
+    assert_ne!(previous.doc_frequencies, current.doc_frequencies);
+    let stale = Bm25QueryRequest {
+        terms: vec!["rust".into()],
+        k: 10,
+        global_doc_count: previous.doc_count,
+        global_total_doc_length: previous.total_doc_length,
+        global_doc_frequencies: previous.doc_frequencies,
+        expected_stats_epoch: previous.stats_epoch,
+        expected_stats_incarnation: previous.stats_incarnation,
+        ..Default::default()
+    };
+    let refusal = new.bm25_query(stale).await.unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+    assert!(refusal.message().starts_with("stale stats epoch"));
+    old_node.abort();
+    new_node.abort();
     mock.abort();
 }
