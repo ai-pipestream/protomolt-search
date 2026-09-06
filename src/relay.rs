@@ -4386,6 +4386,11 @@ impl NodeService for RelayService {
         crate::metrics::timed(Route::FetchValues, request, |request| async move {
             let timeout = grpc_timeout(request.metadata());
             let req = request.into_inner();
+            if req.include_identities && req.candidate_ids.len() > 1_000_000 {
+                return Err(Status::resource_exhausted(
+                    "identity fetch exceeds 1000000 input IDs",
+                ));
+            }
             let (pinned, frozen, children, claims) = self.open_children(
                 "FetchValues",
                 req.visibility.as_ref(),
@@ -4403,6 +4408,7 @@ impl NodeService for RelayService {
                 .map(|(shard, candidate_ids)| {
                     Some(crate::pb::FetchValuesRequest {
                         candidate_ids,
+                        include_identities: req.include_identities,
                         projections: req.projections.clone(),
                         stages: req.stages.clone(),
                         visibility: req.visibility.clone(),
@@ -4426,7 +4432,30 @@ impl NodeService for RelayService {
             let mut projection_types =
                 vec![crate::pb::ScalarValueType::Unspecified; req.projections.len()];
             let mut rows = Vec::new();
+            let mut identities = Vec::new();
+            let mut identity_bytes = 0usize;
+            let requested: std::collections::HashSet<_> =
+                req.candidate_ids.iter().copied().collect();
+            let mut identity_ids = std::collections::HashSet::new();
             for (shard, share) in shares {
+                if share.identities_included != req.include_identities
+                    || (!req.include_identities && !share.identities.is_empty())
+                {
+                    return Err(Status::failed_precondition(
+                        "child omitted or changed identity fetch certificate",
+                    ));
+                }
+                for row in &share.identities {
+                    if !requested.contains(&row.doc_id)
+                        || child_of_id(&ranges, row.doc_id) != Some(shard)
+                        || !identity_ids.insert(row.doc_id)
+                    {
+                        return Err(Status::failed_precondition(
+                            "child returned an unrequested or duplicate identity",
+                        ));
+                    }
+                    crate::query_identity::charge_candidate_identity(row, &mut identity_bytes)?;
+                }
                 merge_known(
                     "stage-column",
                     shard,
@@ -4446,6 +4475,7 @@ impl NodeService for RelayService {
                 )?;
                 receipts.push(read_metadata(&share));
                 rows.extend(share.rows);
+                identities.extend(share.identities);
             }
             let rows = in_caller_order(&req.candidate_ids, rows, |r| r.doc_id);
             let receipt = self.read_receipt(
@@ -4457,6 +4487,8 @@ impl NodeService for RelayService {
             )?;
             Ok(Response::new(crate::pb::FetchValuesResponse {
                 rows,
+                identities,
+                identities_included: req.include_identities,
                 stage_columns_known: stage_known.unwrap_or_default(),
                 projection_leaves_known: projection_known.unwrap_or_default(),
                 projection_types: projection_types.into_iter().map(i32::from).collect(),

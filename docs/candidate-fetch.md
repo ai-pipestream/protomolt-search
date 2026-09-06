@@ -43,19 +43,17 @@ with no projections or stages skips fan-out and returns no version claims.
 
 The public query executor now binds these reads to its admitted versions and
 validates the whole query again before completion; see
-[query read versions](query-read-versions.md). Restricted `Query` and
-`QueryStream` still refuse. Before enabling them, their planners must carry the
-mandatory view into every selection/statistics path and
-thread selection versions into all later reads, including vector rescoring,
-source fetch, lineage/collapse, sort and aggregation. Unary and provisional
-streamed hits, explanations and cursor continuations must apply field disclosure
-and current authority checks. Read-version validation rejects changed data;
+[query read versions](query-read-versions.md). Private in-process restricted
+`Query` and `QueryStream` now enforce the mandatory view and field grants;
+see [document-authorized queries](document-query-authorization.md). Read-version validation rejects changed data;
 it does not retain a historical snapshot.
 
 The internal visibility and version fields are not credentials. Direct node
-authorization and remote delegation remain separate work. Relays still refuse
-`FetchValues`; no relay support is implied by this protocol extension. These
-ephemeral versions are not durable document identity or idempotency receipts.
+authorization and remote delegation remain separate work. Relays compose
+`FetchValues` with the child read receipts. These ephemeral versions are not
+durable document identity or idempotency receipts. The optional
+[identity evaluation](query-result-identity.md) returns imported stable keys
+separately under those receipts.
 
 Use matching coordinator and node builds: older fetch responses omit version
 metadata and are refused, including for unrestricted projected queries. The

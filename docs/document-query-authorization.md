@@ -41,9 +41,10 @@ when its operation fails. This contract does not claim timing noninterference.
 
 Field-use-only grants still omit raw identity and stored scorer dimensions from
 representatives and inner hits. Document restrictions additionally withhold
-physical execution details. `doc_id` remains a generation-local locator;
-stable identity across every result path and transactional source publication
-remain unfinished foundations.
+physical execution details. `doc_id` remains a generation-local locator.
+[Final query responses](query-result-identity.md) now resolve imported identity
+under the same authority and version. Provisional identity and transactional
+source publication remain unfinished foundations.
 
 ## Evidence
 

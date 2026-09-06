@@ -40,6 +40,20 @@ async fn node(offset: u64) -> Arc<NodeServiceImpl> {
                 .into_iter()
                 .map(|(audience, color)| AddDocumentsRequest {
                     text: "alpha".into(),
+                    original_source: Some(ProtobufSource {
+                        descriptor_set: include_bytes!(
+                            "fixtures/protobuf-semantics/descriptor.bin"
+                        )
+                        .to_vec(),
+                        message_type: "semantics.Doc".into(),
+                        payload: vec![8, 1],
+                    }),
+                    identity: (color != "blue").then(|| DocumentIdentity {
+                        document_key: color.as_bytes().to_vec(),
+                        version: u64::MAX,
+                        chunk_ordinal: Some(0),
+                    }),
+                    source_chunk_ordinal: (color != "blue").then_some(0),
                     analysis: Some(body_spec()),
                     facets: vec![
                         FacetValue {
@@ -58,9 +72,64 @@ async fn node(offset: u64) -> Arc<NodeServiceImpl> {
         .unwrap();
     node
 }
+#[tokio::test]
+async fn vector_only_candidates_have_explicit_identity_absence_under_the_read_receipt() {
+    use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
+    let mut vectors = vec![0.; 128];
+    vectors[0] = 1.;
+    vectors[65] = 1.;
+    let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, 64, 4).unwrap();
+    index.add(&vectors, 64).unwrap();
+    index.prepare().unwrap();
+    let mut live = pipestream_search::live_docs::LiveDocs::default();
+    live.delete(1);
+    let node = NodeServiceImpl::new(
+        Some(index),
+        NodeConfig {
+            slot_offset: 100,
+            ..Default::default()
+        },
+    )
+    .with_live_docs(live)
+    .unwrap();
+    let mut link = NodeLink::local(Arc::new(node));
+    let request = FetchValuesRequest {
+        candidate_ids: vec![100, 101, 102, 100],
+        include_identities: true,
+        ..Default::default()
+    };
+    let response = link
+        .fetch_values(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.identities_included);
+    assert!(response.rows.is_empty());
+    assert_eq!(
+        response.identities,
+        vec![CandidateIdentity {
+            doc_id: 100,
+            identity: None
+        }]
+    );
+    StatsClaim::required(response.stats_epoch, &response.stats_incarnation).unwrap();
+    let scoped = link
+        .fetch_values(FetchValuesRequest {
+            visibility: Some(view("audience")),
+            ..request
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(scoped.identities_included);
+    assert!(scoped.identities.is_empty());
+    assert_eq!(scoped.visibility_columns_known, vec![false]);
+}
+
 fn request() -> FetchValuesRequest {
     FetchValuesRequest {
         candidate_ids: vec![u64::MAX, 12, 11, 10, 10, 0],
+        include_identities: true,
         projections: vec![projection("color")],
         visibility: Some(view("audience")),
         ..Default::default()
@@ -71,6 +140,32 @@ fn request() -> FetchValuesRequest {
 async fn candidate_values_require_live_visible_rows_and_echo_even_empty_views() {
     let mut link = NodeLink::local(node(10).await);
     let response = link.fetch_values(request()).await.unwrap().into_inner();
+    assert!(response.identities_included);
+    let identities: std::collections::BTreeMap<_, _> = response
+        .identities
+        .iter()
+        .map(|row| (row.doc_id, row.identity.clone()))
+        .collect();
+    assert_eq!(identities.len(), 2);
+    assert_eq!(
+        identities[&10],
+        Some(DocumentIdentity {
+            document_key: b"red".to_vec(),
+            version: u64::MAX,
+            chunk_ordinal: Some(0),
+        })
+    );
+    assert_eq!(identities[&12], None);
+    let values_only = link
+        .fetch_values(FetchValuesRequest {
+            include_identities: false,
+            ..request()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!values_only.identities_included);
+    assert!(values_only.identities.is_empty());
     let scope = VisibilityScope::new(Some(&view("audience"))).unwrap();
     scope
         .validate_echo(
@@ -108,6 +203,8 @@ async fn candidate_values_require_live_visible_rows_and_echo_even_empty_views() 
         .unwrap()
         .into_inner();
     assert!(empty.rows.is_empty());
+    assert!(empty.identities_included);
+    assert!(empty.identities.is_empty());
     assert_eq!(
         empty.visibility_fingerprint,
         response.visibility_fingerprint
@@ -377,6 +474,79 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
         .fetch_values_at(&[0], &projections, &[], &[expected])
         .await
         .is_err());
+    let expected = StatsClaim::required(1, &[2; 32]).unwrap();
+    let identity_good = FetchValuesResponse {
+        stats_epoch: 1,
+        stats_incarnation: vec![2; 32],
+        identities_included: true,
+        identities: vec![CandidateIdentity {
+            doc_id: 0,
+            identity: Some(DocumentIdentity {
+                document_key: vec![0, 255],
+                version: u64::MAX,
+                chunk_ordinal: Some(0),
+            }),
+        }],
+        ..Default::default()
+    };
+    *response.lock().unwrap() = identity_good.clone();
+    let identities = coordinator
+        .resolve_candidate_identities_at(&[0], &[expected])
+        .await
+        .unwrap();
+    assert_eq!(identities[&0], identity_good.identities[0].identity);
+    for failure in 0..8 {
+        let mut invalid = identity_good.clone();
+        match failure {
+            0 => {
+                invalid.identities_included = false;
+                invalid.identities.clear();
+            }
+            1 => invalid.identities[0].doc_id = 1,
+            2 => invalid.identities.push(invalid.identities[0].clone()),
+            3 => invalid.stats_epoch += 1,
+            4 => invalid.stats_incarnation[0] ^= 1,
+            5 => invalid.identities[0]
+                .identity
+                .as_mut()
+                .unwrap()
+                .document_key
+                .clear(),
+            6 => invalid.identities[0].identity.as_mut().unwrap().version = 0,
+            7 => {
+                invalid.identities[0]
+                    .identity
+                    .as_mut()
+                    .unwrap()
+                    .document_key = vec![1; 16385]
+            }
+            _ => unreachable!(),
+        }
+        *response.lock().unwrap() = invalid;
+        assert_eq!(
+            coordinator
+                .resolve_candidate_identities_at(&[0], &[expected])
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition,
+            "identity failure {failure}"
+        );
+    }
+    *response.lock().unwrap() = FetchValuesResponse {
+        identities: vec![CandidateIdentity {
+            doc_id: 0,
+            identity: None,
+        }],
+        ..identity_good
+    };
+    assert_eq!(
+        coordinator
+            .resolve_candidate_identities_at(&[0], &[expected])
+            .await
+            .unwrap()[&0],
+        None
+    );
     server.abort();
     let _ = server.await;
 }

@@ -371,11 +371,17 @@ async fn public_query_value_fetch_keeps_the_preselection_lifetime() {
 #[tokio::test]
 async fn final_query_validation_rejects_a_retry_that_changed_the_read_generation() {
     use pipestream_search::pb::search_service_server::SearchService;
-    for streaming in [false, true] {
+    for (streaming, during_identity) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         let (address, service, handle) = start(node(&["rust", "rust"]).await).await;
         let coordinator = coordinator(address);
         let next = node(&["rust", "rust"]).await;
-        service.before_score.lock().unwrap().push_back(next);
+        if during_identity {
+            // This unprojected lexical query has no other candidate-value read.
+            service.before_fetch.lock().unwrap().push_back(next);
+        } else {
+            service.before_score.lock().unwrap().push_back(next);
+        }
         if streaming {
             use pipestream_search::pb::*;
             use tokio_stream::StreamExt;
@@ -411,10 +417,17 @@ async fn final_query_validation_rejects_a_retry_that_changed_the_read_generation
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error.message().contains("query data changed"));
         }
-        assert!(
-            service.scoring_calls.load(Ordering::SeqCst) >= 2,
-            "the lexical delegate must retry successfully before the final read check"
-        );
+        if during_identity {
+            assert!(
+                service.before_fetch.lock().unwrap().is_empty(),
+                "the query must reach identity resolution before replacement"
+            );
+        } else {
+            assert!(
+                service.scoring_calls.load(Ordering::SeqCst) >= 2,
+                "the lexical delegate must retry successfully before the final read check"
+            );
+        }
         handle.abort();
         let _ = handle.await;
     }

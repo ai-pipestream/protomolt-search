@@ -1,8 +1,9 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-The document-query admission increment follows the field-authorization merge to
-main `c3783a2`, with all current replay, relay, dependency and CI changes included.
+The latest increment resolves imported identities on final query results,
+following document-query admission on main `20ac5f1` and the incorporated replay,
+relay, dependency and CI changes.
 The original main reconciliation checkpoint was `1565d07` on
 `feat/protobuf-unsigned-numerics-2026-09`, accepted for main on 2026-09-06.
 This tracks the full requested foundation. Individual passing increments do not
@@ -18,7 +19,7 @@ establish completion of the three workstreams.
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public search and coordinator diagnostics enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
 | Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Private-shard Query/QueryStream and BM25, statistics, caches, suggestions and aggregates enforce document and field grants; remote and remaining direct-entry enforcement remains |
-| Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and lexical results; catalog publication and the other result routes remain |
+| Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and all final Query adapters including collapse; provisional streams, remaining legacy routes and catalog publication remain |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
 | Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Local source acceptance has durable/volatile receipts and abrupt-process-exit coverage; searchable publication remains |
 
@@ -1080,3 +1081,13 @@ Remote and direct-node enforcement, remaining protobuf shape semantics and
 stable identity/publication remain required; the three-part goal is incomplete.
 The admission increment passed 1,217 tests and all five mobile compile targets
 against main `c3783a2`; the document-query contract records the validation scope.
+
+## Final query identity increment
+
+[Query result identity](query-result-identity.md) resolves source keys, versions
+and chunk ordinals for every final Query hit and collapse inner hit under the
+selection-time version and authority view. Explicit absence is distinguished
+from an older peer that did not evaluate identity. Relays preserve and validate
+the records, and field grants can deny disclosure. Provisional streams, server
+publication, write transactions and the remaining protobuf/authorization work
+are still required; this does not complete the three-part goal.

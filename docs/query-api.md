@@ -5,12 +5,14 @@ benchmark provenance carries an explicit evidence scope. See
 [Query execution disclosure](query-disclosure.md) for omission semantics and
 the [private-shard document-query admission contract](document-query-authorization.md).
 
-Simple lexical selection returns the imported `DocumentIdentity` with each hit
-when present on the scored row. The terminal `QueryStream` response carries the
-same identity. It is read with the score, without a later positional-ID lookup.
-`doc_id` is still a generation-local locator. Dense, hybrid, Boolean, browse and
-provisional candidates do not expose logical identity yet; see
-[document writes](document-writes.md) for the remaining publication contract.
+Final query hits and collapse inner hits carry imported `DocumentIdentity`
+when the selected row has one. This covers every result adapter, including
+lexical, dense, hybrid, Boolean and browse. The coordinator resolves identity
+under the selection's admitted shard versions and document view and applies
+field disclosure before publishing unary or terminal streamed results.
+`doc_id` is still a generation-local locator; provisional stream revisions do
+not carry stable identity yet. See [query result identity](query-result-identity.md)
+and [document writes](document-writes.md) for the remaining publication contract.
 
 Status: `SearchService.Query` and its certified streaming form
 `SearchService.QueryStream` are IMPLEMENTED. Increment 1 landed on 2026-08-24:

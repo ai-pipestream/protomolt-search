@@ -731,6 +731,8 @@ type AggregatedHits = (
 /// shard knows is refused by name, the usual typo rule.
 /// The evaluated values for one candidate set (`fetch_values`).
 pub struct FetchedValues {
+    /// Explicit identity/absence records when requested, under the same receipt.
+    pub identities: HashMap<u64, Option<crate::pb::DocumentIdentity>>,
     /// doc -> projected values, aligned with the request projections.
     pub rows: HashMap<u64, Vec<crate::pb::ProjectedValue>>,
     /// Per stage: doc -> identity-score contribution. A doc absent
@@ -3228,7 +3230,18 @@ impl CoordinatorServiceImpl {
                 .as_ref()
                 .expect("pinned read versions"),
         )?;
-        let result = crate::query::execute(&scoped, request).await;
+        let result = async {
+            let mut response = crate::query::execute(&scoped, request).await?;
+            if self
+                .field_permissions
+                .as_ref()
+                .is_none_or(|fields| fields.can_disclose_identity())
+            {
+                scoped.fill_query_identities(&mut response).await?;
+            }
+            Ok::<_, Status>(response)
+        }
+        .await;
         scoped.validate_read_versions(&reads).await?;
         let mut response = result?;
         if let Some(disclosure) = disclosure {
@@ -3243,6 +3256,46 @@ impl CoordinatorServiceImpl {
             profile.total_ms = started.elapsed().as_secs_f32() * 1000.0;
         }
         Ok(response)
+    }
+
+    async fn fill_query_identities(
+        &self,
+        response: &mut crate::pb::QueryResponse,
+    ) -> Result<(), Status> {
+        let ids: Vec<_> = response
+            .hits
+            .iter()
+            .chain(response.groups.iter().flat_map(|group| &group.hits))
+            .map(|hit| hit.doc_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let claims = self.admitted_read_claims()?;
+        let identities = self.resolve_candidate_identities_at(&ids, &claims).await?;
+        if identities.len() != ids.len() {
+            return Err(Status::failed_precondition(
+                "query identity fetch omitted a selected row",
+            ));
+        }
+        for hit in response
+            .hits
+            .iter_mut()
+            .chain(response.groups.iter_mut().flat_map(|group| &mut group.hits))
+        {
+            let identity = identities
+                .get(&hit.doc_id)
+                .expect("complete candidate identity set");
+            if hit.identity.is_some() && &hit.identity != identity {
+                return Err(Status::failed_precondition(
+                    "query identity differs from the selection identity",
+                ));
+            }
+            hit.identity = identity.clone();
+        }
+        Ok(())
     }
 
     fn bind_query_cursor(
@@ -8956,6 +9009,7 @@ impl CoordinatorServiceImpl {
             projections,
             stages,
             self.query_read_versions.as_deref().map(Vec::as_slice),
+            false,
         )
         .await
     }
@@ -8978,8 +9032,39 @@ impl CoordinatorServiceImpl {
         for claim in epochs {
             StatsClaim::required(claim.epoch, &claim.incarnation())?;
         }
-        self.fetch_values_impl(ids, projections, stages, Some(epochs))
+        self.fetch_values_impl(ids, projections, stages, Some(epochs), false)
             .await
+    }
+
+    /// Resolve identity and explicit absence for live, authorized candidate rows
+    /// under a complete selection-time read set. Omitted rows were not served;
+    /// callers publishing selected hits must require complete coverage.
+    pub async fn resolve_candidate_identities_at(
+        &self,
+        ids: &[u64],
+        epochs: &[StatsClaim],
+    ) -> Result<HashMap<u64, Option<crate::pb::DocumentIdentity>>, Status> {
+        if self
+            .field_permissions
+            .as_ref()
+            .is_some_and(|fields| !fields.can_disclose_identity())
+        {
+            return Err(Status::permission_denied(
+                "document identity disclosure is not granted",
+            ));
+        }
+        if epochs.len() != self.node_addrs.len() || epochs.iter().any(|claim| claim.epoch == 0) {
+            return Err(Status::failed_precondition(
+                "identity fetch requires one complete selection claim per node",
+            ));
+        }
+        for claim in epochs {
+            StatsClaim::required(claim.epoch, &claim.incarnation())?;
+        }
+        Ok(self
+            .fetch_values_impl(ids, &[], &[], Some(epochs), true)
+            .await?
+            .identities)
     }
 
     async fn fetch_values_impl(
@@ -8988,6 +9073,7 @@ impl CoordinatorServiceImpl {
         projections: &[crate::pb::CompiledProjection],
         stages: &[crate::pb::ScoreStage],
         epochs: Option<&[StatsClaim]>,
+        include_identities: bool,
     ) -> Result<FetchedValues, Status> {
         if let Some(fields) = &self.field_permissions {
             fields.fetch_values(projections, stages)?;
@@ -8998,14 +9084,22 @@ impl CoordinatorServiceImpl {
         // Stage parameters validate here too, so a malformed stage is
         // refused by name before any fan-out.
         crate::node::parse_score_stages(stages)?;
+        if include_identities && ids.len() > 1_000_000 {
+            return Err(Status::resource_exhausted(
+                "identity fetch exceeds 1000000 input IDs",
+            ));
+        }
+        let mut identity_bytes = 0usize;
         let mut out = FetchedValues {
+            identities: HashMap::new(),
             rows: HashMap::new(),
             stage_rows: vec![HashMap::new(); stages.len()],
             epochs: Vec::with_capacity(self.node_addrs.len()),
         };
         // An empty candidate list still fans out when anything was
         // named: the typo rules run on the flags, not the rows.
-        if projections.is_empty()
+        if !include_identities
+            && projections.is_empty()
             && stages.is_empty()
             && epochs.is_none()
             && self.document_visibility.is_none()
@@ -9017,6 +9111,7 @@ impl CoordinatorServiceImpl {
             let claim = epochs.map_or(StatsClaim::default(), |epochs| epochs[shard]);
             let request = crate::pb::FetchValuesRequest {
                 candidate_ids: ids.to_vec(),
+                include_identities,
                 projections: projections.to_vec(),
                 stages: stages.to_vec(),
                 visibility: self.document_visibility.clone(),
@@ -9050,6 +9145,22 @@ impl CoordinatorServiceImpl {
                 return Err(Status::failed_precondition(
                     "candidate fetch returned a different selection version",
                 ));
+            }
+            if resp.identities_included != include_identities
+                || (!include_identities && !resp.identities.is_empty())
+            {
+                return Err(Status::failed_precondition(
+                    "shard omitted or changed identity fetch certificate",
+                ));
+            }
+            for row in resp.identities {
+                if !candidates.contains(&row.doc_id) || out.identities.contains_key(&row.doc_id) {
+                    return Err(Status::failed_precondition(
+                        "candidate fetch returned an unrequested or duplicate identity",
+                    ));
+                }
+                crate::query_identity::charge_candidate_identity(&row, &mut identity_bytes)?;
+                out.identities.insert(row.doc_id, row.identity);
             }
             out.epochs.push(claim);
             for (known, shard) in visibility_known

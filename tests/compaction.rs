@@ -492,6 +492,66 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
         }
         sorted(out)
     }
+    // Public result identities resolve to the logical source after cutover,
+    // reopen and WAL replay, even though compaction has renumbered physical IDs.
+    let lexical_selection = SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: "lex".into(),
+            query: Some(search_query::Query::Lexical(
+                pipestream_search::pb::LexicalQuery {
+                    text: "common".into(),
+                    ..Default::default()
+                },
+            )),
+        })),
+    };
+    let browse_selection = SelectionQuery {
+        node: Some(selection_query::Node::Filter(
+            pipestream_search::pb::FilterQuery {
+                id: "rows".into(),
+                predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
+                    "num >= 0".into(),
+                )),
+            },
+        )),
+    };
+    let boolean_selection = SelectionQuery {
+        node: Some(selection_query::Node::Boolean(
+            pipestream_search::pb::BooleanQuery {
+                must: vec![lexical_selection.clone()],
+                ..Default::default()
+            },
+        )),
+    };
+    for selection in [lexical_selection, browse_selection, boolean_selection] {
+        let response = SearchService::query(
+            &coordinator,
+            Request::new(QueryRequest {
+                k: 5000,
+                selection: Some(selection),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!response.hits.is_empty());
+        let identities = response
+            .hits
+            .iter()
+            .map(|h| (h.doc_id, h.identity.clone()))
+            .collect();
+        resolve(
+            &mut nodes,
+            response
+                .hits
+                .iter()
+                .map(|h| (h.doc_id, h.score.to_bits()))
+                .collect(),
+            Some(&identities),
+        )
+        .await;
+    }
     let mut lexical = Vec::new();
     let mut facets = Vec::new();
     for probe in LEXICAL_PROBES {

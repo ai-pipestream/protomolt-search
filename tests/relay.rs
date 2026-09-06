@@ -828,6 +828,12 @@ async fn add_columned_documents(addr: &str, leaf: usize, texts: &[String]) {
         for (i, text) in texts.into_iter().enumerate() {
             let row = leaf * LEX_ROWS + i;
             tx.send(AddDocumentsRequest {
+                original_source: Some(common::protobuf_source("relay", &row.to_string())),
+                identity: (row != 0).then(|| pipestream_search::pb::DocumentIdentity {
+                    document_key: (row as u64).to_le_bytes().to_vec(),
+                    version: u64::MAX,
+                    chunk_ordinal: None,
+                }),
                 text,
                 facets: vec![FacetValue {
                     field: "court".into(),
@@ -2045,7 +2051,7 @@ async fn fetches_by_id_through_relays_equal_the_children() {
     let top = relay_over(&[&a, &b]).await;
     let rows = LEX_ROWS as u64;
     // Across the children, out of order, one repeated, one foreign.
-    let ids: Vec<u64> = vec![rows + 3, 1, 1, 3 * rows + 2, 5 * rows, 2 * rows + 1, 0];
+    let ids: Vec<u64> = vec![rows + 3, 1, 1, 3 * rows + 2, 5 * rows, 2 * rows + 1, 0, 2];
     let child_of = |id: u64| (id / rows) as usize;
     let visibility = Some(pipestream_search::pb::DocumentVisibility {
         filter: pipestream_search::cel::compile_filter("court == 'scotus'").unwrap(),
@@ -2071,6 +2077,7 @@ async fn fetches_by_id_through_relays_equal_the_children() {
         let mut documents = Vec::new();
         let mut parents = Vec::new();
         let mut values = Vec::new();
+        let mut identities = std::collections::BTreeMap::new();
         let mut direct_receipt = None;
         for &id in &ids {
             let child = child_of(id);
@@ -2099,6 +2106,7 @@ async fn fetches_by_id_through_relays_equal_the_children() {
             );
             let fetched = node
                 .fetch_values(FetchValuesRequest {
+                    include_identities: true,
                     candidate_ids: vec![id],
                     projections: projections.clone(),
                     visibility: visibility.clone(),
@@ -2107,6 +2115,13 @@ async fn fetches_by_id_through_relays_equal_the_children() {
                 .await
                 .unwrap()
                 .into_inner();
+            assert!(fetched.identities_included);
+            identities.extend(
+                fetched
+                    .identities
+                    .into_iter()
+                    .map(|row| (row.doc_id, row.identity)),
+            );
             values.extend(fetched.rows);
             direct_receipt = Some((
                 fetched.visibility_fingerprint,
@@ -2187,6 +2202,7 @@ async fn fetches_by_id_through_relays_equal_the_children() {
         );
         let through = relay
             .fetch_values(FetchValuesRequest {
+                include_identities: true,
                 candidate_ids: ids.clone(),
                 projections: projections.clone(),
                 visibility: visibility.clone(),
@@ -2196,6 +2212,18 @@ async fn fetches_by_id_through_relays_equal_the_children() {
             .unwrap_or_else(|e| panic!("{name}: {e}"))
             .into_inner();
         assert_eq!(through.rows, values, "{name}: FetchValues");
+        assert!(through.identities_included);
+        assert!(identities.values().any(Option::is_some));
+        assert!(identities.values().any(Option::is_none));
+        assert_eq!(through.identities.len(), identities.len());
+        assert_eq!(
+            through
+                .identities
+                .into_iter()
+                .map(|row| (row.doc_id, row.identity))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            identities
+        );
         assert_eq!(
             through.projection_types, types,
             "{name}: the projection types"

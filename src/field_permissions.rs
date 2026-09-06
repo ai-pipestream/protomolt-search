@@ -38,6 +38,9 @@ impl FieldScope {
             disclose_identity: input.disclose_document_identity,
         })
     }
+    pub(crate) fn can_disclose_identity(&self) -> bool {
+        self.disclose_identity
+    }
     pub(crate) fn can_use(&self, field: &str) -> bool {
         self.grants.get(field).is_some_and(|bits| bits & 1 != 0)
     }

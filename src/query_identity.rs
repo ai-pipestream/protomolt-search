@@ -13,6 +13,28 @@ use crate::pb::{
 };
 use crate::source_archive::IdentitySnapshot;
 
+/// Bound identity records before accumulating them at a node, relay or root.
+/// Includes each record's repeated-field framing, not unrelated value payloads.
+pub(crate) fn charge_candidate_identity(
+    row: &crate::pb::CandidateIdentity,
+    bytes: &mut usize,
+) -> Result<(), Status> {
+    if let Some(identity) = &row.identity {
+        crate::source_archive::validate_identity(identity, identity.chunk_ordinal)
+            .map_err(|_| Status::failed_precondition("candidate returned an invalid identity"))?;
+    }
+    let len = row.encoded_len();
+    *bytes = bytes
+        .checked_add(1 + prost::encoding::encoded_len_varint(len as u64) + len)
+        .ok_or_else(|| Status::resource_exhausted("identity response length overflow"))?;
+    if *bytes > 32 * 1024 * 1024 {
+        return Err(Status::resource_exhausted(
+            "candidate identities exceed 32 MiB",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_limits(limits: &StreamIdentityLimits) -> Result<Duration, Status> {
     if !(1..=1_000_000).contains(&limits.max_rows)
         || !(1..=64 * 1024 * 1024).contains(&limits.max_response_bytes)
@@ -152,6 +174,36 @@ impl ScanIdentities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_identity_budget_includes_framing_and_is_shared_across_rows() {
+        let row = crate::pb::CandidateIdentity {
+            doc_id: u64::MAX,
+            identity: Some(crate::pb::DocumentIdentity {
+                document_key: vec![0xff; 16384],
+                version: u64::MAX,
+                chunk_ordinal: Some(0),
+            }),
+        };
+        let len = row.encoded_len();
+        let framed = 1 + prost::encoding::encoded_len_varint(len as u64) + len;
+        let mut bytes = 32 * 1024 * 1024 - framed;
+        charge_candidate_identity(&row, &mut bytes).unwrap();
+        assert_eq!(bytes, 32 * 1024 * 1024);
+        assert_eq!(
+            charge_candidate_identity(&row, &mut bytes)
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let mut overflow = usize::MAX;
+        assert_eq!(
+            charge_candidate_identity(&row, &mut overflow)
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
 
     #[test]
     fn captured_eligibility_and_range_apply_even_without_identity_metadata() {

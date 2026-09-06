@@ -13602,6 +13602,41 @@ impl NodeService for NodeServiceImpl {
                         visibility_columns_known,
                         ..Default::default()
                     };
+                    response.identities_included = req.include_identities;
+                    if req.include_identities {
+                        if req.candidate_ids.len() > 1_000_000 {
+                            return Err(Status::resource_exhausted(
+                                "identity fetch exceeds 1000000 input IDs",
+                            ));
+                        }
+                        let slots = guard.visible_candidate_slots(
+                            req.visibility.as_ref(),
+                            &req.candidate_ids,
+                            offset,
+                            usize::try_from(physical_rows(&guard)).map_err(|_| {
+                                Status::failed_precondition(
+                                    "identity row span exceeds this host address space",
+                                )
+                            })?,
+                        )?;
+                        let mut bytes = 0usize;
+                        for slot in slots {
+                            let row = crate::pb::CandidateIdentity {
+                                doc_id: offset + slot as u64,
+                                identity: guard.bm25.as_ref().and_then(|store| {
+                                    u32::try_from(slot)
+                                        .ok()
+                                        .and_then(|local| store.document_identity(local))
+                                }),
+                            };
+                            crate::query_identity::charge_candidate_identity(&row, &mut bytes)?;
+                            response.identities.push(row);
+                        }
+                    }
+                    if req.include_identities && req.projections.is_empty() && req.stages.is_empty()
+                    {
+                        return Ok(response);
+                    }
                     let projection_leaves = {
                         let mut leaves = Vec::new();
                         for p in &req.projections {

@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Identity on final query results.** Public Query and terminal
+  QueryStream responses resolve imported identities for all result adapters and
+  collapse inner hits under the selection's version and authority view. Relays
+  preserve explicit identity/absence records; older peers refuse. No stored
+  format change. See [query result identity](docs/query-result-identity.md).
 - **2026-09-06 — Document-authorized Query and QueryStream.** Private in-process
   shards now accept mandatory document views with optional field grants. Tests
   cover provisional membership, rich final answers, paging and policy changes

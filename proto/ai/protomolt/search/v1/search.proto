@@ -4804,6 +4804,10 @@ message FetchValuesRequest {
   // mutation, compaction or a new shard lifetime refuses before reading values.
   uint64 expected_stats_epoch = 5;
   bytes expected_stats_incarnation = 6;
+  // Resolve imported identities under this same view and version, including
+  // explicit absence for live vector-only rows. Limited to 1,000,000 input IDs
+  // and 32 MiB of encoded identity records per node and combined at the root.
+  bool include_identities = 7;
 }
 
 // One candidate's evaluated values.
@@ -4815,6 +4819,12 @@ message FetchedRow {
   // Aligned with the request's stages: the identity-score
   // contribution as a double, or absent.
   repeated ProjectedValue stage_values = 3;
+}
+
+// An evaluated identity, including explicit absence for a legacy/vector-only row.
+message CandidateIdentity {
+  uint64 doc_id = 1;
+  DocumentIdentity identity = 2;
 }
 
 // The candidates this shard owns, doc id ascending.
@@ -4840,6 +4850,12 @@ message FetchValuesResponse {
   repeated bool visibility_columns_known = 6;
   uint64 stats_epoch = 7;
   bytes stats_incarnation = 8;
+  // Echoes include_identities even for an empty shard. A coordinator must refuse
+  // an omitted certificate when requested, including through every relay.
+  bool identities_included = 9;
+  // One per owned live visible requested row, including rows without column
+  // tables. Bound to the response view/version; independent of projected rows.
+  repeated CandidateIdentity identities = 10;
 }
 
 // Candidate-scoped vector scoring (see NodeService.VectorRescore).
