@@ -6,7 +6,7 @@ shard-side Boolean evaluation. The public package remains
 `ai.protomolt.search.v1`. This note describes the reconciliation; it is not a
 fleet deployment record or a claim that the foundations project is complete.
 
-The field-authorization integration incorporates main `3103fe1`, including
+The field-authorization integration incorporates main `5ded652`, including
 spill staging, relay fetches/folds, the bulk-analysis end-of-stream fix,
 segment-backed re-placement replay, source-id localization, bounded child
 builds, the refreshed lockfiles and the CI toolchain/protobuf prerequisites.
@@ -176,7 +176,15 @@ The dependency audit retained its existing allowed maintenance warnings.
 
 Descriptor comparisons against main `3103fe1` and checkpoint `eb68322` preserve
 all existing declarations. The 344-file source/build/test/script/lock manifest
-was unchanged through the final run. The earlier validation run on the old
+was unchanged through the full run. The earlier validation run on the old
 locks was stopped when the refresh landed, and the library and integration
 suites were restarted on the new locks. These results are local validation;
 hosted CI and fleet deployment are separate outcomes.
+
+The last remote check found main `5ded652`, which changes only the replica
+bootstrap regression: its concurrent writer stops after the replica installs,
+leaving a finite catch-up backlog. That commit was merged and the changed test
+passed again; formatting, descriptor compatibility and whitespace checks also
+passed. Source-manifest comparison confirmed that this test was the only change
+to the validated source/build/dependency files. Production code and lockfiles
+remain exactly those from the full run.

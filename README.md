@@ -1226,7 +1226,8 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   integration preserves main's segment replay and bounded split builds while
   adding scoped query admission, read receipts, dense evidence disclosure and
   structured restricted errors. It also incorporates the refreshed lockfiles
-  and CI prerequisites through `3103fe1`. See the current integration validation
+  and CI prerequisites, plus the replica-bootstrap test fix through `5ded652`.
+  See the current integration validation
   in [Main reconciliation](docs/main-reconciliation-2026-09.md).
 - **2026-09-06 — Restricted search error disclosure.** Collection-boundary errors
   with field or document restrictions carry safe messages and a protobuf
