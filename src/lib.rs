@@ -46,6 +46,7 @@ pub mod document_catalog;
 pub mod embedded;
 pub mod exact_vectors;
 pub mod explain;
+mod field_permissions;
 pub mod filter;
 pub mod fusion;
 pub mod geo;

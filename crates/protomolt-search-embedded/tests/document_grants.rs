@@ -44,13 +44,20 @@ fn authorized_mobile_facade_preserves_private_shard_ownership() {
             }])
             .unwrap()
             .with_policy(AccessPolicy {
-                format_version: 2,
+                format_version: 3,
                 revision: 1,
                 resources: vec![CollectionResource {
                     workspace: "phone".into(),
                     collection: "".into(),
                 }],
                 grants: vec![CollectionGrant {
+                    field_permissions: Some(FieldPermissions {
+                        grants: vec![FieldGrant {
+                            field: "body".into(),
+                            actions: vec![FieldAction::Use as i32, FieldAction::Disclose as i32],
+                        }],
+                        disclose_document_identity: false,
+                    }),
                     principal: "reader".into(),
                     workspace: "phone".into(),
                     collection: "".into(),
@@ -107,6 +114,22 @@ fn authorized_mobile_facade_preserves_private_shard_ownership() {
                 assert_eq!(response.dictionary_terms_with_prefix, count as u64);
                 assert!(!response.df_includes_tombstoned_rows);
             }
+            let mut forbidden = Request::new(SuggestRequest {
+                field: "audience".into(),
+                prefix: "pu".into(),
+                analysis: Some(body_spec()),
+                ..Default::default()
+            });
+            forbidden
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            assert_eq!(
+                SearchService::suggest(&facade, forbidden)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
             assert!(!runtime.allows_network());
         });
 }

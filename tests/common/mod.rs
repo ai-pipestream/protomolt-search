@@ -134,6 +134,7 @@ pub fn access_policy(
             .iter()
             .flat_map(|p| {
                 collections.iter().map(move |c| CollectionGrant {
+                    field_permissions: None,
                     document_visibility: None,
                     principal: (*p).into(),
                     workspace: "test".into(),

@@ -34,6 +34,7 @@ fn policy() -> AccessPolicy {
         ]
         .into_iter()
         .map(|(principal, action)| CollectionGrant {
+            field_permissions: None,
             document_visibility: None,
             principal: principal.into(),
             workspace: "workspace-a".into(),
@@ -121,7 +122,7 @@ fn grants_are_exact_and_actions_do_not_imply_each_other() {
 #[test]
 fn invalid_policy_cannot_replace_the_current_revision() {
     let authority = PolicyAuthority::new(policy()).unwrap();
-    for format_version in [0, 3, u32::MAX] {
+    for format_version in [0, 4, u32::MAX] {
         let mut unsupported = policy();
         unsupported.format_version = format_version;
         assert!(PolicyAuthority::new(unsupported).is_err());

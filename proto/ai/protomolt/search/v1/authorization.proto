@@ -18,27 +18,57 @@ message CollectionResource {
   string collection = 2;
 }
 
+// Operations on an exact indexed field name. No action implies another.
+enum FieldAction {
+  FIELD_ACTION_UNSPECIFIED = 0;
+  // Read in selection, ranking, filters, expressions, aggregates or dictionaries.
+  // Matches and scores may reveal information about a field granted for use.
+  FIELD_ACTION_USE = 1;
+  // Disclose content, values, offsets, explanations or dictionary entries.
+  FIELD_ACTION_DISCLOSE = 2;
+}
+
+message FieldGrant {
+  // Exact engine field/column name, including its indexed aliases. No wildcard
+  // or parent-path inheritance. A map grant covers every key in that column.
+  string field = 1;
+  repeated FieldAction actions = 2;
+}
+
+message FieldPermissions {
+  // Complete allowlist. Empty denies every field operation. Only SEARCH is
+  // narrowed; explicitly granted ingestion and administration remain independent.
+  repeated FieldGrant grants = 1;
+  // Raw document keys may contain source data. Independent from indexed fields;
+  // false omits DocumentIdentity from hits, with explicit response redaction.
+  bool disclose_document_identity = 2;
+}
+
 // An exact grant; no implicit wildcard, role expansion or inheritance.
 message CollectionGrant {
   string principal = 1;
   string workspace = 2;
   string collection = 3;
   repeated AccessAction actions = 4;
-  // Optional mandatory view for SEARCH only; requires policy format 2.
+  // Optional mandatory view for SEARCH only; requires policy format 2 or 3.
   // Other actions remain independent and are not narrowed by this predicate.
   // Absent means unrestricted documents. Present must contain a valid filter.
   DocumentVisibility document_visibility = 5;
+  // Optional SEARCH field allowlist; requires policy format 3. Absent is
+  // unrestricted. Present empty denies all fields, never unrestricted access.
+  FieldPermissions field_permissions = 6;
 }
 
 // A complete policy snapshot supplied by the workspace authority. Revision must
 // increase on replacement. Empty grants deny every authenticated principal.
-// Document and field policies are separate contracts, not implied by this grant.
+// Document and field restrictions are explicit; actions alone do not imply them.
 message AccessPolicy {
   uint64 revision = 1;
   repeated CollectionResource resources = 2;
   repeated CollectionGrant grants = 3;
   // Required: 1 for collection actions, 2 for mandatory document visibility.
-  // Format 1 refuses any document_visibility. Future restrictions require a
+  // Format 3 adds field permissions. Formats 1/2 refuse field_permissions.
+  // Format 1 also refuses document_visibility. Future restrictions require a
   // new version so older readers reject rather than ignore them.
   uint32 format_version = 4;
 }
@@ -54,4 +84,5 @@ message AccessDecision {
   // Authority-supplied mandatory view. Private operation context, never taken
   // from public client metadata. Consumers must enforce it or refuse the route.
   DocumentVisibility document_visibility = 6;
+  FieldPermissions field_permissions = 7;
 }

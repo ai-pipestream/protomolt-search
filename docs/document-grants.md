@@ -5,11 +5,12 @@ public collection authority. Certified execution covers `Bm25Search`, `Suggest`
 and `TermSuggest` over private in-process shards. BM25 includes prefix expansion,
 flat and fused fields, the internal streaming scorer, facets, supported
 projections, snippets and score explains. Other retrieval routes, network-node
-delegation, field grants and RAG disclosure remain required work.
+delegation and RAG disclosure remain required work. [Field grants](field-grants.md)
+now apply to these same private-shard routes.
 
 ## Protobuf authority contract
 
-`AccessPolicy.format_version = 2` permits
+`AccessPolicy.format_version = 2` or `3` permits
 `CollectionGrant.document_visibility`, a `DocumentVisibility` containing one
 required, validated `FilterExpr`. Format 1 refuses this field. Absent visibility
 retains unrestricted document access; a present but empty message is invalid.
@@ -40,8 +41,8 @@ authorizer decisions and compares the complete decision again before disclosure.
 A changed view invalidates the operation, even if a faulty provider neglected to
 advance its revision. Principals and workspace ownership still come from the
 configured authority. Public request metadata cannot supply or replace a view.
-Future field restrictions require another policy format version; they must never
-be encoded as silently ignored additions to format 2.
+Policy format 3 adds [field restrictions](field-grants.md); format 2 refuses
+them instead of silently ignoring their restrictions.
 
 ## Enforcement
 
@@ -92,7 +93,9 @@ The command-line TOML adapter does not yet configure document predicates.
 
 Before enabling additional routes, carry visibility into every candidate and
 fetch boundary, source expansion, aggregations and RAG
-context. Field-use and field-disclosure grants also remain open. Query cursors
+context. Field-use and field-disclosure grants apply on the supported
+private-shard routes; the additional routes still need their enforcement. Query
+cursors
 must bind the visibility identity without serializing the private predicate to
 callers; the current restricted Query refusal precedes cursor construction.
 

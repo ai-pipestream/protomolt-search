@@ -80,7 +80,8 @@ wire bytes and hashes independently of the generated encoder.
 
 Private-shard BM25, prefix expansion and suggestion paths now consume
 authority-issued document grants.
-Field grants and the remaining query paths still need mandatory visibility in
+[Field grants](field-grants.md) now cover the supported private-shard routes.
+The remaining query paths still need mandatory visibility in
 selection, rescoring, facets, source/projection fetch
 and eventual RAG context.
 Field-use and field-disclosure checks must precede cache lookup. Public requests

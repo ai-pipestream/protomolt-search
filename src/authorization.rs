@@ -28,13 +28,14 @@ struct Policy {
     resources: BTreeMap<String, String>,
     grants: BTreeMap<(String, String), BTreeSet<i32>>,
     views: BTreeMap<(String, String), crate::pb::DocumentVisibility>,
+    fields: BTreeMap<(String, String), crate::pb::FieldPermissions>,
 }
 
 impl Policy {
     fn validate(input: AccessPolicy) -> Result<Self, String> {
-        if !matches!(input.format_version, 1 | 2) {
+        if !matches!(input.format_version, 1 | 2 | 3) {
             return Err(format!(
-                "unsupported access policy format_version {}; expected 1 or 2",
+                "unsupported access policy format_version {}; expected 1, 2 or 3",
                 input.format_version
             ));
         }
@@ -59,6 +60,7 @@ impl Policy {
         }
         let mut grants = BTreeMap::new();
         let mut views = BTreeMap::new();
+        let mut fields = BTreeMap::new();
         for grant in input.grants {
             if grant.principal.is_empty() {
                 return Err("access grant principal must be nonempty".into());
@@ -80,7 +82,7 @@ impl Policy {
                 }
             }
             if let Some(view) = grant.document_visibility {
-                if input.format_version != 2 {
+                if input.format_version < 2 {
                     return Err("document visibility requires access policy format 2".into());
                 }
                 if !actions.contains(&(AccessAction::Search as i32)) {
@@ -89,6 +91,19 @@ impl Policy {
                 crate::visibility::VisibilityScope::new(Some(&view))
                     .map_err(|error| format!("invalid document grant: {}", error.message()))?;
                 views.insert((grant.principal.clone(), grant.collection.clone()), view);
+            }
+            if let Some(permissions) = grant.field_permissions {
+                if input.format_version != 3 {
+                    return Err("field permissions require access policy format 3".into());
+                }
+                if !actions.contains(&(AccessAction::Search as i32)) {
+                    return Err("field permissions require an explicit search action".into());
+                }
+                crate::field_permissions::FieldScope::new(&permissions)?;
+                fields.insert(
+                    (grant.principal.clone(), grant.collection.clone()),
+                    permissions,
+                );
             }
             if grants
                 .insert((grant.principal, grant.collection), actions)
@@ -102,6 +117,7 @@ impl Policy {
             resources,
             grants,
             views,
+            fields,
         })
     }
 }
@@ -162,6 +178,14 @@ impl Authorizer for PolicyAuthority {
             collection: collection.into(),
             workspace: policy.resources[collection].clone(),
             action: action as i32,
+            field_permissions: if action == AccessAction::Search {
+                policy
+                    .fields
+                    .get(&(principal.to_owned(), collection.to_owned()))
+                    .cloned()
+            } else {
+                None
+            },
             document_visibility: if action == AccessAction::Search {
                 policy
                     .views
@@ -211,6 +235,15 @@ impl AccessPermit {
             }
             crate::visibility::VisibilityScope::new(decision.document_visibility.as_ref())
                 .map_err(|_| Status::permission_denied("invalid document visibility decision"))?;
+        }
+        if let Some(fields) = &decision.field_permissions {
+            if action != AccessAction::Search {
+                return Err(Status::permission_denied(
+                    "field permissions require a search decision",
+                ));
+            }
+            crate::field_permissions::FieldScope::new(fields)
+                .map_err(|_| Status::permission_denied("invalid field permission decision"))?;
         }
         let permit = Self {
             authority,

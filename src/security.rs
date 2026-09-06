@@ -445,6 +445,7 @@ impl PolicyConfig {
                 });
             }
             grants.push(crate::pb::CollectionGrant {
+                field_permissions: None,
                 document_visibility: None,
                 principal: grant.principal,
                 workspace: grant.workspace,

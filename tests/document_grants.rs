@@ -36,6 +36,7 @@ fn policy() -> AccessPolicy {
         grants: ["public", "private", "owner"]
             .into_iter()
             .map(|name| CollectionGrant {
+                field_permissions: None,
                 principal: name.into(),
                 workspace: "work".into(),
                 collection: "".into(),
@@ -301,6 +302,7 @@ async fn caller_filters_and_context_cannot_replace_the_grant() {
     q.filter = "audience == 'public' || audience == 'private'".into();
     let mut input = request(q.clone(), "public");
     input.extensions_mut().insert(AccessDecision {
+        field_permissions: None,
         principal: "owner".into(),
         ..Default::default()
     });

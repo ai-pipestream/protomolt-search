@@ -4057,6 +4057,10 @@ message Bm25SearchResponse {
   // because they describe storage that may contain unauthorized documents.
   // When true, segments_total and segments_skipped are zero, not measurements.
   bool execution_details_redacted = 12;
+  // True when automatic occurrences, synonym details or raw document identity
+  // were omitted by field permissions. Explicitly unauthorized projections,
+  // facets, snippets, explanations or dictionary requests refuse instead.
+  bool field_details_redacted = 13;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.

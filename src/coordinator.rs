@@ -410,6 +410,7 @@ pub struct CoordinatorServiceImpl {
     /// enforce the epoch claim on every scoring request built from it.
     stats_cache: Arc<crate::stats_cache::StatsCache>,
     document_visibility: Option<crate::pb::DocumentVisibility>,
+    field_permissions: Option<crate::field_permissions::FieldScope>,
     /// Optional distributed vector collection. The product coordinator calls
     /// it once as one provider; it never learns or re-fans its shard topology.
     #[cfg(feature = "net")]
@@ -1815,6 +1816,7 @@ impl CoordinatorServiceImpl {
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
             document_visibility: None,
+            field_permissions: None,
             #[cfg(feature = "net")]
             clustered_vectors: None,
             dense_quality_profile: None,
@@ -1863,18 +1865,24 @@ impl CoordinatorServiceImpl {
         route: &str,
     ) -> Result<Self, Status> {
         let mut scoped = self.clone();
-        let Some(view) = access.and_then(|a| a.document_visibility.as_ref()) else {
+        let view = access.and_then(|a| a.document_visibility.as_ref());
+        let fields = access.and_then(|a| a.field_permissions.as_ref());
+        if view.is_none() && fields.is_none() {
             return Ok(scoped);
-        };
-        crate::visibility::VisibilityScope::new(Some(view))?;
+        }
+        crate::visibility::VisibilityScope::new(view)?;
+        scoped.field_permissions = fields
+            .map(crate::field_permissions::FieldScope::new)
+            .transpose()
+            .map_err(|_| Status::permission_denied("invalid field permission decision"))?;
         if access.is_none_or(|a| a.action != crate::pb::AccessAction::Search as i32) {
             return Err(Status::permission_denied(
-                "document grants require search authorization",
+                "restricted grants require search authorization",
             ));
         }
         if !matches!(route, "bm25_search" | "suggest" | "term_suggest") {
             return Err(Status::permission_denied(
-                "this route does not yet enforce document grants",
+                "this route does not yet enforce document or field grants",
             ));
         }
         if self.allow_network
@@ -1888,10 +1896,10 @@ impl CoordinatorServiceImpl {
                 .any(|link| !link.is_local())
         {
             return Err(Status::failed_precondition(
-                "document grants currently require private in-process shards",
+                "restricted grants currently require private in-process shards",
             ));
         }
-        scoped.document_visibility = Some(view.clone());
+        scoped.document_visibility = view.cloned();
         Ok(scoped)
     }
 
@@ -4325,6 +4333,12 @@ impl CoordinatorServiceImpl {
         for (fi, f) in fields.iter().enumerate() {
             if let Some((sequence, 0)) = phrase_requests[fi].as_ref().map(|(s, slop)| (s, *slop)) {
                 if sequence.len() == 2 {
+                    let column = crate::proximity::bigram_field_name(&f.field);
+                    if self.field_permissions.as_ref().is_some_and(|fields| {
+                        !fields.can_use(&column) || (explain && !fields.can_disclose(&column))
+                    }) {
+                        continue;
+                    }
                     let bigram = crate::proximity::bigram_term(
                         &field_terms[fi][sequence[0]],
                         &field_terms[fi][sequence[1]],
@@ -11221,10 +11235,14 @@ impl SearchService for CoordinatorServiceImpl {
             // CEL text compiles ONCE, here, into the predicate IR the
             // shards execute (docs/cel-filters.md): every shard sees the
             // same tree, and none ever sees CEL text.
-            let filter = self.visible_filter(crate::cel::compile_filter(&req.filter)?)?;
+            let user_filter = crate::cel::compile_filter(&req.filter)?;
             // Projection text compiles ONCE, here, into the ValueExpr IR
             // the shards resolve and evaluate (docs/cel-values.md).
             let projections = compile_projections(&req.projections)?;
+            if let Some(fields) = &self.field_permissions {
+                fields.bm25(&req, user_filter.as_ref(), &projections)?;
+            }
+            let filter = self.visible_filter(user_filter)?;
             let mut phrase_routing = Vec::new();
             let mut prefix_expansions = Vec::new();
             let mut synonym_expansions = Vec::new();
@@ -11381,7 +11399,8 @@ impl SearchService for CoordinatorServiceImpl {
             } else {
                 0.0
             };
-            Ok(Response::new(Bm25SearchResponse {
+            let mut response = Bm25SearchResponse {
+                field_details_redacted: false,
                 execution_details_redacted: self.document_visibility.is_some(),
                 segments_total: if self.document_visibility.is_some() {
                     0
@@ -11402,7 +11421,11 @@ impl SearchService for CoordinatorServiceImpl {
                 phrase_routing,
                 prefix_expansions,
                 synonym_expansions,
-            }))
+            };
+            if let Some(fields) = &self.field_permissions {
+                fields.disclose(&mut response)?;
+            }
+            Ok(Response::new(response))
         })
         .await
     }
@@ -11459,6 +11482,7 @@ impl SearchService for CoordinatorServiceImpl {
         };
         Ok(Response::new(Bm25SearchResponse {
             execution_details_redacted: false,
+            field_details_redacted: false,
             segments_total: 0,
             segments_skipped: 0,
             hits,
@@ -12291,6 +12315,9 @@ impl SearchService for CoordinatorServiceImpl {
                 return Box::pin(SearchService::suggest(&snapshot, request)).await;
             }
             let req = request.into_inner();
+            if let Some(fields) = &self.field_permissions {
+                fields.suggest(&req)?;
+            }
             let limit = match req.limit as usize {
                 0 => DEFAULT_SUGGEST_LIMIT,
                 n if n > MAX_SUGGEST_LIMIT => {
@@ -12413,6 +12440,9 @@ impl SearchService for CoordinatorServiceImpl {
                 return Box::pin(SearchService::term_suggest(&snapshot, request)).await;
             }
             let req = request.into_inner();
+            if let Some(fields) = &self.field_permissions {
+                fields.term_suggest(&req)?;
+            }
             let max_edits = match req.max_edits {
                 0 => 1usize,
                 n if n > MAX_TERM_SUGGEST_EDITS => {

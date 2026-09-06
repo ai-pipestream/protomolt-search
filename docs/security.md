@@ -110,8 +110,9 @@ The product-owned `authorization.proto` defines `AccessPolicy`, workspace-bound
 above is a configuration adapter for that protobuf contract. Credentials supply
 identity; they grant no capability by themselves. Empty grants deny access.
 `format_version` is 1 for collection capabilities, or 2 for mandatory document
-visibility. Format 1 refuses a document predicate. Future restrictions require a
-new version so older readers reject rather than drop them. The document-grant
+visibility, or 3 for [field permissions](field-grants.md). Format 1 refuses a
+document predicate; formats 1/2 refuse field permissions. Future restrictions
+require a new version so older readers reject rather than drop them. The document-grant
 execution and deployment boundaries are in [document grants](document-grants.md).
 Unknown actions, duplicate resources or grants, and grants whose workspace does
 not own the collection are configuration errors. Configuration typos refuse.
@@ -146,7 +147,8 @@ admitted mutations are not rolled back by revocation or a later stream error.
 Authorization precedes coordinator cache lookup. Revoked callers cannot retrieve
 a previous cached response through the public service. Mandatory document views
 use separate statistics entries on the certified private-shard BM25 path.
-Dictionary routes apply the view before counting terms. Field policies, broader
+Dictionary routes apply the view before counting terms. Format-3 field checks
+precede cache access and guard disclosure on these private-shard routes. Broader
 retrieval and network-node delegation remain unfinished;
 unsupported restricted routes refuse.
 
@@ -161,9 +163,9 @@ only the exact datasets/actions required. `mkcerts.sh` generates a policy for th
 fleet tools' unnamed dataset when creating a new file; it does not overwrite an
 existing file. This increment does not alter the separate node mTLS or cluster
 control membership rules. Document authorization is currently limited to the
-private-shard BM25 and dictionary paths. Field authorization and applying
-delegated policy on direct node calls remain unfinished; restricted network-backed
-collections refuse.
+private-shard BM25 and dictionary paths, where field permissions also apply.
+Applying delegated policy on direct node calls remains unfinished; restricted
+network-backed collections refuse.
 The console (`docs/console-facade.md`) is the one client that holds the
 cluster credentials on a browser's behalf: it binds to loopback unless
 told otherwise, and whoever reaches it acts as its principal.

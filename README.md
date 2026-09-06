@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Private-shard field grants (2026-09-06, feature branch).** Policy format 3
+  separates using a field from disclosing its values. BM25, autocomplete and
+  did-you-mean check field inputs before execution, redact automatic details
+  explicitly, and validate current authority before returning results. Raw
+  document keys have an independent disclosure flag. See [field grants](docs/field-grants.md).
+
 - **Document-scoped dictionaries (2026-09-06, feature branch).** Autocomplete,
   did-you-mean and BM25 prefix expansion use only live authorized documents.
   Hidden vocabulary does not consume visible expansion limits; nodes echo the

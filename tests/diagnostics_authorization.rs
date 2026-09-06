@@ -24,6 +24,7 @@ fn policy(revision: u64, collections: &[&str]) -> AccessPolicy {
         grants: collections
             .iter()
             .map(|name| CollectionGrant {
+                field_permissions: None,
                 document_visibility: None,
                 principal: "operator".into(),
                 workspace: format!("workspace-{name}"),

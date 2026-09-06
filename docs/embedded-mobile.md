@@ -42,8 +42,9 @@ with the public workspace/collection authority. The mobile package re-exports
 the principal and authority types. Keep the runtime's owner methods and raw
 `search_service()` handle private; they intentionally carry owner access.
 Policy format 2 can restrict `Bm25Search`, including prefix expansion, `Suggest`
-and `TermSuggest` to a mandatory document view. Other restricted routes refuse. Field grants and
-collaborative network delegation remain unfinished. See
+and `TermSuggest` to a mandatory document view. Other restricted routes refuse.
+Policy format 3 adds [field grants](field-grants.md) on those same private-shard
+routes. Collaborative network delegation remains unfinished. See
 [document grants](document-grants.md) for the exact supported boundary.
 
 ## Contract

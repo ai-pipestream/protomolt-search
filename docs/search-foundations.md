@@ -14,7 +14,7 @@ establish completion of the three workstreams.
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing sources survive image/WAL lifecycle byte-for-byte; the catalog retains zero-row sources across restart; catalog backup and publication remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public search and coordinator diagnostics enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
-| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Document grants enforce private-shard BM25 selection, statistics, caches, suggestions and prefix expansion; other restricted routes/network deployments refuse; field grants remain unimplemented |
+| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Document grants enforce private-shard BM25 selection, statistics, caches, suggestions and prefix expansion; field use/disclosure grants cover these routes; broader query and network enforcement remains |
 | Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and lexical results; catalog publication and the other result routes remain |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
 | Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Local source acceptance has durable/volatile receipts and abrupt-process-exit coverage; searchable publication remains |
@@ -846,3 +846,26 @@ compilation, formatting and vendored-proto checks passed. Descriptor comparison
 against `2e30bdf` confirms exactly six additive dictionary visibility fields;
 existing declarations are unchanged. These are local checks, with no fleet or
 device-runtime validation. No stored index or WAL format changes were introduced.
+
+
+## Private-shard field grant checkpoint (2026-09-06)
+
+Policy format 3 adds exact indexed-field grants for query use and disclosure,
+plus independent raw document-key disclosure. Private BM25 and dictionary routes
+check field dependencies before statistics or fan-out. Automatic details can be
+withheld with an explicit response flag; unauthorized explicit detail requests
+refuse. Phrase planning does not implicitly grant a body's auxiliary bigram
+column. See [field grants](field-grants.md) for semantics and coverage.
+
+The complete goal remains open: broader queries and node delegation, remaining
+protobuf shapes and indexing definitions, and durable source-to-search publication
+with stable identity still require implementation and validation.
+
+Validation: 454 library tests, 610 integration tests across 107 targets, and
+12 embedded tests passed (1,076 total); one existing live-sidecar conformance
+test remains ignored. All five Android/iOS Rust target checks, tests/examples
+compilation, formatting and vendored-proto checks passed. Descriptor comparison
+against `7e9496b` confirms exactly three additive fields, two field-policy
+messages and one action enum; existing declarations are unchanged. These are
+local checks, with no fleet deployment or device-runtime validation. Stored
+index and WAL formats are unchanged.
