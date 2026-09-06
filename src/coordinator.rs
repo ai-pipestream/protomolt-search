@@ -8697,7 +8697,10 @@ impl CoordinatorServiceImpl {
         let mut spine_offsets: Vec<(usize, usize, usize)> = Vec::new();
         let mut offset = 0usize;
         for &leaf in &plan.root_must_filters {
-            let Some(tree) = plan.filters.get(leaf).and_then(|f| f.as_ref()?.tree.as_ref())
+            let Some(tree) = plan
+                .filters
+                .get(leaf)
+                .and_then(|f| f.as_ref()?.tree.as_ref())
             else {
                 continue;
             };
@@ -8756,7 +8759,7 @@ impl CoordinatorServiceImpl {
         // shard's placement implies.
         let mut shard_requests: Vec<Option<crate::pb::BooleanShardRequest>> =
             Vec::with_capacity(self.node_addrs.len());
-        for shard in 0..self.node_addrs.len() {
+        for (shard, claim) in claims.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 shard_requests.push(None);
                 continue;
@@ -8784,7 +8787,7 @@ impl CoordinatorServiceImpl {
                 root: Some(plan.root.clone()),
                 leaves,
                 depth: plan.depth,
-                expected_stats_epoch: claims[shard],
+                expected_stats_epoch: *claim,
                 max_logical_bytes: self.max_rerank_bytes,
                 exact_batch: self.signal_batch() as u32,
                 aggregate: plan.aggregate.as_ref().map(|(spec, _)| spec.clone()),

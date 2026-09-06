@@ -1556,19 +1556,20 @@ pub fn merge_boolean_responses(
         segments_total = segments_total.saturating_add(share.segments_total);
         segments_skipped = segments_skipped.saturating_add(share.segments_skipped);
         for (index, known) in share.filters_known.iter().enumerate() {
-            join_flags(
-                &mut filters_known[index],
-                known,
-                |acc, k| {
-                    or_flags(&mut acc.geo_columns_known, &k.geo_columns_known, shard, "geo")?;
-                    or_flags(
-                        &mut acc.filter_columns_known,
-                        &k.filter_columns_known,
-                        shard,
-                        "filter-leaf",
-                    )
-                },
-            )?;
+            join_flags(&mut filters_known[index], known, |acc, k| {
+                or_flags(
+                    &mut acc.geo_columns_known,
+                    &k.geo_columns_known,
+                    shard,
+                    "geo",
+                )?;
+                or_flags(
+                    &mut acc.filter_columns_known,
+                    &k.filter_columns_known,
+                    shard,
+                    "filter-leaf",
+                )
+            })?;
         }
         for (index, known) in share.stages_known.iter().enumerate() {
             join_flags(&mut stages_known[index], known, |acc, k| {

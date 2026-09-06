@@ -17,9 +17,9 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     aggregate_result, selection_query, AddDocumentsRequest, AddVectorsRequest, AggregateOp,
     AggregateRequest, Aggregation, BooleanQuery, BoostQuery, CompositeSearchStrategy, DenseQuery,
-    FacetValue, FilterQuery, FlushRequest, HistogramSpec, IntegerValue, LexicalQuery,
-    NumericValue, PercentileSpec, QueryHit, QueryRequest, QueryResponse, SearchQuery,
-    SelectionOperator, SelectionQuery, SetCalibrationRequest,
+    FacetValue, FilterQuery, FlushRequest, HistogramSpec, IntegerValue, LexicalQuery, NumericValue,
+    PercentileSpec, QueryHit, QueryRequest, QueryResponse, SearchQuery, SelectionOperator,
+    SelectionQuery, SetCalibrationRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -310,7 +310,10 @@ async fn a_filter_and_a_search_equal_the_and_composite_without_a_bitmap_route() 
     .await;
     let ordinary = query(
         c,
-        request(and(vec![cel("f", "year >= 2010"), lexical("l", "zebra")]), 50),
+        request(
+            and(vec![cel("f", "year >= 2010"), lexical("l", "zebra")]),
+            50,
+        ),
     )
     .await;
     assert_eq!(planned.hits.len(), 50);
@@ -343,7 +346,7 @@ async fn a_filter_and_a_search_equal_the_and_composite_without_a_bitmap_route() 
     .await;
     assert_eq!(planned.hits.len(), 50);
     assert_eq!(bits(&planned.hits), bits(&ordinary.hits), "dense");
-    assert!(planned.hits.iter().all(|h| ids(&[h.clone()])[0] % 25 >= 10));
+    assert!(planned.hits.iter().all(|h| h.doc_id % 25 >= 10));
     // The profile counts the segments each leaf consulted, the filter
     // and the dense leaf apart: the filter rules out the years below
     // 2010 on no segment (every segment holds every year).
@@ -409,7 +412,11 @@ async fn the_group_rule_holds_across_shards() {
         request(
             boolean(
                 vec![],
-                vec![lexical("a", "zebra"), lexical("b", "quagga"), dense("v", 11)],
+                vec![
+                    lexical("a", "zebra"),
+                    lexical("b", "quagga"),
+                    dense("v", 11),
+                ],
                 vec![cel("n", "year == 2005")],
                 2,
                 None,
@@ -519,11 +526,7 @@ async fn a_boost_reorders_the_selection_pool_named_by_selection_k() {
     )
     .await
     .unwrap_err();
-    assert!(
-        err.message().contains("selection_k"),
-        "{}",
-        err.message()
-    );
+    assert!(err.message().contains("selection_k"), "{}", err.message());
     let err = SearchService::query(
         c,
         Request::new(QueryRequest {
@@ -533,11 +536,7 @@ async fn a_boost_reorders_the_selection_pool_named_by_selection_k() {
     )
     .await
     .unwrap_err();
-    assert!(
-        err.message().contains("selection_k"),
-        "{}",
-        err.message()
-    );
+    assert!(err.message().contains("selection_k"), "{}", err.message());
     fleet.stop();
 }
 
@@ -560,7 +559,6 @@ fn aggregate_spec() -> AggregateRequest {
             name: "pages_pct".into(),
             expression: "pages".into(),
             percentiles: vec![50.0, 90.0],
-            ..Default::default()
         }],
         ..Default::default()
     }

@@ -1669,6 +1669,55 @@ async fn filtered_and_boolean_queries_through_relays_equal_the_flat_fanout() {
     }
 }
 
+/// A root aggregate on a boolean tree folds on the shards in the root's
+/// shard order; a relay does not compose that fold and says so by name,
+/// while the flat fleet serves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_boolean_aggregate_through_a_relay_refuses_by_name() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let with_bm25 = |addrs: Vec<String>| {
+        CoordinatorServiceImpl::new(addrs)
+            .with_bm25(Some(leaves.analysis.clone()), Default::default())
+            .with_stream_search(true)
+    };
+    let aggregate = pipestream_search::pb::AggregateRequest {
+        aggregations: vec![pipestream_search::pb::Aggregation {
+            name: "n".into(),
+            expression: "1".into(),
+            op: pipestream_search::pb::AggregateOp::Count as i32,
+            max_distinct: 0,
+        }],
+        ..Default::default()
+    };
+    let selection = SelectionQuery {
+        node: Some(selection_query::Node::Boolean(
+            pipestream_search::pb::BooleanQuery {
+                must: vec![
+                    lexical_clause("lex", "court"),
+                    cel_clause("f", r#"court == "scotus""#),
+                ],
+                should: Vec::new(),
+                must_not: Vec::new(),
+                minimum_should_match: 0,
+                aggregate: Some(aggregate),
+            },
+        )),
+    };
+    let flat = with_bm25(l.clone());
+    let want = run_query(&flat, selection.clone()).await.expect("flat");
+    assert!(!want.is_empty());
+    let a = relay_over(&[&l[0], &l[1]]).await;
+    let relayed = with_bm25(vec![a, l[2].clone(), l[3].clone()]);
+    let err = run_query(&relayed, selection).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unimplemented, "{}", err.message());
+    assert!(
+        err.message().contains("relay") && err.message().contains("aggregate"),
+        "{}",
+        err.message()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bitmaps_through_a_relay_lie_over_the_children_and_refuse_a_gap() {
     let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;

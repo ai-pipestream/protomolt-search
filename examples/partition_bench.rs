@@ -326,6 +326,15 @@ fn cases(queries: Vec<Vec<f32>>) -> Vec<Case> {
         build: Box::new(move |i| request(boolean(vec![lexical(COMMON), dq(i)]))),
     });
     out.push(Case {
+        label: "boolean MUST(common term, year >= 2010)",
+        build: Box::new(move |_| request(boolean(vec![lexical(COMMON), cel("year >= 2010")]))),
+    });
+    let dq = dense_q.clone();
+    out.push(Case {
+        label: "boolean MUST(dense, year >= 2010)",
+        build: Box::new(move |i| request(boolean(vec![dq(i), cel("year >= 2010")]))),
+    });
+    out.push(Case {
         label: "browse year >= 2018, sorted by year",
         build: Box::new(|_| QueryRequest {
             sort: vec![QuerySort {

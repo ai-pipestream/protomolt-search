@@ -10938,14 +10938,16 @@ impl NodeService for NodeServiceImpl {
             // on this shard under the same guard the counts read through.
             let membership = match req.boolean.as_ref() {
                 Some(plan) => {
-                    if req.filter.is_some() || !req.geo_filters.is_empty() || req.restrict_doc_ids
-                    {
+                    if req.filter.is_some() || !req.geo_filters.is_empty() || req.restrict_doc_ids {
                         return Err(Status::invalid_argument(
                             "quantile round: a Boolean membership excludes filters and an id \
                              allowlist",
                         ));
                     }
-                    Some(evaluate_boolean_membership(&guard, plan, self.knobs.segment_pruning())?.members)
+                    Some(
+                        evaluate_boolean_membership(&guard, plan, self.knobs.segment_pruning())?
+                            .members,
+                    )
                 }
                 None => None,
             };
@@ -13871,10 +13873,10 @@ pub(crate) struct EvaluatedBoolean {
     n: usize,
 }
 
-fn boolean_leaf<'a>(
-    req: &'a crate::pb::BooleanShardRequest,
+fn boolean_leaf(
+    req: &crate::pb::BooleanShardRequest,
     index: u32,
-) -> Result<&'a crate::pb::boolean_plan_leaf::Leaf, Status> {
+) -> Result<&crate::pb::boolean_plan_leaf::Leaf, Status> {
     req.leaves
         .get(index as usize)
         .and_then(|leaf| leaf.leaf.as_ref())
@@ -14027,31 +14029,33 @@ pub(crate) fn evaluate_boolean_membership(
                     prune_enabled,
                 )?;
                 prune.add(stats);
-                Membership::Bits(allow.map_or_else(|| Bits::full(n), |allow| Bits::from_bools(&allow)))
+                Membership::Bits(
+                    allow.map_or_else(|| Bits::full(n), |allow| Bits::from_bools(&allow)),
+                )
             }
             Some(L::Lexical(lexical)) => {
                 let mut bits = Bits::empty(n);
                 if !lexical.terms.is_empty() {
                     if let Some(store) = bm25 {
                         let index = store.as_index().ok_or_else(|| {
-                            Status::failed_precondition(
-                                "bm25 bulk build in progress; Flush first",
-                            )
+                            Status::failed_precondition("bm25 bulk build in progress; Flush first")
                         })?;
                         // A sealed segment none of the terms occur in
                         // contributes no member (docs/segment-pruning.md).
                         let (masked, stats) = match store {
                             Bm25Shard::Segmented(segmented) => {
                                 let lacking = segmented.parts_lacking_terms(0, &lexical.terms);
-                                let skipped =
-                                    lacking.iter().filter(|&&lacks| lacks).count() as u32;
+                                let skipped = lacking.iter().filter(|&&lacks| lacks).count() as u32;
                                 let stats = crate::segment_prune::PruneStats {
                                     segments_total: lacking.len() as u32,
                                     segments_skipped: if prune_enabled { skipped } else { 0 },
                                 };
                                 let masked = (prune_enabled && skipped > 0).then(|| {
                                     segmented.masked(
-                                        lacking.iter().map(|&lacks| !lacks).collect::<Arc<[bool]>>(),
+                                        lacking
+                                            .iter()
+                                            .map(|&lacks| !lacks)
+                                            .collect::<Arc<[bool]>>(),
                                     )
                                 });
                                 (masked, stats)
@@ -14107,7 +14111,10 @@ pub(crate) fn evaluate_boolean_membership(
         }
         if let Some(crate::pb::boolean_plan_leaf::Leaf::Dense(dense)) = leaf.leaf.as_ref() {
             let rows = if dense.exact_fp32 {
-                guard.exact_vectors.as_ref().map_or(0, ExactVectorStore::len)
+                guard
+                    .exact_vectors
+                    .as_ref()
+                    .map_or(0, ExactVectorStore::len)
             } else {
                 guard.index.as_ref().map_or(0, VectorIndex::len)
             };
@@ -14168,7 +14175,8 @@ impl TopSlots {
             self.heap.pop();
             self.heap.push(std::cmp::Reverse(entry));
         }
-        (self.heap.len() == self.depth).then(|| self.heap.peek().map_or(f32::NEG_INFINITY, |w| w.0.score))
+        (self.heap.len() == self.depth)
+            .then(|| self.heap.peek().map_or(f32::NEG_INFINITY, |w| w.0.score))
     }
 
     fn into_sorted(self) -> Vec<RankedSlot> {
@@ -14252,379 +14260,372 @@ impl NodeServiceImpl {
         req: crate::pb::AggregateShardRequest,
         membership: Option<&crate::boolean_bits::Bits>,
     ) -> Result<crate::pb::AggregateShardResponse, Status> {
-            if req.aggregations.is_empty()
-                && req.histograms.is_empty()
-                && req.percentiles.is_empty()
-            {
-                return Err(Status::invalid_argument(
-                    "aggregate requires at least one aggregation, histogram, or percentile",
-                ));
+        if req.aggregations.is_empty() && req.histograms.is_empty() && req.percentiles.is_empty() {
+            return Err(Status::invalid_argument(
+                "aggregate requires at least one aggregation, histogram, or percentile",
+            ));
+        }
+        if membership.is_some()
+            && (req.filter.is_some() || !req.geo_filters.is_empty() || req.restrict_doc_ids)
+        {
+            return Err(Status::invalid_argument(
+                "aggregate: a Boolean membership excludes filters and an id allowlist",
+            ));
+        }
+        let grouping = !req.group_by.is_empty();
+        let group_cap = req.max_groups as usize;
+        let geo_regions = validate_geo_filters(&req.geo_filters)?;
+        let (geo_columns_known, filter_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+        // Expression column leaves: aggregations first, then
+        // histograms, request order then depth-first — the projection
+        // typo contract.
+        let mut leaves = Vec::new();
+        for expr in req
+            .aggregations
+            .iter()
+            .filter_map(|a| a.expr.as_ref())
+            .chain(req.histograms.iter().filter_map(|h| h.expr.as_ref()))
+            .chain(req.percentiles.iter().filter_map(|p| p.expr.as_ref()))
+        {
+            crate::values::column_leaves(expr, &mut leaves);
+        }
+        let Some(store) = guard.bm25.as_ref() else {
+            // A document-less shard holds no values and no columns; its
+            // all-absent partials and all-false flags feed the merge
+            // and the typo rule like everywhere.
+            return Ok(crate::pb::AggregateShardResponse {
+                segments_total: 0,
+                segments_skipped: 0,
+                partials: req
+                    .aggregations
+                    .iter()
+                    .map(|_| AggAcc::Absent.partial(None))
+                    .collect(),
+                matched: 0,
+                geo_columns_known,
+                filter_columns_known,
+                expr_leaves_known: vec![false; leaves.len()],
+                groups: Vec::new(),
+                ungrouped: 0,
+                group_column_known: false,
+                histograms: req
+                    .histograms
+                    .iter()
+                    .map(|_| crate::pb::ShardHistogram::default())
+                    .collect(),
+                percentile_partials: req
+                    .percentiles
+                    .iter()
+                    .map(|_| crate::pb::PercentilePartial {
+                        vtype: crate::pb::AggregateValueType::Absent as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+            });
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush before aggregating",
+            ));
+        }
+        let expr_leaves_known: Vec<bool> = leaves
+            .iter()
+            .map(|l| crate::values::leaf_known(l, store))
+            .collect();
+        let group_facet = grouping.then(|| store.facet_index(&req.group_by)).flatten();
+        let group_column_known = group_facet.is_some();
+        // Resolve every expression and admit its op against the
+        // resolved type BEFORE touching any document: a type conflict
+        // refuses the request, it never mis-aggregates.
+        let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType, bool)> =
+            Vec::with_capacity(req.aggregations.len());
+        let mut totals: Vec<AggAcc> = Vec::with_capacity(req.aggregations.len());
+        for agg in &req.aggregations {
+            let op = agg_op_of(agg.op)?;
+            let cardinality = op == crate::pb::AggregateOp::Cardinality;
+            if cardinality && agg.max_distinct == 0 {
+                return Err(Status::internal(format!(
+                    "aggregation {:?} arrived without a distinct cap",
+                    agg.name
+                )));
             }
-            if membership.is_some()
-                && (req.filter.is_some() || !req.geo_filters.is_empty() || req.restrict_doc_ids)
-            {
-                return Err(Status::invalid_argument(
-                    "aggregate: a Boolean membership excludes filters and an id allowlist",
-                ));
-            }
-            let grouping = !req.group_by.is_empty();
-            let group_cap = req.max_groups as usize;
-            let geo_regions = validate_geo_filters(&req.geo_filters)?;
-            let (geo_columns_known, filter_columns_known) =
-                filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
-            // Expression column leaves: aggregations first, then
-            // histograms, request order then depth-first — the projection
-            // typo contract.
-            let mut leaves = Vec::new();
-            for expr in req
-                .aggregations
-                .iter()
-                .filter_map(|a| a.expr.as_ref())
-                .chain(req.histograms.iter().filter_map(|h| h.expr.as_ref()))
-                .chain(req.percentiles.iter().filter_map(|p| p.expr.as_ref()))
-            {
-                crate::values::column_leaves(expr, &mut leaves);
-            }
-            let Some(store) = guard.bm25.as_ref() else {
-                // A document-less shard holds no values and no columns; its
-                // all-absent partials and all-false flags feed the merge
-                // and the typo rule like everywhere.
-                return Ok(crate::pb::AggregateShardResponse {
-                    segments_total: 0,
-                    segments_skipped: 0,
-                    partials: req
-                        .aggregations
-                        .iter()
-                        .map(|_| AggAcc::Absent.partial(None))
-                        .collect(),
-                    matched: 0,
-                    geo_columns_known,
-                    filter_columns_known,
-                    expr_leaves_known: vec![false; leaves.len()],
-                    groups: Vec::new(),
-                    ungrouped: 0,
-                    group_column_known: false,
-                    histograms: req
-                        .histograms
-                        .iter()
-                        .map(|_| crate::pb::ShardHistogram::default())
-                        .collect(),
-                    percentile_partials: req
-                        .percentiles
-                        .iter()
-                        .map(|_| crate::pb::PercentilePartial {
-                            vtype: crate::pb::AggregateValueType::Absent as i32,
-                            ..Default::default()
-                        })
-                        .collect(),
-                });
-            };
-            if store.as_index().is_none() {
-                return Err(Status::failed_precondition(
-                    "bm25 bulk build in progress; Flush before aggregating",
-                ));
-            }
-            let expr_leaves_known: Vec<bool> = leaves
-                .iter()
-                .map(|l| crate::values::leaf_known(l, store))
-                .collect();
-            let group_facet = grouping.then(|| store.facet_index(&req.group_by)).flatten();
-            let group_column_known = group_facet.is_some();
-            // Resolve every expression and admit its op against the
-            // resolved type BEFORE touching any document: a type conflict
-            // refuses the request, it never mis-aggregates.
-            let mut exprs: Vec<(crate::values::ResolvedValue, crate::values::ValueType, bool)> =
-                Vec::with_capacity(req.aggregations.len());
-            let mut totals: Vec<AggAcc> = Vec::with_capacity(req.aggregations.len());
-            for agg in &req.aggregations {
-                let op = agg_op_of(agg.op)?;
-                let cardinality = op == crate::pb::AggregateOp::Cardinality;
-                if cardinality && agg.max_distinct == 0 {
-                    return Err(Status::internal(format!(
-                        "aggregation {:?} arrived without a distinct cap",
-                        agg.name
-                    )));
-                }
-                let expr = agg.expr.as_ref().ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "aggregation {:?} without an expression",
-                        agg.name
-                    ))
-                })?;
-                let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
-                    Status::invalid_argument(format!("aggregation {:?}: {}", agg.name, e.message()))
-                })?;
-                check_agg_type(&agg.name, op, vt)?;
-                totals.push(acc_of(vt, cardinality));
-                exprs.push((rv, vt, cardinality));
-            }
-            let mut hists: Vec<(
-                Option<crate::values::ResolvedValue>,
-                Bucketing,
-                usize,
-                String,
-                HistAcc,
-            )> = Vec::with_capacity(req.histograms.len());
-            for h in &req.histograms {
-                let bucketing = if h.calendar != 0 {
-                    let unit = crate::calendar::interval_of(h.calendar).ok_or_else(|| {
-                        Status::internal(format!(
-                            "histogram {:?} arrived with an unvalidated calendar unit",
-                            h.name
-                        ))
-                    })?;
-                    Bucketing::Calendar {
-                        unit,
-                        utc_offset_minutes: h.utc_offset_minutes,
-                    }
-                } else {
-                    if !(h.interval > 0.0 && h.interval.is_finite()) {
-                        return Err(Status::internal(format!(
-                            "histogram {:?} arrived with an unvalidated interval",
-                            h.name
-                        )));
-                    }
-                    Bucketing::Fixed(h.interval)
-                };
-                let expr = h.expr.as_ref().ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "histogram {:?} without an expression",
+            let expr = agg.expr.as_ref().ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "aggregation {:?} without an expression",
+                    agg.name
+                ))
+            })?;
+            let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
+                Status::invalid_argument(format!("aggregation {:?}: {}", agg.name, e.message()))
+            })?;
+            check_agg_type(&agg.name, op, vt)?;
+            totals.push(acc_of(vt, cardinality));
+            exprs.push((rv, vt, cardinality));
+        }
+        let mut hists: Vec<(
+            Option<crate::values::ResolvedValue>,
+            Bucketing,
+            usize,
+            String,
+            HistAcc,
+        )> = Vec::with_capacity(req.histograms.len());
+        for h in &req.histograms {
+            let bucketing = if h.calendar != 0 {
+                let unit = crate::calendar::interval_of(h.calendar).ok_or_else(|| {
+                    Status::internal(format!(
+                        "histogram {:?} arrived with an unvalidated calendar unit",
                         h.name
                     ))
                 })?;
-                let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
-                    Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
-                })?;
-                let type_name = |vt: crate::values::ValueType| match vt {
-                    crate::values::ValueType::Str => "string",
-                    crate::values::ValueType::Bool => "boolean",
-                    crate::values::ValueType::Int => "int",
-                    crate::values::ValueType::Double => "double",
-                    crate::values::ValueType::Unknown => "unknown",
-                };
-                let rv = match (bucketing, vt) {
-                    (_, crate::values::ValueType::Unknown) => None,
-                    (Bucketing::Fixed(_), crate::values::ValueType::Double) => Some(rv),
-                    (Bucketing::Fixed(_), crate::values::ValueType::Int) => {
-                        return Err(Status::invalid_argument(format!(
-                            "histogram {:?} takes a double expression; convert explicitly \
-                         with double()",
-                            h.name
-                        )));
-                    }
-                    (Bucketing::Fixed(_), other) => {
-                        return Err(Status::invalid_argument(format!(
-                            "histogram {:?} takes a double expression, not a {}",
-                            h.name,
-                            type_name(other)
-                        )));
-                    }
-                    (Bucketing::Calendar { .. }, crate::values::ValueType::Int) => Some(rv),
-                    (Bucketing::Calendar { .. }, other) => {
-                        return Err(Status::invalid_argument(format!(
-                            "histogram {:?} buckets by calendar over an int expression in \
-                             epoch micros (a timestamp column), not a {}",
-                            h.name,
-                            type_name(other)
-                        )));
-                    }
-                };
-                hists.push((
-                    rv,
-                    bucketing,
-                    h.max_buckets as usize,
-                    h.name.clone(),
-                    HistAcc::default(),
-                ));
-            }
-            let mut pcts: Vec<(Option<(crate::values::ResolvedValue, bool)>, PctAcc)> =
-                Vec::with_capacity(req.percentiles.len());
-            for spec in &req.percentiles {
-                let resolved =
-                    resolve_rankable(store, spec.expr.as_ref(), &spec.name, "percentile")?;
-                pcts.push((resolved, PctAcc::default()));
-            }
-            let doc_filter = crate::filter::DocFilter {
-                deleted: guard.live_docs.words(),
-                geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                pred: req
-                    .filter
-                    .as_ref()
-                    .map(|f| store.resolve_filter(f))
-                    .transpose()?,
-                phrase: Vec::new(),
+                Bucketing::Calendar {
+                    unit,
+                    utc_offset_minutes: h.utc_offset_minutes,
+                }
+            } else {
+                if !(h.interval > 0.0 && h.interval.is_finite()) {
+                    return Err(Status::internal(format!(
+                        "histogram {:?} arrived with an unvalidated interval",
+                        h.name
+                    )));
+                }
+                Bucketing::Fixed(h.interval)
             };
-            let cols = ShardNumericRead(store);
-            let n = u64::from(store.next_doc_id());
-            let prune = prune_segments(
-                store,
-                doc_filter.pred.as_ref(),
-                self.knobs.segment_pruning(),
-            );
-            let id_allowlist = req.restrict_doc_ids.then(|| {
-                req.doc_ids
-                    .iter()
-                    .filter_map(|id| id.checked_sub(self.config.slot_offset))
-                    .filter_map(|local| u32::try_from(local).ok())
-                    .collect::<std::collections::HashSet<_>>()
-            });
-            let mut matched = 0u64;
-            let mut ungrouped = 0u64;
-            // Group accumulators by facet ordinal; each holds (matched,
-            // one accumulator per aggregation).
-            let mut groups: std::collections::HashMap<u32, (u64, Vec<AggAcc>)> =
-                std::collections::HashMap::new();
-            // One pass in doc order: the fold orders themselves are part
-            // of the determinism contract (Neumaier and Welford both fold
-            // exactly this sequence on every run).
-            for doc in prune.admitted_slots(n as u32) {
-                if id_allowlist
-                    .as_ref()
-                    .is_some_and(|allowlist| !allowlist.contains(&doc))
-                {
-                    continue;
+            let expr = h.expr.as_ref().ok_or_else(|| {
+                Status::invalid_argument(format!("histogram {:?} without an expression", h.name))
+            })?;
+            let (rv, vt) = crate::values::resolve(expr, store).map_err(|e| {
+                Status::invalid_argument(format!("histogram {:?}: {}", h.name, e.message()))
+            })?;
+            let type_name = |vt: crate::values::ValueType| match vt {
+                crate::values::ValueType::Str => "string",
+                crate::values::ValueType::Bool => "boolean",
+                crate::values::ValueType::Int => "int",
+                crate::values::ValueType::Double => "double",
+                crate::values::ValueType::Unknown => "unknown",
+            };
+            let rv = match (bucketing, vt) {
+                (_, crate::values::ValueType::Unknown) => None,
+                (Bucketing::Fixed(_), crate::values::ValueType::Double) => Some(rv),
+                (Bucketing::Fixed(_), crate::values::ValueType::Int) => {
+                    return Err(Status::invalid_argument(format!(
+                        "histogram {:?} takes a double expression; convert explicitly \
+                         with double()",
+                        h.name
+                    )));
                 }
-                if membership.is_some_and(|m| !m.test(doc as usize)) {
-                    continue;
+                (Bucketing::Fixed(_), other) => {
+                    return Err(Status::invalid_argument(format!(
+                        "histogram {:?} takes a double expression, not a {}",
+                        h.name,
+                        type_name(other)
+                    )));
                 }
-                if !doc_filter.passes(doc, &cols) {
-                    continue;
+                (Bucketing::Calendar { .. }, crate::values::ValueType::Int) => Some(rv),
+                (Bucketing::Calendar { .. }, other) => {
+                    return Err(Status::invalid_argument(format!(
+                        "histogram {:?} buckets by calendar over an int expression in \
+                             epoch micros (a timestamp column), not a {}",
+                        h.name,
+                        type_name(other)
+                    )));
                 }
-                matched += 1;
-                let group = if grouping {
-                    match group_facet.and_then(|fi| store.facet_ord(fi, doc)) {
-                        Some(ord) => {
-                            let n_groups = groups.len();
-                            let entry = groups.entry(ord).or_insert_with(|| {
-                                (
-                                    0,
-                                    exprs
-                                        .iter()
-                                        .map(|(_, vt, cardinality)| acc_of(*vt, *cardinality))
-                                        .collect(),
-                                )
-                            });
-                            if entry.0 == 0 && n_groups == group_cap {
-                                return Err(Status::failed_precondition(format!(
-                                    "group_by {:?} exceeds {group_cap} distinct values on \
+            };
+            hists.push((
+                rv,
+                bucketing,
+                h.max_buckets as usize,
+                h.name.clone(),
+                HistAcc::default(),
+            ));
+        }
+        let mut pcts: Vec<(Option<(crate::values::ResolvedValue, bool)>, PctAcc)> =
+            Vec::with_capacity(req.percentiles.len());
+        for spec in &req.percentiles {
+            let resolved = resolve_rankable(store, spec.expr.as_ref(), &spec.name, "percentile")?;
+            pcts.push((resolved, PctAcc::default()));
+        }
+        let doc_filter = crate::filter::DocFilter {
+            deleted: guard.live_docs.words(),
+            geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
+            pred: req
+                .filter
+                .as_ref()
+                .map(|f| store.resolve_filter(f))
+                .transpose()?,
+            phrase: Vec::new(),
+        };
+        let cols = ShardNumericRead(store);
+        let n = u64::from(store.next_doc_id());
+        let prune = prune_segments(
+            store,
+            doc_filter.pred.as_ref(),
+            self.knobs.segment_pruning(),
+        );
+        let id_allowlist = req.restrict_doc_ids.then(|| {
+            req.doc_ids
+                .iter()
+                .filter_map(|id| id.checked_sub(self.config.slot_offset))
+                .filter_map(|local| u32::try_from(local).ok())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        let mut matched = 0u64;
+        let mut ungrouped = 0u64;
+        // Group accumulators by facet ordinal; each holds (matched,
+        // one accumulator per aggregation).
+        let mut groups: std::collections::HashMap<u32, (u64, Vec<AggAcc>)> =
+            std::collections::HashMap::new();
+        // One pass in doc order: the fold orders themselves are part
+        // of the determinism contract (Neumaier and Welford both fold
+        // exactly this sequence on every run).
+        for doc in prune.admitted_slots(n as u32) {
+            if id_allowlist
+                .as_ref()
+                .is_some_and(|allowlist| !allowlist.contains(&doc))
+            {
+                continue;
+            }
+            if membership.is_some_and(|m| !m.test(doc as usize)) {
+                continue;
+            }
+            if !doc_filter.passes(doc, &cols) {
+                continue;
+            }
+            matched += 1;
+            let group = if grouping {
+                match group_facet.and_then(|fi| store.facet_ord(fi, doc)) {
+                    Some(ord) => {
+                        let n_groups = groups.len();
+                        let entry = groups.entry(ord).or_insert_with(|| {
+                            (
+                                0,
+                                exprs
+                                    .iter()
+                                    .map(|(_, vt, cardinality)| acc_of(*vt, *cardinality))
+                                    .collect(),
+                            )
+                        });
+                        if entry.0 == 0 && n_groups == group_cap {
+                            return Err(Status::failed_precondition(format!(
+                                "group_by {:?} exceeds {group_cap} distinct values on \
                                  one shard; tighten the filter or raise max_groups",
-                                    req.group_by
-                                )));
-                            }
-                            entry.0 += 1;
-                            Some(entry)
+                                req.group_by
+                            )));
                         }
-                        None => {
-                            ungrouped += 1;
-                            None
-                        }
+                        entry.0 += 1;
+                        Some(entry)
                     }
-                } else {
-                    None
+                    None => {
+                        ungrouped += 1;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut group_accs = group.map(|g| &mut g.1);
+            for (i, (rv, _, _)) in exprs.iter().enumerate() {
+                // Absent-typed totals imply an absent-typed group
+                // accumulator: the type is the expression's, not the
+                // group's.
+                if matches!(totals[i], AggAcc::Absent) {
+                    continue;
+                }
+                if let Some(v) = crate::values::eval(rv, doc, &cols) {
+                    totals[i].push(v);
+                    if let Some(accs) = group_accs.as_deref_mut() {
+                        accs[i].push(v);
+                    }
+                }
+            }
+            for (rv, bucketing, cap, name, acc) in hists.iter_mut() {
+                let Some(rv) = rv else { continue };
+                match (*bucketing, crate::values::eval(rv, doc, &cols)) {
+                    (Bucketing::Fixed(interval), Some(crate::values::Val::Double(x))) => {
+                        acc.push(x, interval, *cap, name)?;
+                    }
+                    (
+                        Bucketing::Calendar {
+                            unit,
+                            utc_offset_minutes,
+                        },
+                        Some(crate::values::Val::Int(micros)),
+                    ) => {
+                        acc.push_calendar(micros, unit, utc_offset_minutes, *cap, name)?;
+                    }
+                    _ => {}
+                }
+            }
+            for (resolved, acc) in pcts.iter_mut() {
+                let Some((rv, int_typed)) = resolved else {
+                    continue;
                 };
-                let mut group_accs = group.map(|g| &mut g.1);
-                for (i, (rv, _, _)) in exprs.iter().enumerate() {
-                    // Absent-typed totals imply an absent-typed group
-                    // accumulator: the type is the expression's, not the
-                    // group's.
-                    if matches!(totals[i], AggAcc::Absent) {
-                        continue;
-                    }
-                    if let Some(v) = crate::values::eval(rv, doc, &cols) {
-                        totals[i].push(v);
-                        if let Some(accs) = group_accs.as_deref_mut() {
-                            accs[i].push(v);
-                        }
-                    }
-                }
-                for (rv, bucketing, cap, name, acc) in hists.iter_mut() {
-                    let Some(rv) = rv else { continue };
-                    match (*bucketing, crate::values::eval(rv, doc, &cols)) {
-                        (Bucketing::Fixed(interval), Some(crate::values::Val::Double(x))) => {
-                            acc.push(x, interval, *cap, name)?;
-                        }
-                        (
-                            Bucketing::Calendar {
-                                unit,
-                                utc_offset_minutes,
-                            },
-                            Some(crate::values::Val::Int(micros)),
-                        ) => {
-                            acc.push_calendar(micros, unit, utc_offset_minutes, *cap, name)?;
-                        }
-                        _ => {}
-                    }
-                }
-                for (resolved, acc) in pcts.iter_mut() {
-                    let Some((rv, int_typed)) = resolved else {
-                        continue;
-                    };
-                    if let Some(v) = crate::values::eval(rv, doc, &cols) {
-                        acc.push(rankable_bits(v, *int_typed));
-                    }
+                if let Some(v) = crate::values::eval(rv, doc, &cols) {
+                    acc.push(rankable_bits(v, *int_typed));
                 }
             }
-            for (agg, acc) in req.aggregations.iter().zip(&totals) {
-                if let Some(n) = acc.distinct_len() {
-                    if n > agg.max_distinct as usize {
-                        return Err(Status::failed_precondition(format!(
-                            "aggregation {:?}: more than {} distinct values on one shard; \
+        }
+        for (agg, acc) in req.aggregations.iter().zip(&totals) {
+            if let Some(n) = acc.distinct_len() {
+                if n > agg.max_distinct as usize {
+                    return Err(Status::failed_precondition(format!(
+                        "aggregation {:?}: more than {} distinct values on one shard; \
                              raise max_distinct or tighten the filter",
-                            agg.name, agg.max_distinct
-                        )));
-                    }
+                        agg.name, agg.max_distinct
+                    )));
                 }
             }
-            let mut group_rows: Vec<(u32, u64, Vec<AggAcc>)> = groups
-                .into_iter()
-                .map(|(ord, (m, accs))| (ord, m, accs))
-                .collect();
-            group_rows.sort_unstable_by_key(|r| r.0);
-            let groups = group_facet
-                .map(|fi| {
-                    group_rows
-                        .iter()
-                        .map(|(ord, m, accs)| crate::pb::AggregateShardGroup {
-                            value: store.facet_value(fi, *ord).to_string(),
-                            matched: *m,
-                            partials: accs.iter().map(|acc| acc.partial(Some(store))).collect(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(crate::pb::AggregateShardResponse {
-                segments_total: prune.stats.segments_total,
-                segments_skipped: prune.stats.segments_skipped,
-                partials: totals.iter().map(|acc| acc.partial(Some(store))).collect(),
-                matched,
-                geo_columns_known,
-                filter_columns_known,
-                expr_leaves_known,
-                groups,
-                ungrouped,
-                group_column_known,
-                histograms: hists
+        }
+        let mut group_rows: Vec<(u32, u64, Vec<AggAcc>)> = groups
+            .into_iter()
+            .map(|(ord, (m, accs))| (ord, m, accs))
+            .collect();
+        group_rows.sort_unstable_by_key(|r| r.0);
+        let groups = group_facet
+            .map(|fi| {
+                group_rows
                     .iter()
-                    .map(|(_, _, _, _, acc)| acc.response())
-                    .collect(),
-                percentile_partials: pcts
-                    .iter()
-                    .map(|(resolved, acc)| {
-                        use crate::pb::AggregateValueType as T;
-                        crate::pb::PercentilePartial {
-                            vtype: match resolved {
-                                None => T::Absent as i32,
-                                Some((_, true)) => T::Int as i32,
-                                Some((_, false)) => T::Double as i32,
-                            },
-                            present: acc.present,
-                            unrankable: acc.unrankable,
-                            min_bits: acc.min_bits,
-                            max_bits: acc.max_bits,
-                        }
+                    .map(|(ord, m, accs)| crate::pb::AggregateShardGroup {
+                        value: store.facet_value(fi, *ord).to_string(),
+                        matched: *m,
+                        partials: accs.iter().map(|acc| acc.partial(Some(store))).collect(),
                     })
-                    .collect(),
+                    .collect()
             })
+            .unwrap_or_default();
+        Ok(crate::pb::AggregateShardResponse {
+            segments_total: prune.stats.segments_total,
+            segments_skipped: prune.stats.segments_skipped,
+            partials: totals.iter().map(|acc| acc.partial(Some(store))).collect(),
+            matched,
+            geo_columns_known,
+            filter_columns_known,
+            expr_leaves_known,
+            groups,
+            ungrouped,
+            group_column_known,
+            histograms: hists
+                .iter()
+                .map(|(_, _, _, _, acc)| acc.response())
+                .collect(),
+            percentile_partials: pcts
+                .iter()
+                .map(|(resolved, acc)| {
+                    use crate::pb::AggregateValueType as T;
+                    crate::pb::PercentilePartial {
+                        vtype: match resolved {
+                            None => T::Absent as i32,
+                            Some((_, true)) => T::Int as i32,
+                            Some((_, false)) => T::Double as i32,
+                        },
+                        present: acc.present,
+                        unrankable: acc.unrankable,
+                        min_bits: acc.min_bits,
+                        max_bits: acc.max_bits,
+                    }
+                })
+                .collect(),
+        })
     }
 
     /// Score `slots` (sorted, distinct, all members) for one lexical
@@ -14729,9 +14730,7 @@ impl NodeServiceImpl {
                 let predicted = (local.len() as u64)
                     .checked_mul(dim as u64)
                     .and_then(|bytes| bytes.checked_mul(4))
-                    .ok_or_else(|| {
-                        Status::resource_exhausted("FP32 rerank byte count overflow")
-                    })?;
+                    .ok_or_else(|| Status::resource_exhausted("FP32 rerank byte count overflow"))?;
                 if req.max_logical_bytes != 0 && predicted > req.max_logical_bytes {
                     return Err(Status::resource_exhausted(format!(
                         "FP32 rerank needs {predicted} logical row bytes on this shard, above \
@@ -14846,7 +14845,9 @@ impl NodeServiceImpl {
                 for &leaf_index in &scoring {
                     match req.leaves[leaf_index].leaf.as_ref() {
                         Some(L::Lexical(lexical)) => {
-                            let candidates: Vec<u32> = match &evaluated.leaves[leaf_index].membership {
+                            let candidates: Vec<u32> = match &evaluated.leaves[leaf_index]
+                                .membership
+                            {
                                 crate::boolean_bits::Membership::Bits(bits) => member_slots
                                     .iter()
                                     .copied()
@@ -14923,8 +14924,7 @@ impl NodeServiceImpl {
                             .collect(),
                         crate::boolean_bits::Membership::Universal => candidate_slots.clone(),
                     };
-                    let (scores, known) =
-                        Self::boolean_lexical_scores(&guard, lexical, &in_leaf)?;
+                    let (scores, known) = Self::boolean_lexical_scores(&guard, lexical, &in_leaf)?;
                     if scoring.len() == 1 {
                         stages_known[leaf_index].stage_columns_known = known;
                     }
@@ -14940,11 +14940,17 @@ impl NodeServiceImpl {
                 }
                 Some(L::Dense(dense)) => {
                     let mut spread = vec![None; candidate_slots.len()];
-                    self.boolean_dense_each(&guard, dense, &candidate_slots, &req, |slot, score| {
-                        if let Ok(position) = candidate_slots.binary_search(&slot) {
-                            spread[position] = Some(score);
-                        }
-                    })?;
+                    self.boolean_dense_each(
+                        &guard,
+                        dense,
+                        &candidate_slots,
+                        &req,
+                        |slot, score| {
+                            if let Ok(position) = candidate_slots.binary_search(&slot) {
+                                spread[position] = Some(score);
+                            }
+                        },
+                    )?;
                     spread
                 }
                 _ => unreachable!("scoring leaves are lexical or dense"),

@@ -362,16 +362,21 @@ mod tests {
         assert_eq!(m.count(), 11);
         assert!(seeded);
         // SHOULD count with a universal SHOULD counting for every slot.
-        let (m, seeded) =
-            group_members(&[], &[a.clone(), b.clone(), Membership::Universal], &[], 2, &live);
+        let (m, seeded) = group_members(
+            &[],
+            &[a.clone(), b.clone(), Membership::Universal],
+            &[],
+            2,
+            &live,
+        );
         assert_eq!(m.iter().collect::<Vec<_>>(), vec![1, 2, 3, 4, 9]);
         assert!(!seeded);
         let (m, _) = group_members(&[], &[a.clone(), b.clone()], &[], 2, &live);
         assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 3]);
         // MUST plus a SHOULD minimum, then MUST_NOT.
         let (m, _) = group_members(
-            &[a.clone()],
-            &[b.clone()],
+            std::slice::from_ref(&a),
+            std::slice::from_ref(&b),
             &[Membership::Bits(of(12, &[3]))],
             1,
             &live,

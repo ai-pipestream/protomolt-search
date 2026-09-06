@@ -555,9 +555,9 @@ async fn execute_recursive_boolean(
                  Boolean selection pages its score order and selection_k must stay zero",
             ));
         }
-        cursor_rank.checked_add(k).ok_or_else(|| {
-            refuse("the cursor's rank plus k overflows the candidate depth")
-        })?
+        cursor_rank
+            .checked_add(k)
+            .ok_or_else(|| refuse("the cursor's rank plus k overflows the candidate depth"))?
     };
     let aggregate_plan = match &boolean.aggregate {
         Some(aggregate) => {
@@ -585,7 +585,8 @@ async fn execute_recursive_boolean(
         meta: Vec::new(),
         root_must_filters: Vec::new(),
     };
-    compiled.root = compile_boolean_group(coordinator, boolean, true, 1, &mut compiled, true).await?;
+    compiled.root =
+        compile_boolean_group(coordinator, boolean, true, 1, &mut compiled, true).await?;
     let positive_lexical: Vec<usize> = compiled
         .meta
         .iter()
