@@ -1222,6 +1222,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Scalar wrapper projection (2026-09-05, feature branch).** Standard scalar
+  wrappers project at their declared field paths and retain message presence.
+  Type/name/identity hints apply to the containing field; unusable ID projections
+  refuse during planning. Empty string facets are present values. Schema report
+  version 2 identifies wrapper and Timestamp inputs separately from queryable
+  values. Wrapper bindings need new plans and rebuilt columns. Native mapped
+  non-body analysis still needs an explicit per-field configuration contract.
+  See [scalar wrappers](docs/descriptor-mappings.md#scalar-wrappers-2026-09-05-feature-branch).
+
 - **Timestamp semantics (2026-09-05, feature branch).** DATE plans verify the
   descriptor components instead of trusting a well-known type name. Mapped and
   direct ingest reject instants outside protobuf's domain; valid values retain

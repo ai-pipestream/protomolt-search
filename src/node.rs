@@ -9301,9 +9301,9 @@ impl NodeServiceImpl {
                 }
             }
         }
-        // Facet values: refuse unknown fields, repeats, and empty
-        // values BEFORE anything mutates — a document that fails
-        // validation must never half-enter the store or reach the log.
+        // Facet values: refuse unknown fields and repeats BEFORE anything
+        // mutates. Empty strings are values; omission represents absence.
+        // A document that fails validation must never half-enter the store or reach the log.
         let facet_slots: Vec<(usize, String)> = {
             let shard = guard.bm25.as_ref().expect("builder just ensured");
             let mut seen: Vec<&str> = Vec::new();
@@ -9323,12 +9323,6 @@ impl NodeServiceImpl {
                         fv.field
                     )));
                 };
-                if fv.value.is_empty() {
-                    return Err(Status::invalid_argument(format!(
-                        "facet field {:?} has an empty value; omit absent facets instead",
-                        fv.field
-                    )));
-                }
                 slots.push((fi, fv.value.clone()));
             }
             slots

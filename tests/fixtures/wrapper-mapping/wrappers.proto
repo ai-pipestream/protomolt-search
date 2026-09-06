@@ -1,0 +1,73 @@
+syntax = "proto3";
+package wrapper_fixture;
+import "google/protobuf/wrappers.proto";
+import "ai/protomolt/proto/index/hints/v1/indexing_hints.proto";
+message Record {
+  google.protobuf.UInt64Value id = 1;
+  google.protobuf.StringValue body = 2;
+  repeated float embedding = 3;
+  google.protobuf.Int64Value signed = 4;
+  google.protobuf.UInt64Value unsigned = 5;
+  google.protobuf.Int32Value small_signed = 6;
+  google.protobuf.UInt32Value small_unsigned = 7;
+  google.protobuf.BoolValue enabled = 8;
+  google.protobuf.FloatValue ratio = 9;
+  google.protobuf.DoubleValue weight = 10;
+  google.protobuf.StringValue status = 11;
+  google.protobuf.BytesValue payload = 12;
+  oneof selection {
+    google.protobuf.Int64Value selected = 13;
+    google.protobuf.StringValue ignored = 14 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_SKIP];
+  }
+  google.protobuf.UInt64Value keyword_id = 15 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  google.protobuf.Int64Value renamed = 16 [(ai.protomolt.proto.index.hints.v1.index).name = "total"];
+  repeated google.protobuf.Int64Value many = 17;
+  map<string, google.protobuf.Int64Value> by_key = 18;
+  Nested nested = 19;
+  google.protobuf.Int64Value opaque = 20 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_OBJECT];
+}
+message Nested {
+  google.protobuf.StringValue caption = 1;
+  google.protobuf.Int64Value number = 2;
+}
+message Chunked {
+  google.protobuf.StringValue id = 1;
+  repeated Chunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}
+message Chunk {
+  google.protobuf.UInt64Value id = 1 [(ai.protomolt.proto.index.hints.v1.index) = { block_role: BLOCK_ROLE_CHUNK_ID name: "chunk_key" }];
+  google.protobuf.StringValue body = 2;
+  repeated float embedding = 3;
+}
+message BadText {
+  string id = 1;
+  repeated float embedding = 2;
+  google.protobuf.Int64Value value = 3 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_TEXT];
+}
+message BadId {
+  google.protobuf.UInt64Value key = 1 [(ai.protomolt.proto.index.hints.v1.index) = { type: INDEX_FIELD_TYPE_OBJECT block_role: BLOCK_ROLE_DOC_ID }];
+  string body = 2;
+  repeated float embedding = 3;
+}
+message BadTextId {
+  google.protobuf.StringValue id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_TEXT];
+  string body = 2;
+  repeated float embedding = 3;
+}
+message BadChunked {
+  string id = 1;
+  repeated BadChunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}
+message BadChunk {
+  google.protobuf.UInt64Value key = 1 [(ai.protomolt.proto.index.hints.v1.index) = { type: INDEX_FIELD_TYPE_OBJECT block_role: BLOCK_ROLE_CHUNK_ID }];
+  string body = 2;
+  repeated float embedding = 3;
+}
+message NumericParent {
+  google.protobuf.UInt64Value id = 1;
+  repeated Chunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}
+message NumericKeywordParent {
+  google.protobuf.UInt64Value id = 1 [(ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_KEYWORD];
+  repeated Chunk chunks = 2 [(ai.protomolt.proto.index.hints.v1.index).block_role = BLOCK_ROLE_CHUNKS];
+}

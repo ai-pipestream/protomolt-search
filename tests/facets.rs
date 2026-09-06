@@ -427,8 +427,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
     mock.abort();
 }
 
-/// Ingest validation refuses unknown facet fields, repeats, and empty
-/// values — before anything mutates.
+/// Ingest validation refuses unknown facet fields and repeats before mutation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn facet_ingest_validation_refuses_bad_values() {
     let (analysis, mock) = start_mock_analysis().await;
@@ -442,7 +441,6 @@ async fn facet_ingest_validation_refuses_bad_values() {
     let cases: &[(&[(&str, &str)], &str)] = &[
         (&[("bogus", "x")], "unknown facet field"),
         (&[("court", "a"), ("court", "b")], "repeats"),
-        (&[("court", "")], "empty value"),
     ];
     for (facets, needle) in cases {
         let err = add_documents_faceted(&addr, &[("some text", facets)])
@@ -543,4 +541,75 @@ async fn spilled_shard_serves_facets_after_flush() {
     node.abort();
     mock.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn empty_facet_values_are_present_and_counted_across_shards() {
+    let (analysis, mock) = start_mock_analysis().await;
+    let mut addresses = Vec::new();
+    let mut servers = Vec::new();
+    for offset in [0, 2] {
+        let (address, server) = start_empty_node(NodeConfig {
+            slot_offset: offset,
+            analysis_addr: Some(analysis.clone()),
+            facet_fields: vec!["court".into()],
+            ..Default::default()
+        })
+        .await;
+        add_documents_faceted(&address, &[("word", &[("court", "")]), ("word", &[])])
+            .await
+            .unwrap();
+        addresses.push(address);
+        servers.push(server);
+    }
+    let coordinator =
+        CoordinatorServiceImpl::new(addresses).with_bm25(Some(analysis), Default::default());
+    for (filter, hits, count) in [
+        ("", 4, 2),
+        ("has(court) && court == \"\"", 2, 2),
+        ("!has(court)", 2, 0),
+    ] {
+        let response = coordinator
+            .bm25_search(Request::new(Bm25SearchRequest {
+                text: "word".into(),
+                k: 10,
+                filter: filter.into(),
+                facet_fields: vec!["court".into()],
+                projections: vec![pipestream_search::pb::NamedProjection {
+                    name: "copy".into(),
+                    expression: "court".into(),
+                }],
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.hits.len(), hits);
+        assert_eq!(
+            counts_of(&response.facets[0]),
+            if count == 0 {
+                vec![]
+            } else {
+                vec![("", count)]
+            }
+        );
+        for hit in &response.hits {
+            assert_eq!(
+                hit.projected[0].value,
+                if hit.doc_id % 2 == 0 {
+                    Some(pipestream_search::pb::projected_value::Value::StringValue(
+                        String::new(),
+                    ))
+                } else {
+                    None
+                }
+            );
+        }
+    }
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+    mock.abort();
+    let _ = mock.await;
 }

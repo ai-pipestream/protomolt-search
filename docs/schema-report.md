@@ -44,7 +44,11 @@ order retains alias/default meaning.
 Each field lists exact root-relative paths and their field-number paths. VALUE
 paths name the mapped column and its query representation. CONTAINER paths
 identify traversal or a chunk scope, with no independently queryable message
-value. SOURCE_ONLY paths do not extract values. All unlisted occurrences of a
+value. Version 2 adds INPUT paths for wrapper `value` and Timestamp `seconds`
+and `nanos` components. An INPUT names its consuming VALUE through `value_path`
+and carries that output column name; its query representation is NONE. It does
+not create an independently queryable dotted field. SOURCE_ONLY paths do not
+extract values. All unlisted occurrences of a
 field are source-only, including descendants reached through an unindexed
 repeated message or a recursive occurrence beyond the listed paths. Thus a
 message reused under two parents does not acquire a projection everywhere just
@@ -79,9 +83,10 @@ catalog, accept a document, validate document payloads or acknowledge durability
 Source acceptance still uses the [document catalog](document-writes.md), including
 for empty and zero-chunk sources.
 
-The report is derived and excluded from the v3 projection fingerprint. Valid
-existing mappings keep their identities; incompatible projection/wire changes
-still require their existing migration checks. Planning also validates the
+The report is derived and excluded from the v3 projection fingerprint. Adding
+report metadata does not change a binding; changing wrapper projection paths or
+other projection/wire semantics does. See the wrapper migration in
+[descriptor mappings](descriptor-mappings.md#scalar-wrappers-2026-09-05-feature-branch). Planning also validates the
 extractor for each proposed value path, so a column family that cannot decode
 its declared protobuf type refuses during planning rather than failing only at
 bind. Rejected plans still return a status; clients can independently call

@@ -42,6 +42,56 @@ The ownership move is decided (descriptor-derived mappings belong to
 pipestream-search, not turbovec-grpc), and the reference implementation
 is frozen in turbovec-grpc git history.
 
+## Scalar wrappers (2026-09-05, feature branch)
+
+Singular `DoubleValue`, `FloatValue`, `Int64Value`, `UInt64Value`, `Int32Value`,
+`UInt32Value`, `BoolValue` and `StringValue` messages project their scalar value
+at the containing field's declared path. For example, `counter` projects to a
+u64 column rather than `counter.value` to `counter_value`. Type, name and
+identity hints belong on the containing field. String kind inference uses that
+field's name, so a wrapped `status` is a keyword while a wrapped `body` is text.
+Numeric keyword hints retain decimal rendering and integer key reduction.
+Boolean wrappers use the existing `true`/`false` string facet representation.
+TEXT wrappers index analyzed terms; scalar presence and value expressions need a
+KEYWORD projection. Original bytes distinguish absent and empty text regardless
+of whether either produces terms. Floating wrappers use finite f64 columns.
+`BytesValue`, repeated wrappers, maps and explicit OBJECT/NESTED/BINARY hints
+remain source-only under the current column contract. SKIP retains the original
+without a projected value. These are the [standard protobuf wrappers](https://protobuf.dev/reference/protobuf/google.protobuf/).
+
+Absence of the wrapper is missing. A present empty wrapper projects the scalar
+default, including zero, false and the empty string. Message merging and oneof
+selection finish before extraction. Empty facet strings are now accepted and
+remain distinct from absent values through filtering, projection, counting,
+WAL replay and compaction; facet storage already encodes absence separately.
+The original protobuf retains wrapper presence, bytes, unknown fields and
+unindexed members. Scalar wrappers must have the expected `value = 1` component,
+scalar type, default and optional cardinality without a oneof. Incompatible
+named descriptors refuse projection while remaining available to DescribeSchema.
+Hints on wrapper or Timestamp component fields refuse rather than being ignored.
+
+DOC_ID and CHUNK_ID require keyword or integer value projections. A string
+identity role with an unspecified kind infers KEYWORD; explicitly requesting
+TEXT or a source-only kind refuses during planning. Wrapped identities work in
+flat and chunked plans, with exact unsigned bits and string-key hashing.
+This does not supply catalog identity or publication receipts to legacy ingest.
+
+This changes wrapper paths, names and sometimes kinds, so their canonical v3
+plan fingerprints change. Rebuild existing wrapper bindings from original
+sources and use the new plan's column names. No stored format changes are needed,
+and unrelated plans retain their fingerprints. Report version 2 identifies
+wrapper and Timestamp components as INPUT paths, with `value_path` identifying
+the consuming query value. See [schema reports](schema-report.md).
+
+Analysis-name hints remain recorded rather than resolved. MappedBind currently
+provides an explicit AnalysisSpec only for the body. Native embedded analysis
+therefore supports the wrapped body and scalar columns but refuses populated
+non-body text without an explicit specification; the current mapped API cannot
+supply one. Per-field analysis configuration remains required for complete
+mobile mapped indexing. The lifecycle conformance test uses the supported
+sidecar path for nested text; a separate embedded test exercises native body
+analysis and wrapper scalar defaults.
+
 ## Timestamp projection validation (2026-09-05, feature branch)
 
 A DATE projection validates the descriptor's `seconds` field as int64 number 1

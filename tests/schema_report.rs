@@ -214,7 +214,7 @@ fn graph_covers_skipped_recursive_repeated_map_and_well_known_fields() {
     let bytes = include_bytes!("fixtures/schema-report/descriptor.bin");
     let plan = derive_plan(bytes, "report_fixture.Record").unwrap();
     let report = plan.schema_report.as_ref().unwrap();
-    assert_eq!(report.report_version, 1);
+    assert_eq!(report.report_version, 2);
     assert!(report.requires_index_rows_for_preservation);
     assert_eq!(
         report.unknown_fields,

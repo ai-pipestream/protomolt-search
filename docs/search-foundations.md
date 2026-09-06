@@ -594,3 +594,29 @@ three existing relay dead-code warnings. Tests/examples compilation, formatting,
 vendored-proto identity and whitespace checks passed. Public protobuf
 declarations are unchanged; comments now document the accepted instant range.
 These are local checks, not on-device or fleet deployment evidence.
+
+
+Scalar wrapper mappings now use their containing field paths, honoring type,
+name and identity hints and preserving absent versus default-valued messages.
+The report records component inputs explicitly in version 2. Empty facet strings
+are distinct from absence through native ingest, public selection/projection and
+persisted storage. Planning rejects unusable identity projections and ignored
+well-known-component hints. Existing wrapper bindings require new plans and a
+rebuild from source; the column formats are unchanged.
+
+The wrapper lifecycle test also exposed a pre-existing mobile gap: MappedBind
+has no per-field AnalysisSpec for non-body text, whose current contract uses
+sidecar defaults. Native analysis correctly refuses an unspecified spec. The
+next mapped-analysis work must make those specifications explicit, persist the
+binding/replay semantics and cover both native and sidecar execution. It must
+not silently reuse the body's analyzer or weaken fingerprint validation.
+
+Wrapper validation on 2026-09-05: 434 library tests, 559 integration tests
+across 98 targets and 11 embedded tests passed, with one existing sidecar test
+ignored and no retries in the final suite. All five Android/iOS Rust target
+checks passed with the three existing relay dead-code warnings. The new native
+embedded runtime test covers wrapped body analysis and scalar defaults; it does
+not claim native non-body analysis support. Tests/examples compilation,
+formatting, vendored-proto identity, fixture regeneration and whitespace checks
+passed. Descriptor comparison confirms only additive INPUT=4 and
+FieldProjection.value_path=7 declarations. No fleet deployment or reindex ran.

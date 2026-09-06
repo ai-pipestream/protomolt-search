@@ -2088,8 +2088,8 @@ message FacetValue {
   // names are INVALID_ARGUMENT — the same typo protection as
   // DocumentField.field.
   string field = 1;
-  // The value. Non-empty; a document without a value for a facet field
-  // simply omits the entry and is counted under no value.
+  // The value, including the empty string. A document without a value
+  // omits the entry and is counted under no value.
   string value = 2;
 }
 

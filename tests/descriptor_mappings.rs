@@ -451,8 +451,8 @@ fn hints_are_read_from_field_options_and_win() {
     assert_eq!(sku.role, MappedRole::DocId as i32);
     assert_eq!(
         sku.kind,
-        MappedKind::Text as i32,
-        "an unset hint type still infers"
+        MappedKind::Keyword as i32,
+        "an identity role infers an exact keyword projection"
     );
 
     let body = &plan.fields[2];

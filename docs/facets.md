@@ -83,8 +83,11 @@ persists the request verbatim, so facet values ride the same
 durable-record lever as multi-field: old logs replay facet-less,
 reshard replay re-applies values and derives the child's facet table
 from the records themselves. Validation refuses unknown facet fields
-(typo protection, `--facet-fields` is the schema), repeated fields, and
-empty values — before anything mutates.
+(typo protection, `--facet-fields` is the schema) and repeated fields before
+mutation. The empty string is a present value and is counted under `""`.
+Omitting the entry represents absence; the ordinal table distinguishes these
+without a format change. Older servers reject empty input values, so use
+matching server builds when ingesting them.
 
 ## Wire and merge
 

@@ -166,7 +166,7 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
     // must not switch the id to string hashing.
     let id_leaf = index.navigate(root, &doc_id_path)?;
     let id_ok = matches!(
-        id_leaf.r#type(),
+        projection_scalar_type(id_leaf),
         prost_types::field_descriptor_proto::Type::String
             | prost_types::field_descriptor_proto::Type::Int32
             | prost_types::field_descriptor_proto::Type::Int64
@@ -703,12 +703,50 @@ fn is_repeated(field: &FieldDescriptorProto) -> bool {
     field.label() == prost_types::field_descriptor_proto::Label::Repeated
 }
 
+/// The scalar represented by a standard wrapper. Recognition is followed by
+/// descriptor validation whenever a wrapper contributes an indexed value.
+fn wrapper_kind(full: &str) -> Option<prost_types::field_descriptor_proto::Type> {
+    use prost_types::field_descriptor_proto::Type;
+    Some(match full.trim_start_matches('.') {
+        "google.protobuf.DoubleValue" => Type::Double,
+        "google.protobuf.FloatValue" => Type::Float,
+        "google.protobuf.Int64Value" => Type::Int64,
+        "google.protobuf.UInt64Value" => Type::Uint64,
+        "google.protobuf.Int32Value" => Type::Int32,
+        "google.protobuf.UInt32Value" => Type::Uint32,
+        "google.protobuf.BoolValue" => Type::Bool,
+        "google.protobuf.StringValue" => Type::String,
+        "google.protobuf.BytesValue" => Type::Bytes,
+        _ => return None,
+    })
+}
+
+fn projection_scalar_type(
+    field: &FieldDescriptorProto,
+) -> prost_types::field_descriptor_proto::Type {
+    if field.r#type() == prost_types::field_descriptor_proto::Type::Message {
+        wrapper_kind(field.type_name()).unwrap_or(field.r#type())
+    } else {
+        field.r#type()
+    }
+}
+
 /// Infer a hint from the descriptor alone, with protomolt's rules:
 /// strings whose names look like identifiers become KEYWORD, Timestamp
 /// becomes DATE, Struct/Value stay OBJECT, repeated and map messages
 /// stay NESTED.
 fn inferred_kind(field: &FieldDescriptorProto, shape: &Shape<'_>) -> pb::MappedKind {
     use prost_types::field_descriptor_proto::Type;
+    if let Shape::Message {
+        full, map: false, ..
+    } = shape
+    {
+        if !is_repeated(field) {
+            if let Some(kind) = wrapper_kind(full) {
+                return inferred_kind(field, &Shape::Scalar(kind));
+            }
+        }
+    }
     match shape {
         Shape::Scalar(Type::String) => {
             if looks_like_keyword(field.name()) {
@@ -778,7 +816,7 @@ fn resolve_hint(
     let Some(hint) = explicit else {
         return Ok(plain_hint(inferred_kind(field, shape)));
     };
-    let (kind, explicit_kind, skip) = match hints::IndexFieldType::try_from(hint.r#type) {
+    let (mut kind, explicit_kind, skip) = match hints::IndexFieldType::try_from(hint.r#type) {
         Ok(hints::IndexFieldType::Unspecified) => (inferred_kind(field, shape), false, false),
         Ok(hints::IndexFieldType::Skip) => (pb::MappedKind::Unspecified, true, true),
         Ok(explicit) => (convert_kind(explicit, path)?, true, false),
@@ -801,6 +839,14 @@ fn resolve_hint(
             ))
         }
     };
+    // Identity roles need an exact value. An unspecified string kind adopts
+    // keyword semantics; an explicitly requested TEXT kind is refused below.
+    if !explicit_kind
+        && matches!(role, pb::MappedRole::DocId | pb::MappedRole::ChunkId)
+        && kind == pb::MappedKind::Text
+    {
+        kind = pb::MappedKind::Keyword;
+    }
     if hint.chunking_policy.is_some() {
         return Err(refuse_at(
             path,
@@ -873,6 +919,16 @@ fn validate_hint(
             validate_timestamp_descriptor(entry.desc, path)?;
         }
     }
+    if family(hint.kind, is_repeated(field)) != pb::ColumnFamily::None {
+        if let Shape::Message { full, entry, .. } = shape {
+            if let Some(kind) = wrapper_kind(full) {
+                if field.r#type() != Type::Message {
+                    return Err(refuse_at(path, "a scalar wrapper must be a message field"));
+                }
+                validate_wrapper_descriptor(entry.desc, kind, path)?;
+            }
+        }
+    }
     if hint.kind == pb::MappedKind::Vector {
         let element_ok = matches!(shape, Shape::Scalar(Type::Float | Type::Double));
         if !is_repeated(field) || !element_ok {
@@ -904,9 +960,16 @@ fn validate_hint(
                 format!("{role_name} requires a singular field"),
             ));
         }
+        let id_type = match shape {
+            Shape::Scalar(kind) => Some(*kind),
+            Shape::Message {
+                full, map: false, ..
+            } => wrapper_kind(full),
+            _ => None,
+        };
         let id_ok = matches!(
-            shape,
-            Shape::Scalar(
+            id_type,
+            Some(
                 Type::String
                     | Type::Int32
                     | Type::Int64
@@ -926,6 +989,47 @@ fn validate_hint(
                 format!("{role_name} requires an integer or string field"),
             ));
         }
+        if !matches!(
+            family(hint.kind, false),
+            pb::ColumnFamily::Facet | pb::ColumnFamily::I64 | pb::ColumnFamily::U64
+        ) {
+            return Err(refuse_at(
+                path,
+                format!("{role_name} requires a keyword or integer value projection"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_wrapper_descriptor(
+    message: &DescriptorProto,
+    kind: prost_types::field_descriptor_proto::Type,
+    path: &str,
+) -> Result<(), Status> {
+    use prost_types::field_descriptor_proto::{Label, Type};
+    let valid = message.field.iter().any(|field| {
+        let default_ok = field
+            .default_value
+            .as_deref()
+            .is_none_or(|value| match kind {
+                Type::String | Type::Bytes => value.is_empty(),
+                Type::Bool => value == "false",
+                Type::Float | Type::Double => value.parse::<f64>().is_ok_and(|v| v.to_bits() == 0),
+                _ => value.parse::<i64>() == Ok(0),
+            });
+        field.name() == "value"
+            && field.number() == 1
+            && field.r#type() == kind
+            && field.label() == Label::Optional
+            && field.oneof_index.is_none()
+            && default_ok
+    });
+    if !valid {
+        return Err(refuse_at(path, format!(
+            "scalar wrapper requires singular value = 1 of type {} with its scalar default and no oneof",
+            kind.as_str_name()
+        )));
     }
     Ok(())
 }
@@ -968,10 +1072,11 @@ fn validate_timestamp_descriptor(message: &DescriptorProto, path: &str) -> Resul
 
 /// Well-known message types that plan as leaves rather than expanding.
 fn well_known_leaf(full: &str) -> bool {
-    matches!(
-        full,
-        "google.protobuf.Timestamp" | "google.protobuf.Struct" | "google.protobuf.Value"
-    )
+    wrapper_kind(full).is_some()
+        || matches!(
+            full,
+            "google.protobuf.Timestamp" | "google.protobuf.Struct" | "google.protobuf.Value"
+        )
 }
 
 /// The column plane one planned field lands on. `NONE` is a visible
@@ -1055,6 +1160,17 @@ fn walk(
             map,
         } = &field_shape
         {
+            if (wrapper_kind(full).is_some() || hint.kind == pb::MappedKind::Date)
+                && family(hint.kind, is_repeated(field)) != pb::ColumnFamily::None
+                && child
+                    .desc
+                    .field
+                    .iter()
+                    .enumerate()
+                    .any(|(i, _)| hint_map.contains_key(&(child.key.clone(), i)))
+            {
+                return Err(refuse_at(&path, "indexing hints on well-known value components are unsupported; put the hint on the containing field"));
+            }
             let blocked = depth >= MAX_DEPTH || visiting.iter().any(|n| n == full);
             if hint.role == pb::MappedRole::Chunks {
                 // The chunk scope keeps its container entry and expands
@@ -1263,6 +1379,12 @@ fn resolve_doc_id(
         .iter()
         .find(|f| f.path == path)
         .expect("path came from this plan");
+    if target.kind == pb::MappedKind::Text as i32 {
+        return Err(refuse_at(
+            &path,
+            "a TEXT document id would dissolve into postings; hint it KEYWORD or use an integer id",
+        ));
+    }
     if target.repeated {
         return Err(refuse_at(&path, "the document id field must be singular"));
     }
@@ -1520,6 +1642,8 @@ struct Leaf {
 
 /// How one decoded leaf lands in the index.
 enum Land {
+    /// A present wrapper projects its scalar default even when value is omitted.
+    Wrapper(Box<Land>),
     /// A TEXT field: the body, or a multi-field column.
     Text,
     /// A string facet value.
@@ -1544,6 +1668,15 @@ enum Land {
     Num,
     /// The document's dense vector.
     Vector,
+}
+
+impl Land {
+    fn value_land(&self) -> &Self {
+        match self {
+            Self::Wrapper(inner) => inner.value_land(),
+            _ => self,
+        }
+    }
 }
 
 /// One decoded document, ready for the ordinary ingest path.
@@ -1847,7 +1980,7 @@ impl Extractor {
             }
             match slot.clone() {
                 Slot::Str(value) => {
-                    if matches!(leaf.land, Land::Text) {
+                    if matches!(leaf.land.value_land(), Land::Text) {
                         if index == self.body {
                             request.text = value;
                         } else {
@@ -1944,7 +2077,8 @@ impl Extractor {
                     }
                 }
                 (Child::Leaf(slot), value) => {
-                    slots[*slot] = Some(project_leaf(&self.leaves[*slot], value)?);
+                    let leaf = &self.leaves[*slot];
+                    slots[*slot] = Some(project_leaf(&leaf.land, &leaf.path, value)?);
                 }
                 _ => unreachable!("validated projection type"),
             }
@@ -1960,6 +2094,9 @@ impl Extractor {
 /// DESCRIPTOR type (a KEYWORD hint on an integer field renders as a
 /// facet string but still reduces as the integer it is).
 fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
+    if let Land::Wrapper(inner) = land {
+        return reduce_id(inner, slot, path);
+    }
     match (land, slot) {
         (Land::Int, Slot::Int(value)) => Ok(*value as u64),
         (Land::Uint, Slot::Uint(value)) => Ok(*value),
@@ -1997,6 +2134,17 @@ fn land_for(
     enums: &HashMap<String, HashMap<i64, String>>,
 ) -> Result<Land, Status> {
     use prost_types::field_descriptor_proto::Type;
+    if leaf.r#type() == Type::Message {
+        if let Some(kind) = wrapper_kind(leaf.type_name()) {
+            let scalar = FieldDescriptorProto {
+                r#type: Some(kind as i32),
+                type_name: None,
+                ..leaf.clone()
+            };
+            return land_for(field, is_vector, &scalar, enums)
+                .map(|inner| Land::Wrapper(Box::new(inner)));
+        }
+    }
     if is_vector {
         return match leaf.r#type() {
             Type::Float => Ok(Land::Vector),
@@ -2209,22 +2357,25 @@ fn collect_enum_values(set: &FileDescriptorSet) -> HashMap<String, HashMap<i64, 
         .collect()
 }
 
-fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
+fn project_leaf(land: &Land, path: &str, value: &Value) -> Result<Slot, Status> {
     let integer = |value: &Value| -> Result<i64, Status> {
         match value {
             Value::I32(v) => Ok(i64::from(*v)),
             Value::I64(v) => Ok(*v),
             Value::U32(v) => Ok(i64::from(*v)),
             Value::U64(v) => i64::try_from(*v).map_err(|_| {
-                refuse_at(
-                    &leaf.path,
-                    format!("unsigned value {v} overflows the i64 column"),
-                )
+                refuse_at(path, format!("unsigned value {v} overflows the i64 column"))
             }),
-            _ => Err(refuse_at(&leaf.path, "expected an integer value")),
+            _ => Err(refuse_at(path, "expected an integer value")),
         }
     };
-    Ok(match (&leaf.land, value) {
+    Ok(match (land, value) {
+        (Land::Wrapper(inner), Value::Message(message)) => {
+            let value = message.get_field_by_name("value").ok_or_else(|| {
+                refuse_at(path, "scalar wrapper value does not match its descriptor")
+            })?;
+            project_leaf(inner, path, value.as_ref())?
+        }
         (Land::Text | Land::FacetStr, Value::String(v)) => Slot::Str(v.clone()),
         (Land::FacetBool, Value::Bool(v)) => Slot::Str(v.to_string()),
         (Land::FacetEnum(table), Value::EnumNumber(v)) => Slot::Str(
@@ -2246,21 +2397,13 @@ fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
                 .get_field_by_name("seconds")
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| {
-                    refuse_at(
-                        &leaf.path,
-                        "Timestamp seconds does not match its descriptor",
-                    )
+                    refuse_at(path, "Timestamp seconds does not match its descriptor")
                 })?;
             let nanos = v
                 .get_field_by_name("nanos")
                 .and_then(|v| v.as_i32())
-                .ok_or_else(|| {
-                    refuse_at(&leaf.path, "Timestamp nanos does not match its descriptor")
-                })?;
-            crate::protobuf::validate_timestamp(
-                &leaf.path,
-                &prost_types::Timestamp { seconds, nanos },
-            )?;
+                .ok_or_else(|| refuse_at(path, "Timestamp nanos does not match its descriptor"))?;
+            crate::protobuf::validate_timestamp(path, &prost_types::Timestamp { seconds, nanos })?;
             Slot::Ts { seconds, nanos }
         }
         (Land::Vector, Value::List(values)) => Slot::Floats(
@@ -2275,7 +2418,7 @@ fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
         ),
         _ => {
             return Err(refuse_at(
-                &leaf.path,
+                path,
                 "value does not match the planned projection",
             ))
         }

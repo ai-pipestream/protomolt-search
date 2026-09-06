@@ -45,8 +45,47 @@ pub(super) fn build(
                         &enum_values,
                     )?;
                 }
-                let projection =
-                    projection(mapped, field.field_descriptor_proto(), numbers.clone());
+                let mut value_descriptor = field.field_descriptor_proto().clone();
+                value_descriptor.r#type =
+                    Some(super::projection_scalar_type(&value_descriptor) as i32);
+                let mut projection = projection(mapped, &value_descriptor, numbers.clone());
+                if mapped.family != ColumnFamily::None as i32 {
+                    if let Kind::Message(child) = field.kind() {
+                        let component_names: &[&str] = if super::wrapper_kind(child.full_name())
+                            .is_some()
+                        {
+                            projection.constraints.push("An absent wrapper is missing; a present empty wrapper projects its scalar default.".into());
+                            &["value"]
+                        } else if mapped.kind == pb::MappedKind::Date as i32 {
+                            &["seconds", "nanos"]
+                        } else {
+                            &[]
+                        };
+                        for name in component_names {
+                            let component = child
+                                .get_field_by_name(name)
+                                .expect("validated well-known component");
+                            let component_path = format!("{path}.{name}");
+                            let mut component_numbers = numbers.clone();
+                            component_numbers.push(component.number());
+                            bindings
+                                .entry(component.full_name().into())
+                                .or_default()
+                                .insert(
+                                    component_path.clone(),
+                                    pb::FieldProjection {
+                                        path: component_path,
+                                        field_numbers: component_numbers,
+                                        column_name: mapped.name.clone(),
+                                        r#use: Use::Input as i32,
+                                        query_representation: Query::None as i32,
+                                        value_path: path.clone(),
+                                        ..Default::default()
+                                    },
+                                );
+                        }
+                    }
+                }
                 bindings
                     .entry(field.full_name().into())
                     .or_default()
@@ -121,6 +160,8 @@ fn inventory(
                 "Indexing disabled by the ProtoMolt SKIP hint; retained in the original."
             } else if projections.iter().any(|p| p.r#use == Use::Value as i32) {
                 "Only listed value paths are projected; other occurrences are source-only."
+            } else if projections.iter().any(|p| p.r#use == Use::Input as i32) {
+                "Only listed input paths contribute to their named mapped values; the inputs are not independently queryable."
             } else if projections.iter().any(|p| p.r#use == Use::Container as i32) {
                 "Only listed container paths are traversed; the message itself is not a query value."
             } else if extension {
@@ -182,7 +223,7 @@ fn inventory(
         return Err(Status::internal("schema report omitted a projected field"));
     }
     Ok(pb::SchemaReport {
-        report_version: 1,
+        report_version: 2,
         root_message: message_type.into(),
         messages,
         enums: enums.into_values().collect(),
@@ -238,7 +279,7 @@ fn projection(
             match descriptor.r#type() {
                 Type::Enum => constraints.push("Enums query as their first declared alias; unknown open-enum numbers query as decimal strings. Unknown closed-enum numbers do not project.".into()),
                 Type::Bool => constraints.push("Booleans query as the strings true and false.".into()),
-                Type::String => {},
+                Type::String => constraints.push("An empty string is a present facet value; omission represents absence.".into()),
                 _ => constraints.push("Integers query as decimal strings.".into()),
             }
         }
@@ -263,5 +304,6 @@ fn projection(
         r#use: usage as i32,
         query_representation: representation as i32,
         constraints,
+        value_path: String::new(),
     }
 }
